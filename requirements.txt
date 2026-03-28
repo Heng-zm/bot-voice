@@ -1,0 +1,7 @@
+python-telegram-bot
+google-genai
+edge-tts
+supabase
+python-dotenv
+imageio-ffmpeg
+flask
