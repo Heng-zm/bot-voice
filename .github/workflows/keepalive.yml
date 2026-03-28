@@ -1,1 +1,19 @@
+name: Keep Render Bot Alive
 
+on:
+  schedule:
+    # Runs every 5 minutes, 24/7
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # allow manual trigger
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render service
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" ${{ secrets.RENDER_URL }}/ping)
+          echo "Ping status: $STATUS"
+          if [ "$STATUS" != "200" ]; then
+            echo "Warning: got HTTP $STATUS — bot may be restarting"
+          fi
