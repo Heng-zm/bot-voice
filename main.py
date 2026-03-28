@@ -227,13 +227,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    # 1. Start Flask ក្នុង background (សម្រាប់ Render)
     threading.Thread(target=run_flask, daemon=True).start()
+    
+    # 2. បង្កើត Application
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # បន្ថែម Handlers
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    print("🚀 Bot running & Fixed Gemini 400 Error...")
-    app.run_polling()
+    
+    print("🚀 Bot is starting...")
+
+    # 3. ដំណើរការ Polling 
+    # drop_pending_updates=True ជួយដោះស្រាយបញ្ហា Conflict មួយចំនួន
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
