@@ -131,7 +131,7 @@ async def generate_voice(text: str, gender: str, output_path: str):
         # English Flow (Gemini AI with strict instruction to avoid Error 400)
         client = get_gemini()
         resp = client.models.generate_content(
-            model="gemini-2.5-flash-preview-tts",
+            model="gemini-2.5-pro-preview-tts",
             contents=[{"role": "user", "parts": [{"text": text}]}],
             config=types.GenerateContentConfig(
                 # System Instruction បង្ខំឱ្យ Gemini អានតែអត្ថបទ ហាមឆ្លើយតបជាអក្សរ
