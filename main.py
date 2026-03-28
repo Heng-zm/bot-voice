@@ -8,14 +8,15 @@ import imageio_ffmpeg as _iio_ffmpeg
 from flask import Flask
 from supabase import create_client, Client
 
-# ── Flask Web Server for Render Health Checks ──────────────────────────────
+# ── Flask Web Server សម្រាប់ Render Health Checks ──────────────────────────
 app_flask = Flask(__name__)
 
 @app_flask.route('/')
 def health_check():
-    return "Bot is running!", 200
+    return "Bot is running online!", 200
 
 def run_flask():
+    # Render ផ្ដល់ Port តាមរយៈ Environment Variable
     port = int(os.environ.get("PORT", 8080))
     app_flask.run(host='0.0.0.0', port=port)
 
@@ -37,7 +38,7 @@ from telegram.ext import (
 )
 
 # ---------------------------------------------------------------------------
-# Configuration & Database Init
+# ការកំណត់ Configuration & Database
 # ---------------------------------------------------------------------------
 load_dotenv()
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -46,6 +47,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY")
 
+# Supabase Connection
 SB_URL = os.getenv("SUPABASE_URL")
 SB_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SB_URL, SB_KEY)
@@ -64,38 +66,52 @@ WELCOME_TEXT = (
 )
 
 # ---------------------------------------------------------------------------
-# Database Helpers
+# មុខងារជំនួយ Database (Database Helpers)
 # ---------------------------------------------------------------------------
 def sync_user_data(user):
     try:
-        supabase.table("user_prefs").upsert({"user_id": user.id, "username": user.username or user.first_name}, on_conflict="user_id").execute()
+        supabase.table("user_prefs").upsert({
+            "user_id": user.id, 
+            "username": user.username or user.first_name
+        }, on_conflict="user_id").execute()
     except Exception as e:
-        logger.error(f"DB Sync Error: {e}")
+        logger.error(f"DB Sync Error (401?): {e}")
 
 def get_user_gender(user_id: int) -> str:
     try:
         res = supabase.table("user_prefs").select("gender").eq("user_id", user_id).execute()
-        if res.data and res.data[0]['gender']: return res.data[0]['gender']
-    except: pass
+        if res.data and res.data[0].get('gender'):
+            return res.data[0]['gender']
+    except:
+        pass
     return "female"
 
 def update_user_gender(user_id: int, gender: str):
-    supabase.table("user_prefs").update({"gender": gender}).eq("user_id", user_id).execute()
+    try:
+        supabase.table("user_prefs").update({"gender": gender}).eq("user_id", user_id).execute()
+    except: pass
 
 def save_text_cache(msg_id: int, text: str):
-    supabase.table("text_cache").upsert({"message_id": msg_id, "original_text": text}).execute()
+    try:
+        supabase.table("text_cache").upsert({"message_id": msg_id, "original_text": text}).execute()
+    except: pass
 
 def get_text_cache(msg_id: int) -> str:
-    res = supabase.table("text_cache").select("original_text").eq("message_id", msg_id).execute()
-    return res.data[0]['original_text'] if res.data else None
+    try:
+        res = supabase.table("text_cache").select("original_text").eq("message_id", msg_id).execute()
+        return res.data[0]['original_text'] if res.data else None
+    except: return None
 
 def delete_text_cache(msg_id: int):
-    supabase.table("text_cache").delete().eq("message_id", msg_id).execute()
+    try:
+        supabase.table("text_cache").delete().eq("message_id", msg_id).execute()
+    except: pass
 
 # ---------------------------------------------------------------------------
-# Fast Async Audio Engine
+# ម៉ាស៊ីនបំប្លែងសំឡេង (Async Audio Engine)
 # ---------------------------------------------------------------------------
 async def async_convert_audio(input_data: bytes | str, output_path: str, is_pcm: bool):
+    """បំប្លែងអូឌីយ៉ូដោយប្រើ FFmpeg ផ្ទាល់ (លឿន និងមានស្ថេរភាពលើ Cloud)"""
     if is_pcm:
         cmd = [_FFMPEG_EXE, "-y", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "pipe:0", 
                "-c:a", "libopus", "-b:a", "32k", output_path]
@@ -106,20 +122,24 @@ async def async_convert_audio(input_data: bytes | str, output_path: str, is_pcm:
         *cmd, stdin=asyncio.subprocess.PIPE if is_pcm else None,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
     )
-    if is_pcm: await process.communicate(input=input_data)
-    else: await process.wait()
+    if is_pcm:
+        await process.communicate(input=input_data)
+    else:
+        await process.wait()
 
 # ---------------------------------------------------------------------------
-# TTS Logic (Fixed Gemini Error 400)
+# TTS Routing Logic
 # ---------------------------------------------------------------------------
 _gemini_client = None
 def get_gemini():
     global _gemini_client
-    if _gemini_client is None: _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    if _gemini_client is None:
+        _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
     return _gemini_client
 
 async def generate_voice(text: str, gender: str, output_path: str):
     is_khmer = bool(re.search(r"[\u1780-\u17FF]", text))
+    
     if is_khmer:
         # Khmer Flow (Edge-TTS)
         tmp_mp3 = f"{output_path}.mp3"
@@ -128,33 +148,38 @@ async def generate_voice(text: str, gender: str, output_path: str):
         if os.path.exists(tmp_mp3): os.remove(tmp_mp3)
         return "🇰🇭 ភាសាខ្មែរ"
     else:
-        # English Flow (Gemini AI with strict instruction to avoid Error 400)
+        # English Flow (Gemini AI with Retry logic and strict System Instruction)
         client = get_gemini()
-        resp = client.models.generate_content(
-            model="gemini-2.5-pro-preview-tts",
-            contents=[{"role": "user", "parts": [{"text": text}]}],
-            config=types.GenerateContentConfig(
-                # System Instruction បង្ខំឱ្យ Gemini អានតែអត្ថបទ ហាមឆ្លើយតបជាអក្សរ
-                system_instruction="You are a professional text-to-speech engine. Your only task is to read the provided text transcript exactly as it is. Do NOT generate any conversational text, comments, or answers. Output MUST be audio only.",
-                response_modalities=["AUDIO"],
-                speech_config=types.SpeechConfig(
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=VOICE_MAP["en"][gender])
-                    )
-                ),
-            ),
-        )
-        
-        if not resp.candidates or not resp.candidates[0].content.parts:
-            raise ValueError("Gemini មិនអាចបង្កើតសំឡេងបានទេ (Empty Response)។")
-            
-        raw = resp.candidates[0].content.parts[0].inline_data.data
-        pcm = base64.b64decode(raw) if isinstance(raw, str) else raw
-        await async_convert_audio(pcm, output_path, True)
-        return "🇺🇸 English"
+        for attempt in range(2): # Retry up to 2 times for 500 error
+            try:
+                resp = client.models.generate_content(
+                    model="gemini-2.5-flash-preview-tts",
+                    contents=[{"role": "user", "parts": [{"text": text}]}],
+                    config=types.GenerateContentConfig(
+                        system_instruction="You are a professional text-to-speech engine. Your only task is to read the provided text transcript exactly as it is. Do NOT generate any conversational text, comments, or answers. Output MUST be audio only.",
+                        response_modalities=["AUDIO"],
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=VOICE_MAP["en"][gender])
+                            )
+                        ),
+                    ),
+                )
+                if not resp.candidates or not resp.candidates[0].content.parts:
+                    raise ValueError("Gemini Response is empty.")
+
+                raw = resp.candidates[0].content.parts[0].inline_data.data
+                pcm = base64.b64decode(raw) if isinstance(raw, str) else raw
+                await async_convert_audio(pcm, output_path, True)
+                return "🇺🇸 English"
+            except Exception as e:
+                if attempt == 0:
+                    await asyncio.sleep(1)
+                    continue
+                raise e
 
 # ---------------------------------------------------------------------------
-# UI & Handlers
+# Handlers
 # ---------------------------------------------------------------------------
 def get_voice_kb(gender: str):
     f_btn = "👩 សំឡេងស្រី" + (" ✅" if gender == "female" else "")
@@ -183,11 +208,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         label = await generate_voice(text, gender, file_path)
         with open(file_path, "rb") as audio:
-            sent_msg = await update.message.reply_voice(voice=audio, caption=f"🗣️ {label}", reply_markup=get_voice_kb(gender))
+            sent_msg = await update.message.reply_voice(
+                voice=audio, 
+                caption=f"🗣️ {label}",
+                reply_markup=get_voice_kb(gender)
+            )
             save_text_cache(sent_msg.message_id, text)
     except Exception as e:
         logger.error(f"TTS Error: {e}")
-        await update.message.reply_text("❌ មិនអាចបំប្លែងបានទេ (Gemini Error)។ សូមព្យាយាមអត្ថបទផ្សេង។")
     finally:
         if os.path.exists(file_path): os.remove(file_path)
 
@@ -199,7 +227,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     original_text = get_text_cache(msg_id)
     if not original_text:
-        await query.answer("❌ រកអត្ថបទដើមមិនឃើញ។", show_alert=True)
+        await query.answer("❌ រកអត្ថបទដើមមិនឃើញ (Cache Expired)។", show_alert=True)
         return
 
     if get_user_gender(user_id) == new_gender:
@@ -215,7 +243,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await query.message.delete()
         except: pass
         with open(file_path, "rb") as audio:
-            new_msg = await query.message.chat.send_voice(voice=audio, caption=f"🗣️ {label}", reply_markup=get_voice_kb(new_gender))
+            new_msg = await query.message.chat.send_voice(
+                voice=audio, 
+                caption=f"🗣️ {label}",
+                reply_markup=get_voice_kb(new_gender)
+            )
             save_text_cache(new_msg.message_id, original_text)
             delete_text_cache(msg_id)
     except Exception as e:
@@ -224,24 +256,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if os.path.exists(file_path): os.remove(file_path)
 
 # ---------------------------------------------------------------------------
-# Main
+# Main Deployment Logic
 # ---------------------------------------------------------------------------
 def main():
-    # 1. Start Flask ក្នុង background (សម្រាប់ Render)
+    # ១. ដំណើរការ Flask ក្នុង background thread (សម្រាប់ Render)
     threading.Thread(target=run_flask, daemon=True).start()
-    
-    # 2. បង្កើត Application
+
+    # ២. ដំណើរការ Telegram Bot
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
-    # បន្ថែម Handlers
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     
-    print("🚀 Bot is starting...")
-
-    # 3. ដំណើរការ Polling 
-    # drop_pending_updates=True ជួយដោះស្រាយបញ្ហា Conflict មួយចំនួន
+    print("🚀 Bot is Online & Fixed Bugs...")
+    
+    # ប្រើ drop_pending_updates=True ដើម្បីការពារ Error 409 Conflict
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
