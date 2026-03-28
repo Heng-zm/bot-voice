@@ -85,23 +85,46 @@ def sync_user_data(user):
 
 
 def get_user_prefs(user_id: int) -> dict:
-    """Fetch gender and speed in one DB call."""
+    """Fetch gender and speed in one DB call. Falls back if speed column missing."""
+    defaults = {"gender": "female", "speed": 1.0}
+    # Try fetching both columns; fall back to gender-only if speed col missing
+    for cols in ("gender, speed", "gender"):
+        try:
+            res = (
+                supabase.table("user_prefs")
+                .select(cols)
+                .eq("user_id", user_id)
+                .execute()
+            )
+            if res.data:
+                row = res.data[0]
+                defaults["gender"] = row.get("gender") or "female"
+                if "speed" in row and row["speed"] is not None:
+                    defaults["speed"] = float(row["speed"])
+            return defaults
+        except Exception as e:
+            err_msg = str(e)
+            if "speed" in err_msg and "does not exist" in err_msg:
+                # Column not yet created — retry with gender only
+                logger.warning("speed column missing in user_prefs — using default 1.0")
+                continue
+            logger.error(f"Error fetching prefs: {e}")
+            break
+    return defaults
+
+
+def ensure_speed_column():
+    """Try to add speed column if it doesn't exist (runs once at startup)."""
     try:
-        res = (
-            supabase.table("user_prefs")
-            .select("gender, speed")
-            .eq("user_id", user_id)
-            .execute()
-        )
-        if res.data:
-            row = res.data[0]
-            return {
-                "gender": row.get("gender") or "female",
-                "speed":  float(row.get("speed") or 1.0),
-            }
+        supabase.table("user_prefs").select("speed").limit(1).execute()
+        logger.info("speed column exists ✓")
     except Exception as e:
-        logger.error(f"Error fetching prefs: {e}")
-    return {"gender": "female", "speed": 1.0}
+        if "does not exist" in str(e):
+            logger.warning(
+                "⚠️  speed column missing. Run this in Supabase SQL editor:\n"
+                "    ALTER TABLE user_prefs ADD COLUMN speed FLOAT DEFAULT 1.0;\n"
+                "Bot will use speed=1.0 for all users until then."
+            )
 
 
 def update_user_gender(user_id: int, gender: str):
@@ -115,7 +138,41 @@ def update_user_speed(user_id: int, speed: float):
     try:
         supabase.table("user_prefs").update({"speed": speed}).eq("user_id", user_id).execute()
     except Exception as e:
-        logger.error(f"Error updating speed: {e}")
+        if "does not exist" in str(e):
+            logger.warning("Cannot save speed — column missing. Run ALTER TABLE first.")
+        else:
+            logger.error(f"Error updating speed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Status Timer  (animated dots while TTS is being generated)
+# ---------------------------------------------------------------------------
+_STATUS_FRAMES = [
+    "⏳ កំពុងបង្កើតសំឡេង ·",
+    "⏳ កំពុងបង្កើតសំឡេង ··",
+    "⏳ កំពុងបង្កើតសំឡេង ···",
+    "⏳ កំពុងបង្កើតសំឡេង ····",
+]
+
+async def send_status_timer(chat_id: int, bot, stop_event: asyncio.Event):
+    """Send an animated status message that updates every second until stopped."""
+    msg = await bot.send_message(chat_id=chat_id, text=_STATUS_FRAMES[0])
+    frame = 1
+    try:
+        while not stop_event.is_set():
+            await asyncio.sleep(1)
+            if stop_event.is_set():
+                break
+            try:
+                await msg.edit_text(_STATUS_FRAMES[frame % len(_STATUS_FRAMES)])
+            except Exception:
+                pass
+            frame += 1
+    finally:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
 
 
 def save_text_cache(msg_id: int, text: str):
@@ -205,7 +262,7 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str)
     is_khmer = bool(re.search(r"[\u1780-\u17FF]", text))
     lang_key = "km" if is_khmer else "en"
     voice = VOICE_MAP[lang_key][gender]
-    label = "@voicekhaibot" if is_khmer else "@voicekhaibot"
+    label = "🇰🇭 ភាសាខ្មែរ" if is_khmer else "🇺🇸 English"
 
     tmp_mp3 = f"{output_path}.raw.mp3"
     tmp_ogg = f"{output_path}.base.ogg"
@@ -280,14 +337,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gender = prefs["gender"]
     speed  = prefs["speed"]
 
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action=constants.ChatAction.RECORD_VOICE,
-    )
-
     file_path = f"v_{user_id}_{msg.message_id}.ogg"
+    stop_event = asyncio.Event()
+    timer_task = asyncio.create_task(
+        send_status_timer(update.effective_chat.id, context.bot, stop_event)
+    )
     try:
         label = await generate_voice(text, gender, speed, file_path)
+        stop_event.set()
+        await timer_task
         with open(file_path, "rb") as audio:
             sent_msg = await msg.reply_voice(
                 voice=audio,
@@ -297,6 +355,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_text_cache(sent_msg.message_id, text)
     except Exception as e:
         logger.error(f"TTS Error: {e}")
+        stop_event.set()
+        await timer_task
         await msg.reply_text("❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។ សូមព្យាយាមម្តងទៀត។")
     finally:
         if os.path.exists(file_path):
@@ -351,8 +411,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prefs  = get_user_prefs(user_id)
         gender = prefs["gender"]
         file_path = f"spd_{user_id}_{msg_id}.ogg"
+        stop_event = asyncio.Event()
+        timer_task = asyncio.create_task(
+            send_status_timer(query.message.chat.id, query.get_bot(), stop_event)
+        )
         try:
             label = await generate_voice(original_text, gender, new_speed, file_path)
+            stop_event.set()
+            await timer_task
             try:
                 await query.message.delete()
             except Exception:
@@ -366,6 +432,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_text_cache(new_msg.message_id, original_text)
         except Exception as e:
             logger.error(f"Speed regen error: {e}")
+            stop_event.set()
+            await timer_task
         finally:
             if os.path.exists(file_path):
                 try:
@@ -388,8 +456,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prefs = get_user_prefs(user_id)
         speed = prefs["speed"]
         file_path = f"rev_{user_id}_{msg_id}.ogg"
+        stop_event = asyncio.Event()
+        timer_task = asyncio.create_task(
+            send_status_timer(query.message.chat.id, query.get_bot(), stop_event)
+        )
         try:
             label = await generate_voice(original_text, new_gender, speed, file_path)
+            stop_event.set()
+            await timer_task
             try:
                 await query.message.delete()
             except Exception:
@@ -403,6 +477,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_text_cache(new_msg.message_id, original_text)
         except Exception as e:
             logger.error(f"Gender regen error: {e}")
+            stop_event.set()
+            await timer_task
         finally:
             if os.path.exists(file_path):
                 try:
@@ -421,6 +497,9 @@ def main():
     # Start Flask health-check server in background
     threading.Thread(target=run_flask, daemon=True).start()
     print("✅ Health check server started.")
+
+    # Check DB schema
+    ensure_speed_column()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", on_start))
