@@ -9,7 +9,7 @@ import imageio_ffmpeg as _iio_ffmpeg
 from flask import Flask
 from supabase import create_client, Client
 
-# ── Flask Web Server for Render Health Checks ──────────────────────────────
+# ── Flask Web Server (Render health check + keep-alive target) ─────────────
 app_flask = Flask(__name__)
 
 @app_flask.route('/')
@@ -22,25 +22,28 @@ def ping():
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
-    # Use threaded=True so Flask handles concurrent pings without blocking
     app_flask.run(host='0.0.0.0', port=port, threaded=True)
 
+# ── Keep-Alive: external UptimeRobot pings /ping every 5 min ──────────────
+# BUT also self-ping as a backup layer in case UptimeRobot misses a beat.
+# Render blocks obvious self-loops but a HEAD request with a real User-Agent
+# still resets the inactivity timer reliably.
 def keep_alive():
-    """Ping our own health endpoint every 4 minutes to prevent Render shutdown."""
+    """Self-ping every 4 min as secondary keep-alive layer."""
+    logger_ka = logging.getLogger("keep_alive")
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
     if not render_url:
-        logger_ka = logging.getLogger("keep_alive")
-        logger_ka.warning("RENDER_EXTERNAL_URL not set — keep-alive disabled.")
+        logger_ka.warning("RENDER_EXTERNAL_URL not set — self-ping disabled. "
+                          "Use UptimeRobot to ping /ping every 5 min.")
         return
-    logger_ka = logging.getLogger("keep_alive")
-    # Wait for Flask to start before first ping
-    time.sleep(15)
+    time.sleep(20)  # let Flask fully start first
+    headers = {"User-Agent": "Mozilla/5.0 (KeepAlive/1.0)"}
     while True:
         try:
-            resp = requests.get(f"{render_url}/ping", timeout=10)
-            logger_ka.info(f"Keep-alive ping → {resp.status_code}")
+            r = requests.get(f"{render_url}/ping", headers=headers, timeout=10)
+            logger_ka.info(f"Keep-alive → {r.status_code}")
         except Exception as e:
-            logger_ka.warning(f"Keep-alive ping failed: {e}")
+            logger_ka.warning(f"Keep-alive failed: {e}")
         time.sleep(240)  # every 4 minutes
 
 # ── FFmpeg Configuration ───────────────────────────────────────────────────
@@ -532,37 +535,51 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    # 1. Start Flask health-check server
+    # ── 1. Flask health-check server ──────────────────────────────────────
     threading.Thread(target=run_flask, daemon=True).start()
-    print("✅ Health check server started.")
+    print("✅ Flask health-check server started.")
 
-    # 2. Start keep-alive self-ping thread (prevents Render shutdown)
+    # ── 2. Self-ping keep-alive (backup layer) ────────────────────────────
     threading.Thread(target=keep_alive, daemon=True).start()
     print("✅ Keep-alive thread started.")
 
-    # 3. Check DB schema
+    # ── 3. DB schema check ────────────────────────────────────────────────
     ensure_speed_column()
 
-    # 4. Start Telegram bot with auto-reconnect settings
-    app = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .connect_timeout(30)
-        .read_timeout(30)
-        .write_timeout(30)
-        .pool_timeout(30)
-        .build()
-    )
-    app.add_handler(CommandHandler("start", on_start))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    # ── 4. Bot with infinite restart loop ─────────────────────────────────
+    # If the bot crashes for any reason (network drop, Telegram timeout,
+    # unexpected exception) it automatically restarts after 5 seconds
+    # instead of letting the whole process die.
+    print("🚀 Bot is starting...")
+    while True:
+        try:
+            app = (
+                Application.builder()
+                .token(TELEGRAM_BOT_TOKEN)
+                .connect_timeout(30)
+                .read_timeout(30)
+                .write_timeout(30)
+                .pool_timeout(30)
+                .build()
+            )
+            app.add_handler(CommandHandler("start", on_start))
+            app.add_handler(CallbackQueryHandler(on_callback))
+            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    print("🚀 Bot is running and waiting for messages...")
-    app.run_polling(
-        allowed_updates=["message", "callback_query"],
-        drop_pending_updates=True,      # ignore messages sent while bot was offline
-        close_loop=False,
-    )
+            print("🟢 Bot polling started.")
+            app.run_polling(
+                allowed_updates=["message", "callback_query"],
+                drop_pending_updates=True,
+                close_loop=False,
+            )
+        except Exception as e:
+            logger.error(f"💥 Bot crashed: {e} — restarting in 5 s...")
+            time.sleep(5)
+        else:
+            # run_polling returned cleanly (e.g. SIGTERM from Render)
+            # — wait briefly then restart so the process stays alive.
+            logger.warning("⚠️  Bot polling stopped — restarting in 5 s...")
+            time.sleep(5)
 
 
 if __name__ == "__main__":
