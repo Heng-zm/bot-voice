@@ -175,11 +175,14 @@ async def send_status_timer(chat_id: int, bot, stop_event: asyncio.Event):
             pass
 
 
-def save_text_cache(msg_id: int, text: str):
+def save_text_cache(msg_id: int, text: str, user_id: int = None, username: str = None):
     try:
-        supabase.table("text_cache").upsert(
-            {"message_id": msg_id, "original_text": text}
-        ).execute()
+        payload = {"message_id": msg_id, "original_text": text}
+        if user_id is not None:
+            payload["user_id"] = user_id
+        if username is not None:
+            payload["username"] = username
+        supabase.table("text_cache").upsert(payload).execute()
     except Exception as e:
         logger.error(f"Error saving cache: {e}")
 
@@ -352,7 +355,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption=f"🗣️ {label}",
                 reply_markup=get_main_kb(gender),
             )
-        save_text_cache(sent_msg.message_id, text)
+        save_text_cache(
+            sent_msg.message_id, text,
+            user_id=user_id,
+            username=update.effective_user.username or update.effective_user.first_name,
+        )
     except Exception as e:
         logger.error(f"TTS Error: {e}")
         stop_event.set()
@@ -429,9 +436,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption=f"🗣️ {label}",
                     reply_markup=get_main_kb(gender),
                 )
-            save_text_cache(new_msg.message_id, original_text)
-        except Exception as e:
-            logger.error(f"Speed regen error: {e}")
+            save_text_cache(
+                new_msg.message_id, original_text,
+                user_id=user_id,
+                username=query.from_user.username or query.from_user.first_name,
+            )
             stop_event.set()
             await timer_task
         finally:
@@ -474,7 +483,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption=f"🗣️ {label}",
                     reply_markup=get_main_kb(new_gender),
                 )
-            save_text_cache(new_msg.message_id, original_text)
+            save_text_cache(
+                new_msg.message_id, original_text,
+                user_id=user_id,
+                username=query.from_user.username or query.from_user.first_name,
+            )
         except Exception as e:
             logger.error(f"Gender regen error: {e}")
             stop_event.set()
