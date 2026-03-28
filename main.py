@@ -9,7 +9,6 @@ from flask import Flask
 from supabase import create_client, Client
 
 # ── Flask Web Server for Render Health Checks ──────────────────────────────
-# Render requires a web server to stay alive.
 app_flask = Flask(__name__)
 
 @app_flask.route('/')
@@ -17,7 +16,6 @@ def health_check():
     return "Bot is running!", 200
 
 def run_flask():
-    # Render provides a PORT environment variable
     port = int(os.environ.get("PORT", 8080))
     app_flask.run(host='0.0.0.0', port=port)
 
@@ -69,20 +67,16 @@ WELCOME_TEXT = (
 # Database Helpers
 # ---------------------------------------------------------------------------
 def sync_user_data(user):
-    user_id = user.id
-    username = user.username or user.first_name
     try:
-        supabase.table("user_prefs").upsert({"user_id": user_id, "username": username}, on_conflict="user_id").execute()
+        supabase.table("user_prefs").upsert({"user_id": user.id, "username": user.username or user.first_name}, on_conflict="user_id").execute()
     except Exception as e:
         logger.error(f"DB Sync Error: {e}")
 
 def get_user_gender(user_id: int) -> str:
     try:
         res = supabase.table("user_prefs").select("gender").eq("user_id", user_id).execute()
-        if res.data and res.data[0]['gender']:
-            return res.data[0]['gender']
-    except Exception as e:
-        logger.error(f"Error fetching gender: {e}")
+        if res.data and res.data[0]['gender']: return res.data[0]['gender']
+    except: pass
     return "female"
 
 def update_user_gender(user_id: int, gender: str):
@@ -95,18 +89,29 @@ def get_text_cache(msg_id: int) -> str:
     res = supabase.table("text_cache").select("original_text").eq("message_id", msg_id).execute()
     return res.data[0]['original_text'] if res.data else None
 
+def delete_text_cache(msg_id: int):
+    supabase.table("text_cache").delete().eq("message_id", msg_id).execute()
+
 # ---------------------------------------------------------------------------
-# TTS & Audio (Async FFmpeg)
+# Fast Async Audio Engine
 # ---------------------------------------------------------------------------
 async def async_convert_audio(input_data: bytes | str, output_path: str, is_pcm: bool):
-    cmd = [_FFMPEG_EXE, "-y", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "pipe:0" if is_pcm else input_data,
-           "-c:a", "libopus", "-b:a", "32k", output_path]
-    if not is_pcm: cmd = [_FFMPEG_EXE, "-y", "-i", input_data, "-c:a", "libopus", "-b:a", "32k", output_path]
-    process = await asyncio.create_subprocess_exec(*cmd, stdin=asyncio.subprocess.PIPE if is_pcm else None,
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    if is_pcm:
+        cmd = [_FFMPEG_EXE, "-y", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "pipe:0", 
+               "-c:a", "libopus", "-b:a", "32k", output_path]
+    else:
+        cmd = [_FFMPEG_EXE, "-y", "-i", input_data, "-c:a", "libopus", "-b:a", "32k", output_path]
+
+    process = await asyncio.create_subprocess_exec(
+        *cmd, stdin=asyncio.subprocess.PIPE if is_pcm else None,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+    )
     if is_pcm: await process.communicate(input=input_data)
     else: await process.wait()
 
+# ---------------------------------------------------------------------------
+# TTS Logic (Fixed Gemini Error 400)
+# ---------------------------------------------------------------------------
 _gemini_client = None
 def get_gemini():
     global _gemini_client
@@ -116,23 +121,40 @@ def get_gemini():
 async def generate_voice(text: str, gender: str, output_path: str):
     is_khmer = bool(re.search(r"[\u1780-\u17FF]", text))
     if is_khmer:
+        # Khmer Flow (Edge-TTS)
         tmp_mp3 = f"{output_path}.mp3"
         await edge_tts.Communicate(text, VOICE_MAP["km"][gender]).save(tmp_mp3)
         await async_convert_audio(tmp_mp3, output_path, False)
         if os.path.exists(tmp_mp3): os.remove(tmp_mp3)
         return "🇰🇭 ភាសាខ្មែរ"
     else:
-        resp = get_gemini().models.generate_content(model="gemini-2.5-flash-preview-tts",
+        # English Flow (Gemini AI with strict instruction to avoid Error 400)
+        client = get_gemini()
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash-preview-tts",
             contents=[{"role": "user", "parts": [{"text": text}]}],
-            config=types.GenerateContentConfig(response_modalities=["AUDIO"],
-                speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=VOICE_MAP["en"][gender])))),)
-        pcm = base64.b64decode(resp.candidates[0].content.parts[0].inline_data.data)
+            config=types.GenerateContentConfig(
+                # System Instruction បង្ខំឱ្យ Gemini អានតែអត្ថបទ ហាមឆ្លើយតបជាអក្សរ
+                system_instruction="You are a professional text-to-speech engine. Your only task is to read the provided text transcript exactly as it is. Do NOT generate any conversational text, comments, or answers. Output MUST be audio only.",
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=VOICE_MAP["en"][gender])
+                    )
+                ),
+            ),
+        )
+        
+        if not resp.candidates or not resp.candidates[0].content.parts:
+            raise ValueError("Gemini មិនអាចបង្កើតសំឡេងបានទេ (Empty Response)។")
+            
+        raw = resp.candidates[0].content.parts[0].inline_data.data
+        pcm = base64.b64decode(raw) if isinstance(raw, str) else raw
         await async_convert_audio(pcm, output_path, True)
         return "🇺🇸 English"
 
 # ---------------------------------------------------------------------------
-# Handlers
+# UI & Handlers
 # ---------------------------------------------------------------------------
 def get_voice_kb(gender: str):
     f_btn = "👩 សំឡេងស្រី" + (" ✅" if gender == "female" else "")
@@ -165,6 +187,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_text_cache(sent_msg.message_id, text)
     except Exception as e:
         logger.error(f"TTS Error: {e}")
+        await update.message.reply_text("❌ មិនអាចបំប្លែងបានទេ (Gemini Error)។ សូមព្យាយាមអត្ថបទផ្សេង។")
     finally:
         if os.path.exists(file_path): os.remove(file_path)
 
@@ -179,6 +202,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❌ រកអត្ថបទដើមមិនឃើញ។", show_alert=True)
         return
 
+    if get_user_gender(user_id) == new_gender:
+        await query.answer()
+        return
+
     update_user_gender(user_id, new_gender)
     await query.answer("🔄 កំពុងប្តូរសំឡេង...")
     
@@ -190,26 +217,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(file_path, "rb") as audio:
             new_msg = await query.message.chat.send_voice(voice=audio, caption=f"🗣️ {label}", reply_markup=get_voice_kb(new_gender))
             save_text_cache(new_msg.message_id, original_text)
+            delete_text_cache(msg_id)
     except Exception as e:
         logger.error(f"Regen Error: {e}")
     finally:
         if os.path.exists(file_path): os.remove(file_path)
 
 # ---------------------------------------------------------------------------
-# Main Deployment Logic
+# Main
 # ---------------------------------------------------------------------------
 def main():
-    # 1. Start Flask in a background thread
     threading.Thread(target=run_flask, daemon=True).start()
-    print("✅ Health Check server started on background thread.")
-
-    # 2. Start Telegram Bot
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    
-    print("🚀 Bot is running and waiting for messages...")
+    print("🚀 Bot running & Fixed Gemini 400 Error...")
     app.run_polling()
 
 if __name__ == "__main__":
