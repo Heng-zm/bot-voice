@@ -3,6 +3,8 @@ import os
 import re
 import asyncio
 import threading
+import time
+import requests
 import imageio_ffmpeg as _iio_ffmpeg
 from flask import Flask
 from supabase import create_client, Client
@@ -14,9 +16,32 @@ app_flask = Flask(__name__)
 def health_check():
     return "Bot is running!", 200
 
+@app_flask.route('/ping')
+def ping():
+    return "pong", 200
+
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
-    app_flask.run(host='0.0.0.0', port=port)
+    # Use threaded=True so Flask handles concurrent pings without blocking
+    app_flask.run(host='0.0.0.0', port=port, threaded=True)
+
+def keep_alive():
+    """Ping our own health endpoint every 4 minutes to prevent Render shutdown."""
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not render_url:
+        logger_ka = logging.getLogger("keep_alive")
+        logger_ka.warning("RENDER_EXTERNAL_URL not set — keep-alive disabled.")
+        return
+    logger_ka = logging.getLogger("keep_alive")
+    # Wait for Flask to start before first ping
+    time.sleep(15)
+    while True:
+        try:
+            resp = requests.get(f"{render_url}/ping", timeout=10)
+            logger_ka.info(f"Keep-alive ping → {resp.status_code}")
+        except Exception as e:
+            logger_ka.warning(f"Keep-alive ping failed: {e}")
+        time.sleep(240)  # every 4 minutes
 
 # ── FFmpeg Configuration ───────────────────────────────────────────────────
 _FFMPEG_EXE = _iio_ffmpeg.get_ffmpeg_exe()
@@ -507,20 +532,37 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    # Start Flask health-check server in background
+    # 1. Start Flask health-check server
     threading.Thread(target=run_flask, daemon=True).start()
     print("✅ Health check server started.")
 
-    # Check DB schema
+    # 2. Start keep-alive self-ping thread (prevents Render shutdown)
+    threading.Thread(target=keep_alive, daemon=True).start()
+    print("✅ Keep-alive thread started.")
+
+    # 3. Check DB schema
     ensure_speed_column()
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # 4. Start Telegram bot with auto-reconnect settings
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
+        .build()
+    )
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     print("🚀 Bot is running and waiting for messages...")
-    app.run_polling()
+    app.run_polling(
+        allowed_updates=["message", "callback_query"],
+        drop_pending_updates=True,      # ignore messages sent while bot was offline
+        close_loop=False,
+    )
 
 
 if __name__ == "__main__":
