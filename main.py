@@ -290,7 +290,7 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str)
     is_khmer = bool(re.search(r"[\u1780-\u17FF]", text))
     lang_key = "km" if is_khmer else "en"
     voice = VOICE_MAP[lang_key][gender]
-    label = "🇰🇭 ភាសាខ្មែរ" if is_khmer else "🇺🇸 English"
+    label = "@voicekhaibot" if is_khmer else "@voicekhaibot"
 
     tmp_mp3 = f"{output_path}.raw.mp3"
     tmp_ogg = f"{output_path}.base.ogg"
