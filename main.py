@@ -391,7 +391,7 @@ async def transcribe_voice(ogg_path: str) -> str:
     # Run blocking Gemini call in a thread so it doesn't block the event loop
     def _call_gemini():
         return _gemini.models.generate_content(
-            model="gemini-2.0-flash",
+            model="./models/gemini-2.5-pro",
             contents=[
                 genai_types.Part.from_bytes(
                     data=base64.b64decode(audio_b64),
