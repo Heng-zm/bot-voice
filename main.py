@@ -396,7 +396,7 @@ async def transcribe_voice(ogg_path: str) -> str:
 
     def _call():
         return _gemini.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-pro",
             contents=[
                 genai_types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"),
                 prompt,
