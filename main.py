@@ -310,7 +310,7 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str)
     is_khmer = bool(re.search(r"[\u1780-\u17FF]", text))
     lang_key = "km" if is_khmer else "en"
     voice = VOICE_MAP[lang_key][gender]
-    label = "🇰🇭 ភាសាខ្មែរ" if is_khmer else "🇺🇸 English"
+    label = "@voicekhaibot" if is_khmer else "@voicekhaibot
 
     tmp_mp3 = f"{output_path}.raw.mp3"
     tmp_ogg = f"{output_path}.base.ogg"
@@ -362,7 +362,7 @@ def get_speed_kb(current_speed: float) -> InlineKeyboardMarkup:
 def get_transcription_kb(transcript_msg_id: int) -> InlineKeyboardMarkup:
     """Buttons shown below a Whisper transcription result."""
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📢 អានឡើងវិញ", callback_data=f"tts_transcript:{transcript_msg_id}"),
+        InlineKeyboardButton("📢 អេអាយ អាន", callback_data=f"tts_transcript:{transcript_msg_id}"),
         InlineKeyboardButton("🗑️ លុប",        callback_data=f"del_transcript:{transcript_msg_id}"),
     ]])
 
