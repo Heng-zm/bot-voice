@@ -407,7 +407,7 @@ async def transcribe_voice(ogg_path: str) -> str:
     try:
         response = await asyncio.wait_for(
             loop.run_in_executor(None, _call),
-            timeout=60,  # max 60s for transcription
+            timeout=60,
         )
         return (response.text or "").strip()
     except asyncio.TimeoutError:
@@ -481,7 +481,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user    = update.effective_user
     user_id = user.id
 
-    # Per-user lock: ignore if already generating
     lock = _get_user_lock(user_id)
     if lock.locked():
         try:
@@ -575,7 +574,6 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_khmer  = bool(re.search(r"[\u1780-\u17FF]", transcript))
         lang_flag = "🇰🇭" if is_khmer else "🇺🇸"
 
-        # Escape special Markdown chars in transcript to avoid parse errors
         safe_transcript = transcript.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
 
         reply = await safe_send(msg.reply_text(
@@ -612,7 +610,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg_id  = query.message.message_id
     data    = query.data
 
-    # Always answer the callback to remove the loading spinner
     try:
         await query.answer()
     except Exception:
@@ -799,7 +796,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Unhandled exception: {context.error}", exc_info=context.error)
-    # Notify user if possible
     if isinstance(update, Update) and update.effective_message:
         try:
             await safe_send(update.effective_message.reply_text(
@@ -807,6 +803,37 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
             ))
         except Exception:
             pass
+
+# ---------------------------------------------------------------------------
+# Bot runner — isolated event loop per attempt, guarantees clean restart
+# ---------------------------------------------------------------------------
+async def _run_bot():
+    """Build and run the bot. Raises on any fatal error so main() can retry."""
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
+        .build()
+    )
+    app.add_handler(CommandHandler("start", on_start))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.VOICE, on_voice))
+    app.add_error_handler(error_handler)
+
+    print("🟢 Bot polling started.")
+    async with app:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(
+            allowed_updates=["message", "callback_query"],
+            drop_pending_updates=True,
+        )
+        # Park here forever — any exception propagates out and triggers restart
+        await asyncio.Event().wait()
 
 # ---------------------------------------------------------------------------
 # Main — infinite restart loop, never dies
@@ -823,33 +850,12 @@ def main():
     print("🚀 Bot is starting...")
     while True:
         try:
-            app = (
-                Application.builder()
-                .token(TELEGRAM_BOT_TOKEN)
-                .connect_timeout(30)
-                .read_timeout(30)
-                .write_timeout(30)
-                .pool_timeout(30)
-                .build()
-            )
-            app.add_handler(CommandHandler("start", on_start))
-            app.add_handler(CallbackQueryHandler(on_callback))
-            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-            app.add_handler(MessageHandler(filters.VOICE, on_voice))
-            app.add_error_handler(error_handler)
-
-            print("🟢 Bot polling started.")
-            app.run_polling(
-                allowed_updates=["message", "callback_query"],
-                drop_pending_updates=True,
-                close_loop=False,
-            )
+            asyncio.run(_run_bot())
         except Exception as e:
             logger.error(f"💥 Bot crashed: {e} — restarting in 5s...")
-            time.sleep(5)
         else:
-            logger.warning("⚠️  Polling stopped cleanly — restarting in 5s...")
-            time.sleep(5)
+            logger.warning("⚠️  Polling stopped — restarting in 5s...")
+        time.sleep(5)
 
 
 if __name__ == "__main__":
