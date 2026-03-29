@@ -4,12 +4,14 @@ import re
 import asyncio
 import threading
 import time
+import functools
 import requests
 import imageio_ffmpeg as _iio_ffmpeg
+from collections import OrderedDict
 from flask import Flask
 from supabase import create_client, Client
 
-# ── Flask Web Server (Render health check + keep-alive target) ─────────────
+# ── Flask (Render health check + keep-alive target) ────────────────────────
 app_flask = Flask(__name__)
 
 @app_flask.route('/')
@@ -24,10 +26,6 @@ def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app_flask.run(host='0.0.0.0', port=port, threaded=True)
 
-# ── Keep-Alive: external UptimeRobot pings /ping every 5 min ──────────────
-# BUT also self-ping as a backup layer in case UptimeRobot misses a beat.
-# Render blocks obvious self-loops but a HEAD request with a real User-Agent
-# still resets the inactivity timer reliably.
 def keep_alive():
     """Self-ping every 4 min as secondary keep-alive layer."""
     logger_ka = logging.getLogger("keep_alive")
@@ -36,7 +34,7 @@ def keep_alive():
         logger_ka.warning("RENDER_EXTERNAL_URL not set — self-ping disabled. "
                           "Use UptimeRobot to ping /ping every 5 min.")
         return
-    time.sleep(20)  # let Flask fully start first
+    time.sleep(20)
     headers = {"User-Agent": "Mozilla/5.0 (KeepAlive/1.0)"}
     while True:
         try:
@@ -44,9 +42,9 @@ def keep_alive():
             logger_ka.info(f"Keep-alive → {r.status_code}")
         except Exception as e:
             logger_ka.warning(f"Keep-alive failed: {e}")
-        time.sleep(240)  # every 4 minutes
+        time.sleep(240)
 
-# ── FFmpeg Configuration ───────────────────────────────────────────────────
+# ── FFmpeg ─────────────────────────────────────────────────────────────────
 _FFMPEG_EXE = _iio_ffmpeg.get_ffmpeg_exe()
 
 import edge_tts
@@ -62,7 +60,7 @@ from telegram.ext import (
 )
 
 # ---------------------------------------------------------------------------
-# Configuration & Database Init
+# Config
 # ---------------------------------------------------------------------------
 load_dotenv()
 logging.basicConfig(
@@ -72,23 +70,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
 SB_URL = os.getenv("SUPABASE_URL")
 SB_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SB_URL, SB_KEY)
 
-# edge-tts voice map for both languages
 VOICE_MAP = {
     "km": {"female": "km-KH-SreymomNeural", "male": "km-KH-PisethNeural"},
     "en": {"female": "en-US-AriaNeural",     "male": "en-US-GuyNeural"},
 }
 
-# Speed options: callback_data -> (label, atempo_value)
 SPEED_OPTIONS = {
-    "spd_0.5":  ("x0.5",   0.5),
-    "spd_1.0":  ("Normal", 1.0),
-    "spd_1.5":  ("x1.5",   1.5),
-    "spd_2.0":  ("x2.0",   2.0),
+    "spd_0.5": ("x0.5",   0.5),
+    "spd_1.0": ("Normal", 1.0),
+    "spd_1.5": ("x1.5",   1.5),
+    "spd_2.0": ("x2.0",   2.0),
 }
 
 WELCOME_TEXT = (
@@ -100,22 +95,59 @@ WELCOME_TEXT = (
 )
 
 # ---------------------------------------------------------------------------
-# Database Helpers
+# In-memory LRU cache for user prefs (avoids a DB round-trip on every message)
+# ---------------------------------------------------------------------------
+_PREFS_CACHE: OrderedDict[int, dict] = OrderedDict()
+_PREFS_CACHE_MAX = 500  # keep last 500 users in memory
+
+def _cache_get(user_id: int) -> dict | None:
+    if user_id in _PREFS_CACHE:
+        _PREFS_CACHE.move_to_end(user_id)
+        return _PREFS_CACHE[user_id].copy()
+    return None
+
+def _cache_set(user_id: int, prefs: dict):
+    _PREFS_CACHE[user_id] = prefs.copy()
+    _PREFS_CACHE.move_to_end(user_id)
+    if len(_PREFS_CACHE) > _PREFS_CACHE_MAX:
+        _PREFS_CACHE.popitem(last=False)
+
+def _cache_invalidate(user_id: int):
+    _PREFS_CACHE.pop(user_id, None)
+
+# ---------------------------------------------------------------------------
+# Per-user lock — prevents duplicate TTS jobs from double-taps
+# ---------------------------------------------------------------------------
+_USER_LOCKS: dict[int, asyncio.Lock] = {}
+
+def _get_user_lock(user_id: int) -> asyncio.Lock:
+    if user_id not in _USER_LOCKS:
+        _USER_LOCKS[user_id] = asyncio.Lock()
+    return _USER_LOCKS[user_id]
+
+# ---------------------------------------------------------------------------
+# Database helpers
 # ---------------------------------------------------------------------------
 def sync_user_data(user):
-    try:
-        supabase.table("user_prefs").upsert(
-            {"user_id": user.id, "username": user.username or user.first_name},
-            on_conflict="user_id",
-        ).execute()
-    except Exception as e:
-        logger.error(f"DB Sync Error: {e}")
+    """Fire-and-forget upsert run in a thread so it never blocks handlers."""
+    def _run():
+        try:
+            supabase.table("user_prefs").upsert(
+                {"user_id": user.id, "username": user.username or user.first_name},
+                on_conflict="user_id",
+            ).execute()
+        except Exception as e:
+            logger.error(f"DB Sync Error: {e}")
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def get_user_prefs(user_id: int) -> dict:
-    """Fetch gender and speed in one DB call. Falls back if speed column missing."""
+    """Return cached prefs, or fetch from DB (with speed-column fallback)."""
+    cached = _cache_get(user_id)
+    if cached:
+        return cached
+
     defaults = {"gender": "female", "speed": 1.0}
-    # Try fetching both columns; fall back to gender-only if speed col missing
     for cols in ("gender, speed", "gender"):
         try:
             res = (
@@ -129,51 +161,141 @@ def get_user_prefs(user_id: int) -> dict:
                 defaults["gender"] = row.get("gender") or "female"
                 if "speed" in row and row["speed"] is not None:
                     defaults["speed"] = float(row["speed"])
+            _cache_set(user_id, defaults)
             return defaults
         except Exception as e:
-            err_msg = str(e)
-            if "speed" in err_msg and "does not exist" in err_msg:
-                # Column not yet created — retry with gender only
-                logger.warning("speed column missing in user_prefs — using default 1.0")
+            if "speed" in str(e) and "does not exist" in str(e):
+                logger.warning("speed column missing — using default 1.0")
                 continue
             logger.error(f"Error fetching prefs: {e}")
             break
+
+    _cache_set(user_id, defaults)
     return defaults
 
 
+def update_user_gender(user_id: int, gender: str):
+    _cache_invalidate(user_id)
+    def _run():
+        try:
+            supabase.table("user_prefs").update({"gender": gender}).eq("user_id", user_id).execute()
+        except Exception as e:
+            logger.error(f"Error updating gender: {e}")
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def update_user_speed(user_id: int, speed: float):
+    _cache_invalidate(user_id)
+    def _run():
+        try:
+            supabase.table("user_prefs").update({"speed": speed}).eq("user_id", user_id).execute()
+        except Exception as e:
+            if "does not exist" in str(e):
+                logger.warning("Cannot save speed — run: ALTER TABLE user_prefs ADD COLUMN speed FLOAT DEFAULT 1.0;")
+            else:
+                logger.error(f"Error updating speed: {e}")
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def ensure_speed_column():
-    """Try to add speed column if it doesn't exist (runs once at startup)."""
     try:
         supabase.table("user_prefs").select("speed").limit(1).execute()
         logger.info("speed column exists ✓")
     except Exception as e:
         if "does not exist" in str(e):
             logger.warning(
-                "⚠️  speed column missing. Run this in Supabase SQL editor:\n"
-                "    ALTER TABLE user_prefs ADD COLUMN speed FLOAT DEFAULT 1.0;\n"
-                "Bot will use speed=1.0 for all users until then."
+                "⚠️  speed column missing. Run in Supabase SQL editor:\n"
+                "    ALTER TABLE user_prefs ADD COLUMN speed FLOAT DEFAULT 1.0;"
             )
 
 
-def update_user_gender(user_id: int, gender: str):
+def save_text_cache(msg_id: int, text: str, user_id: int = None, username: str = None):
+    """Async fire-and-forget cache save."""
+    def _run():
+        try:
+            payload = {"message_id": msg_id, "original_text": text}
+            if user_id  is not None: payload["user_id"]  = user_id
+            if username is not None: payload["username"] = username
+            supabase.table("text_cache").upsert(payload).execute()
+        except Exception as e:
+            logger.error(f"Error saving cache: {e}")
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def get_text_cache(msg_id: int) -> str | None:
     try:
-        supabase.table("user_prefs").update({"gender": gender}).eq("user_id", user_id).execute()
+        res = (
+            supabase.table("text_cache")
+            .select("original_text")
+            .eq("message_id", msg_id)
+            .execute()
+        )
+        if res.data:
+            return res.data[0]["original_text"]
     except Exception as e:
-        logger.error(f"Error updating gender: {e}")
-
-
-def update_user_speed(user_id: int, speed: float):
-    try:
-        supabase.table("user_prefs").update({"speed": speed}).eq("user_id", user_id).execute()
-    except Exception as e:
-        if "does not exist" in str(e):
-            logger.warning("Cannot save speed — column missing. Run ALTER TABLE first.")
-        else:
-            logger.error(f"Error updating speed: {e}")
-
+        logger.error(f"Error fetching cache: {e}")
+    return None
 
 # ---------------------------------------------------------------------------
-# Status Timer  (animated dots while TTS is being generated)
+# Audio — single-pass FFmpeg pipeline (MP3 → OGG + speed in one command)
+# ---------------------------------------------------------------------------
+def _build_atempo_chain(speed: float) -> str:
+    stages = []
+    r = speed
+    if r < 1.0:
+        while r < 0.5:
+            stages.append("atempo=0.5"); r /= 0.5
+        stages.append(f"atempo={r:.4f}")
+    else:
+        while r > 2.0:
+            stages.append("atempo=2.0"); r /= 2.0
+        stages.append(f"atempo={r:.4f}")
+    return ",".join(stages)
+
+
+async def generate_voice(text: str, gender: str, speed: float, output_path: str) -> str:
+    """
+    edge-tts → raw MP3 bytes piped directly into FFmpeg → final OGG.
+    One FFmpeg process, no intermediate temp files when speed == 1.0.
+    """
+    is_khmer = bool(re.search(r"[\u1780-\u17FF]", text))
+    lang_key  = "km" if is_khmer else "en"
+    voice     = VOICE_MAP[lang_key][gender]
+    label     = "@voicekhaibot" if is_khmer else "@voicekhaibot"
+
+    # 1. Collect all MP3 chunks from edge-tts into memory (avoids disk write)
+    mp3_chunks: list[bytes] = []
+    communicate = edge_tts.Communicate(text, voice)
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            mp3_chunks.append(chunk["data"])
+    mp3_data = b"".join(mp3_chunks)
+
+    if not mp3_data:
+        raise RuntimeError("edge-tts returned empty audio")
+
+    # 2. Single FFmpeg pass: stdin MP3 → stdout OGG (+ optional atempo)
+    af_filter = _build_atempo_chain(speed) if speed != 1.0 else None
+    cmd = [_FFMPEG_EXE, "-y", "-f", "mp3", "-i", "pipe:0"]
+    if af_filter:
+        cmd += ["-filter:a", af_filter]
+    cmd += ["-c:a", "libopus", "-b:a", "32k", output_path]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await proc.communicate(input=mp3_data)
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"FFmpeg failed with code {proc.returncode}")
+
+    return label
+
+# ---------------------------------------------------------------------------
+# Status timer
 # ---------------------------------------------------------------------------
 _STATUS_FRAMES = [
     "⏳ កំពុងបង្កើតសំឡេង ·",
@@ -183,7 +305,6 @@ _STATUS_FRAMES = [
 ]
 
 async def send_status_timer(chat_id: int, bot, stop_event: asyncio.Event):
-    """Send an animated status message that updates every second until stopped."""
     msg = await bot.send_message(chat_id=chat_id, text=_STATUS_FRAMES[0])
     frame = 1
     try:
@@ -202,123 +323,10 @@ async def send_status_timer(chat_id: int, bot, stop_event: asyncio.Event):
         except Exception:
             pass
 
-
-def save_text_cache(msg_id: int, text: str, user_id: int = None, username: str = None):
-    try:
-        payload = {"message_id": msg_id, "original_text": text}
-        if user_id is not None:
-            payload["user_id"] = user_id
-        if username is not None:
-            payload["username"] = username
-        supabase.table("text_cache").upsert(payload).execute()
-    except Exception as e:
-        logger.error(f"Error saving cache: {e}")
-
-
-def get_text_cache(msg_id: int) -> str | None:
-    try:
-        res = (
-            supabase.table("text_cache")
-            .select("original_text")
-            .eq("message_id", msg_id)
-            .execute()
-        )
-        if res.data:
-            return res.data[0]["original_text"]
-    except Exception as e:
-        logger.error(f"Error fetching cache: {e}")
-    return None
-
 # ---------------------------------------------------------------------------
-# Audio Helpers
-# ---------------------------------------------------------------------------
-async def _run_ffmpeg(*args):
-    """Run an ffmpeg command asynchronously and wait for it to finish."""
-    process = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    await process.wait()
-    return process.returncode
-
-
-async def convert_mp3_to_ogg(mp3_path: str, ogg_path: str):
-    """Convert an MP3/any audio file to Opus OGG."""
-    await _run_ffmpeg(
-        _FFMPEG_EXE, "-y", "-i", mp3_path,
-        "-c:a", "libopus", "-b:a", "32k", ogg_path,
-    )
-
-
-async def apply_speed_to_ogg(input_ogg: str, output_ogg: str, speed: float):
-    """Apply atempo speed filter. atempo supports 0.5–2.0; chain for extremes."""
-    if speed == 1.0:
-        # No processing needed — just copy
-        await _run_ffmpeg(
-            _FFMPEG_EXE, "-y", "-i", input_ogg,
-            "-c:a", "libopus", "-b:a", "32k", output_ogg,
-        )
-        return
-
-    # Build chained atempo filters if needed (each stage: 0.5–2.0)
-    filters_chain = _build_atempo_chain(speed)
-    await _run_ffmpeg(
-        _FFMPEG_EXE, "-y", "-i", input_ogg,
-        "-filter:a", filters_chain,
-        "-c:a", "libopus", "-b:a", "32k", output_ogg,
-    )
-
-
-def _build_atempo_chain(speed: float) -> str:
-    """Return a comma-joined atempo filter string safe for ffmpeg."""
-    # atempo is limited to [0.5, 2.0] per stage
-    stages = []
-    remaining = speed
-    if remaining < 1.0:
-        while remaining < 0.5:
-            stages.append("atempo=0.5")
-            remaining /= 0.5
-        stages.append(f"atempo={remaining:.4f}")
-    else:
-        while remaining > 2.0:
-            stages.append("atempo=2.0")
-            remaining /= 2.0
-        stages.append(f"atempo={remaining:.4f}")
-    return ",".join(stages)
-
-
-async def generate_voice(text: str, gender: str, speed: float, output_path: str) -> str:
-    """Generate TTS audio using edge-tts, then apply speed adjustment."""
-    is_khmer = bool(re.search(r"[\u1780-\u17FF]", text))
-    lang_key = "km" if is_khmer else "en"
-    voice = VOICE_MAP[lang_key][gender]
-    label = "@voicekhaibot" if is_khmer else "@voicekhaibot"
-
-    tmp_mp3 = f"{output_path}.raw.mp3"
-    tmp_ogg = f"{output_path}.base.ogg"
-    try:
-        # Step 1: edge-tts → MP3
-        await edge_tts.Communicate(text, voice).save(tmp_mp3)
-        # Step 2: MP3 → OGG (base, no speed)
-        await convert_mp3_to_ogg(tmp_mp3, tmp_ogg)
-        # Step 3: Apply speed → final OGG
-        await apply_speed_to_ogg(tmp_ogg, output_path, speed)
-    finally:
-        for f in (tmp_mp3, tmp_ogg):
-            if os.path.exists(f):
-                try:
-                    os.remove(f)
-                except OSError:
-                    pass
-
-    return label
-
-# ---------------------------------------------------------------------------
-# Keyboard Builders
+# Keyboard builders
 # ---------------------------------------------------------------------------
 def get_main_kb(gender: str) -> InlineKeyboardMarkup:
-    """Main keyboard: gender buttons + speed toggle button."""
     f_btn = "👩 សំឡេងស្រី" + (" ✅" if gender == "female" else "")
     m_btn = "👨 សំឡេងប្រុស" + (" ✅" if gender == "male" else "")
     return InlineKeyboardMarkup([
@@ -329,17 +337,59 @@ def get_main_kb(gender: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🎚️ ល្បឿនសំឡេង", callback_data="show_speed")],
     ])
 
-
 def get_speed_kb(current_speed: float) -> InlineKeyboardMarkup:
-    """Speed selection keyboard (replaces main kb after clicking ល្បឿនសំឡេង)."""
-    rows = []
     speed_row = []
     for cb, (lbl, val) in SPEED_OPTIONS.items():
         mark = " ✅" if abs(val - current_speed) < 0.01 else ""
         speed_row.append(InlineKeyboardButton(lbl + mark, callback_data=cb))
-    rows.append(speed_row)
-    rows.append([InlineKeyboardButton("🔙 ត្រឡប់", callback_data="hide_speed")])
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup([
+        speed_row,
+        [InlineKeyboardButton("🔙 ត្រឡប់", callback_data="hide_speed")],
+    ])
+
+# ---------------------------------------------------------------------------
+# Shared regen helper (used by both gender + speed callbacks)
+# ---------------------------------------------------------------------------
+async def _regen_voice(
+    chat_id: int,
+    bot,
+    original_msg,           # the message whose voice is being replaced
+    original_text: str,
+    gender: str,
+    speed: float,
+    user_id: int,
+    username: str,
+    file_prefix: str,
+    msg_id: int,
+) -> None:
+    file_path = f"{file_prefix}_{user_id}_{msg_id}.ogg"
+    stop_event = asyncio.Event()
+    timer_task = asyncio.create_task(send_status_timer(chat_id, bot, stop_event))
+    try:
+        label = await generate_voice(original_text, gender, speed, file_path)
+        stop_event.set()
+        await timer_task
+        try:
+            await original_msg.delete()
+        except Exception:
+            pass
+        with open(file_path, "rb") as audio:
+            new_msg = await bot.send_voice(
+                chat_id=chat_id,
+                voice=audio,
+                caption=f"🗣️ {label}",
+                reply_markup=get_main_kb(gender),
+            )
+        save_text_cache(new_msg.message_id, original_text, user_id=user_id, username=username)
+    except Exception as e:
+        logger.error(f"Regen error: {e}")
+        stop_event.set()
+        await timer_task
+    finally:
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
 
 # ---------------------------------------------------------------------------
 # Handlers
@@ -354,7 +404,7 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
+    msg  = update.message
     text = msg.text
     if not text:
         return
@@ -362,39 +412,49 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await on_start(update, context)
         return
 
-    sync_user_data(update.effective_user)
-    user_id = update.effective_user.id
-    prefs = get_user_prefs(user_id)
-    gender = prefs["gender"]
-    speed  = prefs["speed"]
+    user   = update.effective_user
+    user_id = user.id
 
-    file_path = f"v_{user_id}_{msg.message_id}.ogg"
-    stop_event = asyncio.Event()
-    timer_task = asyncio.create_task(
-        send_status_timer(update.effective_chat.id, context.bot, stop_event)
-    )
-    try:
-        label = await generate_voice(text, gender, speed, file_path)
-        stop_event.set()
-        await timer_task
-        with open(file_path, "rb") as audio:
-            sent_msg = await msg.reply_voice(
-                voice=audio,
-                caption=f"🗣️ {label}",
-                reply_markup=get_main_kb(gender),
-            )
-        save_text_cache(
-            sent_msg.message_id, text,
-            user_id=user_id,
-            username=update.effective_user.username or update.effective_user.first_name,
+    # Fire-and-forget user sync (non-blocking)
+    sync_user_data(user)
+
+    # Per-user lock: ignore if already generating for this user
+    lock = _get_user_lock(user_id)
+    if lock.locked():
+        await msg.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ...")
+        return
+
+    async with lock:
+        prefs  = get_user_prefs(user_id)
+        gender = prefs["gender"]
+        speed  = prefs["speed"]
+
+        file_path  = f"v_{user_id}_{msg.message_id}.ogg"
+        stop_event = asyncio.Event()
+        timer_task = asyncio.create_task(
+            send_status_timer(update.effective_chat.id, context.bot, stop_event)
         )
-    except Exception as e:
-        logger.error(f"TTS Error: {e}")
-        stop_event.set()
-        await timer_task
-        await msg.reply_text("❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។ សូមព្យាយាមម្តងទៀត។")
-    finally:
-        if os.path.exists(file_path):
+        try:
+            label = await generate_voice(text, gender, speed, file_path)
+            stop_event.set()
+            await timer_task
+            with open(file_path, "rb") as audio:
+                sent_msg = await msg.reply_voice(
+                    voice=audio,
+                    caption=f"🗣️ {label}",
+                    reply_markup=get_main_kb(gender),
+                )
+            save_text_cache(
+                sent_msg.message_id, text,
+                user_id=user_id,
+                username=user.username or user.first_name,
+            )
+        except Exception as e:
+            logger.error(f"TTS Error: {e}")
+            stop_event.set()
+            await timer_task
+            await msg.reply_text("❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។ សូមព្យាយាមម្តងទៀត។")
+        finally:
             try:
                 os.remove(file_path)
             except OSError:
@@ -402,154 +462,90 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+    query   = update.callback_query
     user_id = query.from_user.id
     msg_id  = query.message.message_id
     data    = query.data
+    bot     = context.bot
 
-    # ── Show speed sub-menu ─────────────────────────────────────────────
+    # ── Show / hide speed sub-menu (no TTS, just keyboard swap) ────────
     if data == "show_speed":
         await query.answer()
         prefs = get_user_prefs(user_id)
         try:
-            await query.message.edit_reply_markup(
-                reply_markup=get_speed_kb(prefs["speed"])
-            )
+            await query.message.edit_reply_markup(reply_markup=get_speed_kb(prefs["speed"]))
         except Exception as e:
-            logger.error(f"Edit markup error: {e}")
+            logger.error(f"Markup error: {e}")
         return
 
-    # ── Hide speed sub-menu (back button) ───────────────────────────────
     if data == "hide_speed":
         await query.answer()
         prefs = get_user_prefs(user_id)
         try:
-            await query.message.edit_reply_markup(
-                reply_markup=get_main_kb(prefs["gender"])
-            )
+            await query.message.edit_reply_markup(reply_markup=get_main_kb(prefs["gender"]))
         except Exception as e:
-            logger.error(f"Edit markup error: {e}")
+            logger.error(f"Markup error: {e}")
         return
 
-    # ── Speed selected ──────────────────────────────────────────────────
-    if data in SPEED_OPTIONS:
-        _, new_speed = SPEED_OPTIONS[data]
-        update_user_speed(user_id, new_speed)
-
+    # ── Speed or gender change — both use shared _regen_voice ───────────
+    if data in SPEED_OPTIONS or data in ("tg_female", "tg_male"):
         original_text = get_text_cache(msg_id)
         if not original_text:
             await query.answer("❌ រកអត្ថបទដើមមិនឃើញ។", show_alert=True)
             return
 
-        await query.answer("🔄 កំពុងប្តូរល្បឿន...")
-
-        prefs  = get_user_prefs(user_id)
-        gender = prefs["gender"]
-        file_path = f"spd_{user_id}_{msg_id}.ogg"
-        stop_event = asyncio.Event()
-        timer_task = asyncio.create_task(
-            send_status_timer(query.message.chat.id, query.get_bot(), stop_event)
-        )
-        try:
-            label = await generate_voice(original_text, gender, new_speed, file_path)
-            stop_event.set()
-            await timer_task
-            try:
-                await query.message.delete()
-            except Exception:
-                pass
-            with open(file_path, "rb") as audio:
-                new_msg = await query.message.chat.send_voice(
-                    voice=audio,
-                    caption=f"🗣️ {label}",
-                    reply_markup=get_main_kb(gender),
-                )
-            save_text_cache(
-                new_msg.message_id, original_text,
-                user_id=user_id,
-                username=query.from_user.username or query.from_user.first_name,
-            )
-            stop_event.set()
-            await timer_task
-        finally:
-            if os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except OSError:
-                    pass
-        return
-
-    # ── Gender selected ─────────────────────────────────────────────────
-    if data in ("tg_female", "tg_male"):
-        new_gender = data.replace("tg_", "")
-        original_text = get_text_cache(msg_id)
-        if not original_text:
-            await query.answer("❌ រកអត្ថបទដើមមិនឃើញ។", show_alert=True)
+        # Per-user lock: ignore double-taps
+        lock = _get_user_lock(user_id)
+        if lock.locked():
+            await query.answer("⏳ សូមរង់ចាំ...")
             return
 
-        update_user_gender(user_id, new_gender)
-        await query.answer("🔄 កំពុងប្តូរសំឡេង...")
+        if data in SPEED_OPTIONS:
+            _, new_speed = SPEED_OPTIONS[data]
+            update_user_speed(user_id, new_speed)   # async, cache already cleared
+            prefs  = get_user_prefs(user_id)
+            gender = prefs["gender"]
+            speed  = new_speed
+            await query.answer("🔄 កំពុងប្តូរល្បឿន...")
+            prefix = "spd"
+        else:
+            new_gender = data.replace("tg_", "")
+            update_user_gender(user_id, new_gender)  # async, cache already cleared
+            prefs  = get_user_prefs(user_id)
+            gender = new_gender
+            speed  = prefs["speed"]
+            await query.answer("🔄 កំពុងប្តូរសំឡេង...")
+            prefix = "rev"
 
-        prefs = get_user_prefs(user_id)
-        speed = prefs["speed"]
-        file_path = f"rev_{user_id}_{msg_id}.ogg"
-        stop_event = asyncio.Event()
-        timer_task = asyncio.create_task(
-            send_status_timer(query.message.chat.id, query.get_bot(), stop_event)
-        )
-        try:
-            label = await generate_voice(original_text, new_gender, speed, file_path)
-            stop_event.set()
-            await timer_task
-            try:
-                await query.message.delete()
-            except Exception:
-                pass
-            with open(file_path, "rb") as audio:
-                new_msg = await query.message.chat.send_voice(
-                    voice=audio,
-                    caption=f"🗣️ {label}",
-                    reply_markup=get_main_kb(new_gender),
-                )
-            save_text_cache(
-                new_msg.message_id, original_text,
+        async with lock:
+            await _regen_voice(
+                chat_id=query.message.chat.id,
+                bot=bot,
+                original_msg=query.message,
+                original_text=original_text,
+                gender=gender,
+                speed=speed,
                 user_id=user_id,
                 username=query.from_user.username or query.from_user.first_name,
+                file_prefix=prefix,
+                msg_id=msg_id,
             )
-        except Exception as e:
-            logger.error(f"Gender regen error: {e}")
-            stop_event.set()
-            await timer_task
-        finally:
-            if os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except OSError:
-                    pass
         return
 
-    # Unknown callback
     await query.answer()
 
 # ---------------------------------------------------------------------------
-# Main
+# Main — infinite restart loop so the process never dies
 # ---------------------------------------------------------------------------
 def main():
-    # ── 1. Flask health-check server ──────────────────────────────────────
     threading.Thread(target=run_flask, daemon=True).start()
     print("✅ Flask health-check server started.")
 
-    # ── 2. Self-ping keep-alive (backup layer) ────────────────────────────
     threading.Thread(target=keep_alive, daemon=True).start()
     print("✅ Keep-alive thread started.")
 
-    # ── 3. DB schema check ────────────────────────────────────────────────
     ensure_speed_column()
 
-    # ── 4. Bot with infinite restart loop ─────────────────────────────────
-    # If the bot crashes for any reason (network drop, Telegram timeout,
-    # unexpected exception) it automatically restarts after 5 seconds
-    # instead of letting the whole process die.
     print("🚀 Bot is starting...")
     while True:
         try:
@@ -576,9 +572,7 @@ def main():
             logger.error(f"💥 Bot crashed: {e} — restarting in 5 s...")
             time.sleep(5)
         else:
-            # run_polling returned cleanly (e.g. SIGTERM from Render)
-            # — wait briefly then restart so the process stays alive.
-            logger.warning("⚠️  Bot polling stopped — restarting in 5 s...")
+            logger.warning("⚠️  Polling stopped — restarting in 5 s...")
             time.sleep(5)
 
 
