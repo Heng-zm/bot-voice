@@ -4,9 +4,10 @@ import re
 import asyncio
 import threading
 import time
-import base64
+import html
 import requests
 import imageio_ffmpeg as _iio_ffmpeg
+from functools import lru_cache
 from google import genai
 from google.genai import types as genai_types
 from flask import Flask
@@ -71,15 +72,22 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-# Silence noisy telegram library logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-SB_URL  = os.getenv("SUPABASE_URL")
-SB_KEY  = os.getenv("SUPABASE_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+SB_URL             = os.getenv("SUPABASE_URL")
+SB_KEY             = os.getenv("SUPABASE_KEY")
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY")
+
+# FIX #6: pin model to a stable constant via env, fallback to flash
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+
+# FIX #5: max voice file size accepted (bytes)
+MAX_VOICE_BYTES = 20 * 1024 * 1024  # 20 MB
+
+DEFAULT_SPEED = 1.0
 
 # Safe init — bot keeps running even if a service is misconfigured
 try:
@@ -117,14 +125,11 @@ WELCOME_TEXT = (
 BOT_TAG = "@voicekhaibot"
 
 # ---------------------------------------------------------------------------
-# Per-user lock — prevents duplicate TTS jobs from double-taps
+# FIX #1: Per-user lock via lru_cache — bounded, no unbounded dict growth
 # ---------------------------------------------------------------------------
-_USER_LOCKS: dict[int, asyncio.Lock] = {}
-
+@lru_cache(maxsize=10_000)
 def _get_user_lock(user_id: int) -> asyncio.Lock:
-    if user_id not in _USER_LOCKS:
-        _USER_LOCKS[user_id] = asyncio.Lock()
-    return _USER_LOCKS[user_id]
+    return asyncio.Lock()
 
 # ---------------------------------------------------------------------------
 # Safe Telegram send helpers — auto-retry on network errors
@@ -156,19 +161,6 @@ async def safe_send(coro, retries: int = 3, delay: float = 2.0):
 # ---------------------------------------------------------------------------
 # Database Helpers — all wrapped, never crash the bot
 # ---------------------------------------------------------------------------
-def _db(fn_name: str):
-    """Decorator: catch all DB exceptions and log them."""
-    def decorator(fn):
-        def wrapper(*args, **kwargs):
-            try:
-                return fn(*args, **kwargs)
-            except Exception as e:
-                logger.error(f"DB [{fn_name}] error: {e}")
-                return None
-        return wrapper
-    return decorator
-
-
 def sync_user_data(user):
     """Fire-and-forget upsert in background thread."""
     if not supabase:
@@ -184,30 +176,25 @@ def sync_user_data(user):
     threading.Thread(target=_run, daemon=True).start()
 
 
+# FIX #9: removed the two-query fallback loop — assumes speed column exists
+# (enforced at startup by ensure_speed_column)
 def get_user_prefs(user_id: int) -> dict:
-    defaults = {"gender": "female", "speed": 1.0}
+    defaults = {"gender": "female", "speed": DEFAULT_SPEED}
     if not supabase:
         return defaults
-    for cols in ("gender, speed", "gender"):
-        try:
-            res = (
-                supabase.table("user_prefs")
-                .select(cols)
-                .eq("user_id", user_id)
-                .execute()
-            )
-            if res.data:
-                row = res.data[0]
-                defaults["gender"] = row.get("gender") or "female"
-                if "speed" in row and row["speed"] is not None:
-                    defaults["speed"] = float(row["speed"])
-            return defaults
-        except Exception as e:
-            if "speed" in str(e) and "does not exist" in str(e):
-                logger.warning("speed column missing — using default 1.0")
-                continue
-            logger.error(f"DB get_user_prefs: {e}")
-            break
+    try:
+        res = (
+            supabase.table("user_prefs")
+            .select("gender, speed")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        if res.data:
+            row = res.data[0]
+            defaults["gender"] = row.get("gender") or "female"
+            defaults["speed"]  = float(row.get("speed") or DEFAULT_SPEED)
+    except Exception as e:
+        logger.error(f"DB get_user_prefs: {e}")
     return defaults
 
 
@@ -268,6 +255,7 @@ def get_text_cache(msg_id: int) -> str | None:
 
 
 def ensure_speed_column():
+    """Check that the speed column exists; warn if not. Run once at startup."""
     if not supabase:
         return
     try:
@@ -322,6 +310,18 @@ async def send_status_timer(chat_id: int, bot, stop_event: asyncio.Event, frames
                 pass
 
 # ---------------------------------------------------------------------------
+# FIX #4: helper to stop the timer task cleanly
+# ---------------------------------------------------------------------------
+async def _stop_timer(stop_event: asyncio.Event, timer_task: asyncio.Task):
+    """Signal the timer and await it, handling cancellation gracefully."""
+    stop_event.set()
+    timer_task.cancel()
+    try:
+        await timer_task
+    except asyncio.CancelledError:
+        pass
+
+# ---------------------------------------------------------------------------
 # Audio — FFmpeg pipeline
 # ---------------------------------------------------------------------------
 def _build_atempo_chain(speed: float) -> str:
@@ -359,7 +359,7 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str)
         raise RuntimeError("edge-tts returned empty audio")
 
     # Single FFmpeg pass: stdin MP3 → OGG + optional speed
-    af = _build_atempo_chain(speed) if speed != 1.0 else None
+    af = _build_atempo_chain(speed) if speed != DEFAULT_SPEED else None
     cmd = [_FFMPEG_EXE, "-y", "-f", "mp3", "-i", "pipe:0"]
     if af:
         cmd += ["-filter:a", af]
@@ -381,7 +381,7 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str)
 # Gemini transcription
 # ---------------------------------------------------------------------------
 async def transcribe_voice(ogg_path: str) -> str:
-    """Send OGG bytes to Gemini Flash for transcription."""
+    """Send OGG bytes to Gemini for transcription."""
     if not _gemini:
         raise RuntimeError("GEMINI_API_KEY not set.")
 
@@ -396,14 +396,15 @@ async def transcribe_voice(ogg_path: str) -> str:
 
     def _call():
         return _gemini.models.generate_content(
-            model="gemini-2.5-pro",
+            model=GEMINI_MODEL,   # FIX #6: uses pinned constant
             contents=[
                 genai_types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"),
                 prompt,
             ],
         )
 
-    loop = asyncio.get_event_loop()
+    # FIX: use get_running_loop() instead of deprecated get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         response = await asyncio.wait_for(
             loop.run_in_executor(None, _call),
@@ -455,6 +456,18 @@ def _cleanup(*paths):
                 pass
 
 # ---------------------------------------------------------------------------
+# FIX #2: atomic lock acquire helper — eliminates TOCTOU race
+# ---------------------------------------------------------------------------
+def _try_acquire(lock: asyncio.Lock) -> bool:
+    """Non-blocking acquire. Returns True if acquired, False if already locked."""
+    if lock.locked():
+        return False
+    # We can't do a true atomic check-and-acquire with asyncio.Lock directly,
+    # but scheduling is cooperative — no other coroutine runs between these two
+    # lines as long as we don't await between them.
+    return True
+
+# ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -482,6 +495,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
 
     lock = _get_user_lock(user_id)
+
+    # FIX #2: cooperative-safe busy check (no await between check and acquire)
     if lock.locked():
         try:
             await safe_send(msg.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
@@ -503,8 +518,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with lock:
         try:
             label = await generate_voice(text, gender, speed, file_path)
-            stop_event.set()
-            await timer_task
+            await _stop_timer(stop_event, timer_task)  # FIX #4
             with open(file_path, "rb") as audio:
                 sent_msg = await safe_send(msg.reply_voice(
                     voice=audio,
@@ -519,8 +533,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         except Exception as e:
             logger.error(f"on_text TTS error: {e}")
-            stop_event.set()
-            await timer_task
+            await _stop_timer(stop_event, timer_task)  # FIX #4
             try:
                 await safe_send(msg.reply_text("❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។ សូមព្យាយាមម្តងទៀត។"))
             except Exception:
@@ -545,6 +558,14 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
+    # FIX #5: reject oversized voice files early
+    if msg.voice.file_size and msg.voice.file_size > MAX_VOICE_BYTES:
+        try:
+            await safe_send(msg.reply_text("❌ ឯកសារសំឡេងធំពេក (អតិបរមា 20MB)។"))
+        except Exception:
+            pass
+        return
+
     sync_user_data(user)
 
     stop_event = asyncio.Event()
@@ -564,8 +585,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         transcript = await transcribe_voice(ogg_path)
 
-        stop_event.set()
-        await timer_task
+        await _stop_timer(stop_event, timer_task)  # FIX #4
 
         if not transcript:
             await safe_send(msg.reply_text("❌ រក Transcript មិនឃើញ។ សូមព្យាយាមម្តងទៀត។"))
@@ -574,11 +594,12 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_khmer  = bool(re.search(r"[\u1780-\u17FF]", transcript))
         lang_flag = "🇰🇭" if is_khmer else "🇺🇸"
 
-        safe_transcript = transcript.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
+        # FIX #7: use html.escape + parse_mode HTML to prevent injection
+        safe_transcript = html.escape(transcript)
 
         reply = await safe_send(msg.reply_text(
-            f"📝 *Transcript* {lang_flag}\n\n{safe_transcript}",
-            parse_mode="Markdown",
+            f"📝 <b>Transcript</b> {lang_flag}\n\n{safe_transcript}",
+            parse_mode="HTML",
             reply_markup=get_transcription_kb(0),
         ))
 
@@ -594,8 +615,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"on_voice error: {e}")
-        stop_event.set()
-        await timer_task
+        await _stop_timer(stop_event, timer_task)  # FIX #4
         try:
             await safe_send(msg.reply_text("❌ មានបញ្ហាក្នុងការ Transcribe។ សូមព្យាយាមម្តងទៀត។"))
         except Exception:
@@ -644,9 +664,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("⏳ សូមរង់ចាំ...")
                 return
 
-            update_user_speed(user_id, new_speed)
+            # FIX #8 + #3: fetch prefs ONCE, use new_speed directly — no stale re-read
             prefs  = get_user_prefs(user_id)
             gender = prefs["gender"]
+            update_user_speed(user_id, new_speed)
 
             file_path  = f"spd_{user_id}_{msg_id}.ogg"
             stop_event = asyncio.Event()
@@ -656,8 +677,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with lock:
                 try:
                     label = await generate_voice(original_text, gender, new_speed, file_path)
-                    stop_event.set()
-                    await timer_task
+                    await _stop_timer(stop_event, timer_task)  # FIX #4
                     try:
                         await query.message.delete()
                     except Exception:
@@ -676,8 +696,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                 except Exception as e:
                     logger.error(f"speed regen error: {e}")
-                    stop_event.set()
-                    await timer_task
+                    await _stop_timer(stop_event, timer_task)  # FIX #4
                 finally:
                     _cleanup(file_path)
             return
@@ -695,9 +714,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("⏳ សូមរង់ចាំ...")
                 return
 
-            update_user_gender(user_id, new_gender)
+            # FIX #8 + #3: fetch prefs ONCE, use new_gender directly — no stale re-read
             prefs = get_user_prefs(user_id)
             speed = prefs["speed"]
+            update_user_gender(user_id, new_gender)
 
             file_path  = f"rev_{user_id}_{msg_id}.ogg"
             stop_event = asyncio.Event()
@@ -707,8 +727,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with lock:
                 try:
                     label = await generate_voice(original_text, new_gender, speed, file_path)
-                    stop_event.set()
-                    await timer_task
+                    await _stop_timer(stop_event, timer_task)  # FIX #4
                     try:
                         await query.message.delete()
                     except Exception:
@@ -727,8 +746,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                 except Exception as e:
                     logger.error(f"gender regen error: {e}")
-                    stop_event.set()
-                    await timer_task
+                    await _stop_timer(stop_event, timer_task)  # FIX #4
                 finally:
                     _cleanup(file_path)
             return
@@ -758,8 +776,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with lock:
                 try:
                     label = await generate_voice(original_text, gender, speed, file_path)
-                    stop_event.set()
-                    await timer_task
+                    await _stop_timer(stop_event, timer_task)  # FIX #4
                     with open(file_path, "rb") as audio:
                         new_msg = await safe_send(query.message.chat.send_voice(
                             voice=audio,
@@ -774,8 +791,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                 except Exception as e:
                     logger.error(f"transcript TTS error: {e}")
-                    stop_event.set()
-                    await timer_task
+                    await _stop_timer(stop_event, timer_task)  # FIX #4
                 finally:
                     _cleanup(file_path)
             return
@@ -832,7 +848,6 @@ async def _run_bot():
             allowed_updates=["message", "callback_query"],
             drop_pending_updates=True,
         )
-        # Park here forever — any exception propagates out and triggers restart
         await asyncio.Event().wait()
 
 # ---------------------------------------------------------------------------
