@@ -5,3 +5,5 @@ supabase
 python-dotenv
 imageio-ffmpeg
 flask
+pypdf
+python-docx
