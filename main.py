@@ -91,7 +91,7 @@ for _aid in _raw_admin_ids.split(","):
     if _aid.isdigit():
         ADMIN_IDS.add(int(_aid))
 
-GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
+GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 MAX_VOICE_BYTES = 20 * 1024 * 1024
 TTS_CHUNK_CHARS = 900
 DEFAULT_SPEED   = 1.0
