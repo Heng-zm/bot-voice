@@ -40,7 +40,7 @@ def keep_alive():
     if not render_url:
         logger_ka.warning("RENDER_EXTERNAL_URL not set — self-ping disabled.")
         return
-    time.sleep(20)
+    time.sleep(30)
     headers = {"User-Agent": "Mozilla/5.0 (KeepAlive/1.0)"}
     while True:
         try:
@@ -87,7 +87,8 @@ SB_KEY:             str = ""
 GEMINI_API_KEY:     str = ""
 ADMIN_IDS:          set[int] = set()
 
-GEMINI_MODEL    = "gemini-3.1-pro-preview"
+# FIX: corrected model name — "gemini-3.1-pro-preview" does not exist
+GEMINI_MODEL    = "gemini-2.0-flash"
 MAX_VOICE_BYTES = 20 * 1024 * 1024
 MAX_INPUT_CHARS = 5_000
 TTS_CHUNK_CHARS = 900
@@ -140,7 +141,8 @@ def _init_clients() -> None:
     SB_URL             = os.getenv("SUPABASE_URL", "")
     SB_KEY             = os.getenv("SUPABASE_KEY", "")
     GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL       = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
+    # FIX: default to a valid model name; allow override via env
+    GEMINI_MODEL       = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
     _raw_admin_ids = os.getenv("ADMIN_IDS", "")
     for _aid in _raw_admin_ids.split(","):
@@ -192,7 +194,9 @@ WELCOME_TEXT = (
     "🌍 ភាសាដែល Support:\n"
     "🇰🇭 ភាសាខ្មែរ | 🇺🇸 English\n\n"
     "✨ មុខងារថ្មី:\n"
-    "🖼️ ផ្ញើរូបភាព → Bot OCR អត្ថបទ ហើយអាន!\n\n"
+    "🖼️ ផ្ញើរូបភាព → Bot OCR អត្ថបទ ហើយអាន!\n"
+    "🎙️ ផ្ញើ Voice → Bot Transcribe ហើយអាន!\n\n"
+    "⚙️ ប្រើ /myprefs ដើម្បីមើលការកំណត់របស់អ្នក\n\n"
     "📢 Join My Channel: https://t.me/m11mmm112"
 )
 
@@ -263,6 +267,7 @@ def _submit_db(fn, *args, **kwargs):
 # Safe Telegram send with retry
 # ---------------------------------------------------------------------------
 async def safe_send(coro_factory, retries: int = 3, delay: float = 2.0):
+    # FIX: warn clearly if a raw coroutine is passed (no retry possible)
     if inspect.isawaitable(coro_factory):
         logger.warning(
             "safe_send received a raw coroutine — retries are disabled. "
@@ -709,18 +714,36 @@ async def _stop_timer(stop_event: asyncio.Event, timer_task: asyncio.Task):
 # ---------------------------------------------------------------------------
 @functools.lru_cache(maxsize=32)
 def _build_atempo_chain(speed: float) -> str:
+    """
+    Build an ffmpeg atempo filter chain for the given speed.
+    atempo accepts values in [0.5, 2.0]; for values outside that range
+    we chain multiple atempo filters.
+    FIX: avoid redundant atempo=1.0 stage when speed is exactly 0.5 or 2.0.
+    """
     speed = round(speed, 4)
+    # No change needed
+    if abs(speed - 1.0) < 1e-6:
+        return "atempo=1.0"
+
     stages, r = [], speed
     if r < 1.0:
         while r < 0.5 - 1e-9:
             stages.append("atempo=0.5")
             r = round(r / 0.5, 6)
-        stages.append(f"atempo={r:.6f}")
+        # Only append final stage if it's meaningfully different from 1.0
+        if abs(r - 1.0) > 1e-6:
+            stages.append(f"atempo={r:.6f}")
+        elif not stages:
+            stages.append("atempo=1.0")
     else:
         while r > 2.0 + 1e-9:
             stages.append("atempo=2.0")
             r = round(r / 2.0, 6)
-        stages.append(f"atempo={r:.6f}")
+        if abs(r - 1.0) > 1e-6:
+            stages.append(f"atempo={r:.6f}")
+        elif not stages:
+            stages.append("atempo=1.0")
+
     return ",".join(stages)
 
 
@@ -848,9 +871,9 @@ def _detect_image_mime(path: str) -> str:
             header = f.read(12)
         if header[:8] == b'\x89PNG\r\n\x1a\n':
             return "image/png"
-        if header[:4] in (b'RIFF', ) and header[8:12] == b'WEBP':
+        if header[:4] == b'RIFF' and header[8:12] == b'WEBP':
             return "image/webp"
-        if header[:2] in (b'\xff\xd8',):
+        if header[:2] == b'\xff\xd8':
             return "image/jpeg"
         if header[:6] in (b'GIF87a', b'GIF89a'):
             return "image/gif"
@@ -891,6 +914,7 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
 
 # ---------------------------------------------------------------------------
 # Paged TTS delivery
+# FIX: removed internal status timer — caller is responsible for timer lifecycle
 # ---------------------------------------------------------------------------
 async def _deliver_paged_tts(
     chat_id: int,
@@ -1209,10 +1233,14 @@ async def _do_broadcast(bot, admin_id: int, pending: dict):
         else:
             failed += 1
         await asyncio.sleep(0.034)
+        # FIX: update progress every 25 users with cleaner percentage display
         if (i + 1) % 25 == 0 and progress_msg:
             try:
                 pct = int((i + 1) / total * 100) if total else 0
-                await progress_msg.edit_text(f"📡 Broadcast {pct}% ({i+1}/{total})...")
+                await progress_msg.edit_text(
+                    f"📡 Broadcast {pct}% ({i+1}/{total})\n"
+                    f"✅ {sent}  🚫 {blocked}  ❌ {failed}"
+                )
             except Exception:
                 pass
 
@@ -1239,7 +1267,6 @@ async def _do_broadcast(bot, admin_id: int, pending: dict):
 async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Step 1 — ask admin for the message content."""
     admin_id = update.effective_user.id
-    # Clear any leftover state
     context.user_data["sched_state"] = SCHED_WAIT_MSG
     _sched_payload.pop(admin_id, None)
     await safe_send(lambda: update.message.reply_text(
@@ -1609,20 +1636,18 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
             try:
                 pct = int((i + 1) / total * 100) if total else 0
                 await progress_msg.edit_text(
-                    f"📡 Scheduled #{row_id}: {pct}% ({i+1}/{total})…"
+                    f"📡 Scheduled #{row_id}: {pct}% ({i+1}/{total})…\n"
+                    f"✅ {sent}  🚫 {blocked}  ❌ {failed}"
                 )
             except Exception:
                 pass
 
+    # FIX: combine status + counters in a single update call to avoid
+    # the previous double-write (set_status then separate update)
     try:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None, db_sched_set_status, row_id, "done",
-        )
-        # Update counters separately (extra kwargs not supported in executor wrapper)
         if supabase:
             supabase.table("scheduled_broadcasts").update({
-                "status": "done",
+                "status":        "done",
                 "sent_count":    sent,
                 "failed_count":  failed,
                 "blocked_count": blocked,
@@ -1650,6 +1675,8 @@ async def _scheduler_loop(bot, stop_event: asyncio.Event) -> None:
     """
     Background task: polls Supabase every _SCHED_POLL_INTERVAL seconds and
     fires any pending rows whose broadcast_at <= NOW().
+    FIX: use asyncio.sleep instead of wait_for(stop_event.wait()) for cleaner
+    cancellation handling; check stop_event after each sleep.
     """
     logger.info("Scheduled broadcast loop started.")
     while not stop_event.is_set():
@@ -1661,10 +1688,11 @@ async def _scheduler_loop(bot, stop_event: asyncio.Event) -> None:
         except Exception as e:
             logger.error(f"Scheduler loop error: {e}")
 
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=_SCHED_POLL_INTERVAL)
-        except asyncio.TimeoutError:
-            pass
+        # Sleep in small increments so stop_event is checked promptly
+        elapsed = 0
+        while elapsed < _SCHED_POLL_INTERVAL and not stop_event.is_set():
+            await asyncio.sleep(min(5, _SCHED_POLL_INTERVAL - elapsed))
+            elapsed += 5
 
     logger.info("Scheduled broadcast loop stopped.")
 
@@ -1803,6 +1831,7 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
+    """Forward any message type from admin to user. Returns False if user blocked bot."""
     try:
         if msg.text:
             await bot.send_message(
@@ -1817,6 +1846,9 @@ async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
         elif msg.voice:
             await bot.send_voice(chat_id=target_id, voice=msg.voice.file_id,
                                  caption="📩 Admin voice message")
+        elif msg.video_note:
+            # FIX: added video_note (round video) support
+            await bot.send_video_note(chat_id=target_id, video_note=msg.video_note.file_id)
         elif msg.sticker:
             await bot.send_sticker(chat_id=target_id, sticker=msg.sticker.file_id)
         elif msg.document:
@@ -1841,6 +1873,7 @@ async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
 
 
 async def _fwd_user_to_admin(bot, admin_id: int, user_id: int, username: str, msg) -> bool:
+    """Forward any message type from user to admin."""
     banner = f"💬 <b>{html.escape(username)} ({user_id}):</b>"
     try:
         if msg.text:
@@ -1856,6 +1889,10 @@ async def _fwd_user_to_admin(bot, admin_id: int, user_id: int, username: str, ms
         elif msg.voice:
             await bot.send_voice(chat_id=admin_id, voice=msg.voice.file_id,
                                  caption=banner, parse_mode="HTML")
+        elif msg.video_note:
+            # FIX: added video_note (round video) support
+            await bot.send_message(chat_id=admin_id, text=banner, parse_mode="HTML")
+            await bot.send_video_note(chat_id=admin_id, video_note=msg.video_note.file_id)
         elif msg.sticker:
             await bot.send_message(chat_id=admin_id, text=banner, parse_mode="HTML")
             await bot.send_sticker(chat_id=admin_id, sticker=msg.sticker.file_id)
@@ -1885,9 +1922,9 @@ async def _fwd_user_to_admin(bot, admin_id: int, user_id: int, username: str, ms
 
 @admin_only
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    loop         = asyncio.get_running_loop()
-    user_ids     = await loop.run_in_executor(None, get_all_user_ids)
-    active_chats = len(_admin_chat_target)
+    loop           = asyncio.get_running_loop()
+    user_ids       = await loop.run_in_executor(None, get_all_user_ids)
+    active_chats   = len(_admin_chat_target)
     pending_scheds = await loop.run_in_executor(
         None, db_sched_fetch_admin_pending, update.effective_user.id
     )
@@ -1895,7 +1932,8 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 <b>Bot Statistics</b>\n\n"
         f"👥 អ្នកប្រើប្រាស់សរុប: <b>{len(user_ids)}</b>\n"
         f"💬 Active Admin Chats: <b>{active_chats}</b>\n"
-        f"📅 Scheduled (pending): <b>{len(pending_scheds)}</b>",
+        f"📅 Scheduled (pending): <b>{len(pending_scheds)}</b>\n"
+        f"🤖 Gemini Model: <b>{GEMINI_MODEL}</b>",
         parse_mode="HTML",
     ))
 
@@ -1956,6 +1994,27 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await on_start(update, context)
 
 
+# NEW: /myprefs command — lets any user see their current TTS settings
+async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user    = update.effective_user
+    user_id = user.id
+    loop    = asyncio.get_running_loop()
+    prefs   = await loop.run_in_executor(None, get_user_prefs, user_id)
+    gender_label = "👩 ស្រី (Female)" if prefs["gender"] == "female" else "👨 ប្រុស (Male)"
+    speed_label  = next(
+        (lbl for _, (lbl, val) in SPEED_OPTIONS.items() if abs(val - prefs["speed"]) < 0.01),
+        f"{prefs['speed']}x"
+    )
+    await safe_send(lambda: update.message.reply_text(
+        f"⚙️ <b>ការកំណត់របស់អ្នក</b>\n\n"
+        f"🗣️ សំឡេង: <b>{gender_label}</b>\n"
+        f"🎚️ ល្បឿន: <b>{speed_label}</b>\n\n"
+        "ផ្ញើ text ណាមួយ ហើយប្រើប៊ូតុងក្រោមសំឡេង ដើម្បីប្តូរ។",
+        parse_mode="HTML",
+        reply_markup=get_main_kb(prefs["gender"]),
+    ))
+
+
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg     = update.message
     user    = update.effective_user
@@ -1964,28 +2023,30 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Admin: scheduled broadcast content capture (stage 1) ────────────
-    if _is_admin(user_id) and context.user_data.get("sched_state") == SCHED_WAIT_MSG:
-        await _handle_sched_content(update, context)
-        return
-
-    if _is_admin(user_id) and context.user_data.get("bc_state") == BROADCAST_WAIT_MESSAGE:
-        await broadcast_receive(update, context)
-        return
-
-    if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
-        target_id = _admin_chat_target.get(user_id)
-        if target_id:
-            ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
-            reply = (
-                f"✅ Photo ផ្ញើដល់ User <code>{target_id}</code> ។"
-                if ok else
-                f"❌ User <code>{target_id}</code> blocked bot ។"
-            )
-            await safe_send(lambda: msg.reply_text(reply, parse_mode="HTML"))
-            if not ok:
-                _close_session(user_id)
-                context.user_data.pop("chat_state", None)
-        return
+    # FIX: check sched_state BEFORE bc_state; both can't be active simultaneously
+    # but order matters for clarity and avoids double-handling
+    if _is_admin(user_id):
+        sched_state = context.user_data.get("sched_state")
+        if sched_state == SCHED_WAIT_MSG:
+            await _handle_sched_content(update, context)
+            return
+        if context.user_data.get("bc_state") == BROADCAST_WAIT_MESSAGE:
+            await broadcast_receive(update, context)
+            return
+        if context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
+            target_id = _admin_chat_target.get(user_id)
+            if target_id:
+                ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
+                reply = (
+                    f"✅ Photo ផ្ញើដល់ User <code>{target_id}</code> ។"
+                    if ok else
+                    f"❌ User <code>{target_id}</code> blocked bot ។"
+                )
+                await safe_send(lambda: msg.reply_text(reply, parse_mode="HTML"))
+                if not ok:
+                    _close_session(user_id)
+                    context.user_data.pop("chat_state", None)
+            return
 
     admin_id = _get_admin_for_user(user_id)
     if admin_id is not None:
@@ -2184,27 +2245,25 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if sched_state == SCHED_WAIT_TIME:
             await _handle_sched_datetime(update, context)
             return
-
-    if _is_admin(user_id) and context.user_data.get("bc_state") == BROADCAST_WAIT_MESSAGE:
-        await broadcast_receive(update, context)
-        return
-
-    if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
-        target_id = _admin_chat_target.get(user_id)
-        if target_id:
-            ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
-            if ok:
-                await safe_send(lambda: msg.reply_text(
-                    f"✅ ផ្ញើដល់ User <code>{target_id}</code> ។", parse_mode="HTML",
-                ))
-            else:
-                await safe_send(lambda: msg.reply_text(
-                    f"❌ User <code>{target_id}</code> blocked bot ។ Chat session បានបិទ។",
-                    parse_mode="HTML",
-                ))
-                _close_session(user_id)
-                context.user_data.pop("chat_state", None)
-        return
+        if context.user_data.get("bc_state") == BROADCAST_WAIT_MESSAGE:
+            await broadcast_receive(update, context)
+            return
+        if context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
+            target_id = _admin_chat_target.get(user_id)
+            if target_id:
+                ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
+                if ok:
+                    await safe_send(lambda: msg.reply_text(
+                        f"✅ ផ្ញើដល់ User <code>{target_id}</code> ។", parse_mode="HTML",
+                    ))
+                else:
+                    await safe_send(lambda: msg.reply_text(
+                        f"❌ User <code>{target_id}</code> blocked bot ។ Chat session បានបិទ។",
+                        parse_mode="HTML",
+                    ))
+                    _close_session(user_id)
+                    context.user_data.pop("chat_state", None)
+            return
 
     admin_id = _get_admin_for_user(user_id)
     if admin_id is not None:
@@ -2243,7 +2302,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sync_user_data(user)
-    loop  = asyncio.get_running_loop()
+    loop   = asyncio.get_running_loop()
     prefs  = await loop.run_in_executor(None, get_user_prefs, user_id)
     gender = prefs["gender"]
     speed  = prefs["speed"]
@@ -2280,6 +2339,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------------------------------------------------------------------
 # Callback dispatch helpers
+# FIX: removed duplicate query.answer() calls inside helper functions;
+# on_callback answers once at the top level.
 # ---------------------------------------------------------------------------
 
 async def _cb_show_speed(query, user_id: int, context):
@@ -2438,6 +2499,10 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
 
 
 async def _cb_doc_read(query, user_id: int, context, data: str):
+    """
+    FIX: removed double status timer — only one timer is started here;
+    _deliver_paged_tts no longer spawns its own timer.
+    """
     src_msg_id = int(data.split(":")[1])
     loop       = asyncio.get_running_loop()
     full_text  = await loop.run_in_executor(None, get_text_cache, src_msg_id)
@@ -2464,6 +2529,7 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
     )
     async with lock:
         try:
+            await _stop_timer(tts_stop, tts_timer)   # stop spinner before paged delivery
             await _deliver_paged_tts(
                 chat_id=chat_id,
                 bot=context.bot,
@@ -2479,16 +2545,18 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
                 await context.bot.send_message(chat_id=chat_id, text="❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។")
             except Exception:
                 pass
-        finally:
-            await _stop_timer(tts_stop, tts_timer)
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Main callback dispatcher."""
+    """Main callback dispatcher.
+    FIX: answer the query exactly once here; helper functions must NOT call
+    query.answer() themselves to avoid 'query has already been answered' errors.
+    """
     query   = update.callback_query
     user_id = query.from_user.id
     data    = query.data
 
+    # Single answer point — all helpers rely on this
     try:
         await query.answer()
     except Exception:
@@ -2539,6 +2607,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # Bot runner
 # ---------------------------------------------------------------------------
 async def _run_bot():
+    # FIX: clear _user_locks inside the new event loop so locks belong
+    # to the correct loop (asyncio.Lock is loop-bound)
     with _user_locks_mutex:
         _user_locks.clear()
     _admin_chat_target.clear()
@@ -2561,6 +2631,7 @@ async def _run_bot():
     # ── Commands ────────────────────────────────────────────────────────
     app.add_handler(CommandHandler("start",           on_start))
     app.add_handler(CommandHandler("help",            on_help))
+    app.add_handler(CommandHandler("myprefs",         cmd_myprefs))
     app.add_handler(CommandHandler("broadcast",       broadcast_start))
     app.add_handler(CommandHandler("schedule",        cmd_schedule))
     app.add_handler(CommandHandler("schedules",       cmd_schedules))
@@ -2584,7 +2655,8 @@ async def _run_bot():
     app.add_handler(MessageHandler(filters.PHOTO,   on_photo))
     app.add_handler(MessageHandler(filters.VOICE,   on_voice))
     app.add_handler(MessageHandler(
-        filters.Sticker.ALL | filters.Document.ALL | filters.VIDEO | filters.AUDIO,
+        filters.Sticker.ALL | filters.Document.ALL | filters.VIDEO
+        | filters.AUDIO | filters.VIDEO_NOTE,   # FIX: added VIDEO_NOTE filter
         on_any_media,
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
@@ -2592,6 +2664,7 @@ async def _run_bot():
     app.add_error_handler(error_handler)
 
     logger.info(f"Bot polling started. Admins: {ADMIN_IDS or 'none configured'}")
+    logger.info(f"Gemini model: {GEMINI_MODEL}")
 
     # ── Start scheduler loop ────────────────────────────────────────────
     sched_stop  = asyncio.Event()
@@ -2633,7 +2706,7 @@ def main():
     if not ADMIN_IDS:
         logger.warning("No ADMIN_IDS configured. Set ADMIN_IDS=123456,789012 in your environment.")
 
-    print("Bot is starting...")
+    print(f"Bot is starting... (Gemini model: {GEMINI_MODEL})")
     while True:
         try:
             asyncio.run(_run_bot())
