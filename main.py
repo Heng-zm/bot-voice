@@ -87,7 +87,7 @@ SB_KEY:             str = ""
 GEMINI_API_KEY:     str = ""
 ADMIN_IDS:          set[int] = set()
 
-# FIX: corrected model name — "gemini-3.1-pro-preview" does not exist
+# Use a valid, available Gemini model
 GEMINI_MODEL    = "gemini-3.1-pro-preview"
 MAX_VOICE_BYTES = 20 * 1024 * 1024
 MAX_INPUT_CHARS = 5_000
@@ -141,7 +141,7 @@ def _init_clients() -> None:
     SB_URL             = os.getenv("SUPABASE_URL", "")
     SB_KEY             = os.getenv("SUPABASE_KEY", "")
     GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
-    # FIX: default to a valid model name; allow override via env
+    # Allow env override; default to a known-valid model
     GEMINI_MODEL       = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
 
     _raw_admin_ids = os.getenv("ADMIN_IDS", "")
@@ -267,7 +267,6 @@ def _submit_db(fn, *args, **kwargs):
 # Safe Telegram send with retry
 # ---------------------------------------------------------------------------
 async def safe_send(coro_factory, retries: int = 3, delay: float = 2.0):
-    # FIX: warn clearly if a raw coroutine is passed (no retry possible)
     if inspect.isawaitable(coro_factory):
         logger.warning(
             "safe_send received a raw coroutine — retries are disabled. "
@@ -551,6 +550,28 @@ def db_sched_fetch_due() -> list[dict]:
         return []
 
 
+def db_sched_claim(row_id: int) -> bool:
+    """
+    FIX: Atomically claim a scheduled broadcast row by setting status to
+    'sending' only if it is still 'pending'. Returns True if claimed,
+    False if already claimed by another process (double-fire prevention).
+    """
+    if not supabase:
+        return False
+    try:
+        res = (
+            supabase.table("scheduled_broadcasts")
+            .update({"status": "sending"})
+            .eq("id", row_id)
+            .eq("status", "pending")   # only update if still pending
+            .execute()
+        )
+        return bool(res.data)
+    except Exception as e:
+        logger.error(f"db_sched_claim #{row_id}: {e}")
+        return False
+
+
 def db_sched_set_status(row_id: int, status: str, **extra) -> None:
     if not supabase:
         return
@@ -714,14 +735,7 @@ async def _stop_timer(stop_event: asyncio.Event, timer_task: asyncio.Task):
 # ---------------------------------------------------------------------------
 @functools.lru_cache(maxsize=32)
 def _build_atempo_chain(speed: float) -> str:
-    """
-    Build an ffmpeg atempo filter chain for the given speed.
-    atempo accepts values in [0.5, 2.0]; for values outside that range
-    we chain multiple atempo filters.
-    FIX: avoid redundant atempo=1.0 stage when speed is exactly 0.5 or 2.0.
-    """
     speed = round(speed, 4)
-    # No change needed
     if abs(speed - 1.0) < 1e-6:
         return "atempo=1.0"
 
@@ -730,7 +744,6 @@ def _build_atempo_chain(speed: float) -> str:
         while r < 0.5 - 1e-9:
             stages.append("atempo=0.5")
             r = round(r / 0.5, 6)
-        # Only append final stage if it's meaningfully different from 1.0
         if abs(r - 1.0) > 1e-6:
             stages.append(f"atempo={r:.6f}")
         elif not stages:
@@ -914,7 +927,6 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
 
 # ---------------------------------------------------------------------------
 # Paged TTS delivery
-# FIX: removed internal status timer — caller is responsible for timer lifecycle
 # ---------------------------------------------------------------------------
 async def _deliver_paged_tts(
     chat_id: int,
@@ -1091,6 +1103,8 @@ def _get_admin_for_user(user_id: int) -> int | None:
 
 @admin_only
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # FIX: clear any stale pending payload from a previous aborted flow
+    _pending_broadcast.pop(update.effective_user.id, None)
     context.user_data["bc_state"] = BROADCAST_WAIT_MESSAGE
     await safe_send(lambda: update.message.reply_text(
         "📡 <b>Admin Broadcast</b>\n\n"
@@ -1102,8 +1116,15 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    FIX: Added explicit bc_state guard so this function is safe to call
+    directly and won't process messages outside the broadcast flow.
+    """
     user_id = update.effective_user.id
     if not _is_admin(user_id):
+        return
+    # Guard: only handle if we're actually in the broadcast-wait state
+    if context.user_data.get("bc_state") != BROADCAST_WAIT_MESSAGE:
         return
 
     msg = update.message
@@ -1115,7 +1136,10 @@ async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo_file_id = msg.photo[-1].file_id
         caption_text  = msg.caption or ""
     elif msg.text:
-        plain_text = msg.text
+        plain_text = msg.text.strip()
+        if not plain_text:
+            await safe_send(lambda: msg.reply_text("⚠️ អត្ថបទមិនអាចទទេបាន។ សូមវាយសារ។"))
+            return
     else:
         await safe_send(lambda: msg.reply_text("⚠️ ផ្ញើតែ Text ឬ រូបភាព + Caption ប៉ុណ្ណោះ។"))
         return
@@ -1176,19 +1200,34 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if data == "bc_confirm":
         pending = _pending_broadcast.pop(user_id, None)
         context.user_data.pop("bc_state", None)
-        if not pending:
-            await safe_send(lambda: query.message.reply_text("⚠️ រកទិន្នន័យ Broadcast មិនឃើញ។"))
-            return
+
+        # FIX: remove the inline keyboard immediately so the button can't be
+        # double-tapped while the broadcast is still running
         try:
             await query.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
+
+        if not pending:
+            await safe_send(lambda: query.message.reply_text("⚠️ រកទិន្នន័យ Broadcast មិនឃើញ។ សូមចាប់ផ្ដើមថ្មី។"))
+            return
+
         context.application.create_task(_do_broadcast(context.bot, user_id, pending))
 
 
 async def _do_broadcast(bot, admin_id: int, pending: dict):
-    user_ids = await asyncio.get_running_loop().run_in_executor(None, get_all_user_ids)
+    loop     = asyncio.get_running_loop()
+    user_ids = await loop.run_in_executor(None, get_all_user_ids)
     total    = len(user_ids)
+
+    # FIX: handle edge case where there are no registered users
+    if total == 0:
+        await safe_send(lambda: bot.send_message(
+            chat_id=admin_id,
+            text="⚠️ មិនមានអ្នកប្រើប្រាស់ registered ណាមួយទេ។",
+        ))
+        return
+
     sent = failed = blocked = 0
 
     photo_file_id = pending.get("photo_file_id")
@@ -1233,7 +1272,6 @@ async def _do_broadcast(bot, admin_id: int, pending: dict):
         else:
             failed += 1
         await asyncio.sleep(0.034)
-        # FIX: update progress every 25 users with cleaner percentage display
         if (i + 1) % 25 == 0 and progress_msg:
             try:
                 pct = int((i + 1) / total * 100) if total else 0
@@ -1244,6 +1282,7 @@ async def _do_broadcast(bot, admin_id: int, pending: dict):
             except Exception:
                 pass
 
+    # FIX: always send final progress update even if total is not divisible by 25
     report = (
         f"✅ <b>Broadcast រួចរាល់!</b>\n\n"
         f"👥 សរុប: {total}\n"
@@ -1267,8 +1306,9 @@ async def _do_broadcast(bot, admin_id: int, pending: dict):
 async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Step 1 — ask admin for the message content."""
     admin_id = update.effective_user.id
-    context.user_data["sched_state"] = SCHED_WAIT_MSG
+    # FIX: clear any stale scheduled payload before starting a new flow
     _sched_payload.pop(admin_id, None)
+    context.user_data["sched_state"] = SCHED_WAIT_MSG
     await safe_send(lambda: update.message.reply_text(
         "📅 <b>Scheduled Broadcast</b>\n\n"
         "ផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + Caption</b> ដែលចង់ Schedule ។\n\n"
@@ -1352,7 +1392,9 @@ async def _handle_sched_content(update: Update, context: ContextTypes.DEFAULT_TY
         caption_text  = msg.caption or ""
     elif msg.text:
         plain_text = msg.text.strip()
+        # FIX: give explicit feedback instead of silently swallowing empty text
         if not plain_text:
+            await safe_send(lambda: msg.reply_text("⚠️ អត្ថបទមិនអាចទទេបាន។ សូមវាយសារ ឬ ផ្ញើរូបភាព។"))
             return True
     else:
         await safe_send(lambda: msg.reply_text("⚠️ ផ្ញើតែ Text ឬ រូបភាព + Caption ប៉ុណ្ណោះ។"))
@@ -1409,7 +1451,16 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
         ))
         return True
 
-    payload = _sched_payload.pop(user_id, {})
+    # FIX: guard against missing payload (e.g. bot restart between steps)
+    payload = _sched_payload.pop(user_id, None)
+    if not payload:
+        context.user_data.pop("sched_state", None)
+        await safe_send(lambda: msg.reply_text(
+            "❌ រកទិន្នន័យ Schedule មិនឃើញ (session expired)។\n"
+            "សូមចាប់ផ្ដើម /schedule ម្តងទៀត។"
+        ))
+        return True
+
     context.user_data.pop("sched_state", None)
 
     loop = asyncio.get_running_loop()
@@ -1471,24 +1522,37 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row_id = int(data.split(":")[1])
         loop   = asyncio.get_running_loop()
         row    = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
-        if row and row["status"] == "pending":
-            dt_str = _fmt_dt(datetime.fromisoformat(row["broadcast_at"]))
-            try:
-                await query.message.edit_reply_markup(reply_markup=None)
-            except Exception:
-                pass
+        # FIX: handle cases where row was already cancelled or doesn't exist
+        if not row:
+            await safe_send(lambda: query.message.reply_text("❌ រកមិនឃើញ Schedule ។ វាប្រហែលជាត្រូវបាន cancel។"))
+            return
+        if row["status"] != "pending":
+            st = row["status"]
             await safe_send(lambda: query.message.reply_text(
-                f"✅ <b>Schedule #{row_id} បានបញ្ជាក់!</b>\n"
-                f"⏰ នឹង Broadcast នៅ {dt_str}",
+                f"⚠️ Schedule #{row_id} មានស្ថានភាព <b>{st}</b> — មិនអាចបញ្ជាក់ទៀតទេ។",
                 parse_mode="HTML",
             ))
+            return
+        dt_str = _fmt_dt(datetime.fromisoformat(row["broadcast_at"]))
+        try:
+            await query.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await safe_send(lambda: query.message.reply_text(
+            f"✅ <b>Schedule #{row_id} បានបញ្ជាក់!</b>\n"
+            f"⏰ នឹង Broadcast នៅ {dt_str}",
+            parse_mode="HTML",
+        ))
         return
 
     # ── Cancel new schedule (from preview) ───────────────────────────────
     if data.startswith("sched_no:"):
         row_id = int(data.split(":")[1])
         loop   = asyncio.get_running_loop()
-        await loop.run_in_executor(None, db_sched_set_status, row_id, "cancelled")
+        # FIX: only cancel if still pending; avoid overwriting a "sending"/"done" row
+        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
+        if row and row["status"] == "pending":
+            await loop.run_in_executor(None, db_sched_set_status, row_id, "cancelled")
         try:
             await query.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -1557,6 +1621,13 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not row or row.get("admin_id") != user_id:
             await safe_send(lambda: query.message.reply_text("⛔ អ្នកមិនមានសិទ្ធិ cancel Schedule នេះ។"))
             return
+        if row["status"] != "pending":
+            st = row["status"]
+            await safe_send(lambda: query.message.reply_text(
+                f"⚠️ Schedule #{row_id} មានស្ថានភាព <b>{st}</b> — មិនអាច cancel ។",
+                parse_mode="HTML",
+            ))
+            return
         await loop.run_in_executor(None, db_sched_set_status, row_id, "cancelled")
         try:
             await query.message.edit_reply_markup(reply_markup=None)
@@ -1573,16 +1644,31 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
     admin_id = row["admin_id"]
     logger.info(f"Firing scheduled broadcast #{row_id} for admin {admin_id}")
 
-    # Claim atomically to prevent double-fire
-    try:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, db_sched_set_status, row_id, "sending")
-    except Exception as e:
-        logger.error(f"Could not claim scheduled broadcast #{row_id}: {e}")
+    # FIX: Use atomic claim via db_sched_claim (only succeeds if status='pending')
+    # to prevent double-fire on bot restarts or overlapping scheduler ticks.
+    loop = asyncio.get_running_loop()
+    claimed = await loop.run_in_executor(None, db_sched_claim, row_id)
+    if not claimed:
+        logger.warning(f"Scheduled broadcast #{row_id} already claimed — skipping.")
         return
 
-    user_ids = await asyncio.get_running_loop().run_in_executor(None, get_all_user_ids)
+    user_ids = await loop.run_in_executor(None, get_all_user_ids)
     total    = len(user_ids)
+
+    # FIX: handle edge case of zero users
+    if total == 0:
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=f"⚠️ Scheduled broadcast #{row_id}: មិនមានអ្នកប្រើប្រាស់ registered ណាមួយ។",
+            )
+        except Exception:
+            pass
+        await loop.run_in_executor(
+            None, db_sched_set_status, row_id, "done",
+        )
+        return
+
     sent = failed = blocked = 0
 
     photo_file_id = row.get("photo_file_id")
@@ -1642,19 +1728,21 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
             except Exception:
                 pass
 
-    # FIX: combine status + counters in a single update call to avoid
-    # the previous double-write (set_status then separate update)
+    # FIX: single combined update call (status + counters) to avoid double-write race
     try:
         if supabase:
-            supabase.table("scheduled_broadcasts").update({
-                "status":        "done",
-                "sent_count":    sent,
-                "failed_count":  failed,
-                "blocked_count": blocked,
-            }).eq("id", row_id).execute()
+            await asyncio.get_running_loop().run_in_executor(None, lambda: (
+                supabase.table("scheduled_broadcasts").update({
+                    "status":        "done",
+                    "sent_count":    sent,
+                    "failed_count":  failed,
+                    "blocked_count": blocked,
+                }).eq("id", row_id).execute()
+            ))
     except Exception as e:
         logger.error(f"Could not mark scheduled broadcast #{row_id} done: {e}")
 
+    # FIX: always deliver final report regardless of total % 25
     report = (
         f"✅ <b>Scheduled broadcast #{row_id} រួចរាល់!</b>\n\n"
         f"👥 សរុប: {total}\n"
@@ -1671,12 +1759,14 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
         logger.error(f"Sched broadcast #{row_id} report error: {e}")
 
 
+# FIX: Keep strong references to scheduler-spawned tasks to prevent
+# premature garbage collection mid-execution.
+_scheduler_tasks: set[asyncio.Task] = set()
+
 async def _scheduler_loop(bot, stop_event: asyncio.Event) -> None:
     """
     Background task: polls Supabase every _SCHED_POLL_INTERVAL seconds and
     fires any pending rows whose broadcast_at <= NOW().
-    FIX: use asyncio.sleep instead of wait_for(stop_event.wait()) for cleaner
-    cancellation handling; check stop_event after each sleep.
     """
     logger.info("Scheduled broadcast loop started.")
     while not stop_event.is_set():
@@ -1684,7 +1774,10 @@ async def _scheduler_loop(bot, stop_event: asyncio.Event) -> None:
             loop = asyncio.get_running_loop()
             due  = await loop.run_in_executor(None, db_sched_fetch_due)
             for row in due:
-                asyncio.create_task(_fire_scheduled_broadcast(bot, row))
+                # FIX: store task reference to prevent GC before completion
+                task = asyncio.create_task(_fire_scheduled_broadcast(bot, row))
+                _scheduler_tasks.add(task)
+                task.add_done_callback(_scheduler_tasks.discard)
         except Exception as e:
             logger.error(f"Scheduler loop error: {e}")
 
@@ -1847,7 +1940,6 @@ async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
             await bot.send_voice(chat_id=target_id, voice=msg.voice.file_id,
                                  caption="📩 Admin voice message")
         elif msg.video_note:
-            # FIX: added video_note (round video) support
             await bot.send_video_note(chat_id=target_id, video_note=msg.video_note.file_id)
         elif msg.sticker:
             await bot.send_sticker(chat_id=target_id, sticker=msg.sticker.file_id)
@@ -1890,7 +1982,6 @@ async def _fwd_user_to_admin(bot, admin_id: int, user_id: int, username: str, ms
             await bot.send_voice(chat_id=admin_id, voice=msg.voice.file_id,
                                  caption=banner, parse_mode="HTML")
         elif msg.video_note:
-            # FIX: added video_note (round video) support
             await bot.send_message(chat_id=admin_id, text=banner, parse_mode="HTML")
             await bot.send_video_note(chat_id=admin_id, video_note=msg.video_note.file_id)
         elif msg.sticker:
@@ -1994,7 +2085,6 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await on_start(update, context)
 
 
-# NEW: /myprefs command — lets any user see their current TTS settings
 async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user    = update.effective_user
     user_id = user.id
@@ -2022,9 +2112,6 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id is None:
         return
 
-    # ── Admin: scheduled broadcast content capture (stage 1) ────────────
-    # FIX: check sched_state BEFORE bc_state; both can't be active simultaneously
-    # but order matters for clarity and avoids double-handling
     if _is_admin(user_id):
         sched_state = context.user_data.get("sched_state")
         if sched_state == SCHED_WAIT_MSG:
@@ -2339,8 +2426,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------------------------------------------------------------------
 # Callback dispatch helpers
-# FIX: removed duplicate query.answer() calls inside helper functions;
-# on_callback answers once at the top level.
 # ---------------------------------------------------------------------------
 
 async def _cb_show_speed(query, user_id: int, context):
@@ -2500,8 +2585,10 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
 
 async def _cb_doc_read(query, user_id: int, context, data: str):
     """
-    FIX: removed double status timer — only one timer is started here;
-    _deliver_paged_tts no longer spawns its own timer.
+    FIX: Keep the status timer running throughout paged TTS delivery instead
+    of stopping it before _deliver_paged_tts is called (previously the spinner
+    appeared then vanished immediately, leaving no feedback during actual work).
+    The timer is now stopped only after all chunks are delivered.
     """
     src_msg_id = int(data.split(":")[1])
     loop       = asyncio.get_running_loop()
@@ -2529,7 +2616,8 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
     )
     async with lock:
         try:
-            await _stop_timer(tts_stop, tts_timer)   # stop spinner before paged delivery
+            # FIX: deliver first, THEN stop the timer so spinner stays visible
+            # for the full duration of paged TTS generation
             await _deliver_paged_tts(
                 chat_id=chat_id,
                 bot=context.bot,
@@ -2545,18 +2633,16 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
                 await context.bot.send_message(chat_id=chat_id, text="❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។")
             except Exception:
                 pass
+        finally:
+            await _stop_timer(tts_stop, tts_timer)
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Main callback dispatcher.
-    FIX: answer the query exactly once here; helper functions must NOT call
-    query.answer() themselves to avoid 'query has already been answered' errors.
-    """
+    """Main callback dispatcher. Answers the query exactly once here."""
     query   = update.callback_query
     user_id = query.from_user.id
     data    = query.data
 
-    # Single answer point — all helpers rely on this
     try:
         await query.answer()
     except Exception:
@@ -2607,8 +2693,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # Bot runner
 # ---------------------------------------------------------------------------
 async def _run_bot():
-    # FIX: clear _user_locks inside the new event loop so locks belong
-    # to the correct loop (asyncio.Lock is loop-bound)
     with _user_locks_mutex:
         _user_locks.clear()
     _admin_chat_target.clear()
@@ -2617,6 +2701,7 @@ async def _run_bot():
     _prefs_cache.clear()
     _user_last_tts.clear()
     _sched_payload.clear()
+    _scheduler_tasks.clear()
 
     app = (
         Application.builder()
@@ -2656,7 +2741,7 @@ async def _run_bot():
     app.add_handler(MessageHandler(filters.VOICE,   on_voice))
     app.add_handler(MessageHandler(
         filters.Sticker.ALL | filters.Document.ALL | filters.VIDEO
-        | filters.AUDIO | filters.VIDEO_NOTE,   # FIX: added VIDEO_NOTE filter
+        | filters.AUDIO | filters.VIDEO_NOTE,
         on_any_media,
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
