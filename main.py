@@ -11,6 +11,7 @@ import tempfile
 import glob
 import requests
 import imageio_ffmpeg as _iio_ffmpeg
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from google import genai
@@ -87,7 +88,6 @@ SB_KEY:             str = ""
 GEMINI_API_KEY:     str = ""
 ADMIN_IDS:          set[int] = set()
 
-# Use a valid, available Gemini model
 GEMINI_MODEL    = "gemini-3.1-pro-preview"
 MAX_VOICE_BYTES = 20 * 1024 * 1024
 MAX_INPUT_CHARS = 5_000
@@ -126,7 +126,7 @@ _pending_broadcast:  dict[int, dict]  = {}
 _admin_chat_target:  dict[int, int]   = {}
 _user_to_admin:      dict[int, int]   = {}
 _user_last_tts:      dict[int, float] = {}
-_sched_payload:      dict[int, dict]  = {}   # admin_id → pending payload
+_sched_payload:      dict[int, dict]  = {}
 
 # ---------------------------------------------------------------------------
 # Supabase + Gemini
@@ -141,7 +141,6 @@ def _init_clients() -> None:
     SB_URL             = os.getenv("SUPABASE_URL", "")
     SB_KEY             = os.getenv("SUPABASE_KEY", "")
     GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
-    # Allow env override; default to a known-valid model
     GEMINI_MODEL       = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
 
     _raw_admin_ids = os.getenv("ADMIN_IDS", "")
@@ -203,24 +202,20 @@ WELCOME_TEXT = (
 BOT_TAG = "@voicekhaibot"
 
 # ---------------------------------------------------------------------------
-# User prefs cache — bounded with TTL
+# FIX #9: User prefs cache — OrderedDict LRU for O(1) eviction
 # ---------------------------------------------------------------------------
 _PREFS_TTL      = 300.0
 _PREFS_MAX_SIZE = 10_000
 
-_prefs_cache: dict[int, tuple[dict, float]] = {}
+_prefs_cache: OrderedDict[int, tuple[dict, float]] = OrderedDict()
 
 def _cache_prefs(user_id: int, prefs: dict) -> None:
-    if len(_prefs_cache) >= _PREFS_MAX_SIZE:
-        now = time.monotonic()
-        expired = [k for k, (_, ts) in _prefs_cache.items() if now - ts >= _PREFS_TTL]
-        for k in expired:
-            _prefs_cache.pop(k, None)
-        if len(_prefs_cache) >= _PREFS_MAX_SIZE:
-            sorted_keys = sorted(_prefs_cache, key=lambda k: _prefs_cache[k][1])
-            for k in sorted_keys[:_PREFS_MAX_SIZE // 10]:
-                _prefs_cache.pop(k, None)
+    # Remove existing entry to re-insert at end (most-recently-used)
+    _prefs_cache.pop(user_id, None)
     _prefs_cache[user_id] = (prefs, time.monotonic())
+    # FIX #9: O(1) LRU eviction instead of O(n log n) sort
+    while len(_prefs_cache) > _PREFS_MAX_SIZE:
+        _prefs_cache.popitem(last=False)
 
 def _get_cached_prefs(user_id: int) -> dict | None:
     entry = _prefs_cache.get(user_id)
@@ -238,10 +233,7 @@ _user_locks: dict[int, asyncio.Lock] = {}
 _user_locks_mutex = threading.Lock()
 
 def _get_user_lock(user_id: int) -> asyncio.Lock:
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        raise RuntimeError("_get_user_lock() must be called from within an async context.")
+    asyncio.get_running_loop()  # raises RuntimeError if not in async context
     with _user_locks_mutex:
         if user_id not in _user_locks:
             _user_locks[user_id] = asyncio.Lock()
@@ -354,6 +346,15 @@ def _sweep_stale_temps() -> None:
             except OSError:
                 pass
 
+# FIX #13: Periodic temp sweep task to prevent /tmp accumulation on long-running bot
+async def _periodic_temp_sweep(stop_event: asyncio.Event) -> None:
+    while not stop_event.is_set():
+        for _ in range(720):  # 720 * 5s = 1 hour
+            if stop_event.is_set():
+                return
+            await asyncio.sleep(5)
+        _sweep_stale_temps()
+
 # ---------------------------------------------------------------------------
 # Database helpers — user prefs
 # ---------------------------------------------------------------------------
@@ -405,6 +406,9 @@ def _paginated_fetch(select_fields: str) -> list[dict]:
                 .execute()
             )
             batch = res.data or []
+            # FIX #7: exit immediately on empty batch to prevent infinite loop
+            if not batch:
+                break
             all_rows.extend(batch)
             if len(batch) < page_size:
                 break
@@ -515,7 +519,6 @@ def ensure_speed_column():
 # Database helpers — scheduled broadcasts
 # ---------------------------------------------------------------------------
 def db_sched_insert(payload: dict, admin_id: int, broadcast_at: datetime) -> dict:
-    """Insert a new pending schedule row. Returns the inserted row."""
     if not supabase:
         raise RuntimeError("Supabase not configured.")
     row = {
@@ -531,7 +534,6 @@ def db_sched_insert(payload: dict, admin_id: int, broadcast_at: datetime) -> dic
 
 
 def db_sched_fetch_due() -> list[dict]:
-    """Return all pending rows whose broadcast_at <= NOW()."""
     if not supabase:
         return []
     try:
@@ -551,11 +553,6 @@ def db_sched_fetch_due() -> list[dict]:
 
 
 def db_sched_claim(row_id: int) -> bool:
-    """
-    FIX: Atomically claim a scheduled broadcast row by setting status to
-    'sending' only if it is still 'pending'. Returns True if claimed,
-    False if already claimed by another process (double-fire prevention).
-    """
     if not supabase:
         return False
     try:
@@ -563,7 +560,7 @@ def db_sched_claim(row_id: int) -> bool:
             supabase.table("scheduled_broadcasts")
             .update({"status": "sending"})
             .eq("id", row_id)
-            .eq("status", "pending")   # only update if still pending
+            .eq("status", "pending")
             .execute()
         )
         return bool(res.data)
@@ -617,7 +614,6 @@ def db_sched_fetch_one(row_id: int) -> dict | None:
 # Scheduled broadcast — datetime helpers
 # ---------------------------------------------------------------------------
 def _parse_dt(text: str) -> datetime | None:
-    """Parse a naive datetime string → UTC-aware datetime."""
     text = text.strip()
     for fmt in _DT_FORMATS:
         try:
@@ -760,7 +756,8 @@ def _build_atempo_chain(speed: float) -> str:
     return ",".join(stages)
 
 
-async def generate_voice(text: str, gender: str, speed: float, output_path: str) -> None:
+# FIX #12: Return audio bytes directly from generate_voice to avoid double disk read
+async def generate_voice(text: str, gender: str, speed: float, output_path: str) -> bytes:
     khmer_chars  = len(_KHMER_RE.findall(text))
     total_alpha  = sum(1 for c in text if c.isalpha())
     is_khmer     = khmer_chars > (total_alpha * 0.3)
@@ -796,6 +793,11 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str)
     if proc.returncode != 0:
         stderr_snippet = (stderr_data or b"").decode(errors="replace")[-400:]
         raise RuntimeError(f"FFmpeg failed (code {proc.returncode}): {stderr_snippet}")
+
+    # FIX #12: read and return bytes once here instead of re-reading at every call site
+    loop = asyncio.get_running_loop()
+    audio_bytes = await loop.run_in_executor(None, lambda: open(output_path, "rb").read())
+    return audio_bytes
 
 # ---------------------------------------------------------------------------
 # Gemini transcription
@@ -944,18 +946,19 @@ async def _deliver_paged_tts(
 
     total = len(chunks)
 
+    # FIX #5: set cooldown at the start of delivery so users can't spam
+    # during multi-chunk generation
+    _user_last_tts[user_id] = time.monotonic()
+
     for i, chunk in enumerate(chunks, 1):
         if not chunk or not chunk.strip():
             logger.warning(f"_deliver_paged_tts: skipping empty chunk {i}/{total}")
             continue
         file_path = _make_temp_ogg()
         try:
-            await generate_voice(chunk, gender, speed, file_path)
+            # FIX #12: use returned bytes directly, no extra disk read
+            audio_bytes = await generate_voice(chunk, gender, speed, file_path)
             caption = f"🗣️ {BOT_TAG}  [{i}/{total}]"
-            loop = asyncio.get_running_loop()
-            audio_bytes = await loop.run_in_executor(
-                None, lambda fp=file_path: open(fp, "rb").read()
-            )
             sent = await safe_send(lambda ab=audio_bytes, cap=caption: bot.send_voice(
                 chat_id=chat_id,
                 voice=io.BytesIO(ab),
@@ -975,8 +978,6 @@ async def _deliver_paged_tts(
             _cleanup(file_path)
         if i < total:
             await asyncio.sleep(0.3)
-
-    _user_last_tts[user_id] = time.monotonic()
 
 # ---------------------------------------------------------------------------
 # Keyboard builders
@@ -1103,7 +1104,6 @@ def _get_admin_for_user(user_id: int) -> int | None:
 
 @admin_only
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # FIX: clear any stale pending payload from a previous aborted flow
     _pending_broadcast.pop(update.effective_user.id, None)
     context.user_data["bc_state"] = BROADCAST_WAIT_MESSAGE
     await safe_send(lambda: update.message.reply_text(
@@ -1116,14 +1116,9 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    FIX: Added explicit bc_state guard so this function is safe to call
-    directly and won't process messages outside the broadcast flow.
-    """
     user_id = update.effective_user.id
     if not _is_admin(user_id):
         return
-    # Guard: only handle if we're actually in the broadcast-wait state
     if context.user_data.get("bc_state") != BROADCAST_WAIT_MESSAGE:
         return
 
@@ -1201,8 +1196,6 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         pending = _pending_broadcast.pop(user_id, None)
         context.user_data.pop("bc_state", None)
 
-        # FIX: remove the inline keyboard immediately so the button can't be
-        # double-tapped while the broadcast is still running
         try:
             await query.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -1220,7 +1213,6 @@ async def _do_broadcast(bot, admin_id: int, pending: dict):
     user_ids = await loop.run_in_executor(None, get_all_user_ids)
     total    = len(user_ids)
 
-    # FIX: handle edge case where there are no registered users
     if total == 0:
         await safe_send(lambda: bot.send_message(
             chat_id=admin_id,
@@ -1282,7 +1274,6 @@ async def _do_broadcast(bot, admin_id: int, pending: dict):
             except Exception:
                 pass
 
-    # FIX: always send final progress update even if total is not divisible by 25
     report = (
         f"✅ <b>Broadcast រួចរាល់!</b>\n\n"
         f"👥 សរុប: {total}\n"
@@ -1304,9 +1295,7 @@ async def _do_broadcast(bot, admin_id: int, pending: dict):
 
 @admin_only
 async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 1 — ask admin for the message content."""
     admin_id = update.effective_user.id
-    # FIX: clear any stale scheduled payload before starting a new flow
     _sched_payload.pop(admin_id, None)
     context.user_data["sched_state"] = SCHED_WAIT_MSG
     await safe_send(lambda: update.message.reply_text(
@@ -1319,7 +1308,6 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def cmd_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List pending scheduled broadcasts for this admin."""
     admin_id = update.effective_user.id
     loop     = asyncio.get_running_loop()
     rows     = await loop.run_in_executor(None, db_sched_fetch_admin_pending, admin_id)
@@ -1336,7 +1324,6 @@ async def cmd_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def cmd_cancelschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/cancelschedule <id> — cancel a pending schedule by ID."""
     admin_id = update.effective_user.id
     args     = context.args or []
     if not args or not args[0].isdigit():
@@ -1372,10 +1359,6 @@ async def cmd_cancelschedule(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def _handle_sched_content(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """
-    Stage 1 of the /schedule flow: capture broadcast content.
-    Returns True if the message was consumed, False otherwise.
-    """
     user_id = update.effective_user.id
     if not _is_admin(user_id):
         return False
@@ -1392,7 +1375,6 @@ async def _handle_sched_content(update: Update, context: ContextTypes.DEFAULT_TY
         caption_text  = msg.caption or ""
     elif msg.text:
         plain_text = msg.text.strip()
-        # FIX: give explicit feedback instead of silently swallowing empty text
         if not plain_text:
             await safe_send(lambda: msg.reply_text("⚠️ អត្ថបទមិនអាចទទេបាន។ សូមវាយសារ ឬ ផ្ញើរូបភាព។"))
             return True
@@ -1418,10 +1400,6 @@ async def _handle_sched_content(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """
-    Stage 2 of the /schedule flow: capture datetime, insert row, show preview.
-    Returns True if the message was consumed, False otherwise.
-    """
     user_id = update.effective_user.id
     if not _is_admin(user_id):
         return False
@@ -1451,7 +1429,6 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
         ))
         return True
 
-    # FIX: guard against missing payload (e.g. bot restart between steps)
     payload = _sched_payload.pop(user_id, None)
     if not payload:
         context.user_data.pop("sched_state", None)
@@ -1500,7 +1477,6 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all sched_* inline callbacks."""
     query   = update.callback_query
     user_id = query.from_user.id
     data    = query.data
@@ -1517,12 +1493,10 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # ── Confirm new schedule ─────────────────────────────────────────────
     if data.startswith("sched_ok:"):
         row_id = int(data.split(":")[1])
         loop   = asyncio.get_running_loop()
         row    = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
-        # FIX: handle cases where row was already cancelled or doesn't exist
         if not row:
             await safe_send(lambda: query.message.reply_text("❌ រកមិនឃើញ Schedule ។ វាប្រហែលជាត្រូវបាន cancel។"))
             return
@@ -1545,11 +1519,9 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ))
         return
 
-    # ── Cancel new schedule (from preview) ───────────────────────────────
     if data.startswith("sched_no:"):
         row_id = int(data.split(":")[1])
         loop   = asyncio.get_running_loop()
-        # FIX: only cancel if still pending; avoid overwriting a "sending"/"done" row
         row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
         if row and row["status"] == "pending":
             await loop.run_in_executor(None, db_sched_set_status, row_id, "cancelled")
@@ -1562,7 +1534,6 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ))
         return
 
-    # ── /schedules list: close ────────────────────────────────────────────
     if data == "sched_close":
         try:
             await query.message.delete()
@@ -1570,11 +1541,9 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    # ── /schedules list: no-op page counter ──────────────────────────────
     if data == "sched_noop":
         return
 
-    # ── /schedules list: paginate ─────────────────────────────────────────
     if data.startswith("sched_page:"):
         page = int(data.split(":")[1])
         loop = asyncio.get_running_loop()
@@ -1587,7 +1556,6 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    # ── /schedules list: view detail ─────────────────────────────────────
     if data.startswith("sched_view:"):
         row_id = int(data.split(":")[1])
         loop   = asyncio.get_running_loop()
@@ -1613,7 +1581,6 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ))
         return
 
-    # ── Cancel from detail view ───────────────────────────────────────────
     if data.startswith("sched_cancel_confirm:"):
         row_id = int(data.split(":")[1])
         loop   = asyncio.get_running_loop()
@@ -1639,14 +1606,11 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _fire_scheduled_broadcast(bot, row: dict) -> None:
-    """Execute one due scheduled broadcast row."""
     row_id   = row["id"]
     admin_id = row["admin_id"]
     logger.info(f"Firing scheduled broadcast #{row_id} for admin {admin_id}")
 
-    # FIX: Use atomic claim via db_sched_claim (only succeeds if status='pending')
-    # to prevent double-fire on bot restarts or overlapping scheduler ticks.
-    loop = asyncio.get_running_loop()
+    loop    = asyncio.get_running_loop()
     claimed = await loop.run_in_executor(None, db_sched_claim, row_id)
     if not claimed:
         logger.warning(f"Scheduled broadcast #{row_id} already claimed — skipping.")
@@ -1655,7 +1619,6 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
     user_ids = await loop.run_in_executor(None, get_all_user_ids)
     total    = len(user_ids)
 
-    # FIX: handle edge case of zero users
     if total == 0:
         try:
             await bot.send_message(
@@ -1664,9 +1627,7 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
             )
         except Exception:
             pass
-        await loop.run_in_executor(
-            None, db_sched_set_status, row_id, "done",
-        )
+        await loop.run_in_executor(None, db_sched_set_status, row_id, "done")
         return
 
     sent = failed = blocked = 0
@@ -1728,7 +1689,7 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
             except Exception:
                 pass
 
-    # FIX: single combined update call (status + counters) to avoid double-write race
+    # FIX: single combined status+counters update to avoid race condition
     try:
         if supabase:
             await asyncio.get_running_loop().run_in_executor(None, lambda: (
@@ -1742,7 +1703,6 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
     except Exception as e:
         logger.error(f"Could not mark scheduled broadcast #{row_id} done: {e}")
 
-    # FIX: always deliver final report regardless of total % 25
     report = (
         f"✅ <b>Scheduled broadcast #{row_id} រួចរាល់!</b>\n\n"
         f"👥 សរុប: {total}\n"
@@ -1759,29 +1719,21 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
         logger.error(f"Sched broadcast #{row_id} report error: {e}")
 
 
-# FIX: Keep strong references to scheduler-spawned tasks to prevent
-# premature garbage collection mid-execution.
 _scheduler_tasks: set[asyncio.Task] = set()
 
 async def _scheduler_loop(bot, stop_event: asyncio.Event) -> None:
-    """
-    Background task: polls Supabase every _SCHED_POLL_INTERVAL seconds and
-    fires any pending rows whose broadcast_at <= NOW().
-    """
     logger.info("Scheduled broadcast loop started.")
     while not stop_event.is_set():
         try:
             loop = asyncio.get_running_loop()
             due  = await loop.run_in_executor(None, db_sched_fetch_due)
             for row in due:
-                # FIX: store task reference to prevent GC before completion
                 task = asyncio.create_task(_fire_scheduled_broadcast(bot, row))
                 _scheduler_tasks.add(task)
                 task.add_done_callback(_scheduler_tasks.discard)
         except Exception as e:
             logger.error(f"Scheduler loop error: {e}")
 
-        # Sleep in small increments so stop_event is checked promptly
         elapsed = 0
         while elapsed < _SCHED_POLL_INTERVAL and not stop_event.is_set():
             await asyncio.sleep(min(5, _SCHED_POLL_INTERVAL - elapsed))
@@ -1924,7 +1876,6 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
-    """Forward any message type from admin to user. Returns False if user blocked bot."""
     try:
         if msg.text:
             await bot.send_message(
@@ -1965,7 +1916,6 @@ async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
 
 
 async def _fwd_user_to_admin(bot, admin_id: int, user_id: int, username: str, msg) -> bool:
-    """Forward any message type from user to admin."""
     banner = f"💬 <b>{html.escape(username)} ({user_id}):</b>"
     try:
         if msg.text:
@@ -2114,13 +2064,14 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if _is_admin(user_id):
         sched_state = context.user_data.get("sched_state")
+        # FIX #4: use elif to prevent double-firing when both states are set
         if sched_state == SCHED_WAIT_MSG:
             await _handle_sched_content(update, context)
             return
-        if context.user_data.get("bc_state") == BROADCAST_WAIT_MESSAGE:
+        elif context.user_data.get("bc_state") == BROADCAST_WAIT_MESSAGE:
             await broadcast_receive(update, context)
             return
-        if context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
+        elif context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
             target_id = _admin_chat_target.get(user_id)
             if target_id:
                 ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
@@ -2374,12 +2325,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ))
         return
 
+    # FIX #6: check lock BEFORE cooldown so in-progress requests give the
+    # correct "please wait" message instead of a misleading cooldown error
     lock = _get_user_lock(user_id)
     if lock.locked():
         await safe_send(lambda: msg.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
         return
 
-    now = time.monotonic()
+    now  = time.monotonic()
     last = _user_last_tts.get(user_id, 0.0)
     if now - last < USER_COOLDOWN_S:
         remaining = USER_COOLDOWN_S - (now - last)
@@ -2401,10 +2354,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     async with lock:
         try:
-            await generate_voice(stripped, gender, speed, file_path)
-            audio_bytes = await loop.run_in_executor(
-                None, lambda fp=file_path: open(fp, "rb").read()
-            )
+            # FIX #12: use returned bytes directly, no extra disk read
+            audio_bytes = await generate_voice(stripped, gender, speed, file_path)
             sent_msg = await safe_send(lambda: msg.reply_voice(
                 voice=io.BytesIO(audio_bytes),
                 caption=f"🗣️ {BOT_TAG}",
@@ -2448,6 +2399,8 @@ async def _cb_speed(query, user_id: int, context, data: str):
     if not original_text:
         await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទដើមមិនឃើញ។"))
         return
+
+    # FIX #6: check lock first, then cooldown
     lock = _get_user_lock(user_id)
     if lock.locked():
         await safe_send(lambda: query.message.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
@@ -2457,6 +2410,7 @@ async def _cb_speed(query, user_id: int, context, data: str):
         _rem = round(USER_COOLDOWN_S - (_now - _user_last_tts.get(user_id, 0.0)), 1)
         await safe_send(lambda r=_rem: query.message.reply_text(f"⏳ សូមរង់ចាំ {r}s មុននឹងផ្ញើម្តងទៀត។"))
         return
+
     prefs  = await loop.run_in_executor(None, get_user_prefs, user_id)
     gender = prefs["gender"]
     update_user_speed(user_id, new_speed)
@@ -2467,14 +2421,12 @@ async def _cb_speed(query, user_id: int, context, data: str):
     )
     async with lock:
         try:
-            await generate_voice(original_text, gender, new_speed, file_path)
+            # FIX #12: use returned bytes directly
+            audio_bytes = await generate_voice(original_text, gender, new_speed, file_path)
             try:
                 await query.message.delete()
             except Exception:
                 pass
-            audio_bytes = await loop.run_in_executor(
-                None, lambda fp=file_path: open(fp, "rb").read()
-            )
             new_msg = await safe_send(lambda: query.message.chat.send_voice(
                 voice=io.BytesIO(audio_bytes),
                 caption=f"🗣️ {BOT_TAG}",
@@ -2499,6 +2451,8 @@ async def _cb_gender(query, user_id: int, context, data: str):
     if not original_text:
         await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទដើមមិនឃើញ។"))
         return
+
+    # FIX #6: check lock first, then cooldown
     lock = _get_user_lock(user_id)
     if lock.locked():
         await safe_send(lambda: query.message.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
@@ -2508,6 +2462,7 @@ async def _cb_gender(query, user_id: int, context, data: str):
         _rem = round(USER_COOLDOWN_S - (_now - _user_last_tts.get(user_id, 0.0)), 1)
         await safe_send(lambda r=_rem: query.message.reply_text(f"⏳ សូមរង់ចាំ {r}s មុននឹងផ្ញើម្តងទៀត។"))
         return
+
     prefs = await loop.run_in_executor(None, get_user_prefs, user_id)
     speed = prefs["speed"]
     update_user_gender(user_id, new_gender)
@@ -2518,14 +2473,12 @@ async def _cb_gender(query, user_id: int, context, data: str):
     )
     async with lock:
         try:
-            await generate_voice(original_text, new_gender, speed, file_path)
+            # FIX #12: use returned bytes directly
+            audio_bytes = await generate_voice(original_text, new_gender, speed, file_path)
             try:
                 await query.message.delete()
             except Exception:
                 pass
-            audio_bytes = await loop.run_in_executor(
-                None, lambda fp=file_path: open(fp, "rb").read()
-            )
             new_msg = await safe_send(lambda: query.message.chat.send_voice(
                 voice=io.BytesIO(audio_bytes),
                 caption=f"🗣️ {BOT_TAG}",
@@ -2563,10 +2516,8 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
     )
     async with lock:
         try:
-            await generate_voice(original_text, gender, speed, file_path)
-            audio_bytes = await loop.run_in_executor(
-                None, lambda fp=file_path: open(fp, "rb").read()
-            )
+            # FIX #12: use returned bytes directly
+            audio_bytes = await generate_voice(original_text, gender, speed, file_path)
             new_msg = await safe_send(lambda: query.message.chat.send_voice(
                 voice=io.BytesIO(audio_bytes),
                 caption=f"🗣️ {BOT_TAG}",
@@ -2584,12 +2535,6 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
 
 
 async def _cb_doc_read(query, user_id: int, context, data: str):
-    """
-    FIX: Keep the status timer running throughout paged TTS delivery instead
-    of stopping it before _deliver_paged_tts is called (previously the spinner
-    appeared then vanished immediately, leaving no feedback during actual work).
-    The timer is now stopped only after all chunks are delivered.
-    """
     src_msg_id = int(data.split(":")[1])
     loop       = asyncio.get_running_loop()
     full_text  = await loop.run_in_executor(None, get_text_cache, src_msg_id)
@@ -2616,8 +2561,6 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
     )
     async with lock:
         try:
-            # FIX: deliver first, THEN stop the timer so spinner stays visible
-            # for the full duration of paged TTS generation
             await _deliver_paged_tts(
                 chat_id=chat_id,
                 bot=context.bot,
@@ -2638,7 +2581,6 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Main callback dispatcher. Answers the query exactly once here."""
     query   = update.callback_query
     user_id = query.from_user.id
     data    = query.data
@@ -2693,8 +2635,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # Bot runner
 # ---------------------------------------------------------------------------
 async def _run_bot():
-    with _user_locks_mutex:
-        _user_locks.clear()
+    # FIX #3: do NOT clear _user_locks on restart — in-flight coroutines may
+    # still hold references to old Lock objects; clearing causes them to never
+    # unblock. Locks are lightweight and recreated on first use per user.
     _admin_chat_target.clear()
     _user_to_admin.clear()
     _pending_broadcast.clear()
@@ -2751,9 +2694,12 @@ async def _run_bot():
     logger.info(f"Bot polling started. Admins: {ADMIN_IDS or 'none configured'}")
     logger.info(f"Gemini model: {GEMINI_MODEL}")
 
-    # ── Start scheduler loop ────────────────────────────────────────────
+    # ── Start background tasks ──────────────────────────────────────────
     sched_stop  = asyncio.Event()
+    sweep_stop  = asyncio.Event()
     sched_task  = asyncio.create_task(_scheduler_loop(app.bot, sched_stop))
+    # FIX #13: periodic /tmp sweep to prevent stale file accumulation
+    sweep_task  = asyncio.create_task(_periodic_temp_sweep(sweep_stop))
 
     async with app:
         await app.initialize()
@@ -2766,11 +2712,13 @@ async def _run_bot():
             await asyncio.Event().wait()
         finally:
             sched_stop.set()
-            sched_task.cancel()
-            try:
-                await sched_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            sweep_stop.set()
+            for task in (sched_task, sweep_task):
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
 # ---------------------------------------------------------------------------
 # Main
