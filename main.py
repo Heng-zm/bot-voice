@@ -77,6 +77,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
     ContextTypes,
+    TypeHandler,
     CallbackQueryHandler,
 )
 
