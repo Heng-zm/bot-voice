@@ -13,7 +13,7 @@ import requests
 import imageio_ffmpeg as _iio_ffmpeg
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime as _dt , timezone
 from google import genai
 from google.genai import types as genai_types
 from flask import Flask
@@ -2268,6 +2268,40 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===========================================================================
 
 
+async def _drop_stale_updates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Drop any update whose date predates this bot process start.
+    Registered as a TypeHandler with group=-1 so it runs before all others.
+    Raises ApplicationHandlerStop to prevent further processing.
+    """
+    if _BOT_START_TIME == 0.0:
+        return  # safety: not yet initialised
+
+    msg = (
+        update.message
+        or update.edited_message
+        or update.callback_query and update.callback_query.message
+    )
+    if msg and hasattr(msg, "date") and msg.date:
+        # msg.date is a timezone-aware datetime; compare to our start epoch
+        update_ts = msg.date.timestamp()
+        if update_ts < _BOT_START_TIME:
+            logger.debug(
+                f"Dropping stale update (id={update.update_id}, "
+                f"age={_BOT_START_TIME - update_ts:.1f}s)"
+            )
+            raise ApplicationHandlerStop
+
+async def _drop_stale_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Same check for callback queries, which have their own .message.date."""
+    if not update.callback_query:
+        return
+    msg = update.callback_query.message
+    if msg and msg.date:
+        if msg.date.timestamp() < _BOT_START_TIME:
+            logger.debug(f"Dropping stale callback (id={update.update_id})")
+            raise ApplicationHandlerStop
+
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         sync_user_data(update.effective_user)
@@ -2952,6 +2986,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # Bot runner
 # ---------------------------------------------------------------------------
 async def _run_bot():
+    global _BOT_START_TIME
+    _BOT_START_TIME = time.time()
+    _BOT_START_TIME: float = 0.0
     # NOTE: do NOT clear _user_locks — in-flight coroutines may still hold
     # references to existing Lock objects; clearing would orphan them.
     _admin_chat_target.clear()
@@ -2996,6 +3033,9 @@ async def _run_bot():
     )
     app.add_handler(CallbackQueryHandler(sched_callback, pattern=r"^sched_"))
     app.add_handler(CallbackQueryHandler(on_callback))  # catch-all for TTS callbacks
+
+    # Inside _run_bot(), BEFORE all other app.add_handler() calls:
+    app.add_handler(TypeHandler(Update, _drop_stale_updates), group=-1)
 
     # ── Message handlers ──────────────────────────────────────────────────
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
