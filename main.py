@@ -101,7 +101,7 @@ ADMIN_IDS: set[int] = set()
 
 # FIX #1: "gemini-3.1-pro-preview" does not exist; use a real model name.
 # Overridable via GEMINI_MODEL env var; default to gemini-1.5-flash for cost/speed.
-GEMINI_MODEL = "gemini-2.5-pro"
+GEMINI_MODEL = "gemini-3.1-pro-preview"
 
 MAX_VOICE_BYTES = 20 * 1024 * 1024
 MAX_INPUT_CHARS = 5_000
@@ -155,7 +155,7 @@ def _init_clients() -> None:
     SB_KEY = os.getenv("SUPABASE_KEY", "")
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
     # FIX #1: default to a model that actually exists
-    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
 
     _raw_admin_ids = os.getenv("ADMIN_IDS", "")
     for _aid in _raw_admin_ids.split(","):
