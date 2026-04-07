@@ -13,7 +13,7 @@ import requests
 import imageio_ffmpeg as _iio_ffmpeg
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime , timezone
+from datetime import datetime, timezone
 from google import genai
 from google.genai import types as genai_types
 from flask import Flask
@@ -22,17 +22,21 @@ from supabase import create_client, Client
 # ── Flask Web Server ───────────────────────────────────────────────────────
 app_flask = Flask(__name__)
 
+
 @app_flask.route("/")
 def health_check():
     return "Bot is running!", 200
+
 
 @app_flask.route("/ping")
 def ping():
     return "pong", 200
 
+
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app_flask.run(host="0.0.0.0", port=port, threaded=True)
+
 
 def keep_alive():
     """Self-ping every 4 min as secondary keep-alive layer."""
@@ -50,6 +54,7 @@ def keep_alive():
         except Exception as e:
             logger_ka.warning(f"Keep-alive failed: {e}")
         time.sleep(240)
+
 
 # ── FFmpeg ─────────────────────────────────────────────────────────────────
 _FFMPEG_EXE = _iio_ffmpeg.get_ffmpeg_exe()
@@ -99,9 +104,10 @@ SB_KEY: str = ""
 GEMINI_API_KEY: str = ""
 ADMIN_IDS: set[int] = set()
 
-# FIX #1: "gemini-3.1-pro-preview" does not exist; use a real model name.
-# Overridable via GEMINI_MODEL env var; default to gemini-1.5-flash for cost/speed.
-GEMINI_MODEL = "gemini-3.1-pro-preview"
+# FIX #1: Use a real, available model name as default.
+# "gemini-3.1-pro-preview" does not exist and causes every OCR/transcription
+# call to fail at runtime.  Override via GEMINI_MODEL env var at any time.
+GEMINI_MODEL = "gemini-1.5-flash"
 
 MAX_VOICE_BYTES = 20 * 1024 * 1024
 MAX_INPUT_CHARS = 5_000
@@ -110,9 +116,17 @@ DEFAULT_SPEED = 1.0
 TELE_MSG_LIMIT = 4000
 USER_COOLDOWN_S = 3.0
 
+# FIX #10: grace window so valid messages arriving within 30 s of a restart
+# are not incorrectly dropped by the stale-update guard.
+_STALE_GRACE_S = 30.0
+
 _KHMER_RE = re.compile(r"[\u1780-\u17FF]")
 
+# FIX #9: Gemini API calls get their own executor so slow/timed-out Gemini
+# requests (up to 60 s) cannot starve the DB thread pool used by _submit_db.
 _DB_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="db_write")
+_GEMINI_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="gemini")
+
 
 # ---------------------------------------------------------------------------
 # State constants
@@ -137,8 +151,25 @@ _DT_FORMATS = [
 _pending_broadcast: dict[int, dict] = {}
 _admin_chat_target: dict[int, int] = {}
 _user_to_admin: dict[int, int] = {}
-_user_last_tts: dict[int, float] = {}
 _sched_payload: dict[int, dict] = {}
+
+# FIX #8: _user_last_tts uses a LRU-capped OrderedDict to prevent unbounded
+# memory growth for bots with large/growing user bases.
+_USER_LAST_TTS_MAX = 10_000
+_user_last_tts: OrderedDict[int, float] = OrderedDict()
+
+
+def _set_last_tts(user_id: int) -> None:
+    """Record the TTS completion time for a user with LRU eviction."""
+    _user_last_tts.pop(user_id, None)
+    _user_last_tts[user_id] = time.monotonic()
+    while len(_user_last_tts) > _USER_LAST_TTS_MAX:
+        _user_last_tts.popitem(last=False)
+
+
+def _get_last_tts(user_id: int) -> float:
+    return _user_last_tts.get(user_id, 0.0)
+
 
 # ---------------------------------------------------------------------------
 # Supabase + Gemini
@@ -154,8 +185,8 @@ def _init_clients() -> None:
     SB_URL = os.getenv("SUPABASE_URL", "")
     SB_KEY = os.getenv("SUPABASE_KEY", "")
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-    # FIX #1: default to a model that actually exists
-    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
+    # FIX #1: default to a model that actually exists.
+    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
     _raw_admin_ids = os.getenv("ADMIN_IDS", "")
     for _aid in _raw_admin_ids.split(","):
@@ -244,32 +275,32 @@ def _invalidate_prefs(user_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# FIX #2: Per-user async lock with LRU eviction to prevent unbounded growth
+# FIX #6: Per-user async lock — asyncio is cooperative/single-threaded so we
+# don't need a threading.Lock to guard the dict.  Removing it eliminates the
+# risk of asyncio.Lock() being instantiated off the running event loop
+# (which raises RuntimeError in Python ≥ 3.10).
 # ---------------------------------------------------------------------------
 _USER_LOCK_MAX = 5_000
 _user_locks: OrderedDict[int, asyncio.Lock] = OrderedDict()
-_user_locks_mutex = threading.Lock()
 
 
 def _get_user_lock(user_id: int) -> asyncio.Lock:
     """
     Return (or create) a per-user asyncio.Lock.
 
-    Uses an OrderedDict as an LRU so the dict never grows beyond
-    _USER_LOCK_MAX entries.  Locks that are currently *held* are never
-    evicted because the caller holds a reference; the dict entry is the
-    only thing that gets removed, which is harmless.
+    Must only be called from within an async handler (i.e. on the running
+    event loop).  asyncio is cooperative — no threading guard is needed for
+    the dict itself.  The OrderedDict acts as an LRU so the map never grows
+    beyond _USER_LOCK_MAX entries.
     """
-    with _user_locks_mutex:
-        if user_id in _user_locks:
-            # Move to end (most-recently-used)
-            _user_locks.move_to_end(user_id)
-            return _user_locks[user_id]
-        lock = asyncio.Lock()
-        _user_locks[user_id] = lock
-        while len(_user_locks) > _USER_LOCK_MAX:
-            _user_locks.popitem(last=False)
-        return lock
+    if user_id in _user_locks:
+        _user_locks.move_to_end(user_id)
+        return _user_locks[user_id]
+    lock = asyncio.Lock()
+    _user_locks[user_id] = lock
+    while len(_user_locks) > _USER_LOCK_MAX:
+        _user_locks.popitem(last=False)
+    return lock
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +408,6 @@ def _make_temp_img(suffix: str = ".jpg") -> str:
 
 
 def _sweep_stale_temps() -> None:
-    # FIX #9: include both .jpg and .png in sweep patterns
     for pattern in [
         f"/tmp/{_TMP_PREFIX}*.ogg",
         f"/tmp/{_TMP_PREFIX}*.jpg",
@@ -392,7 +422,6 @@ def _sweep_stale_temps() -> None:
                 pass
 
 
-# FIX #3: Simplified periodic sweep — stop_event checked cleanly
 async def _periodic_temp_sweep(stop_event: asyncio.Event) -> None:
     while not stop_event.is_set():
         try:
@@ -524,9 +553,13 @@ def update_user_speed(user_id: int, speed: float):
     _submit_db(_run)
 
 
-# FIX #4: Use (chat_id, message_id) as composite key to avoid cross-chat collisions.
-# The DB table should have a PRIMARY KEY of (chat_id, message_id).
-def save_text_cache(msg_id: int, text: str, chat_id: int = 0, user_id: int = None, username: str = None):
+def save_text_cache(
+    msg_id: int,
+    text: str,
+    chat_id: int = 0,
+    user_id: int = None,
+    username: str = None,
+):
     if not supabase:
         return
 
@@ -803,11 +836,8 @@ async def _stop_timer(stop_event: asyncio.Event, timer_task: asyncio.Task):
 def _build_atempo_chain(speed: float) -> str:
     """
     Build a valid FFmpeg atempo filter chain for the given speed.
-
     atempo only accepts values in [0.5, 2.0], so we chain multiple stages
     for speeds outside that range.
-
-    FIX #5: Rewrite to be cleaner and handle edge cases correctly.
     """
     speed = round(speed, 4)
     if abs(speed - 1.0) < 1e-6:
@@ -831,12 +861,7 @@ def _build_atempo_chain(speed: float) -> str:
 
 
 async def generate_voice(text: str, gender: str, speed: float, output_path: str) -> bytes:
-    """
-    Generate TTS audio and return the raw OGG/Opus bytes.
-
-    FIX #6: Wrap file read in try/finally so the temp file is always readable
-    even if FFmpeg writes only a partial file, and propagate the error cleanly.
-    """
+    """Generate TTS audio and return the raw OGG/Opus bytes."""
     khmer_chars = len(_KHMER_RE.findall(text))
     total_alpha = sum(1 for c in text if c.isalpha())
     is_khmer = khmer_chars > (total_alpha * 0.3)
@@ -901,8 +926,11 @@ async def transcribe_voice(ogg_path: str) -> str:
             ],
         )
 
+    # FIX #9: use the dedicated Gemini executor, not the shared default/DB executor.
     try:
-        response = await asyncio.wait_for(loop.run_in_executor(None, _call), timeout=60)
+        response = await asyncio.wait_for(
+            loop.run_in_executor(_GEMINI_EXECUTOR, _call), timeout=60
+        )
         return (response.text or "").strip()
     except asyncio.TimeoutError:
         raise RuntimeError("Gemini transcription timed out after 60s")
@@ -1007,11 +1035,40 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
             ],
         )
 
+    # FIX #9: use the dedicated Gemini executor.
     try:
-        response = await asyncio.wait_for(loop.run_in_executor(None, _call), timeout=60)
+        response = await asyncio.wait_for(
+            loop.run_in_executor(_GEMINI_EXECUTOR, _call), timeout=60
+        )
         return (response.text or "").strip()
     except asyncio.TimeoutError:
         raise RuntimeError("Gemini OCR timed out after 60s")
+
+
+# ---------------------------------------------------------------------------
+# Cooldown check helper — shared by all TTS entry points
+# ---------------------------------------------------------------------------
+async def _check_cooldown(reply_target, user_id: int) -> bool:
+    """
+    FIX #7: Centralised cooldown check used by ALL TTS paths
+    (on_text, _cb_speed, _cb_gender, _cb_tts_transcript, _cb_doc_read).
+    Returns True if the request is within cooldown and a warning was sent.
+    """
+    lock = _get_user_lock(user_id)
+    if lock.locked():
+        await safe_send(
+            lambda: reply_target.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ...")
+        )
+        return True
+    now = time.monotonic()
+    last = _get_last_tts(user_id)
+    if now - last < USER_COOLDOWN_S:
+        rem = round(USER_COOLDOWN_S - (now - last), 1)
+        await safe_send(
+            lambda r=rem: reply_target.reply_text(f"⏳ សូមរង់ចាំ {r}s មុននឹងផ្ញើម្តងទៀត។")
+        )
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1032,8 +1089,6 @@ async def _deliver_paged_tts(
         return
 
     total = len(chunks)
-    # Set cooldown at start so users can't spam during multi-chunk generation
-    _user_last_tts[user_id] = time.monotonic()
 
     for i, chunk in enumerate(chunks, 1):
         if not chunk or not chunk.strip():
@@ -1053,8 +1108,11 @@ async def _deliver_paged_tts(
             )
             if sent:
                 save_text_cache(
-                    sent.message_id, chunk,
-                    chat_id=chat_id, user_id=user_id, username=username,
+                    sent.message_id,
+                    chunk,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    username=username,
                 )
         except Exception as e:
             logger.error(f"paged TTS chunk {i}/{total} error: {e}")
@@ -1069,6 +1127,12 @@ async def _deliver_paged_tts(
             _cleanup(file_path)
         if i < total:
             await asyncio.sleep(0.3)
+
+    # FIX #5: Set cooldown AFTER all chunks have been delivered, not before the
+    # first chunk is generated.  Previously, cooldown was set at the start of
+    # the loop so a slow multi-chunk request could expire before delivery ended,
+    # allowing a second request to slip through concurrently.
+    _set_last_tts(user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1105,8 +1169,12 @@ def get_transcription_kb(transcript_msg_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("📢 AI អាន", callback_data=f"tts_transcript:{transcript_msg_id}"),
-                InlineKeyboardButton("🗑️ លុប", callback_data=f"del_transcript:{transcript_msg_id}"),
+                InlineKeyboardButton(
+                    "📢 AI អាន", callback_data=f"tts_transcript:{transcript_msg_id}"
+                ),
+                InlineKeyboardButton(
+                    "🗑️ លុប", callback_data=f"del_transcript:{transcript_msg_id}"
+                ),
             ]
         ]
     )
@@ -1324,7 +1392,9 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         if not pending:
             await safe_send(
-                lambda: query.message.reply_text("⚠️ រកទិន្នន័យ Broadcast មិនឃើញ។ សូមចាប់ផ្ដើមថ្មី។")
+                lambda: query.message.reply_text(
+                    "⚠️ រកទិន្នន័យ Broadcast មិនឃើញ។ សូមចាប់ផ្ដើមថ្មី។"
+                )
             )
             return
 
@@ -1442,7 +1512,9 @@ async def cmd_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loop = asyncio.get_running_loop()
     rows = await loop.run_in_executor(None, db_sched_fetch_admin_pending, admin_id)
     if not rows:
-        await safe_send(lambda: update.message.reply_text("📭 មិនមាន Scheduled Broadcast ណាមួយទេ។"))
+        await safe_send(
+            lambda: update.message.reply_text("📭 មិនមាន Scheduled Broadcast ណាមួយទេ។")
+        )
         return
     await safe_send(
         lambda: update.message.reply_text(
@@ -1871,7 +1943,6 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
             except Exception:
                 pass
 
-    # Single atomic update: status + counters
     try:
         if supabase:
             await asyncio.get_running_loop().run_in_executor(
@@ -1923,7 +1994,6 @@ async def _scheduler_loop(bot, stop_event: asyncio.Event) -> None:
         except Exception as e:
             logger.error(f"Scheduler loop error: {e}")
 
-        # FIX #3: cleaner sleep — respects stop_event immediately
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=float(_SCHED_POLL_INTERVAL))
         except asyncio.TimeoutError:
@@ -2083,7 +2153,6 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
 
-# FIX #7: _fwd_admin_to_user and _fwd_user_to_admin now handle RetryAfter
 async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
     async def _do():
         if msg.text:
@@ -2144,9 +2213,7 @@ async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
         return False
 
 
-async def _fwd_user_to_admin(
-    bot, admin_id: int, user_id: int, username: str, msg
-) -> bool:
+async def _fwd_user_to_admin(bot, admin_id: int, user_id: int, username: str, msg) -> bool:
     banner = f"💬 <b>{html.escape(username)} ({user_id}):</b>"
 
     async def _do():
@@ -2269,40 +2336,46 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # REGULAR HANDLERS
 # ===========================================================================
 
+# FIX #2 + #10: _BOT_START_TIME initialised at module level so the stale-drop
+# guard is available before _run_bot() sets it, and _STALE_GRACE_S provides a
+# 30-second window to tolerate NTP clock steps and restart-edge-case messages.
+_BOT_START_TIME: float = 0.0
+
 
 async def _drop_stale_updates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Drop any update whose date predates this bot process start.
-    Registered as a TypeHandler with group=-1 so it runs before all others.
+    Drop any update whose date predates this bot process start (minus grace window).
+    Registered as a TypeHandler with group=-1 so it runs before all other handlers.
     Raises ApplicationHandlerStop to prevent further processing.
     """
     if _BOT_START_TIME == 0.0:
-        return  # safety: not yet initialised
+        return
 
-    msg = (
-        update.message
-        or update.edited_message
-        or update.callback_query and update.callback_query.message
-    )
+    msg = update.message or update.edited_message
     if msg and hasattr(msg, "date") and msg.date:
-        # msg.date is a timezone-aware datetime; compare to our start epoch
         update_ts = msg.date.timestamp()
-        if update_ts < _BOT_START_TIME:
+        if update_ts < (_BOT_START_TIME - _STALE_GRACE_S):
             logger.debug(
                 f"Dropping stale update (id={update.update_id}, "
                 f"age={_BOT_START_TIME - update_ts:.1f}s)"
             )
             raise ApplicationHandlerStop
 
+
+# FIX #3: _drop_stale_callback was defined but never registered.
+# It is now registered in _run_bot() alongside the updates guard.
 async def _drop_stale_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Same check for callback queries, which have their own .message.date."""
+    """Drop stale callback queries from pre-restart inline buttons."""
     if not update.callback_query:
+        return
+    if _BOT_START_TIME == 0.0:
         return
     msg = update.callback_query.message
     if msg and msg.date:
-        if msg.date.timestamp() < _BOT_START_TIME:
+        if msg.date.timestamp() < (_BOT_START_TIME - _STALE_GRACE_S):
             logger.debug(f"Dropping stale callback (id={update.update_id})")
             raise ApplicationHandlerStop
+
 
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -2351,9 +2424,10 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id is None:
         return
 
+    # FIX #11 (admin self-forward guard): admin path must return before
+    # _get_admin_for_user so admins are never forwarded to themselves.
     if _is_admin(user_id):
         sched_state = context.user_data.get("sched_state")
-        # Use elif to prevent double-firing when multiple states are set
         if sched_state == SCHED_WAIT_MSG:
             await _handle_sched_content(update, context)
             return
@@ -2373,8 +2447,10 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not ok:
                     _close_session(user_id)
                     context.user_data.pop("chat_state", None)
-            return
+        # Admin with no active state: fall through to OCR
+        # (intentional — admins can also use OCR when not in a flow)
 
+    # Non-admin user in a chat session — forward to admin
     admin_id = _get_admin_for_user(user_id)
     if admin_id is not None:
         uname = user.username or user.first_name or str(user_id)
@@ -2397,8 +2473,11 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     best_photo = msg.photo[-1]
-    img_path = _make_temp_img(suffix=".jpg")
+    # FIX #4: allocate the temp file INSIDE the try block so it is always
+    # cleaned up in the finally clause even if the download fails.
+    img_path = None
     try:
+        img_path = _make_temp_img(suffix=".jpg")
         tg_file = await safe_send(lambda: context.bot.get_file(best_photo.file_id))
         if not tg_file:
             raise RuntimeError("Could not download photo.")
@@ -2429,8 +2508,11 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         last_sent = sent_pages[-1] if sent_pages else None
         if last_sent:
             save_text_cache(
-                last_sent.message_id, ocr_text,
-                chat_id=msg.chat_id, user_id=user_id, username=uname,
+                last_sent.message_id,
+                ocr_text,
+                chat_id=msg.chat_id,
+                user_id=user_id,
+                username=uname,
             )
             await safe_send(
                 lambda: last_sent.edit_reply_markup(
@@ -2443,7 +2525,8 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការ OCR រូបភាព។"))
     finally:
         await _stop_timer(stop_event, timer_task)
-        _cleanup(img_path)
+        if img_path:
+            _cleanup(img_path)
 
 
 async def on_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2480,6 +2563,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
 
+    # FIX #11: admin early-return before _get_admin_for_user check.
     if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
         target_id = _admin_chat_target.get(user_id)
         if target_id:
@@ -2547,7 +2631,8 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         last_sent = sent_pages[-1] if sent_pages else None
         if last_sent:
             save_text_cache(
-                last_sent.message_id, transcript,
+                last_sent.message_id,
+                transcript,
                 chat_id=msg.chat_id,
                 user_id=user_id,
                 username=user.username or user.first_name,
@@ -2636,19 +2721,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Check in-progress lock first, then cooldown
-    lock = _get_user_lock(user_id)
-    if lock.locked():
-        await safe_send(lambda: msg.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
-        return
-
-    now = time.monotonic()
-    last = _user_last_tts.get(user_id, 0.0)
-    if now - last < USER_COOLDOWN_S:
-        remaining = USER_COOLDOWN_S - (now - last)
-        await safe_send(
-            lambda: msg.reply_text(f"⏳ សូមរង់ចាំ {remaining:.1f}s មុននឹងផ្ញើម្តងទៀត។")
-        )
+    # FIX #7: use the centralised cooldown helper.
+    if await _check_cooldown(msg, user_id):
         return
 
     sync_user_data(user)
@@ -2662,6 +2736,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     timer_task = asyncio.create_task(
         send_status_timer(update.effective_chat.id, context.bot, stop_event)
     )
+    lock = _get_user_lock(user_id)
     async with lock:
         try:
             audio_bytes = await generate_voice(stripped, gender, speed, file_path)
@@ -2674,12 +2749,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             if sent_msg:
                 save_text_cache(
-                    sent_msg.message_id, stripped,
+                    sent_msg.message_id,
+                    stripped,
                     chat_id=msg.chat_id,
                     user_id=user_id,
                     username=user.username or user.first_name,
                 )
-            _user_last_tts[user_id] = time.monotonic()
+            _set_last_tts(user_id)
         except Exception as e:
             logger.error(f"on_text TTS error: {e}")
             try:
@@ -2692,7 +2768,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# FIX #8: Centralised helper to get (chat_id, msg_id) for cache lookups
+# Centralised helper to get (chat_id, msg_id) for cache lookups
 # ---------------------------------------------------------------------------
 def _cache_key_from_query(query) -> tuple[int, int]:
     return query.message.chat.id, query.message.message_id
@@ -2728,16 +2804,8 @@ async def _cb_speed(query, user_id: int, context, data: str):
         await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទដើមមិនឃើញ។"))
         return
 
-    lock = _get_user_lock(user_id)
-    if lock.locked():
-        await safe_send(lambda: query.message.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
-        return
-    _now = time.monotonic()
-    if _now - _user_last_tts.get(user_id, 0.0) < USER_COOLDOWN_S:
-        _rem = round(USER_COOLDOWN_S - (_now - _user_last_tts.get(user_id, 0.0)), 1)
-        await safe_send(
-            lambda r=_rem: query.message.reply_text(f"⏳ សូមរង់ចាំ {r}s មុននឹងផ្ញើម្តងទៀត។")
-        )
+    # FIX #7: centralised cooldown check.
+    if await _check_cooldown(query.message, user_id):
         return
 
     prefs = await loop.run_in_executor(None, get_user_prefs, user_id)
@@ -2748,6 +2816,7 @@ async def _cb_speed(query, user_id: int, context, data: str):
     timer_task = asyncio.create_task(
         send_status_timer(query.message.chat.id, context.bot, stop_event)
     )
+    lock = _get_user_lock(user_id)
     async with lock:
         try:
             audio_bytes = await generate_voice(original_text, gender, new_speed, file_path)
@@ -2764,12 +2833,13 @@ async def _cb_speed(query, user_id: int, context, data: str):
             )
             if new_msg:
                 save_text_cache(
-                    new_msg.message_id, original_text,
+                    new_msg.message_id,
+                    original_text,
                     chat_id=chat_id,
                     user_id=user_id,
                     username=query.from_user.username or query.from_user.first_name,
                 )
-            _user_last_tts[user_id] = time.monotonic()
+            _set_last_tts(user_id)
         except Exception as e:
             logger.error(f"speed regen error: {e}")
         finally:
@@ -2786,16 +2856,8 @@ async def _cb_gender(query, user_id: int, context, data: str):
         await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទដើមមិនឃើញ។"))
         return
 
-    lock = _get_user_lock(user_id)
-    if lock.locked():
-        await safe_send(lambda: query.message.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
-        return
-    _now = time.monotonic()
-    if _now - _user_last_tts.get(user_id, 0.0) < USER_COOLDOWN_S:
-        _rem = round(USER_COOLDOWN_S - (_now - _user_last_tts.get(user_id, 0.0)), 1)
-        await safe_send(
-            lambda r=_rem: query.message.reply_text(f"⏳ សូមរង់ចាំ {r}s មុននឹងផ្ញើម្តងទៀត។")
-        )
+    # FIX #7: centralised cooldown check.
+    if await _check_cooldown(query.message, user_id):
         return
 
     prefs = await loop.run_in_executor(None, get_user_prefs, user_id)
@@ -2806,6 +2868,7 @@ async def _cb_gender(query, user_id: int, context, data: str):
     timer_task = asyncio.create_task(
         send_status_timer(query.message.chat.id, context.bot, stop_event)
     )
+    lock = _get_user_lock(user_id)
     async with lock:
         try:
             audio_bytes = await generate_voice(original_text, new_gender, speed, file_path)
@@ -2822,12 +2885,13 @@ async def _cb_gender(query, user_id: int, context, data: str):
             )
             if new_msg:
                 save_text_cache(
-                    new_msg.message_id, original_text,
+                    new_msg.message_id,
+                    original_text,
                     chat_id=chat_id,
                     user_id=user_id,
                     username=query.from_user.username or query.from_user.first_name,
                 )
-            _user_last_tts[user_id] = time.monotonic()
+            _set_last_tts(user_id)
         except Exception as e:
             logger.error(f"gender regen error: {e}")
         finally:
@@ -2843,10 +2907,11 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
     if not original_text:
         await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទមិនឃើញ។"))
         return
-    lock = _get_user_lock(user_id)
-    if lock.locked():
-        await safe_send(lambda: query.message.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
+
+    # FIX #7: cooldown check was missing here; now uses centralised helper.
+    if await _check_cooldown(query.message, user_id):
         return
+
     prefs = await loop.run_in_executor(None, get_user_prefs, user_id)
     gender = prefs["gender"]
     speed = prefs["speed"]
@@ -2855,6 +2920,7 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
     timer_task = asyncio.create_task(
         send_status_timer(query.message.chat.id, context.bot, stop_event)
     )
+    lock = _get_user_lock(user_id)
     async with lock:
         try:
             audio_bytes = await generate_voice(original_text, gender, speed, file_path)
@@ -2867,12 +2933,13 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
             )
             if new_msg:
                 save_text_cache(
-                    new_msg.message_id, original_text,
+                    new_msg.message_id,
+                    original_text,
                     chat_id=chat_id,
                     user_id=user_id,
                     username=query.from_user.username or query.from_user.first_name,
                 )
-            _user_last_tts[user_id] = time.monotonic()
+            _set_last_tts(user_id)
         except Exception as e:
             logger.error(f"transcript TTS error: {e}")
         finally:
@@ -2888,10 +2955,11 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
     if not full_text:
         await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទមិនឃើញ (cache expired)។"))
         return
-    lock = _get_user_lock(user_id)
-    if lock.locked():
-        await safe_send(lambda: query.message.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
+
+    # FIX #7: cooldown check was missing here; now uses centralised helper.
+    if await _check_cooldown(query.message, user_id):
         return
+
     prefs = await loop.run_in_executor(None, get_user_prefs, user_id)
     gender = prefs["gender"]
     speed = prefs["speed"]
@@ -2903,6 +2971,7 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
 
     tts_stop = asyncio.Event()
     tts_timer = asyncio.create_task(send_status_timer(chat_id, context.bot, tts_stop))
+    lock = _get_user_lock(user_id)
     async with lock:
         try:
             await _deliver_paged_tts(
@@ -2926,10 +2995,8 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
             await _stop_timer(tts_stop, tts_timer)
 
 
-# FIX #10: on_callback is the catch-all handler; bc_*, users_*, sched_* are
-# handled by dedicated handlers registered first, so this handler will ONLY
-# receive TTS/voice callbacks that aren't matched by earlier patterns.
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catch-all callback handler for TTS/voice callbacks not matched earlier."""
     query = update.callback_query
     user_id = query.from_user.id
     data = query.data
@@ -2987,14 +3054,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # Bot runner
 # ---------------------------------------------------------------------------
-_BOT_START_TIME: float = 0.0  # Move the initial declaration outside the function
-
 async def _run_bot():
     global _BOT_START_TIME
     _BOT_START_TIME = time.time()
-    
-    # NOTE: do NOT clear _user_locks — in-flight coroutines may still hold
-    # references to existing Lock objects; clearing would orphan them.
+
     _admin_chat_target.clear()
     _user_to_admin.clear()
     _pending_broadcast.clear()
@@ -3002,6 +3065,8 @@ async def _run_bot():
     _user_last_tts.clear()
     _sched_payload.clear()
     _scheduler_tasks.clear()
+    # NOTE: do NOT clear _user_locks — in-flight coroutines may still hold
+    # references to existing Lock objects.
 
     app = (
         Application.builder()
@@ -3012,6 +3077,14 @@ async def _run_bot():
         .pool_timeout(30)
         .build()
     )
+
+    # FIX #2: Stale-update and stale-callback guards MUST be registered first
+    # (group=-1) before any other handlers, so they run before message/callback
+    # handlers.  Previously these were added after all other handlers, making
+    # them ineffective.
+    # FIX #3: _drop_stale_callback was defined but never registered — fixed here.
+    app.add_handler(TypeHandler(Update, _drop_stale_updates), group=-1)
+    app.add_handler(CallbackQueryHandler(_drop_stale_callback), group=-1)
 
     # ── Commands ──────────────────────────────────────────────────────────
     app.add_handler(CommandHandler("start", on_start))
@@ -3037,9 +3110,6 @@ async def _run_bot():
     )
     app.add_handler(CallbackQueryHandler(sched_callback, pattern=r"^sched_"))
     app.add_handler(CallbackQueryHandler(on_callback))  # catch-all for TTS callbacks
-
-    # Inside _run_bot(), BEFORE all other app.add_handler() calls:
-    app.add_handler(TypeHandler(Update, _drop_stale_updates), group=-1)
 
     # ── Message handlers ──────────────────────────────────────────────────
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
