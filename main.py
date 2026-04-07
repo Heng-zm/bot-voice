@@ -107,7 +107,7 @@ ADMIN_IDS: set[int] = set()
 # FIX #1: Use a real, available model name as default.
 # "gemini-3.1-pro-preview" does not exist and causes every OCR/transcription
 # call to fail at runtime.  Override via GEMINI_MODEL env var at any time.
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL = "gemini-2.5-pro"
 
 MAX_VOICE_BYTES = 20 * 1024 * 1024
 MAX_INPUT_CHARS = 5_000
@@ -186,7 +186,7 @@ def _init_clients() -> None:
     SB_KEY = os.getenv("SUPABASE_KEY", "")
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
     # FIX #1: default to a model that actually exists.
-    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 
     _raw_admin_ids = os.getenv("ADMIN_IDS", "")
     for _aid in _raw_admin_ids.split(","):
