@@ -2986,10 +2986,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # Bot runner
 # ---------------------------------------------------------------------------
+_BOT_START_TIME: float = 0.0  # Move the initial declaration outside the function
+
 async def _run_bot():
     global _BOT_START_TIME
     _BOT_START_TIME = time.time()
-    _BOT_START_TIME: float = 0.0
+    
     # NOTE: do NOT clear _user_locks — in-flight coroutines may still hold
     # references to existing Lock objects; clearing would orphan them.
     _admin_chat_target.clear()
