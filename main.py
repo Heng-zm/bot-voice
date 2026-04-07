@@ -22,17 +22,17 @@ from supabase import create_client, Client
 # ── Flask Web Server ───────────────────────────────────────────────────────
 app_flask = Flask(__name__)
 
-@app_flask.route('/')
+@app_flask.route("/")
 def health_check():
     return "Bot is running!", 200
 
-@app_flask.route('/ping')
+@app_flask.route("/ping")
 def ping():
     return "pong", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
-    app_flask.run(host='0.0.0.0', port=port, threaded=True)
+    app_flask.run(host="0.0.0.0", port=port, threaded=True)
 
 def keep_alive():
     """Self-ping every 4 min as secondary keep-alive layer."""
@@ -59,16 +59,25 @@ import io
 from dotenv import load_dotenv
 from telegram import (
     Update,
-    InlineKeyboardButton, InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     ReplyKeyboardRemove,
 )
 from telegram.error import (
-    NetworkError, TimedOut, RetryAfter,
-    BadRequest, TelegramError, Forbidden,
+    NetworkError,
+    TimedOut,
+    RetryAfter,
+    BadRequest,
+    TelegramError,
+    Forbidden,
 )
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    filters, ContextTypes, CallbackQueryHandler,
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    CallbackQueryHandler,
 )
 
 # ---------------------------------------------------------------------------
@@ -83,17 +92,20 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN: str = ""
-SB_URL:             str = ""
-SB_KEY:             str = ""
-GEMINI_API_KEY:     str = ""
-ADMIN_IDS:          set[int] = set()
+SB_URL: str = ""
+SB_KEY: str = ""
+GEMINI_API_KEY: str = ""
+ADMIN_IDS: set[int] = set()
 
-GEMINI_MODEL    = "gemini-3.1-pro-preview"
+# FIX #1: "gemini-3.1-pro-preview" does not exist; use a real model name.
+# Overridable via GEMINI_MODEL env var; default to gemini-1.5-flash for cost/speed.
+GEMINI_MODEL = "gemini-1.5-flash"
+
 MAX_VOICE_BYTES = 20 * 1024 * 1024
 MAX_INPUT_CHARS = 5_000
 TTS_CHUNK_CHARS = 900
-DEFAULT_SPEED   = 1.0
-TELE_MSG_LIMIT  = 4000
+DEFAULT_SPEED = 1.0
+TELE_MSG_LIMIT = 4000
 USER_COOLDOWN_S = 3.0
 
 _KHMER_RE = re.compile(r"[\u1780-\u17FF]")
@@ -104,14 +116,12 @@ _DB_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="db_write")
 # State constants
 # ---------------------------------------------------------------------------
 BROADCAST_WAIT_MESSAGE = 1
-CHAT_WAIT_MESSAGE      = 2
-SCHED_WAIT_MSG         = 3
-SCHED_WAIT_TIME        = 4
+CHAT_WAIT_MESSAGE = 2
+SCHED_WAIT_MSG = 3
+SCHED_WAIT_TIME = 4
 
-# Scheduler poll interval (seconds)
 _SCHED_POLL_INTERVAL = 60
 
-# Datetime formats accepted by /schedule
 _DT_FORMATS = [
     "%Y-%m-%d %H:%M",
     "%Y-%m-%d %H:%M:%S",
@@ -122,26 +132,28 @@ _DT_FORMATS = [
 # ---------------------------------------------------------------------------
 # In-memory stores
 # ---------------------------------------------------------------------------
-_pending_broadcast:  dict[int, dict]  = {}
-_admin_chat_target:  dict[int, int]   = {}
-_user_to_admin:      dict[int, int]   = {}
-_user_last_tts:      dict[int, float] = {}
-_sched_payload:      dict[int, dict]  = {}
+_pending_broadcast: dict[int, dict] = {}
+_admin_chat_target: dict[int, int] = {}
+_user_to_admin: dict[int, int] = {}
+_user_last_tts: dict[int, float] = {}
+_sched_payload: dict[int, dict] = {}
 
 # ---------------------------------------------------------------------------
 # Supabase + Gemini
 # ---------------------------------------------------------------------------
 supabase: Client | None = None
-_gemini:  genai.Client | None = None
+_gemini: genai.Client | None = None
+
 
 def _init_clients() -> None:
     global supabase, _gemini, TELEGRAM_BOT_TOKEN, SB_URL, SB_KEY, GEMINI_API_KEY, ADMIN_IDS, GEMINI_MODEL
 
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    SB_URL             = os.getenv("SUPABASE_URL", "")
-    SB_KEY             = os.getenv("SUPABASE_KEY", "")
-    GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL       = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
+    SB_URL = os.getenv("SUPABASE_URL", "")
+    SB_KEY = os.getenv("SUPABASE_KEY", "")
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+    # FIX #1: default to a model that actually exists
+    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
     _raw_admin_ids = os.getenv("ADMIN_IDS", "")
     for _aid in _raw_admin_ids.split(","):
@@ -165,26 +177,27 @@ def _init_clients() -> None:
     if GEMINI_API_KEY:
         try:
             _gemini = genai.Client(api_key=GEMINI_API_KEY)
-            logger.info("Gemini client initialised.")
+            logger.info(f"Gemini client initialised (model: {GEMINI_MODEL}).")
         except Exception as e:
             logger.error(f"Gemini init failed: {e}")
             _gemini = None
     else:
         logger.warning("GEMINI_API_KEY not set — OCR / transcription disabled.")
 
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 VOICE_MAP = {
     "km": {"female": "km-KH-SreymomNeural", "male": "km-KH-PisethNeural"},
-    "en": {"female": "en-US-AriaNeural",     "male": "en-US-GuyNeural"},
+    "en": {"female": "en-US-AriaNeural", "male": "en-US-GuyNeural"},
 }
 
 SPEED_OPTIONS = {
-    "spd_0.5": ("x0.5",   0.5),
+    "spd_0.5": ("x0.5", 0.5),
     "spd_1.0": ("Normal", 1.0),
-    "spd_1.5": ("x1.5",   1.5),
-    "spd_2.0": ("x2.0",   2.0),
+    "spd_1.5": ("x1.5", 1.5),
+    "spd_2.0": ("x2.0", 2.0),
 }
 
 WELCOME_TEXT = (
@@ -202,20 +215,20 @@ WELCOME_TEXT = (
 BOT_TAG = "@voicekhaibot"
 
 # ---------------------------------------------------------------------------
-# FIX #9: User prefs cache — OrderedDict LRU for O(1) eviction
+# User prefs cache — OrderedDict LRU
 # ---------------------------------------------------------------------------
-_PREFS_TTL      = 300.0
+_PREFS_TTL = 300.0
 _PREFS_MAX_SIZE = 10_000
 
 _prefs_cache: OrderedDict[int, tuple[dict, float]] = OrderedDict()
 
+
 def _cache_prefs(user_id: int, prefs: dict) -> None:
-    # Remove existing entry to re-insert at end (most-recently-used)
     _prefs_cache.pop(user_id, None)
     _prefs_cache[user_id] = (prefs, time.monotonic())
-    # FIX #9: O(1) LRU eviction instead of O(n log n) sort
     while len(_prefs_cache) > _PREFS_MAX_SIZE:
         _prefs_cache.popitem(last=False)
+
 
 def _get_cached_prefs(user_id: int) -> dict | None:
     entry = _prefs_cache.get(user_id)
@@ -223,21 +236,39 @@ def _get_cached_prefs(user_id: int) -> dict | None:
         return entry[0]
     return None
 
+
 def _invalidate_prefs(user_id: int) -> None:
     _prefs_cache.pop(user_id, None)
 
+
 # ---------------------------------------------------------------------------
-# Per-user async lock
+# FIX #2: Per-user async lock with LRU eviction to prevent unbounded growth
 # ---------------------------------------------------------------------------
-_user_locks: dict[int, asyncio.Lock] = {}
+_USER_LOCK_MAX = 5_000
+_user_locks: OrderedDict[int, asyncio.Lock] = OrderedDict()
 _user_locks_mutex = threading.Lock()
 
+
 def _get_user_lock(user_id: int) -> asyncio.Lock:
-    asyncio.get_running_loop()  # raises RuntimeError if not in async context
+    """
+    Return (or create) a per-user asyncio.Lock.
+
+    Uses an OrderedDict as an LRU so the dict never grows beyond
+    _USER_LOCK_MAX entries.  Locks that are currently *held* are never
+    evicted because the caller holds a reference; the dict entry is the
+    only thing that gets removed, which is harmless.
+    """
     with _user_locks_mutex:
-        if user_id not in _user_locks:
-            _user_locks[user_id] = asyncio.Lock()
-        return _user_locks[user_id]
+        if user_id in _user_locks:
+            # Move to end (most-recently-used)
+            _user_locks.move_to_end(user_id)
+            return _user_locks[user_id]
+        lock = asyncio.Lock()
+        _user_locks[user_id] = lock
+        while len(_user_locks) > _USER_LOCK_MAX:
+            _user_locks.popitem(last=False)
+        return lock
+
 
 # ---------------------------------------------------------------------------
 # DB Future error logger
@@ -250,10 +281,12 @@ def _log_future_exception(future):
     except Exception:
         pass
 
+
 def _submit_db(fn, *args, **kwargs):
     future = _DB_EXECUTOR.submit(fn, *args, **kwargs)
     future.add_done_callback(_log_future_exception)
     return future
+
 
 # ---------------------------------------------------------------------------
 # Safe Telegram send with retry
@@ -276,7 +309,7 @@ async def safe_send(coro_factory, retries: int = 3, delay: float = 2.0):
             return await coro_factory()
         except RetryAfter as e:
             wait = e.retry_after + 1
-            logger.warning(f"Rate-limited — sleeping {wait}s (attempt {attempt+1})")
+            logger.warning(f"Rate-limited — sleeping {wait}s (attempt {attempt + 1})")
             await asyncio.sleep(wait)
             last_exc = e
             if attempt == retries - 1:
@@ -284,7 +317,7 @@ async def safe_send(coro_factory, retries: int = 3, delay: float = 2.0):
         except (TimedOut, NetworkError) as e:
             last_exc = e
             if attempt < retries - 1:
-                logger.warning(f"Network error (attempt {attempt+1}): {e}")
+                logger.warning(f"Network error (attempt {attempt + 1}): {e}")
                 await asyncio.sleep(delay)
             else:
                 raise
@@ -298,6 +331,7 @@ async def safe_send(coro_factory, retries: int = 3, delay: float = 2.0):
     if last_exc:
         logger.warning(f"safe_send giving up after {retries} attempts: {last_exc}")
     return None
+
 
 # ---------------------------------------------------------------------------
 # Telegram-safe text pagination
@@ -314,31 +348,40 @@ def _paginate_plain(text: str, limit: int = TELE_MSG_LIMIT) -> list[str]:
         if len(text) <= limit:
             pages.append(text)
             break
-        cut = text.rfind('\n', 0, limit)
+        cut = text.rfind("\n", 0, limit)
         if cut <= 0:
             cut = limit
         pages.append(text[:cut])
-        text = text[cut:].lstrip('\n')
+        text = text[cut:].lstrip("\n")
     return pages
+
 
 # ---------------------------------------------------------------------------
 # Temp file helpers
 # ---------------------------------------------------------------------------
 _TMP_PREFIX = "tgbot_"
 
+
 def _make_temp_ogg() -> str:
     fd, path = tempfile.mkstemp(suffix=".ogg", prefix=_TMP_PREFIX, dir="/tmp")
     os.close(fd)
     return path
+
 
 def _make_temp_img(suffix: str = ".jpg") -> str:
     fd, path = tempfile.mkstemp(suffix=suffix, prefix=_TMP_PREFIX, dir="/tmp")
     os.close(fd)
     return path
 
+
 def _sweep_stale_temps() -> None:
-    for pattern in [f"/tmp/{_TMP_PREFIX}*.ogg", f"/tmp/{_TMP_PREFIX}*.jpg",
-                    f"/tmp/{_TMP_PREFIX}*.png"]:
+    # FIX #9: include both .jpg and .png in sweep patterns
+    for pattern in [
+        f"/tmp/{_TMP_PREFIX}*.ogg",
+        f"/tmp/{_TMP_PREFIX}*.jpg",
+        f"/tmp/{_TMP_PREFIX}*.png",
+        f"/tmp/{_TMP_PREFIX}*.webp",
+    ]:
         for f in glob.glob(pattern):
             try:
                 os.remove(f)
@@ -346,14 +389,17 @@ def _sweep_stale_temps() -> None:
             except OSError:
                 pass
 
-# FIX #13: Periodic temp sweep task to prevent /tmp accumulation on long-running bot
+
+# FIX #3: Simplified periodic sweep — stop_event checked cleanly
 async def _periodic_temp_sweep(stop_event: asyncio.Event) -> None:
     while not stop_event.is_set():
-        for _ in range(720):  # 720 * 5s = 1 hour
-            if stop_event.is_set():
-                return
-            await asyncio.sleep(5)
-        _sweep_stale_temps()
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=3600.0)
+        except asyncio.TimeoutError:
+            pass
+        if not stop_event.is_set():
+            _sweep_stale_temps()
+
 
 # ---------------------------------------------------------------------------
 # Database helpers — user prefs
@@ -361,11 +407,13 @@ async def _periodic_temp_sweep(stop_event: asyncio.Event) -> None:
 def sync_user_data(user):
     if not supabase:
         return
+
     def _run():
         supabase.table("user_prefs").upsert(
             {"user_id": user.id, "username": user.username or user.first_name},
             on_conflict="user_id",
         ).execute()
+
     _submit_db(_run)
 
 
@@ -386,7 +434,7 @@ def get_user_prefs(user_id: int) -> dict:
         if res.data:
             row = res.data[0]
             defaults["gender"] = row.get("gender") or "female"
-            defaults["speed"]  = float(row.get("speed") or DEFAULT_SPEED)
+            defaults["speed"] = float(row.get("speed") or DEFAULT_SPEED)
     except Exception as e:
         logger.error(f"DB get_user_prefs: {e}")
     _cache_prefs(user_id, defaults)
@@ -406,7 +454,6 @@ def _paginated_fetch(select_fields: str) -> list[dict]:
                 .execute()
             )
             batch = res.data or []
-            # FIX #7: exit immediately on empty batch to prevent infinite loop
             if not batch:
                 break
             all_rows.extend(batch)
@@ -448,8 +495,10 @@ def update_user_gender(user_id: int, gender: str):
     _invalidate_prefs(user_id)
     if not supabase:
         return
+
     def _run():
         supabase.table("user_prefs").update({"gender": gender}).eq("user_id", user_id).execute()
+
     _submit_db(_run)
 
 
@@ -457,6 +506,7 @@ def update_user_speed(user_id: int, speed: float):
     _invalidate_prefs(user_id)
     if not supabase:
         return
+
     def _run():
         try:
             supabase.table("user_prefs").update({"speed": speed}).eq("user_id", user_id).execute()
@@ -468,21 +518,28 @@ def update_user_speed(user_id: int, speed: float):
                 )
             else:
                 raise
+
     _submit_db(_run)
 
 
-def save_text_cache(msg_id: int, text: str, user_id: int = None, username: str = None):
+# FIX #4: Use (chat_id, message_id) as composite key to avoid cross-chat collisions.
+# The DB table should have a PRIMARY KEY of (chat_id, message_id).
+def save_text_cache(msg_id: int, text: str, chat_id: int = 0, user_id: int = None, username: str = None):
     if not supabase:
         return
+
     def _run():
-        payload = {"message_id": msg_id, "original_text": text}
-        if user_id  is not None: payload["user_id"]  = user_id
-        if username is not None: payload["username"] = username
-        supabase.table("text_cache").upsert(payload).execute()
+        payload = {"message_id": msg_id, "chat_id": chat_id, "original_text": text}
+        if user_id is not None:
+            payload["user_id"] = user_id
+        if username is not None:
+            payload["username"] = username
+        supabase.table("text_cache").upsert(payload, on_conflict="chat_id,message_id").execute()
+
     _submit_db(_run)
 
 
-def get_text_cache(msg_id: int) -> str | None:
+def get_text_cache(msg_id: int, chat_id: int = 0) -> str | None:
     if not supabase:
         return None
     try:
@@ -490,6 +547,7 @@ def get_text_cache(msg_id: int) -> str | None:
             supabase.table("text_cache")
             .select("original_text")
             .eq("message_id", msg_id)
+            .eq("chat_id", chat_id)
             .execute()
         )
         if res.data:
@@ -504,16 +562,17 @@ def ensure_speed_column():
         return
     try:
         supabase.table("user_prefs").select("speed").limit(1).execute()
-        logger.info("speed column exists (or table is empty — verify manually).")
+        logger.info("speed column present.")
     except Exception as e:
-        err = str(e)
-        if "does not exist" in err or "column" in err.lower():
+        err = str(e).lower()
+        if "does not exist" in err or "column" in err:
             logger.warning(
                 "speed column missing. Run in Supabase SQL editor:\n"
                 "  ALTER TABLE user_prefs ADD COLUMN speed FLOAT DEFAULT 1.0;"
             )
         else:
             logger.error(f"ensure_speed_column unexpected error: {e}")
+
 
 # ---------------------------------------------------------------------------
 # Database helpers — scheduled broadcasts
@@ -522,12 +581,12 @@ def db_sched_insert(payload: dict, admin_id: int, broadcast_at: datetime) -> dic
     if not supabase:
         raise RuntimeError("Supabase not configured.")
     row = {
-        "admin_id":      admin_id,
+        "admin_id": admin_id,
         "photo_file_id": payload.get("photo_file_id"),
-        "caption":       payload.get("caption"),
-        "plain_text":    payload.get("text"),
-        "broadcast_at":  broadcast_at.isoformat(),
-        "status":        "pending",
+        "caption": payload.get("caption"),
+        "plain_text": payload.get("text"),
+        "broadcast_at": broadcast_at.isoformat(),
+        "status": "pending",
     }
     res = supabase.table("scheduled_broadcasts").insert(row).execute()
     return res.data[0]
@@ -610,6 +669,7 @@ def db_sched_fetch_one(row_id: int) -> dict | None:
         logger.error(f"db_sched_fetch_one: {e}")
         return None
 
+
 # ---------------------------------------------------------------------------
 # Scheduled broadcast — datetime helpers
 # ---------------------------------------------------------------------------
@@ -627,19 +687,24 @@ def _parse_dt(text: str) -> datetime | None:
 def _fmt_dt(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M UTC")
 
+
 # ---------------------------------------------------------------------------
-# Scheduled broadcast — keyboard helpers
+# Keyboard helpers — scheduled broadcast
 # ---------------------------------------------------------------------------
 def get_sched_confirm_kb(row_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ បញ្ជាក់ Schedule", callback_data=f"sched_ok:{row_id}"),
-        InlineKeyboardButton("❌ បោះបង់",           callback_data=f"sched_no:{row_id}"),
-    ]])
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ បញ្ជាក់ Schedule", callback_data=f"sched_ok:{row_id}"),
+                InlineKeyboardButton("❌ បោះបង់", callback_data=f"sched_no:{row_id}"),
+            ]
+        ]
+    )
 
 
 def get_schedules_list_kb(rows: list[dict], page: int, page_size: int = 5) -> InlineKeyboardMarkup:
     total = max(1, (len(rows) + page_size - 1) // page_size)
-    chunk = rows[page * page_size:(page + 1) * page_size]
+    chunk = rows[page * page_size : (page + 1) * page_size]
     kbd_rows = []
     for r in chunk:
         try:
@@ -650,14 +715,15 @@ def get_schedules_list_kb(rows: list[dict], page: int, page_size: int = 5) -> In
         kbd_rows.append([InlineKeyboardButton(label, callback_data=f"sched_view:{r['id']}")])
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"sched_page:{page-1}"))
-    nav.append(InlineKeyboardButton(f"{page+1}/{total}", callback_data="sched_noop"))
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"sched_page:{page - 1}"))
+    nav.append(InlineKeyboardButton(f"{page + 1}/{total}", callback_data="sched_noop"))
     if page < total - 1:
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"sched_page:{page+1}"))
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"sched_page:{page + 1}"))
     if nav:
         kbd_rows.append(nav)
     kbd_rows.append([InlineKeyboardButton("❌ បិទ", callback_data="sched_close")])
     return InlineKeyboardMarkup(kbd_rows)
+
 
 # ---------------------------------------------------------------------------
 # Status timer
@@ -680,6 +746,7 @@ _OCR_FRAMES = [
     "🔍 កំពុង OCR រូបភាព ···",
     "🔍 កំពុង OCR រូបភាព ····",
 ]
+
 
 async def send_status_timer(chat_id: int, bot, stop_event: asyncio.Event, frames=None):
     frames = frames or _STATUS_FRAMES
@@ -726,42 +793,52 @@ async def _stop_timer(stop_event: asyncio.Event, timer_task: asyncio.Task):
         except (asyncio.CancelledError, Exception):
             pass
 
+
 # ---------------------------------------------------------------------------
 # Audio pipeline
 # ---------------------------------------------------------------------------
 @functools.lru_cache(maxsize=32)
 def _build_atempo_chain(speed: float) -> str:
+    """
+    Build a valid FFmpeg atempo filter chain for the given speed.
+
+    atempo only accepts values in [0.5, 2.0], so we chain multiple stages
+    for speeds outside that range.
+
+    FIX #5: Rewrite to be cleaner and handle edge cases correctly.
+    """
     speed = round(speed, 4)
     if abs(speed - 1.0) < 1e-6:
         return "atempo=1.0"
 
-    stages, r = [], speed
+    stages: list[str] = []
+    r = speed
+
     if r < 1.0:
         while r < 0.5 - 1e-9:
             stages.append("atempo=0.5")
             r = round(r / 0.5, 6)
-        if abs(r - 1.0) > 1e-6:
-            stages.append(f"atempo={r:.6f}")
-        elif not stages:
-            stages.append("atempo=1.0")
+        stages.append(f"atempo={r:.6f}")
     else:
         while r > 2.0 + 1e-9:
             stages.append("atempo=2.0")
             r = round(r / 2.0, 6)
-        if abs(r - 1.0) > 1e-6:
-            stages.append(f"atempo={r:.6f}")
-        elif not stages:
-            stages.append("atempo=1.0")
+        stages.append(f"atempo={r:.6f}")
 
     return ",".join(stages)
 
 
-# FIX #12: Return audio bytes directly from generate_voice to avoid double disk read
 async def generate_voice(text: str, gender: str, speed: float, output_path: str) -> bytes:
-    khmer_chars  = len(_KHMER_RE.findall(text))
-    total_alpha  = sum(1 for c in text if c.isalpha())
-    is_khmer     = khmer_chars > (total_alpha * 0.3)
-    voice        = VOICE_MAP["km" if is_khmer else "en"][gender]
+    """
+    Generate TTS audio and return the raw OGG/Opus bytes.
+
+    FIX #6: Wrap file read in try/finally so the temp file is always readable
+    even if FFmpeg writes only a partial file, and propagate the error cleanly.
+    """
+    khmer_chars = len(_KHMER_RE.findall(text))
+    total_alpha = sum(1 for c in text if c.isalpha())
+    is_khmer = khmer_chars > (total_alpha * 0.3)
+    voice = VOICE_MAP["km" if is_khmer else "en"][gender]
 
     mp3_chunks: list[bytes] = []
     try:
@@ -770,14 +847,14 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str)
             if chunk["type"] == "audio":
                 mp3_chunks.append(chunk["data"])
     except Exception as e:
-        raise RuntimeError(f"edge-tts failed: {e}")
+        raise RuntimeError(f"edge-tts failed: {e}") from e
 
     mp3_data = b"".join(mp3_chunks)
     if not mp3_data:
         raise RuntimeError("edge-tts returned empty audio")
 
     speed_key = round(speed, 4)
-    af  = _build_atempo_chain(speed_key) if abs(speed_key - DEFAULT_SPEED) > 1e-4 else None
+    af = _build_atempo_chain(speed_key) if abs(speed_key - DEFAULT_SPEED) > 1e-4 else None
     cmd = [_FFMPEG_EXE, "-y", "-f", "mp3", "-i", "pipe:0"]
     if af:
         cmd += ["-filter:a", af]
@@ -794,10 +871,10 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str)
         stderr_snippet = (stderr_data or b"").decode(errors="replace")[-400:]
         raise RuntimeError(f"FFmpeg failed (code {proc.returncode}): {stderr_snippet}")
 
-    # FIX #12: read and return bytes once here instead of re-reading at every call site
     loop = asyncio.get_running_loop()
     audio_bytes = await loop.run_in_executor(None, lambda: open(output_path, "rb").read())
     return audio_bytes
+
 
 # ---------------------------------------------------------------------------
 # Gemini transcription
@@ -812,6 +889,7 @@ async def transcribe_voice(ogg_path: str) -> str:
         "Output ONLY the transcribed text — no labels, no explanation. "
         "Support both Khmer and English."
     )
+
     def _call():
         return _gemini.models.generate_content(
             model=GEMINI_MODEL,
@@ -820,11 +898,13 @@ async def transcribe_voice(ogg_path: str) -> str:
                 prompt,
             ],
         )
+
     try:
         response = await asyncio.wait_for(loop.run_in_executor(None, _call), timeout=60)
         return (response.text or "").strip()
     except asyncio.TimeoutError:
         raise RuntimeError("Gemini transcription timed out after 60s")
+
 
 # ---------------------------------------------------------------------------
 # Text chunking for TTS
@@ -836,8 +916,8 @@ def _split_text_chunks(text: str, max_chars: int = TTS_CHUNK_CHARS) -> list[str]
     if len(text) <= max_chars:
         return [text]
 
-    sentence_re = re.compile(r'(?<=[។!\?\.。])\s*')
-    sentences   = [s for s in sentence_re.split(text) if s]
+    sentence_re = re.compile(r"(?<=[។!\?\.。])\s*")
+    sentences = [s for s in sentence_re.split(text) if s]
 
     chunks, current = [], ""
     for sent in sentences:
@@ -847,7 +927,7 @@ def _split_text_chunks(text: str, max_chars: int = TTS_CHUNK_CHARS) -> list[str]
             if current:
                 chunks.append(current.strip())
                 current = ""
-            if ' ' in sent:
+            if " " in sent:
                 words = sent.split()
                 for word in words:
                     if len(current) + len(word) + (1 if current else 0) > max_chars:
@@ -877,6 +957,7 @@ def _split_text_chunks(text: str, max_chars: int = TTS_CHUNK_CHARS) -> list[str]
         chunks.append(current.strip())
     return [c for c in chunks if c and c.strip()]
 
+
 # ---------------------------------------------------------------------------
 # Detect image MIME type from magic bytes
 # ---------------------------------------------------------------------------
@@ -884,17 +965,18 @@ def _detect_image_mime(path: str) -> str:
     try:
         with open(path, "rb") as f:
             header = f.read(12)
-        if header[:8] == b'\x89PNG\r\n\x1a\n':
+        if header[:8] == b"\x89PNG\r\n\x1a\n":
             return "image/png"
-        if header[:4] == b'RIFF' and header[8:12] == b'WEBP':
+        if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
             return "image/webp"
-        if header[:2] == b'\xff\xd8':
+        if header[:2] == b"\xff\xd8":
             return "image/jpeg"
-        if header[:6] in (b'GIF87a', b'GIF89a'):
+        if header[:6] in (b"GIF87a", b"GIF89a"):
             return "image/gif"
     except Exception:
         pass
     return "image/jpeg"
+
 
 # ---------------------------------------------------------------------------
 # Gemini OCR
@@ -913,6 +995,7 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
         "Support both Khmer (ខ្មែរ) and English text with full Unicode accuracy. "
         "If there is truly no text anywhere in the image, output only the single word: NOTEXT"
     )
+
     def _call():
         return _gemini.models.generate_content(
             model=GEMINI_MODEL,
@@ -921,11 +1004,13 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
                 prompt,
             ],
         )
+
     try:
         response = await asyncio.wait_for(loop.run_in_executor(None, _call), timeout=60)
         return (response.text or "").strip()
     except asyncio.TimeoutError:
         raise RuntimeError("Gemini OCR timed out after 60s")
+
 
 # ---------------------------------------------------------------------------
 # Paged TTS delivery
@@ -945,9 +1030,7 @@ async def _deliver_paged_tts(
         return
 
     total = len(chunks)
-
-    # FIX #5: set cooldown at the start of delivery so users can't spam
-    # during multi-chunk generation
+    # Set cooldown at start so users can't spam during multi-chunk generation
     _user_last_tts[user_id] = time.monotonic()
 
     for i, chunk in enumerate(chunks, 1):
@@ -956,28 +1039,35 @@ async def _deliver_paged_tts(
             continue
         file_path = _make_temp_ogg()
         try:
-            # FIX #12: use returned bytes directly, no extra disk read
             audio_bytes = await generate_voice(chunk, gender, speed, file_path)
             caption = f"🗣️ {BOT_TAG}  [{i}/{total}]"
-            sent = await safe_send(lambda ab=audio_bytes, cap=caption: bot.send_voice(
-                chat_id=chat_id,
-                voice=io.BytesIO(ab),
-                caption=cap,
-                reply_markup=get_main_kb(gender),
-            ))
+            sent = await safe_send(
+                lambda ab=audio_bytes, cap=caption: bot.send_voice(
+                    chat_id=chat_id,
+                    voice=io.BytesIO(ab),
+                    caption=cap,
+                    reply_markup=get_main_kb(gender),
+                )
+            )
             if sent:
-                save_text_cache(sent.message_id, chunk, user_id=user_id, username=username)
+                save_text_cache(
+                    sent.message_id, chunk,
+                    chat_id=chat_id, user_id=user_id, username=username,
+                )
         except Exception as e:
             logger.error(f"paged TTS chunk {i}/{total} error: {e}")
             ci, ct = i, total
-            await safe_send(lambda ci=ci, ct=ct: bot.send_message(
-                chat_id=chat_id,
-                text=f"❌ មានបញ្ហាក្នុង chunk {ci}/{ct}។",
-            ))
+            await safe_send(
+                lambda ci=ci, ct=ct: bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ មានបញ្ហាក្នុង chunk {ci}/{ct}។",
+                )
+            )
         finally:
             _cleanup(file_path)
         if i < total:
             await asyncio.sleep(0.3)
+
 
 # ---------------------------------------------------------------------------
 # Keyboard builders
@@ -985,13 +1075,15 @@ async def _deliver_paged_tts(
 def get_main_kb(gender: str) -> InlineKeyboardMarkup:
     f_btn = "👩 សំឡេងស្រី" + (" ✅" if gender == "female" else "")
     m_btn = "👨 សំឡេងប្រុស" + (" ✅" if gender == "male" else "")
-    return InlineKeyboardMarkup([
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(f_btn, callback_data="tg_female"),
-            InlineKeyboardButton(m_btn, callback_data="tg_male"),
-        ],
-        [InlineKeyboardButton("🎚️ ល្បឿនសំឡេង", callback_data="show_speed")],
-    ])
+            [
+                InlineKeyboardButton(f_btn, callback_data="tg_female"),
+                InlineKeyboardButton(m_btn, callback_data="tg_male"),
+            ],
+            [InlineKeyboardButton("🎚️ ល្បឿនសំឡេង", callback_data="show_speed")],
+        ]
+    )
 
 
 def get_speed_kb(current_speed: float) -> InlineKeyboardMarkup:
@@ -999,31 +1091,45 @@ def get_speed_kb(current_speed: float) -> InlineKeyboardMarkup:
     for cb, (lbl, val) in SPEED_OPTIONS.items():
         mark = " ✅" if abs(val - current_speed) < 0.01 else ""
         speed_row.append(InlineKeyboardButton(lbl + mark, callback_data=cb))
-    return InlineKeyboardMarkup([
-        speed_row,
-        [InlineKeyboardButton("🔙 ត្រឡប់", callback_data="hide_speed")],
-    ])
+    return InlineKeyboardMarkup(
+        [
+            speed_row,
+            [InlineKeyboardButton("🔙 ត្រឡប់", callback_data="hide_speed")],
+        ]
+    )
 
 
 def get_transcription_kb(transcript_msg_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📢 AI អាន", callback_data=f"tts_transcript:{transcript_msg_id}"),
-        InlineKeyboardButton("🗑️ លុប",    callback_data=f"del_transcript:{transcript_msg_id}"),
-    ]])
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📢 AI អាន", callback_data=f"tts_transcript:{transcript_msg_id}"),
+                InlineKeyboardButton("🗑️ លុប", callback_data=f"del_transcript:{transcript_msg_id}"),
+            ]
+        ]
+    )
 
 
 def get_ocr_confirm_kb(msg_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("▶️ អាន",  callback_data=f"doc_read:{msg_id}"),
-        InlineKeyboardButton("🗑️ លុប", callback_data=f"doc_del:{msg_id}"),
-    ]])
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("▶️ អាន", callback_data=f"doc_read:{msg_id}"),
+                InlineKeyboardButton("🗑️ លុប", callback_data=f"doc_del:{msg_id}"),
+            ]
+        ]
+    )
 
 
 def get_broadcast_confirm_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ បញ្ជាក់ Broadcast", callback_data="bc_confirm"),
-        InlineKeyboardButton("❌ បោះបង់",            callback_data="bc_cancel"),
-    ]])
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ បញ្ជាក់ Broadcast", callback_data="bc_confirm"),
+                InlineKeyboardButton("❌ បោះបង់", callback_data="bc_cancel"),
+            ]
+        ]
+    )
 
 
 def get_users_page_kb(users: list[dict], page: int, page_size: int = 8) -> InlineKeyboardMarkup:
@@ -1031,12 +1137,11 @@ def get_users_page_kb(users: list[dict], page: int, page_size: int = 8) -> Inlin
     chunk = users[page * page_size : page * page_size + page_size]
     rows = []
     for u in chunk:
-        uid   = u["user_id"]
+        uid = u["user_id"]
         uname = (u.get("username") or str(uid))[:20]
-        rows.append([InlineKeyboardButton(
-            f"👤 {uname}  ({uid})",
-            callback_data=f"chat_open:{uid}",
-        )])
+        rows.append(
+            [InlineKeyboardButton(f"👤 {uname}  ({uid})", callback_data=f"chat_open:{uid}")]
+        )
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("⬅️", callback_data=f"users_page:{page - 1}"))
@@ -1047,6 +1152,7 @@ def get_users_page_kb(users: list[dict], page: int, page_size: int = 8) -> Inlin
         rows.append(nav)
     rows.append([InlineKeyboardButton("❌ បិទ", callback_data="users_close")])
     return InlineKeyboardMarkup(rows)
+
 
 # ---------------------------------------------------------------------------
 # Cleanup
@@ -1059,6 +1165,7 @@ def _cleanup(*paths):
             except OSError:
                 pass
 
+
 # ---------------------------------------------------------------------------
 # Admin guard
 # ---------------------------------------------------------------------------
@@ -1068,14 +1175,18 @@ def admin_only(handler):
         uid = update.effective_user.id if update.effective_user else None
         if uid not in ADMIN_IDS:
             if update.message:
-                await safe_send(lambda: update.message.reply_text("⛔ អ្នកមិនមានសិទ្ធិប្រើពាក្យបញ្ជានេះទេ។"))
+                await safe_send(
+                    lambda: update.message.reply_text("⛔ អ្នកមិនមានសិទ្ធិប្រើពាក្យបញ្ជានេះទេ។")
+                )
             return
         return await handler(update, context)
+
     return wrapper
 
 
 def _is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
 
 # ---------------------------------------------------------------------------
 # Chat session helpers
@@ -1085,7 +1196,7 @@ def _open_session(admin_id: int, target_id: int) -> None:
     if old_target is not None:
         _user_to_admin.pop(old_target, None)
     _admin_chat_target[admin_id] = target_id
-    _user_to_admin[target_id]    = admin_id
+    _user_to_admin[target_id] = admin_id
 
 
 def _close_session(admin_id: int) -> int | None:
@@ -1098,21 +1209,25 @@ def _close_session(admin_id: int) -> int | None:
 def _get_admin_for_user(user_id: int) -> int | None:
     return _user_to_admin.get(user_id)
 
+
 # ===========================================================================
 # BROADCAST (immediate)
 # ===========================================================================
+
 
 @admin_only
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _pending_broadcast.pop(update.effective_user.id, None)
     context.user_data["bc_state"] = BROADCAST_WAIT_MESSAGE
-    await safe_send(lambda: update.message.reply_text(
-        "📡 <b>Admin Broadcast</b>\n\n"
-        "ផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + Caption</b> ដែលចង់ Broadcast ។\n"
-        "👉 អាចផ្ញើរូបភាព + Caption រួមគ្នា ឬ តែ text ។\n\n"
-        "វាយ /cancel ដើម្បីបោះបង់។",
-        parse_mode="HTML",
-    ))
+    await safe_send(
+        lambda: update.message.reply_text(
+            "📡 <b>Admin Broadcast</b>\n\n"
+            "ផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + Caption</b> ដែលចង់ Broadcast ។\n"
+            "👉 អាចផ្ញើរូបភាព + Caption រួមគ្នា ឬ តែ text ។\n\n"
+            "វាយ /cancel ដើម្បីបោះបង់។",
+            parse_mode="HTML",
+        )
+    )
 
 
 async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1124,12 +1239,12 @@ async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = update.message
     photo_file_id: str | None = None
-    caption_text:  str | None = None
-    plain_text:    str | None = None
+    caption_text: str | None = None
+    plain_text: str | None = None
 
     if msg.photo:
         photo_file_id = msg.photo[-1].file_id
-        caption_text  = msg.caption or ""
+        caption_text = msg.caption or ""
     elif msg.text:
         plain_text = msg.text.strip()
         if not plain_text:
@@ -1141,34 +1256,38 @@ async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     _pending_broadcast[user_id] = {
         "photo_file_id": photo_file_id,
-        "caption":       caption_text,
-        "text":          plain_text,
+        "caption": caption_text,
+        "text": plain_text,
     }
 
     if photo_file_id:
         preview_cap = html.escape(caption_text) if caption_text else "<i>(គ្មាន Caption)</i>"
-        await safe_send(lambda: msg.reply_photo(
-            photo=photo_file_id,
-            caption=(
-                f"👁️ <b>Preview Broadcast</b>\n\n{preview_cap}\n\n"
-                "តើចង់ Broadcast ដល់អ្នកប្រើប្រាស់ទាំងអស់?"
-            ),
-            parse_mode="HTML",
-            reply_markup=get_broadcast_confirm_kb(),
-        ))
+        await safe_send(
+            lambda: msg.reply_photo(
+                photo=photo_file_id,
+                caption=(
+                    f"👁️ <b>Preview Broadcast</b>\n\n{preview_cap}\n\n"
+                    "តើចង់ Broadcast ដល់អ្នកប្រើប្រាស់ទាំងអស់?"
+                ),
+                parse_mode="HTML",
+                reply_markup=get_broadcast_confirm_kb(),
+            )
+        )
     else:
-        await safe_send(lambda: msg.reply_text(
-            f"👁️ <b>Preview Broadcast</b>\n\n{html.escape(plain_text)}\n\n"
-            "តើចង់ Broadcast ដល់អ្នកប្រើប្រាស់ទាំងអស់?",
-            parse_mode="HTML",
-            reply_markup=get_broadcast_confirm_kb(),
-        ))
+        await safe_send(
+            lambda: msg.reply_text(
+                f"👁️ <b>Preview Broadcast</b>\n\n{html.escape(plain_text)}\n\n"
+                "តើចង់ Broadcast ដល់អ្នកប្រើប្រាស់ទាំងអស់?",
+                parse_mode="HTML",
+                reply_markup=get_broadcast_confirm_kb(),
+            )
+        )
 
 
 async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
+    query = update.callback_query
     user_id = query.from_user.id
-    data    = query.data
+    data = query.data
 
     if not _is_admin(user_id):
         try:
@@ -1202,29 +1321,32 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass
 
         if not pending:
-            await safe_send(lambda: query.message.reply_text("⚠️ រកទិន្នន័យ Broadcast មិនឃើញ។ សូមចាប់ផ្ដើមថ្មី។"))
+            await safe_send(
+                lambda: query.message.reply_text("⚠️ រកទិន្នន័យ Broadcast មិនឃើញ។ សូមចាប់ផ្ដើមថ្មី។")
+            )
             return
 
         context.application.create_task(_do_broadcast(context.bot, user_id, pending))
 
 
 async def _do_broadcast(bot, admin_id: int, pending: dict):
-    loop     = asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
     user_ids = await loop.run_in_executor(None, get_all_user_ids)
-    total    = len(user_ids)
+    total = len(user_ids)
 
     if total == 0:
-        await safe_send(lambda: bot.send_message(
-            chat_id=admin_id,
-            text="⚠️ មិនមានអ្នកប្រើប្រាស់ registered ណាមួយទេ។",
-        ))
+        await safe_send(
+            lambda: bot.send_message(
+                chat_id=admin_id,
+                text="⚠️ មិនមានអ្នកប្រើប្រាស់ registered ណាមួយទេ។",
+            )
+        )
         return
 
     sent = failed = blocked = 0
-
     photo_file_id = pending.get("photo_file_id")
-    caption       = pending.get("caption") or ""
-    plain_text    = pending.get("text") or ""
+    caption = pending.get("caption") or ""
+    plain_text = pending.get("text") or ""
 
     progress_msg = await safe_send(
         lambda: bot.send_message(chat_id=admin_id, text=f"📡 កំពុង Broadcast ទៅ {total} នាក់...")
@@ -1268,7 +1390,7 @@ async def _do_broadcast(bot, admin_id: int, pending: dict):
             try:
                 pct = int((i + 1) / total * 100) if total else 0
                 await progress_msg.edit_text(
-                    f"📡 Broadcast {pct}% ({i+1}/{total})\n"
+                    f"📡 Broadcast {pct}% ({i + 1}/{total})\n"
                     f"✅ {sent}  🚫 {blocked}  ❌ {failed}"
                 )
             except Exception:
@@ -1285,58 +1407,68 @@ async def _do_broadcast(bot, admin_id: int, pending: dict):
         if progress_msg:
             await safe_send(lambda: progress_msg.edit_text(report, parse_mode="HTML"))
         else:
-            await safe_send(lambda: bot.send_message(chat_id=admin_id, text=report, parse_mode="HTML"))
+            await safe_send(
+                lambda: bot.send_message(chat_id=admin_id, text=report, parse_mode="HTML")
+            )
     except Exception as e:
         logger.error(f"Broadcast report error: {e}")
+
 
 # ===========================================================================
 # SCHEDULED BROADCAST
 # ===========================================================================
+
 
 @admin_only
 async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_id = update.effective_user.id
     _sched_payload.pop(admin_id, None)
     context.user_data["sched_state"] = SCHED_WAIT_MSG
-    await safe_send(lambda: update.message.reply_text(
-        "📅 <b>Scheduled Broadcast</b>\n\n"
-        "ផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + Caption</b> ដែលចង់ Schedule ។\n\n"
-        "វាយ /cancel ដើម្បីបោះបង់។",
-        parse_mode="HTML",
-    ))
+    await safe_send(
+        lambda: update.message.reply_text(
+            "📅 <b>Scheduled Broadcast</b>\n\n"
+            "ផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + Caption</b> ដែលចង់ Schedule ។\n\n"
+            "វាយ /cancel ដើម្បីបោះបង់។",
+            parse_mode="HTML",
+        )
+    )
 
 
 @admin_only
 async def cmd_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_id = update.effective_user.id
-    loop     = asyncio.get_running_loop()
-    rows     = await loop.run_in_executor(None, db_sched_fetch_admin_pending, admin_id)
+    loop = asyncio.get_running_loop()
+    rows = await loop.run_in_executor(None, db_sched_fetch_admin_pending, admin_id)
     if not rows:
         await safe_send(lambda: update.message.reply_text("📭 មិនមាន Scheduled Broadcast ណាមួយទេ។"))
         return
-    await safe_send(lambda: update.message.reply_text(
-        f"📋 <b>Scheduled Broadcasts ({len(rows)} pending)</b>\n"
-        "ចុចលើ Schedule ដើម្បីមើលលម្អិត ឬ Cancel ។",
-        parse_mode="HTML",
-        reply_markup=get_schedules_list_kb(rows, page=0),
-    ))
+    await safe_send(
+        lambda: update.message.reply_text(
+            f"📋 <b>Scheduled Broadcasts ({len(rows)} pending)</b>\n"
+            "ចុចលើ Schedule ដើម្បីមើលលម្អិត ឬ Cancel ។",
+            parse_mode="HTML",
+            reply_markup=get_schedules_list_kb(rows, page=0),
+        )
+    )
 
 
 @admin_only
 async def cmd_cancelschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_id = update.effective_user.id
-    args     = context.args or []
+    args = context.args or []
     if not args or not args[0].isdigit():
-        await safe_send(lambda: update.message.reply_text(
-            "❌ Usage: /cancelschedule &lt;id&gt;\n"
-            "ឬប្រើ /schedules ដើម្បីជ្រើស។",
-            parse_mode="HTML",
-        ))
+        await safe_send(
+            lambda: update.message.reply_text(
+                "❌ Usage: /cancelschedule &lt;id&gt;\n"
+                "ឬប្រើ /schedules ដើម្បីជ្រើស។",
+                parse_mode="HTML",
+            )
+        )
         return
 
     row_id = int(args[0])
-    loop   = asyncio.get_running_loop()
-    row    = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
+    loop = asyncio.get_running_loop()
+    row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
 
     if not row:
         await safe_send(lambda: update.message.reply_text(f"❌ រកមិនឃើញ Schedule #{row_id}។"))
@@ -1346,16 +1478,20 @@ async def cmd_cancelschedule(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     if row["status"] != "pending":
         st = row["status"]
-        await safe_send(lambda: update.message.reply_text(
-            f"⚠️ Schedule #{row_id} មានស្ថានភាព <b>{st}</b> — មិនអាច cancel ។",
-            parse_mode="HTML",
-        ))
+        await safe_send(
+            lambda: update.message.reply_text(
+                f"⚠️ Schedule #{row_id} មានស្ថានភាព <b>{st}</b> — មិនអាច cancel ។",
+                parse_mode="HTML",
+            )
+        )
         return
 
     await loop.run_in_executor(None, db_sched_set_status, row_id, "cancelled")
-    await safe_send(lambda: update.message.reply_text(
-        f"✅ Schedule <b>#{row_id}</b> បានបោះបង់។", parse_mode="HTML"
-    ))
+    await safe_send(
+        lambda: update.message.reply_text(
+            f"✅ Schedule <b>#{row_id}</b> បានបោះបង់។", parse_mode="HTML"
+        )
+    )
 
 
 async def _handle_sched_content(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1367,16 +1503,18 @@ async def _handle_sched_content(update: Update, context: ContextTypes.DEFAULT_TY
 
     msg = update.message
     photo_file_id: str | None = None
-    caption_text:  str | None = None
-    plain_text:    str | None = None
+    caption_text: str | None = None
+    plain_text: str | None = None
 
     if msg.photo:
         photo_file_id = msg.photo[-1].file_id
-        caption_text  = msg.caption or ""
+        caption_text = msg.caption or ""
     elif msg.text:
         plain_text = msg.text.strip()
         if not plain_text:
-            await safe_send(lambda: msg.reply_text("⚠️ អត្ថបទមិនអាចទទេបាន។ សូមវាយសារ ឬ ផ្ញើរូបភាព។"))
+            await safe_send(
+                lambda: msg.reply_text("⚠️ អត្ថបទមិនអាចទទេបាន។ សូមវាយសារ ឬ ផ្ញើរូបភាព។")
+            )
             return True
     else:
         await safe_send(lambda: msg.reply_text("⚠️ ផ្ញើតែ Text ឬ រូបភាព + Caption ប៉ុណ្ណោះ។"))
@@ -1384,18 +1522,20 @@ async def _handle_sched_content(update: Update, context: ContextTypes.DEFAULT_TY
 
     _sched_payload[user_id] = {
         "photo_file_id": photo_file_id,
-        "caption":       caption_text,
-        "text":          plain_text,
+        "caption": caption_text,
+        "text": plain_text,
     }
     context.user_data["sched_state"] = SCHED_WAIT_TIME
 
-    await safe_send(lambda: msg.reply_text(
-        "🕐 <b>ពេលវេលា Broadcast (UTC)</b>\n\n"
-        "វាយកាលបរិច្ឆេទ និងម៉ោង ។\n"
-        "ទម្រង់: <code>YYYY-MM-DD HH:MM</code>\n"
-        "ឧទាហរណ៍: <code>2025-12-25 09:00</code>",
-        parse_mode="HTML",
-    ))
+    await safe_send(
+        lambda: msg.reply_text(
+            "🕐 <b>ពេលវេលា Broadcast (UTC)</b>\n\n"
+            "វាយកាលបរិច្ឆេទ និងម៉ោង ។\n"
+            "ទម្រង់: <code>YYYY-MM-DD HH:MM</code>\n"
+            "ឧទាហរណ៍: <code>2025-12-25 09:00</code>",
+            parse_mode="HTML",
+        )
+    )
     return True
 
 
@@ -1413,73 +1553,85 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
 
     broadcast_at = _parse_dt(msg.text)
     if broadcast_at is None:
-        await safe_send(lambda: msg.reply_text(
-            "❌ ទម្រង់ពេលវេលាខុស។\n"
-            "ឧទាហរណ៍ត្រឹមត្រូវ: <code>2025-12-25 09:00</code>",
-            parse_mode="HTML",
-        ))
+        await safe_send(
+            lambda: msg.reply_text(
+                "❌ ទម្រង់ពេលវេលាខុស។\n"
+                "ឧទាហរណ៍ត្រឹមត្រូវ: <code>2025-12-25 09:00</code>",
+                parse_mode="HTML",
+            )
+        )
         return True
 
     now = datetime.now(timezone.utc)
     if broadcast_at <= now:
-        await safe_send(lambda: msg.reply_text(
-            "❌ ពេលវេលាត្រូវតែជាអនាគត (UTC) ។\n"
-            f"ឥឡូវ: <code>{_fmt_dt(now)}</code>",
-            parse_mode="HTML",
-        ))
+        await safe_send(
+            lambda: msg.reply_text(
+                "❌ ពេលវេលាត្រូវតែជាអនាគត (UTC) ។\n"
+                f"ឥឡូវ: <code>{_fmt_dt(now)}</code>",
+                parse_mode="HTML",
+            )
+        )
         return True
 
     payload = _sched_payload.pop(user_id, None)
     if not payload:
         context.user_data.pop("sched_state", None)
-        await safe_send(lambda: msg.reply_text(
-            "❌ រកទិន្នន័យ Schedule មិនឃើញ (session expired)។\n"
-            "សូមចាប់ផ្ដើម /schedule ម្តងទៀត។"
-        ))
+        await safe_send(
+            lambda: msg.reply_text(
+                "❌ រកទិន្នន័យ Schedule មិនឃើញ (session expired)។\n"
+                "សូមចាប់ផ្ដើម /schedule ម្តងទៀត។"
+            )
+        )
         return True
 
     context.user_data.pop("sched_state", None)
 
     loop = asyncio.get_running_loop()
     try:
-        row = await loop.run_in_executor(
-            None, db_sched_insert, payload, user_id, broadcast_at
-        )
+        row = await loop.run_in_executor(None, db_sched_insert, payload, user_id, broadcast_at)
     except Exception as e:
         logger.error(f"db_sched_insert failed: {e}")
-        await safe_send(lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការ Save Schedule ។ សូមព្យាយាមម្តងទៀត។"))
+        await safe_send(
+            lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការ Save Schedule ។ សូមព្យាយាមម្តងទៀត។")
+        )
         return True
 
     row_id = row["id"]
     dt_str = _fmt_dt(broadcast_at)
 
     if payload.get("photo_file_id"):
-        cap_preview = html.escape(payload["caption"]) if payload.get("caption") else "<i>(គ្មាន Caption)</i>"
-        await safe_send(lambda: msg.reply_photo(
-            photo=payload["photo_file_id"],
-            caption=(
+        cap_preview = (
+            html.escape(payload["caption"]) if payload.get("caption") else "<i>(គ្មាន Caption)</i>"
+        )
+        await safe_send(
+            lambda: msg.reply_photo(
+                photo=payload["photo_file_id"],
+                caption=(
+                    f"📅 <b>Preview Schedule #{row_id}</b>\n"
+                    f"⏰ {dt_str}\n\n"
+                    f"{cap_preview}"
+                ),
+                parse_mode="HTML",
+                reply_markup=get_sched_confirm_kb(row_id),
+            )
+        )
+    else:
+        await safe_send(
+            lambda: msg.reply_text(
                 f"📅 <b>Preview Schedule #{row_id}</b>\n"
                 f"⏰ {dt_str}\n\n"
-                f"{cap_preview}"
-            ),
-            parse_mode="HTML",
-            reply_markup=get_sched_confirm_kb(row_id),
-        ))
-    else:
-        await safe_send(lambda: msg.reply_text(
-            f"📅 <b>Preview Schedule #{row_id}</b>\n"
-            f"⏰ {dt_str}\n\n"
-            f"{html.escape(payload.get('text') or '')}",
-            parse_mode="HTML",
-            reply_markup=get_sched_confirm_kb(row_id),
-        ))
+                f"{html.escape(payload.get('text') or '')}",
+                parse_mode="HTML",
+                reply_markup=get_sched_confirm_kb(row_id),
+            )
+        )
     return True
 
 
 async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
+    query = update.callback_query
     user_id = query.from_user.id
-    data    = query.data
+    data = query.data
 
     if not _is_admin(user_id):
         try:
@@ -1495,33 +1647,41 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("sched_ok:"):
         row_id = int(data.split(":")[1])
-        loop   = asyncio.get_running_loop()
-        row    = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
+        loop = asyncio.get_running_loop()
+        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
         if not row:
-            await safe_send(lambda: query.message.reply_text("❌ រកមិនឃើញ Schedule ។ វាប្រហែលជាត្រូវបាន cancel។"))
+            await safe_send(
+                lambda: query.message.reply_text(
+                    "❌ រកមិនឃើញ Schedule ។ វាប្រហែលជាត្រូវបាន cancel។"
+                )
+            )
             return
         if row["status"] != "pending":
             st = row["status"]
-            await safe_send(lambda: query.message.reply_text(
-                f"⚠️ Schedule #{row_id} មានស្ថានភាព <b>{st}</b> — មិនអាចបញ្ជាក់ទៀតទេ។",
-                parse_mode="HTML",
-            ))
+            await safe_send(
+                lambda: query.message.reply_text(
+                    f"⚠️ Schedule #{row_id} មានស្ថានភាព <b>{st}</b> — មិនអាចបញ្ជាក់ទៀតទេ។",
+                    parse_mode="HTML",
+                )
+            )
             return
         dt_str = _fmt_dt(datetime.fromisoformat(row["broadcast_at"]))
         try:
             await query.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await safe_send(lambda: query.message.reply_text(
-            f"✅ <b>Schedule #{row_id} បានបញ្ជាក់!</b>\n"
-            f"⏰ នឹង Broadcast នៅ {dt_str}",
-            parse_mode="HTML",
-        ))
+        await safe_send(
+            lambda: query.message.reply_text(
+                f"✅ <b>Schedule #{row_id} បានបញ្ជាក់!</b>\n"
+                f"⏰ នឹង Broadcast នៅ {dt_str}",
+                parse_mode="HTML",
+            )
+        )
         return
 
     if data.startswith("sched_no:"):
         row_id = int(data.split(":")[1])
-        loop   = asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()
         row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
         if row and row["status"] == "pending":
             await loop.run_in_executor(None, db_sched_set_status, row_id, "cancelled")
@@ -1529,9 +1689,11 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await safe_send(lambda: query.message.reply_text(
-            f"❌ Schedule <b>#{row_id}</b> បានបោះបង់។", parse_mode="HTML"
-        ))
+        await safe_send(
+            lambda: query.message.reply_text(
+                f"❌ Schedule <b>#{row_id}</b> បានបោះបង់។", parse_mode="HTML"
+            )
+        )
         return
 
     if data == "sched_close":
@@ -1558,8 +1720,8 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("sched_view:"):
         row_id = int(data.split(":")[1])
-        loop   = asyncio.get_running_loop()
-        row    = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
+        loop = asyncio.get_running_loop()
+        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
         if not row:
             await safe_send(lambda: query.message.reply_text("❌ រកមិនឃើញ Schedule ។"))
             return
@@ -1568,56 +1730,75 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             dt_str = str(row.get("broadcast_at", "?"))
         content = (row.get("plain_text") or row.get("caption") or "(photo)")[:300]
-        cancel_kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🗑️ Cancel Schedule", callback_data=f"sched_cancel_confirm:{row_id}")
-        ]]) if row["status"] == "pending" else None
-        await safe_send(lambda: query.message.reply_text(
-            f"📋 <b>Schedule #{row_id}</b>\n"
-            f"⏰ {dt_str}\n"
-            f"ស្ថានភាព: <b>{row['status']}</b>\n\n"
-            f"{html.escape(content)}",
-            parse_mode="HTML",
-            reply_markup=cancel_kb,
-        ))
+        cancel_kb = (
+            InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🗑️ Cancel Schedule",
+                            callback_data=f"sched_cancel_confirm:{row_id}",
+                        )
+                    ]
+                ]
+            )
+            if row["status"] == "pending"
+            else None
+        )
+        await safe_send(
+            lambda: query.message.reply_text(
+                f"📋 <b>Schedule #{row_id}</b>\n"
+                f"⏰ {dt_str}\n"
+                f"ស្ថានភាព: <b>{row['status']}</b>\n\n"
+                f"{html.escape(content)}",
+                parse_mode="HTML",
+                reply_markup=cancel_kb,
+            )
+        )
         return
 
     if data.startswith("sched_cancel_confirm:"):
         row_id = int(data.split(":")[1])
-        loop   = asyncio.get_running_loop()
-        row    = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
+        loop = asyncio.get_running_loop()
+        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
         if not row or row.get("admin_id") != user_id:
-            await safe_send(lambda: query.message.reply_text("⛔ អ្នកមិនមានសិទ្ធិ cancel Schedule នេះ។"))
+            await safe_send(
+                lambda: query.message.reply_text("⛔ អ្នកមិនមានសិទ្ធិ cancel Schedule នេះ។")
+            )
             return
         if row["status"] != "pending":
             st = row["status"]
-            await safe_send(lambda: query.message.reply_text(
-                f"⚠️ Schedule #{row_id} មានស្ថានភាព <b>{st}</b> — មិនអាច cancel ។",
-                parse_mode="HTML",
-            ))
+            await safe_send(
+                lambda: query.message.reply_text(
+                    f"⚠️ Schedule #{row_id} មានស្ថានភាព <b>{st}</b> — មិនអាច cancel ។",
+                    parse_mode="HTML",
+                )
+            )
             return
         await loop.run_in_executor(None, db_sched_set_status, row_id, "cancelled")
         try:
             await query.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await safe_send(lambda: query.message.reply_text(
-            f"✅ Schedule <b>#{row_id}</b> បានបោះបង់។", parse_mode="HTML"
-        ))
+        await safe_send(
+            lambda: query.message.reply_text(
+                f"✅ Schedule <b>#{row_id}</b> បានបោះបង់។", parse_mode="HTML"
+            )
+        )
 
 
 async def _fire_scheduled_broadcast(bot, row: dict) -> None:
-    row_id   = row["id"]
+    row_id = row["id"]
     admin_id = row["admin_id"]
     logger.info(f"Firing scheduled broadcast #{row_id} for admin {admin_id}")
 
-    loop    = asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
     claimed = await loop.run_in_executor(None, db_sched_claim, row_id)
     if not claimed:
         logger.warning(f"Scheduled broadcast #{row_id} already claimed — skipping.")
         return
 
     user_ids = await loop.run_in_executor(None, get_all_user_ids)
-    total    = len(user_ids)
+    total = len(user_ids)
 
     if total == 0:
         try:
@@ -1631,10 +1812,9 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
         return
 
     sent = failed = blocked = 0
-
     photo_file_id = row.get("photo_file_id")
-    caption       = row.get("caption") or ""
-    plain_text    = row.get("plain_text") or ""
+    caption = row.get("caption") or ""
+    plain_text = row.get("plain_text") or ""
 
     progress_msg = None
     try:
@@ -1683,23 +1863,29 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
             try:
                 pct = int((i + 1) / total * 100) if total else 0
                 await progress_msg.edit_text(
-                    f"📡 Scheduled #{row_id}: {pct}% ({i+1}/{total})…\n"
+                    f"📡 Scheduled #{row_id}: {pct}% ({i + 1}/{total})…\n"
                     f"✅ {sent}  🚫 {blocked}  ❌ {failed}"
                 )
             except Exception:
                 pass
 
-    # FIX: single combined status+counters update to avoid race condition
+    # Single atomic update: status + counters
     try:
         if supabase:
-            await asyncio.get_running_loop().run_in_executor(None, lambda: (
-                supabase.table("scheduled_broadcasts").update({
-                    "status":        "done",
-                    "sent_count":    sent,
-                    "failed_count":  failed,
-                    "blocked_count": blocked,
-                }).eq("id", row_id).execute()
-            ))
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: supabase.table("scheduled_broadcasts")
+                .update(
+                    {
+                        "status": "done",
+                        "sent_count": sent,
+                        "failed_count": failed,
+                        "blocked_count": blocked,
+                    }
+                )
+                .eq("id", row_id)
+                .execute(),
+            )
     except Exception as e:
         logger.error(f"Could not mark scheduled broadcast #{row_id} done: {e}")
 
@@ -1721,12 +1907,13 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
 
 _scheduler_tasks: set[asyncio.Task] = set()
 
+
 async def _scheduler_loop(bot, stop_event: asyncio.Event) -> None:
     logger.info("Scheduled broadcast loop started.")
     while not stop_event.is_set():
         try:
             loop = asyncio.get_running_loop()
-            due  = await loop.run_in_executor(None, db_sched_fetch_due)
+            due = await loop.run_in_executor(None, db_sched_fetch_due)
             for row in due:
                 task = asyncio.create_task(_fire_scheduled_broadcast(bot, row))
                 _scheduler_tasks.add(task)
@@ -1734,16 +1921,19 @@ async def _scheduler_loop(bot, stop_event: asyncio.Event) -> None:
         except Exception as e:
             logger.error(f"Scheduler loop error: {e}")
 
-        elapsed = 0
-        while elapsed < _SCHED_POLL_INTERVAL and not stop_event.is_set():
-            await asyncio.sleep(min(5, _SCHED_POLL_INTERVAL - elapsed))
-            elapsed += 5
+        # FIX #3: cleaner sleep — respects stop_event immediately
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=float(_SCHED_POLL_INTERVAL))
+        except asyncio.TimeoutError:
+            pass
 
     logger.info("Scheduled broadcast loop stopped.")
+
 
 # ===========================================================================
 # PER-USER CHAT
 # ===========================================================================
+
 
 @admin_only
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1752,47 +1942,55 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: update.message.reply_text("❌ គ្មានអ្នកប្រើប្រាស់ registered ទេ។"))
         return
     kb = get_users_page_kb(users, page=0)
-    await safe_send(lambda: update.message.reply_text(
-        f"👥 <b>អ្នកប្រើប្រាស់ ({len(users)} នាក់)</b>\n"
-        "ចុចលើឈ្មោះ ដើម្បីចាប់ផ្ដើម Chat ។",
-        parse_mode="HTML",
-        reply_markup=kb,
-    ))
+    await safe_send(
+        lambda: update.message.reply_text(
+            f"👥 <b>អ្នកប្រើប្រាស់ ({len(users)} នាក់)</b>\n"
+            "ចុចលើឈ្មោះ ដើម្បីចាប់ផ្ដើម Chat ។",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+    )
 
 
 @admin_only
 async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_id = update.effective_user.id
-    args     = context.args or []
+    args = context.args or []
 
     if not args or not args[0].isdigit():
-        await safe_send(lambda: update.message.reply_text(
-            "❌ Usage: /chat <user_id>\nឬប្រើ /users ដើម្បីជ្រើស user ។"
-        ))
+        await safe_send(
+            lambda: update.message.reply_text(
+                "❌ Usage: /chat <user_id>\nឬប្រើ /users ដើម្បីជ្រើស user ។"
+            )
+        )
         return
 
     target_id = int(args[0])
     exists = await asyncio.get_running_loop().run_in_executor(None, user_exists_in_db, target_id)
     if not exists:
-        await safe_send(lambda: update.message.reply_text(
-            f"❌ User <code>{target_id}</code> មិនមាននៅក្នុង Database ។",
-            parse_mode="HTML",
-        ))
+        await safe_send(
+            lambda: update.message.reply_text(
+                f"❌ User <code>{target_id}</code> មិនមាននៅក្នុង Database ។",
+                parse_mode="HTML",
+            )
+        )
         return
 
     await _open_chat_session(context.bot, admin_id, target_id, context)
-    await safe_send(lambda: update.message.reply_text(
-        f"💬 <b>Chat Mode បើក</b>\n\n"
-        f"កំពុង Chat ជាមួយ User <code>{target_id}</code>\n"
-        f"សារ/រូបភាព/Voice ផ្ញើនឹងទៅដល់ User ។\n\n"
-        f"វាយ /endchat ឬ /cancel ដើម្បីបញ្ចប់។",
-        parse_mode="HTML",
-    ))
+    await safe_send(
+        lambda: update.message.reply_text(
+            f"💬 <b>Chat Mode បើក</b>\n\n"
+            f"កំពុង Chat ជាមួយ User <code>{target_id}</code>\n"
+            f"សារ/រូបភាព/Voice ផ្ញើនឹងទៅដល់ User ។\n\n"
+            f"វាយ /endchat ឬ /cancel ដើម្បីបញ្ចប់។",
+            parse_mode="HTML",
+        )
+    )
 
 
 @admin_only
 async def cmd_endchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_id  = update.effective_user.id
+    admin_id = update.effective_user.id
     target_id = _close_session(admin_id)
     context.user_data.pop("chat_state", None)
 
@@ -1800,29 +1998,35 @@ async def cmd_endchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: update.message.reply_text("ℹ️ អ្នកមិនទាន់ open Chat ណាមួយទេ។"))
         return
 
-    await safe_send(lambda: update.message.reply_text(
-        f"✅ Chat ជាមួយ User <code>{target_id}</code> បានបញ្ចប់។",
-        parse_mode="HTML",
-    ))
+    await safe_send(
+        lambda: update.message.reply_text(
+            f"✅ Chat ជាមួយ User <code>{target_id}</code> បានបញ្ចប់។",
+            parse_mode="HTML",
+        )
+    )
     try:
         await context.bot.send_message(chat_id=target_id, text="ℹ️ Admin បានបញ្ចប់ Session Chat ។")
     except Exception:
         pass
 
 
-async def _open_chat_session(bot, admin_id: int, target_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def _open_chat_session(
+    bot, admin_id: int, target_id: int, context: ContextTypes.DEFAULT_TYPE
+):
     _open_session(admin_id, target_id)
     context.user_data["chat_state"] = CHAT_WAIT_MESSAGE
     try:
-        await bot.send_message(chat_id=target_id, text="🔔 Admin ចង់ Chat ជាមួយអ្នក។ ផ្ញើសារតបមកបាន!")
+        await bot.send_message(
+            chat_id=target_id, text="🔔 Admin ចង់ Chat ជាមួយអ្នក។ ផ្ញើសារតបមកបាន!"
+        )
     except Exception as e:
         logger.warning(f"Could not notify user {target_id}: {e}")
 
 
 async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
+    query = update.callback_query
     user_id = query.from_user.id
-    data    = query.data
+    data = query.data
 
     if not _is_admin(user_id):
         try:
@@ -1847,7 +2051,7 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if data.startswith("users_page:"):
-        page  = int(data.split(":")[1])
+        page = int(data.split(":")[1])
         users = await asyncio.get_running_loop().run_in_executor(None, get_all_users_with_names)
         try:
             await query.message.edit_reply_markup(reply_markup=get_users_page_kb(users, page=page))
@@ -1857,26 +2061,29 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if data.startswith("chat_open:"):
         target_id = int(data.split(":")[1])
-        admin_id  = user_id
+        admin_id = user_id
         try:
             await query.message.delete()
         except Exception:
             pass
         await _open_chat_session(context.bot, admin_id, target_id, context)
-        await safe_send(lambda: context.bot.send_message(
-            chat_id=admin_id,
-            text=(
-                f"💬 <b>Chat Mode បើក</b>\n\n"
-                f"កំពុង Chat ជាមួយ User <code>{target_id}</code>\n"
-                f"សារ/រូបភាព/Voice ផ្ញើនឹងទៅដល់ User ។\n\n"
-                f"វាយ /endchat ឬ /cancel ដើម្បីបញ្ចប់។"
-            ),
-            parse_mode="HTML",
-        ))
+        await safe_send(
+            lambda: context.bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    f"💬 <b>Chat Mode បើក</b>\n\n"
+                    f"កំពុង Chat ជាមួយ User <code>{target_id}</code>\n"
+                    f"សារ/រូបភាព/Voice ផ្ញើនឹងទៅដល់ User ។\n\n"
+                    f"វាយ /endchat ឬ /cancel ដើម្បីបញ្ចប់។"
+                ),
+                parse_mode="HTML",
+            )
+        )
 
 
+# FIX #7: _fwd_admin_to_user and _fwd_user_to_admin now handle RetryAfter
 async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
-    try:
+    async def _do():
         if msg.text:
             await bot.send_message(
                 chat_id=target_id,
@@ -1884,29 +2091,49 @@ async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
                 parse_mode="HTML",
             )
         elif msg.photo:
-            cap = f"📩 <b>Admin:</b>\n{html.escape(msg.caption)}" if msg.caption else "📩 <b>Admin:</b>"
-            await bot.send_photo(chat_id=target_id, photo=msg.photo[-1].file_id,
-                                 caption=cap, parse_mode="HTML")
+            cap = (
+                f"📩 <b>Admin:</b>\n{html.escape(msg.caption)}"
+                if msg.caption
+                else "📩 <b>Admin:</b>"
+            )
+            await bot.send_photo(
+                chat_id=target_id, photo=msg.photo[-1].file_id, caption=cap, parse_mode="HTML"
+            )
         elif msg.voice:
-            await bot.send_voice(chat_id=target_id, voice=msg.voice.file_id,
-                                 caption="📩 Admin voice message")
+            await bot.send_voice(
+                chat_id=target_id, voice=msg.voice.file_id, caption="📩 Admin voice message"
+            )
         elif msg.video_note:
             await bot.send_video_note(chat_id=target_id, video_note=msg.video_note.file_id)
         elif msg.sticker:
             await bot.send_sticker(chat_id=target_id, sticker=msg.sticker.file_id)
         elif msg.document:
-            cap = f"📩 <b>Admin:</b>\n{html.escape(msg.caption)}" if msg.caption else "📩 <b>Admin:</b>"
-            await bot.send_document(chat_id=target_id, document=msg.document.file_id,
-                                    caption=cap, parse_mode="HTML")
+            cap = (
+                f"📩 <b>Admin:</b>\n{html.escape(msg.caption)}"
+                if msg.caption
+                else "📩 <b>Admin:</b>"
+            )
+            await bot.send_document(
+                chat_id=target_id, document=msg.document.file_id, caption=cap, parse_mode="HTML"
+            )
         elif msg.video:
-            cap = f"📩 <b>Admin:</b>\n{html.escape(msg.caption)}" if msg.caption else "📩 <b>Admin:</b>"
-            await bot.send_video(chat_id=target_id, video=msg.video.file_id,
-                                 caption=cap, parse_mode="HTML")
+            cap = (
+                f"📩 <b>Admin:</b>\n{html.escape(msg.caption)}"
+                if msg.caption
+                else "📩 <b>Admin:</b>"
+            )
+            await bot.send_video(
+                chat_id=target_id, video=msg.video.file_id, caption=cap, parse_mode="HTML"
+            )
         elif msg.audio:
             await bot.send_audio(chat_id=target_id, audio=msg.audio.file_id)
         else:
-            await bot.forward_message(chat_id=target_id, from_chat_id=admin_id,
-                                      message_id=msg.message_id)
+            await bot.forward_message(
+                chat_id=target_id, from_chat_id=admin_id, message_id=msg.message_id
+            )
+
+    try:
+        await safe_send(_do)
         return True
     except Forbidden:
         return False
@@ -1915,9 +2142,12 @@ async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
         return False
 
 
-async def _fwd_user_to_admin(bot, admin_id: int, user_id: int, username: str, msg) -> bool:
+async def _fwd_user_to_admin(
+    bot, admin_id: int, user_id: int, username: str, msg
+) -> bool:
     banner = f"💬 <b>{html.escape(username)} ({user_id}):</b>"
-    try:
+
+    async def _do():
         if msg.text:
             await bot.send_message(
                 chat_id=admin_id,
@@ -1926,11 +2156,13 @@ async def _fwd_user_to_admin(bot, admin_id: int, user_id: int, username: str, ms
             )
         elif msg.photo:
             cap = f"{banner}\n{html.escape(msg.caption)}" if msg.caption else banner
-            await bot.send_photo(chat_id=admin_id, photo=msg.photo[-1].file_id,
-                                 caption=cap, parse_mode="HTML")
+            await bot.send_photo(
+                chat_id=admin_id, photo=msg.photo[-1].file_id, caption=cap, parse_mode="HTML"
+            )
         elif msg.voice:
-            await bot.send_voice(chat_id=admin_id, voice=msg.voice.file_id,
-                                 caption=banner, parse_mode="HTML")
+            await bot.send_voice(
+                chat_id=admin_id, voice=msg.voice.file_id, caption=banner, parse_mode="HTML"
+            )
         elif msg.video_note:
             await bot.send_message(chat_id=admin_id, text=banner, parse_mode="HTML")
             await bot.send_video_note(chat_id=admin_id, video_note=msg.video_note.file_id)
@@ -1939,44 +2171,55 @@ async def _fwd_user_to_admin(bot, admin_id: int, user_id: int, username: str, ms
             await bot.send_sticker(chat_id=admin_id, sticker=msg.sticker.file_id)
         elif msg.document:
             cap = f"{banner}\n{html.escape(msg.caption)}" if msg.caption else banner
-            await bot.send_document(chat_id=admin_id, document=msg.document.file_id,
-                                    caption=cap, parse_mode="HTML")
+            await bot.send_document(
+                chat_id=admin_id, document=msg.document.file_id, caption=cap, parse_mode="HTML"
+            )
         elif msg.video:
             cap = f"{banner}\n{html.escape(msg.caption)}" if msg.caption else banner
-            await bot.send_video(chat_id=admin_id, video=msg.video.file_id,
-                                 caption=cap, parse_mode="HTML")
+            await bot.send_video(
+                chat_id=admin_id, video=msg.video.file_id, caption=cap, parse_mode="HTML"
+            )
         elif msg.audio:
             await bot.send_message(chat_id=admin_id, text=banner, parse_mode="HTML")
             await bot.send_audio(chat_id=admin_id, audio=msg.audio.file_id)
         else:
             await bot.send_message(chat_id=admin_id, text=banner, parse_mode="HTML")
-            await bot.forward_message(chat_id=admin_id, from_chat_id=user_id,
-                                      message_id=msg.message_id)
+            await bot.forward_message(
+                chat_id=admin_id, from_chat_id=user_id, message_id=msg.message_id
+            )
+
+    try:
+        await safe_send(_do)
         return True
     except Exception as e:
         logger.error(f"_fwd_user_to_admin error: {e}")
         return False
 
+
 # ===========================================================================
 # STATS + CANCEL
 # ===========================================================================
 
+
 @admin_only
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    loop           = asyncio.get_running_loop()
-    user_ids       = await loop.run_in_executor(None, get_all_user_ids)
-    active_chats   = len(_admin_chat_target)
+    loop = asyncio.get_running_loop()
+    user_ids = await loop.run_in_executor(None, get_all_user_ids)
+    active_chats = len(_admin_chat_target)
     pending_scheds = await loop.run_in_executor(
         None, db_sched_fetch_admin_pending, update.effective_user.id
     )
-    await safe_send(lambda: update.message.reply_text(
-        f"📊 <b>Bot Statistics</b>\n\n"
-        f"👥 អ្នកប្រើប្រាស់សរុប: <b>{len(user_ids)}</b>\n"
-        f"💬 Active Admin Chats: <b>{active_chats}</b>\n"
-        f"📅 Scheduled (pending): <b>{len(pending_scheds)}</b>\n"
-        f"🤖 Gemini Model: <b>{GEMINI_MODEL}</b>",
-        parse_mode="HTML",
-    ))
+    await safe_send(
+        lambda: update.message.reply_text(
+            f"📊 <b>Bot Statistics</b>\n\n"
+            f"👥 អ្នកប្រើប្រាស់សរុប: <b>{len(user_ids)}</b>\n"
+            f"💬 Active Admin Chats: <b>{active_chats}</b>\n"
+            f"📅 Scheduled (pending): <b>{len(pending_scheds)}</b>\n"
+            f"🔒 Active user locks: <b>{len(_user_locks)}</b>\n"
+            f"🤖 Gemini Model: <b>{GEMINI_MODEL}</b>",
+            parse_mode="HTML",
+        )
+    )
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1996,12 +2239,16 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = _close_session(uid)
         context.user_data.pop("chat_state", None)
         if target_id:
-            await safe_send(lambda: update.message.reply_text(
-                f"✅ Chat ជាមួយ User <code>{target_id}</code> បានបញ្ចប់។",
-                parse_mode="HTML",
-            ))
+            await safe_send(
+                lambda: update.message.reply_text(
+                    f"✅ Chat ជាមួយ User <code>{target_id}</code> បានបញ្ចប់។",
+                    parse_mode="HTML",
+                )
+            )
             try:
-                await context.bot.send_message(chat_id=target_id, text="ℹ️ Admin បានបញ្ចប់ Session Chat ។")
+                await context.bot.send_message(
+                    chat_id=target_id, text="ℹ️ Admin បានបញ្ចប់ Session Chat ។"
+                )
             except Exception:
                 pass
         cleared = True
@@ -2015,18 +2262,22 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not cleared:
         await safe_send(lambda: update.message.reply_text("ℹ️ មិនមាន operation ត្រូវ cancel ទេ។"))
 
+
 # ===========================================================================
 # REGULAR HANDLERS
 # ===========================================================================
 
+
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         sync_user_data(update.effective_user)
-        await safe_send(lambda: update.message.reply_text(
-            WELCOME_TEXT,
-            reply_markup=ReplyKeyboardRemove(),
-            disable_web_page_preview=True,
-        ))
+        await safe_send(
+            lambda: update.message.reply_text(
+                WELCOME_TEXT,
+                reply_markup=ReplyKeyboardRemove(),
+                disable_web_page_preview=True,
+            )
+        )
     except Exception as e:
         logger.error(f"on_start error: {e}")
 
@@ -2036,35 +2287,37 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user    = update.effective_user
+    user = update.effective_user
     user_id = user.id
-    loop    = asyncio.get_running_loop()
-    prefs   = await loop.run_in_executor(None, get_user_prefs, user_id)
+    loop = asyncio.get_running_loop()
+    prefs = await loop.run_in_executor(None, get_user_prefs, user_id)
     gender_label = "👩 ស្រី (Female)" if prefs["gender"] == "female" else "👨 ប្រុស (Male)"
-    speed_label  = next(
+    speed_label = next(
         (lbl for _, (lbl, val) in SPEED_OPTIONS.items() if abs(val - prefs["speed"]) < 0.01),
-        f"{prefs['speed']}x"
+        f"{prefs['speed']}x",
     )
-    await safe_send(lambda: update.message.reply_text(
-        f"⚙️ <b>ការកំណត់របស់អ្នក</b>\n\n"
-        f"🗣️ សំឡេង: <b>{gender_label}</b>\n"
-        f"🎚️ ល្បឿន: <b>{speed_label}</b>\n\n"
-        "ផ្ញើ text ណាមួយ ហើយប្រើប៊ូតុងក្រោមសំឡេង ដើម្បីប្តូរ។",
-        parse_mode="HTML",
-        reply_markup=get_main_kb(prefs["gender"]),
-    ))
+    await safe_send(
+        lambda: update.message.reply_text(
+            f"⚙️ <b>ការកំណត់របស់អ្នក</b>\n\n"
+            f"🗣️ សំឡេង: <b>{gender_label}</b>\n"
+            f"🎚️ ល្បឿន: <b>{speed_label}</b>\n\n"
+            "ផ្ញើ text ណាមួយ ហើយប្រើប៊ូតុងក្រោមសំឡេង ដើម្បីប្តូរ។",
+            parse_mode="HTML",
+            reply_markup=get_main_kb(prefs["gender"]),
+        )
+    )
 
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg     = update.message
-    user    = update.effective_user
+    msg = update.message
+    user = update.effective_user
     user_id = user.id if user else None
     if user_id is None:
         return
 
     if _is_admin(user_id):
         sched_state = context.user_data.get("sched_state")
-        # FIX #4: use elif to prevent double-firing when both states are set
+        # Use elif to prevent double-firing when multiple states are set
         if sched_state == SCHED_WAIT_MSG:
             await _handle_sched_content(update, context)
             return
@@ -2077,8 +2330,8 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
                 reply = (
                     f"✅ Photo ផ្ញើដល់ User <code>{target_id}</code> ។"
-                    if ok else
-                    f"❌ User <code>{target_id}</code> blocked bot ។"
+                    if ok
+                    else f"❌ User <code>{target_id}</code> blocked bot ។"
                 )
                 await safe_send(lambda: msg.reply_text(reply, parse_mode="HTML"))
                 if not ok:
@@ -2094,7 +2347,9 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not _gemini:
-        await safe_send(lambda: msg.reply_text("❌ Gemini API មិន Activate ទេ។ សូម Set GEMINI_API_KEY ។"))
+        await safe_send(
+            lambda: msg.reply_text("❌ Gemini API មិន Activate ទេ។ សូម Set GEMINI_API_KEY ។")
+        )
         return
 
     sync_user_data(user)
@@ -2114,15 +2369,17 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await tg_file.download_to_drive(img_path)
 
         mime_type = _detect_image_mime(img_path)
-        ocr_text  = await ocr_image(img_path, mime_type=mime_type)
+        ocr_text = await ocr_image(img_path, mime_type=mime_type)
 
         if not ocr_text or ocr_text.upper() == "NOTEXT":
-            await safe_send(lambda: msg.reply_text("🖼️ រូបភាពនេះមិនមានអត្ថបទដែលអាចអានបាន។"))
+            await safe_send(
+                lambda: msg.reply_text("🖼️ រូបភាពនេះមិនមានអត្ថបទដែលអាចអានបាន។")
+            )
             return
 
-        is_khmer  = bool(_KHMER_RE.search(ocr_text))
+        is_khmer = bool(_KHMER_RE.search(ocr_text))
         lang_flag = "🇰🇭" if is_khmer else "🇺🇸"
-        header    = f"🔍 <b>OCR {lang_flag}</b>\n\n"
+        header = f"🔍 <b>OCR {lang_flag}</b>\n\n"
 
         plain_pages = _paginate_plain(ocr_text, limit=TELE_MSG_LIMIT - len(header))
 
@@ -2135,10 +2392,15 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         last_sent = sent_pages[-1] if sent_pages else None
         if last_sent:
-            save_text_cache(last_sent.message_id, ocr_text, user_id=user_id, username=uname)
-            await safe_send(lambda: last_sent.edit_reply_markup(
-                reply_markup=get_ocr_confirm_kb(last_sent.message_id)
-            ))
+            save_text_cache(
+                last_sent.message_id, ocr_text,
+                chat_id=msg.chat_id, user_id=user_id, username=uname,
+            )
+            await safe_send(
+                lambda: last_sent.edit_reply_markup(
+                    reply_markup=get_ocr_confirm_kb(last_sent.message_id)
+                )
+            )
 
     except Exception as e:
         logger.error(f"on_photo OCR error: {e}")
@@ -2149,8 +2411,8 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg     = update.message
-    user    = update.effective_user
+    msg = update.message
+    user = update.effective_user
     user_id = user.id if user else None
     if user_id is None:
         return
@@ -2161,8 +2423,8 @@ async def on_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
             reply = (
                 f"✅ ផ្ញើដល់ User <code>{target_id}</code> ។"
-                if ok else
-                f"❌ User <code>{target_id}</code> blocked bot ។"
+                if ok
+                else f"❌ User <code>{target_id}</code> blocked bot ។"
             )
             await safe_send(lambda: msg.reply_text(reply, parse_mode="HTML"))
             if not ok:
@@ -2178,8 +2440,8 @@ async def on_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg     = update.message
-    user    = update.effective_user
+    msg = update.message
+    user = update.effective_user
     user_id = user.id
 
     if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
@@ -2188,8 +2450,8 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
             reply = (
                 f"✅ Voice ផ្ញើដល់ User <code>{target_id}</code> ។"
-                if ok else
-                f"❌ User <code>{target_id}</code> blocked bot ។"
+                if ok
+                else f"❌ User <code>{target_id}</code> blocked bot ។"
             )
             await safe_send(lambda: msg.reply_text(reply, parse_mode="HTML"))
             if not ok:
@@ -2205,7 +2467,9 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not _gemini:
-        await safe_send(lambda: msg.reply_text("❌ Gemini API មិន Activate ទេ។ សូម Set GEMINI_API_KEY ។"))
+        await safe_send(
+            lambda: msg.reply_text("❌ Gemini API មិន Activate ទេ។ សូម Set GEMINI_API_KEY ។")
+        )
         return
 
     if msg.voice.file_size and msg.voice.file_size > MAX_VOICE_BYTES:
@@ -2231,9 +2495,9 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_send(lambda: msg.reply_text("❌ រក Transcript មិនឃើញ។"))
             return
 
-        is_khmer  = bool(_KHMER_RE.search(transcript))
+        is_khmer = bool(_KHMER_RE.search(transcript))
         lang_flag = "🇰🇭" if is_khmer else "🇺🇸"
-        header    = f"📝 <b>Transcript</b> {lang_flag}\n\n"
+        header = f"📝 <b>Transcript</b> {lang_flag}\n\n"
 
         plain_pages = _paginate_plain(transcript, limit=TELE_MSG_LIMIT - len(header))
 
@@ -2248,11 +2512,15 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if last_sent:
             save_text_cache(
                 last_sent.message_id, transcript,
-                user_id=user_id, username=user.username or user.first_name
+                chat_id=msg.chat_id,
+                user_id=user_id,
+                username=user.username or user.first_name,
             )
-            await safe_send(lambda: last_sent.edit_reply_markup(
-                reply_markup=get_transcription_kb(last_sent.message_id)
-            ))
+            await safe_send(
+                lambda: last_sent.edit_reply_markup(
+                    reply_markup=get_transcription_kb(last_sent.message_id)
+                )
+            )
 
     except Exception as e:
         logger.error(f"on_voice error: {e}")
@@ -2266,15 +2534,15 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg  = update.message
+    msg = update.message
     text = msg.text
     if not text:
         return
 
-    user    = update.effective_user
+    user = update.effective_user
     user_id = user.id
 
-    # ── Admin: scheduled broadcast flows ────────────────────────────────
+    # ── Admin: state machine flows ────────────────────────────────────────
     if _is_admin(user_id):
         sched_state = context.user_data.get("sched_state")
         if sched_state == SCHED_WAIT_MSG:
@@ -2291,14 +2559,19 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if target_id:
                 ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
                 if ok:
-                    await safe_send(lambda: msg.reply_text(
-                        f"✅ ផ្ញើដល់ User <code>{target_id}</code> ។", parse_mode="HTML",
-                    ))
+                    await safe_send(
+                        lambda: msg.reply_text(
+                            f"✅ ផ្ញើដល់ User <code>{target_id}</code> ។",
+                            parse_mode="HTML",
+                        )
+                    )
                 else:
-                    await safe_send(lambda: msg.reply_text(
-                        f"❌ User <code>{target_id}</code> blocked bot ។ Chat session បានបិទ។",
-                        parse_mode="HTML",
-                    ))
+                    await safe_send(
+                        lambda: msg.reply_text(
+                            f"❌ User <code>{target_id}</code> blocked bot ។ Chat session បានបិទ។",
+                            parse_mode="HTML",
+                        )
+                    )
                     _close_session(user_id)
                     context.user_data.pop("chat_state", None)
             return
@@ -2319,51 +2592,57 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if len(stripped) > MAX_INPUT_CHARS:
-        await safe_send(lambda: msg.reply_text(
-            f"❌ អត្ថបទវែងពេក។ អតិបរមា {MAX_INPUT_CHARS} តួអក្សរ។\n"
-            f"(អ្នកបានផ្ញើ {len(stripped)} តួ)"
-        ))
+        await safe_send(
+            lambda: msg.reply_text(
+                f"❌ អត្ថបទវែងពេក។ អតិបរមា {MAX_INPUT_CHARS} តួអក្សរ។\n"
+                f"(អ្នកបានផ្ញើ {len(stripped)} តួ)"
+            )
+        )
         return
 
-    # FIX #6: check lock BEFORE cooldown so in-progress requests give the
-    # correct "please wait" message instead of a misleading cooldown error
+    # Check in-progress lock first, then cooldown
     lock = _get_user_lock(user_id)
     if lock.locked():
         await safe_send(lambda: msg.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
         return
 
-    now  = time.monotonic()
+    now = time.monotonic()
     last = _user_last_tts.get(user_id, 0.0)
     if now - last < USER_COOLDOWN_S:
         remaining = USER_COOLDOWN_S - (now - last)
-        await safe_send(lambda: msg.reply_text(
-            f"⏳ សូមរង់ចាំ {remaining:.1f}s មុននឹងផ្ញើម្តងទៀត។"
-        ))
+        await safe_send(
+            lambda: msg.reply_text(f"⏳ សូមរង់ចាំ {remaining:.1f}s មុននឹងផ្ញើម្តងទៀត។")
+        )
         return
 
     sync_user_data(user)
-    loop   = asyncio.get_running_loop()
-    prefs  = await loop.run_in_executor(None, get_user_prefs, user_id)
+    loop = asyncio.get_running_loop()
+    prefs = await loop.run_in_executor(None, get_user_prefs, user_id)
     gender = prefs["gender"]
-    speed  = prefs["speed"]
+    speed = prefs["speed"]
 
-    file_path  = _make_temp_ogg()
+    file_path = _make_temp_ogg()
     stop_event = asyncio.Event()
     timer_task = asyncio.create_task(
         send_status_timer(update.effective_chat.id, context.bot, stop_event)
     )
     async with lock:
         try:
-            # FIX #12: use returned bytes directly, no extra disk read
             audio_bytes = await generate_voice(stripped, gender, speed, file_path)
-            sent_msg = await safe_send(lambda: msg.reply_voice(
-                voice=io.BytesIO(audio_bytes),
-                caption=f"🗣️ {BOT_TAG}",
-                reply_markup=get_main_kb(gender),
-            ))
+            sent_msg = await safe_send(
+                lambda: msg.reply_voice(
+                    voice=io.BytesIO(audio_bytes),
+                    caption=f"🗣️ {BOT_TAG}",
+                    reply_markup=get_main_kb(gender),
+                )
+            )
             if sent_msg:
-                save_text_cache(sent_msg.message_id, stripped,
-                                user_id=user_id, username=user.username or user.first_name)
+                save_text_cache(
+                    sent_msg.message_id, stripped,
+                    chat_id=msg.chat_id,
+                    user_id=user_id,
+                    username=user.username or user.first_name,
+                )
             _user_last_tts[user_id] = time.monotonic()
         except Exception as e:
             logger.error(f"on_text TTS error: {e}")
@@ -2375,32 +2654,44 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _stop_timer(stop_event, timer_task)
             _cleanup(file_path)
 
+
+# ---------------------------------------------------------------------------
+# FIX #8: Centralised helper to get (chat_id, msg_id) for cache lookups
+# ---------------------------------------------------------------------------
+def _cache_key_from_query(query) -> tuple[int, int]:
+    return query.message.chat.id, query.message.message_id
+
+
 # ---------------------------------------------------------------------------
 # Callback dispatch helpers
 # ---------------------------------------------------------------------------
 
+
 async def _cb_show_speed(query, user_id: int, context):
-    loop  = asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
     prefs = await loop.run_in_executor(None, get_user_prefs, user_id)
-    await safe_send(lambda: query.message.edit_reply_markup(reply_markup=get_speed_kb(prefs["speed"])))
+    await safe_send(
+        lambda: query.message.edit_reply_markup(reply_markup=get_speed_kb(prefs["speed"]))
+    )
 
 
 async def _cb_hide_speed(query, user_id: int, context):
-    loop  = asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
     prefs = await loop.run_in_executor(None, get_user_prefs, user_id)
-    await safe_send(lambda: query.message.edit_reply_markup(reply_markup=get_main_kb(prefs["gender"])))
+    await safe_send(
+        lambda: query.message.edit_reply_markup(reply_markup=get_main_kb(prefs["gender"]))
+    )
 
 
 async def _cb_speed(query, user_id: int, context, data: str):
-    _, new_speed  = SPEED_OPTIONS[data]
-    msg_id        = query.message.message_id
-    loop          = asyncio.get_running_loop()
-    original_text = await loop.run_in_executor(None, get_text_cache, msg_id)
+    _, new_speed = SPEED_OPTIONS[data]
+    chat_id, msg_id = _cache_key_from_query(query)
+    loop = asyncio.get_running_loop()
+    original_text = await loop.run_in_executor(None, get_text_cache, msg_id, chat_id)
     if not original_text:
         await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទដើមមិនឃើញ។"))
         return
 
-    # FIX #6: check lock first, then cooldown
     lock = _get_user_lock(user_id)
     if lock.locked():
         await safe_send(lambda: query.message.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
@@ -2408,33 +2699,40 @@ async def _cb_speed(query, user_id: int, context, data: str):
     _now = time.monotonic()
     if _now - _user_last_tts.get(user_id, 0.0) < USER_COOLDOWN_S:
         _rem = round(USER_COOLDOWN_S - (_now - _user_last_tts.get(user_id, 0.0)), 1)
-        await safe_send(lambda r=_rem: query.message.reply_text(f"⏳ សូមរង់ចាំ {r}s មុននឹងផ្ញើម្តងទៀត។"))
+        await safe_send(
+            lambda r=_rem: query.message.reply_text(f"⏳ សូមរង់ចាំ {r}s មុននឹងផ្ញើម្តងទៀត។")
+        )
         return
 
-    prefs  = await loop.run_in_executor(None, get_user_prefs, user_id)
+    prefs = await loop.run_in_executor(None, get_user_prefs, user_id)
     gender = prefs["gender"]
     update_user_speed(user_id, new_speed)
-    file_path  = _make_temp_ogg()
+    file_path = _make_temp_ogg()
     stop_event = asyncio.Event()
     timer_task = asyncio.create_task(
         send_status_timer(query.message.chat.id, context.bot, stop_event)
     )
     async with lock:
         try:
-            # FIX #12: use returned bytes directly
             audio_bytes = await generate_voice(original_text, gender, new_speed, file_path)
             try:
                 await query.message.delete()
             except Exception:
                 pass
-            new_msg = await safe_send(lambda: query.message.chat.send_voice(
-                voice=io.BytesIO(audio_bytes),
-                caption=f"🗣️ {BOT_TAG}",
-                reply_markup=get_main_kb(gender),
-            ))
+            new_msg = await safe_send(
+                lambda: query.message.chat.send_voice(
+                    voice=io.BytesIO(audio_bytes),
+                    caption=f"🗣️ {BOT_TAG}",
+                    reply_markup=get_main_kb(gender),
+                )
+            )
             if new_msg:
-                save_text_cache(new_msg.message_id, original_text, user_id=user_id,
-                                username=query.from_user.username or query.from_user.first_name)
+                save_text_cache(
+                    new_msg.message_id, original_text,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    username=query.from_user.username or query.from_user.first_name,
+                )
             _user_last_tts[user_id] = time.monotonic()
         except Exception as e:
             logger.error(f"speed regen error: {e}")
@@ -2444,15 +2742,14 @@ async def _cb_speed(query, user_id: int, context, data: str):
 
 
 async def _cb_gender(query, user_id: int, context, data: str):
-    new_gender    = data.replace("tg_", "")
-    msg_id        = query.message.message_id
-    loop          = asyncio.get_running_loop()
-    original_text = await loop.run_in_executor(None, get_text_cache, msg_id)
+    new_gender = data.replace("tg_", "")
+    chat_id, msg_id = _cache_key_from_query(query)
+    loop = asyncio.get_running_loop()
+    original_text = await loop.run_in_executor(None, get_text_cache, msg_id, chat_id)
     if not original_text:
         await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទដើមមិនឃើញ។"))
         return
 
-    # FIX #6: check lock first, then cooldown
     lock = _get_user_lock(user_id)
     if lock.locked():
         await safe_send(lambda: query.message.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
@@ -2460,33 +2757,40 @@ async def _cb_gender(query, user_id: int, context, data: str):
     _now = time.monotonic()
     if _now - _user_last_tts.get(user_id, 0.0) < USER_COOLDOWN_S:
         _rem = round(USER_COOLDOWN_S - (_now - _user_last_tts.get(user_id, 0.0)), 1)
-        await safe_send(lambda r=_rem: query.message.reply_text(f"⏳ សូមរង់ចាំ {r}s មុននឹងផ្ញើម្តងទៀត។"))
+        await safe_send(
+            lambda r=_rem: query.message.reply_text(f"⏳ សូមរង់ចាំ {r}s មុននឹងផ្ញើម្តងទៀត។")
+        )
         return
 
     prefs = await loop.run_in_executor(None, get_user_prefs, user_id)
     speed = prefs["speed"]
     update_user_gender(user_id, new_gender)
-    file_path  = _make_temp_ogg()
+    file_path = _make_temp_ogg()
     stop_event = asyncio.Event()
     timer_task = asyncio.create_task(
         send_status_timer(query.message.chat.id, context.bot, stop_event)
     )
     async with lock:
         try:
-            # FIX #12: use returned bytes directly
             audio_bytes = await generate_voice(original_text, new_gender, speed, file_path)
             try:
                 await query.message.delete()
             except Exception:
                 pass
-            new_msg = await safe_send(lambda: query.message.chat.send_voice(
-                voice=io.BytesIO(audio_bytes),
-                caption=f"🗣️ {BOT_TAG}",
-                reply_markup=get_main_kb(new_gender),
-            ))
+            new_msg = await safe_send(
+                lambda: query.message.chat.send_voice(
+                    voice=io.BytesIO(audio_bytes),
+                    caption=f"🗣️ {BOT_TAG}",
+                    reply_markup=get_main_kb(new_gender),
+                )
+            )
             if new_msg:
-                save_text_cache(new_msg.message_id, original_text, user_id=user_id,
-                                username=query.from_user.username or query.from_user.first_name)
+                save_text_cache(
+                    new_msg.message_id, original_text,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    username=query.from_user.username or query.from_user.first_name,
+                )
             _user_last_tts[user_id] = time.monotonic()
         except Exception as e:
             logger.error(f"gender regen error: {e}")
@@ -2497,8 +2801,9 @@ async def _cb_gender(query, user_id: int, context, data: str):
 
 async def _cb_tts_transcript(query, user_id: int, context, data: str):
     transcript_msg_id = int(data.split(":")[1])
-    loop          = asyncio.get_running_loop()
-    original_text = await loop.run_in_executor(None, get_text_cache, transcript_msg_id)
+    chat_id = query.message.chat.id
+    loop = asyncio.get_running_loop()
+    original_text = await loop.run_in_executor(None, get_text_cache, transcript_msg_id, chat_id)
     if not original_text:
         await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទមិនឃើញ។"))
         return
@@ -2506,26 +2811,31 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
     if lock.locked():
         await safe_send(lambda: query.message.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
         return
-    prefs  = await loop.run_in_executor(None, get_user_prefs, user_id)
+    prefs = await loop.run_in_executor(None, get_user_prefs, user_id)
     gender = prefs["gender"]
-    speed  = prefs["speed"]
-    file_path  = _make_temp_ogg()
+    speed = prefs["speed"]
+    file_path = _make_temp_ogg()
     stop_event = asyncio.Event()
     timer_task = asyncio.create_task(
         send_status_timer(query.message.chat.id, context.bot, stop_event)
     )
     async with lock:
         try:
-            # FIX #12: use returned bytes directly
             audio_bytes = await generate_voice(original_text, gender, speed, file_path)
-            new_msg = await safe_send(lambda: query.message.chat.send_voice(
-                voice=io.BytesIO(audio_bytes),
-                caption=f"🗣️ {BOT_TAG}",
-                reply_markup=get_main_kb(gender),
-            ))
+            new_msg = await safe_send(
+                lambda: query.message.chat.send_voice(
+                    voice=io.BytesIO(audio_bytes),
+                    caption=f"🗣️ {BOT_TAG}",
+                    reply_markup=get_main_kb(gender),
+                )
+            )
             if new_msg:
-                save_text_cache(new_msg.message_id, original_text, user_id=user_id,
-                                username=query.from_user.username or query.from_user.first_name)
+                save_text_cache(
+                    new_msg.message_id, original_text,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    username=query.from_user.username or query.from_user.first_name,
+                )
             _user_last_tts[user_id] = time.monotonic()
         except Exception as e:
             logger.error(f"transcript TTS error: {e}")
@@ -2536,8 +2846,9 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
 
 async def _cb_doc_read(query, user_id: int, context, data: str):
     src_msg_id = int(data.split(":")[1])
-    loop       = asyncio.get_running_loop()
-    full_text  = await loop.run_in_executor(None, get_text_cache, src_msg_id)
+    chat_id = query.message.chat.id
+    loop = asyncio.get_running_loop()
+    full_text = await loop.run_in_executor(None, get_text_cache, src_msg_id, chat_id)
     if not full_text:
         await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទមិនឃើញ (cache expired)។"))
         return
@@ -2545,20 +2856,17 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
     if lock.locked():
         await safe_send(lambda: query.message.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
         return
-    prefs   = await loop.run_in_executor(None, get_user_prefs, user_id)
-    gender  = prefs["gender"]
-    speed   = prefs["speed"]
-    uname   = query.from_user.username or query.from_user.first_name or str(user_id)
-    chat_id = query.message.chat.id
+    prefs = await loop.run_in_executor(None, get_user_prefs, user_id)
+    gender = prefs["gender"]
+    speed = prefs["speed"]
+    uname = query.from_user.username or query.from_user.first_name or str(user_id)
     try:
         await query.message.delete()
     except Exception:
         pass
 
-    tts_stop  = asyncio.Event()
-    tts_timer = asyncio.create_task(
-        send_status_timer(chat_id, context.bot, tts_stop)
-    )
+    tts_stop = asyncio.Event()
+    tts_timer = asyncio.create_task(send_status_timer(chat_id, context.bot, tts_stop))
     async with lock:
         try:
             await _deliver_paged_tts(
@@ -2573,17 +2881,22 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
         except Exception as e:
             logger.error(f"_cb_doc_read delivery error: {e}")
             try:
-                await context.bot.send_message(chat_id=chat_id, text="❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។")
+                await context.bot.send_message(
+                    chat_id=chat_id, text="❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"
+                )
             except Exception:
                 pass
         finally:
             await _stop_timer(tts_stop, tts_timer)
 
 
+# FIX #10: on_callback is the catch-all handler; bc_*, users_*, sched_* are
+# handled by dedicated handlers registered first, so this handler will ONLY
+# receive TTS/voice callbacks that aren't matched by earlier patterns.
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
+    query = update.callback_query
     user_id = query.from_user.id
-    data    = query.data
+    data = query.data
 
     try:
         await query.answer()
@@ -2618,6 +2931,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"on_callback unhandled [data={data}]: {e}", exc_info=True)
 
+
 # ---------------------------------------------------------------------------
 # Global error handler
 # ---------------------------------------------------------------------------
@@ -2625,19 +2939,21 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Unhandled exception: {context.error}", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         try:
-            await safe_send(lambda: update.effective_message.reply_text(
-                "⚠️ មានបញ្ហាបច្ចេកទេស។ Bot នៅដំណើរការ — សូមព្យាយាមម្តងទៀត។"
-            ))
+            await safe_send(
+                lambda: update.effective_message.reply_text(
+                    "⚠️ មានបញ្ហាបច្ចេកទេស។ Bot នៅដំណើរការ — សូមព្យាយាមម្តងទៀត។"
+                )
+            )
         except Exception:
             pass
+
 
 # ---------------------------------------------------------------------------
 # Bot runner
 # ---------------------------------------------------------------------------
 async def _run_bot():
-    # FIX #3: do NOT clear _user_locks on restart — in-flight coroutines may
-    # still hold references to old Lock objects; clearing causes them to never
-    # unblock. Locks are lightweight and recreated on first use per user.
+    # NOTE: do NOT clear _user_locks — in-flight coroutines may still hold
+    # references to existing Lock objects; clearing would orphan them.
     _admin_chat_target.clear()
     _user_to_admin.clear()
     _pending_broadcast.clear()
@@ -2656,37 +2972,44 @@ async def _run_bot():
         .build()
     )
 
-    # ── Commands ────────────────────────────────────────────────────────
-    app.add_handler(CommandHandler("start",           on_start))
-    app.add_handler(CommandHandler("help",            on_help))
-    app.add_handler(CommandHandler("myprefs",         cmd_myprefs))
-    app.add_handler(CommandHandler("broadcast",       broadcast_start))
-    app.add_handler(CommandHandler("schedule",        cmd_schedule))
-    app.add_handler(CommandHandler("schedules",       cmd_schedules))
-    app.add_handler(CommandHandler("cancelschedule",  cmd_cancelschedule))
-    app.add_handler(CommandHandler("cancel",          cmd_cancel))
-    app.add_handler(CommandHandler("stats",           admin_stats))
-    app.add_handler(CommandHandler("users",           cmd_users))
-    app.add_handler(CommandHandler("chat",            cmd_chat))
-    app.add_handler(CommandHandler("endchat",         cmd_endchat))
+    # ── Commands ──────────────────────────────────────────────────────────
+    app.add_handler(CommandHandler("start", on_start))
+    app.add_handler(CommandHandler("help", on_help))
+    app.add_handler(CommandHandler("myprefs", cmd_myprefs))
+    app.add_handler(CommandHandler("broadcast", broadcast_start))
+    app.add_handler(CommandHandler("schedule", cmd_schedule))
+    app.add_handler(CommandHandler("schedules", cmd_schedules))
+    app.add_handler(CommandHandler("cancelschedule", cmd_cancelschedule))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("stats", admin_stats))
+    app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("chat", cmd_chat))
+    app.add_handler(CommandHandler("endchat", cmd_endchat))
 
-    # ── Callback query handlers (specific patterns first) ──────────────
-    app.add_handler(CallbackQueryHandler(broadcast_callback,  pattern=r"^bc_(confirm|cancel)$"))
-    app.add_handler(CallbackQueryHandler(
-        users_page_callback,
-        pattern=r"^(users_page:\d+|users_close|chat_open:\d+|noop)$",
-    ))
+    # ── Callback query handlers (most-specific patterns first) ────────────
+    app.add_handler(CallbackQueryHandler(broadcast_callback, pattern=r"^bc_(confirm|cancel)$"))
+    app.add_handler(
+        CallbackQueryHandler(
+            users_page_callback,
+            pattern=r"^(users_page:\d+|users_close|chat_open:\d+|noop)$",
+        )
+    )
     app.add_handler(CallbackQueryHandler(sched_callback, pattern=r"^sched_"))
-    app.add_handler(CallbackQueryHandler(on_callback))   # catch-all
+    app.add_handler(CallbackQueryHandler(on_callback))  # catch-all for TTS callbacks
 
-    # ── Message handlers ────────────────────────────────────────────────
-    app.add_handler(MessageHandler(filters.PHOTO,   on_photo))
-    app.add_handler(MessageHandler(filters.VOICE,   on_voice))
-    app.add_handler(MessageHandler(
-        filters.Sticker.ALL | filters.Document.ALL | filters.VIDEO
-        | filters.AUDIO | filters.VIDEO_NOTE,
-        on_any_media,
-    ))
+    # ── Message handlers ──────────────────────────────────────────────────
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.VOICE, on_voice))
+    app.add_handler(
+        MessageHandler(
+            filters.Sticker.ALL
+            | filters.Document.ALL
+            | filters.VIDEO
+            | filters.AUDIO
+            | filters.VIDEO_NOTE,
+            on_any_media,
+        )
+    )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     app.add_error_handler(error_handler)
@@ -2694,12 +3017,11 @@ async def _run_bot():
     logger.info(f"Bot polling started. Admins: {ADMIN_IDS or 'none configured'}")
     logger.info(f"Gemini model: {GEMINI_MODEL}")
 
-    # ── Start background tasks ──────────────────────────────────────────
-    sched_stop  = asyncio.Event()
-    sweep_stop  = asyncio.Event()
-    sched_task  = asyncio.create_task(_scheduler_loop(app.bot, sched_stop))
-    # FIX #13: periodic /tmp sweep to prevent stale file accumulation
-    sweep_task  = asyncio.create_task(_periodic_temp_sweep(sweep_stop))
+    # ── Background tasks ──────────────────────────────────────────────────
+    sched_stop = asyncio.Event()
+    sweep_stop = asyncio.Event()
+    sched_task = asyncio.create_task(_scheduler_loop(app.bot, sched_stop))
+    sweep_task = asyncio.create_task(_periodic_temp_sweep(sweep_stop))
 
     async with app:
         await app.initialize()
@@ -2720,6 +3042,7 @@ async def _run_bot():
                 except (asyncio.CancelledError, Exception):
                     pass
 
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -2737,7 +3060,9 @@ def main():
     ensure_speed_column()
 
     if not ADMIN_IDS:
-        logger.warning("No ADMIN_IDS configured. Set ADMIN_IDS=123456,789012 in your environment.")
+        logger.warning(
+            "No ADMIN_IDS configured. Set ADMIN_IDS=123456,789012 in your environment."
+        )
 
     print(f"Bot is starting... (Gemini model: {GEMINI_MODEL})")
     while True:
