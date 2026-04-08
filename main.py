@@ -11,7 +11,7 @@ import tempfile
 import glob
 import requests
 import imageio_ffmpeg as _iio_ffmpeg
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from google import genai
@@ -234,8 +234,10 @@ WELCOME_TEXT = (
     "🇰🇭 ភាសាខ្មែរ | 🇺🇸 English\n\n"
     "✨ មុខងារថ្មី:\n"
     "🖼️ ផ្ញើរូបភាព → Bot OCR អត្ថបទ ហើយអាន!\n"
-    "🎙️ ផ្ញើ Voice → Bot Transcribe ហើយអាន!\n\n"
-    "⚙️ ប្រើ /myprefs ដើម្បីមើលការកំណត់របស់អ្នក\n\n"
+    "🎙️ ផ្ញើ Voice → Bot Transcribe ហើយអាន!\n"
+    "💬 Bot ចងចាំការសន្ទនា — អាចនិយាយ 'អានម្តងទៀត' ឬ 'បកប្រែ' បាន!\n\n"
+    "⚙️ ប្រើ /myprefs ដើម្បីមើលការកំណត់របស់អ្នក\n"
+    "🗑️ ប្រើ /clear ដើម្បីលុបប្រវត្តិការសន្ទនា\n\n"
     "📢 Join My Channel: https://t.me/m11mmm112"
 )
 
@@ -610,6 +612,243 @@ def ensure_speed_column():
             )
         else:
             logger.error(f"ensure_speed_column unexpected error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Database helpers — conversation history
+# ---------------------------------------------------------------------------
+
+# SQL to run once in Supabase:
+# ──────────────────────────────────────────────────────────────────────────
+# CREATE TABLE conversation_history (
+#     id          BIGSERIAL PRIMARY KEY,
+#     user_id     BIGINT NOT NULL,
+#     role        TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+#     content     TEXT NOT NULL,
+#     created_at  TIMESTAMPTZ DEFAULT NOW()
+# );
+# CREATE INDEX idx_conv_user_created ON conversation_history (user_id, created_at DESC);
+#
+# -- Auto-prune trigger: keep only last 30 rows per user
+# CREATE OR REPLACE FUNCTION prune_conversation_history()
+# RETURNS TRIGGER LANGUAGE plpgsql AS $$
+# BEGIN
+#     DELETE FROM conversation_history
+#     WHERE user_id = NEW.user_id
+#       AND id NOT IN (
+#           SELECT id FROM conversation_history
+#           WHERE user_id = NEW.user_id
+#           ORDER BY created_at DESC
+#           LIMIT 30
+#       );
+#     RETURN NEW;
+# END;
+# $$;
+# CREATE TRIGGER trg_prune_conv_history
+# AFTER INSERT ON conversation_history
+# FOR EACH ROW EXECUTE FUNCTION prune_conversation_history();
+# ──────────────────────────────────────────────────────────────────────────
+
+CONV_HISTORY_LIMIT = 10        # turns fetched from DB per request
+CONV_CONTEXT_MAX_CHARS = 3000  # hard cap before sending to Gemini
+CONV_RESOLVE_TIMEOUT_S = 15    # Gemini resolution timeout
+
+# In-memory history cache — per-user deque, LRU-evicted
+_HIST_CACHE_MAX_USERS = 5_000
+_HIST_CACHE_TURNS = 10
+_hist_cache: OrderedDict[int, deque] = OrderedDict()
+
+
+def _hist_cache_append(user_id: int, role: str, content: str) -> None:
+    """Append one turn to the in-memory history cache with LRU eviction."""
+    if user_id not in _hist_cache:
+        _hist_cache[user_id] = deque(maxlen=_HIST_CACHE_TURNS)
+        while len(_hist_cache) > _HIST_CACHE_MAX_USERS:
+            _hist_cache.popitem(last=False)
+    _hist_cache.move_to_end(user_id)
+    _hist_cache[user_id].append({"role": role, "content": content})
+
+
+def _hist_cache_get(user_id: int) -> list[dict] | None:
+    """Return cached turns (oldest-first) or None if the user is not warmed."""
+    d = _hist_cache.get(user_id)
+    if d is None:
+        return None
+    _hist_cache.move_to_end(user_id)
+    return list(d)
+
+
+def _hist_cache_clear(user_id: int) -> None:
+    _hist_cache.pop(user_id, None)
+
+
+def db_history_append(user_id: int, role: str, content: str) -> None:
+    """Fire-and-forget: write one conversation turn to Supabase."""
+    if not supabase:
+        return
+
+    def _run():
+        try:
+            supabase.table("conversation_history").insert(
+                {"user_id": user_id, "role": role, "content": content}
+            ).execute()
+        except Exception as e:
+            logger.error(f"db_history_append error: {e}")
+
+    _submit_db(_run)
+
+
+def db_history_fetch(user_id: int, limit: int = CONV_HISTORY_LIMIT) -> list[dict]:
+    """Return the last `limit` turns in chronological order (oldest first)."""
+    if not supabase:
+        return []
+    try:
+        res = (
+            supabase.table("conversation_history")
+            .select("role, content")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        rows = res.data or []
+        rows.reverse()   # newest-first from DB → oldest-first for context
+        return rows
+    except Exception as e:
+        logger.error(f"db_history_fetch error: {e}")
+        return []
+
+
+def db_history_clear(user_id: int) -> None:
+    """Delete all conversation history rows for this user."""
+    if not supabase:
+        return
+
+    def _run():
+        try:
+            supabase.table("conversation_history").delete().eq(
+                "user_id", user_id
+            ).execute()
+        except Exception as e:
+            logger.error(f"db_history_clear error: {e}")
+
+    _submit_db(_run)
+
+
+def _build_context_block(history: list[dict]) -> str:
+    """
+    Render history rows into a compact plain-text context string for Gemini.
+    Truncates from the oldest end if over CONV_CONTEXT_MAX_CHARS.
+    """
+    if not history:
+        return ""
+    lines = []
+    for row in history:
+        prefix = "User" if row["role"] == "user" else "Bot"
+        lines.append(f"{prefix}: {row['content']}")
+    block = "\n".join(lines)
+    if len(block) > CONV_CONTEXT_MAX_CHARS:
+        block = block[-CONV_CONTEXT_MAX_CHARS:]
+        nl = block.find("\n")
+        if nl != -1:
+            block = block[nl + 1:]
+    return block
+
+
+def record_turn(user_id: int, role: str, content: str) -> None:
+    """
+    Record one conversation turn to both the in-memory cache and Supabase.
+    Call this for every user message and every TTS response.
+    """
+    _hist_cache_append(user_id, role, content)
+    db_history_append(user_id, role, content)
+
+
+# ---------------------------------------------------------------------------
+# Conversation history: Gemini-powered text resolution
+# ---------------------------------------------------------------------------
+
+async def resolve_tts_text(
+    user_id: int,
+    raw_text: str,
+    loop: asyncio.AbstractEventLoop,
+) -> str:
+    """
+    Given the user's raw input and their conversation history, return the
+    exact text that should be spoken aloud.
+
+    Handles natural follow-ups:
+      "read that again"        → repeats last bot turn
+      "translate that to Khmer" → translates then returns translated text
+      "what did I just say?"   → echoes the last user turn
+      "say it faster"          → speed change handled elsewhere; repeats last text
+
+    Falls back to raw_text unchanged when:
+      - Gemini is not configured
+      - No history exists yet (first message)
+      - Gemini call fails or times out
+    """
+    if not _gemini:
+        return raw_text
+
+    history = _hist_cache_get(user_id)
+    if history is None:
+        history = await loop.run_in_executor(
+            _DB_EXECUTOR, db_history_fetch, user_id
+        )
+        # Warm the cache so subsequent messages in this session skip the DB call
+        for row in history:
+            _hist_cache_append(user_id, row["role"], row["content"])
+
+    if not history:
+        # No prior turns — nothing to resolve
+        return raw_text
+
+    context_block = _build_context_block(history)
+
+    system_prompt = (
+        "You are a text pre-processor for a Khmer/English text-to-speech bot. "
+        "You receive a conversation history and the user's latest message. "
+        "Your ONLY job is to output the exact text that should be spoken aloud. "
+        "Output nothing else — no labels, no explanation, no markdown.\n\n"
+        "Rules:\n"
+        "1. If the message is a normal sentence or paragraph to be read, output it verbatim.\n"
+        "2. If the message is a follow-up like 'read that again' or 'អានម្តងទៀត', "
+        "output the last Bot turn verbatim.\n"
+        "3. If the message asks to translate something (e.g. 'translate that to Khmer', "
+        "'បកប្រែជាភាសាខ្មែរ'), output the translated text in the target language.\n"
+        "4. If the message references previous content using pronouns like 'that', 'it', "
+        "'the last thing', resolve the reference and output the resolved text.\n"
+        "5. If the message asks 'what did I say?' or similar, output the last User turn.\n"
+        "6. Preserve the original language (Khmer or English) unless translation is requested.\n"
+        "7. If you cannot determine what to speak, output the user's message verbatim."
+    )
+
+    prompt = (
+        f"Conversation history:\n{context_block}\n\n"
+        f"User's new message: {raw_text}\n\n"
+        "Output only the text to speak:"
+    )
+
+    def _call():
+        return _gemini.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[system_prompt, prompt],
+        )
+
+    try:
+        response = await asyncio.wait_for(
+            loop.run_in_executor(_GEMINI_EXECUTOR, _call),
+            timeout=CONV_RESOLVE_TIMEOUT_S,
+        )
+        resolved = (response.text or "").strip()
+        return resolved if resolved else raw_text
+    except asyncio.TimeoutError:
+        logger.warning(f"resolve_tts_text timed out for user {user_id} — using raw text")
+        return raw_text
+    except Exception as e:
+        logger.warning(f"resolve_tts_text error for user {user_id}: {e} — using raw text")
+        return raw_text
 
 
 # ---------------------------------------------------------------------------
@@ -2408,6 +2647,7 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💬 Active Admin Chats: <b>{active_chats}</b>\n"
             f"📅 Scheduled (pending): <b>{len(pending_scheds)}</b>\n"
             f"🔒 Active user locks: <b>{len(_user_locks)}</b>\n"
+            f"💭 History cache entries: <b>{len(_hist_cache)}</b>\n"
             f"🤖 Gemini Model: <b>{GEMINI_MODEL}</b>",
             parse_mode="HTML",
         )
@@ -2463,8 +2703,6 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # REGULAR HANDLERS
 # ===========================================================================
 
-# _BOT_START_TIME initialised at module level so the stale-drop guard is
-# available before _run_bot() sets it.
 _BOT_START_TIME: float = 0.0
 
 
@@ -2547,6 +2785,24 @@ async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /clear — wipe this user's conversation history from both the
+    in-memory cache and Supabase so the bot starts fresh.
+    Available to all users (not admin-only).
+    """
+    user_id = update.effective_user.id
+    _hist_cache_clear(user_id)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(_DB_EXECUTOR, db_history_clear, user_id)
+    await safe_send(
+        lambda: update.message.reply_text(
+            "🗑️ ប្រវត្តិការសន្ទនារបស់អ្នកបានលុបចេញហើយ។\n"
+            "Bot នឹងចាប់ផ្ដើមការសន្ទនាថ្មី។"
+        )
+    )
+
+
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user = update.effective_user
@@ -2554,8 +2810,6 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id is None:
         return
 
-    # Admin path — must return before _get_admin_for_user to prevent
-    # admins being forwarded to themselves.
     if _is_admin(user_id):
         sched_state = context.user_data.get("sched_state")
         if sched_state == SCHED_WAIT_MSG:
@@ -2577,10 +2831,8 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not ok:
                     _close_session(user_id)
                     context.user_data.pop("chat_state", None)
-            return  # BUG FIX: admin in chat mode should not fall through to OCR
-        # Admin with no active state: fall through to OCR intentionally.
+            return
 
-    # Non-admin: forward to admin if in chat session
     admin_id = _get_admin_for_user(user_id)
     if admin_id is not None:
         uname = user.username or user.first_name or str(user_id)
@@ -2695,7 +2947,6 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
 
-    # Admin early-return before _get_admin_for_user check.
     if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
         target_id = _admin_chat_target.get(user_id)
         if target_id:
@@ -2839,7 +3090,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     context.user_data.pop("chat_state", None)
             return
 
-    # Non-admin in chat session
+    # Non-admin in chat session — forward to admin, do NOT run TTS
     admin_id = _get_admin_for_user(user_id)
     if admin_id is not None:
         uname = user.username or user.first_name or str(user_id)
@@ -2873,6 +3124,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gender = prefs["gender"]
     speed = prefs["speed"]
 
+    # ── Resolve text through conversation context ──────────────────────────
+    # This handles follow-ups like "read that again", "translate that", etc.
+    tts_text = await resolve_tts_text(user_id, stripped, loop)
+
+    # Record the user's raw message (before resolution) into history
+    record_turn(user_id, "user", stripped)
+    # ──────────────────────────────────────────────────────────────────────
+
     file_path = _make_temp_ogg()
     stop_event = asyncio.Event()
     timer_task = asyncio.create_task(
@@ -2881,7 +3140,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lock = _get_user_lock(user_id)
     async with lock:
         try:
-            audio_bytes = await generate_voice(stripped, gender, speed, file_path)
+            audio_bytes = await generate_voice(tts_text, gender, speed, file_path)
             sent_msg = await safe_send(
                 lambda: msg.reply_voice(
                     voice=io.BytesIO(audio_bytes),
@@ -2890,13 +3149,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             )
             if sent_msg:
+                # Cache the resolved text (what was actually spoken)
                 save_text_cache(
                     sent_msg.message_id,
-                    stripped,
+                    tts_text,
                     chat_id=msg.chat_id,
                     user_id=user_id,
                     username=user.username or user.first_name,
                 )
+                # Record what the bot actually spoke into history
+                record_turn(user_id, "assistant", tts_text)
+
             _set_last_tts(user_id)
         except Exception as e:
             logger.error(f"on_text TTS error: {e}")
@@ -3086,6 +3349,8 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
                     user_id=user_id,
                     username=query.from_user.username or query.from_user.first_name,
                 )
+                # Record transcript TTS into conversation history
+                record_turn(user_id, "assistant", original_text)
             _set_last_tts(user_id)
         except Exception as e:
             logger.error(f"transcript TTS error: {e}")
@@ -3133,6 +3398,8 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
                 user_id=user_id,
                 username=uname,
             )
+            # Record OCR/doc TTS into conversation history
+            record_turn(user_id, "assistant", full_text[:CONV_CONTEXT_MAX_CHARS])
         except Exception as e:
             logger.error(f"_cb_doc_read delivery error: {e}")
             try:
@@ -3215,6 +3482,7 @@ async def _run_bot():
     _user_last_tts.clear()
     _sched_payload.clear()
     _scheduler_tasks.clear()
+    _hist_cache.clear()
     # NOTE: do NOT clear _user_locks — in-flight coroutines may hold references.
 
     app = (
@@ -3235,6 +3503,7 @@ async def _run_bot():
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("help", on_help))
     app.add_handler(CommandHandler("myprefs", cmd_myprefs))
+    app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("broadcast", broadcast_start))
     app.add_handler(CommandHandler("schedule", cmd_schedule))
     app.add_handler(CommandHandler("schedules", cmd_schedules))
