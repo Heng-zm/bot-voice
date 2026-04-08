@@ -88,7 +88,7 @@ from telegram.ext import (
 )
 
 # ---------------------------------------------------------------------------
-# Config
+# Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -98,16 +98,15 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN: str = ""
 SB_URL: str = ""
 SB_KEY: str = ""
 GEMINI_API_KEY: str = ""
 ADMIN_IDS: set[int] = set()
-
-# FIX #1: Use a real, available model name as default.
-# "gemini-3.1-pro-preview" does not exist and causes every OCR/transcription
-# call to fail at runtime.  Override via GEMINI_MODEL env var at any time.
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-2.0-flash"
 
 MAX_VOICE_BYTES = 20 * 1024 * 1024
 MAX_INPUT_CHARS = 5_000
@@ -116,17 +115,14 @@ DEFAULT_SPEED = 1.0
 TELE_MSG_LIMIT = 4000
 USER_COOLDOWN_S = 3.0
 
-# FIX #10: grace window so valid messages arriving within 30 s of a restart
-# are not incorrectly dropped by the stale-update guard.
+# Grace window: valid messages arriving within 30s of restart are not dropped.
 _STALE_GRACE_S = 30.0
 
 _KHMER_RE = re.compile(r"[\u1780-\u17FF]")
 
-# FIX #9: Gemini API calls get their own executor so slow/timed-out Gemini
-# requests (up to 60 s) cannot starve the DB thread pool used by _submit_db.
+# Separate executor pools: DB writes (blocking I/O) vs Gemini API (slow network).
 _DB_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="db_write")
 _GEMINI_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="gemini")
-
 
 # ---------------------------------------------------------------------------
 # State constants
@@ -153,14 +149,13 @@ _admin_chat_target: dict[int, int] = {}
 _user_to_admin: dict[int, int] = {}
 _sched_payload: dict[int, dict] = {}
 
-# FIX #8: _user_last_tts uses a LRU-capped OrderedDict to prevent unbounded
-# memory growth for bots with large/growing user bases.
+# LRU-capped OrderedDict to prevent unbounded memory growth.
 _USER_LAST_TTS_MAX = 10_000
 _user_last_tts: OrderedDict[int, float] = OrderedDict()
 
 
 def _set_last_tts(user_id: int) -> None:
-    """Record the TTS completion time for a user with LRU eviction."""
+    """Record TTS completion time with LRU eviction."""
     _user_last_tts.pop(user_id, None)
     _user_last_tts[user_id] = time.monotonic()
     while len(_user_last_tts) > _USER_LAST_TTS_MAX:
@@ -172,24 +167,23 @@ def _get_last_tts(user_id: int) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Supabase + Gemini
+# Supabase + Gemini clients
 # ---------------------------------------------------------------------------
 supabase: Client | None = None
 _gemini: genai.Client | None = None
 
 
 def _init_clients() -> None:
-    global supabase, _gemini, TELEGRAM_BOT_TOKEN, SB_URL, SB_KEY, GEMINI_API_KEY, ADMIN_IDS, GEMINI_MODEL
+    global supabase, _gemini, TELEGRAM_BOT_TOKEN, SB_URL, SB_KEY
+    global GEMINI_API_KEY, ADMIN_IDS, GEMINI_MODEL
 
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     SB_URL = os.getenv("SUPABASE_URL", "")
     SB_KEY = os.getenv("SUPABASE_KEY", "")
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-    # FIX #1: default to a model that actually exists.
-    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
-    _raw_admin_ids = os.getenv("ADMIN_IDS", "")
-    for _aid in _raw_admin_ids.split(","):
+    for _aid in os.getenv("ADMIN_IDS", "").split(","):
         _aid = _aid.strip()
         if _aid.isdigit():
             ADMIN_IDS.add(int(_aid))
@@ -252,7 +246,6 @@ BOT_TAG = "@voicekhaibot"
 # ---------------------------------------------------------------------------
 _PREFS_TTL = 300.0
 _PREFS_MAX_SIZE = 10_000
-
 _prefs_cache: OrderedDict[int, tuple[dict, float]] = OrderedDict()
 
 
@@ -275,10 +268,7 @@ def _invalidate_prefs(user_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# FIX #6: Per-user async lock — asyncio is cooperative/single-threaded so we
-# don't need a threading.Lock to guard the dict.  Removing it eliminates the
-# risk of asyncio.Lock() being instantiated off the running event loop
-# (which raises RuntimeError in Python ≥ 3.10).
+# Per-user async locks (LRU-capped, asyncio-safe)
 # ---------------------------------------------------------------------------
 _USER_LOCK_MAX = 5_000
 _user_locks: OrderedDict[int, asyncio.Lock] = OrderedDict()
@@ -287,11 +277,8 @@ _user_locks: OrderedDict[int, asyncio.Lock] = OrderedDict()
 def _get_user_lock(user_id: int) -> asyncio.Lock:
     """
     Return (or create) a per-user asyncio.Lock.
-
-    Must only be called from within an async handler (i.e. on the running
-    event loop).  asyncio is cooperative — no threading guard is needed for
-    the dict itself.  The OrderedDict acts as an LRU so the map never grows
-    beyond _USER_LOCK_MAX entries.
+    Must only be called from an async handler (on the running event loop).
+    The OrderedDict acts as an LRU so the map never exceeds _USER_LOCK_MAX entries.
     """
     if user_id in _user_locks:
         _user_locks.move_to_end(user_id)
@@ -304,7 +291,7 @@ def _get_user_lock(user_id: int) -> asyncio.Lock:
 
 
 # ---------------------------------------------------------------------------
-# DB Future error logger
+# DB executor helpers
 # ---------------------------------------------------------------------------
 def _log_future_exception(future):
     try:
@@ -327,7 +314,7 @@ def _submit_db(fn, *args, **kwargs):
 async def safe_send(coro_factory, retries: int = 3, delay: float = 2.0):
     if inspect.isawaitable(coro_factory):
         logger.warning(
-            "safe_send received a raw coroutine — retries are disabled. "
+            "safe_send received a raw coroutine — retries disabled. "
             "Pass a zero-arg lambda instead."
         )
         try:
@@ -436,14 +423,18 @@ async def _periodic_temp_sweep(stop_event: asyncio.Event) -> None:
 # Database helpers — user prefs
 # ---------------------------------------------------------------------------
 def sync_user_data(user):
+    """Upsert user record asynchronously (fire-and-forget)."""
     if not supabase:
         return
 
     def _run():
-        supabase.table("user_prefs").upsert(
-            {"user_id": user.id, "username": user.username or user.first_name},
-            on_conflict="user_id",
-        ).execute()
+        try:
+            supabase.table("user_prefs").upsert(
+                {"user_id": user.id, "username": user.username or user.first_name},
+                on_conflict="user_id",
+            ).execute()
+        except Exception as e:
+            logger.error(f"sync_user_data error: {e}")
 
     _submit_db(_run)
 
@@ -528,7 +519,12 @@ def update_user_gender(user_id: int, gender: str):
         return
 
     def _run():
-        supabase.table("user_prefs").update({"gender": gender}).eq("user_id", user_id).execute()
+        try:
+            supabase.table("user_prefs").update({"gender": gender}).eq(
+                "user_id", user_id
+            ).execute()
+        except Exception as e:
+            logger.error(f"update_user_gender error: {e}")
 
     _submit_db(_run)
 
@@ -540,7 +536,9 @@ def update_user_speed(user_id: int, speed: float):
 
     def _run():
         try:
-            supabase.table("user_prefs").update({"speed": speed}).eq("user_id", user_id).execute()
+            supabase.table("user_prefs").update({"speed": speed}).eq(
+                "user_id", user_id
+            ).execute()
         except Exception as e:
             if "does not exist" in str(e):
                 logger.error(
@@ -548,7 +546,7 @@ def update_user_speed(user_id: int, speed: float):
                     "Run: ALTER TABLE user_prefs ADD COLUMN speed FLOAT DEFAULT 1.0;"
                 )
             else:
-                raise
+                logger.error(f"update_user_speed error: {e}")
 
     _submit_db(_run)
 
@@ -564,12 +562,17 @@ def save_text_cache(
         return
 
     def _run():
-        payload = {"message_id": msg_id, "chat_id": chat_id, "original_text": text}
-        if user_id is not None:
-            payload["user_id"] = user_id
-        if username is not None:
-            payload["username"] = username
-        supabase.table("text_cache").upsert(payload, on_conflict="chat_id,message_id").execute()
+        try:
+            payload = {"message_id": msg_id, "chat_id": chat_id, "original_text": text}
+            if user_id is not None:
+                payload["user_id"] = user_id
+            if username is not None:
+                payload["username"] = username
+            supabase.table("text_cache").upsert(
+                payload, on_conflict="chat_id,message_id"
+            ).execute()
+        except Exception as e:
+            logger.error(f"save_text_cache error: {e}")
 
     _submit_db(_run)
 
@@ -666,8 +669,11 @@ def db_sched_claim(row_id: int) -> bool:
 def db_sched_set_status(row_id: int, status: str, **extra) -> None:
     if not supabase:
         return
-    patch = {"status": status, **extra}
-    supabase.table("scheduled_broadcasts").update(patch).eq("id", row_id).execute()
+    try:
+        patch = {"status": status, **extra}
+        supabase.table("scheduled_broadcasts").update(patch).eq("id", row_id).execute()
+    except Exception as e:
+        logger.error(f"db_sched_set_status #{row_id} -> {status}: {e}")
 
 
 def db_sched_fetch_admin_pending(admin_id: int) -> list[dict]:
@@ -706,7 +712,7 @@ def db_sched_fetch_one(row_id: int) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Scheduled broadcast — datetime helpers
+# Datetime helpers
 # ---------------------------------------------------------------------------
 def _parse_dt(text: str) -> datetime | None:
     text = text.strip()
@@ -730,14 +736,18 @@ def get_sched_confirm_kb(row_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("✅ បញ្ជាក់ Schedule", callback_data=f"sched_ok:{row_id}"),
+                InlineKeyboardButton(
+                    "✅ បញ្ជាក់ Schedule", callback_data=f"sched_ok:{row_id}"
+                ),
                 InlineKeyboardButton("❌ បោះបង់", callback_data=f"sched_no:{row_id}"),
             ]
         ]
     )
 
 
-def get_schedules_list_kb(rows: list[dict], page: int, page_size: int = 5) -> InlineKeyboardMarkup:
+def get_schedules_list_kb(
+    rows: list[dict], page: int, page_size: int = 5
+) -> InlineKeyboardMarkup:
     total = max(1, (len(rows) + page_size - 1) // page_size)
     chunk = rows[page * page_size : (page + 1) * page_size]
     kbd_rows = []
@@ -747,13 +757,21 @@ def get_schedules_list_kb(rows: list[dict], page: int, page_size: int = 5) -> In
         except Exception:
             dt_str = str(r.get("broadcast_at", "?"))
         label = f"#{r['id']}  {dt_str}"
-        kbd_rows.append([InlineKeyboardButton(label, callback_data=f"sched_view:{r['id']}")])
+        kbd_rows.append(
+            [InlineKeyboardButton(label, callback_data=f"sched_view:{r['id']}")]
+        )
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"sched_page:{page - 1}"))
-    nav.append(InlineKeyboardButton(f"{page + 1}/{total}", callback_data="sched_noop"))
+        nav.append(
+            InlineKeyboardButton("⬅️", callback_data=f"sched_page:{page - 1}")
+        )
+    nav.append(
+        InlineKeyboardButton(f"{page + 1}/{total}", callback_data="sched_noop")
+    )
     if page < total - 1:
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"sched_page:{page + 1}"))
+        nav.append(
+            InlineKeyboardButton("➡️", callback_data=f"sched_page:{page + 1}")
+        )
     if nav:
         kbd_rows.append(nav)
     kbd_rows.append([InlineKeyboardButton("❌ បិទ", callback_data="sched_close")])
@@ -761,7 +779,7 @@ def get_schedules_list_kb(rows: list[dict], page: int, page_size: int = 5) -> In
 
 
 # ---------------------------------------------------------------------------
-# Status timer
+# Status timer (animated spinner messages)
 # ---------------------------------------------------------------------------
 _STATUS_FRAMES = [
     "⏳ កំពុងបង្កើតសំឡេង ·",
@@ -783,7 +801,9 @@ _OCR_FRAMES = [
 ]
 
 
-async def send_status_timer(chat_id: int, bot, stop_event: asyncio.Event, frames=None):
+async def send_status_timer(
+    chat_id: int, bot, stop_event: asyncio.Event, frames=None
+):
     frames = frames or _STATUS_FRAMES
     msg = None
     try:
@@ -835,9 +855,8 @@ async def _stop_timer(stop_event: asyncio.Event, timer_task: asyncio.Task):
 @functools.lru_cache(maxsize=32)
 def _build_atempo_chain(speed: float) -> str:
     """
-    Build a valid FFmpeg atempo filter chain for the given speed.
-    atempo only accepts values in [0.5, 2.0], so we chain multiple stages
-    for speeds outside that range.
+    Build a valid FFmpeg atempo filter chain.
+    atempo only accepts [0.5, 2.0]; chain multiple stages for other ranges.
     """
     speed = round(speed, 4)
     if abs(speed - 1.0) < 1e-6:
@@ -864,7 +883,7 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str)
     """Generate TTS audio and return the raw OGG/Opus bytes."""
     khmer_chars = len(_KHMER_RE.findall(text))
     total_alpha = sum(1 for c in text if c.isalpha())
-    is_khmer = khmer_chars > (total_alpha * 0.3)
+    is_khmer = khmer_chars > (total_alpha * 0.3) if total_alpha else False
     voice = VOICE_MAP["km" if is_khmer else "en"][gender]
 
     mp3_chunks: list[bytes] = []
@@ -899,7 +918,9 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str)
         raise RuntimeError(f"FFmpeg failed (code {proc.returncode}): {stderr_snippet}")
 
     loop = asyncio.get_running_loop()
-    audio_bytes = await loop.run_in_executor(None, lambda: open(output_path, "rb").read())
+    audio_bytes = await loop.run_in_executor(
+        None, lambda: open(output_path, "rb").read()
+    )
     return audio_bytes
 
 
@@ -910,7 +931,9 @@ async def transcribe_voice(ogg_path: str) -> str:
     if not _gemini:
         raise RuntimeError("GEMINI_API_KEY not set.")
     loop = asyncio.get_running_loop()
-    audio_bytes = await loop.run_in_executor(None, lambda: open(ogg_path, "rb").read())
+    audio_bytes = await loop.run_in_executor(
+        None, lambda: open(ogg_path, "rb").read()
+    )
     prompt = (
         "Transcribe this audio exactly as spoken. "
         "Output ONLY the transcribed text — no labels, no explanation. "
@@ -926,7 +949,6 @@ async def transcribe_voice(ogg_path: str) -> str:
             ],
         )
 
-    # FIX #9: use the dedicated Gemini executor, not the shared default/DB executor.
     try:
         response = await asyncio.wait_for(
             loop.run_in_executor(_GEMINI_EXECUTOR, _call), timeout=60
@@ -1015,15 +1037,17 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
     if not _gemini:
         raise RuntimeError("GEMINI_API_KEY not set.")
     loop = asyncio.get_running_loop()
-    image_bytes = await loop.run_in_executor(None, lambda: open(image_path, "rb").read())
+    image_bytes = await loop.run_in_executor(
+        None, lambda: open(image_path, "rb").read()
+    )
     prompt = (
         "You are an OCR engine. Extract EVERY line of text visible in this image, "
         "from top to bottom, left to right. "
-        "Do NOT skip, truncate, summarise, or omit any line — even if the text is long or the image has many lines. "
-        "Do NOT add any labels, headers, explanations, bullet points, or markdown formatting. "
-        "Output ONLY the raw extracted text, preserving the original line breaks exactly. "
-        "Support both Khmer (ខ្មែរ) and English text with full Unicode accuracy. "
-        "If there is truly no text anywhere in the image, output only the single word: NOTEXT"
+        "Do NOT skip, truncate, summarise, or omit any line — even if the text is long. "
+        "Do NOT add any labels, headers, explanations, bullet points, or markdown. "
+        "Output ONLY the raw extracted text, preserving original line breaks exactly. "
+        "Support both Khmer (ខ្មែរ) and English with full Unicode accuracy. "
+        "If there is truly no text, output only the single word: NOTEXT"
     )
 
     def _call():
@@ -1035,7 +1059,6 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
             ],
         )
 
-    # FIX #9: use the dedicated Gemini executor.
     try:
         response = await asyncio.wait_for(
             loop.run_in_executor(_GEMINI_EXECUTOR, _call), timeout=60
@@ -1046,13 +1069,12 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Cooldown check helper — shared by all TTS entry points
+# Cooldown check — shared by all TTS entry points
 # ---------------------------------------------------------------------------
 async def _check_cooldown(reply_target, user_id: int) -> bool:
     """
-    FIX #7: Centralised cooldown check used by ALL TTS paths
-    (on_text, _cb_speed, _cb_gender, _cb_tts_transcript, _cb_doc_read).
-    Returns True if the request is within cooldown and a warning was sent.
+    Returns True if the request is within cooldown (warning sent).
+    Checks both lock state and time-based cooldown.
     """
     lock = _get_user_lock(user_id)
     if lock.locked():
@@ -1065,7 +1087,9 @@ async def _check_cooldown(reply_target, user_id: int) -> bool:
     if now - last < USER_COOLDOWN_S:
         rem = round(USER_COOLDOWN_S - (now - last), 1)
         await safe_send(
-            lambda r=rem: reply_target.reply_text(f"⏳ សូមរង់ចាំ {r}s មុននឹងផ្ញើម្តងទៀត។")
+            lambda r=rem: reply_target.reply_text(
+                f"⏳ សូមរង់ចាំ {r}s មុននឹងផ្ញើម្តងទៀត។"
+            )
         )
         return True
     return False
@@ -1085,7 +1109,9 @@ async def _deliver_paged_tts(
 ) -> None:
     chunks = _split_text_chunks(text)
     if not chunks:
-        await safe_send(lambda: bot.send_message(chat_id=chat_id, text="❌ រកអត្ថបទមិនឃើញ។"))
+        await safe_send(
+            lambda: bot.send_message(chat_id=chat_id, text="❌ រកអត្ថបទមិនឃើញ។")
+        )
         return
 
     total = len(chunks)
@@ -1128,10 +1154,7 @@ async def _deliver_paged_tts(
         if i < total:
             await asyncio.sleep(0.3)
 
-    # FIX #5: Set cooldown AFTER all chunks have been delivered, not before the
-    # first chunk is generated.  Previously, cooldown was set at the start of
-    # the loop so a slow multi-chunk request could expire before delivery ended,
-    # allowing a second request to slip through concurrently.
+    # Cooldown set AFTER all chunks delivered, not at start of loop.
     _set_last_tts(user_id)
 
 
@@ -1195,14 +1218,18 @@ def get_broadcast_confirm_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("✅ បញ្ជាក់ Broadcast", callback_data="bc_confirm"),
+                InlineKeyboardButton(
+                    "✅ បញ្ជាក់ Broadcast", callback_data="bc_confirm"
+                ),
                 InlineKeyboardButton("❌ បោះបង់", callback_data="bc_cancel"),
             ]
         ]
     )
 
 
-def get_users_page_kb(users: list[dict], page: int, page_size: int = 8) -> InlineKeyboardMarkup:
+def get_users_page_kb(
+    users: list[dict], page: int, page_size: int = 8
+) -> InlineKeyboardMarkup:
     total_pages = max(1, (len(users) + page_size - 1) // page_size)
     chunk = users[page * page_size : page * page_size + page_size]
     rows = []
@@ -1214,10 +1241,16 @@ def get_users_page_kb(users: list[dict], page: int, page_size: int = 8) -> Inlin
         )
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"users_page:{page - 1}"))
-    nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+        nav.append(
+            InlineKeyboardButton("⬅️", callback_data=f"users_page:{page - 1}")
+        )
+    nav.append(
+        InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop")
+    )
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"users_page:{page + 1}"))
+        nav.append(
+            InlineKeyboardButton("➡️", callback_data=f"users_page:{page + 1}")
+        )
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton("❌ បិទ", callback_data="users_close")])
@@ -1246,7 +1279,9 @@ def admin_only(handler):
         if uid not in ADMIN_IDS:
             if update.message:
                 await safe_send(
-                    lambda: update.message.reply_text("⛔ អ្នកមិនមានសិទ្ធិប្រើពាក្យបញ្ជានេះទេ។")
+                    lambda: update.message.reply_text(
+                        "⛔ អ្នកមិនមានសិទ្ធិប្រើពាក្យបញ្ជានេះទេ។"
+                    )
                 )
             return
         return await handler(update, context)
@@ -1318,10 +1353,14 @@ async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif msg.text:
         plain_text = msg.text.strip()
         if not plain_text:
-            await safe_send(lambda: msg.reply_text("⚠️ អត្ថបទមិនអាចទទេបាន។ សូមវាយសារ។"))
+            await safe_send(
+                lambda: msg.reply_text("⚠️ អត្ថបទមិនអាចទទេបាន។ សូមវាយសារ។")
+            )
             return
     else:
-        await safe_send(lambda: msg.reply_text("⚠️ ផ្ញើតែ Text ឬ រូបភាព + Caption ប៉ុណ្ណោះ។"))
+        await safe_send(
+            lambda: msg.reply_text("⚠️ ផ្ញើតែ Text ឬ រូបភាព + Caption ប៉ុណ្ណោះ។")
+        )
         return
 
     _pending_broadcast[user_id] = {
@@ -1331,7 +1370,9 @@ async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     if photo_file_id:
-        preview_cap = html.escape(caption_text) if caption_text else "<i>(គ្មាន Caption)</i>"
+        preview_cap = (
+            html.escape(caption_text) if caption_text else "<i>(គ្មាន Caption)</i>"
+        )
         await safe_send(
             lambda: msg.reply_photo(
                 photo=photo_file_id,
@@ -1421,7 +1462,9 @@ async def _do_broadcast(bot, admin_id: int, pending: dict):
     plain_text = pending.get("text") or ""
 
     progress_msg = await safe_send(
-        lambda: bot.send_message(chat_id=admin_id, text=f"📡 កំពុង Broadcast ទៅ {total} នាក់...")
+        lambda: bot.send_message(
+            chat_id=admin_id, text=f"📡 កំពុង Broadcast ទៅ {total} នាក់..."
+        )
     )
 
     async def _send_one(uid: int) -> str:
@@ -1435,7 +1478,9 @@ async def _do_broadcast(bot, admin_id: int, pending: dict):
                         parse_mode="HTML" if caption else None,
                     )
                 else:
-                    await bot.send_message(chat_id=uid, text=plain_text, parse_mode="HTML")
+                    await bot.send_message(
+                        chat_id=uid, text=plain_text, parse_mode="HTML"
+                    )
                 return "sent"
             except Forbidden:
                 return "blocked"
@@ -1480,7 +1525,9 @@ async def _do_broadcast(bot, admin_id: int, pending: dict):
             await safe_send(lambda: progress_msg.edit_text(report, parse_mode="HTML"))
         else:
             await safe_send(
-                lambda: bot.send_message(chat_id=admin_id, text=report, parse_mode="HTML")
+                lambda: bot.send_message(
+                    chat_id=admin_id, text=report, parse_mode="HTML"
+                )
             )
     except Exception as e:
         logger.error(f"Broadcast report error: {e}")
@@ -1513,7 +1560,9 @@ async def cmd_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = await loop.run_in_executor(None, db_sched_fetch_admin_pending, admin_id)
     if not rows:
         await safe_send(
-            lambda: update.message.reply_text("📭 មិនមាន Scheduled Broadcast ណាមួយទេ។")
+            lambda: update.message.reply_text(
+                "📭 មិនមាន Scheduled Broadcast ណាមួយទេ។"
+            )
         )
         return
     await safe_send(
@@ -1545,10 +1594,14 @@ async def cmd_cancelschedule(update: Update, context: ContextTypes.DEFAULT_TYPE)
     row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
 
     if not row:
-        await safe_send(lambda: update.message.reply_text(f"❌ រកមិនឃើញ Schedule #{row_id}។"))
+        await safe_send(
+            lambda: update.message.reply_text(f"❌ រកមិនឃើញ Schedule #{row_id}។")
+        )
         return
     if row["admin_id"] != admin_id:
-        await safe_send(lambda: update.message.reply_text("⛔ Schedule នេះមិនមែនជារបស់អ្នកទេ។"))
+        await safe_send(
+            lambda: update.message.reply_text("⛔ Schedule នេះមិនមែនជារបស់អ្នកទេ។")
+        )
         return
     if row["status"] != "pending":
         st = row["status"]
@@ -1568,7 +1621,9 @@ async def cmd_cancelschedule(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
-async def _handle_sched_content(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def _handle_sched_content(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
     user_id = update.effective_user.id
     if not _is_admin(user_id):
         return False
@@ -1587,11 +1642,15 @@ async def _handle_sched_content(update: Update, context: ContextTypes.DEFAULT_TY
         plain_text = msg.text.strip()
         if not plain_text:
             await safe_send(
-                lambda: msg.reply_text("⚠️ អត្ថបទមិនអាចទទេបាន។ សូមវាយសារ ឬ ផ្ញើរូបភាព។")
+                lambda: msg.reply_text(
+                    "⚠️ អត្ថបទមិនអាចទទេបាន។ សូមវាយសារ ឬ ផ្ញើរូបភាព។"
+                )
             )
             return True
     else:
-        await safe_send(lambda: msg.reply_text("⚠️ ផ្ញើតែ Text ឬ រូបភាព + Caption ប៉ុណ្ណោះ។"))
+        await safe_send(
+            lambda: msg.reply_text("⚠️ ផ្ញើតែ Text ឬ រូបភាព + Caption ប៉ុណ្ណោះ។")
+        )
         return True
 
     _sched_payload[user_id] = {
@@ -1613,7 +1672,9 @@ async def _handle_sched_content(update: Update, context: ContextTypes.DEFAULT_TY
     return True
 
 
-async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def _handle_sched_datetime(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
     user_id = update.effective_user.id
     if not _is_admin(user_id):
         return False
@@ -1662,11 +1723,15 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
 
     loop = asyncio.get_running_loop()
     try:
-        row = await loop.run_in_executor(None, db_sched_insert, payload, user_id, broadcast_at)
+        row = await loop.run_in_executor(
+            None, db_sched_insert, payload, user_id, broadcast_at
+        )
     except Exception as e:
         logger.error(f"db_sched_insert failed: {e}")
         await safe_send(
-            lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការ Save Schedule ។ សូមព្យាយាមម្តងទៀត។")
+            lambda: msg.reply_text(
+                "❌ មានបញ្ហាក្នុងការ Save Schedule ។ សូមព្យាយាមម្តងទៀត។"
+            )
         )
         return True
 
@@ -1675,7 +1740,9 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
 
     if payload.get("photo_file_id"):
         cap_preview = (
-            html.escape(payload["caption"]) if payload.get("caption") else "<i>(គ្មាន Caption)</i>"
+            html.escape(payload["caption"])
+            if payload.get("caption")
+            else "<i>(គ្មាន Caption)</i>"
         )
         await safe_send(
             lambda: msg.reply_photo(
@@ -1719,9 +1786,10 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+    loop = asyncio.get_running_loop()
+
     if data.startswith("sched_ok:"):
         row_id = int(data.split(":")[1])
-        loop = asyncio.get_running_loop()
         row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
         if not row:
             await safe_send(
@@ -1755,7 +1823,6 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("sched_no:"):
         row_id = int(data.split(":")[1])
-        loop = asyncio.get_running_loop()
         row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
         if row and row["status"] == "pending":
             await loop.run_in_executor(None, db_sched_set_status, row_id, "cancelled")
@@ -1782,7 +1849,6 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("sched_page:"):
         page = int(data.split(":")[1])
-        loop = asyncio.get_running_loop()
         rows = await loop.run_in_executor(None, db_sched_fetch_admin_pending, user_id)
         try:
             await query.message.edit_reply_markup(
@@ -1794,10 +1860,11 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("sched_view:"):
         row_id = int(data.split(":")[1])
-        loop = asyncio.get_running_loop()
         row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
         if not row:
-            await safe_send(lambda: query.message.reply_text("❌ រកមិនឃើញ Schedule ។"))
+            await safe_send(
+                lambda: query.message.reply_text("❌ រកមិនឃើញ Schedule ។")
+            )
             return
         try:
             dt_str = _fmt_dt(datetime.fromisoformat(row["broadcast_at"]))
@@ -1832,11 +1899,12 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("sched_cancel_confirm:"):
         row_id = int(data.split(":")[1])
-        loop = asyncio.get_running_loop()
         row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
         if not row or row.get("admin_id") != user_id:
             await safe_send(
-                lambda: query.message.reply_text("⛔ អ្នកមិនមានសិទ្ធិ cancel Schedule នេះ។")
+                lambda: query.message.reply_text(
+                    "⛔ អ្នកមិនមានសិទ្ធិ cancel Schedule នេះ។"
+                )
             )
             return
         if row["status"] != "pending":
@@ -1910,7 +1978,9 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
                         parse_mode="HTML" if caption else None,
                     )
                 else:
-                    await bot.send_message(chat_id=uid, text=plain_text, parse_mode="HTML")
+                    await bot.send_message(
+                        chat_id=uid, text=plain_text, parse_mode="HTML"
+                    )
                 return "sent"
             except Forbidden:
                 return "blocked"
@@ -1919,7 +1989,9 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
                 if attempt == 1:
                     return "failed"
             except Exception as exc:
-                logger.error(f"Sched broadcast #{row_id} uid={uid} attempt={attempt}: {exc}")
+                logger.error(
+                    f"Sched broadcast #{row_id} uid={uid} attempt={attempt}: {exc}"
+                )
                 if attempt == 1:
                     return "failed"
         return "failed"
@@ -1945,7 +2017,7 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
 
     try:
         if supabase:
-            await asyncio.get_running_loop().run_in_executor(
+            await loop.run_in_executor(
                 None,
                 lambda: supabase.table("scheduled_broadcasts")
                 .update(
@@ -1995,7 +2067,9 @@ async def _scheduler_loop(bot, stop_event: asyncio.Event) -> None:
             logger.error(f"Scheduler loop error: {e}")
 
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=float(_SCHED_POLL_INTERVAL))
+            await asyncio.wait_for(
+                stop_event.wait(), timeout=float(_SCHED_POLL_INTERVAL)
+            )
         except asyncio.TimeoutError:
             pass
 
@@ -2009,9 +2083,15 @@ async def _scheduler_loop(bot, stop_event: asyncio.Event) -> None:
 
 @admin_only
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = await asyncio.get_running_loop().run_in_executor(None, get_all_users_with_names)
+    users = await asyncio.get_running_loop().run_in_executor(
+        None, get_all_users_with_names
+    )
     if not users:
-        await safe_send(lambda: update.message.reply_text("❌ គ្មានអ្នកប្រើប្រាស់ registered ទេ។"))
+        await safe_send(
+            lambda: update.message.reply_text(
+                "❌ គ្មានអ្នកប្រើប្រាស់ registered ទេ។"
+            )
+        )
         return
     kb = get_users_page_kb(users, page=0)
     await safe_send(
@@ -2038,7 +2118,9 @@ async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     target_id = int(args[0])
-    exists = await asyncio.get_running_loop().run_in_executor(None, user_exists_in_db, target_id)
+    exists = await asyncio.get_running_loop().run_in_executor(
+        None, user_exists_in_db, target_id
+    )
     if not exists:
         await safe_send(
             lambda: update.message.reply_text(
@@ -2067,7 +2149,9 @@ async def cmd_endchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("chat_state", None)
 
     if target_id is None:
-        await safe_send(lambda: update.message.reply_text("ℹ️ អ្នកមិនទាន់ open Chat ណាមួយទេ។"))
+        await safe_send(
+            lambda: update.message.reply_text("ℹ️ អ្នកមិនទាន់ open Chat ណាមួយទេ។")
+        )
         return
 
     await safe_send(
@@ -2077,7 +2161,9 @@ async def cmd_endchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     )
     try:
-        await context.bot.send_message(chat_id=target_id, text="ℹ️ Admin បានបញ្ចប់ Session Chat ។")
+        await context.bot.send_message(
+            chat_id=target_id, text="ℹ️ Admin បានបញ្ចប់ Session Chat ។"
+        )
     except Exception:
         pass
 
@@ -2124,9 +2210,13 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if data.startswith("users_page:"):
         page = int(data.split(":")[1])
-        users = await asyncio.get_running_loop().run_in_executor(None, get_all_users_with_names)
+        users = await asyncio.get_running_loop().run_in_executor(
+            None, get_all_users_with_names
+        )
         try:
-            await query.message.edit_reply_markup(reply_markup=get_users_page_kb(users, page=page))
+            await query.message.edit_reply_markup(
+                reply_markup=get_users_page_kb(users, page=page)
+            )
         except Exception:
             pass
         return
@@ -2168,14 +2258,21 @@ async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
                 else "📩 <b>Admin:</b>"
             )
             await bot.send_photo(
-                chat_id=target_id, photo=msg.photo[-1].file_id, caption=cap, parse_mode="HTML"
+                chat_id=target_id,
+                photo=msg.photo[-1].file_id,
+                caption=cap,
+                parse_mode="HTML",
             )
         elif msg.voice:
             await bot.send_voice(
-                chat_id=target_id, voice=msg.voice.file_id, caption="📩 Admin voice message"
+                chat_id=target_id,
+                voice=msg.voice.file_id,
+                caption="📩 Admin voice message",
             )
         elif msg.video_note:
-            await bot.send_video_note(chat_id=target_id, video_note=msg.video_note.file_id)
+            await bot.send_video_note(
+                chat_id=target_id, video_note=msg.video_note.file_id
+            )
         elif msg.sticker:
             await bot.send_sticker(chat_id=target_id, sticker=msg.sticker.file_id)
         elif msg.document:
@@ -2185,7 +2282,10 @@ async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
                 else "📩 <b>Admin:</b>"
             )
             await bot.send_document(
-                chat_id=target_id, document=msg.document.file_id, caption=cap, parse_mode="HTML"
+                chat_id=target_id,
+                document=msg.document.file_id,
+                caption=cap,
+                parse_mode="HTML",
             )
         elif msg.video:
             cap = (
@@ -2194,13 +2294,18 @@ async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
                 else "📩 <b>Admin:</b>"
             )
             await bot.send_video(
-                chat_id=target_id, video=msg.video.file_id, caption=cap, parse_mode="HTML"
+                chat_id=target_id,
+                video=msg.video.file_id,
+                caption=cap,
+                parse_mode="HTML",
             )
         elif msg.audio:
             await bot.send_audio(chat_id=target_id, audio=msg.audio.file_id)
         else:
             await bot.forward_message(
-                chat_id=target_id, from_chat_id=admin_id, message_id=msg.message_id
+                chat_id=target_id,
+                from_chat_id=admin_id,
+                message_id=msg.message_id,
             )
 
     try:
@@ -2213,7 +2318,9 @@ async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
         return False
 
 
-async def _fwd_user_to_admin(bot, admin_id: int, user_id: int, username: str, msg) -> bool:
+async def _fwd_user_to_admin(
+    bot, admin_id: int, user_id: int, username: str, msg
+) -> bool:
     banner = f"💬 <b>{html.escape(username)} ({user_id}):</b>"
 
     async def _do():
@@ -2226,27 +2333,41 @@ async def _fwd_user_to_admin(bot, admin_id: int, user_id: int, username: str, ms
         elif msg.photo:
             cap = f"{banner}\n{html.escape(msg.caption)}" if msg.caption else banner
             await bot.send_photo(
-                chat_id=admin_id, photo=msg.photo[-1].file_id, caption=cap, parse_mode="HTML"
+                chat_id=admin_id,
+                photo=msg.photo[-1].file_id,
+                caption=cap,
+                parse_mode="HTML",
             )
         elif msg.voice:
             await bot.send_voice(
-                chat_id=admin_id, voice=msg.voice.file_id, caption=banner, parse_mode="HTML"
+                chat_id=admin_id,
+                voice=msg.voice.file_id,
+                caption=banner,
+                parse_mode="HTML",
             )
         elif msg.video_note:
             await bot.send_message(chat_id=admin_id, text=banner, parse_mode="HTML")
-            await bot.send_video_note(chat_id=admin_id, video_note=msg.video_note.file_id)
+            await bot.send_video_note(
+                chat_id=admin_id, video_note=msg.video_note.file_id
+            )
         elif msg.sticker:
             await bot.send_message(chat_id=admin_id, text=banner, parse_mode="HTML")
             await bot.send_sticker(chat_id=admin_id, sticker=msg.sticker.file_id)
         elif msg.document:
             cap = f"{banner}\n{html.escape(msg.caption)}" if msg.caption else banner
             await bot.send_document(
-                chat_id=admin_id, document=msg.document.file_id, caption=cap, parse_mode="HTML"
+                chat_id=admin_id,
+                document=msg.document.file_id,
+                caption=cap,
+                parse_mode="HTML",
             )
         elif msg.video:
             cap = f"{banner}\n{html.escape(msg.caption)}" if msg.caption else banner
             await bot.send_video(
-                chat_id=admin_id, video=msg.video.file_id, caption=cap, parse_mode="HTML"
+                chat_id=admin_id,
+                video=msg.video.file_id,
+                caption=cap,
+                parse_mode="HTML",
             )
         elif msg.audio:
             await bot.send_message(chat_id=admin_id, text=banner, parse_mode="HTML")
@@ -2254,7 +2375,9 @@ async def _fwd_user_to_admin(bot, admin_id: int, user_id: int, username: str, ms
         else:
             await bot.send_message(chat_id=admin_id, text=banner, parse_mode="HTML")
             await bot.forward_message(
-                chat_id=admin_id, from_chat_id=user_id, message_id=msg.message_id
+                chat_id=admin_id,
+                from_chat_id=user_id,
+                message_id=msg.message_id,
             )
 
     try:
@@ -2325,32 +2448,33 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("sched_state") in (SCHED_WAIT_MSG, SCHED_WAIT_TIME):
         _sched_payload.pop(uid, None)
         context.user_data.pop("sched_state", None)
-        await safe_send(lambda: update.message.reply_text("❌ Schedule flow បានបោះបង់។"))
+        await safe_send(
+            lambda: update.message.reply_text("❌ Schedule flow បានបោះបង់។")
+        )
         cleared = True
 
     if not cleared:
-        await safe_send(lambda: update.message.reply_text("ℹ️ មិនមាន operation ត្រូវ cancel ទេ។"))
+        await safe_send(
+            lambda: update.message.reply_text("ℹ️ មិនមាន operation ត្រូវ cancel ទេ។")
+        )
 
 
 # ===========================================================================
 # REGULAR HANDLERS
 # ===========================================================================
 
-# FIX #2 + #10: _BOT_START_TIME initialised at module level so the stale-drop
-# guard is available before _run_bot() sets it, and _STALE_GRACE_S provides a
-# 30-second window to tolerate NTP clock steps and restart-edge-case messages.
+# _BOT_START_TIME initialised at module level so the stale-drop guard is
+# available before _run_bot() sets it.
 _BOT_START_TIME: float = 0.0
 
 
 async def _drop_stale_updates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Drop any update whose date predates this bot process start (minus grace window).
-    Registered as a TypeHandler with group=-1 so it runs before all other handlers.
-    Raises ApplicationHandlerStop to prevent further processing.
+    Drop updates whose date predates this bot process start (minus grace window).
+    Registered as TypeHandler with group=-1, runs before all other handlers.
     """
     if _BOT_START_TIME == 0.0:
         return
-
     msg = update.message or update.edited_message
     if msg and hasattr(msg, "date") and msg.date:
         update_ts = msg.date.timestamp()
@@ -2362,9 +2486,9 @@ async def _drop_stale_updates(update: Update, context: ContextTypes.DEFAULT_TYPE
             raise ApplicationHandlerStop
 
 
-# FIX #3: _drop_stale_callback was defined but never registered.
-# It is now registered in _run_bot() alongside the updates guard.
-async def _drop_stale_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _drop_stale_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     """Drop stale callback queries from pre-restart inline buttons."""
     if not update.callback_query:
         return
@@ -2400,9 +2524,15 @@ async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     loop = asyncio.get_running_loop()
     prefs = await loop.run_in_executor(None, get_user_prefs, user_id)
-    gender_label = "👩 ស្រី (Female)" if prefs["gender"] == "female" else "👨 ប្រុស (Male)"
+    gender_label = (
+        "👩 ស្រី (Female)" if prefs["gender"] == "female" else "👨 ប្រុស (Male)"
+    )
     speed_label = next(
-        (lbl for _, (lbl, val) in SPEED_OPTIONS.items() if abs(val - prefs["speed"]) < 0.01),
+        (
+            lbl
+            for _, (lbl, val) in SPEED_OPTIONS.items()
+            if abs(val - prefs["speed"]) < 0.01
+        ),
         f"{prefs['speed']}x",
     )
     await safe_send(
@@ -2424,8 +2554,8 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id is None:
         return
 
-    # FIX #11 (admin self-forward guard): admin path must return before
-    # _get_admin_for_user so admins are never forwarded to themselves.
+    # Admin path — must return before _get_admin_for_user to prevent
+    # admins being forwarded to themselves.
     if _is_admin(user_id):
         sched_state = context.user_data.get("sched_state")
         if sched_state == SCHED_WAIT_MSG:
@@ -2447,10 +2577,10 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not ok:
                     _close_session(user_id)
                     context.user_data.pop("chat_state", None)
-        # Admin with no active state: fall through to OCR
-        # (intentional — admins can also use OCR when not in a flow)
+            return  # BUG FIX: admin in chat mode should not fall through to OCR
+        # Admin with no active state: fall through to OCR intentionally.
 
-    # Non-admin user in a chat session — forward to admin
+    # Non-admin: forward to admin if in chat session
     admin_id = _get_admin_for_user(user_id)
     if admin_id is not None:
         uname = user.username or user.first_name or str(user_id)
@@ -2460,7 +2590,9 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not _gemini:
         await safe_send(
-            lambda: msg.reply_text("❌ Gemini API មិន Activate ទេ។ សូម Set GEMINI_API_KEY ។")
+            lambda: msg.reply_text(
+                "❌ Gemini API មិន Activate ទេ។ សូម Set GEMINI_API_KEY ។"
+            )
         )
         return
 
@@ -2473,8 +2605,6 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     best_photo = msg.photo[-1]
-    # FIX #4: allocate the temp file INSIDE the try block so it is always
-    # cleaned up in the finally clause even if the download fails.
     img_path = None
     try:
         img_path = _make_temp_img(suffix=".jpg")
@@ -2501,7 +2631,9 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_pages = []
         for page_idx, plain_page in enumerate(plain_pages):
             page_body = (header if page_idx == 0 else "") + html.escape(plain_page)
-            sent = await safe_send(lambda pb=page_body: msg.reply_text(pb, parse_mode="HTML"))
+            sent = await safe_send(
+                lambda pb=page_body: msg.reply_text(pb, parse_mode="HTML")
+            )
             sent_pages.append(sent)
             await asyncio.sleep(0.2)
 
@@ -2563,7 +2695,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
 
-    # FIX #11: admin early-return before _get_admin_for_user check.
+    # Admin early-return before _get_admin_for_user check.
     if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
         target_id = _admin_chat_target.get(user_id)
         if target_id:
@@ -2588,19 +2720,25 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not _gemini:
         await safe_send(
-            lambda: msg.reply_text("❌ Gemini API មិន Activate ទេ។ សូម Set GEMINI_API_KEY ។")
+            lambda: msg.reply_text(
+                "❌ Gemini API មិន Activate ទេ។ សូម Set GEMINI_API_KEY ។"
+            )
         )
         return
 
     if msg.voice.file_size and msg.voice.file_size > MAX_VOICE_BYTES:
-        await safe_send(lambda: msg.reply_text("❌ ឯកសារសំឡេងធំពេក (អតិបរមា 20MB)។"))
+        await safe_send(
+            lambda: msg.reply_text("❌ ឯកសារសំឡេងធំពេក (អតិបរមា 20MB)។")
+        )
         return
 
     sync_user_data(user)
 
     stop_event = asyncio.Event()
     timer_task = asyncio.create_task(
-        send_status_timer(msg.chat_id, context.bot, stop_event, frames=_TRANSCRIBE_FRAMES)
+        send_status_timer(
+            msg.chat_id, context.bot, stop_event, frames=_TRANSCRIBE_FRAMES
+        )
     )
     ogg_path = _make_temp_ogg()
     try:
@@ -2624,7 +2762,9 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_pages = []
         for page_idx, plain_page in enumerate(plain_pages):
             page_body = (header if page_idx == 0 else "") + html.escape(plain_page)
-            sent = await safe_send(lambda pb=page_body: msg.reply_text(pb, parse_mode="HTML"))
+            sent = await safe_send(
+                lambda pb=page_body: msg.reply_text(pb, parse_mode="HTML")
+            )
             sent_pages.append(sent)
             await asyncio.sleep(0.2)
 
@@ -2646,7 +2786,9 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"on_voice error: {e}")
         try:
-            await safe_send(lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការ Transcribe។"))
+            await safe_send(
+                lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការ Transcribe។")
+            )
         except Exception:
             pass
     finally:
@@ -2663,7 +2805,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
 
-    # ── Admin: state machine flows ────────────────────────────────────────
+    # ── Admin: state machine flows ─────────────────────────────────────────
     if _is_admin(user_id):
         sched_state = context.user_data.get("sched_state")
         if sched_state == SCHED_WAIT_MSG:
@@ -2697,6 +2839,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     context.user_data.pop("chat_state", None)
             return
 
+    # Non-admin in chat session
     admin_id = _get_admin_for_user(user_id)
     if admin_id is not None:
         uname = user.username or user.first_name or str(user_id)
@@ -2721,7 +2864,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # FIX #7: use the centralised cooldown helper.
     if await _check_cooldown(msg, user_id):
         return
 
@@ -2759,7 +2901,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"on_text TTS error: {e}")
             try:
-                await safe_send(lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"))
+                await safe_send(
+                    lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។")
+                )
             except Exception:
                 pass
         finally:
@@ -2768,7 +2912,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Centralised helper to get (chat_id, msg_id) for cache lookups
+# Cache key helper
 # ---------------------------------------------------------------------------
 def _cache_key_from_query(query) -> tuple[int, int]:
     return query.message.chat.id, query.message.message_id
@@ -2783,7 +2927,9 @@ async def _cb_show_speed(query, user_id: int, context):
     loop = asyncio.get_running_loop()
     prefs = await loop.run_in_executor(None, get_user_prefs, user_id)
     await safe_send(
-        lambda: query.message.edit_reply_markup(reply_markup=get_speed_kb(prefs["speed"]))
+        lambda: query.message.edit_reply_markup(
+            reply_markup=get_speed_kb(prefs["speed"])
+        )
     )
 
 
@@ -2791,7 +2937,9 @@ async def _cb_hide_speed(query, user_id: int, context):
     loop = asyncio.get_running_loop()
     prefs = await loop.run_in_executor(None, get_user_prefs, user_id)
     await safe_send(
-        lambda: query.message.edit_reply_markup(reply_markup=get_main_kb(prefs["gender"]))
+        lambda: query.message.edit_reply_markup(
+            reply_markup=get_main_kb(prefs["gender"])
+        )
     )
 
 
@@ -2804,7 +2952,6 @@ async def _cb_speed(query, user_id: int, context, data: str):
         await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទដើមមិនឃើញ។"))
         return
 
-    # FIX #7: centralised cooldown check.
     if await _check_cooldown(query.message, user_id):
         return
 
@@ -2856,7 +3003,6 @@ async def _cb_gender(query, user_id: int, context, data: str):
         await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទដើមមិនឃើញ។"))
         return
 
-    # FIX #7: centralised cooldown check.
     if await _check_cooldown(query.message, user_id):
         return
 
@@ -2903,12 +3049,13 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
     transcript_msg_id = int(data.split(":")[1])
     chat_id = query.message.chat.id
     loop = asyncio.get_running_loop()
-    original_text = await loop.run_in_executor(None, get_text_cache, transcript_msg_id, chat_id)
+    original_text = await loop.run_in_executor(
+        None, get_text_cache, transcript_msg_id, chat_id
+    )
     if not original_text:
         await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទមិនឃើញ។"))
         return
 
-    # FIX #7: cooldown check was missing here; now uses centralised helper.
     if await _check_cooldown(query.message, user_id):
         return
 
@@ -2953,10 +3100,13 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
     loop = asyncio.get_running_loop()
     full_text = await loop.run_in_executor(None, get_text_cache, src_msg_id, chat_id)
     if not full_text:
-        await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទមិនឃើញ (cache expired)។"))
+        await safe_send(
+            lambda: query.message.reply_text(
+                "❌ រកអត្ថបទមិនឃើញ (cache expired)។"
+            )
+        )
         return
 
-    # FIX #7: cooldown check was missing here; now uses centralised helper.
     if await _check_cooldown(query.message, user_id):
         return
 
@@ -2996,7 +3146,7 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Catch-all callback handler for TTS/voice callbacks not matched earlier."""
+    """Catch-all callback handler for TTS/voice callbacks."""
     query = update.callback_query
     user_id = query.from_user.id
     data = query.data
@@ -3065,8 +3215,7 @@ async def _run_bot():
     _user_last_tts.clear()
     _sched_payload.clear()
     _scheduler_tasks.clear()
-    # NOTE: do NOT clear _user_locks — in-flight coroutines may still hold
-    # references to existing Lock objects.
+    # NOTE: do NOT clear _user_locks — in-flight coroutines may hold references.
 
     app = (
         Application.builder()
@@ -3078,11 +3227,7 @@ async def _run_bot():
         .build()
     )
 
-    # FIX #2: Stale-update and stale-callback guards MUST be registered first
-    # (group=-1) before any other handlers, so they run before message/callback
-    # handlers.  Previously these were added after all other handlers, making
-    # them ineffective.
-    # FIX #3: _drop_stale_callback was defined but never registered — fixed here.
+    # Stale-update and stale-callback guards registered first (group=-1).
     app.add_handler(TypeHandler(Update, _drop_stale_updates), group=-1)
     app.add_handler(CallbackQueryHandler(_drop_stale_callback), group=-1)
 
@@ -3100,8 +3245,10 @@ async def _run_bot():
     app.add_handler(CommandHandler("chat", cmd_chat))
     app.add_handler(CommandHandler("endchat", cmd_endchat))
 
-    # ── Callback query handlers (most-specific patterns first) ────────────
-    app.add_handler(CallbackQueryHandler(broadcast_callback, pattern=r"^bc_(confirm|cancel)$"))
+    # ── Callback query handlers (most-specific first) ─────────────────────
+    app.add_handler(
+        CallbackQueryHandler(broadcast_callback, pattern=r"^bc_(confirm|cancel)$")
+    )
     app.add_handler(
         CallbackQueryHandler(
             users_page_callback,
@@ -3109,7 +3256,7 @@ async def _run_bot():
         )
     )
     app.add_handler(CallbackQueryHandler(sched_callback, pattern=r"^sched_"))
-    app.add_handler(CallbackQueryHandler(on_callback))  # catch-all for TTS callbacks
+    app.add_handler(CallbackQueryHandler(on_callback))  # catch-all for TTS
 
     # ── Message handlers ──────────────────────────────────────────────────
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
@@ -3175,7 +3322,8 @@ def main():
 
     if not ADMIN_IDS:
         logger.warning(
-            "No ADMIN_IDS configured. Set ADMIN_IDS=123456,789012 in your environment."
+            "No ADMIN_IDS configured. "
+            "Set ADMIN_IDS=123456,789012 in your environment."
         )
 
     print(f"Bot is starting... (Gemini model: {GEMINI_MODEL})")
