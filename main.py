@@ -512,6 +512,9 @@ def update_user_speed(user_id: int, speed: float):
                 logger.error(f"update_user_speed error: {e}")
     _submit_db(_run)
 
+# Track whether we've already warned about RLS so we don't spam logs
+_rls_warned = False
+
 def save_text_cache(
     msg_id: int,
     text: str,
@@ -522,6 +525,7 @@ def save_text_cache(
     if not supabase:
         return
     def _run():
+        global _rls_warned
         try:
             payload = {"message_id": msg_id, "chat_id": chat_id, "original_text": text}
             if user_id is not None:
@@ -532,7 +536,21 @@ def save_text_cache(
                 payload, on_conflict="chat_id,message_id"
             ).execute()
         except Exception as e:
-            logger.error(f"save_text_cache error: {e}")
+            err_str = str(e)
+            if "42501" in err_str or "row-level security" in err_str.lower():
+                if not _rls_warned:
+                    _rls_warned = True
+                    logger.error(
+                        "text_cache RLS policy blocking inserts. "
+                        "Fix: run in Supabase SQL editor:\n"
+                        "  ALTER TABLE text_cache DISABLE ROW LEVEL SECURITY;\n"
+                        "  -- or --\n"
+                        "  CREATE POLICY \"service_role_all\" ON text_cache "
+                        "FOR ALL TO service_role USING (true) WITH CHECK (true);"
+                    )
+                # Don't re-raise — text_cache is non-critical, bot continues normally
+            else:
+                logger.error(f"save_text_cache error: {e}")
     _submit_db(_run)
 
 def get_text_cache(msg_id: int, chat_id: int = 0) -> str | None:
