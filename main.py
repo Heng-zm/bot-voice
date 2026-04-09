@@ -102,7 +102,7 @@ SB_URL: str = ""
 SB_KEY: str = ""
 GEMINI_API_KEY: str = ""
 ADMIN_IDS: set[int] = set()
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-3-flash-preview"
 MAX_VOICE_BYTES = 20 * 1024 * 1024
 MAX_INPUT_CHARS = 5_000
 TTS_CHUNK_CHARS = 900
@@ -175,7 +175,7 @@ def _init_clients() -> None:
     SB_URL = os.getenv("SUPABASE_URL", "")
     SB_KEY = os.getenv("SUPABASE_KEY", "")
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 
     for _aid in os.getenv("ADMIN_IDS", "").split(","):
         _aid = _aid.strip()
