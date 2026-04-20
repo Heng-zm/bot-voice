@@ -117,6 +117,9 @@ _KHMER_RE = re.compile(r"[\u1780-\u17FF]")
 _SPEED_MIN = 0.25
 _SPEED_MAX = 4.0
 
+# FIX PERF-12: compile sentence regex once at module level instead of per-call
+_SENTENCE_RE = re.compile(r"(?<=[។!\?\.。])\s*")
+
 # Separate executor pools: DB writes (blocking I/O) vs Gemini API (slow network).
 _DB_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="db_write")
 _GEMINI_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="gemini")
@@ -239,9 +242,7 @@ BOT_TAG = "@voicekhaibot"
 
 # ---------------------------------------------------------------------------
 # FIX #11: Prefs cache — keep all mutations on the event loop to avoid
-# non-atomic OrderedDict operations across threads (move_to_end + popitem).
-# get_user_prefs() is called via run_in_executor for the Supabase I/O but
-# the cache is now guarded by an asyncio.Lock accessed only from async code.
+# non-atomic OrderedDict operations across threads.
 # ---------------------------------------------------------------------------
 _PREFS_TTL = 300.0
 _PREFS_MAX_SIZE = 10_000
@@ -249,7 +250,6 @@ _prefs_cache: OrderedDict[int, tuple[dict, float]] = OrderedDict()
 _prefs_cache_lock: asyncio.Lock | None = None  # init in _run_bot()
 
 def _cache_prefs_sync(user_id: int, prefs: dict) -> None:
-    """Thread-safe-enough cache write (called only from the event loop via async wrapper)."""
     _prefs_cache.pop(user_id, None)
     _prefs_cache[user_id] = (prefs, time.monotonic())
     while len(_prefs_cache) > _PREFS_MAX_SIZE:
@@ -265,21 +265,19 @@ def _invalidate_prefs(user_id: int) -> None:
     _prefs_cache.pop(user_id, None)
 
 async def _async_cache_prefs(user_id: int, prefs: dict) -> None:
-    """Cache prefs from async context, protected by the asyncio lock."""
     assert _prefs_cache_lock is not None
     async with _prefs_cache_lock:
         _cache_prefs_sync(user_id, prefs)
 
 async def _async_get_cached_prefs(user_id: int) -> dict | None:
-    """Read prefs cache from async context, protected by the asyncio lock."""
     assert _prefs_cache_lock is not None
     async with _prefs_cache_lock:
         return _get_cached_prefs_sync(user_id)
 
 async def get_user_prefs_async(user_id: int) -> dict:
     """
-    Async-safe version of get_user_prefs.
-    Cache reads/writes happen on the event loop; Supabase I/O is off-loaded.
+    Async-safe prefs fetch. Cache reads/writes on the event loop;
+    Supabase I/O off-loaded to executor.
     """
     cached = await _async_get_cached_prefs(user_id)
     if cached is not None:
@@ -308,7 +306,6 @@ async def get_user_prefs_async(user_id: int) -> dict:
     await _async_cache_prefs(user_id, defaults)
     return defaults
 
-# Keep the sync version for any remaining executor calls (DB helpers).
 def get_user_prefs(user_id: int) -> dict:
     cached = _get_cached_prefs_sync(user_id)
     if cached is not None:
@@ -459,13 +456,16 @@ def _sweep_stale_temps() -> None:
                 logger.info(f"Swept stale temp file: {f}")
 
 async def _periodic_temp_sweep(stop_event: asyncio.Event) -> None:
-    while not stop_event.is_set():
+    # FIX BUG-7: Always perform a sweep when the loop wakes, including on shutdown.
+    while True:
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=3600.0)
         except asyncio.TimeoutError:
             pass
-        if not stop_event.is_set():
-            _sweep_stale_temps()
+        # Sweep whether we hit timeout (periodic) or stop was set (shutdown cleanup).
+        _sweep_stale_temps()
+        if stop_event.is_set():
+            break
 
 # ---------------------------------------------------------------------------
 # Database helpers — user prefs
@@ -540,7 +540,6 @@ def update_user_gender(user_id: int, gender: str):
     _submit_db(_run)
 
 def update_user_speed(user_id: int, speed: float):
-    # FIX: clamp speed before storing
     speed = round(max(_SPEED_MIN, min(_SPEED_MAX, speed)), 4)
     _invalidate_prefs(user_id)
     if not supabase:
@@ -560,7 +559,6 @@ def update_user_speed(user_id: int, speed: float):
                 logger.error(f"update_user_speed error: {e}")
     _submit_db(_run)
 
-# Track whether we've already warned about RLS so we don't spam logs
 _rls_warned = False
 
 def save_text_cache(
@@ -619,6 +617,7 @@ def get_text_cache(msg_id: int, chat_id: int = 0) -> str | None:
 
 def ensure_speed_column():
     if not supabase:
+        logger.info("ensure_speed_column: Supabase not configured, skipping.")
         return
     try:
         supabase.table("user_prefs").select("speed").limit(1).execute()
@@ -640,13 +639,11 @@ CONV_HISTORY_LIMIT = 10
 CONV_CONTEXT_MAX_CHARS = 3000
 CONV_RESOLVE_TIMEOUT_S = 15
 
-# In-memory history cache
 _HIST_CACHE_MAX_USERS = 5_000
 _HIST_CACHE_TURNS = 10
 _hist_cache: OrderedDict[int, deque] = OrderedDict()
 
 def _hist_cache_append(user_id: int, role: str, content: str) -> None:
-    """Append one turn to the in-memory history cache with LRU eviction."""
     if user_id not in _hist_cache:
         while len(_hist_cache) >= _HIST_CACHE_MAX_USERS:
             _hist_cache.popitem(last=False)
@@ -655,7 +652,6 @@ def _hist_cache_append(user_id: int, role: str, content: str) -> None:
     _hist_cache[user_id].append({"role": role, "content": content})
 
 def _hist_cache_get(user_id: int) -> list[dict] | None:
-    """Return cached turns (oldest-first) or None if user is not warmed."""
     d = _hist_cache.get(user_id)
     if d is None:
         return None
@@ -666,7 +662,6 @@ def _hist_cache_clear(user_id: int) -> None:
     _hist_cache.pop(user_id, None)
 
 def db_history_append(user_id: int, role: str, content: str) -> None:
-    """Fire-and-forget: write one conversation turn to Supabase."""
     if not supabase:
         return
     def _run():
@@ -677,7 +672,6 @@ def db_history_append(user_id: int, role: str, content: str) -> None:
     _submit_db(_run)
 
 def db_history_fetch(user_id: int, limit: int = CONV_HISTORY_LIMIT) -> list[dict]:
-    """Return the last `limit` turns in chronological order (oldest first)."""
     if not supabase:
         return []
     try:
@@ -697,7 +691,6 @@ def db_history_fetch(user_id: int, limit: int = CONV_HISTORY_LIMIT) -> list[dict
         return []
 
 def db_history_clear(user_id: int) -> None:
-    """Delete all conversation history rows for this user."""
     if not supabase:
         return
     def _run():
@@ -735,6 +728,10 @@ async def resolve_tts_text(
     raw_text: str,
     loop: asyncio.AbstractEventLoop,
 ) -> str:
+    """
+    Resolve conversational references using Gemini + conversation history.
+    Does NOT record any history turns — callers are responsible for recording.
+    """
     if not _gemini:
         return raw_text
 
@@ -772,9 +769,14 @@ async def resolve_tts_text(
         "Output only the text to speak:"
     )
 
+    # FIX BUG-9: Guard against _GEMINI_SEMAPHORE being None (called before _run_bot initialises it).
+    semaphore = _GEMINI_SEMAPHORE
+    if semaphore is None:
+        logger.warning("resolve_tts_text: _GEMINI_SEMAPHORE not initialised, skipping resolve.")
+        return raw_text
+
     async def _guarded_call():
-        assert _GEMINI_SEMAPHORE is not None
-        async with _GEMINI_SEMAPHORE:
+        async with semaphore:
             def _call():
                 return _gemini.models.generate_content(
                     model=GEMINI_MODEL,
@@ -999,19 +1001,21 @@ async def _stop_timer(stop_event: asyncio.Event, timer_task: asyncio.Task):
 # ---------------------------------------------------------------------------
 # Audio pipeline
 # ---------------------------------------------------------------------------
+# FIX PERF-13: Normalise speed before cache lookup so equivalent float
+# representations (e.g. 1.0 vs 1.0000001) map to the same cache key.
 @functools.lru_cache(maxsize=64)
 def _build_atempo_chain(speed: float) -> str:
+    # Speed is already rounded to 4dp by callers; guard again for safety.
     speed = round(max(_SPEED_MIN, min(_SPEED_MAX, speed)), 4)
     if abs(speed - 1.0) < 1e-6:
         return "atempo=1.0"
     stages: list[str] = []
     r = speed
     if r < 1.0:
-        while r < 0.5 - 1e-9:
+        # FIX BUG-5: added r > 1e-6 guard to prevent infinite loop on near-zero speeds
+        while r < 0.5 - 1e-9 and r > 1e-6:
             stages.append("atempo=0.5")
             r = round(r / 0.5, 6)
-            if r < 1e-6:
-                break
         stages.append(f"atempo={max(0.5, r):.6f}")
     else:
         while r > 2.0 + 1e-9:
@@ -1044,6 +1048,7 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str)
     if not mp3_data:
         raise RuntimeError("edge-tts returned empty audio")
 
+    # FIX PERF-13: round before cache lookup so we always hit the same key
     speed_key = round(max(_SPEED_MIN, min(_SPEED_MAX, speed)), 4)
     af = _build_atempo_chain(speed_key) if abs(speed_key - DEFAULT_SPEED) > 1e-4 else None
 
@@ -1092,10 +1097,13 @@ async def transcribe_voice(ogg_path: str) -> str:
         "Support both Khmer and English."
     )
 
-    assert _GEMINI_SEMAPHORE is not None
+    # FIX BUG-9: Guard against semaphore not yet initialised.
+    semaphore = _GEMINI_SEMAPHORE
+    if semaphore is None:
+        raise RuntimeError("Gemini semaphore not initialised.")
 
     async def _guarded_call():
-        async with _GEMINI_SEMAPHORE:
+        async with semaphore:
             def _call():
                 return _gemini.models.generate_content(
                     model=GEMINI_MODEL,
@@ -1122,8 +1130,8 @@ def _split_text_chunks(text: str, max_chars: int = TTS_CHUNK_CHARS) -> list[str]
     if len(text) <= max_chars:
         return [text]
 
-    sentence_re = re.compile(r"(?<=[។!\?\.。])\s*")
-    sentences = [s for s in sentence_re.split(text) if s.strip()]
+    # FIX PERF-12: use module-level compiled regex instead of compiling per call
+    sentences = [s for s in _SENTENCE_RE.split(text) if s.strip()]
     chunks, current = [], ""
 
     for sent in sentences:
@@ -1208,10 +1216,13 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
         "If there is truly no text, output only the single word: NOTEXT"
     )
 
-    assert _GEMINI_SEMAPHORE is not None
+    # FIX BUG-9: Guard against semaphore not yet initialised.
+    semaphore = _GEMINI_SEMAPHORE
+    if semaphore is None:
+        raise RuntimeError("Gemini semaphore not initialised.")
 
     async def _guarded_call():
-        async with _GEMINI_SEMAPHORE:
+        async with semaphore:
             def _call():
                 return _gemini.models.generate_content(
                     model=GEMINI_MODEL,
@@ -1278,13 +1289,15 @@ async def _deliver_paged_tts(
         file_path = _make_temp_ogg()
         try:
             audio_bytes = await generate_voice(chunk, gender, speed, file_path)
+            # FIX BUG-2 (loop closure): capture loop variables explicitly in lambdas
             caption = f"🗣️ {BOT_TAG}  [{i}/{total}]"
+            kb = get_main_kb(gender)
             sent = await safe_send(
-                lambda ab=audio_bytes, cap=caption: bot.send_voice(
+                lambda ab=audio_bytes, cap=caption, k=kb: bot.send_voice(
                     chat_id=chat_id,
                     voice=io.BytesIO(ab),
                     caption=cap,
-                    reply_markup=get_main_kb(gender),
+                    reply_markup=k,
                 )
             )
             if sent:
@@ -1437,20 +1450,24 @@ def _get_admin_for_user(user_id: int) -> int | None:
     return _user_to_admin.get(user_id)
 
 # ===========================================================================
-# FIX #7: Shared broadcast delivery helper (replaces duplicated code in
-# _do_broadcast and _fire_scheduled_broadcast).
+# FIX BUG-1: _run_broadcast_to_all — always return a 3-tuple so callers
+# can safely unpack the result even when there are no registered users.
 # ===========================================================================
 async def _run_broadcast_to_all(
     bot,
     admin_id: int,
     pending: dict,
     label: str = "Broadcast",
-) -> None:
+) -> tuple[int, int, int]:
     """
     Send `pending` to every registered user.
-    `label` is used in progress/report messages (e.g. "Broadcast" or "Scheduled #42").
+    Always returns (sent, failed, blocked).
     """
-    assert _BROADCAST_SEMAPHORE is not None
+    # FIX BUG-9: Guard against broadcast semaphore not yet initialised.
+    broadcast_semaphore = _BROADCAST_SEMAPHORE
+    if broadcast_semaphore is None:
+        logger.error(f"{label}: _BROADCAST_SEMAPHORE not initialised.")
+        return (0, 0, 0)
 
     loop = asyncio.get_running_loop()
     user_ids = await loop.run_in_executor(None, get_all_user_ids)
@@ -1462,7 +1479,8 @@ async def _run_broadcast_to_all(
                 text=f"⚠️ {label}: មិនមានអ្នកប្រើប្រាស់ registered ណាមួយទេ។",
             )
         )
-        return
+        # FIX BUG-1: was bare `return` (returns None), causing unpack TypeError in caller
+        return (0, 0, 0)
 
     sent = failed = blocked = 0
     photo_file_id = pending.get("photo_file_id")
@@ -1476,7 +1494,7 @@ async def _run_broadcast_to_all(
     )
 
     async def _send_one(uid: int) -> str:
-        async with _BROADCAST_SEMAPHORE:
+        async with broadcast_semaphore:
             for attempt in range(2):
                 try:
                     if photo_file_id:
@@ -1537,7 +1555,7 @@ async def _run_broadcast_to_all(
     except Exception as e:
         logger.error(f"{label} report error: {e}")
 
-    return sent, failed, blocked
+    return (sent, failed, blocked)
 
 # ===========================================================================
 # BROADCAST (immediate)
@@ -1556,7 +1574,6 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     )
 
-# FIX #6: Added @admin_only decorator (was missing, relied on manual _is_admin check).
 @admin_only
 async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1998,11 +2015,9 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
         "text": row.get("plain_text") or "",
     }
 
-    # FIX #7: use shared helper instead of duplicated loop
-    result = await _run_broadcast_to_all(
+    sent, failed, blocked = await _run_broadcast_to_all(
         bot, admin_id, pending, label=f"Scheduled #{row_id}"
     )
-    sent, failed, blocked = result if result else (0, 0, 0)
 
     try:
         if supabase:
@@ -2316,7 +2331,6 @@ async def _drop_stale_updates(update: Update, context: ContextTypes.DEFAULT_TYPE
             raise ApplicationHandlerStop
 
 async def _drop_stale_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Drop stale callback queries from pre-restart inline buttons."""
     if not update.callback_query:
         return
     if _BOT_START_TIME == 0.0:
@@ -2347,7 +2361,6 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
-    # FIX #11: use async-safe prefs fetch
     prefs = await get_user_prefs_async(user_id)
     gender_label = "👩 ស្រី (Female)" if prefs["gender"] == "female" else "👨 ប្រុស (Male)"
     speed_label = next(
@@ -2659,15 +2672,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sync_user_data(user)
-    # FIX #11: use async-safe prefs fetch
     prefs = await get_user_prefs_async(user_id)
     gender = prefs["gender"]
     speed = prefs["speed"]
 
-    # Resolve text through conversation context
+    # FIX BUG-4: resolve_tts_text does NOT record history; we record below after success.
     tts_text = await resolve_tts_text(user_id, stripped, asyncio.get_running_loop())
 
-    # FIX: guard against empty resolved text
     if not tts_text or not tts_text.strip():
         tts_text = stripped
 
@@ -2693,7 +2704,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=msg.chat_id, user_id=user_id,
                     username=user.username or user.first_name,
                 )
-                # FIX #2: record both turns only after successful TTS delivery
+                # FIX BUG-4: record turns only after successful TTS delivery,
+                # and only here (resolve_tts_text must NOT record turns itself).
                 record_turn(user_id, "user", stripped)
                 record_turn(user_id, "assistant", tts_text)
             _set_last_tts(user_id)
@@ -2715,14 +2727,12 @@ def _cache_key_from_query(query) -> tuple[int, int]:
 # Callback dispatch helpers
 # ---------------------------------------------------------------------------
 async def _cb_show_speed(query, user_id: int, context):
-    # FIX #11: use async-safe prefs fetch
     prefs = await get_user_prefs_async(user_id)
     await safe_send(
         lambda: query.message.edit_reply_markup(reply_markup=get_speed_kb(prefs["speed"]))
     )
 
 async def _cb_hide_speed(query, user_id: int, context):
-    # FIX #11: use async-safe prefs fetch
     prefs = await get_user_prefs_async(user_id)
     await safe_send(
         lambda: query.message.edit_reply_markup(reply_markup=get_main_kb(prefs["gender"]))
@@ -2732,7 +2742,6 @@ async def _cb_speed(query, user_id: int, context, data: str):
     _, new_speed = SPEED_OPTIONS[data]
     chat_id, msg_id = _cache_key_from_query(query)
 
-    # FIX #11: use async-safe prefs fetch; FIX: fetch cache and prefs concurrently
     loop = asyncio.get_running_loop()
     original_text, prefs = await asyncio.gather(
         loop.run_in_executor(None, get_text_cache, msg_id, chat_id),
@@ -2758,13 +2767,15 @@ async def _cb_speed(query, user_id: int, context, data: str):
     async with lock:
         try:
             audio_bytes = await generate_voice(original_text, gender, new_speed, file_path)
+            # FIX BUG-3: delete old message first, then send new one atomically under lock.
+            # suppress delete failure so the new voice still gets sent.
             with suppress(Exception):
                 await query.message.delete()
             new_msg = await safe_send(
-                lambda: query.message.chat.send_voice(
-                    voice=io.BytesIO(audio_bytes),
+                lambda ab=audio_bytes, g=gender: query.message.chat.send_voice(
+                    voice=io.BytesIO(ab),
                     caption=f"🗣️ {BOT_TAG}",
-                    reply_markup=get_main_kb(gender),
+                    reply_markup=get_main_kb(g),
                 )
             )
             if new_msg:
@@ -2773,7 +2784,6 @@ async def _cb_speed(query, user_id: int, context, data: str):
                     chat_id=chat_id, user_id=user_id,
                     username=query.from_user.username or query.from_user.first_name,
                 )
-                # FIX #3: record assistant turn after speed regen
                 record_turn(user_id, "assistant", original_text)
             _set_last_tts(user_id)
         except Exception as e:
@@ -2786,7 +2796,6 @@ async def _cb_gender(query, user_id: int, context, data: str):
     new_gender = data.replace("tg_", "")
     chat_id, msg_id = _cache_key_from_query(query)
 
-    # FIX #11: use async-safe prefs fetch; FIX: fetch cache and prefs concurrently
     loop = asyncio.get_running_loop()
     original_text, prefs = await asyncio.gather(
         loop.run_in_executor(None, get_text_cache, msg_id, chat_id),
@@ -2812,13 +2821,14 @@ async def _cb_gender(query, user_id: int, context, data: str):
     async with lock:
         try:
             audio_bytes = await generate_voice(original_text, new_gender, speed, file_path)
+            # FIX BUG-3: delete before send, capture new_gender in lambda
             with suppress(Exception):
                 await query.message.delete()
             new_msg = await safe_send(
-                lambda: query.message.chat.send_voice(
-                    voice=io.BytesIO(audio_bytes),
+                lambda ab=audio_bytes, ng=new_gender: query.message.chat.send_voice(
+                    voice=io.BytesIO(ab),
                     caption=f"🗣️ {BOT_TAG}",
-                    reply_markup=get_main_kb(new_gender),
+                    reply_markup=get_main_kb(ng),
                 )
             )
             if new_msg:
@@ -2827,7 +2837,6 @@ async def _cb_gender(query, user_id: int, context, data: str):
                     chat_id=chat_id, user_id=user_id,
                     username=query.from_user.username or query.from_user.first_name,
                 )
-                # FIX #3: record assistant turn after gender regen
                 record_turn(user_id, "assistant", original_text)
             _set_last_tts(user_id)
         except Exception as e:
@@ -2840,7 +2849,6 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
     transcript_msg_id = int(data.split(":")[1])
     chat_id = query.message.chat.id
 
-    # FIX #11: use async-safe prefs fetch; FIX: fetch cache and prefs concurrently
     loop = asyncio.get_running_loop()
     original_text, prefs = await asyncio.gather(
         loop.run_in_executor(None, get_text_cache, transcript_msg_id, chat_id),
@@ -2851,6 +2859,7 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
         await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទមិនឃើញ។"))
         return
 
+    # FIX BUG-6: apply cooldown check before processing transcript TTS
     if await _check_cooldown(query.message, user_id):
         return
 
@@ -2866,10 +2875,10 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
         try:
             audio_bytes = await generate_voice(original_text, gender, speed, file_path)
             new_msg = await safe_send(
-                lambda: query.message.chat.send_voice(
-                    voice=io.BytesIO(audio_bytes),
+                lambda ab=audio_bytes, g=gender: query.message.chat.send_voice(
+                    voice=io.BytesIO(ab),
                     caption=f"🗣️ {BOT_TAG}",
-                    reply_markup=get_main_kb(gender),
+                    reply_markup=get_main_kb(g),
                 )
             )
             if new_msg:
@@ -2890,7 +2899,6 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
     src_msg_id = int(data.split(":")[1])
     chat_id = query.message.chat.id
 
-    # FIX #11: use async-safe prefs fetch; FIX: fetch cache and prefs concurrently
     loop = asyncio.get_running_loop()
     full_text, prefs = await asyncio.gather(
         loop.run_in_executor(None, get_text_cache, src_msg_id, chat_id),
@@ -2901,6 +2909,7 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
         await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទមិនឃើញ (cache expired)។"))
         return
 
+    # FIX BUG-6: apply cooldown check for doc_read path too
     if await _check_cooldown(query.message, user_id):
         return
 
@@ -2937,7 +2946,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with suppress(Exception):
         await query.answer()
 
-    # FIX: guard against callbacks without a message (inline mode)
     if query.message is None:
         logger.debug(f"on_callback: no message for data={data!r} (inline mode?)")
         return
@@ -2986,10 +2994,9 @@ async def _run_bot():
     global _BOT_START_TIME, _GEMINI_SEMAPHORE, _BROADCAST_SEMAPHORE, _prefs_cache_lock
     _BOT_START_TIME = time.time()
 
-    # Init all asyncio primitives on the running event loop
     _GEMINI_SEMAPHORE = asyncio.Semaphore(4)
-    _BROADCAST_SEMAPHORE = asyncio.Semaphore(10)  # FIX #8: module-level broadcast semaphore
-    _prefs_cache_lock = asyncio.Lock()             # FIX #11: prefs cache asyncio lock
+    _BROADCAST_SEMAPHORE = asyncio.Semaphore(10)
+    _prefs_cache_lock = asyncio.Lock()
 
     _admin_chat_target.clear()
     _user_to_admin.clear()
@@ -2999,7 +3006,6 @@ async def _run_bot():
     _sched_payload.clear()
     _scheduler_tasks.clear()
     _hist_cache.clear()
-    # NOTE: do NOT clear _user_locks — in-flight coroutines may hold references.
 
     app = (
         Application.builder()
@@ -3011,11 +3017,9 @@ async def _run_bot():
         .build()
     )
 
-    # Stale-update and stale-callback guards registered first (group=-1).
     app.add_handler(TypeHandler(Update, _drop_stale_updates), group=-1)
     app.add_handler(CallbackQueryHandler(_drop_stale_callback), group=-1)
 
-    # ── Commands ──────────────────────────────────────────────────────────
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("help", on_help))
     app.add_handler(CommandHandler("myprefs", cmd_myprefs))
@@ -3030,7 +3034,6 @@ async def _run_bot():
     app.add_handler(CommandHandler("chat", cmd_chat))
     app.add_handler(CommandHandler("endchat", cmd_endchat))
 
-    # ── Callback query handlers (most-specific first) ─────────────────────
     app.add_handler(
         CallbackQueryHandler(broadcast_callback, pattern=r"^bc_(confirm|cancel)$")
     )
@@ -3041,9 +3044,8 @@ async def _run_bot():
         )
     )
     app.add_handler(CallbackQueryHandler(sched_callback, pattern=r"^sched_"))
-    app.add_handler(CallbackQueryHandler(on_callback))  # catch-all for TTS
+    app.add_handler(CallbackQueryHandler(on_callback))
 
-    # ── Message handlers ──────────────────────────────────────────────────
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
     app.add_handler(
@@ -3062,7 +3064,6 @@ async def _run_bot():
     logger.info(f"Bot polling started. Admins: {ADMIN_IDS or 'none configured'}")
     logger.info(f"Gemini model: {GEMINI_MODEL}")
 
-    # ── Background tasks ──────────────────────────────────────────────────
     sched_stop = asyncio.Event()
     sweep_stop = asyncio.Event()
     sched_task = asyncio.create_task(_scheduler_loop(app.bot, sched_stop))
