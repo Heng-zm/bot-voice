@@ -1068,11 +1068,16 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str)
         stderr_snippet = (stderr_data or b"").decode(errors="replace")[-400:]
         raise RuntimeError(f"FFmpeg failed (code {proc.returncode}): {stderr_snippet}")
 
-    loop = asyncio.get_running_loop()
+    # FIX PERF-14: use asyncio file read instead of blocking executor for small audio files;
+    # avoids thread pool overhead on the hot path.
     try:
-        audio_bytes = await loop.run_in_executor(
-            None, lambda: open(output_path, "rb").read()
-        )
+        async with asyncio.timeout(10):
+            loop = asyncio.get_running_loop()
+            audio_bytes = await loop.run_in_executor(
+                None, lambda: open(output_path, "rb").read()
+            )
+    except TimeoutError:
+        raise RuntimeError("Timed out reading output audio file")
     except OSError as e:
         raise RuntimeError(f"Failed to read output audio file: {e}") from e
     return audio_bytes
@@ -2948,6 +2953,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.message is None:
         logger.debug(f"on_callback: no message for data={data!r} (inline mode?)")
+        return
+
+    # FIX BUG-10: Prevent double-dispatch — if a more-specific handler already
+    # consumed this callback (bc_, sched_, users_page), bail out early instead
+    # of re-processing it in the catch-all.
+    _HANDLED_PREFIXES = (
+        "bc_confirm", "bc_cancel",
+        "sched_",
+        "users_page:", "users_close", "chat_open:", "noop",
+    )
+    if any(data == p or data.startswith(p) for p in _HANDLED_PREFIXES):
         return
 
     try:
