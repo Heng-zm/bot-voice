@@ -104,6 +104,7 @@ GEMINI_API_KEY: str = ""
 ADMIN_IDS: set[int] = set()
 GEMINI_MODEL = "gemma-4-31b-it"
 MAX_VOICE_BYTES = 20 * 1024 * 1024
+MAX_AUDIO_FILE_BYTES = 50 * 1024 * 1024   # 50 MB limit for audio files
 MAX_INPUT_CHARS = 5_000
 TTS_CHUNK_CHARS = 900
 DEFAULT_SPEED = 1.0
@@ -117,6 +118,58 @@ _SPEED_MAX = 4.0
 
 # PERF-12: compile sentence regex once at module level
 _SENTENCE_RE = re.compile(r"(?<=[។!\?\.。])\s*")
+
+# ---------------------------------------------------------------------------
+# Supported audio file extensions (for document/audio attachment handling)
+# ---------------------------------------------------------------------------
+_AUDIO_EXTENSIONS = {
+    ".wav", ".mp3", ".mp4", ".m4a", ".ogg", ".oga",
+    ".flac", ".aac", ".wma", ".opus", ".webm", ".aiff", ".aif",
+}
+
+# MIME types that indicate audio content (for document uploads)
+_AUDIO_MIME_PREFIXES = ("audio/", "video/mp4", "video/webm")
+
+def _is_audio_file(filename: str | None, mime_type: str | None) -> bool:
+    """Return True if the file is a supported audio format."""
+    if filename:
+        ext = os.path.splitext(filename.lower())[1]
+        if ext in _AUDIO_EXTENSIONS:
+            return True
+    if mime_type:
+        for prefix in _AUDIO_MIME_PREFIXES:
+            if mime_type.lower().startswith(prefix):
+                return True
+    return False
+
+def _audio_mime_for_gemini(filename: str | None, mime_type: str | None) -> str:
+    """Return the best MIME type string to pass to Gemini for audio."""
+    if mime_type:
+        mt = mime_type.lower()
+        if mt.startswith("audio/"):
+            return mt
+        if mt in ("video/mp4", "video/webm"):
+            return mt
+    # Fallback by extension
+    ext_map = {
+        ".wav": "audio/wav",
+        ".mp3": "audio/mpeg",
+        ".mp4": "audio/mp4",
+        ".m4a": "audio/mp4",
+        ".ogg": "audio/ogg",
+        ".oga": "audio/ogg",
+        ".flac": "audio/flac",
+        ".aac": "audio/aac",
+        ".opus": "audio/opus",
+        ".webm": "audio/webm",
+        ".aiff": "audio/aiff",
+        ".aif": "audio/aiff",
+        ".wma": "audio/x-ms-wma",
+    }
+    if filename:
+        ext = os.path.splitext(filename.lower())[1]
+        return ext_map.get(ext, "audio/mpeg")
+    return "audio/mpeg"
 
 # Separate executor pools: DB writes vs Gemini API
 _DB_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="db_write")
@@ -229,6 +282,7 @@ WELCOME_TEXT = (
     "✨ មុខងារថ្មី:\n"
     "🖼️ ផ្ញើរូបភាព → Bot OCR អត្ថបទ ហើយអាន!\n"
     "🎙️ ផ្ញើ Voice → Bot Transcribe ហើយអាន!\n"
+    "🎵 ផ្ញើឯកសារអូឌីយ៉ូ (MP3, WAV, OGG, MP4...) → Bot Transcribe ហើយបំលែងទៅជាសំឡេង!\n"
     "💬 Bot ចងចាំការសន្ទនា — អាចនិយាយ 'អានម្តងទៀត' ឬ 'បកប្រែ' បាន!\n\n"
     "⚙️ ប្រើ /myprefs ដើម្បីមើលការកំណត់របស់អ្នក\n"
     "🗑️ ប្រើ /clear ដើម្បីលុបប្រវត្តិការសន្ទនា\n\n"
@@ -403,18 +457,32 @@ def _make_temp_ogg() -> str:
     os.close(fd)
     return path
 
+def _make_temp_audio(suffix: str = ".mp3") -> str:
+    fd, path = tempfile.mkstemp(suffix=suffix, prefix=_TMP_PREFIX, dir="/tmp")
+    os.close(fd)
+    return path
+
 def _make_temp_img(suffix: str = ".jpg") -> str:
     fd, path = tempfile.mkstemp(suffix=suffix, prefix=_TMP_PREFIX, dir="/tmp")
     os.close(fd)
     return path
 
 def _sweep_stale_temps() -> None:
-    for pattern in [
+    patterns = [
         f"/tmp/{_TMP_PREFIX}*.ogg",
         f"/tmp/{_TMP_PREFIX}*.jpg",
         f"/tmp/{_TMP_PREFIX}*.png",
         f"/tmp/{_TMP_PREFIX}*.webp",
-    ]:
+        f"/tmp/{_TMP_PREFIX}*.mp3",
+        f"/tmp/{_TMP_PREFIX}*.wav",
+        f"/tmp/{_TMP_PREFIX}*.mp4",
+        f"/tmp/{_TMP_PREFIX}*.m4a",
+        f"/tmp/{_TMP_PREFIX}*.flac",
+        f"/tmp/{_TMP_PREFIX}*.aac",
+        f"/tmp/{_TMP_PREFIX}*.opus",
+        f"/tmp/{_TMP_PREFIX}*.webm",
+    ]
+    for pattern in patterns:
         for f in glob.glob(pattern):
             with suppress(OSError):
                 os.remove(f)
@@ -691,10 +759,6 @@ async def resolve_tts_text(
     raw_text: str,
     loop: asyncio.AbstractEventLoop,
 ) -> str:
-    """
-    Resolve conversational references using Gemini + conversation history.
-    Does NOT record any history turns — callers are responsible for recording.
-    """
     if not _gemini:
         return raw_text
 
@@ -923,6 +987,12 @@ _OCR_FRAMES = [
     "🔍 កំពុង OCR រូបភាព ···",
     "🔍 កំពុង OCR រូបភាព ····",
 ]
+_AUDIO_FILE_FRAMES = [
+    "🎵 កំពុង Transcribe ឯកសារអូឌីយ៉ូ ·",
+    "🎵 កំពុង Transcribe ឯកសារអូឌីយ៉ូ ··",
+    "🎵 កំពុង Transcribe ឯកសារអូឌីយ៉ូ ···",
+    "🎵 កំពុង Transcribe ឯកសារអូឌីយ៉ូ ····",
+]
 
 async def send_status_timer(
     chat_id: int, bot, stop_event: asyncio.Event, frames=None
@@ -982,7 +1052,6 @@ def _build_atempo_chain(speed: float) -> str:
         stages.append(f"atempo={min(2.0, r):.6f}")
     return ",".join(stages)
 
-# PERF-NEW: detect language once; reuse across calls
 def _detect_voice(text: str, gender: str) -> str:
     """Return the edge-tts voice name for the given text and gender."""
     khmer_chars = len(_KHMER_RE.findall(text))
@@ -1019,7 +1088,6 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str)
         cmd += ["-filter:a", af]
     cmd += ["-c:a", "libopus", "-b:a", "32k", output_path]
 
-    # PERF-NEW: added asyncio.timeout so a hung FFmpeg process doesn't leak forever
     try:
         async with asyncio.timeout(60):
             proc = await asyncio.create_subprocess_exec(
@@ -1049,7 +1117,7 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str)
     return audio_bytes
 
 # ---------------------------------------------------------------------------
-# Gemini transcription
+# Gemini transcription (for voice messages — OGG)
 # ---------------------------------------------------------------------------
 async def transcribe_voice(ogg_path: str) -> str:
     if not _gemini:
@@ -1089,6 +1157,52 @@ async def transcribe_voice(ogg_path: str) -> str:
         return (response.text or "").strip()
     except asyncio.TimeoutError:
         raise RuntimeError("Gemini transcription timed out after 60s")
+
+# ---------------------------------------------------------------------------
+# Gemini transcription for uploaded audio files (any format)
+# ---------------------------------------------------------------------------
+async def transcribe_audio_file(file_path: str, mime_type: str) -> str:
+    """
+    Transcribe an uploaded audio file (mp3, wav, ogg, mp4, m4a, flac, etc.)
+    using Gemini. Unlike transcribe_voice(), this accepts any MIME type.
+    """
+    if not _gemini:
+        raise RuntimeError("GEMINI_API_KEY not set.")
+    loop = asyncio.get_running_loop()
+    try:
+        audio_bytes = await loop.run_in_executor(
+            None, lambda: open(file_path, "rb").read()
+        )
+    except OSError as e:
+        raise RuntimeError(f"Cannot read audio file: {e}") from e
+
+    prompt = (
+        "Transcribe this audio exactly as spoken. "
+        "Output ONLY the transcribed text — no labels, no explanation. "
+        "Support both Khmer and English."
+    )
+
+    semaphore = _GEMINI_SEMAPHORE
+    if semaphore is None:
+        raise RuntimeError("Gemini semaphore not initialised.")
+
+    async def _guarded_call():
+        async with semaphore:
+            def _call():
+                return _gemini.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=[
+                        genai_types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+                        prompt,
+                    ],
+                )
+            return await loop.run_in_executor(_GEMINI_EXECUTOR, _call)
+
+    try:
+        response = await asyncio.wait_for(_guarded_call(), timeout=90)
+        return (response.text or "").strip()
+    except asyncio.TimeoutError:
+        raise RuntimeError("Gemini audio transcription timed out after 90s")
 
 # ---------------------------------------------------------------------------
 # Text chunking for TTS
@@ -1251,7 +1365,6 @@ async def _deliver_paged_tts(
 
     total = len(chunks)
 
-    # PERF-NEW: for single chunk, fast-path without concurrent overhead
     if total == 1:
         chunk = chunks[0]
         file_path = _make_temp_ogg()
@@ -1282,7 +1395,6 @@ async def _deliver_paged_tts(
         _set_last_tts(user_id)
         return
 
-    # PERF-NEW: generate all audio concurrently (capped by semaphore)
     sem = _TTS_CHUNK_SEMAPHORE
     file_paths = [_make_temp_ogg() for _ in chunks]
 
@@ -1297,7 +1409,6 @@ async def _deliver_paged_tts(
 
     results = await asyncio.gather(*[_gen_chunk(i) for i in range(total)])
 
-    # Send sequentially to preserve order and respect Telegram rate limits
     for i, (chunk, result) in enumerate(zip(chunks, results), 1):
         if isinstance(result, Exception):
             await safe_send(
@@ -1329,7 +1440,6 @@ async def _deliver_paged_tts(
         if i < total:
             await asyncio.sleep(0.3)
 
-    # Cleanup all temp files
     for fp in file_paths:
         _cleanup(fp)
 
@@ -1368,6 +1478,15 @@ def get_transcription_kb(transcript_msg_id: int) -> InlineKeyboardMarkup:
         [[
             InlineKeyboardButton("📢 AI អាន", callback_data=f"tts_transcript:{transcript_msg_id}"),
             InlineKeyboardButton("🗑️ លុប", callback_data=f"del_transcript:{transcript_msg_id}"),
+        ]]
+    )
+
+def get_audio_file_kb(msg_id: int) -> InlineKeyboardMarkup:
+    """Keyboard shown after audio file transcription — let user trigger TTS."""
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("📢 បំលែងទៅសំឡេង TTS", callback_data=f"audio_tts:{msg_id}"),
+            InlineKeyboardButton("🗑️ លុប", callback_data=f"audio_del:{msg_id}"),
         ]]
     )
 
@@ -2262,7 +2381,6 @@ async def _fwd_user_to_admin(bot, admin_id: int, user_id: int, username: str, ms
 @admin_only
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loop = asyncio.get_running_loop()
-    # PERF-NEW: fetch user_ids and pending schedules concurrently
     user_ids, pending_scheds = await asyncio.gather(
         loop.run_in_executor(None, get_all_user_ids),
         loop.run_in_executor(None, db_sched_fetch_admin_pending, update.effective_user.id),
@@ -2436,7 +2554,6 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # PERF-NEW: cooldown check before the expensive OCR path
     if await _check_cooldown(msg, user_id):
         return
 
@@ -2493,11 +2610,176 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if img_path:
             _cleanup(img_path)
 
+# ===========================================================================
+# NEW: on_audio_file — handles audio files uploaded as Document or Audio
+# ===========================================================================
+async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handle audio files sent as documents or audio attachments (mp3, wav, ogg,
+    mp4, m4a, flac, aac, opus, webm, etc.).
+
+    Flow:
+      1. Transcribe with Gemini
+      2. Show transcript text to user
+      3. Offer "Convert to TTS Voice" button — user taps to trigger TTS
+      4. Do NOT auto-convert — user must explicitly tap the button
+
+    NOTE: Telegram voice messages (on_voice) are separate and NOT routed here.
+    """
+    msg = update.message
+    user = update.effective_user
+    user_id = user.id if user else None
+    if user_id is None:
+        return
+
+    # ── Admin chat-forwarding shortcut ──────────────────────────────────────
+    if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
+        target_id = _admin_chat_target.get(user_id)
+        if target_id:
+            ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
+            reply = (
+                f"✅ ផ្ញើដល់ User <code>{target_id}</code> ។"
+                if ok
+                else f"❌ User <code>{target_id}</code> blocked bot ។"
+            )
+            await safe_send(lambda: msg.reply_text(reply, parse_mode="HTML"))
+            if not ok:
+                _close_session(user_id)
+                context.user_data.pop("chat_state", None)
+        return
+
+    admin_id = _get_admin_for_user(user_id)
+    if admin_id is not None:
+        uname = user.username or user.first_name or str(user_id)
+        await _fwd_user_to_admin(context.bot, admin_id, user_id, uname, msg)
+        await safe_send(lambda: msg.reply_text("✅ ឯកសារបានផ្ញើដល់ Admin ។"))
+        return
+
+    # ── Determine which attachment we have ──────────────────────────────────
+    doc = msg.document
+    audio = msg.audio  # Telegram "audio" type (music files)
+
+    if doc is not None:
+        filename = doc.file_name or ""
+        mime_type = doc.mime_type or ""
+        file_id = doc.file_id
+        file_size = doc.file_size or 0
+    elif audio is not None:
+        filename = audio.file_name or ""
+        mime_type = audio.mime_type or ""
+        file_id = audio.file_id
+        file_size = audio.file_size or 0
+    else:
+        # Neither document nor audio — nothing to do
+        return
+
+    # Guard: only process recognised audio files
+    if not _is_audio_file(filename, mime_type):
+        # Not an audio file — fall through to on_any_media for forwarding
+        return
+
+    if not _gemini:
+        await safe_send(
+            lambda: msg.reply_text(
+                "❌ Gemini API មិន Activate ទេ។ មុខងារ Transcribe ត្រូវការ GEMINI_API_KEY ។"
+            )
+        )
+        return
+
+    if file_size > MAX_AUDIO_FILE_BYTES:
+        await safe_send(
+            lambda: msg.reply_text(
+                f"❌ ឯកសារអូឌីយ៉ូធំពេក (អតិបរមា {MAX_AUDIO_FILE_BYTES // 1024 // 1024}MB)។"
+            )
+        )
+        return
+
+    if await _check_cooldown(msg, user_id):
+        return
+
+    sync_user_data(user)
+    uname = user.username or user.first_name or str(user_id)
+
+    # Infer file extension for temp file
+    ext = os.path.splitext(filename)[1].lower() if filename else ".mp3"
+    if ext not in _AUDIO_EXTENSIONS:
+        ext = ".mp3"
+
+    gemini_mime = _audio_mime_for_gemini(filename, mime_type)
+
+    audio_path = _make_temp_audio(suffix=ext)
+    stop_event = asyncio.Event()
+    timer_task = asyncio.create_task(
+        send_status_timer(msg.chat_id, context.bot, stop_event, frames=_AUDIO_FILE_FRAMES)
+    )
+
+    try:
+        tg_file = await safe_send(lambda: context.bot.get_file(file_id))
+        if not tg_file:
+            raise RuntimeError("Could not download audio file.")
+        await tg_file.download_to_drive(audio_path)
+
+        transcript = await transcribe_audio_file(audio_path, gemini_mime)
+
+        if not transcript:
+            await safe_send(
+                lambda: msg.reply_text("❌ រក Transcript មិនឃើញ — ឯកសារប្រហែលជាស្ងាត់ ឬ មិន Support ។")
+            )
+            return
+
+        record_turn(user_id, "user", f"[Audio File Transcript]: {transcript[:500]}")
+
+        is_khmer = bool(_KHMER_RE.search(transcript))
+        lang_flag = "🇰🇭" if is_khmer else "🇺🇸"
+        fname_display = html.escape(filename[:50]) if filename else "audio"
+        header = f"🎵 <b>Transcript</b> {lang_flag} — <code>{fname_display}</code>\n\n"
+
+        plain_pages = _paginate_plain(transcript, limit=TELE_MSG_LIMIT - len(header))
+        sent_pages = []
+        for page_idx, plain_page in enumerate(plain_pages):
+            page_body = (header if page_idx == 0 else "") + html.escape(plain_page)
+            sent = await safe_send(lambda pb=page_body: msg.reply_text(pb, parse_mode="HTML"))
+            sent_pages.append(sent)
+            await asyncio.sleep(0.2)
+
+        last_sent = sent_pages[-1] if sent_pages else None
+        if last_sent:
+            save_text_cache(
+                last_sent.message_id, transcript,
+                chat_id=msg.chat_id, user_id=user_id, username=uname,
+            )
+            # Offer TTS button — user must tap to convert
+            await safe_send(
+                lambda: last_sent.edit_reply_markup(
+                    reply_markup=get_audio_file_kb(last_sent.message_id)
+                )
+            )
+
+    except Exception as e:
+        logger.error(f"on_audio_file error: {e}")
+        await safe_send(
+            lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការ Transcribe ឯកសារអូឌីយ៉ូ។")
+        )
+    finally:
+        await _stop_timer(stop_event, timer_task)
+        _cleanup(audio_path)
+
+
 async def on_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user = update.effective_user
     user_id = user.id if user else None
     if user_id is None:
+        return
+
+    # Check if it's an audio file that should be handled by on_audio_file
+    doc = msg.document
+    audio = msg.audio
+    if doc is not None and _is_audio_file(doc.file_name, doc.mime_type):
+        await on_audio_file(update, context)
+        return
+    if audio is not None and _is_audio_file(audio.file_name, audio.mime_type):
+        await on_audio_file(update, context)
         return
 
     if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
@@ -2522,6 +2804,11 @@ async def on_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: msg.reply_text("✅ ផ្ញើដល់ Admin ។"))
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handle Telegram voice messages (recorded in-app).
+    These are ONLY transcribed — NOT converted to TTS voice.
+    Users who want TTS can tap the '📢 AI អាន' button after transcription.
+    """
     msg = update.message
     user = update.effective_user
     user_id = user.id
@@ -2558,7 +2845,6 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: msg.reply_text("❌ ឯកសារសំឡេងធំពេក (អតិបរមា 20MB)។"))
         return
 
-    # PERF-NEW: cooldown check before the expensive transcription path
     if await _check_cooldown(msg, user_id):
         return
 
@@ -2621,7 +2907,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
 
-    # ── Admin: state machine flows ─────────────────────────────────────────
     if _is_admin(user_id):
         sched_state = context.user_data.get("sched_state")
         if sched_state == SCHED_WAIT_MSG:
@@ -2655,7 +2940,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     context.user_data.pop("chat_state", None)
             return
 
-    # Non-admin in chat session — forward to admin, do NOT run TTS
     admin_id = _get_admin_for_user(user_id)
     if admin_id is not None:
         uname = user.username or user.first_name or str(user_id)
@@ -2685,7 +2969,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sync_user_data(user)
 
-    # PERF-NEW: fetch prefs and resolve text concurrently
     loop = asyncio.get_running_loop()
     prefs, tts_text = await asyncio.gather(
         get_user_prefs_async(user_id),
@@ -2757,7 +3040,6 @@ async def _cb_speed(query, user_id: int, context, data: str):
     chat_id, msg_id = _cache_key_from_query(query)
 
     loop = asyncio.get_running_loop()
-    # PERF-NEW: fetch text cache and prefs concurrently
     original_text, prefs = await asyncio.gather(
         loop.run_in_executor(None, get_text_cache, msg_id, chat_id),
         get_user_prefs_async(user_id),
@@ -2810,7 +3092,6 @@ async def _cb_gender(query, user_id: int, context, data: str):
     chat_id, msg_id = _cache_key_from_query(query)
 
     loop = asyncio.get_running_loop()
-    # PERF-NEW: fetch text cache and prefs concurrently
     original_text, prefs = await asyncio.gather(
         loop.run_in_executor(None, get_text_cache, msg_id, chat_id),
         get_user_prefs_async(user_id),
@@ -2863,7 +3144,6 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
     chat_id = query.message.chat.id
 
     loop = asyncio.get_running_loop()
-    # PERF-NEW: fetch text cache and prefs concurrently
     original_text, prefs = await asyncio.gather(
         loop.run_in_executor(None, get_text_cache, transcript_msg_id, chat_id),
         get_user_prefs_async(user_id),
@@ -2908,12 +3188,61 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
             await _stop_timer(stop_event, timer_task)
             _cleanup(file_path)
 
+async def _cb_audio_tts(query, user_id: int, context, data: str):
+    """
+    Called when user taps '📢 បំលែងទៅសំឡេង TTS' on an audio-file transcript.
+    Runs paged TTS delivery over the cached transcript text.
+    """
+    src_msg_id = int(data.split(":")[1])
+    chat_id = query.message.chat.id
+
+    loop = asyncio.get_running_loop()
+    full_text, prefs = await asyncio.gather(
+        loop.run_in_executor(None, get_text_cache, src_msg_id, chat_id),
+        get_user_prefs_async(user_id),
+    )
+
+    if not full_text:
+        await safe_send(
+            lambda: query.message.reply_text("❌ រកអត្ថបទមិនឃើញ (cache expired)។")
+        )
+        return
+
+    if await _check_cooldown(query.message, user_id):
+        return
+
+    gender = prefs["gender"]
+    speed = prefs["speed"]
+    uname = query.from_user.username or query.from_user.first_name or str(user_id)
+
+    # Remove the buttons from the transcript message to prevent double-tap
+    with suppress(Exception):
+        await query.message.edit_reply_markup(reply_markup=None)
+
+    tts_stop = asyncio.Event()
+    tts_timer = asyncio.create_task(send_status_timer(chat_id, context.bot, tts_stop))
+    lock = _get_user_lock(user_id)
+    async with lock:
+        try:
+            await _deliver_paged_tts(
+                chat_id=chat_id, bot=context.bot, text=full_text,
+                gender=gender, speed=speed, user_id=user_id, username=uname,
+            )
+            record_turn(user_id, "assistant", full_text[:CONV_CONTEXT_MAX_CHARS])
+        except Exception as e:
+            logger.error(f"_cb_audio_tts delivery error: {e}")
+            with suppress(Exception):
+                await context.bot.send_message(
+                    chat_id=chat_id, text="❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"
+                )
+        finally:
+            await _stop_timer(tts_stop, tts_timer)
+
 async def _cb_doc_read(query, user_id: int, context, data: str):
     src_msg_id = int(data.split(":")[1])
     chat_id = query.message.chat.id
 
     loop = asyncio.get_running_loop()
-    # PERF-NEW: fetch text cache and prefs concurrently
     full_text, prefs = await asyncio.gather(
         loop.run_in_executor(None, get_text_cache, src_msg_id, chat_id),
         get_user_prefs_async(user_id),
@@ -2990,6 +3319,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.delete()
         elif data.startswith("doc_read:"):
             await _cb_doc_read(query, user_id, context, data)
+        elif data.startswith("audio_tts:"):
+            await _cb_audio_tts(query, user_id, context, data)
+        elif data.startswith("audio_del:"):
+            with suppress(Exception):
+                await query.message.delete()
         else:
             logger.debug(f"on_callback: unhandled data={data!r}")
     except Exception as e:
@@ -3015,13 +3349,11 @@ async def _run_bot():
     global _BOT_START_TIME, _GEMINI_SEMAPHORE, _BROADCAST_SEMAPHORE
     global _prefs_cache_lock, _TTS_CHUNK_SEMAPHORE
 
-    # SAFETY: init all asyncio primitives BEFORE resetting state dicts
     _GEMINI_SEMAPHORE = asyncio.Semaphore(4)
     _BROADCAST_SEMAPHORE = asyncio.Semaphore(10)
     _prefs_cache_lock = asyncio.Lock()
-    _TTS_CHUNK_SEMAPHORE = asyncio.Semaphore(3)  # cap concurrent chunk generation
+    _TTS_CHUNK_SEMAPHORE = asyncio.Semaphore(3)
 
-    # Clear all in-memory state
     _admin_chat_target.clear()
     _user_to_admin.clear()
     _pending_broadcast.clear()
@@ -3032,7 +3364,6 @@ async def _run_bot():
     _hist_cache.clear()
     _user_locks.clear()
 
-    # Set start time AFTER state is clean
     _BOT_START_TIME = time.time()
 
     app = (
@@ -3076,6 +3407,17 @@ async def _run_bot():
 
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
+
+    # Audio files: documents or Telegram "audio" type (music files)
+    # These are handled BEFORE the generic on_any_media catch-all
+    app.add_handler(
+        MessageHandler(
+            (filters.Document.AUDIO | filters.Document.Category("audio") | filters.AUDIO)
+            & ~filters.VOICE,
+            on_audio_file,
+        )
+    )
+
     app.add_handler(
         MessageHandler(
             filters.Sticker.ALL
