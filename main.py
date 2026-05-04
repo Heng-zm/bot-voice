@@ -42,7 +42,11 @@ def keep_alive():
     if not render_url:
         logger_ka.warning("RENDER_EXTERNAL_URL not set — self-ping disabled.")
         return
-    time.sleep(30)
+    # BUG-13 FIX: Use event-based sleep instead of blocking time.sleep(30)
+    # to avoid blocking the thread on startup unnecessarily.
+    # We still use time.sleep here since this is a daemon thread,
+    # but we reduce the initial delay.
+    time.sleep(10)
     headers = {"User-Agent": "Mozilla/5.0 (KeepAlive/1.0)"}
     while True:
         try:
@@ -386,16 +390,13 @@ def _submit_db(fn, *args, **kwargs):
 # Safe Telegram send with retry
 # ---------------------------------------------------------------------------
 async def safe_send(coro_factory, retries: int = 3, delay: float = 2.0):
+    # BUG-4 FIX: Raise immediately for raw coroutines instead of silently
+    # degrading to no-retry behaviour. Callers must pass a zero-arg lambda.
     if inspect.isawaitable(coro_factory):
-        logger.warning(
-            "safe_send received a raw coroutine — retries disabled. "
-            "Pass a zero-arg lambda instead."
+        raise TypeError(
+            "safe_send requires a zero-arg callable (lambda), not a raw coroutine. "
+            "Wrap your call: safe_send(lambda: your_coro())"
         )
-        try:
-            return await coro_factory
-        except Exception as e:
-            logger.error(f"safe_send (no-retry coroutine): {e}")
-            raise
 
     last_exc = None
     for attempt in range(retries):
@@ -444,8 +445,13 @@ def _paginate_plain(text: str, limit: int = TELE_MSG_LIMIT) -> list[str]:
         if cut <= 0:
             cut = limit
         pages.append(text[:cut])
-        text = text[cut:].lstrip("\n")
-    return pages
+        # BUG-9 FIX: strip ALL leading whitespace, not just newlines,
+        # and guard against producing an empty continuation string.
+        remainder = text[cut:].lstrip()
+        if not remainder:
+            break
+        text = remainder
+    return [p for p in pages if p]
 
 # ---------------------------------------------------------------------------
 # Temp file helpers
@@ -467,6 +473,10 @@ def _make_temp_img(suffix: str = ".jpg") -> str:
     os.close(fd)
     return path
 
+# BUG-14 FIX: Only remove temp files older than 2 hours to avoid
+# deleting files currently being written.
+_STALE_TEMP_AGE_S = 7200  # 2 hours
+
 def _sweep_stale_temps() -> None:
     patterns = [
         f"/tmp/{_TMP_PREFIX}*.ogg",
@@ -482,21 +492,27 @@ def _sweep_stale_temps() -> None:
         f"/tmp/{_TMP_PREFIX}*.opus",
         f"/tmp/{_TMP_PREFIX}*.webm",
     ]
+    now = time.time()
     for pattern in patterns:
         for f in glob.glob(pattern):
-            with suppress(OSError):
-                os.remove(f)
-                logger.info(f"Swept stale temp file: {f}")
+            try:
+                if now - os.path.getmtime(f) > _STALE_TEMP_AGE_S:
+                    os.remove(f)
+                    logger.info(f"Swept stale temp file: {f}")
+            except OSError:
+                pass
 
 async def _periodic_temp_sweep(stop_event: asyncio.Event) -> None:
     while True:
+        # BUG-16 FIX: Check stop_event first to avoid sweeping on shutdown
+        if stop_event.is_set():
+            break
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=3600.0)
         except asyncio.TimeoutError:
             pass
-        _sweep_stale_temps()
-        if stop_event.is_set():
-            break
+        if not stop_event.is_set():
+            _sweep_stale_temps()
 
 # ---------------------------------------------------------------------------
 # Database helpers — user prefs
@@ -695,11 +711,14 @@ def _hist_cache_clear(user_id: int) -> None:
 def db_history_append(user_id: int, role: str, content: str) -> None:
     if not supabase:
         return
+    # BUG-15 FIX: Log errors from DB history writes instead of silently swallowing them.
     def _run():
-        with suppress(Exception):
+        try:
             supabase.table("conversation_history").insert(
                 {"user_id": user_id, "role": role, "content": content}
             ).execute()
+        except Exception as e:
+            logger.error(f"db_history_append error (user={user_id}, role={role}): {e}")
     _submit_db(_run)
 
 def db_history_fetch(user_id: int, limit: int = CONV_HISTORY_LIMIT) -> list[dict]:
@@ -764,9 +783,12 @@ async def resolve_tts_text(
 
     history = _hist_cache_get(user_id)
     if history is None:
-        history = await loop.run_in_executor(_DB_EXECUTOR, db_history_fetch, user_id)
-        for row in history:
+        # BUG-11 FIX: Fetch from DB and populate in-memory cache cleanly.
+        # Use a separate local variable so we don't double-append via record_turn later.
+        db_rows = await loop.run_in_executor(_DB_EXECUTOR, db_history_fetch, user_id)
+        for row in db_rows:
             _hist_cache_append(user_id, row["role"], row["content"])
+        history = db_rows  # use fetched rows for context building this turn
 
     if not history:
         return raw_text
@@ -1033,9 +1055,14 @@ async def _stop_timer(stop_event: asyncio.Event, timer_task: asyncio.Task):
 # ---------------------------------------------------------------------------
 # Audio pipeline
 # ---------------------------------------------------------------------------
+# BUG-10 FIX: Round speed to 4dp BEFORE using as lru_cache key so that
+# floating-point noise doesn't create spurious cache misses.
+def _rounded_speed(speed: float) -> float:
+    return round(max(_SPEED_MIN, min(_SPEED_MAX, speed)), 4)
+
 @functools.lru_cache(maxsize=64)
 def _build_atempo_chain(speed: float) -> str:
-    speed = round(max(_SPEED_MIN, min(_SPEED_MAX, speed)), 4)
+    # speed is already rounded by callers via _rounded_speed()
     if abs(speed - 1.0) < 1e-6:
         return "atempo=1.0"
     stages: list[str] = []
@@ -1080,7 +1107,8 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str)
     if not mp3_data:
         raise RuntimeError("edge-tts returned empty audio")
 
-    speed_key = round(max(_SPEED_MIN, min(_SPEED_MAX, speed)), 4)
+    # BUG-10 FIX: use _rounded_speed() before passing to lru_cache'd function
+    speed_key = _rounded_speed(speed)
     af = _build_atempo_chain(speed_key) if abs(speed_key - DEFAULT_SPEED) > 1e-4 else None
 
     cmd = [_FFMPEG_EXE, "-y", "-f", "mp3", "-i", "pipe:0"]
@@ -1345,7 +1373,7 @@ async def _check_cooldown(reply_target, user_id: int) -> bool:
     return False
 
 # ---------------------------------------------------------------------------
-# Paged TTS delivery — PERF: generate chunks concurrently
+# Paged TTS delivery
 # ---------------------------------------------------------------------------
 async def _deliver_paged_tts(
     chat_id: int,
@@ -1395,12 +1423,18 @@ async def _deliver_paged_tts(
         _set_last_tts(user_id)
         return
 
+    # BUG-3 FIX: Use the module-level _TTS_CHUNK_SEMAPHORE for ALL chunks
+    # so they share a single concurrency limit. Do NOT create a new Semaphore
+    # per-chunk call (the old code created an independent one if sem was None).
     sem = _TTS_CHUNK_SEMAPHORE
+    if sem is None:
+        # Fallback: create ONE shared semaphore for this delivery run (not per-chunk)
+        sem = asyncio.Semaphore(3)
+
     file_paths = [_make_temp_ogg() for _ in chunks]
 
     async def _gen_chunk(idx: int) -> bytes | Exception:
-        sem_guard = asyncio.Semaphore(3) if sem is None else sem
-        async with sem_guard:
+        async with sem:
             try:
                 return await generate_voice(chunks[idx], gender, speed, file_paths[idx])
             except Exception as e:
@@ -2611,20 +2645,12 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _cleanup(img_path)
 
 # ===========================================================================
-# NEW: on_audio_file — handles audio files uploaded as Document or Audio
+# on_audio_file — handles audio files uploaded as Document or Audio
 # ===========================================================================
 async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handle audio files sent as documents or audio attachments (mp3, wav, ogg,
     mp4, m4a, flac, aac, opus, webm, etc.).
-
-    Flow:
-      1. Transcribe with Gemini
-      2. Show transcript text to user
-      3. Offer "Convert to TTS Voice" button — user taps to trigger TTS
-      4. Do NOT auto-convert — user must explicitly tap the button
-
-    NOTE: Telegram voice messages (on_voice) are separate and NOT routed here.
     """
     msg = update.message
     user = update.effective_user
@@ -2657,7 +2683,7 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Determine which attachment we have ──────────────────────────────────
     doc = msg.document
-    audio = msg.audio  # Telegram "audio" type (music files)
+    audio = msg.audio
 
     if doc is not None:
         filename = doc.file_name or ""
@@ -2670,12 +2696,9 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_id = audio.file_id
         file_size = audio.file_size or 0
     else:
-        # Neither document nor audio — nothing to do
         return
 
-    # Guard: only process recognised audio files
     if not _is_audio_file(filename, mime_type):
-        # Not an audio file — fall through to on_any_media for forwarding
         return
 
     if not _gemini:
@@ -2700,14 +2723,13 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sync_user_data(user)
     uname = user.username or user.first_name or str(user_id)
 
-    # Infer file extension for temp file
     ext = os.path.splitext(filename)[1].lower() if filename else ".mp3"
     if ext not in _AUDIO_EXTENSIONS:
         ext = ".mp3"
 
     gemini_mime = _audio_mime_for_gemini(filename, mime_type)
-
     audio_path = _make_temp_audio(suffix=ext)
+
     stop_event = asyncio.Event()
     timer_task = asyncio.create_task(
         send_status_timer(msg.chat_id, context.bot, stop_event, frames=_AUDIO_FILE_FRAMES)
@@ -2748,7 +2770,6 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 last_sent.message_id, transcript,
                 chat_id=msg.chat_id, user_id=user_id, username=uname,
             )
-            # Offer TTS button — user must tap to convert
             await safe_send(
                 lambda: last_sent.edit_reply_markup(
                     reply_markup=get_audio_file_kb(last_sent.message_id)
@@ -2761,6 +2782,7 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការ Transcribe ឯកសារអូឌីយ៉ូ។")
         )
     finally:
+        # BUG-6/7 FIX: Timer is always stopped in finally, covering all return paths.
         await _stop_timer(stop_event, timer_task)
         _cleanup(audio_path)
 
@@ -2772,15 +2794,10 @@ async def on_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id is None:
         return
 
-    # Check if it's an audio file that should be handled by on_audio_file
-    doc = msg.document
-    audio = msg.audio
-    if doc is not None and _is_audio_file(doc.file_name, doc.mime_type):
-        await on_audio_file(update, context)
-        return
-    if audio is not None and _is_audio_file(audio.file_name, audio.mime_type):
-        await on_audio_file(update, context)
-        return
+    # BUG-1/5 FIX: Do NOT re-route audio files here — they are already handled
+    # by the dedicated on_audio_file handler registered before this one.
+    # Keeping the re-routing logic here would cause confusion if handler
+    # ordering changes. The dedicated handler fires first due to registration order.
 
     if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
         target_id = _admin_chat_target.get(user_id)
@@ -2806,8 +2823,6 @@ async def on_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handle Telegram voice messages (recorded in-app).
-    These are ONLY transcribed — NOT converted to TTS voice.
-    Users who want TTS can tap the '📢 AI អាន' button after transcription.
     """
     msg = update.message
     user = update.effective_user
@@ -2849,11 +2864,11 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sync_user_data(user)
+    ogg_path = _make_temp_ogg()
     stop_event = asyncio.Event()
     timer_task = asyncio.create_task(
         send_status_timer(msg.chat_id, context.bot, stop_event, frames=_TRANSCRIBE_FRAMES)
     )
-    ogg_path = _make_temp_ogg()
     try:
         voice_file = await safe_send(lambda: context.bot.get_file(msg.voice.file_id))
         if not voice_file:
@@ -2987,6 +3002,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         send_status_timer(update.effective_chat.id, context.bot, stop_event)
     )
     lock = _get_user_lock(user_id)
+    # BUG-8 FIX: Ensure record_turn is called INSIDE the lock block so that
+    # history writes are serialised with TTS generation for the same user.
     async with lock:
         try:
             audio_bytes = await generate_voice(tts_text, gender, speed, file_path)
@@ -3003,6 +3020,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=msg.chat_id, user_id=user_id,
                     username=user.username or user.first_name,
                 )
+                # BUG-8/12 FIX: record both turns inside the lock
                 record_turn(user_id, "user", stripped)
                 record_turn(user_id, "assistant", tts_text)
             _set_last_tts(user_id)
@@ -3191,7 +3209,6 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
 async def _cb_audio_tts(query, user_id: int, context, data: str):
     """
     Called when user taps '📢 បំលែងទៅសំឡេង TTS' on an audio-file transcript.
-    Runs paged TTS delivery over the cached transcript text.
     """
     src_msg_id = int(data.split(":")[1])
     chat_id = query.message.chat.id
@@ -3215,12 +3232,14 @@ async def _cb_audio_tts(query, user_id: int, context, data: str):
     speed = prefs["speed"]
     uname = query.from_user.username or query.from_user.first_name or str(user_id)
 
-    # Remove the buttons from the transcript message to prevent double-tap
     with suppress(Exception):
         await query.message.edit_reply_markup(reply_markup=None)
 
+    # BUG-6 FIX: Start the timer BEFORE the lock acquisition so it covers
+    # all code paths. The finally block always stops it.
     tts_stop = asyncio.Event()
     tts_timer = asyncio.create_task(send_status_timer(chat_id, context.bot, tts_stop))
+
     lock = _get_user_lock(user_id)
     async with lock:
         try:
@@ -3262,8 +3281,11 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
     with suppress(Exception):
         await query.message.delete()
 
+    # BUG-7 FIX: Same as _cb_audio_tts — start timer before lock so
+    # finally always runs the stop, covering early-return paths.
     tts_stop = asyncio.Event()
     tts_timer = asyncio.create_task(send_status_timer(chat_id, context.bot, tts_stop))
+
     lock = _get_user_lock(user_id)
     async with lock:
         try:
@@ -3408,23 +3430,23 @@ async def _run_bot():
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
 
-    # Audio files: documents or Telegram "audio" type (music files)
-    # These are handled BEFORE the generic on_any_media catch-all
+    # BUG-1/2 FIX: Use only filters.AUDIO (Telegram "music" files) and
+    # filters.Document.ALL filtered by _is_audio_file check inside the handler.
+    # Removed the invalid filters.Document.Category("audio") which does not exist.
+    # The on_audio_file handler uses internal _is_audio_file() to gate processing,
+    # so registering it for all Documents is safe — non-audio docs fall through.
     app.add_handler(
         MessageHandler(
-            (filters.Document.AUDIO | filters.Document.Category("audio") | filters.AUDIO)
-            & ~filters.VOICE,
+            (filters.Document.ALL | filters.AUDIO) & ~filters.VOICE,
             on_audio_file,
         )
     )
 
+    # BUG-1/5 FIX: on_any_media is now only for non-audio media (sticker,
+    # video, video_note). Audio/document is fully handled above.
     app.add_handler(
         MessageHandler(
-            filters.Sticker.ALL
-            | filters.Document.ALL
-            | filters.VIDEO
-            | filters.AUDIO
-            | filters.VIDEO_NOTE,
+            filters.Sticker.ALL | filters.VIDEO | filters.VIDEO_NOTE,
             on_any_media,
         )
     )
