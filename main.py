@@ -383,10 +383,15 @@ def ai_assistant():
                         full_text += delta
                         yield f"data: {_json.dumps({'ok': True, 'delta': delta, 'done': False})}\n\n"
                 lang = _detect_lang(full_text or message or "")
-                yield (
-                    f"data: {_json.dumps({'ok': True, 'delta': '', 'done': True, "
-                    f"'reply': full_text, 'detected_language': lang, 'model': GEMINI_MODEL})}\n\n"
-                )
+                final_payload = {
+                    "ok": True,
+                    "delta": "",
+                    "done": True,
+                    "reply": full_text,
+                    "detected_language": lang,
+                    "model": GEMINI_MODEL
+                }
+                yield f"data: {_json.dumps(final_payload)}\n\n"
             except Exception as exc:
                 yield f"data: {_json.dumps({'ok': False, 'error': str(exc), 'done': True})}\n\n"
 
