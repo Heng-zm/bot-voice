@@ -42,10 +42,6 @@ def keep_alive():
     if not render_url:
         logger_ka.warning("RENDER_EXTERNAL_URL not set — self-ping disabled.")
         return
-    # BUG-13 FIX: Use event-based sleep instead of blocking time.sleep(30)
-    # to avoid blocking the thread on startup unnecessarily.
-    # We still use time.sleep here since this is a daemon thread,
-    # but we reduce the initial delay.
     time.sleep(10)
     headers = {"User-Agent": "Mozilla/5.0 (KeepAlive/1.0)"}
     while True:
@@ -55,6 +51,574 @@ def keep_alive():
         except Exception as e:
             logger_ka.warning(f"Keep-alive failed: {e}")
         time.sleep(240)
+
+# ── AI Assistant REST API ──────────────────────────────────────────────────
+#
+#  Endpoints:
+#
+#  POST /ai-assistant               – unified chat (text + optional image/audio)
+#  POST /ai-assistant/transcribe    – audio → transcript only
+#  POST /ai-assistant/vision        – image analysis / OCR
+#  GET  /ai-assistant/info          – model info & capabilities
+#
+# ── Request formats ───────────────────────────────────────────────────────
+#
+#  POST /ai-assistant
+#  Content-Type: multipart/form-data  OR  application/json
+#
+#  Multipart fields:
+#    message      (str)  – user text prompt
+#    image        (file) – image (jpg/png/webp/gif, max 10 MB)
+#    audio        (file) – audio (mp3/wav/ogg/mp4/m4a/flac/opus, max 50 MB)
+#    history      (json) – JSON array [{role,content}] for multi-turn chat
+#    stream       (str)  – "true" to get Server-Sent Events streaming
+#
+#  JSON body alternative:
+#    message      (str)
+#    image_base64 (str)  – base64-encoded image bytes
+#    image_mime   (str)  – MIME type for image_base64
+#    audio_base64 (str)  – base64-encoded audio bytes
+#    audio_mime   (str)  – MIME type for audio_base64
+#    history      (list) – [{role, content}]
+#    stream       (bool)
+#
+#  Optional auth header: X-Api-Key or Authorization: Bearer <key>
+#  Set AI_API_KEY env var to enable key gate (leave empty to disable).
+#
+# ── Response (non-streaming) ──────────────────────────────────────────────
+#  200 { "ok": true, "reply": "...", "detected_language": "km"|"en",
+#        "tokens_used": <int|null>, "model": "..." }
+#  4xx { "ok": false, "error": "...", "code": <int> }
+#
+# ── Response (streaming: stream=true) ─────────────────────────────────────
+#  text/event-stream  SSE chunks:
+#    data: {"ok":true,"delta":"...","done":false}
+#    data: {"ok":true,"delta":"","done":true,"reply":"<full>","model":"..."}
+#
+# ──────────────────────────────────────────────────────────────────────────
+
+import base64
+import json as _json
+from flask import request, jsonify, Response, stream_with_context
+
+_AI_API_MAX_IMAGE_BYTES   = 10 * 1024 * 1024   # 10 MB
+_AI_API_MAX_AUDIO_BYTES   = 50 * 1024 * 1024   # 50 MB
+_AI_API_MAX_MESSAGE_CHARS = 32_000
+_AI_API_MAX_HISTORY_TURNS = 20
+
+_AI_ALLOWED_IMAGE_MIME = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+_AI_ALLOWED_AUDIO_MIME = {
+    "audio/mpeg", "audio/mp3", "audio/wav", "audio/ogg", "audio/flac",
+    "audio/aac", "audio/opus", "audio/webm", "audio/mp4", "audio/x-m4a",
+    "video/mp4", "video/webm",
+}
+
+_AI_SYSTEM_PROMPT = (
+    "You are a helpful AI assistant that supports both Khmer (ភាសាខ្មែរ) and English. "
+    "Always reply in the same language the user uses. "
+    "If the user sends an image, describe and analyse it fully. "
+    "If the user sends audio, provide an accurate transcription then answer any follow-up. "
+    "Be concise, accurate, and friendly. "
+    "Never refuse reasonable requests. "
+    "Format answers clearly using plain text (no markdown unless the user asks for it)."
+)
+
+
+def _ai_error(msg: str, code: int = 400):
+    """Return a JSON error response tuple."""
+    return jsonify({"ok": False, "error": msg, "code": code}), code
+
+
+def _ai_cors(response_or_tuple):
+    """Add CORS headers to a response or (response, code) tuple."""
+    if isinstance(response_or_tuple, tuple):
+        resp, code = response_or_tuple
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp, code
+    response_or_tuple.headers["Access-Control-Allow-Origin"] = "*"
+    return response_or_tuple
+
+
+def _detect_lang(text: str) -> str:
+    """Detect whether text is predominantly Khmer or English."""
+    khmer = sum(1 for c in text if "\u1780" <= c <= "\u17FF")
+    alpha = sum(1 for c in text if c.isalpha())
+    return "km" if alpha and khmer / alpha > 0.25 else "en"
+
+
+def _check_ai_api_key() -> bool:
+    """Return True if the request passes the optional API-key gate."""
+    required = os.environ.get("AI_API_KEY", "")
+    if not required:
+        return True  # no gate configured
+    client_key = (
+        request.headers.get("X-Api-Key")
+        or request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    )
+    return client_key == required
+
+
+def _build_gemini_contents(
+    message: str,
+    history: list,
+    image_data: bytes | None,
+    audio_data: bytes | None,
+    image_mime: str,
+    audio_mime: str,
+) -> list:
+    """Build the Gemini contents list from conversation history + current turn."""
+    from google.genai import types as _gtypes
+
+    contents = []
+
+    # Inject previous turns (Gemini uses "model" not "assistant")
+    for turn in history[-_AI_API_MAX_HISTORY_TURNS:]:
+        role = turn.get("role", "user")
+        content = str(turn.get("content", ""))
+        if role not in ("user", "model", "assistant"):
+            continue
+        gemini_role = "model" if role == "assistant" else role
+        contents.append(_gtypes.Content(
+            role=gemini_role,
+            parts=[_gtypes.Part.from_text(text=content)],
+        ))
+
+    # Build current user turn
+    user_parts = []
+    if image_data:
+        user_parts.append(_gtypes.Part.from_bytes(data=image_data, mime_type=image_mime))
+    if audio_data:
+        user_parts.append(_gtypes.Part.from_bytes(data=audio_data, mime_type=audio_mime))
+    if message:
+        user_parts.append(_gtypes.Part.from_text(text=message))
+    elif not image_data and not audio_data:
+        user_parts.append(_gtypes.Part.from_text(text="Hello"))
+
+    contents.append(_gtypes.Content(role="user", parts=user_parts))
+    return contents
+
+
+def _ai_gen_config():
+    """Build Gemini GenerateContentConfig with safe, sensible defaults."""
+    from google.genai import types as _gtypes
+    return _gtypes.GenerateContentConfig(
+        system_instruction=_AI_SYSTEM_PROMPT,
+        temperature=0.7,
+        max_output_tokens=8192,
+        safety_settings=[
+            _gtypes.SafetySetting(
+                category="HARM_CATEGORY_HARASSMENT",
+                threshold="BLOCK_ONLY_HIGH",
+            ),
+            _gtypes.SafetySetting(
+                category="HARM_CATEGORY_HATE_SPEECH",
+                threshold="BLOCK_ONLY_HIGH",
+            ),
+            _gtypes.SafetySetting(
+                category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                threshold="BLOCK_ONLY_HIGH",
+            ),
+            _gtypes.SafetySetting(
+                category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                threshold="BLOCK_ONLY_HIGH",
+            ),
+        ],
+    )
+
+
+def _parse_multipart_ai_request():
+    """
+    Parse multipart/form-data or urlencoded AI assistant request.
+    Returns (message, history, image_data, audio_data, image_mime, audio_mime,
+             do_stream, error_response_or_None).
+    """
+    message = (request.form.get("message") or "").strip()
+    do_stream = request.form.get("stream", "").lower() == "true"
+    history = []
+    raw_history = request.form.get("history", "")
+    if raw_history:
+        try:
+            history = _json.loads(raw_history)
+        except Exception:
+            pass
+
+    image_data = audio_data = None
+    image_mime = audio_mime = ""
+
+    img_file = request.files.get("image")
+    if img_file:
+        image_mime = img_file.mimetype or "image/jpeg"
+        if image_mime not in _AI_ALLOWED_IMAGE_MIME:
+            return None, None, None, None, None, None, None, \
+                _ai_cors(_ai_error(f"Unsupported image type: {image_mime}"))
+        image_data = img_file.read()
+        if len(image_data) > _AI_API_MAX_IMAGE_BYTES:
+            return None, None, None, None, None, None, None, \
+                _ai_cors(_ai_error("Image file too large (max 10 MB)."))
+
+    aud_file = request.files.get("audio")
+    if aud_file:
+        audio_mime = aud_file.mimetype or "audio/mpeg"
+        if audio_mime not in _AI_ALLOWED_AUDIO_MIME:
+            return None, None, None, None, None, None, None, \
+                _ai_cors(_ai_error(f"Unsupported audio type: {audio_mime}"))
+        audio_data = aud_file.read()
+        if len(audio_data) > _AI_API_MAX_AUDIO_BYTES:
+            return None, None, None, None, None, None, None, \
+                _ai_cors(_ai_error("Audio file too large (max 50 MB)."))
+
+    return message, history, image_data, audio_data, image_mime, audio_mime, do_stream, None
+
+
+def _parse_json_ai_request():
+    """
+    Parse application/json AI assistant request.
+    Returns same tuple as _parse_multipart_ai_request().
+    """
+    try:
+        body = request.get_json(force=True) or {}
+    except Exception:
+        return None, None, None, None, None, None, None, \
+            _ai_cors(_ai_error("Invalid JSON body."))
+
+    message = (body.get("message") or "").strip()
+    do_stream = bool(body.get("stream", False))
+    history = body.get("history") or []
+    image_data = audio_data = None
+    image_mime = audio_mime = ""
+
+    if body.get("image_base64"):
+        image_mime = body.get("image_mime", "image/jpeg")
+        if image_mime not in _AI_ALLOWED_IMAGE_MIME:
+            return None, None, None, None, None, None, None, \
+                _ai_cors(_ai_error(f"Unsupported image type: {image_mime}"))
+        try:
+            image_data = base64.b64decode(body["image_base64"])
+        except Exception:
+            return None, None, None, None, None, None, None, \
+                _ai_cors(_ai_error("Invalid base64 image data."))
+        if len(image_data) > _AI_API_MAX_IMAGE_BYTES:
+            return None, None, None, None, None, None, None, \
+                _ai_cors(_ai_error("Image too large (max 10 MB)."))
+
+    if body.get("audio_base64"):
+        audio_mime = body.get("audio_mime", "audio/mpeg")
+        if audio_mime not in _AI_ALLOWED_AUDIO_MIME:
+            return None, None, None, None, None, None, None, \
+                _ai_cors(_ai_error(f"Unsupported audio type: {audio_mime}"))
+        try:
+            audio_data = base64.b64decode(body["audio_base64"])
+        except Exception:
+            return None, None, None, None, None, None, None, \
+                _ai_cors(_ai_error("Invalid base64 audio data."))
+        if len(audio_data) > _AI_API_MAX_AUDIO_BYTES:
+            return None, None, None, None, None, None, None, \
+                _ai_cors(_ai_error("Audio too large (max 50 MB)."))
+
+    return message, history, image_data, audio_data, image_mime, audio_mime, do_stream, None
+
+
+@app_flask.route("/ai-assistant", methods=["POST", "OPTIONS"])
+def ai_assistant():
+    """
+    Main AI assistant endpoint.
+    Supports text chat, image vision, audio transcription, multi-turn history,
+    and optional SSE streaming. All combinations are valid.
+    """
+    if request.method == "OPTIONS":
+        resp = Response("", status=204)
+        resp.headers.update({
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Api-Key",
+        })
+        return resp
+
+    if not _check_ai_api_key():
+        return _ai_cors(_ai_error("Unauthorized — invalid or missing API key.", 401))
+
+    # _gemini is initialised later in main(), but Flask routes run after that.
+    if _gemini is None:
+        return _ai_cors(_ai_error("AI service not configured (GEMINI_API_KEY missing).", 503))
+
+    content_type = request.content_type or ""
+    if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
+        message, history, image_data, audio_data, image_mime, audio_mime, do_stream, err = \
+            _parse_multipart_ai_request()
+    elif "application/json" in content_type:
+        message, history, image_data, audio_data, image_mime, audio_mime, do_stream, err = \
+            _parse_json_ai_request()
+    else:
+        return _ai_cors(_ai_error(
+            "Content-Type must be multipart/form-data or application/json."
+        ))
+
+    if err is not None:
+        return err
+
+    if not message and image_data is None and audio_data is None:
+        return _ai_cors(_ai_error("Provide at least one of: message, image, or audio."))
+
+    if message and len(message) > _AI_API_MAX_MESSAGE_CHARS:
+        return _ai_cors(_ai_error(f"Message too long (max {_AI_API_MAX_MESSAGE_CHARS} chars)."))
+
+    contents = _build_gemini_contents(
+        message, history, image_data, audio_data, image_mime, audio_mime
+    )
+    gen_config = _ai_gen_config()
+
+    # ── Streaming SSE response ───────────────────────────────────────────
+    if do_stream:
+        def _sse_generator():
+            try:
+                stream = _gemini.models.generate_content_stream(
+                    model=GEMINI_MODEL,
+                    contents=contents,
+                    config=gen_config,
+                )
+                full_text = ""
+                for chunk in stream:
+                    delta = chunk.text or ""
+                    if delta:
+                        full_text += delta
+                        yield f"data: {_json.dumps({'ok': True, 'delta': delta, 'done': False})}\n\n"
+                lang = _detect_lang(full_text or message or "")
+                yield (
+                    f"data: {_json.dumps({'ok': True, 'delta': '', 'done': True, "
+                    f"'reply': full_text, 'detected_language': lang, 'model': GEMINI_MODEL})}\n\n"
+                )
+            except Exception as exc:
+                yield f"data: {_json.dumps({'ok': False, 'error': str(exc), 'done': True})}\n\n"
+
+        return Response(
+            stream_with_context(_sse_generator()),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+
+    # ── Non-streaming response ───────────────────────────────────────────
+    try:
+        response = _gemini.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=gen_config,
+        )
+        reply_text = (response.text or "").strip()
+        tokens_used = None
+        try:
+            tokens_used = response.usage_metadata.total_token_count
+        except Exception:
+            pass
+        detected_lang = _detect_lang(reply_text or message or "")
+        return _ai_cors(jsonify({
+            "ok": True,
+            "reply": reply_text,
+            "detected_language": detected_lang,
+            "tokens_used": tokens_used,
+            "model": GEMINI_MODEL,
+        }))
+    except Exception as exc:
+        logging.getLogger(__name__).error(f"/ai-assistant Gemini error: {exc}")
+        return _ai_cors(_ai_error(f"AI generation failed: {exc}", 500))
+
+
+@app_flask.route("/ai-assistant/transcribe", methods=["POST", "OPTIONS"])
+def ai_transcribe():
+    """
+    Dedicated audio transcription endpoint.
+
+    POST multipart/form-data:
+      audio    (file) – audio file (any supported format)
+      language (str)  – "km" | "en" | "auto"  (optional hint)
+
+    Response: { "ok": true, "transcript": "...", "detected_language": "km"|"en", "model": "..." }
+    """
+    if request.method == "OPTIONS":
+        resp = Response("", status=204)
+        resp.headers.update({
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Api-Key",
+        })
+        return resp
+
+    if not _check_ai_api_key():
+        return _ai_cors(_ai_error("Unauthorized.", 401))
+    if _gemini is None:
+        return _ai_cors(_ai_error("AI service not configured.", 503))
+
+    aud_file = request.files.get("audio")
+    if not aud_file:
+        return _ai_cors(_ai_error("No audio file provided (field name: 'audio')."))
+
+    audio_mime = aud_file.mimetype or "audio/mpeg"
+    if audio_mime not in _AI_ALLOWED_AUDIO_MIME:
+        return _ai_cors(_ai_error(f"Unsupported audio type: {audio_mime}"))
+
+    audio_data = aud_file.read()
+    if len(audio_data) > _AI_API_MAX_AUDIO_BYTES:
+        return _ai_cors(_ai_error("Audio too large (max 50 MB)."))
+
+    lang_hint = request.form.get("language", "auto")
+    lang_instruction = {
+        "km": " The audio is in Khmer (ភាសាខ្មែរ).",
+        "en": " The audio is in English.",
+    }.get(lang_hint, "")
+
+    from google.genai import types as _gtypes
+    try:
+        response = _gemini.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                _gtypes.Part.from_bytes(data=audio_data, mime_type=audio_mime),
+                (
+                    "Transcribe this audio exactly as spoken. "
+                    "Output ONLY the transcribed text — no labels, no explanation, "
+                    "no timestamps." + lang_instruction
+                ),
+            ],
+        )
+        transcript = (response.text or "").strip()
+        return _ai_cors(jsonify({
+            "ok": True,
+            "transcript": transcript,
+            "detected_language": _detect_lang(transcript),
+            "model": GEMINI_MODEL,
+        }))
+    except Exception as exc:
+        logging.getLogger(__name__).error(f"/ai-assistant/transcribe error: {exc}")
+        return _ai_cors(_ai_error(f"Transcription failed: {exc}", 500))
+
+
+@app_flask.route("/ai-assistant/vision", methods=["POST", "OPTIONS"])
+def ai_vision():
+    """
+    Dedicated image vision / OCR endpoint.
+
+    Accepts multipart/form-data:
+      image   (file) – image file (jpg/png/webp/gif, max 10 MB)
+      prompt  (str)  – instruction (default: describe + extract text)
+
+    Or application/json:
+      image_base64 (str) – base64 image
+      image_mime   (str) – MIME type
+      prompt       (str) – instruction
+
+    Response: { "ok": true, "result": "...", "detected_language": "...", "model": "..." }
+    """
+    if request.method == "OPTIONS":
+        resp = Response("", status=204)
+        resp.headers.update({
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Api-Key",
+        })
+        return resp
+
+    if not _check_ai_api_key():
+        return _ai_cors(_ai_error("Unauthorized.", 401))
+    if _gemini is None:
+        return _ai_cors(_ai_error("AI service not configured.", 503))
+
+    default_prompt = (
+        "Describe this image in detail. "
+        "If it contains text, extract every line of text accurately."
+    )
+    image_data = None
+    image_mime = "image/jpeg"
+    prompt = default_prompt
+
+    content_type = request.content_type or ""
+    if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
+        img_file = request.files.get("image")
+        if not img_file:
+            return _ai_cors(_ai_error("No image file provided (field name: 'image')."))
+        image_mime = img_file.mimetype or "image/jpeg"
+        if image_mime not in _AI_ALLOWED_IMAGE_MIME:
+            return _ai_cors(_ai_error(f"Unsupported image type: {image_mime}"))
+        image_data = img_file.read()
+        prompt = request.form.get("prompt", default_prompt)
+    elif "application/json" in content_type:
+        try:
+            body = request.get_json(force=True) or {}
+        except Exception:
+            return _ai_cors(_ai_error("Invalid JSON."))
+        image_mime = body.get("image_mime", "image/jpeg")
+        if image_mime not in _AI_ALLOWED_IMAGE_MIME:
+            return _ai_cors(_ai_error(f"Unsupported image type: {image_mime}"))
+        try:
+            image_data = base64.b64decode(body.get("image_base64", ""))
+        except Exception:
+            return _ai_cors(_ai_error("Invalid base64 image."))
+        prompt = body.get("prompt", default_prompt)
+    else:
+        return _ai_cors(_ai_error(
+            "Content-Type must be multipart/form-data or application/json."
+        ))
+
+    if not image_data:
+        return _ai_cors(_ai_error("Empty image data."))
+    if len(image_data) > _AI_API_MAX_IMAGE_BYTES:
+        return _ai_cors(_ai_error("Image too large (max 10 MB)."))
+
+    from google.genai import types as _gtypes
+    try:
+        response = _gemini.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                _gtypes.Part.from_bytes(data=image_data, mime_type=image_mime),
+                prompt,
+            ],
+        )
+        result_text = (response.text or "").strip()
+        return _ai_cors(jsonify({
+            "ok": True,
+            "result": result_text,
+            "detected_language": _detect_lang(result_text),
+            "model": GEMINI_MODEL,
+        }))
+    except Exception as exc:
+        logging.getLogger(__name__).error(f"/ai-assistant/vision error: {exc}")
+        return _ai_cors(_ai_error(f"Vision analysis failed: {exc}", 500))
+
+
+@app_flask.route("/ai-assistant/info", methods=["GET"])
+def ai_info():
+    """
+    Returns model capabilities and limits. Useful for mobile app feature detection.
+    No auth required.
+    """
+    resp = jsonify({
+        "ok": True,
+        "model": GEMINI_MODEL,
+        "gemini_available": _gemini is not None,
+        "features": [
+            "chat",
+            "multi-turn-history",
+            "image-vision",
+            "image-ocr",
+            "audio-transcription",
+            "streaming-sse",
+            "khmer-language",
+            "english-language",
+        ],
+        "limits": {
+            "max_message_chars": _AI_API_MAX_MESSAGE_CHARS,
+            "max_image_bytes": _AI_API_MAX_IMAGE_BYTES,
+            "max_audio_bytes": _AI_API_MAX_AUDIO_BYTES,
+            "max_history_turns": _AI_API_MAX_HISTORY_TURNS,
+        },
+        "supported_image_types": sorted(_AI_ALLOWED_IMAGE_MIME),
+        "supported_audio_types": sorted(_AI_ALLOWED_AUDIO_MIME),
+        "auth_required": bool(os.environ.get("AI_API_KEY", "")),
+    })
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
 
 # ── FFmpeg ─────────────────────────────────────────────────────────────────
 _FFMPEG_EXE = _iio_ffmpeg.get_ffmpeg_exe()
@@ -108,7 +672,7 @@ GEMINI_API_KEY: str = ""
 ADMIN_IDS: set[int] = set()
 GEMINI_MODEL = "gemma-4-31b-it"
 MAX_VOICE_BYTES = 20 * 1024 * 1024
-MAX_AUDIO_FILE_BYTES = 50 * 1024 * 1024   # 50 MB limit for audio files
+MAX_AUDIO_FILE_BYTES = 50 * 1024 * 1024
 MAX_INPUT_CHARS = 5_000
 TTS_CHUNK_CHARS = 900
 DEFAULT_SPEED = 1.0
@@ -120,22 +684,19 @@ _KHMER_RE = re.compile(r"[\u1780-\u17FF]")
 _SPEED_MIN = 0.25
 _SPEED_MAX = 4.0
 
-# PERF-12: compile sentence regex once at module level
 _SENTENCE_RE = re.compile(r"(?<=[។!\?\.。])\s*")
 
 # ---------------------------------------------------------------------------
-# Supported audio file extensions (for document/audio attachment handling)
+# Supported audio file extensions
 # ---------------------------------------------------------------------------
 _AUDIO_EXTENSIONS = {
     ".wav", ".mp3", ".mp4", ".m4a", ".ogg", ".oga",
     ".flac", ".aac", ".wma", ".opus", ".webm", ".aiff", ".aif",
 }
 
-# MIME types that indicate audio content (for document uploads)
 _AUDIO_MIME_PREFIXES = ("audio/", "video/mp4", "video/webm")
 
 def _is_audio_file(filename: str | None, mime_type: str | None) -> bool:
-    """Return True if the file is a supported audio format."""
     if filename:
         ext = os.path.splitext(filename.lower())[1]
         if ext in _AUDIO_EXTENSIONS:
@@ -147,27 +708,17 @@ def _is_audio_file(filename: str | None, mime_type: str | None) -> bool:
     return False
 
 def _audio_mime_for_gemini(filename: str | None, mime_type: str | None) -> str:
-    """Return the best MIME type string to pass to Gemini for audio."""
     if mime_type:
         mt = mime_type.lower()
         if mt.startswith("audio/"):
             return mt
         if mt in ("video/mp4", "video/webm"):
             return mt
-    # Fallback by extension
     ext_map = {
-        ".wav": "audio/wav",
-        ".mp3": "audio/mpeg",
-        ".mp4": "audio/mp4",
-        ".m4a": "audio/mp4",
-        ".ogg": "audio/ogg",
-        ".oga": "audio/ogg",
-        ".flac": "audio/flac",
-        ".aac": "audio/aac",
-        ".opus": "audio/opus",
-        ".webm": "audio/webm",
-        ".aiff": "audio/aiff",
-        ".aif": "audio/aiff",
+        ".wav": "audio/wav", ".mp3": "audio/mpeg", ".mp4": "audio/mp4",
+        ".m4a": "audio/mp4", ".ogg": "audio/ogg", ".oga": "audio/ogg",
+        ".flac": "audio/flac", ".aac": "audio/aac", ".opus": "audio/opus",
+        ".webm": "audio/webm", ".aiff": "audio/aiff", ".aif": "audio/aiff",
         ".wma": "audio/x-ms-wma",
     }
     if filename:
@@ -175,15 +726,11 @@ def _audio_mime_for_gemini(filename: str | None, mime_type: str | None) -> str:
         return ext_map.get(ext, "audio/mpeg")
     return "audio/mpeg"
 
-# Separate executor pools: DB writes vs Gemini API
 _DB_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="db_write")
 _GEMINI_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="gemini")
 
-# Semaphores (init in _run_bot)
 _GEMINI_SEMAPHORE: asyncio.Semaphore | None = None
 _BROADCAST_SEMAPHORE: asyncio.Semaphore | None = None
-
-# PERF-NEW: semaphore to cap concurrent paged-TTS chunk generation
 _TTS_CHUNK_SEMAPHORE: asyncio.Semaphore | None = None
 
 # ---------------------------------------------------------------------------
@@ -295,12 +842,12 @@ WELCOME_TEXT = (
 BOT_TAG = "@voicekhaibot"
 
 # ---------------------------------------------------------------------------
-# Prefs cache — all mutations on the event loop (asyncio.Lock protected)
+# Prefs cache
 # ---------------------------------------------------------------------------
 _PREFS_TTL = 300.0
 _PREFS_MAX_SIZE = 10_000
 _prefs_cache: OrderedDict[int, tuple[dict, float]] = OrderedDict()
-_prefs_cache_lock: asyncio.Lock | None = None  # init in _run_bot()
+_prefs_cache_lock: asyncio.Lock | None = None
 
 def _cache_prefs_sync(user_id: int, prefs: dict) -> None:
     _prefs_cache.pop(user_id, None)
@@ -328,7 +875,6 @@ async def _async_get_cached_prefs(user_id: int) -> dict | None:
         return _get_cached_prefs_sync(user_id)
 
 async def get_user_prefs_async(user_id: int) -> dict:
-    """Async-safe prefs fetch. Cache reads/writes on the event loop."""
     cached = await _async_get_cached_prefs(user_id)
     if cached is not None:
         return cached
@@ -390,14 +936,11 @@ def _submit_db(fn, *args, **kwargs):
 # Safe Telegram send with retry
 # ---------------------------------------------------------------------------
 async def safe_send(coro_factory, retries: int = 3, delay: float = 2.0):
-    # BUG-4 FIX: Raise immediately for raw coroutines instead of silently
-    # degrading to no-retry behaviour. Callers must pass a zero-arg lambda.
     if inspect.isawaitable(coro_factory):
         raise TypeError(
             "safe_send requires a zero-arg callable (lambda), not a raw coroutine. "
             "Wrap your call: safe_send(lambda: your_coro())"
         )
-
     last_exc = None
     for attempt in range(retries):
         try:
@@ -422,7 +965,6 @@ async def safe_send(coro_factory, retries: int = 3, delay: float = 2.0):
         except TelegramError as e:
             logger.error(f"Telegram error: {e}")
             raise
-
     if last_exc:
         logger.warning(f"safe_send giving up after {retries} attempts: {last_exc}")
     return None
@@ -445,8 +987,6 @@ def _paginate_plain(text: str, limit: int = TELE_MSG_LIMIT) -> list[str]:
         if cut <= 0:
             cut = limit
         pages.append(text[:cut])
-        # BUG-9 FIX: strip ALL leading whitespace, not just newlines,
-        # and guard against producing an empty continuation string.
         remainder = text[cut:].lstrip()
         if not remainder:
             break
@@ -473,24 +1013,16 @@ def _make_temp_img(suffix: str = ".jpg") -> str:
     os.close(fd)
     return path
 
-# BUG-14 FIX: Only remove temp files older than 2 hours to avoid
-# deleting files currently being written.
-_STALE_TEMP_AGE_S = 7200  # 2 hours
+_STALE_TEMP_AGE_S = 7200
 
 def _sweep_stale_temps() -> None:
     patterns = [
-        f"/tmp/{_TMP_PREFIX}*.ogg",
-        f"/tmp/{_TMP_PREFIX}*.jpg",
-        f"/tmp/{_TMP_PREFIX}*.png",
-        f"/tmp/{_TMP_PREFIX}*.webp",
-        f"/tmp/{_TMP_PREFIX}*.mp3",
-        f"/tmp/{_TMP_PREFIX}*.wav",
-        f"/tmp/{_TMP_PREFIX}*.mp4",
-        f"/tmp/{_TMP_PREFIX}*.m4a",
-        f"/tmp/{_TMP_PREFIX}*.flac",
-        f"/tmp/{_TMP_PREFIX}*.aac",
-        f"/tmp/{_TMP_PREFIX}*.opus",
-        f"/tmp/{_TMP_PREFIX}*.webm",
+        f"/tmp/{_TMP_PREFIX}*.ogg", f"/tmp/{_TMP_PREFIX}*.jpg",
+        f"/tmp/{_TMP_PREFIX}*.png", f"/tmp/{_TMP_PREFIX}*.webp",
+        f"/tmp/{_TMP_PREFIX}*.mp3", f"/tmp/{_TMP_PREFIX}*.wav",
+        f"/tmp/{_TMP_PREFIX}*.mp4", f"/tmp/{_TMP_PREFIX}*.m4a",
+        f"/tmp/{_TMP_PREFIX}*.flac", f"/tmp/{_TMP_PREFIX}*.aac",
+        f"/tmp/{_TMP_PREFIX}*.opus", f"/tmp/{_TMP_PREFIX}*.webm",
     ]
     now = time.time()
     for pattern in patterns:
@@ -504,7 +1036,6 @@ def _sweep_stale_temps() -> None:
 
 async def _periodic_temp_sweep(stop_event: asyncio.Event) -> None:
     while True:
-        # BUG-16 FIX: Check stop_event first to avoid sweeping on shutdown
         if stop_event.is_set():
             break
         try:
@@ -518,7 +1049,6 @@ async def _periodic_temp_sweep(stop_event: asyncio.Event) -> None:
 # Database helpers — user prefs
 # ---------------------------------------------------------------------------
 def sync_user_data(user):
-    """Upsert user record asynchronously (fire-and-forget)."""
     if not supabase:
         return
     def _run():
@@ -711,7 +1241,6 @@ def _hist_cache_clear(user_id: int) -> None:
 def db_history_append(user_id: int, role: str, content: str) -> None:
     if not supabase:
         return
-    # BUG-15 FIX: Log errors from DB history writes instead of silently swallowing them.
     def _run():
         try:
             supabase.table("conversation_history").insert(
@@ -766,7 +1295,6 @@ def _build_context_block(history: list[dict]) -> str:
     return block
 
 def record_turn(user_id: int, role: str, content: str) -> None:
-    """Record one conversation turn to both in-memory cache and Supabase."""
     _hist_cache_append(user_id, role, content)
     db_history_append(user_id, role, content)
 
@@ -783,12 +1311,10 @@ async def resolve_tts_text(
 
     history = _hist_cache_get(user_id)
     if history is None:
-        # BUG-11 FIX: Fetch from DB and populate in-memory cache cleanly.
-        # Use a separate local variable so we don't double-append via record_turn later.
         db_rows = await loop.run_in_executor(_DB_EXECUTOR, db_history_fetch, user_id)
         for row in db_rows:
             _hist_cache_append(user_id, row["role"], row["content"])
-        history = db_rows  # use fetched rows for context building this turn
+        history = db_rows
 
     if not history:
         return raw_text
@@ -989,7 +1515,7 @@ def get_schedules_list_kb(
     return InlineKeyboardMarkup(kbd_rows)
 
 # ---------------------------------------------------------------------------
-# Status timer (animated spinner messages)
+# Status timer
 # ---------------------------------------------------------------------------
 _STATUS_FRAMES = [
     "⏳ កំពុងបង្កើតសំឡេង ·",
@@ -1055,14 +1581,11 @@ async def _stop_timer(stop_event: asyncio.Event, timer_task: asyncio.Task):
 # ---------------------------------------------------------------------------
 # Audio pipeline
 # ---------------------------------------------------------------------------
-# BUG-10 FIX: Round speed to 4dp BEFORE using as lru_cache key so that
-# floating-point noise doesn't create spurious cache misses.
 def _rounded_speed(speed: float) -> float:
     return round(max(_SPEED_MIN, min(_SPEED_MAX, speed)), 4)
 
 @functools.lru_cache(maxsize=64)
 def _build_atempo_chain(speed: float) -> str:
-    # speed is already rounded by callers via _rounded_speed()
     if abs(speed - 1.0) < 1e-6:
         return "atempo=1.0"
     stages: list[str] = []
@@ -1080,20 +1603,17 @@ def _build_atempo_chain(speed: float) -> str:
     return ",".join(stages)
 
 def _detect_voice(text: str, gender: str) -> str:
-    """Return the edge-tts voice name for the given text and gender."""
     khmer_chars = len(_KHMER_RE.findall(text))
     total_alpha = sum(1 for c in text if c.isalpha())
     is_khmer = khmer_chars > (total_alpha * 0.3) if total_alpha else False
     return VOICE_MAP["km" if is_khmer else "en"][gender]
 
 async def generate_voice(text: str, gender: str, speed: float, output_path: str) -> bytes:
-    """Generate TTS audio and return the raw OGG/Opus bytes."""
     text = text.strip()
     if not text:
         raise ValueError("generate_voice: text must not be empty")
 
     voice = _detect_voice(text, gender)
-
     mp3_chunks: list[bytes] = []
     try:
         communicate = edge_tts.Communicate(text, voice)
@@ -1107,10 +1627,8 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str)
     if not mp3_data:
         raise RuntimeError("edge-tts returned empty audio")
 
-    # BUG-10 FIX: use _rounded_speed() before passing to lru_cache'd function
     speed_key = _rounded_speed(speed)
     af = _build_atempo_chain(speed_key) if abs(speed_key - DEFAULT_SPEED) > 1e-4 else None
-
     cmd = [_FFMPEG_EXE, "-y", "-f", "mp3", "-i", "pipe:0"]
     if af:
         cmd += ["-filter:a", af]
@@ -1145,7 +1663,7 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str)
     return audio_bytes
 
 # ---------------------------------------------------------------------------
-# Gemini transcription (for voice messages — OGG)
+# Gemini transcription helpers
 # ---------------------------------------------------------------------------
 async def transcribe_voice(ogg_path: str) -> str:
     if not _gemini:
@@ -1163,7 +1681,6 @@ async def transcribe_voice(ogg_path: str) -> str:
         "Output ONLY the transcribed text — no labels, no explanation. "
         "Support both Khmer and English."
     )
-
     semaphore = _GEMINI_SEMAPHORE
     if semaphore is None:
         raise RuntimeError("Gemini semaphore not initialised.")
@@ -1186,14 +1703,7 @@ async def transcribe_voice(ogg_path: str) -> str:
     except asyncio.TimeoutError:
         raise RuntimeError("Gemini transcription timed out after 60s")
 
-# ---------------------------------------------------------------------------
-# Gemini transcription for uploaded audio files (any format)
-# ---------------------------------------------------------------------------
 async def transcribe_audio_file(file_path: str, mime_type: str) -> str:
-    """
-    Transcribe an uploaded audio file (mp3, wav, ogg, mp4, m4a, flac, etc.)
-    using Gemini. Unlike transcribe_voice(), this accepts any MIME type.
-    """
     if not _gemini:
         raise RuntimeError("GEMINI_API_KEY not set.")
     loop = asyncio.get_running_loop()
@@ -1209,7 +1719,6 @@ async def transcribe_audio_file(file_path: str, mime_type: str) -> str:
         "Output ONLY the transcribed text — no labels, no explanation. "
         "Support both Khmer and English."
     )
-
     semaphore = _GEMINI_SEMAPHORE
     if semaphore is None:
         raise RuntimeError("Gemini semaphore not initialised.")
@@ -1326,7 +1835,6 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
         "Support both Khmer (ខ្មែរ) and English with full Unicode accuracy. "
         "If there is truly no text, output only the single word: NOTEXT"
     )
-
     semaphore = _GEMINI_SEMAPHORE
     if semaphore is None:
         raise RuntimeError("Gemini semaphore not initialised.")
@@ -1350,10 +1858,9 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
         raise RuntimeError("Gemini OCR timed out after 60s")
 
 # ---------------------------------------------------------------------------
-# Cooldown check — shared by all TTS entry points
+# Cooldown check
 # ---------------------------------------------------------------------------
 async def _check_cooldown(reply_target, user_id: int) -> bool:
-    """Returns True if the request is within cooldown (warning sent)."""
     lock = _get_user_lock(user_id)
     if lock.locked():
         await safe_send(
@@ -1423,12 +1930,8 @@ async def _deliver_paged_tts(
         _set_last_tts(user_id)
         return
 
-    # BUG-3 FIX: Use the module-level _TTS_CHUNK_SEMAPHORE for ALL chunks
-    # so they share a single concurrency limit. Do NOT create a new Semaphore
-    # per-chunk call (the old code created an independent one if sem was None).
     sem = _TTS_CHUNK_SEMAPHORE
     if sem is None:
-        # Fallback: create ONE shared semaphore for this delivery run (not per-chunk)
         sem = asyncio.Semaphore(3)
 
     file_paths = [_make_temp_ogg() for _ in chunks]
@@ -1516,7 +2019,6 @@ def get_transcription_kb(transcript_msg_id: int) -> InlineKeyboardMarkup:
     )
 
 def get_audio_file_kb(msg_id: int) -> InlineKeyboardMarkup:
-    """Keyboard shown after audio file transcription — let user trigger TTS."""
     return InlineKeyboardMarkup(
         [[
             InlineKeyboardButton("📢 បំលែងទៅសំឡេង TTS", callback_data=f"audio_tts:{msg_id}"),
@@ -1613,7 +2115,7 @@ def _get_admin_for_user(user_id: int) -> int | None:
     return _user_to_admin.get(user_id)
 
 # ===========================================================================
-# _run_broadcast_to_all — always return a 3-tuple
+# _run_broadcast_to_all
 # ===========================================================================
 async def _run_broadcast_to_all(
     bot,
@@ -2644,21 +3146,13 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if img_path:
             _cleanup(img_path)
 
-# ===========================================================================
-# on_audio_file — handles audio files uploaded as Document or Audio
-# ===========================================================================
 async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle audio files sent as documents or audio attachments (mp3, wav, ogg,
-    mp4, m4a, flac, aac, opus, webm, etc.).
-    """
     msg = update.message
     user = update.effective_user
     user_id = user.id if user else None
     if user_id is None:
         return
 
-    # ── Admin chat-forwarding shortcut ──────────────────────────────────────
     if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
         target_id = _admin_chat_target.get(user_id)
         if target_id:
@@ -2681,7 +3175,6 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: msg.reply_text("✅ ឯកសារបានផ្ញើដល់ Admin ។"))
         return
 
-    # ── Determine which attachment we have ──────────────────────────────────
     doc = msg.document
     audio = msg.audio
 
@@ -2782,7 +3275,6 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការ Transcribe ឯកសារអូឌីយ៉ូ។")
         )
     finally:
-        # BUG-6/7 FIX: Timer is always stopped in finally, covering all return paths.
         await _stop_timer(stop_event, timer_task)
         _cleanup(audio_path)
 
@@ -2793,11 +3285,6 @@ async def on_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id if user else None
     if user_id is None:
         return
-
-    # BUG-1/5 FIX: Do NOT re-route audio files here — they are already handled
-    # by the dedicated on_audio_file handler registered before this one.
-    # Keeping the re-routing logic here would cause confusion if handler
-    # ordering changes. The dedicated handler fires first due to registration order.
 
     if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
         target_id = _admin_chat_target.get(user_id)
@@ -2821,9 +3308,6 @@ async def on_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: msg.reply_text("✅ ផ្ញើដល់ Admin ។"))
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle Telegram voice messages (recorded in-app).
-    """
     msg = update.message
     user = update.effective_user
     user_id = user.id
@@ -3002,8 +3486,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         send_status_timer(update.effective_chat.id, context.bot, stop_event)
     )
     lock = _get_user_lock(user_id)
-    # BUG-8 FIX: Ensure record_turn is called INSIDE the lock block so that
-    # history writes are serialised with TTS generation for the same user.
     async with lock:
         try:
             audio_bytes = await generate_voice(tts_text, gender, speed, file_path)
@@ -3020,7 +3502,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=msg.chat_id, user_id=user_id,
                     username=user.username or user.first_name,
                 )
-                # BUG-8/12 FIX: record both turns inside the lock
                 record_turn(user_id, "user", stripped)
                 record_turn(user_id, "assistant", tts_text)
             _set_last_tts(user_id)
@@ -3207,9 +3688,6 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
             _cleanup(file_path)
 
 async def _cb_audio_tts(query, user_id: int, context, data: str):
-    """
-    Called when user taps '📢 បំលែងទៅសំឡេង TTS' on an audio-file transcript.
-    """
     src_msg_id = int(data.split(":")[1])
     chat_id = query.message.chat.id
 
@@ -3235,8 +3713,6 @@ async def _cb_audio_tts(query, user_id: int, context, data: str):
     with suppress(Exception):
         await query.message.edit_reply_markup(reply_markup=None)
 
-    # BUG-6 FIX: Start the timer BEFORE the lock acquisition so it covers
-    # all code paths. The finally block always stops it.
     tts_stop = asyncio.Event()
     tts_timer = asyncio.create_task(send_status_timer(chat_id, context.bot, tts_stop))
 
@@ -3281,8 +3757,6 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
     with suppress(Exception):
         await query.message.delete()
 
-    # BUG-7 FIX: Same as _cb_audio_tts — start timer before lock so
-    # finally always runs the stop, covering early-return paths.
     tts_stop = asyncio.Event()
     tts_timer = asyncio.create_task(send_status_timer(chat_id, context.bot, tts_stop))
 
@@ -3302,7 +3776,6 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
             await _stop_timer(tts_stop, tts_timer)
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Catch-all callback handler for TTS/voice callbacks."""
     query = update.callback_query
     user_id = query.from_user.id
     data = query.data
@@ -3429,21 +3902,12 @@ async def _run_bot():
 
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
-
-    # BUG-1/2 FIX: Use only filters.AUDIO (Telegram "music" files) and
-    # filters.Document.ALL filtered by _is_audio_file check inside the handler.
-    # Removed the invalid filters.Document.Category("audio") which does not exist.
-    # The on_audio_file handler uses internal _is_audio_file() to gate processing,
-    # so registering it for all Documents is safe — non-audio docs fall through.
     app.add_handler(
         MessageHandler(
             (filters.Document.ALL | filters.AUDIO) & ~filters.VOICE,
             on_audio_file,
         )
     )
-
-    # BUG-1/5 FIX: on_any_media is now only for non-audio media (sticker,
-    # video, video_note). Audio/document is fully handled above.
     app.add_handler(
         MessageHandler(
             filters.Sticker.ALL | filters.VIDEO | filters.VIDEO_NOTE,
