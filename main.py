@@ -36,20 +36,51 @@ def run_flask():
     app_flask.run(host="0.0.0.0", port=port, threaded=True)
 
 def keep_alive():
-    """Self-ping every 4 min as secondary keep-alive layer."""
+    """Self-ping every 4 min as secondary keep-alive layer.
+
+    Tries the base URL first, then /ping. This avoids noisy 404 logs when the
+    deployed service does not expose /ping or RENDER_EXTERNAL_URL accidentally
+    points to a route instead of the base app URL.
+    """
     logger_ka = logging.getLogger("keep_alive")
-    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
     if not render_url:
         logger_ka.warning("RENDER_EXTERNAL_URL not set — self-ping disabled.")
         return
+
     time.sleep(10)
-    headers = {"User-Agent": "Mozilla/5.0 (KeepAlive/1.0)"}
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (KeepAlive/1.0)",
+        "Accept": "text/plain,*/*",
+    }
+
     while True:
-        try:
-            r = requests.get(f"{render_url}/ping", headers=headers, timeout=10)
-            logger_ka.info(f"Keep-alive -> {r.status_code}")
-        except Exception as e:
-            logger_ka.warning(f"Keep-alive failed: {e}")
+        urls = [render_url]
+        if not render_url.endswith("/ping"):
+            urls.append(f"{render_url}/ping")
+
+        ok = False
+        for url in urls:
+            try:
+                r = requests.get(url, headers=headers, timeout=10)
+                if 200 <= r.status_code < 400:
+                    logger_ka.info(f"Keep-alive OK -> {r.status_code} {url}")
+                    ok = True
+                    break
+
+                logger_ka.warning(f"Keep-alive non-OK -> {r.status_code} {url}")
+
+            except Exception as e:
+                logger_ka.warning(f"Keep-alive failed for {url}: {e}")
+
+        if not ok:
+            logger_ka.warning(
+                "Keep-alive failed for all URLs. Check RENDER_EXTERNAL_URL. "
+                "Use the base URL only, e.g. https://your-app.onrender.com"
+            )
+
         time.sleep(240)
 
 # ── AI Assistant REST API ──────────────────────────────────────────────────
@@ -123,6 +154,23 @@ _AI_SYSTEM_PROMPT = (
     "Format answers clearly using plain text (no markdown unless the user asks for it)."
 )
 
+# ---------------------------------------------------------------------------
+# Concurrency limits
+# ---------------------------------------------------------------------------
+MAX_CONCURRENT_TTS_USERS = int(os.environ.get("MAX_CONCURRENT_TTS_USERS", "6"))
+MAX_CONCURRENT_GEMINI = int(os.environ.get("MAX_CONCURRENT_GEMINI", "3"))
+MAX_CONCURRENT_BROADCAST = int(os.environ.get("MAX_CONCURRENT_BROADCAST", "3"))
+
+# Gemini history resolver for normal text TTS is OFF by default.
+# OCR/image/audio transcription still uses Gemini normally.
+TTS_RESOLVER_AI_ENABLED = os.environ.get("TTS_RESOLVER_AI_ENABLED", "0") == "1"
+
+# ---------------------------------------------------------------------------
+# Subtitle/Text document support
+# ---------------------------------------------------------------------------
+SUBTITLE_EXTENSIONS = {".srt", ".vtt", ".txt"}
+MAX_SUBTITLE_BYTES = 2 * 1024 * 1024      # 2 MB
+MAX_SUBTITLE_CHARS = 20_000               # safe limit before TTS chunking
 
 def _ai_error(msg: str, code: int = 400):
     """Return a JSON error response tuple."""
@@ -171,13 +219,13 @@ def _build_gemini_contents(
 
     contents = []
 
-    # Inject previous turns (Gemini uses "model" not "assistant")
+    # Inject previous turns — normalize "assistant" → "model"
     for turn in history[-_AI_API_MAX_HISTORY_TURNS:]:
         role = turn.get("role", "user")
         content = str(turn.get("content", ""))
         if role not in ("user", "model", "assistant"):
             continue
-        gemini_role = "model" if role == "assistant" else role
+        gemini_role = "model" if role in ("assistant", "model") else "user"
         contents.append(_gtypes.Content(
             role=gemini_role,
             parts=[_gtypes.Part.from_text(text=content)],
@@ -337,7 +385,7 @@ def ai_assistant():
     if not _check_ai_api_key():
         return _ai_cors(_ai_error("Unauthorized — invalid or missing API key.", 401))
 
-    # _gemini is initialised later in main(), but Flask routes run after that.
+    # _gemini is initialised in main() before Flask routes are hit.
     if _gemini is None:
         return _ai_cors(_ai_error("AI service not configured (GEMINI_API_KEY missing).", 503))
 
@@ -389,7 +437,7 @@ def ai_assistant():
                     "done": True,
                     "reply": full_text,
                     "detected_language": lang,
-                    "model": GEMINI_MODEL
+                    "model": GEMINI_MODEL,
                 }
                 yield f"data: {_json.dumps(final_payload)}\n\n"
             except Exception as exc:
@@ -664,7 +712,13 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
+# Hide noisy Google GenAI INFO logs such as: AFC is enabled with max remote calls: 10.
+logging.getLogger("google_genai.models").setLevel(logging.WARNING)
+logging.getLogger("google.genai").setLevel(logging.WARNING)
+logging.getLogger("google").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -731,8 +785,8 @@ def _audio_mime_for_gemini(filename: str | None, mime_type: str | None) -> str:
         return ext_map.get(ext, "audio/mpeg")
     return "audio/mpeg"
 
-_DB_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="db_write")
-_GEMINI_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="gemini")
+_DB_EXECUTOR = ThreadPoolExecutor(max_workers=max(4, MAX_CONCURRENT_TTS_USERS), thread_name_prefix="db_write")
+_GEMINI_EXECUTOR = ThreadPoolExecutor(max_workers=max(2, MAX_CONCURRENT_GEMINI), thread_name_prefix="gemini")
 
 _GEMINI_SEMAPHORE: asyncio.Semaphore | None = None
 _BROADCAST_SEMAPHORE: asyncio.Semaphore | None = None
@@ -772,6 +826,38 @@ def _set_last_tts(user_id: int) -> None:
 
 def _get_last_tts(user_id: int) -> float:
     return _user_last_tts.get(user_id, 0.0)
+
+# ---------------------------------------------------------------------------
+# Last TTS text fallback cache
+# ---------------------------------------------------------------------------
+_LAST_TTS_TEXT_MAX = 10_000
+_last_tts_text: OrderedDict[int, tuple[str, float]] = OrderedDict()
+
+def set_last_tts_text(user_id: int, text: str) -> None:
+    """Remember the latest spoken text per user.
+
+    This fixes callback buttons from /myprefs/settings messages.
+    Those messages are not saved in text_cache, so speed/gender buttons
+    need a fallback to the user's latest generated TTS text.
+    """
+    text = (text or "").strip()
+    if not text:
+        return
+
+    _last_tts_text.pop(user_id, None)
+    _last_tts_text[user_id] = (text, time.monotonic())
+
+    while len(_last_tts_text) > _LAST_TTS_TEXT_MAX:
+        _last_tts_text.popitem(last=False)
+
+def get_last_tts_text(user_id: int) -> str | None:
+    item = _last_tts_text.get(user_id)
+    if not item:
+        return None
+
+    _last_tts_text.move_to_end(user_id)
+    text, _created_at = item
+    return text
 
 # ---------------------------------------------------------------------------
 # Supabase + Gemini clients
@@ -831,17 +917,11 @@ SPEED_OPTIONS = {
     "spd_2.0": ("x2.0", 2.0),
 }
 WELCOME_TEXT = (
-    "🎵 សួស្តី! ខ្ញុំជា Bot បំលែងអក្សរទៅជាសំឡេង\n\n"
+    "🎵 សួស្តី! ខ្ញុំជា Bot បំលែងអក្សរទៅជាសំឡេង អេអាយ\n\n"
     "📌 វាយអក្សរភាសាណាមួយ ផ្ញើរមក Bot នឹងបំលែងដោយស្វ័យប្រវត្តិ!\n\n"
     "🌍 ភាសាដែល Support:\n"
     "🇰🇭 ភាសាខ្មែរ | 🇺🇸 English\n\n"
-    "✨ មុខងារថ្មី:\n"
-    "🖼️ ផ្ញើរូបភាព → Bot OCR អត្ថបទ ហើយអាន!\n"
-    "🎙️ ផ្ញើ Voice → Bot Transcribe ហើយអាន!\n"
-    "🎵 ផ្ញើឯកសារអូឌីយ៉ូ (MP3, WAV, OGG, MP4...) → Bot Transcribe ហើយបំលែងទៅជាសំឡេង!\n"
-    "💬 Bot ចងចាំការសន្ទនា — អាចនិយាយ 'អានម្តងទៀត' ឬ 'បកប្រែ' បាន!\n\n"
     "⚙️ ប្រើ /myprefs ដើម្បីមើលការកំណត់របស់អ្នក\n"
-    "🗑️ ប្រើ /clear ដើម្បីលុបប្រវត្តិការសន្ទនា\n\n"
     "📢 Join My Channel: https://t.me/m11mmm112"
 )
 BOT_TAG = "@voicekhaibot"
@@ -883,27 +963,69 @@ async def get_user_prefs_async(user_id: int) -> dict:
     cached = await _async_get_cached_prefs(user_id)
     if cached is not None:
         return cached
-    defaults = {"gender": "female", "speed": DEFAULT_SPEED}
-    if supabase:
-        loop = asyncio.get_running_loop()
+
+    defaults = {
+        "gender": "female",
+        "speed": DEFAULT_SPEED,
+    }
+
+    if not supabase:
+        await _async_cache_prefs(user_id, defaults)
+        return defaults
+
+    loop = asyncio.get_running_loop()
+
+    for attempt in range(3):
         try:
-            res = await loop.run_in_executor(
-                _DB_EXECUTOR,
-                lambda: supabase.table("user_prefs")
-                    .select("gender, speed")
-                    .eq("user_id", user_id)
-                    .execute()
+            res = await asyncio.wait_for(
+                loop.run_in_executor(
+                    _DB_EXECUTOR,
+                    lambda: supabase.table("user_prefs")
+                        .select("gender, speed")
+                        .eq("user_id", user_id)
+                        .limit(1)
+                        .execute()
+                ),
+                timeout=12,
             )
+
             if res.data:
                 row = res.data[0]
-                defaults["gender"] = row.get("gender") or "female"
+
+                gender = row.get("gender") or "female"
+                if gender not in ("female", "male"):
+                    gender = "female"
+
+                defaults["gender"] = gender
+
                 raw_speed = row.get("speed")
                 if raw_speed is not None:
-                    defaults["speed"] = max(_SPEED_MIN, min(_SPEED_MAX, float(raw_speed)))
-                else:
-                    defaults["speed"] = DEFAULT_SPEED
+                    try:
+                        defaults["speed"] = max(
+                            _SPEED_MIN,
+                            min(_SPEED_MAX, float(raw_speed)),
+                        )
+                    except Exception:
+                        defaults["speed"] = DEFAULT_SPEED
+
+            await _async_cache_prefs(user_id, defaults)
+            return defaults
+
         except Exception as e:
-            logger.error(f"DB get_user_prefs_async: {e}")
+            wait_s = 0.5 * (attempt + 1)
+
+            if attempt < 2:
+                logger.warning(
+                    f"DB get_user_prefs_async retry "
+                    f"{attempt + 1}/3 user={user_id}: {e}"
+                )
+                await asyncio.sleep(wait_s)
+            else:
+                logger.error(
+                    f"DB get_user_prefs_async failed after retries "
+                    f"user={user_id}: {e}"
+                )
+
     await _async_cache_prefs(user_id, defaults)
     return defaults
 
@@ -999,43 +1121,83 @@ def _paginate_plain(text: str, limit: int = TELE_MSG_LIMIT) -> list[str]:
     return [p for p in pages if p]
 
 # ---------------------------------------------------------------------------
-# Temp file helpers
+# Temp file helpers — Windows/Linux safe
 # ---------------------------------------------------------------------------
 _TMP_PREFIX = "tgbot_"
 
-def _make_temp_ogg() -> str:
-    fd, path = tempfile.mkstemp(suffix=".ogg", prefix=_TMP_PREFIX, dir="/tmp")
+def _get_temp_dir() -> str:
+    """
+    Cross-platform temp directory.
+    Fixes Windows crash:
+      FileNotFoundError: C:\\tmp\\tgbot_xxx.ogg
+
+    Priority:
+    1. BOT_TMP_DIR env var, if set
+    2. System temp dir from tempfile.gettempdir()
+    """
+    temp_dir = os.environ.get("BOT_TMP_DIR") or tempfile.gettempdir()
+    os.makedirs(temp_dir, exist_ok=True)
+    return temp_dir
+
+def _make_temp_file(suffix: str) -> str:
+    temp_dir = _get_temp_dir()
+    fd, path = tempfile.mkstemp(
+        suffix=suffix,
+        prefix=_TMP_PREFIX,
+        dir=temp_dir,
+    )
     os.close(fd)
     return path
+
+def _make_temp_ogg() -> str:
+    return _make_temp_file(".ogg")
 
 def _make_temp_audio(suffix: str = ".mp3") -> str:
-    fd, path = tempfile.mkstemp(suffix=suffix, prefix=_TMP_PREFIX, dir="/tmp")
-    os.close(fd)
-    return path
+    if not suffix.startswith("."):
+        suffix = "." + suffix
+    return _make_temp_file(suffix)
 
 def _make_temp_img(suffix: str = ".jpg") -> str:
-    fd, path = tempfile.mkstemp(suffix=suffix, prefix=_TMP_PREFIX, dir="/tmp")
-    os.close(fd)
-    return path
+    if not suffix.startswith("."):
+        suffix = "." + suffix
+    return _make_temp_file(suffix)
+
+def _cleanup(path: str | None) -> None:
+    if not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError as e:
+        logger.warning(f"Temp cleanup failed for {path}: {e}")
 
 _STALE_TEMP_AGE_S = 7200
 
 def _sweep_stale_temps() -> None:
+    temp_dir = _get_temp_dir()
     patterns = [
-        f"/tmp/{_TMP_PREFIX}*.ogg", f"/tmp/{_TMP_PREFIX}*.jpg",
-        f"/tmp/{_TMP_PREFIX}*.png", f"/tmp/{_TMP_PREFIX}*.webp",
-        f"/tmp/{_TMP_PREFIX}*.mp3", f"/tmp/{_TMP_PREFIX}*.wav",
-        f"/tmp/{_TMP_PREFIX}*.mp4", f"/tmp/{_TMP_PREFIX}*.m4a",
-        f"/tmp/{_TMP_PREFIX}*.flac", f"/tmp/{_TMP_PREFIX}*.aac",
-        f"/tmp/{_TMP_PREFIX}*.opus", f"/tmp/{_TMP_PREFIX}*.webm",
+        os.path.join(temp_dir, f"{_TMP_PREFIX}*.ogg"),
+        os.path.join(temp_dir, f"{_TMP_PREFIX}*.jpg"),
+        os.path.join(temp_dir, f"{_TMP_PREFIX}*.jpeg"),
+        os.path.join(temp_dir, f"{_TMP_PREFIX}*.png"),
+        os.path.join(temp_dir, f"{_TMP_PREFIX}*.webp"),
+        os.path.join(temp_dir, f"{_TMP_PREFIX}*.mp3"),
+        os.path.join(temp_dir, f"{_TMP_PREFIX}*.wav"),
+        os.path.join(temp_dir, f"{_TMP_PREFIX}*.mp4"),
+        os.path.join(temp_dir, f"{_TMP_PREFIX}*.m4a"),
+        os.path.join(temp_dir, f"{_TMP_PREFIX}*.flac"),
+        os.path.join(temp_dir, f"{_TMP_PREFIX}*.aac"),
+        os.path.join(temp_dir, f"{_TMP_PREFIX}*.opus"),
+        os.path.join(temp_dir, f"{_TMP_PREFIX}*.webm"),
     ]
+
     now = time.time()
     for pattern in patterns:
-        for f in glob.glob(pattern):
+        for file_path in glob.glob(pattern):
             try:
-                if now - os.path.getmtime(f) > _STALE_TEMP_AGE_S:
-                    os.remove(f)
-                    logger.info(f"Swept stale temp file: {f}")
+                if now - os.path.getmtime(file_path) > _STALE_TEMP_AGE_S:
+                    os.remove(file_path)
+                    logger.info(f"Swept stale temp file: {file_path}")
             except OSError:
                 pass
 
@@ -1053,15 +1215,54 @@ async def _periodic_temp_sweep(stop_event: asyncio.Event) -> None:
 # ---------------------------------------------------------------------------
 # Database helpers — user prefs
 # ---------------------------------------------------------------------------
+_USER_SYNC_TTL = 300.0
+_USER_SYNC_MAX = 20_000
+_user_sync_seen: OrderedDict[int, float] = OrderedDict()
+
 def sync_user_data(user):
-    if not supabase:
+    """Upsert lightweight user data, throttled to avoid Supabase overload."""
+    if not supabase or not user:
         return
+
+    now = time.monotonic()
+    last = _user_sync_seen.get(user.id, 0.0)
+    if now - last < _USER_SYNC_TTL:
+        return
+
+    _user_sync_seen.pop(user.id, None)
+    _user_sync_seen[user.id] = now
+    while len(_user_sync_seen) > _USER_SYNC_MAX:
+        _user_sync_seen.popitem(last=False)
+
     def _run():
-        with suppress(Exception):
-            supabase.table("user_prefs").upsert(
-                {"user_id": user.id, "username": user.username or user.first_name},
-                on_conflict="user_id",
-            ).execute()
+        try:
+            payload = {
+                "user_id": user.id,
+                "username": user.username or user.first_name,
+            }
+
+            # last_active is optional in older DB migrations.
+            # Try with last_active first, then fall back if the column is missing.
+            try:
+                supabase.table("user_prefs").upsert(
+                    {
+                        **payload,
+                        "last_active": datetime.now(timezone.utc).isoformat(),
+                    },
+                    on_conflict="user_id",
+                ).execute()
+            except Exception as inner:
+                if "last_active" in str(inner).lower() or "column" in str(inner).lower():
+                    supabase.table("user_prefs").upsert(
+                        payload,
+                        on_conflict="user_id",
+                    ).execute()
+                else:
+                    raise
+
+        except Exception as e:
+            logger.warning(f"sync_user_data skipped user={user.id}: {e}")
+
     _submit_db(_run)
 
 def _paginated_fetch(select_fields: str) -> list[dict]:
@@ -1225,13 +1426,28 @@ _HIST_CACHE_MAX_USERS = 5_000
 _HIST_CACHE_TURNS = 10
 _hist_cache: OrderedDict[int, deque] = OrderedDict()
 
+def _normalize_role(role: str) -> str:
+    role = (role or "").strip().lower()
+    if role in ("assistant", "bot", "model"):
+        return "assistant"
+    return "user"
+
 def _hist_cache_append(user_id: int, role: str, content: str) -> None:
+    role = _normalize_role(role)
+    content = (content or "").strip()
+    if not content:
+        return
+
     if user_id not in _hist_cache:
         while len(_hist_cache) >= _HIST_CACHE_MAX_USERS:
             _hist_cache.popitem(last=False)
         _hist_cache[user_id] = deque(maxlen=_HIST_CACHE_TURNS)
+
     _hist_cache.move_to_end(user_id)
-    _hist_cache[user_id].append({"role": role, "content": content})
+    _hist_cache[user_id].append({
+        "role": role,
+        "content": content,
+    })
 
 def _hist_cache_get(user_id: int) -> list[dict] | None:
     d = _hist_cache.get(user_id)
@@ -1246,60 +1462,106 @@ def _hist_cache_clear(user_id: int) -> None:
 def db_history_append(user_id: int, role: str, content: str) -> None:
     if not supabase:
         return
+
+    role = _normalize_role(role)
+    content = (content or "").strip()
+    if not content:
+        return
+
     def _run():
         try:
-            supabase.table("conversation_history").insert(
-                {"user_id": user_id, "role": role, "content": content}
-            ).execute()
+            supabase.table("conversation_history").insert({
+                "user_id": user_id,
+                "role": role,
+                "content": content,
+            }).execute()
         except Exception as e:
-            logger.error(f"db_history_append error (user={user_id}, role={role}): {e}")
+            logger.error(
+                f"db_history_append error "
+                f"(user={user_id}, role={role}): {e}"
+            )
+
     _submit_db(_run)
 
 def db_history_fetch(user_id: int, limit: int = CONV_HISTORY_LIMIT) -> list[dict]:
     if not supabase:
         return []
+
     try:
         res = (
             supabase.table("conversation_history")
-            .select("role, content")
+            .select("role, content, created_at")
             .eq("user_id", user_id)
             .order("created_at", desc=True)
             .limit(limit)
             .execute()
         )
+
         rows = res.data or []
         rows.reverse()
-        return rows
+
+        clean_rows = []
+        for row in rows:
+            content = (row.get("content") or "").strip()
+            if not content:
+                continue
+            clean_rows.append({
+                "role": _normalize_role(row.get("role")),
+                "content": content,
+            })
+
+        return clean_rows
+
     except Exception as e:
-        logger.error(f"db_history_fetch error: {e}")
+        logger.error(f"db_history_fetch error user={user_id}: {e}")
         return []
 
 def db_history_clear(user_id: int) -> None:
+    _hist_cache_clear(user_id)
+
     if not supabase:
         return
+
     def _run():
-        with suppress(Exception):
+        try:
             supabase.table("conversation_history").delete().eq(
                 "user_id", user_id
             ).execute()
+        except Exception as e:
+            logger.error(f"db_history_clear error user={user_id}: {e}")
+
     _submit_db(_run)
 
 def _build_context_block(history: list[dict]) -> str:
     if not history:
         return ""
+
     lines = []
     for row in history:
-        prefix = "User" if row["role"] == "user" else "Bot"
-        lines.append(f"{prefix}: {row['content']}")
+        role = _normalize_role(row.get("role"))
+        content = (row.get("content") or "").strip()
+        if not content:
+            continue
+
+        prefix = "User" if role == "user" else "Bot"
+        lines.append(f"{prefix}: {content}")
+
     block = "\n".join(lines)
+
     if len(block) > CONV_CONTEXT_MAX_CHARS:
         block = block[-CONV_CONTEXT_MAX_CHARS:]
         nl = block.find("\n")
         if nl != -1:
             block = block[nl + 1:]
+
     return block
 
 def record_turn(user_id: int, role: str, content: str) -> None:
+    role = _normalize_role(role)
+    content = (content or "").strip()
+    if not content:
+        return
+
     _hist_cache_append(user_id, role, content)
     db_history_append(user_id, role, content)
 
@@ -1311,20 +1573,128 @@ async def resolve_tts_text(
     raw_text: str,
     loop: asyncio.AbstractEventLoop,
 ) -> str:
-    if not _gemini:
+    raw_text = (raw_text or "").strip()
+    if not raw_text:
         return raw_text
 
+    # 1. Always load history FIRST.
+    # Do not depend on Gemini for normal history commands.
     history = _hist_cache_get(user_id)
+
     if history is None:
-        db_rows = await loop.run_in_executor(_DB_EXECUTOR, db_history_fetch, user_id)
-        for row in db_rows:
-            _hist_cache_append(user_id, row["role"], row["content"])
-        history = db_rows
+        try:
+            db_rows = await loop.run_in_executor(
+                _DB_EXECUTOR,
+                db_history_fetch,
+                user_id,
+            )
+
+            for row in db_rows:
+                _hist_cache_append(
+                    user_id,
+                    row.get("role", "user"),
+                    row.get("content", ""),
+                )
+
+            history = db_rows
+
+        except Exception as e:
+            logger.error(f"resolve_tts_text history fetch failed for user {user_id}: {e}")
+            history = []
 
     if not history:
+        logger.info(f"conversation_history empty for user {user_id}")
+        return raw_text
+
+    # 2. Normalize helper
+    def _role_of(row: dict) -> str:
+        role = str(row.get("role", "")).strip().lower()
+        if role in ("assistant", "bot", "model"):
+            return "assistant"
+        return "user"
+
+    def _content_of(row: dict) -> str:
+        return str(row.get("content", "") or "").strip()
+
+    def _last_by_role(role_name: str) -> str | None:
+        for row in reversed(history):
+            if _role_of(row) == role_name:
+                content = _content_of(row)
+                if content:
+                    return content
+        return None
+
+    # 3. Fast local history commands.
+    # These work even when Gemini returns 500 INTERNAL.
+    lower = raw_text.lower()
+    compact = lower.replace(" ", "")
+
+    repeat_phrases = (
+        "read again",
+        "read that again",
+        "say again",
+        "repeat",
+        "again",
+        "អានម្តងទៀត",
+        "អានម្ដងទៀត",
+        "ម្តងទៀត",
+        "ម្ដងទៀត",
+        "អានឡើងវិញ",
+        "និយាយម្តងទៀត",
+        "និយាយម្ដងទៀត",
+    )
+
+    if any(p in lower for p in repeat_phrases) or any(p in compact for p in (
+        "អានម្តងទៀត",
+        "អានម្ដងទៀត",
+        "ម្តងទៀត",
+        "ម្ដងទៀត",
+    )):
+        last_bot = _last_by_role("assistant")
+        if last_bot:
+            logger.info(f"resolve_tts_text local repeat matched for user {user_id}")
+            return last_bot
+
+    what_user_said_phrases = (
+        "what did i say",
+        "what i said",
+        "my last message",
+        "អ្វីដែលខ្ញុំនិយាយ",
+        "ខ្ញុំនិយាយអ្វី",
+        "សារចុងក្រោយរបស់ខ្ញុំ",
+    )
+
+    if any(p in lower for p in what_user_said_phrases) or any(p in compact for p in (
+        "ខ្ញុំនិយាយអ្វី",
+        "អ្វីដែលខ្ញុំនិយាយ",
+    )):
+        last_user = _last_by_role("user")
+        if last_user:
+            logger.info(f"resolve_tts_text local last-user matched for user {user_id}")
+            return last_user
+
+    # 4. Optional Gemini resolver.
+    # Disabled by default so normal text TTS does not call Gemini and does not print AFC logs.
+    # Image OCR, audio transcription, and /ai-assistant still use Gemini normally.
+    if not TTS_RESOLVER_AI_ENABLED:
+        logger.debug(f"TTS resolver AI disabled for user {user_id}; using raw text after local history checks.")
+        return raw_text
+
+    if not _gemini:
+        logger.info("resolve_tts_text: Gemini not available, using raw text after local history checks.")
+        return raw_text
+
+    semaphore = _GEMINI_SEMAPHORE
+    if semaphore is None:
+        logger.warning("resolve_tts_text: _GEMINI_SEMAPHORE not initialised, using raw text.")
         return raw_text
 
     context_block = _build_context_block(history)
+
+    if not context_block.strip():
+        logger.info(f"resolve_tts_text context block empty for user {user_id}")
+        return raw_text
+
     system_prompt = (
         "You are a text pre-processor for a Khmer/English text-to-speech bot. "
         "You receive a conversation history and the user's latest message. "
@@ -1334,25 +1704,20 @@ async def resolve_tts_text(
         "1. If the message is a normal sentence or paragraph to be read, output it verbatim.\n"
         "2. If the message is a follow-up like 'read that again' or 'អានម្តងទៀត', "
         "output the last Bot turn verbatim.\n"
-        "3. If the message asks to translate something (e.g. 'translate that to Khmer', "
-        "'បកប្រែជាភាសាខ្មែរ'), output the translated text in the target language.\n"
+        "3. If the message asks to translate something, output the translated text in the target language.\n"
         "4. If the message references previous content using pronouns like 'that', 'it', "
         "'the last thing', resolve the reference and output the resolved text.\n"
         "5. If the message asks 'what did I say?' or similar, output the last User turn.\n"
-        "6. Preserve the original language (Khmer or English) unless translation is requested.\n"
+        "6. Preserve the original language Khmer or English unless translation is requested.\n"
         "7. If you cannot determine what to speak, output the user's message verbatim."
     )
+
     combined_prompt = (
         f"{system_prompt}\n\n"
         f"Conversation history:\n{context_block}\n\n"
         f"User's new message: {raw_text}\n\n"
         "Output only the text to speak:"
     )
-
-    semaphore = _GEMINI_SEMAPHORE
-    if semaphore is None:
-        logger.warning("resolve_tts_text: _GEMINI_SEMAPHORE not initialised, skipping resolve.")
-        return raw_text
 
     async def _guarded_call():
         async with semaphore:
@@ -1361,6 +1726,7 @@ async def resolve_tts_text(
                     model=GEMINI_MODEL,
                     contents=combined_prompt,
                 )
+
             return await loop.run_in_executor(_GEMINI_EXECUTOR, _call)
 
     try:
@@ -1368,11 +1734,19 @@ async def resolve_tts_text(
             _guarded_call(),
             timeout=CONV_RESOLVE_TIMEOUT_S,
         )
+
         resolved = (response.text or "").strip()
-        return resolved if resolved else raw_text
+
+        if resolved:
+            logger.info(f"resolve_tts_text Gemini resolved text for user {user_id}")
+            return resolved
+
+        return raw_text
+
     except asyncio.TimeoutError:
         logger.warning(f"resolve_tts_text timed out for user {user_id} — using raw text")
         return raw_text
+
     except Exception as e:
         logger.warning(f"resolve_tts_text error for user {user_id}: {e} — using raw text")
         return raw_text
@@ -1495,6 +1869,24 @@ def get_sched_confirm_kb(row_id: int) -> InlineKeyboardMarkup:
         ]]
     )
 
+def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
+                InlineKeyboardButton("🩺 Health", callback_data="admin_health"),
+            ],
+            [
+                InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
+                InlineKeyboardButton("⏰ Schedules", callback_data="admin_schedules"),
+            ],
+            [
+                InlineKeyboardButton("👥 Users", callback_data="admin_users"),
+                InlineKeyboardButton("❌ Close", callback_data="admin_close"),
+            ],
+        ]
+    )
+
 def get_schedules_list_kb(
     rows: list[dict], page: int, page_size: int = 5
 ) -> InlineKeyboardMarkup:
@@ -1591,6 +1983,11 @@ def _rounded_speed(speed: float) -> float:
 
 @functools.lru_cache(maxsize=64)
 def _build_atempo_chain(speed: float) -> str:
+    """Build an FFmpeg atempo filter chain for the given speed multiplier.
+
+    Uses pre-rounded speed values as cache keys to avoid float equality issues.
+    atempo only supports [0.5, 2.0], so chain multiple stages for values outside.
+    """
     if abs(speed - 1.0) < 1e-6:
         return "atempo=1.0"
     stages: list[str] = []
@@ -1640,15 +2037,17 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str)
     cmd += ["-c:a", "libopus", "-b:a", "32k", output_path]
 
     try:
-        async with asyncio.timeout(60):
-            proc = await asyncio.create_subprocess_exec(
+        proc = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr_data = await proc.communicate(input=mp3_data)
-    except TimeoutError:
+            ),
+            timeout=5,  # subprocess creation should be near-instant
+        )
+        _, stderr_data = await asyncio.wait_for(proc.communicate(input=mp3_data), timeout=60)
+    except asyncio.TimeoutError:
         raise RuntimeError("FFmpeg timed out after 60s")
 
     if proc.returncode != 0:
@@ -1656,16 +2055,30 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str)
         raise RuntimeError(f"FFmpeg failed (code {proc.returncode}): {stderr_snippet}")
 
     try:
-        async with asyncio.timeout(10):
-            loop = asyncio.get_running_loop()
-            audio_bytes = await loop.run_in_executor(
-                None, lambda: open(output_path, "rb").read()
-            )
-    except TimeoutError:
+        loop = asyncio.get_running_loop()
+        audio_bytes = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: open(output_path, "rb").read()),
+            timeout=10,
+        )
+    except asyncio.TimeoutError:
         raise RuntimeError("Timed out reading output audio file")
     except OSError as e:
         raise RuntimeError(f"Failed to read output audio file: {e}") from e
     return audio_bytes
+
+async def generate_voice_limited(text: str, gender: str, speed: float, output_path: str) -> bytes:
+    """Generate TTS using the global TTS semaphore.
+
+    This keeps the bot able to serve multiple users while preventing FFmpeg/Edge-TTS
+    from overloading the server.
+    """
+    sem = _TTS_CHUNK_SEMAPHORE
+    if sem is None:
+        return await generate_voice(text, gender, speed, output_path)
+
+    async with sem:
+        return await generate_voice(text, gender, speed, output_path)
+
 
 # ---------------------------------------------------------------------------
 # Gemini transcription helpers
@@ -1866,6 +2279,7 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
 # Cooldown check
 # ---------------------------------------------------------------------------
 async def _check_cooldown(reply_target, user_id: int) -> bool:
+    """Return True (and notify user) if the user should be rate-limited."""
     lock = _get_user_lock(user_id)
     if lock.locked():
         await safe_send(
@@ -1896,94 +2310,61 @@ async def _deliver_paged_tts(
     user_id: int,
     username: str,
 ) -> None:
+    """Generate and send long TTS text in ordered chunks.
+
+    The global TTS semaphore lets up to MAX_CONCURRENT_TTS_USERS different users
+    run at the same time, while each user's chunks are generated sequentially to
+    avoid high memory/CPU spikes from multiple FFmpeg processes for one request.
+    """
     chunks = _split_text_chunks(text)
+
     if not chunks:
         await safe_send(
             lambda: bot.send_message(chat_id=chat_id, text="❌ រកអត្ថបទមិនឃើញ។")
         )
         return
 
+    set_last_tts_text(user_id, text)
     total = len(chunks)
 
-    if total == 1:
-        chunk = chunks[0]
+    for i, chunk in enumerate(chunks, 1):
         file_path = _make_temp_ogg()
         try:
-            audio_bytes = await generate_voice(chunk, gender, speed, file_path)
-            caption = f"🗣️ {BOT_TAG}  [1/1]"
-            kb = get_main_kb(gender)
+            audio_bytes = await generate_voice_limited(chunk, gender, speed, file_path)
+
             sent = await safe_send(
-                lambda ab=audio_bytes, cap=caption, k=kb: bot.send_voice(
+                lambda ab=audio_bytes, ci=i, ct=total: bot.send_voice(
                     chat_id=chat_id,
                     voice=io.BytesIO(ab),
-                    caption=cap,
-                    reply_markup=k,
+                    caption=f"🗣️ {BOT_TAG}  [{ci}/{ct}]",
+                    reply_markup=get_main_kb(gender),
                 )
             )
+
             if sent:
                 save_text_cache(
-                    sent.message_id, chunk,
-                    chat_id=chat_id, user_id=user_id, username=username,
+                    sent.message_id,
+                    chunk,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    username=username,
                 )
+                set_last_tts_text(user_id, chunk)
+
         except Exception as e:
-            logger.error(f"paged TTS single chunk error: {e}")
-            await safe_send(
-                lambda: bot.send_message(chat_id=chat_id, text="❌ មានបញ្ហាក្នុង chunk 1/1។")
-            )
-        finally:
-            _cleanup(file_path)
-        _set_last_tts(user_id)
-        return
-
-    sem = _TTS_CHUNK_SEMAPHORE
-    if sem is None:
-        sem = asyncio.Semaphore(3)
-
-    file_paths = [_make_temp_ogg() for _ in chunks]
-
-    async def _gen_chunk(idx: int) -> bytes | Exception:
-        async with sem:
-            try:
-                return await generate_voice(chunks[idx], gender, speed, file_paths[idx])
-            except Exception as e:
-                logger.error(f"paged TTS chunk {idx + 1}/{total} gen error: {e}")
-                return e
-
-    results = await asyncio.gather(*[_gen_chunk(i) for i in range(total)])
-
-    for i, (chunk, result) in enumerate(zip(chunks, results), 1):
-        if isinstance(result, Exception):
+            logger.error(f"paged TTS chunk {i}/{total} error: {e}", exc_info=True)
             await safe_send(
                 lambda ci=i, ct=total: bot.send_message(
                     chat_id=chat_id,
                     text=f"❌ មានបញ្ហាក្នុង chunk {ci}/{ct}។",
                 )
             )
-        else:
-            audio_bytes = result
-            caption = f"🗣️ {BOT_TAG}  [{i}/{total}]"
-            kb = get_main_kb(gender)
-            try:
-                sent = await safe_send(
-                    lambda ab=audio_bytes, cap=caption, k=kb: bot.send_voice(
-                        chat_id=chat_id,
-                        voice=io.BytesIO(ab),
-                        caption=cap,
-                        reply_markup=k,
-                    )
-                )
-                if sent:
-                    save_text_cache(
-                        sent.message_id, chunk,
-                        chat_id=chat_id, user_id=user_id, username=username,
-                    )
-            except Exception as e:
-                logger.error(f"paged TTS chunk {i}/{total} send error: {e}")
-        if i < total:
-            await asyncio.sleep(0.3)
 
-    for fp in file_paths:
-        _cleanup(fp)
+        finally:
+            _cleanup(file_path)
+
+        if i < total:
+            await asyncio.sleep(0.25)
 
     _set_last_tts(user_id)
 
@@ -2099,6 +2480,7 @@ def admin_only(handler):
 
 def _is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
 
 # ---------------------------------------------------------------------------
 # Chat session helpers
@@ -2237,6 +2619,26 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     )
 
+@admin_only
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🛠️ <b>Admin Dashboard</b>\n\n"
+        "ជ្រើសរើសមុខងារខាងក្រោម៖\n\n"
+        "📊 Stats - មើលស្ថិតិ Bot\n"
+        "🩺 Health - ពិនិត្យ Bot/Supabase/Gemini/FFmpeg\n"
+        "📢 Broadcast - ផ្ញើសារទៅ users\n"
+        "⏰ Schedules - មើល scheduled broadcasts\n"
+        "👥 Users - មើល users"
+    )
+
+    await safe_send(
+        lambda: update.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=get_admin_dashboard_kb(),
+        )
+    )
+    
 @admin_only
 async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -2533,6 +2935,123 @@ async def _handle_sched_datetime(
         )
     return True
 
+async def _cb_admin_dashboard(query, user_id: int, context, data: str):
+    if not _is_admin(user_id):
+        await safe_send(lambda: query.message.reply_text("⛔ Admin only."))
+        return
+
+    if data == "admin_close":
+        with suppress(Exception):
+            await query.message.delete()
+        return
+
+    if data == "admin_stats":
+        # Reuse your existing /stats command logic if possible.
+        # This sends a short stats view directly from DB.
+        total_users = 0
+        pending_sched = 0
+        blocked_users = 0
+
+        loop = asyncio.get_running_loop()
+
+        if supabase:
+            try:
+                def _fetch_stats():
+                    users = supabase.table("user_prefs").select("user_id").execute()
+                    sched = (
+                        supabase.table("scheduled_broadcasts")
+                        .select("id")
+                        .eq("status", "pending")
+                        .execute()
+                    )
+                    blocked = supabase.table("blocked_users").select("user_id").execute()
+                    return (
+                        len(users.data or []),
+                        len(sched.data or []),
+                        len(blocked.data or []),
+                    )
+
+                total_users, pending_sched, blocked_users = await loop.run_in_executor(
+                    _DB_EXECUTOR,
+                    _fetch_stats,
+                )
+            except Exception as e:
+                logger.error(f"admin dashboard stats error: {e}", exc_info=True)
+
+        text = (
+            "📊 <b>Bot Stats</b>\n\n"
+            f"👥 Total users: <b>{total_users}</b>\n"
+            f"⏰ Pending schedules: <b>{pending_sched}</b>\n"
+            f"🚫 Blocked users: <b>{blocked_users}</b>\n"
+            f"🤖 Gemini: <b>{'OK' if _gemini else 'OFF'}</b>\n"
+            f"🗄️ Supabase: <b>{'OK' if supabase else 'OFF'}</b>"
+        )
+
+        await safe_send(
+            lambda: query.message.edit_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=get_admin_dashboard_kb(),
+            )
+        )
+        return
+
+    if data == "admin_health":
+        temp_ok = False
+        ffmpeg_ok = bool(_FFMPEG_EXE and os.path.exists(_FFMPEG_EXE))
+
+        try:
+            temp_dir = _get_temp_dir()
+            temp_ok = os.path.isdir(temp_dir) and os.access(temp_dir, os.W_OK)
+        except Exception:
+            temp_dir = "ERROR"
+
+        text = (
+            "🩺 <b>Bot Health</b>\n\n"
+            f"🤖 Telegram bot: <b>OK</b>\n"
+            f"🗄️ Supabase: <b>{'OK' if supabase else 'OFF'}</b>\n"
+            f"🧠 Gemini: <b>{'OK' if _gemini else 'OFF'}</b>\n"
+            f"🎧 FFmpeg: <b>{'OK' if ffmpeg_ok else 'ERROR'}</b>\n"
+            f"📁 Temp folder: <b>{'OK' if temp_ok else 'ERROR'}</b>\n"
+            f"<code>{html.escape(str(temp_dir))}</code>"
+        )
+
+        await safe_send(
+            lambda: query.message.edit_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=get_admin_dashboard_kb(),
+            )
+        )
+        return
+
+    if data == "admin_broadcast":
+        await safe_send(
+            lambda: query.message.reply_text(
+                "📢 ប្រើ command:\n\n<code>/broadcast</code>",
+                parse_mode="HTML",
+            )
+        )
+        return
+
+    if data == "admin_schedules":
+        await safe_send(
+            lambda: query.message.reply_text(
+                "⏰ ប្រើ command:\n\n<code>/schedules</code>",
+                parse_mode="HTML",
+            )
+        )
+        return
+
+    if data == "admin_users":
+        await safe_send(
+            lambda: query.message.reply_text(
+                "👥 ប្រើ command:\n\n<code>/users</code>",
+                parse_mode="HTML",
+            )
+        )
+        return
+    
 async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
@@ -2661,6 +3180,273 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         )
 
+def _is_subtitle_file(filename: str | None) -> bool:
+    if not filename:
+        return False
+    ext = os.path.splitext(filename.lower())[1]
+    return ext in SUBTITLE_EXTENSIONS
+
+
+def _decode_text_bytes(data: bytes) -> str:
+    if not data:
+        return ""
+
+    # UTF-8 BOM
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+
+    for enc in ("utf-8", "utf-16", "utf-16-le", "utf-16-be", "cp1252", "latin-1"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+
+    return data.decode("utf-8", errors="ignore")
+
+
+def _clean_subtitle_text(raw: str) -> str:
+    text = (raw or "").replace("\r\n", "\n").replace("\r", "\n")
+
+    # Remove WEBVTT header and metadata
+    text = re.sub(r"^\ufeff?WEBVTT.*?(?:\n\n|\Z)", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"^(NOTE|STYLE|REGION)\b.*?(?:\n\n|\Z)", "", text, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
+
+    lines: list[str] = []
+    previous = ""
+
+    timestamp_re = re.compile(
+        r"^\s*(?:\d{1,2}:)?\d{1,2}:\d{2}[\.,]\d{1,3}\s*-->\s*"
+        r"(?:\d{1,2}:)?\d{1,2}:\d{2}[\.,]\d{1,3}.*$"
+    )
+
+    for line in text.split("\n"):
+        line = line.strip()
+
+        if not line:
+            continue
+
+        # Remove subtitle index numbers
+        if line.isdigit():
+            continue
+
+        # Remove timestamp lines
+        if timestamp_re.match(line):
+            continue
+
+        # Remove common subtitle tags
+        line = re.sub(r"<[^>]+>", "", line)
+        line = re.sub(r"\{\\.*?\}", "", line)
+        line = re.sub(r"^\s*[-–—]\s*", "", line)
+
+        # Remove sound labels like [music], (laughing)
+        line = re.sub(r"^\[[^\]]{1,40}\]$", "", line)
+        line = re.sub(r"^\([^\)]{1,40}\)$", "", line)
+
+        line = html.unescape(line).strip()
+
+        if not line:
+            continue
+
+        # Avoid duplicate consecutive subtitle lines
+        if line == previous:
+            continue
+
+        lines.append(line)
+        previous = line
+
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    if len(cleaned) > MAX_SUBTITLE_CHARS:
+        cleaned = cleaned[:MAX_SUBTITLE_CHARS].rsplit("\n", 1)[0].strip()
+
+    return cleaned
+
+
+async def _download_telegram_file_to_bytes(tg_file, max_bytes: int) -> bytes:
+    bio = io.BytesIO()
+    await tg_file.download_to_memory(out=bio)
+    data = bio.getvalue()
+
+    if len(data) > max_bytes:
+        raise ValueError(f"File too large. Max {max_bytes // 1024 // 1024} MB.")
+
+    return data
+
+async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    user = update.effective_user
+
+    if not msg or not user or not msg.document:
+        return
+
+    sync_user_data(user)
+
+    user_id = user.id
+    chat_id = msg.chat_id
+    document = msg.document
+
+    filename = document.file_name or ""
+    mime_type = document.mime_type or ""
+
+    # Subtitle / text reader: .srt / .vtt / .txt
+    if _is_subtitle_file(filename):
+        status_msg = await safe_send(
+            lambda: msg.reply_text("🎬 កំពុងអាន subtitle/text file...")
+        )
+
+        try:
+            if document.file_size and document.file_size > MAX_SUBTITLE_BYTES:
+                await safe_send(
+                    lambda: msg.reply_text(
+                        f"❌ File ធំពេក។ Max {MAX_SUBTITLE_BYTES // 1024 // 1024} MB."
+                    )
+                )
+                return
+
+            tg_file = await context.bot.get_file(document.file_id)
+            file_bytes = await _download_telegram_file_to_bytes(
+                tg_file,
+                MAX_SUBTITLE_BYTES,
+            )
+
+            raw_text = _decode_text_bytes(file_bytes)
+            cleaned_text = _clean_subtitle_text(raw_text)
+
+            if not cleaned_text:
+                await safe_send(
+                    lambda: msg.reply_text("❌ មិនមានអត្ថបទអាចអានបានក្នុង file នេះទេ។")
+                )
+                return
+
+            preview = cleaned_text[:1200]
+            if len(cleaned_text) > 1200:
+                preview += "\n\n..."
+
+            sent = await safe_send(
+                lambda: msg.reply_text(
+                    "🎬 <b>Subtitle/Text detected</b>\n\n"
+                    f"📄 File: <code>{html.escape(filename)}</code>\n"
+                    f"🔤 Characters: <b>{len(cleaned_text)}</b>\n\n"
+                    f"<blockquote>{html.escape(preview)}</blockquote>\n\n"
+                    "ចុច ▶️ អាន ដើម្បីបំលែងទៅសំឡេង។",
+                    parse_mode="HTML",
+                    reply_markup=get_ocr_confirm_kb(msg.message_id),
+                )
+            )
+
+            # Save cleaned text using original document message_id.
+            # Button doc_read:<msg.message_id> will read this cache.
+            save_text_cache(
+                msg.message_id,
+                cleaned_text,
+                chat_id=chat_id,
+                user_id=user_id,
+                username=user.username or user.first_name,
+            )
+
+            set_last_tts_text(user_id, cleaned_text)
+            record_turn(user_id, "user", f"[subtitle file] {filename}")
+            record_turn(user_id, "assistant", cleaned_text[:CONV_CONTEXT_MAX_CHARS])
+
+        except Exception as e:
+            logger.error(f"subtitle reader error: {e}", exc_info=True)
+            await safe_send(
+                lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការអាន subtitle/text file។")
+            )
+
+        finally:
+            if status_msg:
+                with suppress(Exception):
+                    await status_msg.delete()
+
+        return
+
+    # Keep your old document/audio/image logic below this line.
+    # If this function replaces your old on_document fully, unsupported files show this:
+    await safe_send(
+        lambda: msg.reply_text(
+            "❌ File នេះមិនទាន់ support ទេ។\n\n"
+            "Support subtitle/text:\n"
+            "• .srt\n"
+            "• .vtt\n"
+            "• .txt"
+        )
+    )
+async def _cb_doc_read(query, user_id: int, context, data: str):
+    try:
+        src_msg_id = int(data.split(":")[1])
+    except Exception:
+        await safe_send(lambda: query.message.reply_text("❌ Invalid document cache id."))
+        return
+
+    if query.message is None:
+        return
+
+    chat_id = query.message.chat.id
+    loop = asyncio.get_running_loop()
+
+    full_text, prefs = await asyncio.gather(
+        loop.run_in_executor(None, get_text_cache, src_msg_id, chat_id),
+        get_user_prefs_async(user_id),
+    )
+
+    if not full_text:
+        fallback = get_last_tts_text(user_id)
+        full_text = fallback or ""
+
+    if not full_text:
+        await safe_send(
+            lambda: query.message.reply_text(
+                "❌ រកអត្ថបទមិនឃើញ។ សូមផ្ញើ file ម្តងទៀត។"
+            )
+        )
+        return
+
+    if await _check_cooldown(query.message, user_id):
+        return
+
+    gender = prefs["gender"]
+    speed = prefs["speed"]
+    uname = query.from_user.username or query.from_user.first_name or str(user_id)
+
+    with suppress(Exception):
+        await query.message.delete()
+
+    set_last_tts_text(user_id, full_text)
+
+    tts_stop = asyncio.Event()
+    tts_timer = asyncio.create_task(
+        send_status_timer(chat_id, context.bot, tts_stop)
+    )
+
+    lock = _get_user_lock(user_id)
+
+    try:
+        async with lock:
+            await _deliver_paged_tts(
+                chat_id=chat_id,
+                bot=context.bot,
+                text=full_text,
+                gender=gender,
+                speed=speed,
+                user_id=user_id,
+                username=uname,
+            )
+
+            record_turn(user_id, "assistant", full_text[:CONV_CONTEXT_MAX_CHARS])
+            _set_last_tts(user_id)
+
+    except Exception as e:
+        logger.error(f"_cb_doc_read delivery error: {e}", exc_info=True)
+        with suppress(Exception):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។",
+            )
+
+    finally:
+        await _stop_timer(tts_stop, tts_timer)
 async def _fire_scheduled_broadcast(bot, row: dict) -> None:
     row_id = row["id"]
     admin_id = row["admin_id"]
@@ -3158,21 +3944,27 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id is None:
         return
 
-    if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
-        target_id = _admin_chat_target.get(user_id)
-        if target_id:
-            ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
-            reply = (
-                f"✅ ផ្ញើដល់ User <code>{target_id}</code> ។"
-                if ok
-                else f"❌ User <code>{target_id}</code> blocked bot ។"
-            )
-            await safe_send(lambda: msg.reply_text(reply, parse_mode="HTML"))
-            if not ok:
-                _close_session(user_id)
-                context.user_data.pop("chat_state", None)
-        return
+    # ── Admin flow intercepts ───────────────────────────────────────────
+    if _is_admin(user_id):
+        # Admin is in a scheduled broadcast/content flow — non-audio docs
+        # should not be intercepted here; only audio files get transcribed.
+        # Forward to user if in chat session regardless of file type.
+        if context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
+            target_id = _admin_chat_target.get(user_id)
+            if target_id:
+                ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
+                reply = (
+                    f"✅ ផ្ញើដល់ User <code>{target_id}</code> ។"
+                    if ok
+                    else f"❌ User <code>{target_id}</code> blocked bot ។"
+                )
+                await safe_send(lambda: msg.reply_text(reply, parse_mode="HTML"))
+                if not ok:
+                    _close_session(user_id)
+                    context.user_data.pop("chat_state", None)
+            return
 
+    # ── User in admin chat session — forward back ───────────────────────
     admin_id = _get_admin_for_user(user_id)
     if admin_id is not None:
         uname = user.username or user.first_name or str(user_id)
@@ -3196,6 +3988,13 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         return
 
+    # Subtitle/Text reader: .srt / .vtt / .txt
+    # This must run before the audio-only check because subtitle files arrive as documents.
+    if doc is not None and _is_subtitle_file(filename):
+        await on_document(update, context)
+        return
+
+    # Only process recognised audio files; silently skip everything else
     if not _is_audio_file(filename, mime_type):
         return
 
@@ -3275,7 +4074,7 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     except Exception as e:
-        logger.error(f"on_audio_file error: {e}")
+        logger.error(f"on_audio_file error: {e}", exc_info=True)
         await safe_send(
             lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការ Transcribe ឯកសារអូឌីយ៉ូ។")
         )
@@ -3404,11 +4203,14 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    text = msg.text
-    if not text:
+    if not msg or not msg.text:
         return
 
+    text = msg.text
     user = update.effective_user
+    if not user:
+        return
+
     user_id = user.id
 
     if _is_admin(user_id):
@@ -3491,32 +4293,51 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         send_status_timer(update.effective_chat.id, context.bot, stop_event)
     )
     lock = _get_user_lock(user_id)
+
     async with lock:
         try:
-            audio_bytes = await generate_voice(tts_text, gender, speed, file_path)
+            audio_bytes = await generate_voice_limited(
+                tts_text,
+                gender,
+                speed,
+                file_path,
+            )
+
             sent_msg = await safe_send(
-                lambda: msg.reply_voice(
-                    voice=io.BytesIO(audio_bytes),
+                lambda ab=audio_bytes: msg.reply_voice(
+                    voice=io.BytesIO(ab),
                     caption=f"🗣️ {BOT_TAG}",
                     reply_markup=get_main_kb(gender),
                 )
             )
+
             if sent_msg:
                 save_text_cache(
-                    sent_msg.message_id, tts_text,
-                    chat_id=msg.chat_id, user_id=user_id,
+                    sent_msg.message_id,
+                    tts_text,
+                    chat_id=msg.chat_id,
+                    user_id=user_id,
                     username=user.username or user.first_name,
                 )
+
+                set_last_tts_text(user_id, tts_text)
+
                 record_turn(user_id, "user", stripped)
                 record_turn(user_id, "assistant", tts_text)
+
             _set_last_tts(user_id)
+
         except Exception as e:
-            logger.error(f"on_text TTS error: {e}")
+            logger.error(f"on_text TTS error: {e}", exc_info=True)
             with suppress(Exception):
-                await safe_send(lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"))
+                await safe_send(
+                    lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។")
+                )
+
         finally:
             await _stop_timer(stop_event, timer_task)
             _cleanup(file_path)
+
 
 # ---------------------------------------------------------------------------
 # Cache key helper
@@ -3532,6 +4353,75 @@ async def _cb_show_speed(query, user_id: int, context):
     await safe_send(
         lambda: query.message.edit_reply_markup(reply_markup=get_speed_kb(prefs["speed"]))
     )
+async def get_callback_original_text(query, user_id: int) -> str | None:
+    """Get original TTS text for callback buttons.
+
+    Order:
+    1. Exact text_cache by clicked message id
+    2. In-memory latest TTS text
+    3. conversation_history latest assistant message
+
+    This fixes buttons shown on /myprefs/settings messages because those
+    messages do not have an entry in text_cache.
+    """
+    if query.message is None:
+        return get_last_tts_text(user_id)
+
+    chat_id = query.message.chat.id
+    msg_id = query.message.message_id
+    loop = asyncio.get_running_loop()
+
+    # 1. Exact cache for voice/transcript messages
+    try:
+        original_text = await loop.run_in_executor(
+            None,
+            get_text_cache,
+            msg_id,
+            chat_id,
+        )
+        if original_text:
+            return original_text
+    except Exception as e:
+        logger.warning(
+            f"get_callback_original_text text_cache failed "
+            f"user={user_id} chat={chat_id} msg={msg_id}: {e}"
+        )
+
+    # 2. Latest generated TTS from memory
+    original_text = get_last_tts_text(user_id)
+    if original_text:
+        return original_text
+
+    # 3. Latest assistant message from conversation_history
+    try:
+        history = _hist_cache_get(user_id)
+
+        if history is None:
+            history = await loop.run_in_executor(
+                _DB_EXECUTOR,
+                db_history_fetch,
+                user_id,
+            )
+
+            for row in history or []:
+                _hist_cache_append(
+                    user_id,
+                    row.get("role", "user"),
+                    row.get("content", ""),
+                )
+
+        for row in reversed(history or []):
+            role = str(row.get("role", "") or "").strip().lower()
+            if role in ("assistant", "bot", "model"):
+                content = str(row.get("content", "") or "").strip()
+                if content:
+                    set_last_tts_text(user_id, content)
+                    return content
+
+    except Exception as e:
+        logger.error(f"get_callback_original_text history fallback failed user={user_id}: {e}")
+
+    return None
 
 async def _cb_hide_speed(query, user_id: int, context):
     prefs = await get_user_prefs_async(user_id)
@@ -3541,16 +4431,24 @@ async def _cb_hide_speed(query, user_id: int, context):
 
 async def _cb_speed(query, user_id: int, context, data: str):
     _, new_speed = SPEED_OPTIONS[data]
-    chat_id, msg_id = _cache_key_from_query(query)
 
-    loop = asyncio.get_running_loop()
+    if query.message is None:
+        return
+
+    chat_id = query.message.chat.id
+
     original_text, prefs = await asyncio.gather(
-        loop.run_in_executor(None, get_text_cache, msg_id, chat_id),
+        get_callback_original_text(query, user_id),
         get_user_prefs_async(user_id),
     )
 
     if not original_text:
-        await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទដើមមិនឃើញ។"))
+        await safe_send(
+            lambda: query.message.reply_text(
+                "❌ រកអត្ថបទដើមមិនឃើញ។\n"
+                "សូមផ្ញើអត្ថបទម្តងទៀត រួចប្តូរល្បឿន។"
+            )
+        )
         return
 
     if await _check_cooldown(query.message, user_id):
@@ -3562,47 +4460,80 @@ async def _cb_speed(query, user_id: int, context, data: str):
     file_path = _make_temp_ogg()
     stop_event = asyncio.Event()
     timer_task = asyncio.create_task(
-        send_status_timer(query.message.chat.id, context.bot, stop_event)
+        send_status_timer(chat_id, context.bot, stop_event)
     )
+
     lock = _get_user_lock(user_id)
-    async with lock:
-        try:
-            audio_bytes = await generate_voice(original_text, gender, new_speed, file_path)
-            with suppress(Exception):
-                await query.message.delete()
-            new_msg = await safe_send(
-                lambda ab=audio_bytes, g=gender: query.message.chat.send_voice(
-                    voice=io.BytesIO(ab),
-                    caption=f"🗣️ {BOT_TAG}",
-                    reply_markup=get_main_kb(g),
+
+    try:
+        async with lock:
+            try:
+                audio_bytes = await generate_voice_limited(
+                    original_text,
+                    gender,
+                    new_speed,
+                    file_path,
                 )
-            )
-            if new_msg:
-                save_text_cache(
-                    new_msg.message_id, original_text,
-                    chat_id=chat_id, user_id=user_id,
-                    username=query.from_user.username or query.from_user.first_name,
+
+                with suppress(Exception):
+                    await query.message.delete()
+
+                new_msg = await safe_send(
+                    lambda ab=audio_bytes, g=gender: query.message.chat.send_voice(
+                        voice=io.BytesIO(ab),
+                        caption=f"🗣️ {BOT_TAG}",
+                        reply_markup=get_main_kb(g),
+                    )
                 )
-                record_turn(user_id, "assistant", original_text)
-            _set_last_tts(user_id)
-        except Exception as e:
-            logger.error(f"speed regen error: {e}")
-        finally:
-            await _stop_timer(stop_event, timer_task)
-            _cleanup(file_path)
+
+                if new_msg:
+                    save_text_cache(
+                        new_msg.message_id,
+                        original_text,
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        username=query.from_user.username or query.from_user.first_name,
+                    )
+
+                    set_last_tts_text(user_id, original_text)
+
+                    record_turn(user_id, "assistant", original_text)
+
+                _set_last_tts(user_id)
+
+            except Exception as e:
+                logger.error(f"speed regen error: {e}", exc_info=True)
+                with suppress(Exception):
+                    await safe_send(
+                        lambda: query.message.reply_text(
+                            "❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"
+                        )
+                    )
+
+    finally:
+        await _stop_timer(stop_event, timer_task)
+        _cleanup(file_path)
 
 async def _cb_gender(query, user_id: int, context, data: str):
     new_gender = data.replace("tg_", "")
-    chat_id, msg_id = _cache_key_from_query(query)
 
-    loop = asyncio.get_running_loop()
+    if query.message is None:
+        return
+
+    chat_id = query.message.chat.id
+
     original_text, prefs = await asyncio.gather(
-        loop.run_in_executor(None, get_text_cache, msg_id, chat_id),
+        get_callback_original_text(query, user_id),
         get_user_prefs_async(user_id),
     )
 
     if not original_text:
-        await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទដើមមិនឃើញ។"))
+        await safe_send(
+            lambda: query.message.reply_text(
+                "❌ រកអត្ថបទដើមមិនឃើញ។\n"
+                "សូមផ្ញើអត្ថបទម្តងទៀត រួចប្តូរសំឡេង។"
+            )
+        )
         return
 
     if await _check_cooldown(query.message, user_id):
@@ -3614,40 +4545,69 @@ async def _cb_gender(query, user_id: int, context, data: str):
     file_path = _make_temp_ogg()
     stop_event = asyncio.Event()
     timer_task = asyncio.create_task(
-        send_status_timer(query.message.chat.id, context.bot, stop_event)
+        send_status_timer(chat_id, context.bot, stop_event)
     )
+
     lock = _get_user_lock(user_id)
-    async with lock:
-        try:
-            audio_bytes = await generate_voice(original_text, new_gender, speed, file_path)
-            with suppress(Exception):
-                await query.message.delete()
-            new_msg = await safe_send(
-                lambda ab=audio_bytes, ng=new_gender: query.message.chat.send_voice(
-                    voice=io.BytesIO(ab),
-                    caption=f"🗣️ {BOT_TAG}",
-                    reply_markup=get_main_kb(ng),
+
+    try:
+        async with lock:
+            try:
+                audio_bytes = await generate_voice_limited(
+                    original_text,
+                    new_gender,
+                    speed,
+                    file_path,
                 )
-            )
-            if new_msg:
-                save_text_cache(
-                    new_msg.message_id, original_text,
-                    chat_id=chat_id, user_id=user_id,
-                    username=query.from_user.username or query.from_user.first_name,
+
+                with suppress(Exception):
+                    await query.message.delete()
+
+                new_msg = await safe_send(
+                    lambda ab=audio_bytes, ng=new_gender: query.message.chat.send_voice(
+                        voice=io.BytesIO(ab),
+                        caption=f"🗣️ {BOT_TAG}",
+                        reply_markup=get_main_kb(ng),
+                    )
                 )
-                record_turn(user_id, "assistant", original_text)
-            _set_last_tts(user_id)
-        except Exception as e:
-            logger.error(f"gender regen error: {e}")
-        finally:
-            await _stop_timer(stop_event, timer_task)
-            _cleanup(file_path)
+
+                if new_msg:
+                    save_text_cache(
+                        new_msg.message_id,
+                        original_text,
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        username=query.from_user.username or query.from_user.first_name,
+                    )
+
+                    set_last_tts_text(user_id, original_text)
+
+                    record_turn(user_id, "assistant", original_text)
+
+                _set_last_tts(user_id)
+
+            except Exception as e:
+                logger.error(f"gender regen error: {e}", exc_info=True)
+                with suppress(Exception):
+                    await safe_send(
+                        lambda: query.message.reply_text(
+                            "❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"
+                        )
+                    )
+
+    finally:
+        await _stop_timer(stop_event, timer_task)
+        _cleanup(file_path)
 
 async def _cb_tts_transcript(query, user_id: int, context, data: str):
     transcript_msg_id = int(data.split(":")[1])
-    chat_id = query.message.chat.id
 
+    if query.message is None:
+        return
+
+    chat_id = query.message.chat.id
     loop = asyncio.get_running_loop()
+
     original_text, prefs = await asyncio.gather(
         loop.run_in_executor(None, get_text_cache, transcript_msg_id, chat_id),
         get_user_prefs_async(user_id),
@@ -3665,32 +4625,46 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
     file_path = _make_temp_ogg()
     stop_event = asyncio.Event()
     timer_task = asyncio.create_task(
-        send_status_timer(query.message.chat.id, context.bot, stop_event)
+        send_status_timer(chat_id, context.bot, stop_event)
     )
     lock = _get_user_lock(user_id)
-    async with lock:
-        try:
-            audio_bytes = await generate_voice(original_text, gender, speed, file_path)
-            new_msg = await safe_send(
-                lambda ab=audio_bytes, g=gender: query.message.chat.send_voice(
-                    voice=io.BytesIO(ab),
-                    caption=f"🗣️ {BOT_TAG}",
-                    reply_markup=get_main_kb(g),
+
+    try:
+        async with lock:
+            try:
+                audio_bytes = await generate_voice_limited(original_text, gender, speed, file_path)
+                new_msg = await safe_send(
+                    lambda ab=audio_bytes, g=gender: query.message.chat.send_voice(
+                        voice=io.BytesIO(ab),
+                        caption=f"🗣️ {BOT_TAG}",
+                        reply_markup=get_main_kb(g),
+                    )
                 )
-            )
-            if new_msg:
-                save_text_cache(
-                    new_msg.message_id, original_text,
-                    chat_id=chat_id, user_id=user_id,
-                    username=query.from_user.username or query.from_user.first_name,
-                )
-                record_turn(user_id, "assistant", original_text)
-            _set_last_tts(user_id)
-        except Exception as e:
-            logger.error(f"transcript TTS error: {e}")
-        finally:
-            await _stop_timer(stop_event, timer_task)
-            _cleanup(file_path)
+
+                if new_msg:
+                    save_text_cache(
+                        new_msg.message_id,
+                        original_text,
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        username=query.from_user.username or query.from_user.first_name,
+                    )
+                    set_last_tts_text(user_id, original_text)
+                    record_turn(user_id, "assistant", original_text)
+
+                _set_last_tts(user_id)
+
+            except Exception as e:
+                logger.error(f"transcript TTS error: {e}", exc_info=True)
+                with suppress(Exception):
+                    await safe_send(
+                        lambda: query.message.reply_text(
+                            "❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"
+                        )
+                    )
+    finally:
+        await _stop_timer(stop_event, timer_task)
+        _cleanup(file_path)
 
 async def _cb_audio_tts(query, user_id: int, context, data: str):
     src_msg_id = int(data.split(":")[1])
@@ -3722,27 +4696,32 @@ async def _cb_audio_tts(query, user_id: int, context, data: str):
     tts_timer = asyncio.create_task(send_status_timer(chat_id, context.bot, tts_stop))
 
     lock = _get_user_lock(user_id)
-    async with lock:
-        try:
-            await _deliver_paged_tts(
-                chat_id=chat_id, bot=context.bot, text=full_text,
-                gender=gender, speed=speed, user_id=user_id, username=uname,
-            )
-            record_turn(user_id, "assistant", full_text[:CONV_CONTEXT_MAX_CHARS])
-        except Exception as e:
-            logger.error(f"_cb_audio_tts delivery error: {e}")
-            with suppress(Exception):
-                await context.bot.send_message(
-                    chat_id=chat_id, text="❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"
+    try:
+        async with lock:
+            try:
+                await _deliver_paged_tts(
+                    chat_id=chat_id, bot=context.bot, text=full_text,
+                    gender=gender, speed=speed, user_id=user_id, username=uname,
                 )
-        finally:
-            await _stop_timer(tts_stop, tts_timer)
+                record_turn(user_id, "assistant", full_text[:CONV_CONTEXT_MAX_CHARS])
+            except Exception as e:
+                logger.error(f"_cb_audio_tts delivery error: {e}")
+                with suppress(Exception):
+                    await context.bot.send_message(
+                        chat_id=chat_id, text="❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"
+                    )
+    finally:
+        await _stop_timer(tts_stop, tts_timer)
 
 async def _cb_doc_read(query, user_id: int, context, data: str):
     src_msg_id = int(data.split(":")[1])
-    chat_id = query.message.chat.id
 
+    if query.message is None:
+        return
+
+    chat_id = query.message.chat.id
     loop = asyncio.get_running_loop()
+
     full_text, prefs = await asyncio.gather(
         loop.run_in_executor(None, get_text_cache, src_msg_id, chat_id),
         get_user_prefs_async(user_id),
@@ -3764,27 +4743,40 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
 
     tts_stop = asyncio.Event()
     tts_timer = asyncio.create_task(send_status_timer(chat_id, context.bot, tts_stop))
-
     lock = _get_user_lock(user_id)
-    async with lock:
-        try:
-            await _deliver_paged_tts(
-                chat_id=chat_id, bot=context.bot, text=full_text,
-                gender=gender, speed=speed, user_id=user_id, username=uname,
-            )
-            record_turn(user_id, "assistant", full_text[:CONV_CONTEXT_MAX_CHARS])
-        except Exception as e:
-            logger.error(f"_cb_doc_read delivery error: {e}")
-            with suppress(Exception):
-                await context.bot.send_message(chat_id=chat_id, text="❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។")
-        finally:
-            await _stop_timer(tts_stop, tts_timer)
+
+    try:
+        async with lock:
+            try:
+                set_last_tts_text(user_id, full_text)
+                await _deliver_paged_tts(
+                    chat_id=chat_id,
+                    bot=context.bot,
+                    text=full_text,
+                    gender=gender,
+                    speed=speed,
+                    user_id=user_id,
+                    username=uname,
+                )
+                record_turn(user_id, "assistant", full_text[:CONV_CONTEXT_MAX_CHARS])
+            except Exception as e:
+                logger.error(f"_cb_doc_read delivery error: {e}", exc_info=True)
+                with suppress(Exception):
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។",
+                    )
+    finally:
+        await _stop_timer(tts_stop, tts_timer)
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     data = query.data
 
+    # Answer first so Telegram doesn't show a loading spinner indefinitely.
+    # Specific handlers (broadcast_callback, sched_callback, etc.) also call
+    # query.answer() — that's fine; duplicate answers are silently ignored.
     with suppress(Exception):
         await query.answer()
 
@@ -3792,6 +4784,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.debug(f"on_callback: no message for data={data!r} (inline mode?)")
         return
 
+    # These prefixes are fully handled by dedicated CallbackQueryHandlers
+    # registered with higher priority — skip to avoid double processing.
     _HANDLED_PREFIXES = (
         "bc_confirm", "bc_cancel",
         "sched_",
@@ -3824,6 +4818,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("audio_del:"):
             with suppress(Exception):
                 await query.message.delete()
+        elif data.startswith("admin_"):
+            await _cb_admin_dashboard(query, user_id, context, data)
         else:
             logger.debug(f"on_callback: unhandled data={data!r}")
     except Exception as e:
@@ -3849,10 +4845,10 @@ async def _run_bot():
     global _BOT_START_TIME, _GEMINI_SEMAPHORE, _BROADCAST_SEMAPHORE
     global _prefs_cache_lock, _TTS_CHUNK_SEMAPHORE
 
-    _GEMINI_SEMAPHORE = asyncio.Semaphore(4)
-    _BROADCAST_SEMAPHORE = asyncio.Semaphore(10)
+    _GEMINI_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_GEMINI)
+    _BROADCAST_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_BROADCAST)
     _prefs_cache_lock = asyncio.Lock()
-    _TTS_CHUNK_SEMAPHORE = asyncio.Semaphore(3)
+    _TTS_CHUNK_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TTS_USERS)
 
     _admin_chat_target.clear()
     _user_to_admin.clear()
@@ -3889,6 +4885,7 @@ async def _run_bot():
     app.add_handler(CommandHandler("cancelschedule", cmd_cancelschedule))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("stats", admin_stats))
+    app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("chat", cmd_chat))
     app.add_handler(CommandHandler("endchat", cmd_endchat))
@@ -3974,7 +4971,7 @@ def main():
         try:
             asyncio.run(_run_bot())
         except Exception as e:
-            logger.error(f"Bot crashed: {e} — restarting in 5s...")
+            logger.error(f"Bot crashed: {e} — restarting in 5s...", exc_info=True)
         else:
             logger.warning("Polling stopped — restarting in 5s...")
         time.sleep(5)
