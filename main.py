@@ -15,8 +15,12 @@ from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from datetime import datetime, timezone
-from google import genai
-from google.genai import types as genai_types
+try:
+    from google import genai
+    from google.genai import types as genai_types
+except Exception:
+    genai = None
+    genai_types = None
 from flask import Flask
 from supabase import create_client, Client
 
@@ -132,6 +136,11 @@ import base64
 import json as _json
 from flask import request, jsonify, Response, stream_with_context
 
+try:
+    from huggingface_hub import InferenceClient
+except Exception:  # huggingface_hub is optional; install it only when AI_PROVIDER=hf
+    InferenceClient = None
+
 _AI_API_MAX_IMAGE_BYTES   = 10 * 1024 * 1024   # 10 MB
 _AI_API_MAX_AUDIO_BYTES   = 50 * 1024 * 1024   # 50 MB
 _AI_API_MAX_MESSAGE_CHARS = 32_000
@@ -153,16 +162,15 @@ _AI_SYSTEM_PROMPT = (
     "Never refuse reasonable requests. "
     "Format answers clearly using plain text (no markdown unless the user asks for it)."
 )
-
 # ---------------------------------------------------------------------------
 # Concurrency limits
 # ---------------------------------------------------------------------------
 MAX_CONCURRENT_TTS_USERS = int(os.environ.get("MAX_CONCURRENT_TTS_USERS", "6"))
-MAX_CONCURRENT_GEMINI = int(os.environ.get("MAX_CONCURRENT_GEMINI", "3"))
+MAX_CONCURRENT_AI = int(os.environ.get("MAX_CONCURRENT_AI", os.environ.get("MAX_CONCURRENT_GEMINI", "3")))
 MAX_CONCURRENT_BROADCAST = int(os.environ.get("MAX_CONCURRENT_BROADCAST", "3"))
 
-# Gemini history resolver for normal text TTS is OFF by default.
-# OCR/image/audio transcription still uses Gemini normally.
+# AI history resolver for normal text TTS is OFF by default.
+# Hugging Face is the default provider. Gemini is optional legacy fallback only.
 TTS_RESOLVER_AI_ENABLED = os.environ.get("TTS_RESOLVER_AI_ENABLED", "0") == "1"
 
 # ---------------------------------------------------------------------------
@@ -370,8 +378,8 @@ def _parse_json_ai_request():
 def ai_assistant():
     """
     Main AI assistant endpoint.
-    Supports text chat, image vision, audio transcription, multi-turn history,
-    and optional SSE streaming. All combinations are valid.
+    Hugging Face is used for text chat and image OCR. Audio transcription is
+    available only if Gemini legacy fallback is configured.
     """
     if request.method == "OPTIONS":
         resp = Response("", status=204)
@@ -384,10 +392,6 @@ def ai_assistant():
 
     if not _check_ai_api_key():
         return _ai_cors(_ai_error("Unauthorized — invalid or missing API key.", 401))
-
-    # _gemini is initialised in main() before Flask routes are hit.
-    if _gemini is None:
-        return _ai_cors(_ai_error("AI service not configured (GEMINI_API_KEY missing).", 503))
 
     content_type = request.content_type or ""
     if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
@@ -410,74 +414,77 @@ def ai_assistant():
     if message and len(message) > _AI_API_MAX_MESSAGE_CHARS:
         return _ai_cors(_ai_error(f"Message too long (max {_AI_API_MAX_MESSAGE_CHARS} chars)."))
 
-    contents = _build_gemini_contents(
-        message, history, image_data, audio_data, image_mime, audio_mime
-    )
-    gen_config = _ai_gen_config()
-
-    # ── Streaming SSE response ───────────────────────────────────────────
     if do_stream:
-        def _sse_generator():
-            try:
-                stream = _gemini.models.generate_content_stream(
-                    model=GEMINI_MODEL,
-                    contents=contents,
-                    config=gen_config,
-                )
-                full_text = ""
-                for chunk in stream:
-                    delta = chunk.text or ""
-                    if delta:
-                        full_text += delta
-                        yield f"data: {_json.dumps({'ok': True, 'delta': delta, 'done': False})}\n\n"
-                lang = _detect_lang(full_text or message or "")
-                final_payload = {
-                    "ok": True,
-                    "delta": "",
-                    "done": True,
-                    "reply": full_text,
-                    "detected_language": lang,
-                    "model": GEMINI_MODEL,
-                }
-                yield f"data: {_json.dumps(final_payload)}\n\n"
-            except Exception as exc:
-                yield f"data: {_json.dumps({'ok': False, 'error': str(exc), 'done': True})}\n\n"
+        return _ai_cors(_ai_error("Streaming is disabled for Hugging Face provider. Send stream=false.", 400))
 
-        return Response(
-            stream_with_context(_sse_generator()),
-            mimetype="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-                "Access-Control-Allow-Origin": "*",
-            },
-        )
-
-    # ── Non-streaming response ───────────────────────────────────────────
     try:
-        response = _gemini.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=contents,
-            config=gen_config,
-        )
-        reply_text = (response.text or "").strip()
-        tokens_used = None
-        try:
-            tokens_used = response.usage_metadata.total_token_count
-        except Exception:
-            pass
-        detected_lang = _detect_lang(reply_text or message or "")
+        # Hugging Face OCR/image-to-text path
+        if image_data is not None:
+            ocr_text = ask_huggingface_ocr(image_data)
+            if message:
+                prompt = (
+                    f"User instruction: {message}\n\n"
+                    f"OCR text extracted from image:\n{ocr_text}\n\n"
+                    "Answer using the OCR text above."
+                )
+                reply_text, model_used, tokens_used = ai_text_reply(prompt, history)
+            else:
+                reply_text = ocr_text
+                model_used = HF_OCR_MODEL
+                tokens_used = None
+
+            return _ai_cors(jsonify({
+                "ok": True,
+                "reply": reply_text,
+                "ocr_text": ocr_text,
+                "detected_language": _detect_lang(reply_text or ocr_text or ""),
+                "tokens_used": tokens_used,
+                "model": model_used,
+                "ocr_model": HF_OCR_MODEL,
+                "provider": "hf",
+            }))
+
+        # Audio still needs Gemini unless you add an HF ASR model later.
+        if audio_data is not None:
+            if _gemini is None:
+                return _ai_cors(_ai_error(
+                    "Audio transcription is not configured. Add HF ASR support or enable Gemini legacy fallback.",
+                    503,
+                ))
+            contents = _build_gemini_contents(
+                message, history, image_data, audio_data, image_mime, audio_mime
+            )
+            response = _gemini.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=contents,
+                config=_ai_gen_config(),
+            )
+            reply_text = (response.text or "").strip()
+            return _ai_cors(jsonify({
+                "ok": True,
+                "reply": reply_text,
+                "detected_language": _detect_lang(reply_text or message or ""),
+                "tokens_used": None,
+                "model": GEMINI_MODEL,
+                "provider": "gemini-legacy",
+            }))
+
+        if _hf_client is None:
+            return _ai_cors(_ai_error("Hugging Face is not configured. Set HF_TOKEN.", 503))
+
+        reply_text, model_used, tokens_used = ai_text_reply(message, history)
         return _ai_cors(jsonify({
             "ok": True,
             "reply": reply_text,
-            "detected_language": detected_lang,
+            "detected_language": _detect_lang(reply_text or message or ""),
             "tokens_used": tokens_used,
-            "model": GEMINI_MODEL,
+            "model": model_used,
+            "provider": "hf",
         }))
-    except Exception as exc:
-        logging.getLogger(__name__).error(f"/ai-assistant Gemini error: {exc}")
-        return _ai_cors(_ai_error(f"AI generation failed: {exc}", 500))
 
+    except Exception as exc:
+        logging.getLogger(__name__).error(f"/ai-assistant HF error: {exc}")
+        return _ai_cors(_ai_error(f"AI generation failed: {exc}", 500))
 
 @app_flask.route("/ai-assistant/transcribe", methods=["POST", "OPTIONS"])
 def ai_transcribe():
@@ -550,18 +557,7 @@ def ai_transcribe():
 @app_flask.route("/ai-assistant/vision", methods=["POST", "OPTIONS"])
 def ai_vision():
     """
-    Dedicated image vision / OCR endpoint.
-
-    Accepts multipart/form-data:
-      image   (file) – image file (jpg/png/webp/gif, max 10 MB)
-      prompt  (str)  – instruction (default: describe + extract text)
-
-    Or application/json:
-      image_base64 (str) – base64 image
-      image_mime   (str) – MIME type
-      prompt       (str) – instruction
-
-    Response: { "ok": true, "result": "...", "detected_language": "...", "model": "..." }
+    Dedicated image OCR endpoint using Hugging Face image-to-text/OCR model.
     """
     if request.method == "OPTIONS":
         resp = Response("", status=204)
@@ -574,16 +570,11 @@ def ai_vision():
 
     if not _check_ai_api_key():
         return _ai_cors(_ai_error("Unauthorized.", 401))
-    if _gemini is None:
-        return _ai_cors(_ai_error("AI service not configured.", 503))
+    if _hf_client is None:
+        return _ai_cors(_ai_error("Hugging Face OCR is not configured. Set HF_TOKEN.", 503))
 
-    default_prompt = (
-        "Describe this image in detail. "
-        "If it contains text, extract every line of text accurately."
-    )
     image_data = None
     image_mime = "image/jpeg"
-    prompt = default_prompt
 
     content_type = request.content_type or ""
     if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
@@ -594,7 +585,6 @@ def ai_vision():
         if image_mime not in _AI_ALLOWED_IMAGE_MIME:
             return _ai_cors(_ai_error(f"Unsupported image type: {image_mime}"))
         image_data = img_file.read()
-        prompt = request.form.get("prompt", default_prompt)
     elif "application/json" in content_type:
         try:
             body = request.get_json(force=True) or {}
@@ -607,7 +597,6 @@ def ai_vision():
             image_data = base64.b64decode(body.get("image_base64", ""))
         except Exception:
             return _ai_cors(_ai_error("Invalid base64 image."))
-        prompt = body.get("prompt", default_prompt)
     else:
         return _ai_cors(_ai_error(
             "Content-Type must be multipart/form-data or application/json."
@@ -618,47 +607,44 @@ def ai_vision():
     if len(image_data) > _AI_API_MAX_IMAGE_BYTES:
         return _ai_cors(_ai_error("Image too large (max 10 MB)."))
 
-    from google.genai import types as _gtypes
     try:
-        response = _gemini.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[
-                _gtypes.Part.from_bytes(data=image_data, mime_type=image_mime),
-                prompt,
-            ],
-        )
-        result_text = (response.text or "").strip()
+        result_text = ask_huggingface_ocr(image_data)
         return _ai_cors(jsonify({
             "ok": True,
             "result": result_text,
             "detected_language": _detect_lang(result_text),
-            "model": GEMINI_MODEL,
+            "model": HF_OCR_MODEL,
+            "provider": "hf",
         }))
     except Exception as exc:
-        logging.getLogger(__name__).error(f"/ai-assistant/vision error: {exc}")
-        return _ai_cors(_ai_error(f"Vision analysis failed: {exc}", 500))
-
+        logging.getLogger(__name__).error(f"/ai-assistant/vision HF OCR error: {exc}")
+        return _ai_cors(_ai_error(f"Vision OCR failed: {exc}", 500))
 
 @app_flask.route("/ai-assistant/info", methods=["GET"])
 def ai_info():
     """
     Returns model capabilities and limits. Useful for mobile app feature detection.
-    No auth required.
     """
     resp = jsonify({
         "ok": True,
-        "model": GEMINI_MODEL,
-        "gemini_available": _gemini is not None,
+        "provider": AI_PROVIDER,
+        "model": HF_MODEL,
+        "ocr_model": HF_OCR_MODEL,
         "features": [
             "chat",
             "multi-turn-history",
-            "image-vision",
             "image-ocr",
-            "audio-transcription",
-            "streaming-sse",
             "khmer-language",
             "english-language",
         ],
+        "providers": {
+            "active": AI_PROVIDER,
+            "huggingface_available": _hf_client is not None,
+            "huggingface_model": HF_MODEL,
+            "huggingface_ocr_model": HF_OCR_MODEL,
+            "gemini_legacy_available": _gemini is not None,
+            "gemini_legacy_model": GEMINI_MODEL or None,
+        },
         "limits": {
             "max_message_chars": _AI_API_MAX_MESSAGE_CHARS,
             "max_image_bytes": _AI_API_MAX_IMAGE_BYTES,
@@ -727,9 +713,13 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN: str = ""
 SB_URL: str = ""
 SB_KEY: str = ""
-GEMINI_API_KEY: str = ""
+GEMINI_API_KEY: str = ""  # optional legacy fallback only
 ADMIN_IDS: set[int] = set()
-GEMINI_MODEL = "gemma-4-31b-it"
+GEMINI_MODEL = ""
+HF_TOKEN = ""
+HF_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+HF_OCR_MODEL = "microsoft/trocr-base-printed"
+AI_PROVIDER = "hf"
 MAX_VOICE_BYTES = 20 * 1024 * 1024
 MAX_AUDIO_FILE_BYTES = 50 * 1024 * 1024
 MAX_INPUT_CHARS = 5_000
@@ -786,9 +776,9 @@ def _audio_mime_for_gemini(filename: str | None, mime_type: str | None) -> str:
     return "audio/mpeg"
 
 _DB_EXECUTOR = ThreadPoolExecutor(max_workers=max(4, MAX_CONCURRENT_TTS_USERS), thread_name_prefix="db_write")
-_GEMINI_EXECUTOR = ThreadPoolExecutor(max_workers=max(2, MAX_CONCURRENT_GEMINI), thread_name_prefix="gemini")
+_AI_EXECUTOR = ThreadPoolExecutor(max_workers=max(2, MAX_CONCURRENT_AI), thread_name_prefix="ai")
 
-_GEMINI_SEMAPHORE: asyncio.Semaphore | None = None
+_AI_SEMAPHORE: asyncio.Semaphore | None = None
 _BROADCAST_SEMAPHORE: asyncio.Semaphore | None = None
 _TTS_CHUNK_SEMAPHORE: asyncio.Semaphore | None = None
 
@@ -863,18 +853,326 @@ def get_last_tts_text(user_id: int) -> str | None:
 # Supabase + Gemini clients
 # ---------------------------------------------------------------------------
 supabase: Client | None = None
-_gemini: genai.Client | None = None
+_gemini = None
+_hf_client = None
+
+def _init_hf_client() -> None:
+    """Initialise Hugging Face Inference Providers client for chat and OCR."""
+    global _hf_client
+
+    if InferenceClient is None:
+        logger.error("huggingface_hub is not installed. Run: pip install -U huggingface_hub")
+        _hf_client = None
+        return
+
+    if not HF_TOKEN:
+        logger.error("HF_TOKEN is not set — Hugging Face chat/OCR disabled.")
+        _hf_client = None
+        return
+
+    try:
+        _hf_client = InferenceClient(token=HF_TOKEN)
+        logger.info(f"Hugging Face client initialised (chat={HF_MODEL}, ocr={HF_OCR_MODEL}).")
+    except Exception as e:
+        logger.error(f"Hugging Face init failed: {e}")
+        _hf_client = None
+
+
+def _hf_history_messages(history: list[dict] | None) -> list[dict]:
+    """Convert API history into Hugging Face/OpenAI-style chat messages."""
+    messages: list[dict] = [
+        {
+            "role": "system",
+            "content": _AI_SYSTEM_PROMPT,
+        }
+    ]
+
+    for turn in (history or [])[-_AI_API_MAX_HISTORY_TURNS:]:
+        role = str(turn.get("role", "user")).strip().lower()
+        content = str(turn.get("content", "") or "").strip()
+        if not content:
+            continue
+
+        if role in ("assistant", "model", "bot"):
+            role = "assistant"
+        else:
+            role = "user"
+
+        messages.append({"role": role, "content": content})
+
+    return messages
+
+
+def ask_huggingface(prompt: str, history: list[dict] | None = None) -> str:
+    """Generate a text reply with Hugging Face Inference Providers."""
+    if _hf_client is None:
+        raise RuntimeError("Hugging Face client is not configured.")
+
+    prompt = (prompt or "").strip()
+    if not prompt:
+        prompt = "Hello"
+
+    messages = _hf_history_messages(history)
+    messages.append({"role": "user", "content": prompt})
+
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            response = _hf_client.chat_completion(
+                model=HF_MODEL,
+                messages=messages,
+                max_tokens=int(os.environ.get("HF_MAX_TOKENS", "1024")),
+                temperature=float(os.environ.get("HF_TEMPERATURE", "0.7")),
+            )
+
+            content = response.choices[0].message.content
+            if isinstance(content, list):
+                # Some providers may return structured content parts.
+                content = "".join(
+                    str(part.get("text", part)) if isinstance(part, dict) else str(part)
+                    for part in content
+                )
+
+            reply = str(content or "").strip()
+            if reply:
+                return reply
+
+            raise RuntimeError("Hugging Face returned an empty response.")
+
+        except Exception as e:
+            last_exc = e
+            if attempt < 2:
+                time.sleep(0.7 * (attempt + 1))
+            else:
+                break
+
+    raise RuntimeError(f"Hugging Face generation failed: {last_exc}")
+
+
+
+
+def _extract_hf_text(result) -> str:
+    """Normalize Hugging Face OCR outputs across SDK/API/provider variants."""
+    if result is None:
+        return ""
+
+    if isinstance(result, str):
+        return result.strip()
+
+    # huggingface_hub may return dataclass-like objects for image_to_text.
+    for attr in ("generated_text", "text"):
+        value = getattr(result, attr, None)
+        if value:
+            return str(value).strip()
+
+    if isinstance(result, dict):
+        value = result.get("generated_text") or result.get("text")
+        if value:
+            return str(value).strip()
+        if result.get("error"):
+            raise RuntimeError(str(result.get("error")))
+        return str(result).strip()
+
+    if isinstance(result, list):
+        texts: list[str] = []
+        for item in result:
+            text = _extract_hf_text(item)
+            if text:
+                texts.append(text)
+        return "\n".join(texts).strip()
+
+    return str(result).strip()
+
+
+
+def _is_dns_or_network_error(exc: Exception | str) -> bool:
+    msg = str(exc).lower()
+    return any(
+        needle in msg
+        for needle in (
+            "getaddrinfo failed",
+            "failed to resolve",
+            "nameresolutionerror",
+            "temporary failure in name resolution",
+            "nodename nor servname",
+            "connectionerror",
+            "maxretryerror",
+            "name or service not known",
+        )
+    )
+
+
+def _friendly_ocr_error(errors: list[str]) -> RuntimeError:
+    joined = " | ".join(errors)
+    low = joined.lower()
+
+    if _is_dns_or_network_error(joined):
+        return RuntimeError(
+            "Hugging Face OCR cannot connect because DNS/network failed. "
+            "Your machine/server cannot resolve api-inference.huggingface.co. "
+            "Check internet/DNS/VPN/firewall, then test: nslookup api-inference.huggingface.co. "
+            f"Details: {joined[:900]}"
+        )
+
+    if "stopiteration" in low:
+        return RuntimeError(
+            "Hugging Face OCR model/provider is not available for hosted image-to-text. "
+            "Try HF_OCR_MODEL=microsoft/trocr-base-printed first, or use another OCR model that supports Inference Providers. "
+            f"Details: {joined[:900]}"
+        )
+
+    if "401" in low or "unauthorized" in low:
+        return RuntimeError("HF_TOKEN is invalid or expired. Create a new Hugging Face token and update env.")
+
+    if "403" in low or "forbidden" in low:
+        return RuntimeError("HF_TOKEN has no permission for this Hugging Face model/provider.")
+
+    return RuntimeError("Hugging Face OCR failed. " + joined[:1200])
+
+
+def _hf_ocr_via_rest(image_data: bytes) -> str:
+    """Fallback OCR call using the raw Hugging Face Inference API endpoint."""
+    if not HF_TOKEN:
+        raise RuntimeError("HF_TOKEN is missing.")
+
+    model_id = (HF_OCR_MODEL or "microsoft/trocr-base-printed").strip()
+    url_model = requests.utils.quote(model_id, safe="")
+    url = f"https://api-inference.huggingface.co/models/{url_model}"
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Accept": "application/json",
+        "Content-Type": "application/octet-stream",
+        "X-Wait-For-Model": "true",
+    }
+
+    last_body = ""
+    for attempt in range(3):
+        try:
+            resp = requests.post(url, headers=headers, data=image_data, timeout=90)
+            last_body = resp.text[:700]
+
+            if resp.status_code in (503, 504, 429) and attempt < 2:
+                wait_s = 1.5 * (attempt + 1)
+                try:
+                    wait_s = max(wait_s, float(resp.json().get("estimated_time", wait_s)))
+                except Exception:
+                    pass
+                time.sleep(min(wait_s, 10.0))
+                continue
+
+            if not (200 <= resp.status_code < 300):
+                raise RuntimeError(f"HTTP {resp.status_code}: {last_body}")
+
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = resp.text
+
+            text = _extract_hf_text(payload)
+            if text:
+                return text
+            raise RuntimeError(f"REST OCR returned empty result: {payload!r}")
+
+        except Exception as e:
+            if attempt >= 2:
+                if _is_dns_or_network_error(e):
+                    raise RuntimeError(
+                        "REST OCR network/DNS failed: cannot reach api-inference.huggingface.co. "
+                        f"{type(e).__name__}: {e}; body={last_body!r}"
+                    ) from e
+                raise RuntimeError(f"REST OCR failed: {type(e).__name__}: {e!r}; body={last_body!r}") from e
+            time.sleep(0.8 * (attempt + 1))
+
+    raise RuntimeError("REST OCR failed after retries.")
+
+
+def ask_huggingface_ocr(image_data: bytes) -> str:
+    """Extract text from an image using a Hugging Face OCR/image-to-text model.
+
+    Uses InferenceClient first, then falls back to the raw Inference API.
+    Error messages use repr() so blank SDK exceptions are visible in logs.
+    """
+    if _hf_client is None:
+        raise RuntimeError("Hugging Face client is not configured.")
+    if not image_data:
+        raise RuntimeError("Empty image data.")
+
+    errors: list[str] = []
+
+    for attempt in range(3):
+        try:
+            result = _hf_client.image_to_text(image=image_data, model=HF_OCR_MODEL)
+            text = _extract_hf_text(result)
+            if text:
+                return text
+            raise RuntimeError(f"SDK OCR returned empty result: {result!r}")
+
+        except Exception as e:
+            errors.append(f"sdk_attempt_{attempt + 1}={type(e).__name__}: {e!r}")
+            if attempt < 2:
+                time.sleep(0.7 * (attempt + 1))
+
+    try:
+        return _hf_ocr_via_rest(image_data)
+    except Exception as e:
+        errors.append(f"rest={type(e).__name__}: {e!r}")
+
+    raise _friendly_ocr_error(errors)
+
+def ai_text_reply(prompt: str, history: list[dict] | None = None) -> tuple[str, str, int | None]:
+    """Return (reply, model_used, tokens_used) for text-only chat."""
+    provider = (AI_PROVIDER or "hf").lower().strip()
+
+    if provider == "hf":
+        reply = ask_huggingface(prompt, history)
+        return reply, HF_MODEL, None
+
+    if _gemini is None:
+        raise RuntimeError("Gemini client is not configured.")
+
+    contents = _build_gemini_contents(
+        message=prompt,
+        history=history or [],
+        image_data=None,
+        audio_data=None,
+        image_mime="",
+        audio_mime="",
+    )
+    response = _gemini.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=contents,
+        config=_ai_gen_config(),
+    )
+
+    tokens_used = None
+    try:
+        tokens_used = response.usage_metadata.total_token_count
+    except Exception:
+        pass
+
+    return (response.text or "").strip(), GEMINI_MODEL, tokens_used
+
 
 def _init_clients() -> None:
     global supabase, _gemini, TELEGRAM_BOT_TOKEN, SB_URL, SB_KEY
     global GEMINI_API_KEY, ADMIN_IDS, GEMINI_MODEL
+    global HF_TOKEN, HF_MODEL, HF_OCR_MODEL, AI_PROVIDER
 
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     SB_URL = os.getenv("SUPABASE_URL", "")
     SB_KEY = os.getenv("SUPABASE_KEY", "")
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemma-4-31b-it")
+    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip()
 
+    HF_TOKEN = os.getenv("HF_TOKEN", "")
+    HF_MODEL = os.getenv("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+    HF_OCR_MODEL = os.getenv("HF_OCR_MODEL", "microsoft/trocr-base-printed")
+    AI_PROVIDER = os.getenv("AI_PROVIDER", "hf").lower().strip()
+    if AI_PROVIDER not in ("hf", "gemini"):
+        logger.warning(f"Unknown AI_PROVIDER={AI_PROVIDER!r}; falling back to hf.")
+        AI_PROVIDER = "hf"
+
+    ADMIN_IDS.clear()
     for _aid in os.getenv("ADMIN_IDS", "").split(","):
         _aid = _aid.strip()
         if _aid.isdigit():
@@ -893,15 +1191,18 @@ def _init_clients() -> None:
     else:
         logger.warning("Supabase env vars missing — DB features disabled.")
 
-    if GEMINI_API_KEY:
+    if GEMINI_API_KEY and GEMINI_MODEL and genai is not None:
         try:
             _gemini = genai.Client(api_key=GEMINI_API_KEY)
-            logger.info(f"Gemini client initialised (model: {GEMINI_MODEL}).")
+            logger.info(f"Gemini legacy fallback initialised (model: {GEMINI_MODEL}).")
         except Exception as e:
             logger.error(f"Gemini init failed: {e}")
             _gemini = None
     else:
-        logger.warning("GEMINI_API_KEY not set — OCR / transcription disabled.")
+        _gemini = None
+        logger.info("Gemini disabled. Using Hugging Face for chat/OCR.")
+
+    _init_hf_client()
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1684,9 +1985,9 @@ async def resolve_tts_text(
         logger.info("resolve_tts_text: Gemini not available, using raw text after local history checks.")
         return raw_text
 
-    semaphore = _GEMINI_SEMAPHORE
+    semaphore = _AI_SEMAPHORE
     if semaphore is None:
-        logger.warning("resolve_tts_text: _GEMINI_SEMAPHORE not initialised, using raw text.")
+        logger.warning("resolve_tts_text: _AI_SEMAPHORE not initialised, using raw text.")
         return raw_text
 
     context_block = _build_context_block(history)
@@ -1727,7 +2028,7 @@ async def resolve_tts_text(
                     contents=combined_prompt,
                 )
 
-            return await loop.run_in_executor(_GEMINI_EXECUTOR, _call)
+            return await loop.run_in_executor(_AI_EXECUTOR, _call)
 
     try:
         response = await asyncio.wait_for(
@@ -2099,7 +2400,7 @@ async def transcribe_voice(ogg_path: str) -> str:
         "Output ONLY the transcribed text — no labels, no explanation. "
         "Support both Khmer and English."
     )
-    semaphore = _GEMINI_SEMAPHORE
+    semaphore = _AI_SEMAPHORE
     if semaphore is None:
         raise RuntimeError("Gemini semaphore not initialised.")
 
@@ -2113,7 +2414,7 @@ async def transcribe_voice(ogg_path: str) -> str:
                         prompt,
                     ],
                 )
-            return await loop.run_in_executor(_GEMINI_EXECUTOR, _call)
+            return await loop.run_in_executor(_AI_EXECUTOR, _call)
 
     try:
         response = await asyncio.wait_for(_guarded_call(), timeout=60)
@@ -2137,7 +2438,7 @@ async def transcribe_audio_file(file_path: str, mime_type: str) -> str:
         "Output ONLY the transcribed text — no labels, no explanation. "
         "Support both Khmer and English."
     )
-    semaphore = _GEMINI_SEMAPHORE
+    semaphore = _AI_SEMAPHORE
     if semaphore is None:
         raise RuntimeError("Gemini semaphore not initialised.")
 
@@ -2151,7 +2452,7 @@ async def transcribe_audio_file(file_path: str, mime_type: str) -> str:
                         prompt,
                     ],
                 )
-            return await loop.run_in_executor(_GEMINI_EXECUTOR, _call)
+            return await loop.run_in_executor(_AI_EXECUTOR, _call)
 
     try:
         response = await asyncio.wait_for(_guarded_call(), timeout=90)
@@ -2231,11 +2532,13 @@ def _detect_image_mime(path: str) -> str:
     return "image/jpeg"
 
 # ---------------------------------------------------------------------------
-# Gemini OCR
+# Hugging Face OCR
 # ---------------------------------------------------------------------------
 async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
-    if not _gemini:
-        raise RuntimeError("GEMINI_API_KEY not set.")
+    """Read an image from disk and extract text with Hugging Face OCR."""
+    if _hf_client is None:
+        raise RuntimeError("HF_TOKEN not set or huggingface_hub not installed.")
+
     loop = asyncio.get_running_loop()
     try:
         image_bytes = await loop.run_in_executor(
@@ -2244,36 +2547,21 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
     except OSError as e:
         raise RuntimeError(f"Cannot read image file: {e}") from e
 
-    prompt = (
-        "You are an OCR engine. Extract EVERY line of text visible in this image, "
-        "from top to bottom, left to right. "
-        "Do NOT skip, truncate, summarise, or omit any line — even if the text is long. "
-        "Do NOT add any labels, headers, explanations, bullet points, or markdown. "
-        "Output ONLY the raw extracted text, preserving original line breaks exactly. "
-        "Support both Khmer (ខ្មែរ) and English with full Unicode accuracy. "
-        "If there is truly no text, output only the single word: NOTEXT"
-    )
-    semaphore = _GEMINI_SEMAPHORE
+    semaphore = _AI_SEMAPHORE
     if semaphore is None:
-        raise RuntimeError("Gemini semaphore not initialised.")
+        raise RuntimeError("AI semaphore not initialised.")
 
     async def _guarded_call():
         async with semaphore:
-            def _call():
-                return _gemini.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=[
-                        genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                        prompt,
-                    ],
-                )
-            return await loop.run_in_executor(_GEMINI_EXECUTOR, _call)
+            return await loop.run_in_executor(
+                _AI_EXECUTOR,
+                lambda: ask_huggingface_ocr(image_bytes),
+            )
 
     try:
-        response = await asyncio.wait_for(_guarded_call(), timeout=60)
-        return (response.text or "").strip()
+        return await asyncio.wait_for(_guarded_call(), timeout=90)
     except asyncio.TimeoutError:
-        raise RuntimeError("Gemini OCR timed out after 60s")
+        raise RuntimeError("Hugging Face OCR timed out after 90s")
 
 # ---------------------------------------------------------------------------
 # Cooldown check
@@ -2983,7 +3271,7 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
             f"👥 Total users: <b>{total_users}</b>\n"
             f"⏰ Pending schedules: <b>{pending_sched}</b>\n"
             f"🚫 Blocked users: <b>{blocked_users}</b>\n"
-            f"🤖 Gemini: <b>{'OK' if _gemini else 'OFF'}</b>\n"
+            f"🤗 Hugging Face: <b>{'OK' if _hf_client else 'OFF'}</b>\n"
             f"🗄️ Supabase: <b>{'OK' if supabase else 'OFF'}</b>"
         )
 
@@ -3010,7 +3298,7 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
             "🩺 <b>Bot Health</b>\n\n"
             f"🤖 Telegram bot: <b>OK</b>\n"
             f"🗄️ Supabase: <b>{'OK' if supabase else 'OFF'}</b>\n"
-            f"🧠 Gemini: <b>{'OK' if _gemini else 'OFF'}</b>\n"
+            f"🧠 Hugging Face: <b>{'OK' if _hf_client else 'OFF'}</b>\n"
             f"🎧 FFmpeg: <b>{'OK' if ffmpeg_ok else 'ERROR'}</b>\n"
             f"📁 Temp folder: <b>{'OK' if temp_ok else 'ERROR'}</b>\n"
             f"<code>{html.escape(str(temp_dir))}</code>"
@@ -3721,7 +4009,7 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📅 Scheduled (pending): <b>{len(pending_scheds)}</b>\n"
             f"🔒 Active user locks: <b>{len(_user_locks)}</b>\n"
             f"💭 History cache entries: <b>{len(_hist_cache)}</b>\n"
-            f"🤖 Gemini Model: <b>{GEMINI_MODEL}</b>",
+            f"🤗 HF Model: <b>{HF_MODEL}</b>\nOCR: <b>{HF_OCR_MODEL}</b>",
             parse_mode="HTML",
         )
     )
@@ -3875,9 +4163,9 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: msg.reply_text("✅ រូបភាពបានផ្ញើដល់ Admin ។"))
         return
 
-    if not _gemini:
+    if _hf_client is None:
         await safe_send(
-            lambda: msg.reply_text("❌ Gemini API មិន Activate ទេ។ សូម Set GEMINI_API_KEY ។")
+            lambda: msg.reply_text("❌ Hugging Face OCR មិន Activate ទេ។ សូម Set HF_TOKEN ។")
         )
         return
 
@@ -3930,8 +4218,25 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             )
     except Exception as e:
-        logger.error(f"on_photo OCR error: {e}")
-        await safe_send(lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការ OCR រូបភាព។"))
+        err_msg = str(e) or repr(e)
+        logger.error(f"on_photo OCR error: {type(e).__name__}: {e!r}", exc_info=True)
+        if _is_dns_or_network_error(err_msg):
+            user_msg = (
+                "❌ OCR មិនអាចភ្ជាប់ទៅ Hugging Face បានទេ។\n"
+                "មូលហេតុ: DNS/Internet/VPN/Firewall resolve api-inference.huggingface.co មិនបាន។\n\n"
+                "សូមសាកល្បងក្នុង CMD:\n"
+                "nslookup api-inference.huggingface.co\n"
+                "ping huggingface.co\n\n"
+                "បើ run លើ Render សូមពិនិត្យ Environment និង outbound internet។"
+            )
+        elif "model/provider is not available" in err_msg:
+            user_msg = (
+                "❌ Hugging Face OCR model នេះមិន support hosted inference ទេ។\n"
+                "សូមសាក HF_OCR_MODEL=microsoft/trocr-base-printed ជាមុនសិន។"
+            )
+        else:
+            user_msg = f"❌ មានបញ្ហាក្នុងការ OCR រូបភាព។\n{html.escape(err_msg)[:1000]}"
+        await safe_send(lambda: msg.reply_text(user_msg, parse_mode=None))
     finally:
         await _stop_timer(stop_event, timer_task)
         if img_path:
@@ -4842,10 +5147,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # Bot runner
 # ---------------------------------------------------------------------------
 async def _run_bot():
-    global _BOT_START_TIME, _GEMINI_SEMAPHORE, _BROADCAST_SEMAPHORE
+    global _BOT_START_TIME, _AI_SEMAPHORE, _BROADCAST_SEMAPHORE
     global _prefs_cache_lock, _TTS_CHUNK_SEMAPHORE
 
-    _GEMINI_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_GEMINI)
+    _AI_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_AI)
     _BROADCAST_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_BROADCAST)
     _prefs_cache_lock = asyncio.Lock()
     _TTS_CHUNK_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TTS_USERS)
@@ -4920,7 +5225,7 @@ async def _run_bot():
     app.add_error_handler(error_handler)
 
     logger.info(f"Bot polling started. Admins: {ADMIN_IDS or 'none configured'}")
-    logger.info(f"Gemini model: {GEMINI_MODEL}")
+    logger.info(f"HF model: {HF_MODEL}; HF OCR model: {HF_OCR_MODEL}")
 
     sched_stop = asyncio.Event()
     sweep_stop = asyncio.Event()
@@ -4966,7 +5271,7 @@ def main():
             "Set ADMIN_IDS=123456,789012 in your environment."
         )
 
-    print(f"Bot is starting... (Gemini model: {GEMINI_MODEL})")
+    print(f"Bot is starting... (AI provider: {AI_PROVIDER}, HF: {HF_MODEL}, OCR: {HF_OCR_MODEL})")
     while True:
         try:
             asyncio.run(_run_bot())
