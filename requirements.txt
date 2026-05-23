@@ -1,5 +1,4 @@
 python-telegram-bot
-google-genai
 huggingface_hub
 edge-tts
 supabase
