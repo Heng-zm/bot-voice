@@ -1,9 +1,11 @@
 python-telegram-bot
 google-genai
+huggingface_hub
 edge-tts
 supabase
 python-dotenv
 imageio-ffmpeg
 flask
+requests
 pypdf
 python-docx
