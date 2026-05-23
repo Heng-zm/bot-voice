@@ -4222,12 +4222,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"on_photo OCR error: {type(e).__name__}: {e!r}", exc_info=True)
         if _is_dns_or_network_error(err_msg):
             user_msg = (
-                "❌ OCR មិនអាចភ្ជាប់ទៅ Hugging Face បានទេ។\n"
-                "មូលហេតុ: DNS/Internet/VPN/Firewall resolve api-inference.huggingface.co មិនបាន។\n\n"
-                "សូមសាកល្បងក្នុង CMD:\n"
-                "nslookup api-inference.huggingface.co\n"
-                "ping huggingface.co\n\n"
-                "បើ run លើ Render សូមពិនិត្យ Environment និង outbound internet។"
+                "❌ មានបញ្ហាក្នុងការ OCR រូបភាព។"
             )
         elif "model/provider is not available" in err_msg:
             user_msg = (
