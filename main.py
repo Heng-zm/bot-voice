@@ -418,9 +418,9 @@ def ai_assistant():
         return _ai_cors(_ai_error("Streaming is disabled for Hugging Face provider. Send stream=false.", 400))
 
     try:
-        # Hugging Face OCR/image-to-text path
+        # Unified OCR/image-to-text path with provider fallback.
         if image_data is not None:
-            ocr_text = ask_huggingface_ocr(image_data)
+            ocr_text, ocr_provider, ocr_model = ask_ocr_image(image_data, image_mime or "image/jpeg")
             if message:
                 prompt = (
                     f"User instruction: {message}\n\n"
@@ -430,7 +430,7 @@ def ai_assistant():
                 reply_text, model_used, tokens_used = ai_text_reply(prompt, history)
             else:
                 reply_text = ocr_text
-                model_used = HF_OCR_MODEL
+                model_used = ocr_model
                 tokens_used = None
 
             return _ai_cors(jsonify({
@@ -440,8 +440,9 @@ def ai_assistant():
                 "detected_language": _detect_lang(reply_text or ocr_text or ""),
                 "tokens_used": tokens_used,
                 "model": model_used,
-                "ocr_model": HF_OCR_MODEL,
-                "provider": "hf",
+                "ocr_model": ocr_model,
+                "ocr_provider": ocr_provider,
+                "provider": AI_PROVIDER,
             }))
 
         # Audio still needs Gemini unless you add an HF ASR model later.
@@ -557,7 +558,7 @@ def ai_transcribe():
 @app_flask.route("/ai-assistant/vision", methods=["POST", "OPTIONS"])
 def ai_vision():
     """
-    Dedicated image OCR endpoint using Hugging Face image-to-text/OCR model.
+    Dedicated image OCR endpoint using the configured OCR provider.
     """
     if request.method == "OPTIONS":
         resp = Response("", status=204)
@@ -570,8 +571,8 @@ def ai_vision():
 
     if not _check_ai_api_key():
         return _ai_cors(_ai_error("Unauthorized.", 401))
-    if _hf_client is None:
-        return _ai_cors(_ai_error("Hugging Face OCR is not configured. Set HF_TOKEN.", 503))
+    if not _ocr_configured():
+        return _ai_cors(_ai_error(_ocr_status_for_user(), 503))
 
     image_data = None
     image_mime = "image/jpeg"
@@ -608,16 +609,17 @@ def ai_vision():
         return _ai_cors(_ai_error("Image too large (max 10 MB)."))
 
     try:
-        result_text = ask_huggingface_ocr(image_data)
+        result_text, ocr_provider, ocr_model = ask_ocr_image(image_data, image_mime)
         return _ai_cors(jsonify({
             "ok": True,
             "result": result_text,
             "detected_language": _detect_lang(result_text),
-            "model": HF_OCR_MODEL,
-            "provider": "hf",
+            "model": ocr_model,
+            "provider": ocr_provider,
+            "ocr_provider": ocr_provider,
         }))
     except Exception as exc:
-        logging.getLogger(__name__).error(f"/ai-assistant/vision HF OCR error: {exc}")
+        logging.getLogger(__name__).error(f"/ai-assistant/vision OCR error: {exc}")
         return _ai_cors(_ai_error(f"Vision OCR failed: {exc}", 500))
 
 @app_flask.route("/ai-assistant/info", methods=["GET"])
@@ -630,6 +632,7 @@ def ai_info():
         "provider": AI_PROVIDER,
         "model": HF_MODEL,
         "ocr_model": HF_OCR_MODEL,
+        "ocr_provider": OCR_PROVIDER,
         "features": [
             "chat",
             "multi-turn-history",
@@ -642,6 +645,9 @@ def ai_info():
             "huggingface_available": _hf_client is not None,
             "huggingface_model": HF_MODEL,
             "huggingface_ocr_model": HF_OCR_MODEL,
+            "ocr_provider": OCR_PROVIDER,
+            "ocr_configured": _ocr_configured(),
+            "hf_ocr_temporarily_disabled": _hf_ocr_is_temporarily_disabled(),
             "gemini_legacy_available": _gemini is not None,
             "gemini_legacy_model": GEMINI_MODEL or None,
         },
@@ -720,6 +726,13 @@ HF_TOKEN = ""
 HF_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 HF_OCR_MODEL = "microsoft/trocr-base-printed"
 AI_PROVIDER = "hf"
+# OCR_PROVIDER controls image OCR only.
+#   auto   = try Hugging Face first, then Gemini fallback if HF/DNS/provider fails
+#   hf     = Hugging Face only
+#   gemini = Gemini only
+OCR_PROVIDER = "auto"
+OCR_TIMEOUT_SECONDS = 90
+HF_OCR_DNS_COOLDOWN_S = 300.0
 MAX_VOICE_BYTES = 20 * 1024 * 1024
 MAX_AUDIO_FILE_BYTES = 50 * 1024 * 1024
 MAX_INPUT_CHARS = 5_000
@@ -856,6 +869,12 @@ supabase: Client | None = None
 _gemini = None
 _hf_client = None
 
+# OCR circuit breaker. If Hugging Face DNS/network fails, skip HF OCR briefly
+# so every photo does not spend 90s retrying the same broken endpoint.
+_hf_ocr_disabled_until = 0.0
+_hf_ocr_failures = 0
+_hf_ocr_state_lock = threading.Lock()
+
 def _init_hf_client() -> None:
     """Initialise Hugging Face Inference Providers client for chat and OCR."""
     global _hf_client
@@ -984,7 +1003,6 @@ def _extract_hf_text(result) -> str:
     return str(result).strip()
 
 
-
 def _is_dns_or_network_error(exc: Exception | str) -> bool:
     msg = str(exc).lower()
     return any(
@@ -998,6 +1016,8 @@ def _is_dns_or_network_error(exc: Exception | str) -> bool:
             "connectionerror",
             "maxretryerror",
             "name or service not known",
+            "no address associated with hostname",
+            "dns",
         )
     )
 
@@ -1008,16 +1028,16 @@ def _friendly_ocr_error(errors: list[str]) -> RuntimeError:
 
     if _is_dns_or_network_error(joined):
         return RuntimeError(
-            "Hugging Face OCR cannot connect because DNS/network failed. "
-            "Your machine/server cannot resolve api-inference.huggingface.co. "
-            "Check internet/DNS/VPN/firewall, then test: nslookup api-inference.huggingface.co. "
+            "OCR network/DNS failed. The server cannot resolve or reach "
+            "api-inference.huggingface.co. Set OCR_PROVIDER=gemini with "
+            "GEMINI_API_KEY/GEMINI_MODEL for automatic fallback, or fix DNS/firewall. "
             f"Details: {joined[:900]}"
         )
 
     if "stopiteration" in low:
         return RuntimeError(
             "Hugging Face OCR model/provider is not available for hosted image-to-text. "
-            "Try HF_OCR_MODEL=microsoft/trocr-base-printed first, or use another OCR model that supports Inference Providers. "
+            "Try HF_OCR_MODEL=microsoft/trocr-base-printed, or set OCR_PROVIDER=gemini. "
             f"Details: {joined[:900]}"
         )
 
@@ -1027,7 +1047,52 @@ def _friendly_ocr_error(errors: list[str]) -> RuntimeError:
     if "403" in low or "forbidden" in low:
         return RuntimeError("HF_TOKEN has no permission for this Hugging Face model/provider.")
 
-    return RuntimeError("Hugging Face OCR failed. " + joined[:1200])
+    return RuntimeError("OCR failed. " + joined[:1200])
+
+
+def _hf_ocr_is_temporarily_disabled() -> bool:
+    with _hf_ocr_state_lock:
+        return time.monotonic() < _hf_ocr_disabled_until
+
+
+def _mark_hf_ocr_success() -> None:
+    global _hf_ocr_failures, _hf_ocr_disabled_until
+    with _hf_ocr_state_lock:
+        _hf_ocr_failures = 0
+        _hf_ocr_disabled_until = 0.0
+
+
+def _mark_hf_ocr_failure(exc: Exception | str) -> None:
+    """Circuit-breaker for repeated HF OCR network/provider failures."""
+    global _hf_ocr_failures, _hf_ocr_disabled_until
+    with _hf_ocr_state_lock:
+        _hf_ocr_failures += 1
+        if _is_dns_or_network_error(exc):
+            _hf_ocr_disabled_until = time.monotonic() + HF_OCR_DNS_COOLDOWN_S
+        elif _hf_ocr_failures >= 3:
+            _hf_ocr_disabled_until = time.monotonic() + 60.0
+
+
+def _ocr_configured() -> bool:
+    provider = (OCR_PROVIDER or "auto").lower().strip()
+    hf_ok = _hf_client is not None
+    gemini_ok = _gemini is not None
+    if provider == "hf":
+        return hf_ok
+    if provider == "gemini":
+        return gemini_ok
+    return hf_ok or gemini_ok
+
+
+def _ocr_status_for_user() -> str:
+    provider = (OCR_PROVIDER or "auto").lower().strip()
+    if provider == "hf" and _hf_client is None:
+        return "❌ OCR មិនទាន់ Activate ទេ។ សូម Set HF_TOKEN ឬប្ដូរ OCR_PROVIDER=gemini។"
+    if provider == "gemini" and _gemini is None:
+        return "❌ OCR Gemini មិនទាន់ Activate ទេ។ សូម Set GEMINI_API_KEY និង GEMINI_MODEL។"
+    if _hf_client is None and _gemini is None:
+        return "❌ OCR មិនទាន់ Activate ទេ។ សូម Set HF_TOKEN ឬ GEMINI_API_KEY/GEMINI_MODEL។"
+    return "❌ OCR មិនអាចប្រើបាននៅពេលនេះ។ សូមពិនិត្យ API key និង network។"
 
 
 def _hf_ocr_via_rest(image_data: bytes) -> str:
@@ -1048,7 +1113,7 @@ def _hf_ocr_via_rest(image_data: bytes) -> str:
     last_body = ""
     for attempt in range(3):
         try:
-            resp = requests.post(url, headers=headers, data=image_data, timeout=90)
+            resp = requests.post(url, headers=headers, data=image_data, timeout=OCR_TIMEOUT_SECONDS)
             last_body = resp.text[:700]
 
             if resp.status_code in (503, 504, 429) and attempt < 2:
@@ -1087,15 +1152,13 @@ def _hf_ocr_via_rest(image_data: bytes) -> str:
 
 
 def ask_huggingface_ocr(image_data: bytes) -> str:
-    """Extract text from an image using a Hugging Face OCR/image-to-text model.
-
-    Uses InferenceClient first, then falls back to the raw Inference API.
-    Error messages use repr() so blank SDK exceptions are visible in logs.
-    """
+    """Extract text from an image using a Hugging Face OCR/image-to-text model."""
     if _hf_client is None:
         raise RuntimeError("Hugging Face client is not configured.")
     if not image_data:
         raise RuntimeError("Empty image data.")
+    if _hf_ocr_is_temporarily_disabled():
+        raise RuntimeError("Hugging Face OCR is temporarily disabled after recent network/provider failures.")
 
     errors: list[str] = []
 
@@ -1104,6 +1167,7 @@ def ask_huggingface_ocr(image_data: bytes) -> str:
             result = _hf_client.image_to_text(image=image_data, model=HF_OCR_MODEL)
             text = _extract_hf_text(result)
             if text:
+                _mark_hf_ocr_success()
                 return text
             raise RuntimeError(f"SDK OCR returned empty result: {result!r}")
 
@@ -1113,11 +1177,83 @@ def ask_huggingface_ocr(image_data: bytes) -> str:
                 time.sleep(0.7 * (attempt + 1))
 
     try:
-        return _hf_ocr_via_rest(image_data)
+        text = _hf_ocr_via_rest(image_data)
+        _mark_hf_ocr_success()
+        return text
     except Exception as e:
         errors.append(f"rest={type(e).__name__}: {e!r}")
+        _mark_hf_ocr_failure(e)
 
     raise _friendly_ocr_error(errors)
+
+
+def ask_gemini_ocr(image_data: bytes, mime_type: str = "image/jpeg") -> str:
+    """Extract text from an image using Gemini as OCR/vision fallback."""
+    if _gemini is None:
+        raise RuntimeError("Gemini OCR is not configured. Set GEMINI_API_KEY and GEMINI_MODEL.")
+    if not image_data:
+        raise RuntimeError("Empty image data.")
+
+    from google.genai import types as _gtypes
+
+    prompt = (
+        "Extract all readable text from this image. Preserve Khmer and English exactly. "
+        "Keep useful line breaks. If there is no readable text, output only NOTEXT. "
+        "Do not describe the image and do not add explanations."
+    )
+    response = _gemini.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[
+            _gtypes.Part.from_bytes(data=image_data, mime_type=mime_type or "image/jpeg"),
+            prompt,
+        ],
+    )
+    text = (response.text or "").strip()
+    return text or "NOTEXT"
+
+
+def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tuple[str, str, str]:
+    """Unified OCR with provider fallback.
+
+    Returns (text, provider, model). In auto mode, HF is tried first and Gemini
+    is used when HF fails because of DNS/network/provider issues.
+    """
+    if not image_data:
+        raise RuntimeError("Empty image data.")
+
+    provider = (OCR_PROVIDER or "auto").lower().strip()
+    if provider not in ("auto", "hf", "gemini"):
+        provider = "auto"
+
+    errors: list[str] = []
+
+    if provider in ("auto", "hf") and _hf_client is not None:
+        try:
+            return ask_huggingface_ocr(image_data), "hf", HF_OCR_MODEL
+        except Exception as e:
+            errors.append(f"hf={type(e).__name__}: {e!r}")
+            _mark_hf_ocr_failure(e)
+            if provider == "hf":
+                raise _friendly_ocr_error(errors)
+            logger.warning(f"HF OCR failed; trying fallback if available: {e}")
+
+    if provider in ("auto", "gemini") and _gemini is not None:
+        try:
+            return ask_gemini_ocr(image_data, mime_type), "gemini", GEMINI_MODEL
+        except Exception as e:
+            errors.append(f"gemini={type(e).__name__}: {e!r}")
+            if provider == "gemini":
+                raise _friendly_ocr_error(errors)
+            logger.warning(f"Gemini OCR fallback failed: {e}")
+
+    if not errors:
+        errors.append(
+            f"No OCR provider configured. OCR_PROVIDER={OCR_PROVIDER!r}, "
+            f"hf_available={_hf_client is not None}, gemini_available={_gemini is not None}"
+        )
+
+    raise _friendly_ocr_error(errors)
+
 
 def ai_text_reply(prompt: str, history: list[dict] | None = None) -> tuple[str, str, int | None]:
     """Return (reply, model_used, tokens_used) for text-only chat."""
@@ -1156,7 +1292,7 @@ def ai_text_reply(prompt: str, history: list[dict] | None = None) -> tuple[str, 
 def _init_clients() -> None:
     global supabase, _gemini, TELEGRAM_BOT_TOKEN, SB_URL, SB_KEY
     global GEMINI_API_KEY, ADMIN_IDS, GEMINI_MODEL
-    global HF_TOKEN, HF_MODEL, HF_OCR_MODEL, AI_PROVIDER
+    global HF_TOKEN, HF_MODEL, HF_OCR_MODEL, AI_PROVIDER, OCR_PROVIDER
 
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     SB_URL = os.getenv("SUPABASE_URL", "")
@@ -1171,6 +1307,11 @@ def _init_clients() -> None:
     if AI_PROVIDER not in ("hf", "gemini"):
         logger.warning(f"Unknown AI_PROVIDER={AI_PROVIDER!r}; falling back to hf.")
         AI_PROVIDER = "hf"
+
+    OCR_PROVIDER = os.getenv("OCR_PROVIDER", "auto").lower().strip()
+    if OCR_PROVIDER not in ("auto", "hf", "gemini"):
+        logger.warning(f"Unknown OCR_PROVIDER={OCR_PROVIDER!r}; falling back to auto.")
+        OCR_PROVIDER = "auto"
 
     ADMIN_IDS.clear()
     for _aid in os.getenv("ADMIN_IDS", "").split(","):
@@ -2532,12 +2673,12 @@ def _detect_image_mime(path: str) -> str:
     return "image/jpeg"
 
 # ---------------------------------------------------------------------------
-# Hugging Face OCR
+# OCR
 # ---------------------------------------------------------------------------
 async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
-    """Read an image from disk and extract text with Hugging Face OCR."""
-    if _hf_client is None:
-        raise RuntimeError("HF_TOKEN not set or huggingface_hub not installed.")
+    """Read an image from disk and extract text using the configured OCR provider."""
+    if not _ocr_configured():
+        raise RuntimeError(_ocr_status_for_user())
 
     loop = asyncio.get_running_loop()
     try:
@@ -2555,13 +2696,13 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
         async with semaphore:
             return await loop.run_in_executor(
                 _AI_EXECUTOR,
-                lambda: ask_huggingface_ocr(image_bytes),
+                lambda: ask_ocr_image(image_bytes, mime_type)[0],
             )
 
     try:
-        return await asyncio.wait_for(_guarded_call(), timeout=90)
+        return await asyncio.wait_for(_guarded_call(), timeout=OCR_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
-        raise RuntimeError("Hugging Face OCR timed out after 90s")
+        raise RuntimeError(f"OCR timed out after {OCR_TIMEOUT_SECONDS}s")
 
 # ---------------------------------------------------------------------------
 # Cooldown check
@@ -4163,10 +4304,8 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: msg.reply_text("✅ រូបភាពបានផ្ញើដល់ Admin ។"))
         return
 
-    if _hf_client is None:
-        await safe_send(
-            lambda: msg.reply_text("❌ Hugging Face OCR មិន Activate ទេ។ សូម Set HF_TOKEN ។")
-        )
+    if not _ocr_configured():
+        await safe_send(lambda: msg.reply_text(_ocr_status_for_user()))
         return
 
     if await _check_cooldown(msg, user_id):
@@ -4222,7 +4361,8 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"on_photo OCR error: {type(e).__name__}: {e!r}", exc_info=True)
         if _is_dns_or_network_error(err_msg):
             user_msg = (
-                "❌ មានបញ្ហាក្នុងការ OCR រូបភាព។"
+                "❌ OCR network/DNS មានបញ្ហា។ Server មិនអាចភ្ជាប់ទៅ Provider OCR បាន។\n"
+                "✅ Code នេះនឹងសាក fallback provider ដោយស្វ័យប្រវត្តិ បើអ្នកបាន Set OCR_PROVIDER=auto និង GEMINI_API_KEY/GEMINI_MODEL។"
             )
         elif "model/provider is not available" in err_msg:
             user_msg = (
@@ -5220,7 +5360,7 @@ async def _run_bot():
     app.add_error_handler(error_handler)
 
     logger.info(f"Bot polling started. Admins: {ADMIN_IDS or 'none configured'}")
-    logger.info(f"HF model: {HF_MODEL}; HF OCR model: {HF_OCR_MODEL}")
+    logger.info(f"HF model: {HF_MODEL}; OCR provider: {OCR_PROVIDER}; HF OCR model: {HF_OCR_MODEL}; Gemini OCR available: {_gemini is not None}")
 
     sched_stop = asyncio.Event()
     sweep_stop = asyncio.Event()
@@ -5266,7 +5406,7 @@ def main():
             "Set ADMIN_IDS=123456,789012 in your environment."
         )
 
-    print(f"Bot is starting... (AI provider: {AI_PROVIDER}, HF: {HF_MODEL}, OCR: {HF_OCR_MODEL})")
+    print(f"Bot is starting... (AI provider: {AI_PROVIDER}, HF: {HF_MODEL}, OCR provider: {OCR_PROVIDER}, HF OCR: {HF_OCR_MODEL})")
     while True:
         try:
             asyncio.run(_run_bot())
