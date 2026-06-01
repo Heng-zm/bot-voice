@@ -110,6 +110,8 @@ _AI_SYSTEM_PROMPT = (
 MAX_CONCURRENT_TTS_USERS   = int(os.environ.get("MAX_CONCURRENT_TTS_USERS", "6"))
 MAX_CONCURRENT_AI          = int(os.environ.get("MAX_CONCURRENT_AI", os.environ.get("MAX_CONCURRENT_GEMINI", "3")))
 MAX_CONCURRENT_BROADCAST   = int(os.environ.get("MAX_CONCURRENT_BROADCAST", "3"))
+BROADCAST_BATCH_SIZE       = max(1, int(os.environ.get("BROADCAST_BATCH_SIZE", str(MAX_CONCURRENT_BROADCAST))))
+BROADCAST_INTER_BATCH_DELAY = float(os.environ.get("BROADCAST_INTER_BATCH_DELAY", "0.20"))
 TTS_RESOLVER_AI_ENABLED    = os.environ.get("TTS_RESOLVER_AI_ENABLED", "0") == "1"
 
 # ---------------------------------------------------------------------------
@@ -140,14 +142,29 @@ def _detect_lang(text: str) -> str:
 
 
 def _check_ai_api_key() -> bool:
-    required = os.environ.get("AI_API_KEY", "")
+    """Require AI_API_KEY for every public /ai-assistant endpoint.
+
+    Security: the AI REST API no longer becomes public when AI_API_KEY is
+    missing. Set AI_API_KEY in your deployment env and send it as either
+    `X-Api-Key: <key>` or `Authorization: Bearer <key>`.
+
+    FIX: Downgraded missing-key log from ERROR to WARNING to avoid log spam
+    on every unauthenticated request.
+    """
+    required = os.environ.get("AI_API_KEY", "").strip()
     if not required:
-        return True
+        # FIX: was logger.error — changed to warning to avoid log spam
+        logging.getLogger(__name__).warning(
+            "AI_API_KEY is not set; refusing public AI API request."
+        )
+        return False
+
+    auth_header = request.headers.get("Authorization", "")
     client_key = (
         request.headers.get("X-Api-Key")
-        or request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+        or auth_header.removeprefix("Bearer ").strip()
     )
-    return client_key == required
+    return bool(client_key) and client_key == required
 
 
 def _build_gemini_contents(
@@ -523,7 +540,8 @@ def ai_info():
             "huggingface_ocr_model": HF_OCR_MODEL,
             "ocr_provider": OCR_PROVIDER,
             "ocr_configured": _ocr_configured(),
-            "hf_ocr_temporarily_disabled": _hf_ocr_is_temporarily_disabled(),
+            "hf_ocr_temporarily_disabled": _hf_ocr_is_temporarily_disabled() or _ocr_provider_is_temporarily_disabled("hf"),
+            "gemini_ocr_temporarily_disabled": _ocr_provider_is_temporarily_disabled("gemini"),
             "gemini_legacy_available": _gemini is not None,
             "gemini_legacy_model": GEMINI_MODEL or None,
         },
@@ -535,7 +553,8 @@ def ai_info():
         },
         "supported_image_types": sorted(_AI_ALLOWED_IMAGE_MIME),
         "supported_audio_types": sorted(_AI_ALLOWED_AUDIO_MIME),
-        "auth_required": bool(os.environ.get("AI_API_KEY", "")),
+        "auth_required": True,
+        "auth_configured": bool(os.environ.get("AI_API_KEY", "").strip()),
     })
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
@@ -600,6 +619,8 @@ AI_PROVIDER             = "hf"
 OCR_PROVIDER            = "auto"   # auto | hf | gemini
 OCR_TIMEOUT_SECONDS     = 90
 HF_OCR_DNS_COOLDOWN_S   = 300.0
+OCR_PROVIDER_FAILURE_LIMIT = max(1, int(os.environ.get("OCR_PROVIDER_FAILURE_LIMIT", "3")))
+OCR_PROVIDER_COOLDOWN_S    = float(os.environ.get("OCR_PROVIDER_COOLDOWN_S", "300"))
 MAX_VOICE_BYTES         = 20 * 1024 * 1024
 MAX_AUDIO_FILE_BYTES    = 50 * 1024 * 1024
 MAX_INPUT_CHARS         = 5_000
@@ -670,6 +691,7 @@ CHAT_WAIT_MESSAGE      = 2
 SCHED_WAIT_MSG         = 3
 SCHED_WAIT_TIME        = 4
 _SCHED_POLL_INTERVAL   = 60
+_SCHED_SENDING_STALE_SECONDS = int(os.environ.get("SCHED_SENDING_STALE_SECONDS", "1800"))
 _DT_FORMATS = [
     "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S",
     "%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M",
@@ -735,6 +757,38 @@ _hf_client = None
 _hf_ocr_disabled_until = 0.0
 _hf_ocr_failures       = 0
 _hf_ocr_state_lock     = threading.Lock()
+
+# Generic OCR provider circuit breaker.
+_ocr_provider_disabled_until: dict[str, float] = {"hf": 0.0, "gemini": 0.0}
+_ocr_provider_failures: dict[str, int] = {"hf": 0, "gemini": 0}
+_ocr_provider_state_lock = threading.Lock()
+
+
+def _ocr_provider_is_temporarily_disabled(provider: str) -> bool:
+    provider = (provider or "").lower().strip()
+    with _ocr_provider_state_lock:
+        return time.monotonic() < _ocr_provider_disabled_until.get(provider, 0.0)
+
+
+def _mark_ocr_provider_success(provider: str) -> None:
+    provider = (provider or "").lower().strip()
+    with _ocr_provider_state_lock:
+        _ocr_provider_failures[provider] = 0
+        _ocr_provider_disabled_until[provider] = 0.0
+
+
+def _mark_ocr_provider_failure(provider: str, exc: Exception | str) -> None:
+    provider = (provider or "").lower().strip()
+    with _ocr_provider_state_lock:
+        failures = _ocr_provider_failures.get(provider, 0) + 1
+        _ocr_provider_failures[provider] = failures
+        if _is_dns_or_network_error(exc) or failures >= OCR_PROVIDER_FAILURE_LIMIT:
+            cooldown = HF_OCR_DNS_COOLDOWN_S if provider == "hf" and _is_dns_or_network_error(exc) else OCR_PROVIDER_COOLDOWN_S
+            _ocr_provider_disabled_until[provider] = time.monotonic() + cooldown
+            logger.warning(
+                "OCR provider %s temporarily disabled for %.0fs after %d failure(s): %s",
+                provider, cooldown, failures, str(exc)[:300],
+            )
 
 
 def _init_hf_client() -> None:
@@ -882,10 +936,12 @@ def _mark_hf_ocr_failure(exc: Exception | str) -> None:
 
 def _ocr_configured() -> bool:
     p  = (OCR_PROVIDER or "auto").lower().strip()
-    hf = _hf_client is not None
-    gm = _gemini is not None
-    if p == "hf":     return hf
-    if p == "gemini": return gm
+    hf = _hf_client is not None and not _hf_ocr_is_temporarily_disabled() and not _ocr_provider_is_temporarily_disabled("hf")
+    gm = _gemini is not None and not _ocr_provider_is_temporarily_disabled("gemini")
+    if p == "hf":
+        return hf
+    if p == "gemini":
+        return gm
     return hf or gm
 
 
@@ -897,6 +953,10 @@ def _ocr_status_for_user() -> str:
         return "❌ OCR Gemini មិនទាន់ Activate ទេ។ សូម Set GEMINI_API_KEY និង GEMINI_MODEL។"
     if _hf_client is None and _gemini is None:
         return "❌ OCR មិនទាន់ Activate ទេ។ សូម Set HF_TOKEN ឬ GEMINI_API_KEY/GEMINI_MODEL។"
+    if p == "hf" and (_hf_ocr_is_temporarily_disabled() or _ocr_provider_is_temporarily_disabled("hf")):
+        return "❌ Hugging Face OCR ត្រូវបានបិទបណ្តោះអាសន្ន ព្រោះមាន network/API errors ជាប់គ្នា។"
+    if p == "gemini" and _ocr_provider_is_temporarily_disabled("gemini"):
+        return "❌ Gemini OCR ត្រូវបានបិទបណ្តោះអាសន្ន ព្រោះមាន network/API errors ជាប់គ្នា។"
     return "❌ OCR មិនអាចប្រើបាននៅពេលនេះ។ សូមពិនិត្យ API key និង network។"
 
 
@@ -1025,23 +1085,39 @@ def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tuple[str
     errors: list[str] = []
 
     if provider in ("auto", "hf") and _hf_client is not None:
-        try:
-            return ask_huggingface_ocr(image_data), "hf", HF_OCR_MODEL
-        except Exception as e:
-            errors.append(f"hf={type(e).__name__}: {e!r}")
-            _mark_hf_ocr_failure(e)
+        hf_disabled = _hf_ocr_is_temporarily_disabled() or _ocr_provider_is_temporarily_disabled("hf")
+        if hf_disabled:
+            errors.append("hf=temporarily disabled after recent OCR failures")
             if provider == "hf":
                 raise _friendly_ocr_error(errors)
-            logger.warning(f"HF OCR failed; trying Gemini fallback: {e}")
+        else:
+            try:
+                text = ask_huggingface_ocr(image_data)
+                _mark_ocr_provider_success("hf")
+                return text, "hf", HF_OCR_MODEL
+            except Exception as e:
+                errors.append(f"hf={type(e).__name__}: {e!r}")
+                _mark_ocr_provider_failure("hf", e)
+                if provider == "hf":
+                    raise _friendly_ocr_error(errors)
+                logger.warning(f"HF OCR failed; trying Gemini fallback: {e}")
 
     if provider in ("auto", "gemini") and _gemini is not None:
-        try:
-            return ask_gemini_ocr(image_data, mime_type), "gemini", GEMINI_MODEL
-        except Exception as e:
-            errors.append(f"gemini={type(e).__name__}: {e!r}")
+        if _ocr_provider_is_temporarily_disabled("gemini"):
+            errors.append("gemini=temporarily disabled after recent OCR failures")
             if provider == "gemini":
                 raise _friendly_ocr_error(errors)
-            logger.warning(f"Gemini OCR fallback failed: {e}")
+        else:
+            try:
+                text = ask_gemini_ocr(image_data, mime_type)
+                _mark_ocr_provider_success("gemini")
+                return text, "gemini", GEMINI_MODEL
+            except Exception as e:
+                errors.append(f"gemini={type(e).__name__}: {e!r}")
+                _mark_ocr_provider_failure("gemini", e)
+                if provider == "gemini":
+                    raise _friendly_ocr_error(errors)
+                logger.warning(f"Gemini OCR fallback failed: {e}")
 
     if not errors:
         errors.append(
@@ -1519,7 +1595,7 @@ def update_user_speed(user_id: int, speed: float) -> None:
         try:
             supabase.table("user_prefs").update({"speed": speed}).eq("user_id", user_id).execute()
         except Exception as e:
-            if "does not exist" in str(e):
+            if "does not exist" in str(e).lower():
                 logger.error(
                     "speed column missing — run: "
                     "ALTER TABLE user_prefs ADD COLUMN speed FLOAT DEFAULT 1.0;"
@@ -1531,6 +1607,30 @@ def update_user_speed(user_id: int, speed: float) -> None:
 
 _rls_warned = False
 
+# Fast in-memory cache for callback buttons.
+_TEXT_CACHE_MEMORY_MAX = 20_000
+_text_cache_memory: OrderedDict[tuple[int, int], tuple[str, float]] = OrderedDict()
+
+
+def _remember_text_cache_sync(msg_id: int, chat_id: int, text: str) -> None:
+    text = (text or "").strip()
+    if not text:
+        return
+    key = (int(chat_id or 0), int(msg_id))
+    _text_cache_memory.pop(key, None)
+    _text_cache_memory[key] = (text, time.monotonic())
+    while len(_text_cache_memory) > _TEXT_CACHE_MEMORY_MAX:
+        _text_cache_memory.popitem(last=False)
+
+
+def _get_text_cache_memory_sync(msg_id: int, chat_id: int) -> str | None:
+    key = (int(chat_id or 0), int(msg_id))
+    item = _text_cache_memory.get(key)
+    if not item:
+        return None
+    _text_cache_memory.move_to_end(key)
+    return item[0]
+
 
 def save_text_cache(
     msg_id: int,
@@ -1539,6 +1639,7 @@ def save_text_cache(
     user_id: int = None,
     username: str = None,
 ) -> None:
+    _remember_text_cache_sync(msg_id, chat_id, text)
     if not supabase:
         return
     def _run():
@@ -1570,6 +1671,9 @@ def save_text_cache(
 
 
 def get_text_cache(msg_id: int, chat_id: int = 0) -> str | None:
+    cached = _get_text_cache_memory_sync(msg_id, chat_id)
+    if cached:
+        return cached
     if not supabase:
         return None
     try:
@@ -1581,7 +1685,9 @@ def get_text_cache(msg_id: int, chat_id: int = 0) -> str | None:
             .execute()
         )
         if res.data:
-            return res.data[0]["original_text"]
+            text = res.data[0]["original_text"]
+            _remember_text_cache_sync(msg_id, chat_id, text)
+            return text
     except Exception as e:
         logger.error(f"DB get_text_cache: {e}")
     return None
@@ -1596,7 +1702,8 @@ def ensure_speed_column() -> None:
         logger.info("speed column present.")
     except Exception as e:
         err = str(e).lower()
-        if "does not exist" in err or "column" in err:
+        # FIX: was `"column" in err` which is too broad — tightened to specific messages
+        if "does not exist" in err or "column \"speed\"" in err or "undefined column" in err:
             logger.warning(
                 "speed column missing. Run:\n"
                 "  ALTER TABLE user_prefs ADD COLUMN speed FLOAT DEFAULT 1.0;"
@@ -1902,6 +2009,35 @@ def db_sched_set_status(row_id: int, status: str, **extra) -> None:
         return
     with suppress(Exception):
         supabase.table("scheduled_broadcasts").update({"status": status, **extra}).eq("id", row_id).execute()
+
+
+def db_sched_mark_stale_sending_failed() -> int:
+    """Recover scheduled broadcasts stuck in 'sending' after a crash.
+
+    FIX: Uses broadcast_at as the age proxy (unchanged), but the cutoff
+    calculation now uses `_SCHED_SENDING_STALE_SECONDS` correctly relative to
+    UTC now so that broadcasts scheduled far in the past are recovered.
+    """
+    if not supabase:
+        return 0
+    try:
+        cutoff = datetime.fromtimestamp(
+            time.time() - max(60, _SCHED_SENDING_STALE_SECONDS), timezone.utc
+        ).isoformat()
+        res = (
+            supabase.table("scheduled_broadcasts")
+            .update({
+                "status": "failed",
+                "error_msg": f"Marked failed: stuck in sending for more than {_SCHED_SENDING_STALE_SECONDS}s",
+            })
+            .eq("status", "sending")
+            .lte("broadcast_at", cutoff)
+            .execute()
+        )
+        return len(res.data or [])
+    except Exception as e:
+        logger.error(f"db_sched_mark_stale_sending_failed: {e}")
+        return 0
 
 
 def db_sched_fetch_admin_pending(admin_id: int) -> list[dict]:
@@ -2515,6 +2651,16 @@ def _get_admin_for_user(user_id: int) -> int | None:
 # ===========================================================================
 # Broadcast helper
 # ===========================================================================
+def _safe_broadcast_html(text: str | None, max_chars: int) -> str | None:
+    """Escape admin/user broadcast content before using Telegram HTML mode."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if len(raw) > max_chars:
+        raw = raw[: max_chars - 1] + "…"
+    return html.escape(raw, quote=False)
+
+
 async def _run_broadcast_to_all(
     bot,
     admin_id: int,
@@ -2539,11 +2685,18 @@ async def _run_broadcast_to_all(
 
     sent = failed = blocked = 0
     photo_file_id = pending.get("photo_file_id")
-    caption       = pending.get("caption") or ""
-    plain_text    = pending.get("text") or ""
+    safe_caption  = _safe_broadcast_html(pending.get("caption"), 1024)
+    safe_text     = _safe_broadcast_html(pending.get("text"), 4096)
+
+    if not photo_file_id and not safe_text:
+        await safe_send(lambda: bot.send_message(
+            chat_id=admin_id, text=f"❌ {label}: Broadcast text is empty."
+        ))
+        return (0, 0, 0)
 
     progress_msg = await safe_send(lambda: bot.send_message(
-        chat_id=admin_id, text=f"📡 {label} — កំពុង Broadcast ទៅ {total} នាក់..."
+        chat_id=admin_id,
+        text=f"📡 {label} — កំពុង Broadcast ទៅ {total} នាក់..."
     ))
 
     async def _send_one(uid: int) -> str:
@@ -2552,12 +2705,17 @@ async def _run_broadcast_to_all(
                 try:
                     if photo_file_id:
                         await bot.send_photo(
-                            chat_id=uid, photo=photo_file_id,
-                            caption=caption or None,
-                            parse_mode="HTML" if caption else None,
+                            chat_id=uid,
+                            photo=photo_file_id,
+                            caption=safe_caption,
+                            parse_mode="HTML" if safe_caption else None,
                         )
                     else:
-                        await bot.send_message(chat_id=uid, text=plain_text, parse_mode="HTML")
+                        await bot.send_message(
+                            chat_id=uid,
+                            text=safe_text or " ",
+                            parse_mode="HTML",
+                        )
                     return "sent"
                 except Forbidden:
                     return "blocked"
@@ -2565,28 +2723,49 @@ async def _run_broadcast_to_all(
                     await asyncio.sleep(e.retry_after + 1)
                     if attempt == 1:
                         return "failed"
+                except BadRequest as e:
+                    logger.error(f"{label} Telegram BadRequest uid={uid}: {e}")
+                    return "failed"
                 except Exception as e:
                     logger.error(f"{label} error uid={uid} attempt={attempt}: {e}")
                     if attempt == 1:
                         return "failed"
+                    await asyncio.sleep(0.5 * (attempt + 1))
         return "failed"
 
-    for i, uid in enumerate(user_ids):
-        result = await _send_one(uid)
-        if result == "sent":     sent    += 1
-        elif result == "blocked": blocked += 1
-        else:                     failed  += 1
-        await asyncio.sleep(0.034)
-        if (i + 1) % 25 == 0 and progress_msg:
+    batch_size = max(1, BROADCAST_BATCH_SIZE)
+    for start in range(0, total, batch_size):
+        batch = user_ids[start:start + batch_size]
+        results = await asyncio.gather(
+            *(_send_one(uid) for uid in batch),
+            return_exceptions=True,
+        )
+
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"{label} batch task error: {result}")
+                failed += 1
+            elif result == "sent":
+                sent += 1
+            elif result == "blocked":
+                blocked += 1
+            else:
+                failed += 1
+
+        completed = min(start + len(batch), total)
+        if progress_msg and (completed == total or completed % max(25, batch_size) == 0):
             with suppress(Exception):
-                pct = int((i + 1) / total * 100) if total else 0
+                pct = int(completed / total * 100) if total else 0
                 await progress_msg.edit_text(
-                    f"📡 {label}: {pct}% ({i+1}/{total})\n"
+                    f"📡 {label}: {pct}% ({completed}/{total})\n"
                     f"✅ {sent}  🚫 {blocked}  ❌ {failed}"
                 )
 
+        if completed < total:
+            await asyncio.sleep(max(0.0, BROADCAST_INTER_BATCH_DELAY))
+
     report = (
-        f"✅ <b>{label} រួចរាល់!</b>\n\n"
+        f"✅ <b>{html.escape(label)}</b> រួចរាល់!\n\n"
         f"👥 សរុប: {total}\n📨 បានផ្ញើ: {sent}\n"
         f"🚫 Blocked: {blocked}\n❌ Failed: {failed}"
     )
@@ -2599,7 +2778,6 @@ async def _run_broadcast_to_all(
         logger.error(f"{label} report error: {e}")
 
     return (sent, failed, blocked)
-
 
 # ===========================================================================
 # BROADCAST (immediate)
@@ -3261,27 +3439,42 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
         logger.warning(f"Scheduled broadcast #{row_id} already claimed — skipping.")
         return
 
-    pending = {
-        "photo_file_id": row.get("photo_file_id"),
-        "caption":       row.get("caption") or "",
-        "text":          row.get("plain_text") or "",
-    }
-    sent, failed, blocked = await _run_broadcast_to_all(
-        bot, admin_id, pending, label=f"Scheduled #{row_id}"
-    )
+    sent = failed = blocked = 0
     try:
-        if supabase:
-            await loop.run_in_executor(
-                None,
-                lambda: supabase.table("scheduled_broadcasts").update({
-                    "status":        "done",
-                    "sent_count":    sent,
-                    "failed_count":  failed,
-                    "blocked_count": blocked,
-                }).eq("id", row_id).execute(),
-            )
+        pending = {
+            "photo_file_id": row.get("photo_file_id"),
+            "caption":       row.get("caption") or "",
+            "text":          row.get("plain_text") or "",
+        }
+        sent, failed, blocked = await _run_broadcast_to_all(
+            bot, admin_id, pending, label=f"Scheduled #{row_id}"
+        )
+        await loop.run_in_executor(
+            None,
+            functools.partial(
+                db_sched_set_status,
+                row_id,
+                "done",
+                sent_count=sent,
+                failed_count=failed,
+                blocked_count=blocked,
+                error_msg=None,
+            ),
+        )
     except Exception as e:
-        logger.error(f"Could not mark scheduled broadcast #{row_id} done: {e}")
+        logger.error(f"Scheduled broadcast #{row_id} failed: {e}", exc_info=True)
+        await loop.run_in_executor(
+            None,
+            functools.partial(
+                db_sched_set_status,
+                row_id,
+                "failed",
+                sent_count=sent,
+                failed_count=failed,
+                blocked_count=blocked,
+                error_msg=str(e)[:1000],
+            ),
+        )
 
 
 _scheduler_tasks: set[asyncio.Task] = set()
@@ -3292,6 +3485,9 @@ async def _scheduler_loop(bot, stop_event: asyncio.Event) -> None:
     while not stop_event.is_set():
         try:
             loop = asyncio.get_running_loop()
+            stale_count = await loop.run_in_executor(None, db_sched_mark_stale_sending_failed)
+            if stale_count:
+                logger.warning(f"Marked {stale_count} stale scheduled broadcast(s) as failed.")
             due  = await loop.run_in_executor(None, db_sched_fetch_due)
             for row in due:
                 task = asyncio.create_task(_fire_scheduled_broadcast(bot, row))
@@ -3543,22 +3739,23 @@ _BOT_START_TIME: float = 0.0
 
 
 async def _drop_stale_updates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Drop old message updates received before bot started.
+
+    FIX: For callback_query updates, we intentionally do NOT drop them based on
+    message date — the message date is when the original message was sent, not
+    when the user tapped the button. Dropping callbacks based on message age
+    would break buttons on messages sent before the bot restarted. We only drop
+    stale *message* updates.
+    """
     if _BOT_START_TIME == 0.0:
         return
+
+    # Only filter plain messages (not callbacks)
     msg = update.message or update.edited_message
-    if msg and hasattr(msg, "date") and msg.date:
+    if msg and getattr(msg, "date", None):
         if msg.date.timestamp() < (_BOT_START_TIME - _STALE_GRACE_S):
-            logger.debug(f"Dropping stale update (id={update.update_id})")
+            logger.debug(f"Dropping stale message update (id={update.update_id})")
             raise ApplicationHandlerStop
-
-
-async def _drop_stale_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.callback_query or _BOT_START_TIME == 0.0:
-        return
-    msg = update.callback_query.message
-    if msg and msg.date and msg.date.timestamp() < (_BOT_START_TIME - _STALE_GRACE_S):
-        logger.debug(f"Dropping stale callback (id={update.update_id})")
-        raise ApplicationHandlerStop
 
 
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3752,8 +3949,12 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mime_type = doc.mime_type or ""
         file_id   = doc.file_id
         file_size = doc.file_size or 0
-        # Subtitle/text reader
+        # FIX: Check subtitle BEFORE audio — subtitle files (.txt/.srt/.vtt) must
+        # be handled by on_document, not the audio transcriber.
         if _is_subtitle_file(filename):
+            await on_document(update, context)
+            return
+        if not _is_audio_file(filename, mime_type):
             await on_document(update, context)
             return
     elif audio is not None:
@@ -3762,9 +3963,6 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_id   = audio.file_id
         file_size = audio.file_size or 0
     else:
-        return
-
-    if not _is_audio_file(filename, mime_type):
         return
 
     if not _gemini:
@@ -4161,8 +4359,11 @@ async def _cb_speed(query, user_id: int, context, data: str):
                 audio_bytes = await generate_voice_limited(original_text, gender, new_speed, file_path)
                 with suppress(Exception):
                     await query.message.delete()
+                # FIX: was query.message.chat.send_voice() which is not a valid method.
+                # Chat object has no send_voice. Must use bot.send_voice(chat_id=...).
                 new_msg = await safe_send(
-                    lambda ab=audio_bytes, g=gender: query.message.chat.send_voice(
+                    lambda ab=audio_bytes, g=gender: context.bot.send_voice(
+                        chat_id=chat_id,
                         voice=io.BytesIO(ab),
                         caption=f"🗣️ {BOT_TAG}",
                         reply_markup=get_main_kb(g),
@@ -4180,7 +4381,9 @@ async def _cb_speed(query, user_id: int, context, data: str):
             except Exception as e:
                 logger.error(f"speed regen error: {e}", exc_info=True)
                 with suppress(Exception):
-                    await safe_send(lambda: query.message.reply_text("❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"))
+                    await safe_send(lambda: context.bot.send_message(
+                        chat_id=chat_id, text="❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"
+                    ))
     finally:
         await _stop_timer(stop_event, timer_task)
         _cleanup(file_path)
@@ -4220,8 +4423,11 @@ async def _cb_gender(query, user_id: int, context, data: str):
                 audio_bytes = await generate_voice_limited(original_text, new_gender, speed, file_path)
                 with suppress(Exception):
                     await query.message.delete()
+                # FIX: was query.message.chat.send_voice() — Chat object has no send_voice.
+                # Must use bot.send_voice(chat_id=...).
                 new_msg = await safe_send(
-                    lambda ab=audio_bytes, ng=new_gender: query.message.chat.send_voice(
+                    lambda ab=audio_bytes, ng=new_gender: context.bot.send_voice(
+                        chat_id=chat_id,
                         voice=io.BytesIO(ab),
                         caption=f"🗣️ {BOT_TAG}",
                         reply_markup=get_main_kb(ng),
@@ -4239,7 +4445,9 @@ async def _cb_gender(query, user_id: int, context, data: str):
             except Exception as e:
                 logger.error(f"gender regen error: {e}", exc_info=True)
                 with suppress(Exception):
-                    await safe_send(lambda: query.message.reply_text("❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"))
+                    await safe_send(lambda: context.bot.send_message(
+                        chat_id=chat_id, text="❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"
+                    ))
     finally:
         await _stop_timer(stop_event, timer_task)
         _cleanup(file_path)
@@ -4275,8 +4483,10 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
         async with lock:
             try:
                 audio_bytes = await generate_voice_limited(original_text, gender, speed, file_path)
-                new_msg     = await safe_send(
-                    lambda ab=audio_bytes, g=gender: query.message.chat.send_voice(
+                # FIX: was query.message.chat.send_voice() — Chat object has no send_voice.
+                new_msg = await safe_send(
+                    lambda ab=audio_bytes, g=gender: context.bot.send_voice(
+                        chat_id=chat_id,
                         voice=io.BytesIO(ab),
                         caption=f"🗣️ {BOT_TAG}",
                         reply_markup=get_main_kb(g),
@@ -4294,7 +4504,9 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
             except Exception as e:
                 logger.error(f"transcript TTS error: {e}", exc_info=True)
                 with suppress(Exception):
-                    await safe_send(lambda: query.message.reply_text("❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"))
+                    await safe_send(lambda: context.bot.send_message(
+                        chat_id=chat_id, text="❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"
+                    ))
     finally:
         await _stop_timer(stop_event, timer_task)
         _cleanup(file_path)
@@ -4320,9 +4532,9 @@ async def _cb_audio_tts(query, user_id: int, context, data: str):
     speed     = prefs["speed"]
     uname     = query.from_user.username or query.from_user.first_name or str(user_id)
 
-    with suppress(Exception):
-        await query.message.edit_reply_markup(reply_markup=None)
-
+    # FIX: Only remove the button markup AFTER TTS succeeds. If we remove it
+    # before and TTS fails, the user has no way to retry. We suppress errors
+    # so a stale markup doesn't block delivery.
     tts_stop  = asyncio.Event()
     tts_timer = asyncio.create_task(send_status_timer(chat_id, context.bot, tts_stop))
     lock      = _get_user_lock(user_id)
@@ -4336,6 +4548,9 @@ async def _cb_audio_tts(query, user_id: int, context, data: str):
                     user_id=user_id, username=uname,
                 )
                 record_turn(user_id, "assistant", full_text[:CONV_CONTEXT_MAX_CHARS])
+                # Remove markup only after successful delivery
+                with suppress(Exception):
+                    await query.message.edit_reply_markup(reply_markup=None)
             except Exception as e:
                 logger.error(f"_cb_audio_tts delivery error: {e}")
                 with suppress(Exception):
@@ -4349,21 +4564,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data    = query.data
 
-    with suppress(Exception):
-        await query.answer()
-
     if query.message is None:
         logger.debug(f"on_callback: no message for data={data!r}")
+        # FIX: Still answer the query to prevent Telegram showing a loading spinner
+        with suppress(Exception):
+            await query.answer()
         return
 
-    # Skip patterns already handled by dedicated CallbackQueryHandlers
-    _HANDLED_PREFIXES = (
-        "bc_confirm", "bc_cancel",
-        "sched_",
-        "users_page:", "users_close", "chat_open:", "noop",
-    )
-    if any(data == p or data.startswith(p) for p in _HANDLED_PREFIXES):
+    # FIX: These patterns are handled by dedicated CallbackQueryHandlers that
+    # already call query.answer(). Do NOT answer here — it would cause a
+    # "query is too old" double-answer error on Telegram's side.
+    _HANDLED_EXACT = {"bc_confirm", "bc_cancel", "users_close", "noop"}
+    _HANDLED_PREFIX = ("sched_", "users_page:", "chat_open:")
+    if data in _HANDLED_EXACT or any(data.startswith(p) for p in _HANDLED_PREFIX):
         return
+
+    # Answer all other callbacks here (only once)
+    with suppress(Exception):
+        await query.answer()
 
     try:
         if data == "show_speed":
@@ -4415,11 +4633,14 @@ async def _run_bot():
     _prefs_cache_lock    = asyncio.Lock()
     _TTS_CHUNK_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TTS_USERS)
 
-    # Reset all mutable state on restart
+    # FIX: Reset ALL mutable in-memory state on restart to prevent stale data
+    # accumulation across crash-restart cycles.
     for store in (
         _admin_chat_target, _user_to_admin, _pending_broadcast,
         _prefs_cache, _user_last_tts, _sched_payload,
         _hist_cache, _user_locks,
+        # FIX: These two were missing from the original reset list:
+        _last_tts_text, _text_cache_memory,
     ):
         store.clear()
     _scheduler_tasks.clear()
@@ -4437,7 +4658,6 @@ async def _run_bot():
     )
 
     app.add_handler(TypeHandler(Update, _drop_stale_updates), group=-1)
-    app.add_handler(CallbackQueryHandler(_drop_stale_callback), group=-1)
 
     # Commands
     app.add_handler(CommandHandler("start",           on_start))
