@@ -2429,14 +2429,27 @@ def get_sched_confirm_kb(row_id: int) -> InlineKeyboardMarkup:
 
 
 def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
+    """Main admin control panel keyboard.
+
+    FIX: Dashboard buttons now open real panels/actions instead of sending
+    separate "use command" messages. This keeps the admin UI clean on mobile.
+    """
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Stats",     callback_data="admin_stats"),
-         InlineKeyboardButton("🩺 Health",    callback_data="admin_health")],
-        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
-         InlineKeyboardButton("⏰ Schedules", callback_data="admin_schedules")],
-        [InlineKeyboardButton("🔑 API Keys",  callback_data="admin_api"),
-         InlineKeyboardButton("👥 Users",     callback_data="admin_users")],
-        [InlineKeyboardButton("❌ Close",     callback_data="admin_close")],
+        [InlineKeyboardButton("📊 Stats",       callback_data="admin_stats"),
+         InlineKeyboardButton("🩺 Health",      callback_data="admin_health")],
+        [InlineKeyboardButton("📢 Broadcast",   callback_data="admin_broadcast"),
+         InlineKeyboardButton("⏰ Schedules",   callback_data="admin_schedules")],
+        [InlineKeyboardButton("🔑 API Keys",    callback_data="admin_api"),
+         InlineKeyboardButton("👥 Users",       callback_data="admin_users")],
+        [InlineKeyboardButton("🔄 Refresh",     callback_data="admin_home"),
+         InlineKeyboardButton("❌ Close",       callback_data="admin_close")],
+    ])
+
+
+def get_admin_action_kb(cancel_callback: str = "admin_cancel_state") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Admin Dashboard", callback_data="admin_home"),
+         InlineKeyboardButton("❌ Cancel",          callback_data=cancel_callback)],
     ])
 
 
@@ -2502,6 +2515,8 @@ def get_schedules_list_kb(rows: list[dict], page: int, page_size: int = 5) -> In
     if page < total - 1:    nav.append(InlineKeyboardButton("➡️", callback_data=f"sched_page:{page+1}"))
     if nav:
         kbd_rows.append(nav)
+    kbd_rows.append([InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+                     InlineKeyboardButton("📅 New", callback_data="admin_schedule_new")])
     kbd_rows.append([InlineKeyboardButton("❌ បិទ", callback_data="sched_close")])
     return InlineKeyboardMarkup(kbd_rows)
 
@@ -2977,7 +2992,8 @@ def get_users_page_kb(users: list[dict], page: int, page_size: int = 8) -> Inlin
     if page < total_pages-1:  nav.append(InlineKeyboardButton("➡️", callback_data=f"users_page:{page+1}"))
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton("❌ បិទ", callback_data="users_close")])
+    rows.append([InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+                 InlineKeyboardButton("❌ បិទ", callback_data="users_close")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -3169,17 +3185,181 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ))
 
 
+async def _admin_summary_counts(admin_id: int) -> dict:
+    """Fetch lightweight admin dashboard counts without blocking the event loop."""
+    def _fetch() -> dict:
+        counts = {
+            "total_users": 0,
+            "pending_sched": 0,
+            "blocked_users": 0,
+            "active_api_keys": 0,
+            "api_table_ok": False,
+        }
+        try:
+            counts["total_users"] = len(get_all_user_ids()) if supabase else 0
+        except Exception as e:
+            logger.warning(f"admin user count failed: {e}")
+        try:
+            counts["pending_sched"] = len(db_sched_fetch_admin_pending(admin_id)) if supabase else 0
+        except Exception as e:
+            logger.warning(f"admin schedule count failed: {e}")
+        if supabase:
+            try:
+                blocked = supabase.table("blocked_users").select("user_id").execute()
+                counts["blocked_users"] = len(blocked.data or [])
+            except Exception:
+                counts["blocked_users"] = 0
+        try:
+            api_status = db_ai_api_key_status()
+            counts["active_api_keys"] = int(api_status.get("active_count") or 0)
+            counts["api_table_ok"] = bool(api_status.get("table_ok"))
+        except Exception:
+            counts["api_table_ok"] = False
+        return counts
+
+    return await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, _fetch)
+
+
+def _ok_bad(ok: bool, ok_text: str = "OK", bad_text: str = "OFF") -> str:
+    return f"✅ {ok_text}" if ok else f"⚠️ {bad_text}"
+
+
+async def _admin_home_text(admin_id: int, title: str = "🛠️ Admin Dashboard") -> str:
+    counts = await _admin_summary_counts(admin_id)
+    ffmpeg_ok = bool(_FFMPEG_EXE and os.path.exists(_FFMPEG_EXE))
+    temp_ok = False
+    try:
+        temp_dir = _get_temp_dir()
+        temp_ok = os.path.isdir(temp_dir) and os.access(temp_dir, os.W_OK)
+    except Exception:
+        pass
+
+    api_ready = bool(os.environ.get("AI_API_KEY", "").strip()) or bool(counts.get("active_api_keys"))
+    return (
+        f"{title}\n\n"
+        "<b>System</b>\n"
+        f"🤖 Telegram: <b>✅ OK</b>\n"
+        f"🗄️ Supabase: <b>{_ok_bad(bool(supabase))}</b>\n"
+        f"🧠 AI/HF: <b>{_ok_bad(bool(_hf_client))}</b>\n"
+        f"🎧 FFmpeg: <b>{_ok_bad(ffmpeg_ok, 'OK', 'ERROR')}</b>\n"
+        f"📁 Temp: <b>{_ok_bad(temp_ok, 'OK', 'ERROR')}</b>\n\n"
+        "<b>Quick Stats</b>\n"
+        f"👥 Users: <b>{int(counts.get('total_users') or 0)}</b>\n"
+        f"⏰ Pending schedules: <b>{int(counts.get('pending_sched') or 0)}</b>\n"
+        f"🚫 Blocked: <b>{int(counts.get('blocked_users') or 0)}</b>\n"
+        f"🔑 API access: <b>{_ok_bad(api_ready, 'READY', 'SETUP')}</b>\n\n"
+        "ចុចប៊ូតុងខាងក្រោម — មិនចាំបាច់វាយ command ទៀតទេ។"
+    )
+
+
+async def _admin_health_text() -> str:
+    ffmpeg_ok = bool(_FFMPEG_EXE and os.path.exists(_FFMPEG_EXE))
+    temp_dir = ""
+    temp_ok = False
+    try:
+        temp_dir = _get_temp_dir()
+        temp_ok = os.path.isdir(temp_dir) and os.access(temp_dir, os.W_OK)
+    except Exception:
+        temp_dir = "ERROR"
+
+    ocr_ready = _ocr_configured()
+    return (
+        "🩺 <b>Bot Health</b>\n\n"
+        f"🤖 Telegram bot: <b>✅ OK</b>\n"
+        f"🗄️ Supabase: <b>{_ok_bad(bool(supabase))}</b>\n"
+        f"🧠 Hugging Face: <b>{_ok_bad(bool(_hf_client))}</b>\n"
+        f"🔍 OCR: <b>{_ok_bad(bool(ocr_ready), 'READY', 'OFF')}</b>\n"
+        f"🎧 FFmpeg: <b>{_ok_bad(ffmpeg_ok, 'OK', 'ERROR')}</b>\n"
+        f"📁 Temp folder: <b>{_ok_bad(temp_ok, 'OK', 'ERROR')}</b>\n"
+        f"<code>{html.escape(str(temp_dir))}</code>"
+    )
+
+
+async def _admin_stats_text(admin_id: int) -> str:
+    counts = await _admin_summary_counts(admin_id)
+    return (
+        "📊 <b>Bot Stats</b>\n\n"
+        f"👥 Total users: <b>{int(counts.get('total_users') or 0)}</b>\n"
+        f"⏰ Pending schedules: <b>{int(counts.get('pending_sched') or 0)}</b>\n"
+        f"🚫 Blocked users: <b>{int(counts.get('blocked_users') or 0)}</b>\n"
+        f"🔑 Active API keys: <b>{int(counts.get('active_api_keys') or 0)}</b>\n"
+        f"💬 Active admin chats: <b>{len(_admin_chat_target)}</b>\n"
+        f"🧠 HF model: <code>{html.escape(str(HF_MODEL or 'OFF'))}</code>\n"
+        f"🔍 OCR provider: <code>{html.escape(str(OCR_PROVIDER or 'auto'))}</code>"
+    )
+
+
+async def _admin_open_users_panel(query) -> None:
+    users = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, get_all_users_with_names)
+    if not users:
+        await safe_send(lambda: query.message.edit_text(
+            "👥 <b>Users</b>\n\n❌ គ្មានអ្នកប្រើប្រាស់ registered ទេ។",
+            parse_mode="HTML",
+            reply_markup=get_admin_dashboard_kb(),
+        ))
+        return
+    await safe_send(lambda: query.message.edit_text(
+        f"👥 <b>អ្នកប្រើប្រាស់ ({len(users)} នាក់)</b>\n"
+        "ចុចលើឈ្មោះ ដើម្បីចាប់ផ្ដើម Chat ។",
+        parse_mode="HTML",
+        reply_markup=get_users_page_kb(users, page=0),
+    ))
+
+
+async def _admin_open_schedules_panel(query, admin_id: int) -> None:
+    rows = await asyncio.get_running_loop().run_in_executor(
+        _DB_EXECUTOR, lambda: db_sched_fetch_admin_pending(admin_id)
+    )
+    if not rows:
+        await safe_send(lambda: query.message.edit_text(
+            "📋 <b>Scheduled Broadcasts</b>\n\n📭 មិនមាន Scheduled Broadcast ណាមួយទេ។",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📅 New Schedule", callback_data="admin_schedule_new")],
+                [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+                 InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+            ]),
+        ))
+        return
+    await safe_send(lambda: query.message.edit_text(
+        f"📋 <b>Scheduled Broadcasts ({len(rows)} pending)</b>\n"
+        "ចុចលើ Schedule ដើម្បីមើលលម្អិត ឬ Cancel ។",
+        parse_mode="HTML",
+        reply_markup=get_schedules_list_kb(rows, page=0),
+    ))
+
+
+async def _admin_start_broadcast_from_button(query, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    _pending_broadcast.pop(user_id, None)
+    context.user_data["bc_state"] = BROADCAST_WAIT_MESSAGE
+    await safe_send(lambda: query.message.edit_text(
+        "📢 <b>Admin Broadcast</b>\n\n"
+        "ផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + Caption</b> ដែលចង់ Broadcast ។\n"
+        "Bot នឹងបង្ហាញ preview មុនពេលផ្ញើ។\n\n"
+        "ចុច Cancel ឬវាយ /cancel ដើម្បីបោះបង់។",
+        parse_mode="HTML",
+        reply_markup=get_admin_action_kb(),
+    ))
+
+
+async def _admin_start_schedule_from_button(query, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    _sched_payload.pop(user_id, None)
+    context.user_data["sched_state"] = SCHED_WAIT_MSG
+    await safe_send(lambda: query.message.edit_text(
+        "📅 <b>Scheduled Broadcast</b>\n\n"
+        "ផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + Caption</b> ដែលចង់ Schedule ។\n"
+        "បន្ទាប់មក Bot នឹងសួរពេលវេលា UTC។\n\n"
+        "ចុច Cancel ឬវាយ /cancel ដើម្បីបោះបង់។",
+        parse_mode="HTML",
+        reply_markup=get_admin_action_kb(),
+    ))
+
+
 @admin_only
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = await _admin_home_text(update.effective_user.id)
     await safe_send(lambda: update.message.reply_text(
-        "🛠️ <b>Admin Dashboard</b>\n\n"
-        "ជ្រើសរើសមុខងារខាងក្រោម៖\n\n"
-        "📊 Stats — មើលស្ថិតិ Bot\n"
-        "🩺 Health — ពិនិត្យ Bot/Supabase/Gemini/FFmpeg\n"
-        "📢 Broadcast — ផ្ញើសារទៅ users\n"
-        "⏰ Schedules — មើល scheduled broadcasts\n"
-        "🔑 API Keys — បង្កើត key សម្រាប់ /ai-assistant\n"
-        "👥 Users — មើល users",
+        text,
         parse_mode="HTML",
         reply_markup=get_admin_dashboard_kb(),
     ))
@@ -3441,56 +3621,52 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         return
 
     if data == "admin_close":
+        context.user_data.pop("bc_state", None)
+        context.user_data.pop("sched_state", None)
+        _pending_broadcast.pop(user_id, None)
+        _sched_payload.pop(user_id, None)
         with suppress(Exception):
             await query.message.delete()
         return
 
-    if data == "admin_stats":
-        total_users = pending_sched = blocked_users = 0
-        loop = asyncio.get_running_loop()
-        if supabase:
-            try:
-                def _fetch_stats():
-                    users   = supabase.table("user_prefs").select("user_id").execute()
-                    sched   = supabase.table("scheduled_broadcasts").select("id").eq("status", "pending").execute()
-                    blocked = supabase.table("blocked_users").select("user_id").execute()
-                    return len(users.data or []), len(sched.data or []), len(blocked.data or [])
-                total_users, pending_sched, blocked_users = await loop.run_in_executor(
-                    _DB_EXECUTOR, _fetch_stats
-                )
-            except Exception as e:
-                logger.error(f"admin dashboard stats error: {e}", exc_info=True)
-
+    if data in ("admin_home", "admin_refresh"):
+        context.user_data.pop("bc_state", None)
+        context.user_data.pop("sched_state", None)
+        text = await _admin_home_text(user_id)
         await safe_send(lambda: query.message.edit_text(
-            f"📊 <b>Bot Stats</b>\n\n"
-            f"👥 Total users: <b>{total_users}</b>\n"
-            f"⏰ Pending schedules: <b>{pending_sched}</b>\n"
-            f"🚫 Blocked users: <b>{blocked_users}</b>\n"
-            f"🤗 Hugging Face: <b>{'OK' if _hf_client else 'OFF'}</b>\n"
-            f"🗄️ Supabase: <b>{'OK' if supabase else 'OFF'}</b>",
+            text,
             parse_mode="HTML",
             reply_markup=get_admin_dashboard_kb(),
         ))
         return
 
-    if data == "admin_health":
-        ffmpeg_ok = bool(_FFMPEG_EXE and os.path.exists(_FFMPEG_EXE))
-        temp_dir  = ""
-        temp_ok   = False
-        try:
-            temp_dir = _get_temp_dir()
-            temp_ok  = os.path.isdir(temp_dir) and os.access(temp_dir, os.W_OK)
-        except Exception:
-            temp_dir = "ERROR"
-
+    if data == "admin_cancel_state":
+        context.user_data.pop("bc_state", None)
+        context.user_data.pop("sched_state", None)
+        _pending_broadcast.pop(user_id, None)
+        _sched_payload.pop(user_id, None)
+        text = await _admin_home_text(user_id, title="✅ Admin action cancelled")
         await safe_send(lambda: query.message.edit_text(
-            f"🩺 <b>Bot Health</b>\n\n"
-            f"🤖 Telegram bot: <b>OK</b>\n"
-            f"🗄️ Supabase: <b>{'OK' if supabase else 'OFF'}</b>\n"
-            f"🧠 Hugging Face: <b>{'OK' if _hf_client else 'OFF'}</b>\n"
-            f"🎧 FFmpeg: <b>{'OK' if ffmpeg_ok else 'ERROR'}</b>\n"
-            f"📁 Temp folder: <b>{'OK' if temp_ok else 'ERROR'}</b>\n"
-            f"<code>{html.escape(str(temp_dir))}</code>",
+            text,
+            parse_mode="HTML",
+            reply_markup=get_admin_dashboard_kb(),
+        ))
+        return
+
+    if data == "admin_stats":
+        text = await _admin_stats_text(user_id)
+        await safe_send(lambda: query.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=get_admin_dashboard_kb(),
+            disable_web_page_preview=True,
+        ))
+        return
+
+    if data == "admin_health":
+        text = await _admin_health_text()
+        await safe_send(lambda: query.message.edit_text(
+            text,
             parse_mode="HTML",
             reply_markup=get_admin_dashboard_kb(),
         ))
@@ -3500,15 +3676,29 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         await _cb_api_dashboard(query, user_id, context, "api_menu")
         return
 
-    commands = {
-        "admin_broadcast": "/broadcast",
-        "admin_schedules": "/schedules",
-        "admin_users":     "/users",
-    }
-    if data in commands:
-        await safe_send(lambda d=data: query.message.reply_text(
-            f"ប្រើ command:\n\n<code>{commands[d]}</code>", parse_mode="HTML"
-        ))
+    if data == "admin_users":
+        await _admin_open_users_panel(query)
+        return
+
+    if data == "admin_schedules":
+        await _admin_open_schedules_panel(query, user_id)
+        return
+
+    if data == "admin_broadcast":
+        await _admin_start_broadcast_from_button(query, context, user_id)
+        return
+
+    if data == "admin_schedule_new":
+        await _admin_start_schedule_from_button(query, context, user_id)
+        return
+
+    # Fallback: reopen dashboard instead of sending a separate command message.
+    text = await _admin_home_text(user_id)
+    await safe_send(lambda: query.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=get_admin_dashboard_kb(),
+    ))
 
 
 async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4405,9 +4595,9 @@ async def _cb_api_dashboard(query, user_id: int, context: ContextTypes.DEFAULT_T
         return
 
     if data == "api_back":
+        text = await _admin_home_text(user_id)
         await safe_send(lambda: query.message.edit_text(
-            "🛠️ <b>Admin Dashboard</b>\n\n"
-            "ជ្រើសរើសមុខងារខាងក្រោម៖",
+            text,
             parse_mode="HTML",
             reply_markup=get_admin_dashboard_kb(),
         ))
