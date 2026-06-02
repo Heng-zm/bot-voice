@@ -1001,6 +1001,14 @@ MAX_VOICE_BYTES         = 20 * 1024 * 1024
 MAX_AUDIO_FILE_BYTES    = 50 * 1024 * 1024
 MAX_INPUT_CHARS         = 5_000
 TTS_CHUNK_CHARS         = 900
+# Edge TTS can intermittently return NoAudioReceived on Render when a voice
+# is busy, text is too long, or websocket audio chunks stop arriving.
+# These values keep each Edge request small and allow retry/fallback voices.
+EDGE_TTS_CHUNK_CHARS      = max(120, min(700, int(os.environ.get("EDGE_TTS_CHUNK_CHARS", "600"))))
+EDGE_TTS_RETRIES          = max(1, int(os.environ.get("EDGE_TTS_RETRIES", "3")))
+EDGE_TTS_RETRY_DELAY_S    = max(0.2, float(os.environ.get("EDGE_TTS_RETRY_DELAY_S", "0.8")))
+EDGE_TTS_STREAM_TIMEOUT_S = max(15.0, float(os.environ.get("EDGE_TTS_STREAM_TIMEOUT_S", "45")))
+EDGE_TTS_CROSS_LANG_FALLBACK = os.environ.get("EDGE_TTS_CROSS_LANG_FALLBACK", "0") == "1"
 DEFAULT_SPEED           = 1.0
 TELE_MSG_LIMIT          = 4000
 USER_COOLDOWN_S         = 3.0
@@ -1742,7 +1750,17 @@ def _submit_db(fn, *args, **kwargs):
 # ---------------------------------------------------------------------------
 # Safe Telegram send with retry
 # ---------------------------------------------------------------------------
+def _is_message_not_modified_error(exc: Exception | str) -> bool:
+    return "message is not modified" in str(exc).lower()
+
+
 async def safe_send(coro_factory, retries: int = 3, delay: float = 2.0):
+    """Run Telegram send/edit calls with retry.
+
+    Important fix: Telegram raises BadRequest when an inline button edits a
+    message to the same text + same markup. That is not a real failure, so this
+    helper now returns None instead of logging an unhandled callback error.
+    """
     if inspect.isawaitable(coro_factory):
         raise TypeError(
             "safe_send requires a zero-arg callable (lambda), not a raw coroutine."
@@ -1758,17 +1776,26 @@ async def safe_send(coro_factory, retries: int = 3, delay: float = 2.0):
             last_exc = e
             if attempt == retries - 1:
                 raise
+        except BadRequest as e:
+            if _is_message_not_modified_error(e):
+                logger.debug("Telegram edit skipped: message is not modified.")
+                return None
+            logger.warning(f"Telegram BadRequest (not retried): {e}")
+            raise
         except (TimedOut, NetworkError) as e:
+            if _is_message_not_modified_error(e):
+                logger.debug("Telegram edit skipped: message is not modified.")
+                return None
             last_exc = e
             if attempt < retries - 1:
                 logger.warning(f"Network error (attempt {attempt + 1}): {e}")
                 await asyncio.sleep(delay)
             else:
                 raise
-        except BadRequest as e:
-            logger.warning(f"Telegram BadRequest (not retried): {e}")
-            raise
         except TelegramError as e:
+            if _is_message_not_modified_error(e):
+                logger.debug("Telegram edit skipped: message is not modified.")
+                return None
             logger.error(f"Telegram error: {e}")
             raise
     if last_exc:
@@ -2956,31 +2983,131 @@ def _build_atempo_chain(speed: float) -> str:
     return ",".join(stages)
 
 
+def _detect_tts_lang_key(text: str) -> str:
+    khmer_chars = len(_KHMER_RE.findall(text or ""))
+    total_alpha = sum(1 for c in (text or "") if c.isalpha())
+    is_khmer = khmer_chars > (total_alpha * 0.3) if total_alpha else khmer_chars > 0
+    return "km" if is_khmer else "en"
+
+
 def _detect_voice(text: str, gender: str) -> str:
-    khmer_chars  = len(_KHMER_RE.findall(text))
-    total_alpha  = sum(1 for c in text if c.isalpha())
-    is_khmer     = khmer_chars > (total_alpha * 0.3) if total_alpha else False
-    return VOICE_MAP["km" if is_khmer else "en"][gender]
+    gender = gender if gender in ("female", "male") else "female"
+    return VOICE_MAP[_detect_tts_lang_key(text)][gender]
+
+
+def _clean_tts_text_for_edge(text: str) -> str:
+    """Remove hidden/control chars that can make Edge TTS return no audio."""
+    text = (text or "")
+    for ch in ("\ufeff", "\u200b", "\u200c", "\u200d"):
+        text = text.replace(ch, "")
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text)
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _tts_voice_candidates(text: str, gender: str) -> list[str]:
+    """Primary voice first, then same-language fallback; optional cross-language fallback."""
+    gender = gender if gender in ("female", "male") else "female"
+    lang = _detect_tts_lang_key(text)
+    other_gender = "male" if gender == "female" else "female"
+    candidates = [VOICE_MAP[lang][gender], VOICE_MAP[lang][other_gender]]
+    if EDGE_TTS_CROSS_LANG_FALLBACK:
+        other_lang = "en" if lang == "km" else "km"
+        candidates.extend([VOICE_MAP[other_lang][gender], VOICE_MAP[other_lang][other_gender]])
+    seen: set[str] = set()
+    unique: list[str] = []
+    for voice in candidates:
+        if voice and voice not in seen:
+            seen.add(voice)
+            unique.append(voice)
+    return unique
+
+
+async def _edge_tts_stream_once(chunk_text: str, voice: str) -> bytes:
+    async def _collect() -> bytes:
+        audio_chunks: list[bytes] = []
+        # Do not pass rate here; speed is applied by FFmpeg atempo. This avoids
+        # invalid edge-tts parameter combinations that can produce NoAudioReceived.
+        communicate = edge_tts.Communicate(chunk_text, voice)
+        async for message in communicate.stream():
+            if message.get("type") == "audio" and message.get("data"):
+                audio_chunks.append(message["data"])
+        return b"".join(audio_chunks)
+
+    return await asyncio.wait_for(_collect(), timeout=EDGE_TTS_STREAM_TIMEOUT_S)
+
+
+async def _edge_tts_stream_with_retry(chunk_text: str, voices: list[str]) -> tuple[bytes, str]:
+    last_errors: list[str] = []
+    for voice in voices:
+        for attempt in range(1, EDGE_TTS_RETRIES + 1):
+            try:
+                mp3_data = await _edge_tts_stream_once(chunk_text, voice)
+                if mp3_data:
+                    if attempt > 1:
+                        logger.info("edge-tts recovered on attempt %s with voice=%s", attempt, voice)
+                    return mp3_data, voice
+                raise RuntimeError("No audio was received from Edge TTS.")
+            except asyncio.TimeoutError:
+                last_errors.append(
+                    f"voice={voice} attempt={attempt}: timeout after {EDGE_TTS_STREAM_TIMEOUT_S:.0f}s"
+                )
+            except Exception as e:
+                last_errors.append(f"voice={voice} attempt={attempt}: {type(e).__name__}: {e}")
+
+            if attempt < EDGE_TTS_RETRIES:
+                await asyncio.sleep(EDGE_TTS_RETRY_DELAY_S * attempt)
+
+        logger.warning("edge-tts voice failed, trying fallback if available: %s", voice)
+
+    detail = " | ".join(last_errors[-8:])
+    raise RuntimeError(f"edge-tts failed after retries/fallbacks. {detail}")
+
+
+def _tts_user_error_message(exc: Exception | str) -> str:
+    msg = str(exc).lower()
+    if "no audio" in msg or "edge-tts failed" in msg:
+        return (
+            "❌ TTS service មិនបានបញ្ជូនសំឡេងមកវិញ។\n"
+            "✅ Bot បាន retry និងសាក voice fallback រួចហើយ។ សូមសាកម្តងទៀត ឬប្តូរសំឡេង Male/Female។"
+        )
+    if "timeout" in msg:
+        return "❌ TTS យឺតពេក/timeout។ សូមសាកអត្ថបទខ្លីជាងនេះ ឬសាកម្តងទៀត។"
+    if "ffmpeg" in msg:
+        return "❌ FFmpeg មានបញ្ហាក្នុងការបម្លែងសំឡេង។ សូមពិនិត្យ FFmpeg នៅលើ server។"
+    return "❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"
 
 
 async def generate_voice(text: str, gender: str, speed: float, output_path: str) -> bytes:
-    text = text.strip()
+    text = _clean_tts_text_for_edge(text)
     if not text:
         raise ValueError("generate_voice: text must not be empty")
 
-    voice      = _detect_voice(text, gender)
-    mp3_chunks: list[bytes] = []
-    try:
-        communicate = edge_tts.Communicate(text, voice)
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                mp3_chunks.append(chunk["data"])
-    except Exception as e:
-        raise RuntimeError(f"edge-tts failed: {e}") from e
+    voices = _tts_voice_candidates(text, gender)
+    text_chunks = _split_text_chunks(text, max_chars=EDGE_TTS_CHUNK_CHARS)
+    if not text_chunks:
+        raise ValueError("generate_voice: no speakable text chunks")
 
-    mp3_data = b"".join(mp3_chunks)
+    mp3_parts: list[bytes] = []
+    used_voices: list[str] = []
+    for idx, chunk_text in enumerate(text_chunks, 1):
+        try:
+            chunk_mp3, used_voice = await _edge_tts_stream_with_retry(chunk_text, voices)
+            mp3_parts.append(chunk_mp3)
+            used_voices.append(used_voice)
+        except Exception as e:
+            preview = chunk_text[:80].replace("\n", " ")
+            raise RuntimeError(
+                f"edge-tts failed at chunk {idx}/{len(text_chunks)} ({preview!r}): {e}"
+            ) from e
+
+    mp3_data = b"".join(mp3_parts)
     if not mp3_data:
-        raise RuntimeError("edge-tts returned empty audio")
+        raise RuntimeError("edge-tts returned empty audio after retries")
+
+    if len(set(used_voices)) > 1:
+        logger.info("edge-tts used fallback voices: %s", sorted(set(used_voices)))
 
     speed_key = _rounded_speed(speed)
     af        = _build_atempo_chain(speed_key) if abs(speed_key - DEFAULT_SPEED) > 1e-4 else None
@@ -3259,8 +3386,8 @@ async def _deliver_paged_tts(
         except Exception as e:
             logger.error(f"paged TTS chunk {i}/{total} error: {e}", exc_info=True)
             await safe_send(
-                lambda ci=i, ct=total: bot.send_message(
-                    chat_id=chat_id, text=f"❌ មានបញ្ហាក្នុង chunk {ci}/{ct}។"
+                lambda ci=i, ct=total, err=e: bot.send_message(
+                    chat_id=chat_id, text=f"{_tts_user_error_message(err)}\nChunk {ci}/{ct}"
                 )
             )
         finally:
@@ -5852,7 +5979,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"on_text TTS error: {e}", exc_info=True)
             with suppress(Exception):
-                await safe_send(lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"))
+                await safe_send(lambda err=e: msg.reply_text(_tts_user_error_message(err)))
 
         finally:
             await _stop_timer(stop_event, timer_task)
