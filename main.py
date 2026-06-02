@@ -26,6 +26,13 @@ except Exception:
     genai_types = None
 from flask import Flask
 from supabase import create_client, Client
+from typing import Any, Callable
+
+try:
+    import redis as redis_lib
+except Exception:
+    redis_lib = None
+
 
 # ── Flask Web Server ───────────────────────────────────────────────────────
 app_flask = Flask(__name__)
@@ -985,6 +992,12 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN: str = ""
 SB_URL:             str = ""
 SB_KEY:             str = ""
+REDIS_URL:          str = ""
+REDIS_CACHE_PREFIX       = os.environ.get("REDIS_CACHE_PREFIX", "tgbot")
+REDIS_PREFS_TTL_S        = int(os.environ.get("REDIS_PREFS_TTL_S", "1800"))
+REDIS_TEXT_CACHE_TTL_S   = int(os.environ.get("REDIS_TEXT_CACHE_TTL_S", "86400"))
+REDIS_HISTORY_TTL_S      = int(os.environ.get("REDIS_HISTORY_TTL_S", "86400"))
+REDIS_SOCKET_TIMEOUT_S   = float(os.environ.get("REDIS_SOCKET_TIMEOUT_S", "3"))
 GEMINI_API_KEY:     str = ""
 ADMIN_IDS:  set[int]    = set()
 GEMINI_MODEL            = ""
@@ -1068,6 +1081,322 @@ _BROADCAST_SEMAPHORE:  asyncio.Semaphore | None = None
 _TTS_CHUNK_SEMAPHORE:  asyncio.Semaphore | None = None
 
 # ---------------------------------------------------------------------------
+# Redis/Supabase safe retry + cache helpers
+# ---------------------------------------------------------------------------
+class CircuitBreaker:
+    """Small circuit breaker to avoid hammering Redis/Supabase during outages."""
+    def __init__(self, name: str, max_failures: int = 5, reset_after: float = 30.0):
+        self.name = name
+        self.max_failures = max(1, int(max_failures))
+        self.reset_after = max(1.0, float(reset_after))
+        self.failures = 0
+        self.open_until = 0.0
+        self._lock = threading.Lock()
+
+    def is_open(self) -> bool:
+        with self._lock:
+            return time.monotonic() < self.open_until
+
+    def record_success(self) -> None:
+        with self._lock:
+            self.failures = 0
+            self.open_until = 0.0
+
+    def record_failure(self, exc: BaseException | str) -> None:
+        with self._lock:
+            self.failures += 1
+            if self.failures >= self.max_failures:
+                self.open_until = time.monotonic() + self.reset_after
+                logger.warning(
+                    "%s circuit breaker opened for %.0fs after %d failure(s): %s",
+                    self.name,
+                    self.reset_after,
+                    self.failures,
+                    str(exc)[:240],
+                )
+
+
+supabase_breaker = CircuitBreaker(
+    "Supabase",
+    max_failures=int(os.environ.get("SUPABASE_BREAKER_FAILURES", "5")),
+    reset_after=float(os.environ.get("SUPABASE_BREAKER_RESET_S", "30")),
+)
+redis_breaker = CircuitBreaker(
+    "Redis",
+    max_failures=int(os.environ.get("REDIS_BREAKER_FAILURES", "5")),
+    reset_after=float(os.environ.get("REDIS_BREAKER_RESET_S", "20")),
+)
+
+_LOG_ONCE_TTL_S = float(os.environ.get("LOG_ONCE_TTL_S", "60"))
+_log_once_seen: dict[str, float] = {}
+
+
+def _log_once(level: int, key: str, message: str, *args, exc_info=False) -> None:
+    """Log repeated outage errors once per TTL so callbacks don't flood logs."""
+    now = time.monotonic()
+    last = _log_once_seen.get(key, 0.0)
+    if now - last < _LOG_ONCE_TTL_S:
+        return
+    _log_once_seen[key] = now
+    logger.log(level, message, *args, exc_info=exc_info)
+
+
+def _is_retryable_store_error(exc: BaseException | str) -> bool:
+    msg = str(exc).lower()
+    retryable_words = (
+        "server disconnected", "connection reset", "connection aborted",
+        "connection refused", "temporarily unavailable", "temporary failure",
+        "timeout", "timed out", "read timed out", "network", "dns",
+        "name resolution", "too many requests", "rate limit", "429",
+        "500", "502", "503", "504", "bad gateway", "service unavailable",
+        "gateway timeout", "max retries exceeded", "connectionerror",
+    )
+    non_retryable_words = (
+        "400", "401", "403", "unauthorized", "forbidden", "invalid api key",
+        "invalid key", "permission denied", "violates row-level security",
+        "row-level security", "rls", "relation does not exist",
+        "column does not exist", "undefined column", "syntax error",
+        "invalid input syntax",
+    )
+    if any(word in msg for word in non_retryable_words):
+        return False
+    if any(word in msg for word in retryable_words):
+        return True
+    name = exc.__class__.__name__.lower() if not isinstance(exc, str) else ""
+    return any(word in name for word in ("timeout", "connection", "network"))
+
+
+def retry_call_sync(
+    name: str,
+    factory: Callable[[], Any],
+    *,
+    default: Any = None,
+    attempts: int = 3,
+    base_delay: float = 0.35,
+    max_delay: float = 2.0,
+    breaker: CircuitBreaker | None = None,
+    critical: bool = False,
+) -> Any:
+    """Synchronous retry wrapper for Supabase/Redis clients."""
+    if breaker and breaker.is_open():
+        _log_once(logging.WARNING, f"{name}:breaker_open", "%s skipped: circuit breaker is open", name)
+        if critical:
+            raise RuntimeError(f"{name} unavailable: circuit breaker open")
+        return default
+
+    last_exc: BaseException | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            result = factory()
+            if breaker:
+                breaker.record_success()
+            return result
+        except Exception as exc:
+            last_exc = exc
+            retryable = _is_retryable_store_error(exc)
+            if not retryable:
+                if breaker:
+                    breaker.record_failure(exc)
+                _log_once(
+                    logging.ERROR,
+                    f"{name}:non_retryable:{type(exc).__name__}:{str(exc)[:120]}",
+                    "%s failed with non-retryable error: %s",
+                    name,
+                    exc,
+                )
+                if critical:
+                    raise
+                return default
+
+            if attempt >= attempts:
+                if breaker:
+                    breaker.record_failure(exc)
+                _log_once(
+                    logging.WARNING,
+                    f"{name}:failed:{type(exc).__name__}:{str(exc)[:120]}",
+                    "%s failed after %d attempt(s): %s",
+                    name,
+                    attempts,
+                    exc,
+                )
+                break
+
+            delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+            logger.warning("%s temporary error attempt %d/%d: %s", name, attempt, attempts, exc)
+            time.sleep(delay)
+
+    if critical and last_exc:
+        raise last_exc
+    return default
+
+
+async def retry_call(
+    name: str,
+    factory: Callable[[], Any],
+    *,
+    default: Any = None,
+    attempts: int = 3,
+    timeout: float = 8.0,
+    base_delay: float = 0.35,
+    max_delay: float = 2.0,
+    breaker: CircuitBreaker | None = None,
+    critical: bool = False,
+) -> Any:
+    """Async-safe retry wrapper. Blocking SDK calls run in a thread."""
+    if breaker and breaker.is_open():
+        _log_once(logging.WARNING, f"{name}:breaker_open", "%s skipped: circuit breaker is open", name)
+        if critical:
+            raise RuntimeError(f"{name} unavailable: circuit breaker open")
+        return default
+
+    last_exc: BaseException | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            result = await asyncio.wait_for(asyncio.to_thread(factory), timeout=timeout)
+            if breaker:
+                breaker.record_success()
+            return result
+        except Exception as exc:
+            last_exc = exc
+            retryable = _is_retryable_store_error(exc)
+            if not retryable:
+                if breaker:
+                    breaker.record_failure(exc)
+                _log_once(
+                    logging.ERROR,
+                    f"{name}:non_retryable:{type(exc).__name__}:{str(exc)[:120]}",
+                    "%s failed with non-retryable error: %s",
+                    name,
+                    exc,
+                )
+                if critical:
+                    raise
+                return default
+
+            if attempt >= attempts:
+                if breaker:
+                    breaker.record_failure(exc)
+                _log_once(
+                    logging.WARNING,
+                    f"{name}:failed:{type(exc).__name__}:{str(exc)[:120]}",
+                    "%s failed after %d attempt(s): %s",
+                    name,
+                    attempts,
+                    exc,
+                )
+                break
+
+            delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+            logger.warning("%s temporary error attempt %d/%d: %s", name, attempt, attempts, exc)
+            await asyncio.sleep(delay)
+
+    if critical and last_exc:
+        raise last_exc
+    return default
+
+
+def db_call_sync(name: str, factory: Callable[[], Any], *, default: Any = None, attempts: int = 3, critical: bool = False) -> Any:
+    return retry_call_sync(
+        f"Supabase:{name}",
+        factory,
+        default=default,
+        attempts=attempts,
+        breaker=supabase_breaker,
+        critical=critical,
+    )
+
+
+async def db_call(name: str, factory: Callable[[], Any], *, default: Any = None, attempts: int = 3, timeout: float = 8.0, critical: bool = False) -> Any:
+    return await retry_call(
+        f"Supabase:{name}",
+        factory,
+        default=default,
+        attempts=attempts,
+        timeout=timeout,
+        breaker=supabase_breaker,
+        critical=critical,
+    )
+
+
+def redis_call_sync(name: str, factory: Callable[[], Any], *, default: Any = None, attempts: int = 2, critical: bool = False) -> Any:
+    if redis_client is None:
+        return default
+    return retry_call_sync(
+        f"Redis:{name}",
+        factory,
+        default=default,
+        attempts=attempts,
+        breaker=redis_breaker,
+        critical=critical,
+    )
+
+
+async def redis_call(name: str, factory: Callable[[], Any], *, default: Any = None, attempts: int = 2, timeout: float = 3.0, critical: bool = False) -> Any:
+    if redis_client is None:
+        return default
+    return await retry_call(
+        f"Redis:{name}",
+        factory,
+        default=default,
+        attempts=attempts,
+        timeout=timeout,
+        breaker=redis_breaker,
+        critical=critical,
+    )
+
+
+def _redis_key(*parts: Any) -> str:
+    clean = [str(p).replace(" ", "_").replace("\n", "_") for p in parts]
+    return f"{REDIS_CACHE_PREFIX}:" + ":".join(clean)
+
+
+def _redis_get_json_sync(key: str, default: Any = None) -> Any:
+    raw = redis_call_sync(f"get:{key}", lambda: redis_client.get(key), default=None)
+    if not raw:
+        return default
+    try:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        return _json.loads(raw)
+    except Exception as exc:
+        _log_once(logging.WARNING, f"redis_bad_json:{key}", "Invalid Redis JSON for %s: %s", key, exc)
+        return default
+
+
+def _redis_set_json_sync(key: str, value: Any, ttl: int) -> bool:
+    raw = _json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    ok = redis_call_sync(f"set:{key}", lambda: redis_client.setex(key, max(1, int(ttl)), raw), default=False)
+    return bool(ok)
+
+
+def _redis_delete_sync(key: str) -> None:
+    redis_call_sync(f"delete:{key}", lambda: redis_client.delete(key), default=None)
+
+
+async def _redis_get_json(key: str, default: Any = None) -> Any:
+    raw = await redis_call(f"get:{key}", lambda: redis_client.get(key), default=None)
+    if not raw:
+        return default
+    try:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        return _json.loads(raw)
+    except Exception as exc:
+        _log_once(logging.WARNING, f"redis_bad_json:{key}", "Invalid Redis JSON for %s: %s", key, exc)
+        return default
+
+
+async def _redis_set_json(key: str, value: Any, ttl: int) -> bool:
+    raw = _json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    ok = await redis_call(f"set:{key}", lambda: redis_client.setex(key, max(1, int(ttl)), raw), default=False)
+    return bool(ok)
+
+
+async def _redis_delete(key: str) -> None:
+    await redis_call(f"delete:{key}", lambda: redis_client.delete(key), default=None)
+
+
+# ---------------------------------------------------------------------------
 # State constants
 # ---------------------------------------------------------------------------
 BROADCAST_WAIT_MESSAGE = 1
@@ -1135,6 +1464,7 @@ def get_last_tts_text(user_id: int) -> str | None:
 # Supabase + AI clients
 # ---------------------------------------------------------------------------
 supabase: Client | None = None
+redis_client = None
 _gemini    = None
 _hf_client = None
 
@@ -1540,13 +1870,14 @@ def ai_text_reply(prompt: str, history: list[dict] | None = None) -> tuple[str, 
 
 
 def _init_clients() -> None:
-    global supabase, _gemini, TELEGRAM_BOT_TOKEN, SB_URL, SB_KEY
+    global supabase, redis_client, _gemini, TELEGRAM_BOT_TOKEN, SB_URL, SB_KEY, REDIS_URL
     global GEMINI_API_KEY, ADMIN_IDS, GEMINI_MODEL
     global HF_TOKEN, HF_MODEL, HF_OCR_MODEL, AI_PROVIDER, OCR_PROVIDER
 
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     SB_URL             = os.getenv("SUPABASE_URL", "")
     SB_KEY             = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY", "")
+    REDIS_URL          = os.getenv("REDIS_URL", "").strip()
     GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
     GEMINI_MODEL       = os.getenv("GEMINI_MODEL", "").strip()
     HF_TOKEN           = os.getenv("HF_TOKEN", "")
@@ -1583,6 +1914,28 @@ def _init_clients() -> None:
             supabase = None
     else:
         logger.warning("Supabase env vars missing — DB features disabled.")
+
+    redis_client = None
+    if REDIS_URL:
+        if redis_lib is None:
+            logger.warning("REDIS_URL is set but package `redis` is not installed. Install: pip install redis")
+        else:
+            try:
+                redis_client = redis_lib.from_url(
+                    REDIS_URL,
+                    decode_responses=True,
+                    socket_timeout=REDIS_SOCKET_TIMEOUT_S,
+                    socket_connect_timeout=REDIS_SOCKET_TIMEOUT_S,
+                    health_check_interval=30,
+                    retry_on_timeout=True,
+                )
+                redis_client.ping()
+                logger.info("Redis cache initialised.")
+            except Exception as e:
+                logger.warning(f"Redis init failed — cache disabled: {e}")
+                redis_client = None
+    else:
+        logger.info("REDIS_URL not set — Redis cache disabled; using memory + Supabase fallback.")
 
     if GEMINI_API_KEY and GEMINI_MODEL and genai is not None:
         try:
@@ -1622,17 +1975,41 @@ WELCOME_TEXT = (
 BOT_TAG = "@voicekhaibot"
 
 # ---------------------------------------------------------------------------
-# Prefs cache
+# Prefs cache — memory -> Redis -> Supabase -> safe defaults
 # ---------------------------------------------------------------------------
 _PREFS_TTL      = 300.0
 _PREFS_MAX_SIZE = 10_000
 _prefs_cache: OrderedDict[int, tuple[dict, float]] = OrderedDict()
 _prefs_cache_lock: asyncio.Lock | None = None
 
+DEFAULT_USER_PREFS: dict = {"gender": "female", "speed": DEFAULT_SPEED}
+
+
+def _prefs_redis_key(user_id: int) -> str:
+    return _redis_key("prefs", int(user_id))
+
+
+def _normalize_user_prefs(row: dict | None) -> dict:
+    prefs = dict(DEFAULT_USER_PREFS)
+    row = row or {}
+
+    gender = row.get("gender") or prefs["gender"]
+    if gender not in ("female", "male"):
+        gender = "female"
+    prefs["gender"] = gender
+
+    raw_speed = row.get("speed", prefs["speed"])
+    try:
+        prefs["speed"] = max(_SPEED_MIN, min(_SPEED_MAX, float(raw_speed)))
+    except Exception:
+        prefs["speed"] = DEFAULT_SPEED
+
+    return prefs
+
 
 def _cache_prefs_sync(user_id: int, prefs: dict) -> None:
     _prefs_cache.pop(user_id, None)
-    _prefs_cache[user_id] = (prefs, time.monotonic())
+    _prefs_cache[user_id] = (_normalize_user_prefs(prefs), time.monotonic())
     while len(_prefs_cache) > _PREFS_MAX_SIZE:
         _prefs_cache.popitem(last=False)
 
@@ -1640,18 +2017,26 @@ def _cache_prefs_sync(user_id: int, prefs: dict) -> None:
 def _get_cached_prefs_sync(user_id: int) -> dict | None:
     entry = _prefs_cache.get(user_id)
     if entry and time.monotonic() - entry[1] < _PREFS_TTL:
-        return entry[0]
+        _prefs_cache.move_to_end(user_id)
+        return dict(entry[0])
+    if entry:
+        _prefs_cache.pop(user_id, None)
     return None
 
 
 def _invalidate_prefs(user_id: int) -> None:
     _prefs_cache.pop(user_id, None)
+    if redis_client is not None:
+        _submit_db(lambda: _redis_delete_sync(_prefs_redis_key(user_id)))
 
 
-async def _async_cache_prefs(user_id: int, prefs: dict) -> None:
+async def _async_cache_prefs(user_id: int, prefs: dict, *, write_redis: bool = False) -> None:
     assert _prefs_cache_lock is not None
+    prefs = _normalize_user_prefs(prefs)
     async with _prefs_cache_lock:
         _cache_prefs_sync(user_id, prefs)
+    if write_redis and redis_client is not None:
+        await _redis_set_json(_prefs_redis_key(user_id), prefs, REDIS_PREFS_TTL_S)
 
 
 async def _async_get_cached_prefs(user_id: int) -> dict | None:
@@ -1661,57 +2046,59 @@ async def _async_get_cached_prefs(user_id: int) -> dict | None:
 
 
 async def get_user_prefs_async(user_id: int) -> dict:
+    """
+    Safe prefs flow:
+      1) try memory cache
+      2) if missing, try Redis
+      3) if Redis missing, try Supabase with retry
+      4) if Supabase works, refresh Redis
+      5) if Supabase fails, return safe defaults
+      6) never crash Telegram callbacks
+    """
+    defaults = dict(DEFAULT_USER_PREFS)
+
     cached = await _async_get_cached_prefs(user_id)
     if cached is not None:
         return cached
 
-    defaults: dict = {"gender": "female", "speed": DEFAULT_SPEED}
+    redis_key = _prefs_redis_key(user_id)
+    redis_prefs = await _redis_get_json(redis_key, default=None)
+    if isinstance(redis_prefs, dict):
+        prefs = _normalize_user_prefs(redis_prefs)
+        await _async_cache_prefs(user_id, prefs, write_redis=False)
+        return prefs
 
     if not supabase:
-        await _async_cache_prefs(user_id, defaults)
         return defaults
 
-    loop = asyncio.get_running_loop()
+    try:
+        res = await db_call(
+            f"get_user_prefs:{user_id}",
+            lambda: supabase.table("user_prefs")
+                .select("gender, speed")
+                .eq("user_id", user_id)
+                .limit(1)
+                .execute(),
+            default=None,
+            attempts=3,
+            timeout=12,
+            critical=False,
+        )
 
-    for attempt in range(3):
-        try:
-            res = await asyncio.wait_for(
-                loop.run_in_executor(
-                    _DB_EXECUTOR,
-                    lambda: supabase.table("user_prefs")
-                        .select("gender, speed")
-                        .eq("user_id", user_id)
-                        .limit(1)
-                        .execute()
-                ),
-                timeout=12,
-            )
-            if res.data:
-                row    = res.data[0]
-                gender = row.get("gender") or "female"
-                if gender not in ("female", "male"):
-                    gender = "female"
-                defaults["gender"] = gender
+        rows = getattr(res, "data", None) if res else None
+        prefs = _normalize_user_prefs((rows or [None])[0])
+        await _async_cache_prefs(user_id, prefs, write_redis=True)
+        return prefs
 
-                raw_speed = row.get("speed")
-                if raw_speed is not None:
-                    try:
-                        defaults["speed"] = max(_SPEED_MIN, min(_SPEED_MAX, float(raw_speed)))
-                    except Exception:
-                        defaults["speed"] = DEFAULT_SPEED
-
-            await _async_cache_prefs(user_id, defaults)
-            return defaults
-
-        except Exception as e:
-            if attempt < 2:
-                logger.warning(f"DB get_user_prefs_async retry {attempt+1}/3 user={user_id}: {e}")
-                await asyncio.sleep(0.5 * (attempt + 1))
-            else:
-                logger.error(f"DB get_user_prefs_async failed user={user_id}: {e}")
-
-    await _async_cache_prefs(user_id, defaults)
-    return defaults
+    except Exception as exc:
+        _log_once(
+            logging.WARNING,
+            f"prefs:fallback:{type(exc).__name__}:{str(exc)[:120]}",
+            "get_user_prefs_async fallback user=%s: %s",
+            user_id,
+            exc,
+        )
+        return defaults
 
 
 # ---------------------------------------------------------------------------
@@ -1918,20 +2305,31 @@ def sync_user_data(user) -> None:
         _user_sync_seen.popitem(last=False)
 
     def _run():
-        try:
-            payload = {"user_id": user.id, "username": user.username or user.first_name}
-            try:
-                supabase.table("user_prefs").upsert(
-                    {**payload, "last_active": datetime.now(timezone.utc).isoformat()},
-                    on_conflict="user_id",
-                ).execute()
-            except Exception as inner:
-                if "last_active" in str(inner).lower() or "column" in str(inner).lower():
-                    supabase.table("user_prefs").upsert(payload, on_conflict="user_id").execute()
-                else:
-                    raise
-        except Exception as e:
-            logger.warning(f"sync_user_data skipped user={user.id}: {e}")
+        payload = {"user_id": user.id, "username": user.username or user.first_name}
+        primary_payload = {**payload, "last_active": datetime.now(timezone.utc).isoformat()}
+
+        res = db_call_sync(
+            f"sync_user_data:{user.id}:with_last_active",
+            lambda: supabase.table("user_prefs").upsert(
+                primary_payload,
+                on_conflict="user_id",
+            ).execute(),
+            default=None,
+            attempts=3,
+            critical=False,
+        )
+
+        if res is not None:
+            return
+
+        # Fallback for older user_prefs tables without last_active.
+        db_call_sync(
+            f"sync_user_data:{user.id}:basic",
+            lambda: supabase.table("user_prefs").upsert(payload, on_conflict="user_id").execute(),
+            default=None,
+            attempts=2,
+            critical=False,
+        )
 
     _submit_db(_run)
 
@@ -1939,26 +2337,30 @@ def sync_user_data(user) -> None:
 def _paginated_fetch(select_fields: str) -> list[dict]:
     if not supabase:
         return []
-    try:
-        all_rows, page, page_size = [], 0, 1000
-        while True:
-            res = (
-                supabase.table("user_prefs")
+
+    all_rows, page, page_size = [], 0, 1000
+    while True:
+        res = db_call_sync(
+            f"paginated_fetch:{select_fields}:page{page}",
+            lambda p=page: supabase.table("user_prefs")
                 .select(select_fields)
-                .range(page * page_size, (page + 1) * page_size - 1)
-                .execute()
-            )
-            batch = res.data or []
-            if not batch:
-                break
-            all_rows.extend(batch)
-            if len(batch) < page_size:
-                break
-            page += 1
-        return all_rows
-    except Exception as e:
-        logger.error(f"DB _paginated_fetch({select_fields!r}): {e}")
-        return []
+                .range(p * page_size, (p + 1) * page_size - 1)
+                .execute(),
+            default=None,
+            attempts=3,
+            critical=False,
+        )
+        if res is None:
+            return all_rows
+
+        batch = getattr(res, "data", None) or []
+        if not batch:
+            break
+        all_rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        page += 1
+    return all_rows
 
 
 def get_all_user_ids()         -> list[int]:  return [row["user_id"] for row in _paginated_fetch("user_id")]
@@ -2019,27 +2421,35 @@ def search_users_by_query(query: str, limit: int = 80) -> list[dict]:
 def user_exists_in_db(user_id: int) -> bool:
     if not supabase:
         return False
-    try:
-        res = (
-            supabase.table("user_prefs")
+    res = db_call_sync(
+        f"user_exists:{user_id}",
+        lambda: supabase.table("user_prefs")
             .select("user_id")
             .eq("user_id", user_id)
             .limit(1)
-            .execute()
-        )
-        return bool(res.data)
-    except Exception as e:
-        logger.error(f"DB user_exists_in_db: {e}")
-        return False
+            .execute(),
+        default=None,
+        attempts=3,
+        critical=False,
+    )
+    return bool(getattr(res, "data", None)) if res else False
 
 
 def update_user_gender(user_id: int, gender: str) -> None:
+    gender = gender if gender in ("female", "male") else "female"
     _invalidate_prefs(user_id)
     if not supabase:
         return
+
     def _run():
-        with suppress(Exception):
-            supabase.table("user_prefs").update({"gender": gender}).eq("user_id", user_id).execute()
+        db_call_sync(
+            f"update_user_gender:{user_id}",
+            lambda: supabase.table("user_prefs").update({"gender": gender}).eq("user_id", user_id).execute(),
+            default=None,
+            attempts=3,
+            critical=False,
+        )
+
     _submit_db(_run)
 
 
@@ -2048,25 +2458,34 @@ def update_user_speed(user_id: int, speed: float) -> None:
     _invalidate_prefs(user_id)
     if not supabase:
         return
+
     def _run():
-        try:
-            supabase.table("user_prefs").update({"speed": speed}).eq("user_id", user_id).execute()
-        except Exception as e:
-            if "does not exist" in str(e).lower():
-                logger.error(
-                    "speed column missing — run: "
-                    "ALTER TABLE user_prefs ADD COLUMN speed FLOAT DEFAULT 1.0;"
-                )
-            else:
-                logger.error(f"update_user_speed error: {e}")
+        res = db_call_sync(
+            f"update_user_speed:{user_id}",
+            lambda: supabase.table("user_prefs").update({"speed": speed}).eq("user_id", user_id).execute(),
+            default=None,
+            attempts=3,
+            critical=False,
+        )
+        if res is None:
+            _log_once(
+                logging.ERROR,
+                "speed_column_or_update_error",
+                "update_user_speed failed. If the column is missing, run: ALTER TABLE user_prefs ADD COLUMN speed FLOAT DEFAULT 1.0;",
+            )
+
     _submit_db(_run)
 
 
 _rls_warned = False
 
-# Fast in-memory cache for callback buttons.
+# Fast cache for callback buttons: memory -> Redis -> Supabase.
 _TEXT_CACHE_MEMORY_MAX = 20_000
 _text_cache_memory: OrderedDict[tuple[int, int], tuple[str, float]] = OrderedDict()
+
+
+def _text_cache_redis_key(msg_id: int, chat_id: int) -> str:
+    return _redis_key("text_cache", int(chat_id or 0), int(msg_id))
 
 
 def _remember_text_cache_sync(msg_id: int, chat_id: int, text: str) -> None:
@@ -2089,6 +2508,11 @@ def _get_text_cache_memory_sync(msg_id: int, chat_id: int) -> str | None:
     return item[0]
 
 
+def _write_text_cache_redis_sync(msg_id: int, chat_id: int, text: str) -> None:
+    if redis_client is not None and text:
+        _redis_set_json_sync(_text_cache_redis_key(msg_id, chat_id), {"text": text}, REDIS_TEXT_CACHE_TTL_S)
+
+
 def save_text_cache(
     msg_id: int,
     text: str,
@@ -2096,57 +2520,103 @@ def save_text_cache(
     user_id: int = None,
     username: str = None,
 ) -> None:
-    _remember_text_cache_sync(msg_id, chat_id, text)
-    if not supabase:
+    """
+    Save callback text safely:
+      - memory cache immediately
+      - Redis cache in background if configured
+      - Supabase in background with retry
+      - never raises into Telegram callback flow
+    """
+    text = (text or "").strip()
+    if not text:
         return
+
+    _remember_text_cache_sync(msg_id, chat_id, text)
+
     def _run():
         global _rls_warned
-        try:
-            payload = {"message_id": msg_id, "chat_id": chat_id, "original_text": text}
-            if user_id is not None:
-                payload["user_id"] = user_id
-            if username is not None:
-                payload["username"] = username
-            supabase.table("text_cache").upsert(
-                payload, on_conflict="chat_id,message_id"
-            ).execute()
-        except Exception as e:
-            err_str = str(e)
-            if "42501" in err_str or "row-level security" in err_str.lower():
-                if not _rls_warned:
-                    _rls_warned = True
-                    logger.error(
-                        "text_cache RLS policy blocking inserts. Fix with:\n"
-                        "  ALTER TABLE text_cache DISABLE ROW LEVEL SECURITY;\n"
-                        "  -- or --\n"
-                        "  CREATE POLICY \"service_role_all\" ON text_cache "
-                        "FOR ALL TO service_role USING (true) WITH CHECK (true);"
-                    )
-            else:
-                logger.error(f"save_text_cache error: {e}")
+
+        _write_text_cache_redis_sync(msg_id, chat_id, text)
+
+        if not supabase:
+            return
+
+        payload = {"message_id": msg_id, "chat_id": chat_id, "original_text": text}
+        if user_id is not None:
+            payload["user_id"] = user_id
+        if username is not None:
+            payload["username"] = username
+
+        res = db_call_sync(
+            f"save_text_cache:{chat_id}:{msg_id}",
+            lambda: supabase.table("text_cache").upsert(
+                payload,
+                on_conflict="chat_id,message_id",
+            ).execute(),
+            default=None,
+            attempts=3,
+            critical=False,
+        )
+
+        if res is None:
+            err_msg = "text_cache Supabase write failed or returned no result."
+            if not _rls_warned:
+                _rls_warned = True
+                logger.warning(
+                    "%s If RLS blocks inserts, fix with:\\n"
+                    "  ALTER TABLE text_cache DISABLE ROW LEVEL SECURITY;\\n"
+                    "  -- or --\\n"
+                    "  CREATE POLICY \"service_role_all\" ON text_cache "
+                    "FOR ALL TO service_role USING (true) WITH CHECK (true);",
+                    err_msg,
+                )
+
     _submit_db(_run)
 
 
 def get_text_cache(msg_id: int, chat_id: int = 0) -> str | None:
+    """
+    Read callback text safely:
+      1) memory cache
+      2) Redis cache
+      3) Supabase with retry
+      4) return None if unavailable
+    """
     cached = _get_text_cache_memory_sync(msg_id, chat_id)
     if cached:
         return cached
+
+    redis_payload = _redis_get_json_sync(_text_cache_redis_key(msg_id, chat_id), default=None)
+    if isinstance(redis_payload, dict):
+        redis_text = (redis_payload.get("text") or "").strip()
+        if redis_text:
+            _remember_text_cache_sync(msg_id, chat_id, redis_text)
+            return redis_text
+
     if not supabase:
         return None
-    try:
-        res = (
-            supabase.table("text_cache")
+
+    res = db_call_sync(
+        f"get_text_cache:{chat_id}:{msg_id}",
+        lambda: supabase.table("text_cache")
             .select("original_text")
             .eq("message_id", msg_id)
             .eq("chat_id", chat_id)
-            .execute()
-        )
-        if res.data:
-            text = res.data[0]["original_text"]
-            _remember_text_cache_sync(msg_id, chat_id, text)
-            return text
-    except Exception as e:
-        logger.error(f"DB get_text_cache: {e}")
+            .limit(1)
+            .execute(),
+        default=None,
+        attempts=3,
+        critical=False,
+    )
+
+    rows = getattr(res, "data", None) if res else None
+    if rows:
+        text_value = (rows[0].get("original_text") or "").strip()
+        if text_value:
+            _remember_text_cache_sync(msg_id, chat_id, text_value)
+            _write_text_cache_redis_sync(msg_id, chat_id, text_value)
+            return text_value
+
     return None
 
 
@@ -2154,19 +2624,21 @@ def ensure_speed_column() -> None:
     if not supabase:
         logger.info("ensure_speed_column: Supabase not configured, skipping.")
         return
-    try:
-        supabase.table("user_prefs").select("speed").limit(1).execute()
+
+    res = db_call_sync(
+        "ensure_speed_column",
+        lambda: supabase.table("user_prefs").select("speed").limit(1).execute(),
+        default=None,
+        attempts=2,
+        critical=False,
+    )
+    if res is not None:
         logger.info("speed column present.")
-    except Exception as e:
-        err = str(e).lower()
-        # FIX: was `"column" in err` which is too broad — tightened to specific messages
-        if "does not exist" in err or "column \"speed\"" in err or "undefined column" in err:
-            logger.warning(
-                "speed column missing. Run:\n"
-                "  ALTER TABLE user_prefs ADD COLUMN speed FLOAT DEFAULT 1.0;"
-            )
-        else:
-            logger.error(f"ensure_speed_column unexpected error: {e}")
+    else:
+        logger.warning(
+            "Could not verify user_prefs.speed. If missing, run:\n"
+            "  ALTER TABLE user_prefs ADD COLUMN speed FLOAT DEFAULT 1.0;"
+        )
 
 
 
@@ -2483,6 +2955,10 @@ _HIST_CACHE_TURNS     = 10
 _hist_cache: OrderedDict[int, deque] = OrderedDict()
 
 
+def _hist_redis_key(user_id: int) -> str:
+    return _redis_key("history", int(user_id))
+
+
 def _normalize_role(role: str) -> str:
     role = (role or "").strip().lower()
     return "assistant" if role in ("assistant", "bot", "model") else "user"
@@ -2513,55 +2989,94 @@ def _hist_cache_clear(user_id: int) -> None:
     _hist_cache.pop(user_id, None)
 
 
+def _hist_rows_normalized(rows: list[dict] | None) -> list[dict]:
+    clean: list[dict] = []
+    for row in rows or []:
+        content = (row.get("content") or "").strip()
+        if content:
+            clean.append({"role": _normalize_role(row.get("role")), "content": content})
+    return clean[-_HIST_CACHE_TURNS:]
+
+
+def _hist_redis_save_sync(user_id: int, rows: list[dict]) -> None:
+    if redis_client is not None:
+        _redis_set_json_sync(_hist_redis_key(user_id), _hist_rows_normalized(rows), REDIS_HISTORY_TTL_S)
+
+
 def db_history_append(user_id: int, role: str, content: str) -> None:
-    if not supabase:
-        return
     role    = _normalize_role(role)
     content = (content or "").strip()
     if not content:
         return
+
     def _run():
-        try:
-            supabase.table("conversation_history").insert({
-                "user_id": user_id, "role": role, "content": content,
-            }).execute()
-        except Exception as e:
-            logger.error(f"db_history_append error (user={user_id}, role={role}): {e}")
+        # Keep Redis warm even if Supabase is temporarily unavailable.
+        if redis_client is not None:
+            rows = _redis_get_json_sync(_hist_redis_key(user_id), default=[])
+            if not isinstance(rows, list):
+                rows = []
+            rows = _hist_rows_normalized(rows + [{"role": role, "content": content}])
+            _hist_redis_save_sync(user_id, rows)
+
+        if supabase:
+            db_call_sync(
+                f"history_append:{user_id}",
+                lambda: supabase.table("conversation_history").insert({
+                    "user_id": user_id,
+                    "role": role,
+                    "content": content,
+                }).execute(),
+                default=None,
+                attempts=3,
+                critical=False,
+            )
+
     _submit_db(_run)
 
 
 def db_history_fetch(user_id: int, limit: int = CONV_HISTORY_LIMIT) -> list[dict]:
+    redis_rows = _redis_get_json_sync(_hist_redis_key(user_id), default=None)
+    if isinstance(redis_rows, list) and redis_rows:
+        return _hist_rows_normalized(redis_rows)[-limit:]
+
     if not supabase:
         return []
-    try:
-        res = (
-            supabase.table("conversation_history")
+
+    res = db_call_sync(
+        f"history_fetch:{user_id}",
+        lambda: supabase.table("conversation_history")
             .select("role, content, created_at")
             .eq("user_id", user_id)
             .order("created_at", desc=True)
             .limit(limit)
-            .execute()
-        )
-        rows = list(reversed(res.data or []))
-        return [
-            {"role": _normalize_role(r.get("role")), "content": (r.get("content") or "").strip()}
-            for r in rows
-            if (r.get("content") or "").strip()
-        ]
-    except Exception as e:
-        logger.error(f"db_history_fetch error user={user_id}: {e}")
-        return []
+            .execute(),
+        default=None,
+        attempts=3,
+        critical=False,
+    )
+
+    rows = list(reversed(getattr(res, "data", None) or [])) if res else []
+    clean = _hist_rows_normalized(rows)[-limit:]
+    if clean:
+        _hist_redis_save_sync(user_id, clean)
+    return clean
 
 
 def db_history_clear(user_id: int) -> None:
     _hist_cache_clear(user_id)
-    if not supabase:
-        return
+
     def _run():
-        try:
-            supabase.table("conversation_history").delete().eq("user_id", user_id).execute()
-        except Exception as e:
-            logger.error(f"db_history_clear error user={user_id}: {e}")
+        if redis_client is not None:
+            _redis_delete_sync(_hist_redis_key(user_id))
+        if supabase:
+            db_call_sync(
+                f"history_clear:{user_id}",
+                lambda: supabase.table("conversation_history").delete().eq("user_id", user_id).execute(),
+                default=None,
+                attempts=3,
+                critical=False,
+            )
+
     _submit_db(_run)
 
 
@@ -6734,7 +7249,8 @@ def main():
 
     print(
         f"Bot is starting... (AI: {AI_PROVIDER} | HF: {HF_MODEL} | "
-        f"OCR: {OCR_PROVIDER} | HF OCR: {HF_OCR_MODEL})"
+        f"OCR: {OCR_PROVIDER} | HF OCR: {HF_OCR_MODEL} | "
+        f"Redis: {'on' if redis_client is not None else 'off'})"
     )
 
     while True:
