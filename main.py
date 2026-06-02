@@ -2886,7 +2886,7 @@ def db_user_detail(user_id: int) -> dict:
         elif res is None:
             row["error"] = "User detail database read temporarily unavailable."
     row["blocked"] = db_user_is_blocked(user_id)
-    row["history"] = db_history_fetch(user_id, limit=3)
+    row["history"] = db_history_fetch(user_id, limit=ADMIN_DETAIL_HISTORY_TURNS)
     return row
 
 
@@ -2899,9 +2899,9 @@ def _format_user_detail_text(row: dict) -> str:
     blocked = "🚫 BLOCKED" if row.get("blocked") else "✅ ACTIVE"
     history_rows = row.get("history") or []
     last_lines = []
-    for h in history_rows[-3:]:
+    for h in history_rows[-ADMIN_DETAIL_HISTORY_TURNS:]:
         role = "👤" if _normalize_role(h.get("role")) == "user" else "🤖"
-        content = html.escape(str(h.get("content") or "")[:120])
+        content = html.escape(_history_compact_text(h.get("content"), 180))
         if content:
             last_lines.append(f"{role} {content}")
     history_text = "\n".join(last_lines) if last_lines else "-"
@@ -2955,8 +2955,15 @@ CONV_HISTORY_LIMIT    = 10
 CONV_CONTEXT_MAX_CHARS = 3000
 CONV_RESOLVE_TIMEOUT_S = 15
 
+# Admin history display/cache limits.
+# The old admin detail screen was hard-coded to show only 3 turns.
+# These env values let you increase/decrease history without editing code again.
+ADMIN_DETAIL_HISTORY_TURNS = max(3, min(20, int(os.environ.get("ADMIN_DETAIL_HISTORY_TURNS", "10"))))
+ADMIN_FULL_HISTORY_TURNS   = max(10, min(100, int(os.environ.get("ADMIN_FULL_HISTORY_TURNS", "50"))))
+ADMIN_HISTORY_PAGE_SIZE    = max(5, min(20, int(os.environ.get("ADMIN_HISTORY_PAGE_SIZE", "10"))))
+
 _HIST_CACHE_MAX_USERS = 5_000
-_HIST_CACHE_TURNS     = 10
+_HIST_CACHE_TURNS     = max(ADMIN_FULL_HISTORY_TURNS, 50)
 _hist_cache: OrderedDict[int, deque] = OrderedDict()
 
 
@@ -3266,8 +3273,19 @@ def _format_recent_history_panel_text(rows: list[dict], page: int, page_size: in
     return "\n".join(lines)[:3900]
 
 
-def _format_user_full_history_text(user_id: int, rows: list[dict], limit: int = 30) -> str:
+def _format_user_full_history_text(user_id: int, rows: list[dict], page: int = 0, page_size: int = ADMIN_HISTORY_PAGE_SIZE) -> str:
+    """Format one page of user history for Telegram.
+
+    Telegram has a message length limit, so this shows history in pages instead
+    of silently truncating to only the latest few turns.
+    """
     user_id = int(user_id)
+    rows = rows or []
+    page_size = max(5, min(20, int(page_size or ADMIN_HISTORY_PAGE_SIZE)))
+    total = len(rows)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(int(page or 0), total_pages - 1))
+
     if not rows:
         return (
             "📜 <b>User Recent History</b>\n\n"
@@ -3275,22 +3293,27 @@ def _format_user_full_history_text(user_id: int, rows: list[dict], limit: int = 
             "No conversation history found for this user."
         )
 
+    start_i = page * page_size
+    end_i = min(total, start_i + page_size)
+    chunk = rows[start_i:end_i]
+
     lines = [
         "📜 <b>User Recent History</b>",
         "",
         f"User ID: <code>{user_id}</code>",
-        f"Showing latest <b>{len(rows)}</b> turn(s)",
+        f"Showing <b>{start_i + 1}-{end_i}</b> of <b>{total}</b> recent turn(s)",
+        f"Page: <b>{page + 1}/{total_pages}</b>",
         "",
     ]
     max_total = 3850
-    for i, row in enumerate(rows[-limit:], start=1):
+    for i, row in enumerate(chunk, start=start_i + 1):
         role = "👤 User" if _normalize_role(row.get("role")) == "user" else "🤖 Bot"
         created = str(row.get("created_at") or "")[:19].replace("T", " ")
         content = html.escape(_history_compact_text(row.get("content"), 520))
         time_part = f" · 🕒 {html.escape(created)}" if created else ""
         block = f"{i}. <b>{role}</b>{time_part}\n{content}\n"
         if sum(len(x) + 1 for x in lines) + len(block) > max_total:
-            lines.append("\n…more history exists, but Telegram message limit was reached.")
+            lines.append("\n…this page is long, so Telegram message limit was reached. Use next page for more.")
             break
         lines.append(block)
     return "\n".join(lines)
@@ -4365,16 +4388,33 @@ def get_recent_history_kb(rows: list[dict], page: int, page_size: int = 7) -> In
     return InlineKeyboardMarkup(kbd_rows)
 
 
-def get_user_history_kb(user_id: int, back_ref: str = "p0") -> InlineKeyboardMarkup:
+def get_user_history_kb(user_id: int, back_ref: str = "p0", page: int = 0, total_rows: int = 0, page_size: int = ADMIN_HISTORY_PAGE_SIZE) -> InlineKeyboardMarkup:
     back_callback, back_label = _user_back_callback(back_ref)
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Refresh History", callback_data=f"user_history:{user_id}:{back_ref}"),
+    page_size = max(5, min(20, int(page_size or ADMIN_HISTORY_PAGE_SIZE)))
+    total_pages = max(1, (int(total_rows or 0) + page_size - 1) // page_size)
+    page = max(0, min(int(page or 0), total_pages - 1))
+
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("🔄 Refresh History", callback_data=f"user_history:{user_id}:{back_ref}:{page}"),
          InlineKeyboardButton("🧹 Clear History", callback_data=f"user_clearhist:{user_id}:{back_ref}")],
+    ]
+
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"user_history:{user_id}:{back_ref}:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"user_history:{user_id}:{back_ref}:{page+1}"))
+    if total_pages > 1:
+        rows.append(nav)
+
+    rows.extend([
         [InlineKeyboardButton("👤 User Detail", callback_data=f"user_view:{user_id}:{back_ref}"),
          InlineKeyboardButton(back_label, callback_data=back_callback)],
         [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
          InlineKeyboardButton("❌ Close", callback_data="users_close")],
     ])
+    return InlineKeyboardMarkup(rows)
 
 
 def get_user_detail_kb(user_id: int, blocked: bool, back_ref: str = "p0") -> InlineKeyboardMarkup:
@@ -5747,15 +5787,17 @@ async def _admin_open_recent_history_panel(query, page: int = 0) -> None:
     ))
 
 
-async def _show_user_full_history(query, user_id: int, back_ref: str = "p0") -> None:
+async def _show_user_full_history(query, user_id: int, back_ref: str = "p0", page: int = 0) -> None:
     rows = await asyncio.get_running_loop().run_in_executor(
         _DB_EXECUTOR,
-        lambda: db_user_history_fetch(user_id, limit=30),
+        lambda: db_user_history_fetch(user_id, limit=ADMIN_FULL_HISTORY_TURNS),
     )
+    total_pages = max(1, (len(rows) + ADMIN_HISTORY_PAGE_SIZE - 1) // ADMIN_HISTORY_PAGE_SIZE)
+    page = max(0, min(int(page or 0), total_pages - 1))
     await safe_send(lambda: query.message.edit_text(
-        _format_user_full_history_text(user_id, rows, limit=30),
+        _format_user_full_history_text(user_id, rows, page=page, page_size=ADMIN_HISTORY_PAGE_SIZE),
         parse_mode="HTML",
-        reply_markup=get_user_history_kb(user_id, back_ref=back_ref),
+        reply_markup=get_user_history_kb(user_id, back_ref=back_ref, page=page, total_rows=len(rows), page_size=ADMIN_HISTORY_PAGE_SIZE),
         disable_web_page_preview=True,
     ))
 
@@ -5898,7 +5940,8 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         parts = data.split(":")
         target_id = int(parts[1])
         back_ref = parts[2] if len(parts) > 2 else "p0"
-        await _show_user_full_history(query, target_id, back_ref=back_ref)
+        page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+        await _show_user_full_history(query, target_id, back_ref=back_ref, page=page)
         return
 
     if data.startswith("user_chat:"):
