@@ -203,6 +203,57 @@ with check (true);
 """
 
 
+
+ADMIN_V2_TABLES_SQL = AI_API_KEYS_TABLE_SQL + """
+
+-- Optional but recommended tables for Admin Dashboard V2
+create table if not exists public.blocked_users (
+  user_id bigint primary key,
+  admin_id bigint,
+  reason text,
+  blocked_at timestamptz not null default now()
+);
+
+create index if not exists blocked_users_blocked_at_idx
+  on public.blocked_users (blocked_at desc);
+
+alter table public.blocked_users enable row level security;
+
+drop policy if exists "service_role_blocked_users_all" on public.blocked_users;
+create policy "service_role_blocked_users_all"
+on public.blocked_users
+for all
+to service_role
+using (true)
+with check (true);
+
+create table if not exists public.bot_settings (
+  key text primary key,
+  value text not null,
+  updated_by bigint,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.bot_settings enable row level security;
+
+drop policy if exists "service_role_bot_settings_all" on public.bot_settings;
+create policy "service_role_bot_settings_all"
+on public.bot_settings
+for all
+to service_role
+using (true)
+with check (true);
+
+insert into public.bot_settings (key, value) values
+  ('maintenance_mode', '0'),
+  ('tts_enabled', '1'),
+  ('ocr_enabled', '1'),
+  ('voice_transcribe_enabled', '1'),
+  ('audio_transcribe_enabled', '1'),
+  ('ai_resolver_enabled', '1')
+on conflict (key) do nothing;
+"""
+
 def _extract_ai_request_key() -> str:
     auth_header = (request.headers.get("Authorization") or "").strip()
     bearer_key = ""
@@ -2039,6 +2090,308 @@ def ensure_speed_column() -> None:
             logger.error(f"ensure_speed_column unexpected error: {e}")
 
 
+
+# ---------------------------------------------------------------------------
+# Admin Dashboard V2 — settings, blocks, metrics, user tools
+# ---------------------------------------------------------------------------
+BOT_SETTING_DEFAULTS: dict[str, str] = {
+    "maintenance_mode": "0",
+    "tts_enabled": "1",
+    "ocr_enabled": "1",
+    "voice_transcribe_enabled": "1",
+    "audio_transcribe_enabled": "1",
+    "ai_resolver_enabled": "1",
+}
+BOT_SETTING_LABELS: dict[str, str] = {
+    "maintenance_mode": "🛠️ Maintenance Mode",
+    "tts_enabled": "🗣️ Text → Voice",
+    "ocr_enabled": "🔍 Image OCR",
+    "voice_transcribe_enabled": "🎙️ Voice Transcribe",
+    "audio_transcribe_enabled": "🎵 Audio File Transcribe",
+    "ai_resolver_enabled": "🧠 AI Text Resolver",
+}
+BOT_SETTING_DESCRIPTIONS: dict[str, str] = {
+    "maintenance_mode": "When ON, normal users cannot use the bot.",
+    "tts_enabled": "Allow normal text messages to generate voice.",
+    "ocr_enabled": "Allow photo OCR reading.",
+    "voice_transcribe_enabled": "Allow Telegram voice transcription.",
+    "audio_transcribe_enabled": "Allow uploaded audio-file transcription.",
+    "ai_resolver_enabled": "Allow AI to rewrite/resolve text before TTS when enabled by env.",
+}
+_SETTINGS_CACHE_TTL_S = float(os.environ.get("BOT_SETTINGS_CACHE_TTL_S", "30"))
+_bot_settings_memory: dict[str, str] = dict(BOT_SETTING_DEFAULTS)
+_bot_settings_cache: dict = {
+    "data": dict(BOT_SETTING_DEFAULTS),
+    "status": {"db_ok": False, "error": "not loaded", "memory": True},
+    "ts": 0.0,
+}
+
+_blocked_users_memory: set[int] = set()
+_blocked_user_cache: OrderedDict[int, tuple[bool, float]] = OrderedDict()
+_BLOCKED_USER_CACHE_TTL_S = 60.0
+_BLOCKED_USER_CACHE_MAX = 20_000
+
+_RUNTIME_METRICS: OrderedDict[str, int] = OrderedDict([
+    ("tts", 0),
+    ("ocr", 0),
+    ("voice", 0),
+    ("audio", 0),
+    ("blocked_hits", 0),
+    ("disabled_hits", 0),
+    ("errors", 0),
+])
+
+
+def _metric_inc(name: str, amount: int = 1) -> None:
+    _RUNTIME_METRICS[name] = int(_RUNTIME_METRICS.get(name, 0)) + int(amount)
+
+
+def _format_uptime() -> str:
+    if not _BOT_START_TIME:
+        return "starting"
+    seconds = max(0, int(time.time() - _BOT_START_TIME))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def _bool_to_setting_value(enabled: bool) -> str:
+    return "1" if bool(enabled) else "0"
+
+
+def _setting_bool_from(settings: dict | None, key: str, default: bool = True) -> bool:
+    if not settings:
+        settings = BOT_SETTING_DEFAULTS
+    raw = str(settings.get(key, BOT_SETTING_DEFAULTS.get(key, _bool_to_setting_value(default)))).strip().lower()
+    return raw in ("1", "true", "yes", "on", "enabled")
+
+
+def bot_setting_bool_cached(key: str, default: bool = True) -> bool:
+    return _setting_bool_from(_bot_settings_cache.get("data") or BOT_SETTING_DEFAULTS, key, default)
+
+
+def db_bot_settings_fetch_all() -> tuple[dict[str, str], dict]:
+    data = dict(BOT_SETTING_DEFAULTS)
+    data.update(_bot_settings_memory)
+    status = {"db_ok": False, "error": "", "memory": not bool(supabase)}
+    if not supabase:
+        status["error"] = "Supabase not configured; settings are memory-only."
+        return data, status
+    try:
+        res = supabase.table("bot_settings").select("key,value").execute()
+        for row in res.data or []:
+            key = str(row.get("key") or "").strip()
+            if key in BOT_SETTING_DEFAULTS:
+                data[key] = str(row.get("value") or BOT_SETTING_DEFAULTS[key])
+        status.update({"db_ok": True, "error": "", "memory": False})
+    except Exception as e:
+        status.update({"db_ok": False, "error": str(e), "memory": True})
+    return data, status
+
+
+async def get_bot_settings_async(force: bool = False) -> tuple[dict[str, str], dict]:
+    now = time.monotonic()
+    if not force and now - float(_bot_settings_cache.get("ts") or 0.0) < _SETTINGS_CACHE_TTL_S:
+        return dict(_bot_settings_cache["data"]), dict(_bot_settings_cache["status"])
+    data, status = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, db_bot_settings_fetch_all)
+    _bot_settings_cache["data"] = dict(data)
+    _bot_settings_cache["status"] = dict(status)
+    _bot_settings_cache["ts"] = now
+    return data, status
+
+
+def db_bot_setting_set(key: str, enabled: bool, admin_id: int) -> tuple[bool, str]:
+    if key not in BOT_SETTING_DEFAULTS:
+        return False, f"Unknown setting: {key}"
+    value = _bool_to_setting_value(enabled)
+    _bot_settings_memory[key] = value
+    if not supabase:
+        _bot_settings_cache["ts"] = 0.0
+        return True, "saved in memory only"
+    try:
+        supabase.table("bot_settings").upsert({
+            "key": key,
+            "value": value,
+            "updated_by": int(admin_id),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="key").execute()
+        _bot_settings_cache["ts"] = 0.0
+        return True, "saved"
+    except Exception as e:
+        _bot_settings_cache["ts"] = 0.0
+        return False, str(e)
+
+
+def _blocked_cache_set(user_id: int, blocked: bool) -> None:
+    _blocked_user_cache.pop(int(user_id), None)
+    _blocked_user_cache[int(user_id)] = (bool(blocked), time.monotonic())
+    while len(_blocked_user_cache) > _BLOCKED_USER_CACHE_MAX:
+        _blocked_user_cache.popitem(last=False)
+
+
+def _blocked_cache_get(user_id: int) -> bool | None:
+    item = _blocked_user_cache.get(int(user_id))
+    if not item:
+        return None
+    blocked, ts = item
+    if time.monotonic() - ts > _BLOCKED_USER_CACHE_TTL_S:
+        _blocked_user_cache.pop(int(user_id), None)
+        return None
+    _blocked_user_cache.move_to_end(int(user_id))
+    return blocked
+
+
+def db_user_is_blocked(user_id: int) -> bool:
+    user_id = int(user_id)
+    cached = _blocked_cache_get(user_id)
+    if cached is not None:
+        return cached
+    if user_id in _blocked_users_memory:
+        _blocked_cache_set(user_id, True)
+        return True
+    if not supabase:
+        _blocked_cache_set(user_id, False)
+        return False
+    try:
+        res = supabase.table("blocked_users").select("user_id").eq("user_id", user_id).limit(1).execute()
+        blocked = bool(res.data)
+        _blocked_cache_set(user_id, blocked)
+        return blocked
+    except Exception as e:
+        logger.warning(f"blocked_users check skipped user={user_id}: {e}")
+        _blocked_cache_set(user_id, False)
+        return False
+
+
+def db_blocked_user_count() -> int:
+    if not supabase:
+        return len(_blocked_users_memory)
+    try:
+        res = supabase.table("blocked_users").select("user_id").execute()
+        return len(res.data or [])
+    except Exception:
+        return len(_blocked_users_memory)
+
+
+def db_user_set_blocked(user_id: int, admin_id: int, blocked: bool, reason: str = "") -> tuple[bool, str]:
+    user_id = int(user_id)
+    admin_id = int(admin_id)
+    if blocked:
+        _blocked_users_memory.add(user_id)
+    else:
+        _blocked_users_memory.discard(user_id)
+    _blocked_cache_set(user_id, blocked)
+    if not supabase:
+        return True, "memory-only"
+    try:
+        if blocked:
+            supabase.table("blocked_users").upsert({
+                "user_id": user_id,
+                "admin_id": admin_id,
+                "reason": reason or "blocked from admin panel",
+                "blocked_at": datetime.now(timezone.utc).isoformat(),
+            }, on_conflict="user_id").execute()
+        else:
+            supabase.table("blocked_users").delete().eq("user_id", user_id).execute()
+        return True, "saved"
+    except Exception as e:
+        return False, str(e)
+
+
+def db_user_reset_prefs(user_id: int) -> tuple[bool, str]:
+    user_id = int(user_id)
+    _invalidate_prefs(user_id)
+    if not supabase:
+        return True, "memory-only"
+    try:
+        supabase.table("user_prefs").upsert({
+            "user_id": user_id,
+            "gender": "female",
+            "speed": DEFAULT_SPEED,
+        }, on_conflict="user_id").execute()
+        return True, "reset"
+    except Exception as e:
+        return False, str(e)
+
+
+def db_user_detail(user_id: int) -> dict:
+    user_id = int(user_id)
+    row: dict = {"user_id": user_id}
+    if supabase:
+        try:
+            res = supabase.table("user_prefs").select("*").eq("user_id", user_id).limit(1).execute()
+            if res.data:
+                row.update(res.data[0])
+        except Exception as e:
+            row["error"] = str(e)
+    row["blocked"] = db_user_is_blocked(user_id)
+    row["history"] = db_history_fetch(user_id, limit=3) if supabase else []
+    return row
+
+
+def _format_user_detail_text(row: dict) -> str:
+    user_id = int(row.get("user_id") or 0)
+    username = html.escape(str(row.get("username") or row.get("first_name") or "-"))
+    gender = html.escape(str(row.get("gender") or "female"))
+    speed = html.escape(str(row.get("speed") or DEFAULT_SPEED))
+    last_active = html.escape(str(row.get("last_active") or "-")[:19].replace("T", " "))
+    blocked = "🚫 BLOCKED" if row.get("blocked") else "✅ ACTIVE"
+    history_rows = row.get("history") or []
+    last_lines = []
+    for h in history_rows[-3:]:
+        role = "👤" if _normalize_role(h.get("role")) == "user" else "🤖"
+        content = html.escape(str(h.get("content") or "")[:120])
+        if content:
+            last_lines.append(f"{role} {content}")
+    history_text = "\n".join(last_lines) if last_lines else "-"
+    extra_error = f"\n\n⚠️ <pre>{html.escape(str(row.get('error'))[:500])}</pre>" if row.get("error") else ""
+    return (
+        "👤 <b>User Detail</b>\n\n"
+        f"ID: <code>{user_id}</code>\n"
+        f"Username: <b>{username}</b>\n"
+        f"Status: <b>{blocked}</b>\n"
+        f"Voice: <b>{gender}</b>\n"
+        f"Speed: <b>{speed}x</b>\n"
+        f"Last active: <b>{last_active}</b>\n\n"
+        "<b>Recent history</b>\n"
+        f"{history_text}"
+        f"{extra_error}"
+    )
+
+
+async def _ensure_user_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE, feature_key: str | None = None, feature_name: str = "feature") -> bool:
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return False
+    if _is_admin(user.id):
+        return True
+
+    blocked = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_is_blocked(user.id))
+    if blocked:
+        _metric_inc("blocked_hits")
+        await safe_send(lambda: msg.reply_text("⛔ អ្នកត្រូវបាន Block មិនអាចប្រើ Bot នេះបានទេ។"))
+        return False
+
+    settings, _status = await get_bot_settings_async()
+    if _setting_bool_from(settings, "maintenance_mode", False):
+        _metric_inc("disabled_hits")
+        await safe_send(lambda: msg.reply_text("🛠️ Bot កំពុង Maintenance។ សូមព្យាយាមម្តងទៀតពេលក្រោយ។"))
+        return False
+
+    if feature_key and not _setting_bool_from(settings, feature_key, True):
+        _metric_inc("disabled_hits")
+        await safe_send(lambda: msg.reply_text(f"⚠️ {feature_name} ត្រូវបានបិទបណ្តោះអាសន្នដោយ Admin។"))
+        return False
+
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Database helpers — conversation history
 # ---------------------------------------------------------------------------
@@ -2224,7 +2577,7 @@ async def resolve_tts_text(
             logger.info(f"resolve_tts_text local last-user for user {user_id}")
             return last_user
 
-    if not TTS_RESOLVER_AI_ENABLED:
+    if not TTS_RESOLVER_AI_ENABLED or not bot_setting_bool_cached("ai_resolver_enabled", True):
         return raw_text
     if not _gemini:
         return raw_text
@@ -2429,18 +2782,16 @@ def get_sched_confirm_kb(row_id: int) -> InlineKeyboardMarkup:
 
 
 def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
-    """Main admin control panel keyboard.
-
-    FIX: Dashboard buttons now open real panels/actions instead of sending
-    separate "use command" messages. This keeps the admin UI clean on mobile.
-    """
+    """Admin Dashboard V2 keyboard with direct panels and settings."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Stats",       callback_data="admin_stats"),
+        [InlineKeyboardButton("🏠 Dashboard",   callback_data="admin_home"),
          InlineKeyboardButton("🩺 Health",      callback_data="admin_health")],
+        [InlineKeyboardButton("👥 Users",       callback_data="admin_users"),
+         InlineKeyboardButton("⚙️ Settings",    callback_data="admin_settings")],
         [InlineKeyboardButton("📢 Broadcast",   callback_data="admin_broadcast"),
          InlineKeyboardButton("⏰ Schedules",   callback_data="admin_schedules")],
         [InlineKeyboardButton("🔑 API Keys",    callback_data="admin_api"),
-         InlineKeyboardButton("👥 Users",       callback_data="admin_users")],
+         InlineKeyboardButton("📊 Stats",       callback_data="admin_stats")],
         [InlineKeyboardButton("🔄 Refresh",     callback_data="admin_home"),
          InlineKeyboardButton("❌ Close",       callback_data="admin_close")],
     ])
@@ -2976,24 +3327,59 @@ def get_broadcast_confirm_kb() -> InlineKeyboardMarkup:
     ]])
 
 
-def get_users_page_kb(users: list[dict], page: int, page_size: int = 8) -> InlineKeyboardMarkup:
+def get_users_page_kb(users: list[dict], page: int, page_size: int = 7) -> InlineKeyboardMarkup:
     total_pages = max(1, (len(users) + page_size - 1) // page_size)
     chunk       = users[page * page_size : page * page_size + page_size]
-    rows        = [
-        [InlineKeyboardButton(
-            f"👤 {(u.get('username') or str(u['user_id']))[:20]}  ({u['user_id']})",
-            callback_data=f"chat_open:{u['user_id']}"
-        )]
-        for u in chunk
-    ]
+    rows: list[list[InlineKeyboardButton]] = []
+    for u in chunk:
+        uid = int(u.get("user_id") or 0)
+        label_name = (u.get("username") or str(uid))[:22]
+        rows.append([InlineKeyboardButton(f"👤 {label_name}  ({uid})", callback_data=f"user_view:{uid}")])
+
     nav = []
-    if page > 0:              nav.append(InlineKeyboardButton("⬅️", callback_data=f"users_page:{page-1}"))
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"users_page:{page-1}"))
     nav.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
-    if page < total_pages-1:  nav.append(InlineKeyboardButton("➡️", callback_data=f"users_page:{page+1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"users_page:{page+1}"))
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
-                 InlineKeyboardButton("❌ បិទ", callback_data="users_close")])
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data=f"users_page:{page}"),
+                 InlineKeyboardButton("⬅️ Admin", callback_data="admin_home")])
+    rows.append([InlineKeyboardButton("❌ Close", callback_data="users_close")])
+    return InlineKeyboardMarkup(rows)
+
+
+def get_user_detail_kb(user_id: int, blocked: bool, page: int = 0) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("💬 Chat", callback_data=f"user_chat:{user_id}"),
+         InlineKeyboardButton("🧹 Clear History", callback_data=f"user_clearhist:{user_id}")],
+        [InlineKeyboardButton("♻️ Reset Prefs", callback_data=f"user_resetprefs:{user_id}")],
+    ]
+    if blocked:
+        rows.append([InlineKeyboardButton("✅ Unblock User", callback_data=f"user_unblock:{user_id}")])
+    else:
+        rows.append([InlineKeyboardButton("🚫 Block User", callback_data=f"user_block:{user_id}")])
+    rows.append([InlineKeyboardButton("⬅️ Users", callback_data=f"users_page:{page}"),
+                 InlineKeyboardButton("⬅️ Admin", callback_data="admin_home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def get_bot_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for key, label in BOT_SETTING_LABELS.items():
+        enabled = _setting_bool_from(settings, key, default=True)
+        if key == "maintenance_mode":
+            state = "ON 🛠️" if enabled else "OFF ✅"
+        else:
+            state = "ON ✅" if enabled else "OFF ⚠️"
+        rows.append([InlineKeyboardButton(f"{label}: {state}", callback_data=f"admin_set:{key}")])
+    rows.extend([
+        [InlineKeyboardButton("🔄 Refresh", callback_data="admin_settings_refresh"),
+         InlineKeyboardButton("🧩 Setup SQL", callback_data="admin_settings_sql")],
+        [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+         InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+    ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -3194,6 +3580,8 @@ async def _admin_summary_counts(admin_id: int) -> dict:
             "blocked_users": 0,
             "active_api_keys": 0,
             "api_table_ok": False,
+            "settings_db_ok": False,
+            "maintenance_mode": False,
         }
         try:
             counts["total_users"] = len(get_all_user_ids()) if supabase else 0
@@ -3203,12 +3591,16 @@ async def _admin_summary_counts(admin_id: int) -> dict:
             counts["pending_sched"] = len(db_sched_fetch_admin_pending(admin_id)) if supabase else 0
         except Exception as e:
             logger.warning(f"admin schedule count failed: {e}")
-        if supabase:
-            try:
-                blocked = supabase.table("blocked_users").select("user_id").execute()
-                counts["blocked_users"] = len(blocked.data or [])
-            except Exception:
-                counts["blocked_users"] = 0
+        try:
+            counts["blocked_users"] = db_blocked_user_count()
+        except Exception:
+            counts["blocked_users"] = 0
+        try:
+            settings, status = db_bot_settings_fetch_all()
+            counts["settings_db_ok"] = bool(status.get("db_ok"))
+            counts["maintenance_mode"] = _setting_bool_from(settings, "maintenance_mode", False)
+        except Exception:
+            counts["settings_db_ok"] = False
         try:
             api_status = db_ai_api_key_status()
             counts["active_api_keys"] = int(api_status.get("active_count") or 0)
@@ -3224,31 +3616,55 @@ def _ok_bad(ok: bool, ok_text: str = "OK", bad_text: str = "OFF") -> str:
     return f"✅ {ok_text}" if ok else f"⚠️ {bad_text}"
 
 
-async def _admin_home_text(admin_id: int, title: str = "🛠️ Admin Dashboard") -> str:
+async def _admin_home_text(admin_id: int, title: str = "🛠️ Admin Dashboard V2") -> str:
     counts = await _admin_summary_counts(admin_id)
+    settings, settings_status = await get_bot_settings_async()
     ffmpeg_ok = bool(_FFMPEG_EXE and os.path.exists(_FFMPEG_EXE))
     temp_ok = False
+    temp_info = ""
     try:
         temp_dir = _get_temp_dir()
         temp_ok = os.path.isdir(temp_dir) and os.access(temp_dir, os.W_OK)
+        temp_files = glob.glob(os.path.join(temp_dir, f"{_TMP_PREFIX}*"))
+        temp_info = f"{len(temp_files)} files"
     except Exception:
-        pass
+        temp_info = "unknown"
 
     api_ready = bool(os.environ.get("AI_API_KEY", "").strip()) or bool(counts.get("active_api_keys"))
+    maintenance = _setting_bool_from(settings, "maintenance_mode", False)
+    tts_on = _setting_bool_from(settings, "tts_enabled", True)
+    ocr_on = _setting_bool_from(settings, "ocr_enabled", True)
+    voice_on = _setting_bool_from(settings, "voice_transcribe_enabled", True)
     return (
         f"{title}\n\n"
-        "<b>System</b>\n"
+        "<b>System Status</b>\n"
         f"🤖 Telegram: <b>✅ OK</b>\n"
         f"🗄️ Supabase: <b>{_ok_bad(bool(supabase))}</b>\n"
-        f"🧠 AI/HF: <b>{_ok_bad(bool(_hf_client))}</b>\n"
+        f"⚙️ Settings DB: <b>{_ok_bad(bool(settings_status.get('db_ok')), 'READY', 'MEMORY/SETUP')}</b>\n"
+        f"🧠 Hugging Face: <b>{_ok_bad(bool(_hf_client))}</b>\n"
+        f"🔍 OCR provider: <b>{_ok_bad(_ocr_configured(), 'READY', 'OFF')}</b>\n"
         f"🎧 FFmpeg: <b>{_ok_bad(ffmpeg_ok, 'OK', 'ERROR')}</b>\n"
-        f"📁 Temp: <b>{_ok_bad(temp_ok, 'OK', 'ERROR')}</b>\n\n"
+        f"⏱️ Uptime: <b>{html.escape(_format_uptime())}</b>\n"
+        f"📁 Temp: <b>{_ok_bad(temp_ok, 'OK', 'ERROR')}</b> <code>{html.escape(temp_info)}</code>\n\n"
+        "<b>Live Controls</b>\n"
+        f"🛠️ Maintenance: <b>{'ON ⚠️' if maintenance else 'OFF ✅'}</b>\n"
+        f"🗣️ TTS: <b>{'ON ✅' if tts_on else 'OFF ⚠️'}</b>\n"
+        f"🔍 OCR: <b>{'ON ✅' if ocr_on else 'OFF ⚠️'}</b>\n"
+        f"🎙️ Voice: <b>{'ON ✅' if voice_on else 'OFF ⚠️'}</b>\n\n"
         "<b>Quick Stats</b>\n"
         f"👥 Users: <b>{int(counts.get('total_users') or 0)}</b>\n"
-        f"⏰ Pending schedules: <b>{int(counts.get('pending_sched') or 0)}</b>\n"
         f"🚫 Blocked: <b>{int(counts.get('blocked_users') or 0)}</b>\n"
-        f"🔑 API access: <b>{_ok_bad(api_ready, 'READY', 'SETUP')}</b>\n\n"
-        "ចុចប៊ូតុងខាងក្រោម — មិនចាំបាច់វាយ command ទៀតទេ។"
+        f"⏰ Pending schedules: <b>{int(counts.get('pending_sched') or 0)}</b>\n"
+        f"🔑 API access: <b>{_ok_bad(api_ready, 'READY', 'SETUP')}</b>\n"
+        f"💬 Admin chats: <b>{len(_admin_chat_target)}</b>\n\n"
+        "<b>Runtime Since Restart</b>\n"
+        f"🗣️ TTS: <b>{_RUNTIME_METRICS.get('tts', 0)}</b> | "
+        f"🔍 OCR: <b>{_RUNTIME_METRICS.get('ocr', 0)}</b> | "
+        f"🎙️ Voice: <b>{_RUNTIME_METRICS.get('voice', 0)}</b>\n"
+        f"🎵 Audio: <b>{_RUNTIME_METRICS.get('audio', 0)}</b> | "
+        f"⛔ Blocked hits: <b>{_RUNTIME_METRICS.get('blocked_hits', 0)}</b> | "
+        f"⚠️ Disabled hits: <b>{_RUNTIME_METRICS.get('disabled_hits', 0)}</b>\n\n"
+        "ចុចប៊ូតុងខាងក្រោម ដើម្បីគ្រប់គ្រង Bot។"
     )
 
 
@@ -3277,15 +3693,29 @@ async def _admin_health_text() -> str:
 
 async def _admin_stats_text(admin_id: int) -> str:
     counts = await _admin_summary_counts(admin_id)
+    settings, status = await get_bot_settings_async()
     return (
-        "📊 <b>Bot Stats</b>\n\n"
+        "📊 <b>Admin Dashboard V2 Stats</b>\n\n"
         f"👥 Total users: <b>{int(counts.get('total_users') or 0)}</b>\n"
-        f"⏰ Pending schedules: <b>{int(counts.get('pending_sched') or 0)}</b>\n"
         f"🚫 Blocked users: <b>{int(counts.get('blocked_users') or 0)}</b>\n"
+        f"⏰ Pending schedules: <b>{int(counts.get('pending_sched') or 0)}</b>\n"
         f"🔑 Active API keys: <b>{int(counts.get('active_api_keys') or 0)}</b>\n"
         f"💬 Active admin chats: <b>{len(_admin_chat_target)}</b>\n"
+        f"🔒 Active user locks: <b>{len(_user_locks)}</b>\n"
+        f"💭 History cache: <b>{len(_hist_cache)}</b> users\n"
+        f"⚙️ Settings DB: <b>{_ok_bad(bool(status.get('db_ok')), 'READY', 'MEMORY/SETUP')}</b>\n"
+        f"🛠️ Maintenance: <b>{'ON' if _setting_bool_from(settings, 'maintenance_mode', False) else 'OFF'}</b>\n\n"
+        "<b>Runtime metrics since restart</b>\n"
+        f"🗣️ TTS requests: <b>{_RUNTIME_METRICS.get('tts', 0)}</b>\n"
+        f"🔍 OCR requests: <b>{_RUNTIME_METRICS.get('ocr', 0)}</b>\n"
+        f"🎙️ Voice transcripts: <b>{_RUNTIME_METRICS.get('voice', 0)}</b>\n"
+        f"🎵 Audio transcripts: <b>{_RUNTIME_METRICS.get('audio', 0)}</b>\n"
+        f"⛔ Blocked hits: <b>{_RUNTIME_METRICS.get('blocked_hits', 0)}</b>\n"
+        f"⚠️ Disabled hits: <b>{_RUNTIME_METRICS.get('disabled_hits', 0)}</b>\n"
+        f"❌ Errors: <b>{_RUNTIME_METRICS.get('errors', 0)}</b>\n\n"
         f"🧠 HF model: <code>{html.escape(str(HF_MODEL or 'OFF'))}</code>\n"
-        f"🔍 OCR provider: <code>{html.escape(str(OCR_PROVIDER or 'auto'))}</code>"
+        f"🔍 OCR provider: <code>{html.escape(str(OCR_PROVIDER or 'auto'))}</code>\n"
+        f"⏱️ Uptime: <b>{html.escape(_format_uptime())}</b>"
     )
 
 
@@ -3299,8 +3729,8 @@ async def _admin_open_users_panel(query) -> None:
         ))
         return
     await safe_send(lambda: query.message.edit_text(
-        f"👥 <b>អ្នកប្រើប្រាស់ ({len(users)} នាក់)</b>\n"
-        "ចុចលើឈ្មោះ ដើម្បីចាប់ផ្ដើម Chat ។",
+        f"👥 <b>User Management ({len(users)} users)</b>\n"
+        "Select a user to view details, chat, block/unblock, reset prefs, or clear history.",
         parse_mode="HTML",
         reply_markup=get_users_page_kb(users, page=0),
     ))
@@ -3327,6 +3757,46 @@ async def _admin_open_schedules_panel(query, admin_id: int) -> None:
         parse_mode="HTML",
         reply_markup=get_schedules_list_kb(rows, page=0),
     ))
+
+
+async def _admin_open_settings_panel(query, force: bool = False, notice: str = "") -> None:
+    settings, status = await get_bot_settings_async(force=force)
+    lines = []
+    if notice:
+        lines.append(f"{html.escape(notice)}\n")
+    lines.extend([
+        "⚙️ <b>Bot Settings Panel</b>",
+        "",
+        f"Storage: <b>{_ok_bad(bool(status.get('db_ok')), 'Supabase', 'Memory / setup needed')}</b>",
+    ])
+    if status.get("error"):
+        lines.append(f"Setup note: <code>{html.escape(str(status.get('error'))[:500])}</code>")
+    lines.append("")
+    for key, label in BOT_SETTING_LABELS.items():
+        enabled = _setting_bool_from(settings, key, True)
+        if key == "maintenance_mode":
+            state = "ON ⚠️" if enabled else "OFF ✅"
+        else:
+            state = "ON ✅" if enabled else "OFF ⚠️"
+        desc = html.escape(BOT_SETTING_DESCRIPTIONS.get(key, ""))
+        lines.append(f"{label}: <b>{state}</b> — {desc}")
+    lines.extend(["", "ចុច setting ណាមួយដើម្បី ON/OFF។"])
+    await safe_send(lambda: query.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=get_bot_settings_kb(settings),
+        disable_web_page_preview=True,
+    ))
+
+
+async def _admin_send_settings_sql(message) -> None:
+    for page in _paginate_plain(ADMIN_V2_TABLES_SQL, limit=3800):
+        await safe_send(lambda p=page: message.reply_text(
+            "🧩 <b>Admin Dashboard V2 SQL</b>\n\n"
+            f"<pre>{html.escape(p)}</pre>",
+            parse_mode="HTML",
+            reply_markup=get_admin_dashboard_kb(),
+        ))
 
 
 async def _admin_start_broadcast_from_button(query, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
@@ -3362,6 +3832,23 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text,
         parse_mode="HTML",
         reply_markup=get_admin_dashboard_kb(),
+    ))
+
+
+
+
+@admin_only
+async def cmd_botsettings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    settings, status = await get_bot_settings_async(force=True)
+    text = (
+        "⚙️ <b>Bot Settings Panel</b>\n\n"
+        f"Storage: <b>{_ok_bad(bool(status.get('db_ok')), 'Supabase', 'Memory / setup needed')}</b>\n"
+        "Use /admin → ⚙️ Settings for button controls."
+    )
+    await safe_send(lambda: update.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=get_bot_settings_kb(settings),
     ))
 
 
@@ -3670,6 +4157,28 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
             parse_mode="HTML",
             reply_markup=get_admin_dashboard_kb(),
         ))
+        return
+
+    if data in ("admin_settings", "admin_settings_refresh"):
+        await _admin_open_settings_panel(query, force=True)
+        return
+
+    if data == "admin_settings_sql":
+        await _admin_send_settings_sql(query.message)
+        with suppress(Exception):
+            await _admin_open_settings_panel(query, force=True, notice="🧩 SQL sent. Run it in Supabase SQL editor.")
+        return
+
+    if data.startswith("admin_set:"):
+        key = data.split(":", 1)[1].strip()
+        settings, _status = await get_bot_settings_async(force=True)
+        current = _setting_bool_from(settings, key, True)
+        ok, info = await asyncio.get_running_loop().run_in_executor(
+            _DB_EXECUTOR,
+            lambda: db_bot_setting_set(key, not current, user_id),
+        )
+        notice = f"✅ {BOT_SETTING_LABELS.get(key, key)} updated." if ok else f"⚠️ Could not persist setting: {info}"
+        await _admin_open_settings_panel(query, force=True, notice=notice)
         return
 
     if data == "admin_api":
@@ -4155,25 +4664,89 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if data.startswith("users_page:"):
         page  = int(data.split(":")[1])
-        users = await asyncio.get_running_loop().run_in_executor(None, get_all_users_with_names)
-        with suppress(Exception):
-            await query.message.edit_reply_markup(reply_markup=get_users_page_kb(users, page=page))
+        users = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, get_all_users_with_names)
+        await safe_send(lambda: query.message.edit_text(
+            f"👥 <b>User Management ({len(users)} users)</b>\n"
+            "Select a user to view details, chat, block, reset prefs, or clear history.",
+            parse_mode="HTML",
+            reply_markup=get_users_page_kb(users, page=page),
+        ))
         return
 
-    if data.startswith("chat_open:"):
-        target_id = int(data.split(":")[1])
-        admin_id  = user_id
-        with suppress(Exception):
-            await query.message.delete()
-        await _open_chat_session(context.bot, admin_id, target_id, context)
-        await safe_send(lambda: context.bot.send_message(
-            chat_id=admin_id,
-            text=(
-                f"💬 <b>Chat Mode បើក</b>\n\nកំពុង Chat ជាមួយ User <code>{target_id}</code>\n"
-                "សារ/រូបភាព/Voice ផ្ញើនឹងទៅដល់ User ។\n\nវាយ /endchat ឬ /cancel ដើម្បីបញ្ចប់។"
-            ),
+    if data.startswith("user_view:"):
+        target_id = int(data.split(":", 1)[1])
+        row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
+        await safe_send(lambda: query.message.edit_text(
+            _format_user_detail_text(row),
             parse_mode="HTML",
+            reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked"))),
         ))
+        return
+
+    if data.startswith("user_chat:"):
+        target_id = int(data.split(":", 1)[1])
+        exists = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: user_exists_in_db(target_id))
+        if not exists:
+            await safe_send(lambda: query.message.edit_text(
+                f"❌ User <code>{target_id}</code> មិនមាននៅក្នុង Database ។",
+                parse_mode="HTML",
+                reply_markup=get_admin_dashboard_kb(),
+            ))
+            return
+        await _open_chat_session(context.bot, user_id, target_id, context)
+        await safe_send(lambda: query.message.edit_text(
+            f"💬 <b>Chat Mode បើក</b>\n\nកំពុង Chat ជាមួយ User <code>{target_id}</code>\n"
+            "សារ/រូបភាព/Voice ផ្ញើនឹងទៅដល់ User ។\n\n"
+            "វាយ /endchat ឬ /cancel ដើម្បីបញ្ចប់។",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+                InlineKeyboardButton("❌ End Chat", callback_data="admin_cancel_state"),
+            ]]),
+        ))
+        return
+
+    if data.startswith(("user_block:", "user_unblock:")):
+        action, raw_id = data.split(":", 1)
+        target_id = int(raw_id)
+        blocked = action == "user_block"
+        ok, info = await asyncio.get_running_loop().run_in_executor(
+            _DB_EXECUTOR,
+            lambda: db_user_set_blocked(target_id, user_id, blocked),
+        )
+        row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
+        notice = "✅ User blocked." if blocked else "✅ User unblocked."
+        if not ok:
+            notice = f"⚠️ Saved memory only / DB issue: {info[:500]}"
+        await safe_send(lambda: query.message.edit_text(
+            notice + "\n\n" + _format_user_detail_text(row),
+            parse_mode="HTML",
+            reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked"))),
+        ))
+        return
+
+    if data.startswith("user_resetprefs:"):
+        target_id = int(data.split(":", 1)[1])
+        ok, info = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_reset_prefs(target_id))
+        row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
+        notice = "✅ User preferences reset." if ok else f"❌ Reset failed: {info[:500]}"
+        await safe_send(lambda: query.message.edit_text(
+            notice + "\n\n" + _format_user_detail_text(row),
+            parse_mode="HTML",
+            reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked"))),
+        ))
+        return
+
+    if data.startswith("user_clearhist:"):
+        target_id = int(data.split(":", 1)[1])
+        await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_history_clear(target_id))
+        row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
+        await safe_send(lambda: query.message.edit_text(
+            "✅ User conversation history cleared.\n\n" + _format_user_detail_text(row),
+            parse_mode="HTML",
+            reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked"))),
+        ))
+        return
 
 
 async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
@@ -4763,6 +5336,8 @@ async def _drop_stale_updates(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         sync_user_data(update.effective_user)
+        if not await _ensure_user_allowed(update, context):
+            return
         await safe_send(lambda: update.message.reply_text(
             WELCOME_TEXT,
             reply_markup=ReplyKeyboardRemove(),
@@ -4841,6 +5416,9 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: msg.reply_text("✅ រូបភាពបានផ្ញើដល់ Admin ។"))
         return
 
+    if not await _ensure_user_allowed(update, context, "ocr_enabled", "Image OCR"):
+        return
+
     if not _ocr_configured():
         await safe_send(lambda: msg.reply_text(_ocr_status_for_user()))
         return
@@ -4848,6 +5426,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _check_cooldown(msg, user_id):
         return
 
+    _metric_inc("ocr")
     sync_user_data(user)
     uname       = user.username or user.first_name or str(user_id)
     stop_event  = asyncio.Event()
@@ -4967,6 +5546,9 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         return
 
+    if not await _ensure_user_allowed(update, context, "audio_transcribe_enabled", "Audio file transcribe"):
+        return
+
     if not _gemini:
         await safe_send(lambda: msg.reply_text(
             "❌ Gemini API មិន Activate ទេ។ Transcribe ត្រូវការ GEMINI_API_KEY ។"
@@ -4982,6 +5564,7 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _check_cooldown(msg, user_id):
         return
 
+    _metric_inc("audio")
     sync_user_data(user)
     uname       = user.username or user.first_name or str(user_id)
     ext         = os.path.splitext(filename)[1].lower() if filename else ".mp3"
@@ -5094,6 +5677,9 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: msg.reply_text("✅ Voice ផ្ញើដល់ Admin ។"))
         return
 
+    if not await _ensure_user_allowed(update, context, "voice_transcribe_enabled", "Voice transcribe"):
+        return
+
     if not _gemini:
         await safe_send(lambda: msg.reply_text("❌ Gemini API មិន Activate ទេ។ សូម Set GEMINI_API_KEY ។"))
         return
@@ -5105,6 +5691,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _check_cooldown(msg, user_id):
         return
 
+    _metric_inc("voice")
     sync_user_data(user)
     ogg_path   = _make_temp_ogg()
     stop_event = asyncio.Event()
@@ -5201,6 +5788,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: msg.reply_text("✅ សាររបស់អ្នកបានផ្ញើដល់ Admin ។"))
         return
 
+    if not await _ensure_user_allowed(update, context, "tts_enabled", "Text to Voice"):
+        return
+
     if text.strip() == "🎵 សួស្តី!":
         await on_start(update, context)
         return
@@ -5219,6 +5809,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _check_cooldown(msg, user_id):
         return
 
+    _metric_inc("tts")
     sync_user_data(user)
     loop = asyncio.get_running_loop()
     prefs, tts_text = await asyncio.gather(
@@ -5577,7 +6168,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # already call query.answer(). Do NOT answer here — it would cause a
     # "query is too old" double-answer error on Telegram's side.
     _HANDLED_EXACT = {"bc_confirm", "bc_cancel", "users_close", "noop"}
-    _HANDLED_PREFIX = ("sched_", "users_page:", "chat_open:")
+    _HANDLED_PREFIX = ("sched_", "users_page:", "user_")
     if data in _HANDLED_EXACT or any(data.startswith(p) for p in _HANDLED_PREFIX):
         return
 
@@ -5617,6 +6208,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Global error handler
 # ---------------------------------------------------------------------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    _metric_inc("errors")
     logger.error(f"Unhandled exception: {context.error}", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         with suppress(Exception):
@@ -5680,13 +6272,14 @@ async def _run_bot():
     app.add_handler(CommandHandler("stats",           admin_stats))
     app.add_handler(CommandHandler("admin",           cmd_admin))
     app.add_handler(CommandHandler("api",             cmd_api))
+    app.add_handler(CommandHandler("botsettings",     cmd_botsettings))
     app.add_handler(CommandHandler("users",           cmd_users))
     app.add_handler(CommandHandler("chat",            cmd_chat))
     app.add_handler(CommandHandler("endchat",         cmd_endchat))
 
     # Callback handlers (priority order matters)
     app.add_handler(CallbackQueryHandler(broadcast_callback,  pattern=r"^bc_(confirm|cancel)$"))
-    app.add_handler(CallbackQueryHandler(users_page_callback, pattern=r"^(users_page:\d+|users_close|chat_open:\d+|noop)$"))
+    app.add_handler(CallbackQueryHandler(users_page_callback, pattern=r"^(users_page:\d+|users_close|noop|user_(view|chat|block|unblock|resetprefs|clearhist):\d+)$"))
     app.add_handler(CallbackQueryHandler(sched_callback,      pattern=r"^sched_"))
     app.add_handler(CallbackQueryHandler(on_callback))
 
