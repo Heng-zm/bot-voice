@@ -1074,6 +1074,7 @@ BROADCAST_WAIT_MESSAGE = 1
 CHAT_WAIT_MESSAGE      = 2
 SCHED_WAIT_MSG         = 3
 SCHED_WAIT_TIME        = 4
+USER_SEARCH_WAIT_QUERY = 5
 _SCHED_POLL_INTERVAL   = 60
 _SCHED_SENDING_STALE_SECONDS = int(os.environ.get("SCHED_SENDING_STALE_SECONDS", "1800"))
 _DT_FORMATS = [
@@ -1962,6 +1963,57 @@ def _paginated_fetch(select_fields: str) -> list[dict]:
 
 def get_all_user_ids()         -> list[int]:  return [row["user_id"] for row in _paginated_fetch("user_id")]
 def get_all_users_with_names() -> list[dict]: return _paginated_fetch("user_id, username")
+
+
+def _normalize_user_search_query(query: str) -> str:
+    return re.sub(r"\s+", " ", (query or "").strip().lstrip("@")).lower()
+
+
+def search_users_by_query(query: str, limit: int = 80) -> list[dict]:
+    """Search users by Telegram user ID or username.
+
+    This intentionally fetches the same safe fields as the user list, then
+    filters in Python. It avoids fragile Supabase `.or_()` syntax and keeps
+    working even when the table only has `user_id` and `username`.
+    """
+    q = _normalize_user_search_query(query)
+    if not q:
+        return []
+
+    users = get_all_users_with_names()
+    if not users:
+        return []
+
+    exact: list[dict] = []
+    prefix: list[dict] = []
+    contains: list[dict] = []
+
+    for row in users:
+        uid = str(row.get("user_id") or "").strip()
+        username = str(row.get("username") or "").strip()
+        username_l = username.lower().lstrip("@")
+
+        if q == uid or q == username_l:
+            exact.append(row)
+        elif uid.startswith(q) or username_l.startswith(q):
+            prefix.append(row)
+        elif q in uid or q in username_l:
+            contains.append(row)
+
+    seen: set[int] = set()
+    merged: list[dict] = []
+    for row in exact + prefix + contains:
+        try:
+            uid_int = int(row.get("user_id") or 0)
+        except Exception:
+            uid_int = 0
+        if not uid_int or uid_int in seen:
+            continue
+        seen.add(uid_int)
+        merged.append(row)
+        if len(merged) >= limit:
+            break
+    return merged
 
 
 def user_exists_in_db(user_id: int) -> bool:
@@ -3454,14 +3506,39 @@ def get_broadcast_confirm_kb() -> InlineKeyboardMarkup:
     ]])
 
 
+def _clamp_users_page(users: list[dict], page: int, page_size: int = 7) -> int:
+    total_pages = max(1, (len(users) + page_size - 1) // page_size)
+    return max(0, min(int(page or 0), total_pages - 1))
+
+
+def _parse_user_back_ref(ref: str | None) -> tuple[str, int]:
+    ref = (ref or "p0").strip().lower()
+    if len(ref) >= 2 and ref[0] in ("p", "s") and ref[1:].isdigit():
+        return ref[0], int(ref[1:])
+    if ref.isdigit():
+        return "p", int(ref)
+    return "p", 0
+
+
+def _user_back_callback(ref: str | None) -> tuple[str, str]:
+    kind, page = _parse_user_back_ref(ref)
+    if kind == "s":
+        return f"users_search_page:{page}", "⬅️ Search"
+    return f"users_page:{page}", "⬅️ Users"
+
+
 def get_users_page_kb(users: list[dict], page: int, page_size: int = 7) -> InlineKeyboardMarkup:
+    page = _clamp_users_page(users, page, page_size)
     total_pages = max(1, (len(users) + page_size - 1) // page_size)
     chunk       = users[page * page_size : page * page_size + page_size]
     rows: list[list[InlineKeyboardButton]] = []
     for u in chunk:
         uid = int(u.get("user_id") or 0)
         label_name = (u.get("username") or str(uid))[:22]
-        rows.append([InlineKeyboardButton(f"👤 {label_name}  ({uid})", callback_data=f"user_view:{uid}")])
+        rows.append([InlineKeyboardButton(
+            f"👤 {label_name}  ({uid})",
+            callback_data=f"user_view:{uid}:p{page}",
+        )])
 
     nav = []
     if page > 0:
@@ -3471,23 +3548,61 @@ def get_users_page_kb(users: list[dict], page: int, page_size: int = 7) -> Inlin
         nav.append(InlineKeyboardButton("➡️", callback_data=f"users_page:{page+1}"))
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data=f"users_page:{page}"),
-                 InlineKeyboardButton("⬅️ Admin", callback_data="admin_home")])
-    rows.append([InlineKeyboardButton("❌ Close", callback_data="users_close")])
+    rows.append([InlineKeyboardButton("🔎 Search User", callback_data="users_search"),
+                 InlineKeyboardButton("🔄 Refresh", callback_data=f"users_page:{page}")])
+    rows.append([InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+                 InlineKeyboardButton("❌ Close", callback_data="users_close")])
     return InlineKeyboardMarkup(rows)
 
 
-def get_user_detail_kb(user_id: int, blocked: bool, page: int = 0) -> InlineKeyboardMarkup:
+def get_user_search_page_kb(users: list[dict], page: int, page_size: int = 7) -> InlineKeyboardMarkup:
+    page = _clamp_users_page(users, page, page_size)
+    total_pages = max(1, (len(users) + page_size - 1) // page_size)
+    chunk       = users[page * page_size : page * page_size + page_size]
+    rows: list[list[InlineKeyboardButton]] = []
+    for u in chunk:
+        uid = int(u.get("user_id") or 0)
+        label_name = (u.get("username") or str(uid))[:22]
+        rows.append([InlineKeyboardButton(
+            f"👤 {label_name}  ({uid})",
+            callback_data=f"user_view:{uid}:s{page}",
+        )])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"users_search_page:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"users_search_page:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔎 New Search", callback_data="users_search"),
+                 InlineKeyboardButton("👥 All Users", callback_data="users_page:0")])
+    rows.append([InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+                 InlineKeyboardButton("❌ Close", callback_data="users_close")])
+    return InlineKeyboardMarkup(rows)
+
+
+def get_user_search_prompt_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 All Users", callback_data="users_page:0")],
+        [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+         InlineKeyboardButton("❌ Close", callback_data="users_close")],
+    ])
+
+
+def get_user_detail_kb(user_id: int, blocked: bool, back_ref: str = "p0") -> InlineKeyboardMarkup:
+    back_callback, back_label = _user_back_callback(back_ref)
     rows = [
         [InlineKeyboardButton("💬 Chat", callback_data=f"user_chat:{user_id}"),
-         InlineKeyboardButton("🧹 Clear History", callback_data=f"user_clearhist:{user_id}")],
-        [InlineKeyboardButton("♻️ Reset Prefs", callback_data=f"user_resetprefs:{user_id}")],
+         InlineKeyboardButton("🧹 Clear History", callback_data=f"user_clearhist:{user_id}:{back_ref}")],
+        [InlineKeyboardButton("♻️ Reset Prefs", callback_data=f"user_resetprefs:{user_id}:{back_ref}")],
     ]
     if blocked:
-        rows.append([InlineKeyboardButton("✅ Unblock User", callback_data=f"user_unblock:{user_id}")])
+        rows.append([InlineKeyboardButton("✅ Unblock User", callback_data=f"user_unblock:{user_id}:{back_ref}")])
     else:
-        rows.append([InlineKeyboardButton("🚫 Block User", callback_data=f"user_block:{user_id}")])
-    rows.append([InlineKeyboardButton("⬅️ Users", callback_data=f"users_page:{page}"),
+        rows.append([InlineKeyboardButton("🚫 Block User", callback_data=f"user_block:{user_id}:{back_ref}")])
+    rows.append([InlineKeyboardButton(back_label, callback_data=back_callback),
                  InlineKeyboardButton("⬅️ Admin", callback_data="admin_home")])
     return InlineKeyboardMarkup(rows)
 
@@ -3857,7 +3972,7 @@ async def _admin_open_users_panel(query) -> None:
         return
     await safe_send(lambda: query.message.edit_text(
         f"👥 <b>User Management ({len(users)} users)</b>\n"
-        "Select a user to view details, chat, block/unblock, reset prefs, or clear history.",
+        "Select a user, or press 🔎 Search User to find by ID/username.",
         parse_mode="HTML",
         reply_markup=get_users_page_kb(users, page=0),
     ))
@@ -4712,12 +4827,39 @@ async def _scheduler_loop(bot, stop_event: asyncio.Event) -> None:
 # ===========================================================================
 @admin_only
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = await asyncio.get_running_loop().run_in_executor(None, get_all_users_with_names)
+    args = context.args or []
+    if args:
+        query_text = " ".join(args).strip()
+        results = await asyncio.get_running_loop().run_in_executor(
+            _DB_EXECUTOR,
+            lambda: search_users_by_query(query_text),
+        )
+        context.user_data["users_search_query"] = query_text
+        context.user_data["users_search_results"] = results
+        if not results:
+            await safe_send(lambda: update.message.reply_text(
+                "🔎 <b>User Search</b>\n\n"
+                f"No users found for: <code>{html.escape(query_text)}</code>",
+                parse_mode="HTML",
+                reply_markup=get_user_search_prompt_kb(),
+            ))
+            return
+        await safe_send(lambda: update.message.reply_text(
+            "🔎 <b>User Search Results</b>\n\n"
+            f"Query: <code>{html.escape(query_text)}</code>\n"
+            f"Found: <b>{len(results)}</b> user(s)\n\n"
+            "Select a user to view details.",
+            parse_mode="HTML",
+            reply_markup=get_user_search_page_kb(results, page=0),
+        ))
+        return
+
+    users = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, get_all_users_with_names)
     if not users:
         await safe_send(lambda: update.message.reply_text("❌ គ្មានអ្នកប្រើប្រាស់ registered ទេ។"))
         return
     await safe_send(lambda: update.message.reply_text(
-        f"👥 <b>អ្នកប្រើប្រាស់ ({len(users)} នាក់)</b>\nចុចលើឈ្មោះ ដើម្បីចាប់ផ្ដើម Chat ។",
+        f"👥 <b>អ្នកប្រើប្រាស់ ({len(users)} នាក់)</b>\nចុចលើឈ្មោះ ដើម្បីមើល Detail ឬប្រើ 🔎 Search User ។",
         parse_mode="HTML",
         reply_markup=get_users_page_kb(users, page=0),
     ))
@@ -4769,6 +4911,80 @@ async def _open_chat_session(bot, admin_id: int, target_id: int, context):
         await bot.send_message(chat_id=target_id, text="🔔 Admin ចង់ Chat ជាមួយអ្នក។ ផ្ញើសារតបមកបាន!")
 
 
+async def _show_user_search_results(query, context: ContextTypes.DEFAULT_TYPE, page: int = 0) -> None:
+    search_query = (context.user_data.get("users_search_query") or "").strip()
+    results = context.user_data.get("users_search_results")
+    if results is None or not isinstance(results, list):
+        results = await asyncio.get_running_loop().run_in_executor(
+            _DB_EXECUTOR,
+            lambda: search_users_by_query(search_query),
+        )
+        context.user_data["users_search_results"] = results
+
+    page = _clamp_users_page(results, page)
+    if not results:
+        await safe_send(lambda: query.message.edit_text(
+            "🔎 <b>User Search</b>\n\n"
+            f"No users found for: <code>{html.escape(search_query)}</code>\n\n"
+            "Press 🔎 New Search or return to all users.",
+            parse_mode="HTML",
+            reply_markup=get_user_search_prompt_kb(),
+        ))
+        return
+
+    await safe_send(lambda: query.message.edit_text(
+        "🔎 <b>User Search Results</b>\n\n"
+        f"Query: <code>{html.escape(search_query)}</code>\n"
+        f"Found: <b>{len(results)}</b> user(s)\n\n"
+        "Select a user to view details.",
+        parse_mode="HTML",
+        reply_markup=get_user_search_page_kb(results, page=page),
+    ))
+
+
+async def _handle_user_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if context.user_data.get("user_search_state") != USER_SEARCH_WAIT_QUERY:
+        return False
+
+    msg = update.message
+    query_text = (msg.text or "").strip()
+    context.user_data.pop("user_search_state", None)
+
+    if not query_text:
+        await safe_send(lambda: msg.reply_text(
+            "⚠️ Search text is empty. Press /users and try again.",
+            reply_markup=get_user_search_prompt_kb(),
+        ))
+        return True
+
+    results = await asyncio.get_running_loop().run_in_executor(
+        _DB_EXECUTOR,
+        lambda: search_users_by_query(query_text),
+    )
+    context.user_data["users_search_query"] = query_text
+    context.user_data["users_search_results"] = results
+
+    if not results:
+        await safe_send(lambda: msg.reply_text(
+            "🔎 <b>User Search</b>\n\n"
+            f"No users found for: <code>{html.escape(query_text)}</code>\n\n"
+            "Search supports Telegram user ID and username.",
+            parse_mode="HTML",
+            reply_markup=get_user_search_prompt_kb(),
+        ))
+        return True
+
+    await safe_send(lambda: msg.reply_text(
+        "🔎 <b>User Search Results</b>\n\n"
+        f"Query: <code>{html.escape(query_text)}</code>\n"
+        f"Found: <b>{len(results)}</b> user(s)\n\n"
+        "Select a user to view details.",
+        parse_mode="HTML",
+        reply_markup=get_user_search_page_kb(results, page=0),
+    ))
+    return True
+
+
 async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     user_id = query.from_user.id
@@ -4782,6 +4998,7 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer()
 
     if data == "users_close":
+        context.user_data.pop("user_search_state", None)
         with suppress(Exception):
             await query.message.delete()
         return
@@ -4789,24 +5006,47 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if data == "noop":
         return
 
+    if data == "users_search":
+        context.user_data["user_search_state"] = USER_SEARCH_WAIT_QUERY
+        await safe_send(lambda: query.message.edit_text(
+            "🔎 <b>Search User</b>\n\n"
+            "Send a Telegram user ID or username.\n\n"
+            "Examples:\n"
+            "<code>1272791365</code>\n"
+            "<code>heng</code>\n"
+            "<code>@username</code>\n\n"
+            "Use /cancel to stop search.",
+            parse_mode="HTML",
+            reply_markup=get_user_search_prompt_kb(),
+        ))
+        return
+
+    if data.startswith("users_search_page:"):
+        page = int(data.split(":", 1)[1])
+        await _show_user_search_results(query, context, page=page)
+        return
+
     if data.startswith("users_page:"):
         page  = int(data.split(":")[1])
         users = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, get_all_users_with_names)
+        page = _clamp_users_page(users, page)
         await safe_send(lambda: query.message.edit_text(
             f"👥 <b>User Management ({len(users)} users)</b>\n"
-            "Select a user to view details, chat, block, reset prefs, or clear history.",
+            "Select a user, or press 🔎 Search User to find by ID/username.",
             parse_mode="HTML",
             reply_markup=get_users_page_kb(users, page=page),
         ))
         return
 
     if data.startswith("user_view:"):
-        target_id = int(data.split(":", 1)[1])
+        parts = data.split(":")
+        target_id = int(parts[1])
+        back_ref = parts[2] if len(parts) > 2 else "p0"
         row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
         await safe_send(lambda: query.message.edit_text(
             _format_user_detail_text(row),
             parse_mode="HTML",
-            reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked"))),
+            reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
         ))
         return
 
@@ -4834,8 +5074,10 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if data.startswith(("user_block:", "user_unblock:")):
-        action, raw_id = data.split(":", 1)
-        target_id = int(raw_id)
+        parts = data.split(":")
+        action = parts[0]
+        target_id = int(parts[1])
+        back_ref = parts[2] if len(parts) > 2 else "p0"
         blocked = action == "user_block"
         ok, info = await asyncio.get_running_loop().run_in_executor(
             _DB_EXECUTOR,
@@ -4848,30 +5090,34 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await safe_send(lambda: query.message.edit_text(
             notice + "\n\n" + _format_user_detail_text(row),
             parse_mode="HTML",
-            reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked"))),
+            reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
         ))
         return
 
     if data.startswith("user_resetprefs:"):
-        target_id = int(data.split(":", 1)[1])
+        parts = data.split(":")
+        target_id = int(parts[1])
+        back_ref = parts[2] if len(parts) > 2 else "p0"
         ok, info = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_reset_prefs(target_id))
         row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
         notice = "✅ User preferences reset." if ok else f"❌ Reset failed: {info[:500]}"
         await safe_send(lambda: query.message.edit_text(
             notice + "\n\n" + _format_user_detail_text(row),
             parse_mode="HTML",
-            reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked"))),
+            reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
         ))
         return
 
     if data.startswith("user_clearhist:"):
-        target_id = int(data.split(":", 1)[1])
+        parts = data.split(":")
+        target_id = int(parts[1])
+        back_ref = parts[2] if len(parts) > 2 else "p0"
         await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_history_clear(target_id))
         row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
         await safe_send(lambda: query.message.edit_text(
             "✅ User conversation history cleared.\n\n" + _format_user_detail_text(row),
             parse_mode="HTML",
-            reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked"))),
+            reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
         ))
         return
 
@@ -5430,6 +5676,11 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: update.message.reply_text("❌ Schedule flow បានបោះបង់។"))
         cleared = True
 
+    if context.user_data.get("user_search_state") == USER_SEARCH_WAIT_QUERY:
+        context.user_data.pop("user_search_state", None)
+        await safe_send(lambda: update.message.reply_text("❌ User search cancelled."))
+        cleared = True
+
     if not cleared:
         await safe_send(lambda: update.message.reply_text("ℹ️ មិនមាន operation ត្រូវ cancel ទេ។"))
 
@@ -5881,6 +6132,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Admin flow intercepts
     if _is_admin(user_id):
+        if await _handle_user_search_text(update, context):
+            return
+
         sched_state = context.user_data.get("sched_state")
         if sched_state == SCHED_WAIT_MSG:
             await _handle_sched_content(update, context)
@@ -6295,7 +6549,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # already call query.answer(). Do NOT answer here — it would cause a
     # "query is too old" double-answer error on Telegram's side.
     _HANDLED_EXACT = {"bc_confirm", "bc_cancel", "users_close", "noop"}
-    _HANDLED_PREFIX = ("sched_", "users_page:", "user_")
+    _HANDLED_PREFIX = ("sched_", "users_page:", "users_search", "user_")
     if data in _HANDLED_EXACT or any(data.startswith(p) for p in _HANDLED_PREFIX):
         return
 
@@ -6406,7 +6660,10 @@ async def _run_bot():
 
     # Callback handlers (priority order matters)
     app.add_handler(CallbackQueryHandler(broadcast_callback,  pattern=r"^bc_(confirm|cancel)$"))
-    app.add_handler(CallbackQueryHandler(users_page_callback, pattern=r"^(users_page:\d+|users_close|noop|user_(view|chat|block|unblock|resetprefs|clearhist):\d+)$"))
+    app.add_handler(CallbackQueryHandler(
+        users_page_callback,
+        pattern=r"^(users_page:\d+|users_search|users_search_page:\d+|users_close|noop|user_(view|chat|block|unblock|resetprefs|clearhist):\d+(?::[ps]\d+)?)$",
+    ))
     app.add_handler(CallbackQueryHandler(sched_callback,      pattern=r"^sched_"))
     app.add_handler(CallbackQueryHandler(on_callback))
 
