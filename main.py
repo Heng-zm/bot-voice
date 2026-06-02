@@ -431,6 +431,41 @@ def db_ai_api_key_revoke(identifier: str) -> tuple[bool, str]:
         raise RuntimeError(f"Could not revoke API key: {e}") from e
 
 
+def db_ai_api_key_status() -> dict:
+    """Return API auth/setup status for the Telegram admin UI."""
+    status = {
+        "static_key": bool(os.environ.get("AI_API_KEY", "").strip()),
+        "service_role_key": bool(os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()),
+        "supabase": supabase is not None,
+        "table_ok": False,
+        "active_count": 0,
+        "total_sampled": 0,
+        "memory_count": len(_api_keys_memory_by_hash),
+        "error": "",
+    }
+
+    if not supabase:
+        status["table_ok"] = bool(_api_keys_memory_by_hash)
+        status["active_count"] = sum(1 for r in _api_keys_memory_by_hash.values() if r.get("active"))
+        status["total_sampled"] = len(_api_keys_memory_by_hash)
+        return status
+
+    try:
+        res = (
+            supabase.table("ai_api_keys")
+            .select("id, active")
+            .limit(1000)
+            .execute()
+        )
+        rows = res.data or []
+        status["table_ok"] = True
+        status["total_sampled"] = len(rows)
+        status["active_count"] = sum(1 for r in rows if r.get("active"))
+    except Exception as e:
+        status["error"] = str(e)[:500]
+    return status
+
+
 def _check_ai_api_key() -> bool:
     """Validate static AI_API_KEY or Telegram-admin generated /api keys.
 
@@ -2405,6 +2440,52 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def get_api_admin_kb() -> InlineKeyboardMarkup:
+    """Admin API management panel.
+
+    Buttons are intentionally small and direct so admins can create/list/setup
+    API keys without typing /api subcommands.
+    """
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Create API Key", callback_data="api_create"),
+         InlineKeyboardButton("📋 List Keys",      callback_data="api_list")],
+        [InlineKeyboardButton("🧩 Setup SQL",      callback_data="api_sql"),
+         InlineKeyboardButton("🩺 API Status",     callback_data="api_status")],
+        [InlineKeyboardButton("❔ Help",           callback_data="api_help"),
+         InlineKeyboardButton("⬅️ Admin",         callback_data="api_back")],
+        [InlineKeyboardButton("❌ Close",          callback_data="api_close")],
+    ])
+
+
+def get_api_list_kb(rows: list[dict]) -> InlineKeyboardMarkup:
+    kbd_rows: list[list[InlineKeyboardButton]] = []
+    active_rows = [r for r in rows if r.get("active")]
+
+    for row in active_rows[:10]:
+        row_id = str(row.get("id") or "").strip()
+        prefix = str(row.get("key_prefix") or "?").strip()
+        label = f"🚫 Revoke #{row_id} {prefix}"[:60]
+        if row_id:
+            kbd_rows.append([InlineKeyboardButton(label, callback_data=f"api_revoke:{row_id}")])
+
+    kbd_rows.extend([
+        [InlineKeyboardButton("🔄 Refresh List", callback_data="api_list"),
+         InlineKeyboardButton("➕ Create New",   callback_data="api_create")],
+        [InlineKeyboardButton("⬅️ API Menu",    callback_data="api_menu"),
+         InlineKeyboardButton("❌ Close",        callback_data="api_close")],
+    ])
+    return InlineKeyboardMarkup(kbd_rows)
+
+
+def get_api_revoke_confirm_kb(identifier: str) -> InlineKeyboardMarkup:
+    safe_ident = str(identifier or "")[:32]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Confirm Revoke", callback_data=f"api_revoke_confirm:{safe_ident}")],
+        [InlineKeyboardButton("⬅️ Back to List", callback_data="api_list"),
+         InlineKeyboardButton("❌ Close",        callback_data="api_close")],
+    ])
+
+
 def get_schedules_list_kb(rows: list[dict], page: int, page_size: int = 5) -> InlineKeyboardMarkup:
     total   = max(1, (len(rows) + page_size - 1) // page_size)
     chunk   = rows[page * page_size : (page + 1) * page_size]
@@ -3415,10 +3496,13 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         ))
         return
 
+    if data == "admin_api":
+        await _cb_api_dashboard(query, user_id, context, "api_menu")
+        return
+
     commands = {
         "admin_broadcast": "/broadcast",
         "admin_schedules": "/schedules",
-        "admin_api":       "/api",
         "admin_users":     "/users",
     }
     if data in commands:
@@ -4017,7 +4101,12 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = list(context.args or [])
 
     if not args or args[0].lower() in ("help", "-h", "--help"):
-        await safe_send(lambda: msg.reply_text(_api_help_text(), parse_mode="HTML"))
+        await safe_send(lambda: msg.reply_text(
+            _api_help_text(),
+            parse_mode="HTML",
+            reply_markup=get_api_admin_kb(),
+            disable_web_page_preview=True,
+        ))
         return
 
     action = args[0].lower().strip()
@@ -4026,7 +4115,11 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "sql":
         pages = _paginate_plain(AI_API_KEYS_TABLE_SQL, limit=3800)
         for page in pages:
-            await safe_send(lambda p=page: msg.reply_text(f"<pre>{html.escape(p)}</pre>", parse_mode="HTML"))
+            await safe_send(lambda p=page: msg.reply_text(
+                f"<pre>{html.escape(p)}</pre>",
+                parse_mode="HTML",
+                reply_markup=get_api_admin_kb(),
+            ))
         return
 
     if action == "create":
@@ -4042,11 +4135,16 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pages = _paginate_plain(err, limit=3500)
             await safe_send(lambda: msg.reply_text(
                 "❌ Cannot create API key.\n"
-                "If this is first setup, run <code>/api sql</code> and execute it in Supabase.",
+                "If this is first setup, press <b>🧩 Setup SQL</b> or run <code>/api sql</code> and execute it in Supabase.",
                 parse_mode="HTML",
+                reply_markup=get_api_admin_kb(),
             ))
             if pages:
-                await safe_send(lambda p=pages[0]: msg.reply_text(f"<pre>{html.escape(p)}</pre>", parse_mode="HTML"))
+                await safe_send(lambda p=pages[0]: msg.reply_text(
+                f"<pre>{html.escape(p)}</pre>",
+                parse_mode="HTML",
+                reply_markup=get_api_admin_kb(),
+            ))
             return
 
         warning = ""
@@ -4069,6 +4167,7 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  -d '{\"message\":\"Hello\"}'</pre>"
             f"{warning}",
             parse_mode="HTML",
+            reply_markup=get_api_admin_kb(),
             disable_web_page_preview=True,
         ))
         return
@@ -4081,26 +4180,35 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_send(lambda: msg.reply_text(
                 f"❌ Cannot list API keys.\n<pre>{html.escape(str(e)[:3500])}</pre>",
                 parse_mode="HTML",
+                reply_markup=get_api_admin_kb(),
             ))
             return
 
         if not rows:
             await safe_send(lambda: msg.reply_text(
-                "ℹ️ No API keys found. Create one with <code>/api create</code>.",
+                "ℹ️ No API keys found. Press <b>➕ Create API Key</b> or use <code>/api create</code>.",
                 parse_mode="HTML",
+                reply_markup=get_api_admin_kb(),
             ))
             return
 
         body = "\n\n".join(_format_api_key_row(r) for r in rows)
         for page in _paginate_plain("🔑 <b>AI API Keys</b>\n\n" + body, limit=3900):
-            await safe_send(lambda p=page: msg.reply_text(p, parse_mode="HTML"))
+            await safe_send(lambda p=page: msg.reply_text(
+                p,
+                parse_mode="HTML",
+                reply_markup=get_api_list_kb(rows),
+                disable_web_page_preview=True,
+            ))
         return
 
     if action == "revoke":
         if len(args) < 2:
             await safe_send(lambda: msg.reply_text(
-                "⚠️ Usage: <code>/api revoke KEY_PREFIX_OR_ID</code>",
+                "⚠️ Usage: <code>/api revoke KEY_PREFIX_OR_ID</code>\n\n"
+                "Or press <b>📋 List Keys</b> and revoke with buttons.",
                 parse_mode="HTML",
+                reply_markup=get_api_admin_kb(),
             ))
             return
 
@@ -4115,6 +4223,7 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_send(lambda: msg.reply_text(
                 f"❌ Cannot revoke API key.\n<pre>{html.escape(str(e)[:3500])}</pre>",
                 parse_mode="HTML",
+                reply_markup=get_api_admin_kb(),
             ))
             return
 
@@ -4122,15 +4231,265 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_send(lambda: msg.reply_text(
                 f"✅ API key revoked: <code>{html.escape(info)}</code>",
                 parse_mode="HTML",
+                reply_markup=get_api_admin_kb(),
             ))
         else:
             await safe_send(lambda: msg.reply_text(
                 f"❌ {html.escape(info)}",
                 parse_mode="HTML",
+                reply_markup=get_api_admin_kb(),
             ))
         return
 
-    await safe_send(lambda: msg.reply_text(_api_help_text(), parse_mode="HTML"))
+    await safe_send(lambda: msg.reply_text(
+        _api_help_text(),
+        parse_mode="HTML",
+        reply_markup=get_api_admin_kb(),
+        disable_web_page_preview=True,
+    ))
+
+def _api_status_text(status: dict, notice: str = "") -> str:
+    static_key = "✅ ON" if status.get("static_key") else "⚠️ OFF"
+    supabase_ok = "✅ OK" if status.get("supabase") else "⚠️ OFF"
+    service_role = "✅ SET" if status.get("service_role_key") else "⚠️ MISSING"
+    table_ok = "✅ READY" if status.get("table_ok") else "❌ NOT READY"
+    dynamic_ok = "✅ ON" if (status.get("active_count", 0) > 0 or status.get("memory_count", 0) > 0) else "⚠️ NO ACTIVE KEY"
+
+    lines = []
+    if notice:
+        lines.append(f"{html.escape(notice)}\n")
+    lines.extend([
+        "🔑 <b>AI API Key Admin</b>",
+        "",
+        f"Static <code>AI_API_KEY</code>: <b>{static_key}</b>",
+        f"Dynamic generated keys: <b>{dynamic_ok}</b>",
+        f"Supabase: <b>{supabase_ok}</b>",
+        f"Service role key: <b>{service_role}</b>",
+        f"Table <code>ai_api_keys</code>: <b>{table_ok}</b>",
+        f"Active keys: <b>{int(status.get('active_count') or 0)}</b>",
+    ])
+    if status.get("memory_count"):
+        lines.append(f"Memory keys: <b>{int(status.get('memory_count') or 0)}</b> ⚠️ not persistent")
+    if status.get("error"):
+        lines.extend([
+            "",
+            "⚠️ <b>Setup error</b>",
+            f"<pre>{html.escape(str(status.get('error'))[:900])}</pre>",
+            "Press <b>🧩 Setup SQL</b>, run it in Supabase, then restart/redeploy bot with <code>SUPABASE_SERVICE_ROLE_KEY</code>.",
+        ])
+    else:
+        lines.extend([
+            "",
+            "Use buttons below to create/list/revoke keys.",
+        ])
+    return "\n".join(lines)
+
+
+async def _api_status_async() -> dict:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_DB_EXECUTOR, db_ai_api_key_status)
+
+
+async def _api_send_sql_message(message) -> None:
+    pages = _paginate_plain(AI_API_KEYS_TABLE_SQL, limit=3800)
+    for page in pages:
+        await safe_send(lambda p=page: message.reply_text(
+            "🧩 <b>Supabase SQL for API keys</b>\n\n"
+            f"<pre>{html.escape(p)}</pre>",
+            parse_mode="HTML",
+            reply_markup=get_api_admin_kb(),
+        ))
+
+
+async def _api_edit_menu(query, notice: str = "") -> None:
+    status = await _api_status_async()
+    await safe_send(lambda: query.message.edit_text(
+        _api_status_text(status, notice=notice),
+        parse_mode="HTML",
+        reply_markup=get_api_admin_kb(),
+        disable_web_page_preview=True,
+    ))
+
+
+async def _api_create_from_button(query, user_id: int) -> None:
+    loop = asyncio.get_running_loop()
+    note = f"telegram-button admin {user_id}"
+    try:
+        raw_key, row, storage = await loop.run_in_executor(
+            _DB_EXECUTOR,
+            lambda: db_ai_api_key_create(admin_id=user_id, note=note),
+        )
+    except Exception as e:
+        logger.error("api_create button failed: %s", e, exc_info=True)
+        err = str(e)
+        short_err = err[:1800]
+        await safe_send(lambda: query.message.reply_text(
+            "❌ <b>Cannot create API key</b>\n\n"
+            "Usually this means the <code>ai_api_keys</code> table is not created yet, "
+            "or <code>SUPABASE_SERVICE_ROLE_KEY</code> is missing on the server.\n\n"
+            "Press <b>🧩 Setup SQL</b>, run it in Supabase, then redeploy/restart.\n\n"
+            f"<pre>{html.escape(short_err)}</pre>",
+            parse_mode="HTML",
+            reply_markup=get_api_admin_kb(),
+        ))
+        return
+
+    warning = ""
+    if storage == "memory":
+        warning = (
+            "\n\n⚠️ Supabase is not configured. This key is stored in memory only "
+            "and will stop working after restart/deploy."
+        )
+
+    await safe_send(lambda: query.message.reply_text(
+        "✅ <b>New AI API key created</b>\n\n"
+        "Copy it now. It will not be shown again.\n\n"
+        f"<code>{html.escape(raw_key)}</code>\n\n"
+        f"Prefix: <code>{html.escape(str(row.get('key_prefix') or _api_key_prefix(raw_key)))}</code>\n"
+        f"Storage: <b>{html.escape(storage)}</b>\n\n"
+        "Use it like this:\n"
+        "<pre>curl -X POST https://YOUR-APP.onrender.com/ai-assistant \\\n"
+        "  -H 'Content-Type: application/json' \\\n"
+        f"  -H 'X-Api-Key: {html.escape(raw_key)}' \\\n"
+        "  -d '{\"message\":\"Hello\"}'</pre>"
+        f"{warning}",
+        parse_mode="HTML",
+        reply_markup=get_api_admin_kb(),
+        disable_web_page_preview=True,
+    ))
+
+    with suppress(Exception):
+        await _api_edit_menu(query, notice="✅ API key created. Copy it from the new message above.")
+
+
+async def _api_list_from_button(query) -> None:
+    loop = asyncio.get_running_loop()
+    try:
+        rows = await loop.run_in_executor(_DB_EXECUTOR, lambda: db_ai_api_key_list(limit=20))
+    except Exception as e:
+        logger.error("api_list button failed: %s", e, exc_info=True)
+        await safe_send(lambda: query.message.edit_text(
+            "❌ <b>Cannot list API keys</b>\n\n"
+            "Run setup SQL first, then ensure <code>SUPABASE_SERVICE_ROLE_KEY</code> is set.\n\n"
+            f"<pre>{html.escape(str(e)[:1800])}</pre>",
+            parse_mode="HTML",
+            reply_markup=get_api_admin_kb(),
+        ))
+        return
+
+    if not rows:
+        await safe_send(lambda: query.message.edit_text(
+            "📋 <b>AI API Keys</b>\n\n"
+            "No API keys found yet. Press <b>➕ Create API Key</b> after setup is ready.",
+            parse_mode="HTML",
+            reply_markup=get_api_admin_kb(),
+        ))
+        return
+
+    body = "\n\n".join(_format_api_key_row(r) for r in rows)
+    await safe_send(lambda: query.message.edit_text(
+        "📋 <b>AI API Keys</b>\n\n" + body,
+        parse_mode="HTML",
+        reply_markup=get_api_list_kb(rows),
+        disable_web_page_preview=True,
+    ))
+
+
+async def _cb_api_dashboard(query, user_id: int, context: ContextTypes.DEFAULT_TYPE, data: str):
+    if not _is_admin(user_id):
+        await safe_send(lambda: query.message.reply_text("⛔ Admin only."))
+        return
+
+    if data in ("api_menu", "admin_api"):
+        await _api_edit_menu(query)
+        return
+
+    if data == "api_back":
+        await safe_send(lambda: query.message.edit_text(
+            "🛠️ <b>Admin Dashboard</b>\n\n"
+            "ជ្រើសរើសមុខងារខាងក្រោម៖",
+            parse_mode="HTML",
+            reply_markup=get_admin_dashboard_kb(),
+        ))
+        return
+
+    if data == "api_close":
+        with suppress(Exception):
+            await query.message.delete()
+        return
+
+    if data == "api_help":
+        await safe_send(lambda: query.message.edit_text(
+            _api_help_text(),
+            parse_mode="HTML",
+            reply_markup=get_api_admin_kb(),
+            disable_web_page_preview=True,
+        ))
+        return
+
+    if data == "api_status":
+        await _api_edit_menu(query)
+        return
+
+    if data == "api_sql":
+        await _api_send_sql_message(query.message)
+        with suppress(Exception):
+            await _api_edit_menu(query, notice="🧩 SQL sent below. Run it in Supabase SQL editor.")
+        return
+
+    if data == "api_create":
+        await _api_create_from_button(query, user_id)
+        return
+
+    if data == "api_list":
+        await _api_list_from_button(query)
+        return
+
+    if data.startswith("api_revoke:"):
+        identifier = data.split(":", 1)[1].strip()
+        await safe_send(lambda: query.message.edit_text(
+            "⚠️ <b>Confirm revoke API key</b>\n\n"
+            f"Key ID: <code>{html.escape(identifier)}</code>\n\n"
+            "After revoke, apps using this key cannot access <code>/ai-assistant</code>.",
+            parse_mode="HTML",
+            reply_markup=get_api_revoke_confirm_kb(identifier),
+        ))
+        return
+
+    if data.startswith("api_revoke_confirm:"):
+        identifier = data.split(":", 1)[1].strip()
+        loop = asyncio.get_running_loop()
+        try:
+            ok, info = await loop.run_in_executor(
+                _DB_EXECUTOR,
+                lambda: db_ai_api_key_revoke(identifier),
+            )
+        except Exception as e:
+            logger.error("api_revoke button failed: %s", e, exc_info=True)
+            await safe_send(lambda: query.message.edit_text(
+                "❌ <b>Cannot revoke API key</b>\n\n"
+                f"<pre>{html.escape(str(e)[:1800])}</pre>",
+                parse_mode="HTML",
+                reply_markup=get_api_admin_kb(),
+            ))
+            return
+
+        if ok:
+            await _api_list_from_button(query)
+            await safe_send(lambda: query.message.reply_text(
+                f"✅ API key revoked: <code>{html.escape(info)}</code>",
+                parse_mode="HTML",
+            ))
+        else:
+            await safe_send(lambda: query.message.edit_text(
+                f"❌ {html.escape(info)}",
+                parse_mode="HTML",
+                reply_markup=get_api_admin_kb(),
+            ))
+        return
+
+    await _api_edit_menu(query)
+
 
 @admin_only
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5054,6 +5413,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cb_doc_read(query, user_id, context, data)
         elif data.startswith("audio_tts:"):
             await _cb_audio_tts(query, user_id, context, data)
+        elif data.startswith("api_"):
+            await _cb_api_dashboard(query, user_id, context, data)
         elif data.startswith("admin_"):
             await _cb_admin_dashboard(query, user_id, context, data)
         else:
