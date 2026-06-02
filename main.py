@@ -2874,14 +2874,19 @@ def db_user_detail(user_id: int) -> dict:
     user_id = int(user_id)
     row: dict = {"user_id": user_id}
     if supabase:
-        try:
-            res = supabase.table("user_prefs").select("*").eq("user_id", user_id).limit(1).execute()
-            if res.data:
-                row.update(res.data[0])
-        except Exception as e:
-            row["error"] = str(e)
+        res = db_call_sync(
+            f"user_detail:{user_id}",
+            lambda: supabase.table("user_prefs").select("*").eq("user_id", user_id).limit(1).execute(),
+            default=None,
+            attempts=3,
+            critical=False,
+        )
+        if res is not None and getattr(res, "data", None):
+            row.update(res.data[0])
+        elif res is None:
+            row["error"] = "User detail database read temporarily unavailable."
     row["blocked"] = db_user_is_blocked(user_id)
-    row["history"] = db_history_fetch(user_id, limit=3) if supabase else []
+    row["history"] = db_history_fetch(user_id, limit=3)
     return row
 
 
@@ -2974,7 +2979,11 @@ def _hist_cache_append(user_id: int, role: str, content: str) -> None:
             _hist_cache.popitem(last=False)
         _hist_cache[user_id] = deque(maxlen=_HIST_CACHE_TURNS)
     _hist_cache.move_to_end(user_id)
-    _hist_cache[user_id].append({"role": role, "content": content})
+    _hist_cache[user_id].append({
+        "role": role,
+        "content": content,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
 
 
 def _hist_cache_get(user_id: int) -> list[dict] | None:
@@ -2994,7 +3003,11 @@ def _hist_rows_normalized(rows: list[dict] | None) -> list[dict]:
     for row in rows or []:
         content = (row.get("content") or "").strip()
         if content:
-            clean.append({"role": _normalize_role(row.get("role")), "content": content})
+            item = {"role": _normalize_role(row.get("role")), "content": content}
+            created_at = row.get("created_at") or row.get("created") or row.get("ts")
+            if created_at:
+                item["created_at"] = str(created_at)
+            clean.append(item)
     return clean[-_HIST_CACHE_TURNS:]
 
 
@@ -3015,7 +3028,11 @@ def db_history_append(user_id: int, role: str, content: str) -> None:
             rows = _redis_get_json_sync(_hist_redis_key(user_id), default=[])
             if not isinstance(rows, list):
                 rows = []
-            rows = _hist_rows_normalized(rows + [{"role": role, "content": content}])
+            rows = _hist_rows_normalized(rows + [{
+                "role": role,
+                "content": content,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }])
             _hist_redis_save_sync(user_id, rows)
 
         if supabase:
@@ -3078,6 +3095,205 @@ def db_history_clear(user_id: int) -> None:
             )
 
     _submit_db(_run)
+
+
+def _admin_history_rows_normalized(rows: list[dict] | None, limit: int | None = None) -> list[dict]:
+    clean: list[dict] = []
+    for row in rows or []:
+        content = str(row.get("content") or "").strip()
+        if not content:
+            continue
+        item = {
+            "user_id": int(row.get("user_id") or 0) if str(row.get("user_id") or "").lstrip("-").isdigit() else row.get("user_id"),
+            "role": _normalize_role(row.get("role")),
+            "content": content,
+            "created_at": str(row.get("created_at") or ""),
+        }
+        clean.append(item)
+    if limit is not None:
+        return clean[-max(1, int(limit)):]
+    return clean
+
+
+def db_user_history_fetch(user_id: int, limit: int = 30) -> list[dict]:
+    """Admin full history view: Redis/memory first, then Supabase with retry."""
+    user_id = int(user_id)
+    limit = max(1, min(80, int(limit or 30)))
+
+    redis_rows = _redis_get_json_sync(_hist_redis_key(user_id), default=None)
+    if isinstance(redis_rows, list) and redis_rows:
+        rows = []
+        for r in redis_rows[-limit:]:
+            item = dict(r or {})
+            item["user_id"] = user_id
+            rows.append(item)
+        return _admin_history_rows_normalized(rows, limit=limit)
+
+    cached = _hist_cache_get(user_id)
+    if cached:
+        rows = []
+        for r in cached[-limit:]:
+            item = dict(r or {})
+            item["user_id"] = user_id
+            rows.append(item)
+        return _admin_history_rows_normalized(rows, limit=limit)
+
+    if not supabase:
+        return []
+
+    res = db_call_sync(
+        f"admin_user_history_fetch:{user_id}",
+        lambda: supabase.table("conversation_history")
+            .select("user_id, role, content, created_at")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute(),
+        default=None,
+        attempts=3,
+        critical=False,
+    )
+    rows = list(reversed(getattr(res, "data", None) or [])) if res else []
+    clean = _admin_history_rows_normalized(rows, limit=limit)
+    if clean:
+        _hist_redis_save_sync(user_id, clean)
+        for item in clean:
+            _hist_cache_append(user_id, item.get("role"), item.get("content"))
+    return clean
+
+
+def db_recent_history_users(limit_users: int = 80, scan_limit: int = 500) -> list[dict]:
+    """Return users ordered by their latest conversation_history activity.
+
+    This avoids fragile SQL/group-by calls. It scans the most recent rows, then
+    groups in Python so it works with normal Supabase REST tables.
+    """
+    limit_users = max(1, min(200, int(limit_users or 80)))
+    scan_limit = max(limit_users, min(1000, int(scan_limit or 500)))
+
+    name_map: dict[int, str] = {}
+    try:
+        for u in get_all_users_with_names():
+            uid = int(u.get("user_id") or 0)
+            if uid:
+                name_map[uid] = str(u.get("username") or "").strip()
+    except Exception as exc:
+        _log_once(logging.WARNING, "recent_history_names_failed", f"recent history username lookup failed: {exc}")
+
+    rows: list[dict] = []
+    if supabase:
+        res = db_call_sync(
+            "admin_recent_history_scan",
+            lambda: supabase.table("conversation_history")
+                .select("user_id, role, content, created_at")
+                .order("created_at", desc=True)
+                .limit(scan_limit)
+                .execute(),
+            default=None,
+            attempts=3,
+            critical=False,
+        )
+        rows = getattr(res, "data", None) or [] if res else []
+
+    # Fallback: in-memory history from the current process.
+    if not rows:
+        for uid, dq in list(_hist_cache.items()):
+            if not dq:
+                continue
+            last = dict(list(dq)[-1])
+            last["user_id"] = int(uid)
+            rows.append(last)
+
+    grouped: OrderedDict[int, dict] = OrderedDict()
+    for row in rows:
+        try:
+            uid = int(row.get("user_id") or 0)
+        except Exception:
+            uid = 0
+        if not uid:
+            continue
+        if uid not in grouped:
+            grouped[uid] = {
+                "user_id": uid,
+                "username": name_map.get(uid, ""),
+                "role": _normalize_role(row.get("role")),
+                "content": str(row.get("content") or ""),
+                "created_at": str(row.get("created_at") or ""),
+                "turns": 0,
+            }
+        grouped[uid]["turns"] = int(grouped[uid].get("turns") or 0) + 1
+        if len(grouped) >= limit_users and len(rows) >= scan_limit:
+            break
+
+    return list(grouped.values())[:limit_users]
+
+
+def _format_recent_history_panel_text(rows: list[dict], page: int, page_size: int = 7) -> str:
+    page = _clamp_users_page(rows, page, page_size)
+    total_pages = max(1, (len(rows) + page_size - 1) // page_size)
+    chunk = rows[page * page_size : page * page_size + page_size]
+
+    if not rows:
+        return (
+            "🕘 <b>Recent User History</b>\n\n"
+            "No recent conversation history found.\n\n"
+            "Possible reasons:\n"
+            "• <code>conversation_history</code> table has no rows yet\n"
+            "• Supabase is temporarily unavailable\n"
+            "• Redis/memory cache was just restarted"
+        )
+
+    lines = [
+        "🕘 <b>Recent User History</b>",
+        "",
+        f"Users with history: <b>{len(rows)}</b>",
+        f"Page: <b>{page + 1}/{total_pages}</b>",
+        "",
+    ]
+    for i, item in enumerate(chunk, start=page * page_size + 1):
+        uid = int(item.get("user_id") or 0)
+        username = html.escape(str(item.get("username") or "-")[:40])
+        role = "👤" if _normalize_role(item.get("role")) == "user" else "🤖"
+        preview = html.escape(_history_compact_text(item.get("content"), 120))
+        created = html.escape(str(item.get("created_at") or "")[:19].replace("T", " ")) or "-"
+        turns = int(item.get("turns") or 1)
+        lines.append(
+            f"{i}. <code>{uid}</code> · <b>{username}</b> · turns: <b>{turns}</b>\n"
+            f"   {role} {preview}\n"
+            f"   🕒 {created}"
+        )
+    lines.append("\nTap a user below to view full recent history.")
+    return "\n".join(lines)[:3900]
+
+
+def _format_user_full_history_text(user_id: int, rows: list[dict], limit: int = 30) -> str:
+    user_id = int(user_id)
+    if not rows:
+        return (
+            "📜 <b>User Recent History</b>\n\n"
+            f"User ID: <code>{user_id}</code>\n\n"
+            "No conversation history found for this user."
+        )
+
+    lines = [
+        "📜 <b>User Recent History</b>",
+        "",
+        f"User ID: <code>{user_id}</code>",
+        f"Showing latest <b>{len(rows)}</b> turn(s)",
+        "",
+    ]
+    max_total = 3850
+    for i, row in enumerate(rows[-limit:], start=1):
+        role = "👤 User" if _normalize_role(row.get("role")) == "user" else "🤖 Bot"
+        created = str(row.get("created_at") or "")[:19].replace("T", " ")
+        content = html.escape(_history_compact_text(row.get("content"), 520))
+        time_part = f" · 🕒 {html.escape(created)}" if created else ""
+        block = f"{i}. <b>{role}</b>{time_part}\n{content}\n"
+        if sum(len(x) + 1 for x in lines) + len(block) > max_total:
+            lines.append("\n…more history exists, but Telegram message limit was reached.")
+            break
+        lines.append(block)
+    return "\n".join(lines)
 
 
 def _build_context_block(history: list[dict]) -> str:
@@ -3381,13 +3597,14 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🏠 Dashboard",   callback_data="admin_home"),
          InlineKeyboardButton("🩺 Health",      callback_data="admin_health")],
         [InlineKeyboardButton("👥 Users",       callback_data="admin_users"),
-         InlineKeyboardButton("⚙️ Settings",    callback_data="admin_settings")],
+         InlineKeyboardButton("🕘 Recent History", callback_data="admin_history")],
+        [InlineKeyboardButton("⚙️ Settings",    callback_data="admin_settings"),
+         InlineKeyboardButton("📊 Stats",       callback_data="admin_stats")],
         [InlineKeyboardButton("📢 Broadcast",   callback_data="admin_broadcast"),
          InlineKeyboardButton("⏰ Schedules",   callback_data="admin_schedules")],
         [InlineKeyboardButton("🔑 API Keys",    callback_data="admin_api"),
-         InlineKeyboardButton("📊 Stats",       callback_data="admin_stats")],
-        [InlineKeyboardButton("🔄 Refresh",     callback_data="admin_home"),
-         InlineKeyboardButton("❌ Close",       callback_data="admin_close")],
+         InlineKeyboardButton("🔄 Refresh",     callback_data="admin_home")],
+        [InlineKeyboardButton("❌ Close",       callback_data="admin_close")],
     ])
 
 
@@ -4028,7 +4245,7 @@ def _clamp_users_page(users: list[dict], page: int, page_size: int = 7) -> int:
 
 def _parse_user_back_ref(ref: str | None) -> tuple[str, int]:
     ref = (ref or "p0").strip().lower()
-    if len(ref) >= 2 and ref[0] in ("p", "s") and ref[1:].isdigit():
+    if len(ref) >= 2 and ref[0] in ("p", "s", "h") and ref[1:].isdigit():
         return ref[0], int(ref[1:])
     if ref.isdigit():
         return "p", int(ref)
@@ -4039,6 +4256,8 @@ def _user_back_callback(ref: str | None) -> tuple[str, str]:
     kind, page = _parse_user_back_ref(ref)
     if kind == "s":
         return f"users_search_page:{page}", "⬅️ Search"
+    if kind == "h":
+        return f"history_page:{page}", "⬅️ History"
     return f"users_page:{page}", "⬅️ Users"
 
 
@@ -4106,12 +4325,65 @@ def get_user_search_prompt_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def _history_compact_text(text: str, max_len: int = 90) -> str:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(text) > max_len:
+        return text[: max_len - 1].rstrip() + "…"
+    return text
+
+
+def get_recent_history_kb(rows: list[dict], page: int, page_size: int = 7) -> InlineKeyboardMarkup:
+    page = _clamp_users_page(rows, page, page_size)
+    total_pages = max(1, (len(rows) + page_size - 1) // page_size)
+    chunk = rows[page * page_size : page * page_size + page_size]
+
+    kbd_rows: list[list[InlineKeyboardButton]] = []
+    for item in chunk:
+        uid = int(item.get("user_id") or 0)
+        username = str(item.get("username") or "").strip().lstrip("@")
+        label_name = (username or str(uid))[:20]
+        turns = int(item.get("turns") or 1)
+        role_icon = "👤" if _normalize_role(item.get("role")) == "user" else "🤖"
+        kbd_rows.append([InlineKeyboardButton(
+            f"{role_icon} {label_name} ({uid}) · {turns}",
+            callback_data=f"history_user:{uid}:{page}",
+        )])
+
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"history_page:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"history_page:{page+1}"))
+    if nav:
+        kbd_rows.append(nav)
+
+    kbd_rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="history_refresh"),
+                     InlineKeyboardButton("👥 Users", callback_data="users_page:0")])
+    kbd_rows.append([InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+                     InlineKeyboardButton("❌ Close", callback_data="history_close")])
+    return InlineKeyboardMarkup(kbd_rows)
+
+
+def get_user_history_kb(user_id: int, back_ref: str = "p0") -> InlineKeyboardMarkup:
+    back_callback, back_label = _user_back_callback(back_ref)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh History", callback_data=f"user_history:{user_id}:{back_ref}"),
+         InlineKeyboardButton("🧹 Clear History", callback_data=f"user_clearhist:{user_id}:{back_ref}")],
+        [InlineKeyboardButton("👤 User Detail", callback_data=f"user_view:{user_id}:{back_ref}"),
+         InlineKeyboardButton(back_label, callback_data=back_callback)],
+        [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+         InlineKeyboardButton("❌ Close", callback_data="users_close")],
+    ])
+
+
 def get_user_detail_kb(user_id: int, blocked: bool, back_ref: str = "p0") -> InlineKeyboardMarkup:
     back_callback, back_label = _user_back_callback(back_ref)
     rows = [
         [InlineKeyboardButton("💬 Chat", callback_data=f"user_chat:{user_id}"),
-         InlineKeyboardButton("🧹 Clear History", callback_data=f"user_clearhist:{user_id}:{back_ref}")],
-        [InlineKeyboardButton("♻️ Reset Prefs", callback_data=f"user_resetprefs:{user_id}:{back_ref}")],
+         InlineKeyboardButton("📜 Full History", callback_data=f"user_history:{user_id}:{back_ref}")],
+        [InlineKeyboardButton("🧹 Clear History", callback_data=f"user_clearhist:{user_id}:{back_ref}"),
+         InlineKeyboardButton("♻️ Reset Prefs", callback_data=f"user_resetprefs:{user_id}:{back_ref}")],
     ]
     if blocked:
         rows.append([InlineKeyboardButton("✅ Unblock User", callback_data=f"user_unblock:{user_id}:{back_ref}")])
@@ -4946,6 +5218,10 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         await _admin_open_users_panel(query)
         return
 
+    if data == "admin_history":
+        await _admin_open_recent_history_panel(query, page=0)
+        return
+
     if data == "admin_schedules":
         await _admin_open_schedules_panel(query, user_id)
         return
@@ -5457,6 +5733,33 @@ async def _show_user_search_results(query, context: ContextTypes.DEFAULT_TYPE, p
     ))
 
 
+async def _admin_open_recent_history_panel(query, page: int = 0) -> None:
+    rows = await asyncio.get_running_loop().run_in_executor(
+        _DB_EXECUTOR,
+        lambda: db_recent_history_users(limit_users=100, scan_limit=700),
+    )
+    page = _clamp_users_page(rows, page)
+    await safe_send(lambda: query.message.edit_text(
+        _format_recent_history_panel_text(rows, page=page),
+        parse_mode="HTML",
+        reply_markup=get_recent_history_kb(rows, page=page),
+        disable_web_page_preview=True,
+    ))
+
+
+async def _show_user_full_history(query, user_id: int, back_ref: str = "p0") -> None:
+    rows = await asyncio.get_running_loop().run_in_executor(
+        _DB_EXECUTOR,
+        lambda: db_user_history_fetch(user_id, limit=30),
+    )
+    await safe_send(lambda: query.message.edit_text(
+        _format_user_full_history_text(user_id, rows, limit=30),
+        parse_mode="HTML",
+        reply_markup=get_user_history_kb(user_id, back_ref=back_ref),
+        disable_web_page_preview=True,
+    ))
+
+
 async def _handle_user_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if context.user_data.get("user_search_state") != USER_SEARCH_WAIT_QUERY:
         return False
@@ -5521,6 +5824,32 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if data == "noop":
         return
 
+    if data in ("history_refresh", "history_page:0"):
+        await _admin_open_recent_history_panel(query, page=0)
+        return
+
+    if data == "history_close":
+        with suppress(Exception):
+            await query.message.delete()
+        return
+
+    if data.startswith("history_page:"):
+        page = int(data.split(":", 1)[1])
+        await _admin_open_recent_history_panel(query, page=page)
+        return
+
+    if data.startswith("history_user:"):
+        parts = data.split(":")
+        target_id = int(parts[1])
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
+        await safe_send(lambda: query.message.edit_text(
+            _format_user_detail_text(row),
+            parse_mode="HTML",
+            reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=f"h{page}"),
+        ))
+        return
+
     if data == "users_search":
         context.user_data["user_search_state"] = USER_SEARCH_WAIT_QUERY
         await safe_send(lambda: query.message.edit_text(
@@ -5563,6 +5892,13 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode="HTML",
             reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
         ))
+        return
+
+    if data.startswith("user_history:"):
+        parts = data.split(":")
+        target_id = int(parts[1])
+        back_ref = parts[2] if len(parts) > 2 else "p0"
+        await _show_user_full_history(query, target_id, back_ref=back_ref)
         return
 
     if data.startswith("user_chat:"):
@@ -7064,7 +7400,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # already call query.answer(). Do NOT answer here — it would cause a
     # "query is too old" double-answer error on Telegram's side.
     _HANDLED_EXACT = {"bc_confirm", "bc_cancel", "users_close", "noop"}
-    _HANDLED_PREFIX = ("sched_", "users_page:", "users_search", "user_")
+    _HANDLED_PREFIX = ("sched_", "users_page:", "users_search", "user_", "history_")
     if data in _HANDLED_EXACT or any(data.startswith(p) for p in _HANDLED_PREFIX):
         return
 
@@ -7177,7 +7513,7 @@ async def _run_bot():
     app.add_handler(CallbackQueryHandler(broadcast_callback,  pattern=r"^bc_(confirm|cancel)$"))
     app.add_handler(CallbackQueryHandler(
         users_page_callback,
-        pattern=r"^(users_page:\d+|users_search|users_search_page:\d+|users_close|noop|user_(view|chat|block|unblock|resetprefs|clearhist):\d+(?::[ps]\d+)?)$",
+        pattern=r"^(users_page:\d+|users_search|users_search_page:\d+|users_close|noop|history_(page:\d+|refresh|close|user:\d+:\d+)|user_(view|chat|block|unblock|resetprefs|clearhist|history):\d+(?::[psh]\d+)?)$",
     ))
     app.add_handler(CallbackQueryHandler(sched_callback,      pattern=r"^sched_"))
     app.add_handler(CallbackQueryHandler(on_callback))
