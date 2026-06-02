@@ -1373,6 +1373,22 @@ def _redis_delete_sync(key: str) -> None:
     redis_call_sync(f"delete:{key}", lambda: redis_client.delete(key), default=None)
 
 
+def _redis_scan_keys_sync(pattern: str, limit: int = 200) -> list[str]:
+    if redis_client is None:
+        return []
+    keys: list[str] = []
+    try:
+        for key in redis_client.scan_iter(match=pattern, count=100):
+            if isinstance(key, bytes):
+                key = key.decode("utf-8", errors="ignore")
+            keys.append(str(key))
+            if len(keys) >= max(1, int(limit or 200)):
+                break
+    except Exception as exc:
+        _log_once(logging.WARNING, "redis_scan_failed", "Redis scan failed: %s", exc)
+    return keys
+
+
 async def _redis_get_json(key: str, default: Any = None) -> Any:
     raw = await redis_call(f"get:{key}", lambda: redis_client.get(key), default=None)
     if not raw:
@@ -2513,6 +2529,47 @@ def _write_text_cache_redis_sync(msg_id: int, chat_id: int, text: str) -> None:
         _redis_set_json_sync(_text_cache_redis_key(msg_id, chat_id), {"text": text}, REDIS_TEXT_CACHE_TTL_S)
 
 
+def _text_cache_user_history_redis_key(user_id: int) -> str:
+    return _redis_key("text_history", int(user_id))
+
+
+def _text_cache_user_history_append_sync(
+    user_id: int | None,
+    username: str | None,
+    msg_id: int,
+    chat_id: int,
+    text: str,
+    created_at: str | None = None,
+) -> None:
+    """Keep a Redis per-user view of text_cache for fast admin history.
+
+    This is only a cache. Supabase text_cache remains the source of truth.
+    """
+    if redis_client is None or user_id is None:
+        return
+    try:
+        uid = int(user_id)
+    except Exception:
+        return
+    text = (text or "").strip()
+    if not text:
+        return
+    key = _text_cache_user_history_redis_key(uid)
+    rows = _redis_get_json_sync(key, default=[])
+    if not isinstance(rows, list):
+        rows = []
+    rows.append({
+        "user_id": uid,
+        "username": (username or "").strip(),
+        "message_id": int(msg_id or 0),
+        "chat_id": int(chat_id or 0),
+        "original_text": text,
+        "created_at": created_at or datetime.now(timezone.utc).isoformat(),
+    })
+    keep = max(50, int(os.environ.get("ADMIN_TEXT_CACHE_REDIS_TURNS", "120")))
+    _redis_set_json_sync(key, rows[-keep:], REDIS_HISTORY_TTL_S)
+
+
 def save_text_cache(
     msg_id: int,
     text: str,
@@ -2537,6 +2594,13 @@ def save_text_cache(
         global _rls_warned
 
         _write_text_cache_redis_sync(msg_id, chat_id, text)
+        _text_cache_user_history_append_sync(
+            user_id=user_id,
+            username=username,
+            msg_id=msg_id,
+            chat_id=chat_id,
+            text=text,
+        )
 
         if not supabase:
             return
@@ -2886,7 +2950,8 @@ def db_user_detail(user_id: int) -> dict:
         elif res is None:
             row["error"] = "User detail database read temporarily unavailable."
     row["blocked"] = db_user_is_blocked(user_id)
-    row["history"] = db_history_fetch(user_id, limit=ADMIN_DETAIL_HISTORY_TURNS)
+    # Admin Recent History/User Detail must read from text_cache, not conversation_history.
+    row["history"] = db_user_history_fetch(user_id, limit=ADMIN_DETAIL_HISTORY_TURNS)
     return row
 
 
@@ -3087,14 +3152,28 @@ def db_history_fetch(user_id: int, limit: int = CONV_HISTORY_LIMIT) -> list[dict
 
 
 def db_history_clear(user_id: int) -> None:
+    """Clear user history from both admin text_cache history and AI conversation history.
+
+    Admin Recent History reads from text_cache, so Clear History must delete
+    text_cache rows too. conversation_history is also cleared for the AI context.
+    """
+    user_id = int(user_id)
     _hist_cache_clear(user_id)
 
     def _run():
         if redis_client is not None:
             _redis_delete_sync(_hist_redis_key(user_id))
+            _redis_delete_sync(_text_cache_user_history_redis_key(user_id))
         if supabase:
             db_call_sync(
-                f"history_clear:{user_id}",
+                f"text_cache_history_clear:{user_id}",
+                lambda: supabase.table("text_cache").delete().eq("user_id", user_id).execute(),
+                default=None,
+                attempts=3,
+                critical=False,
+            )
+            db_call_sync(
+                f"conversation_history_clear:{user_id}",
                 lambda: supabase.table("conversation_history").delete().eq("user_id", user_id).execute(),
                 default=None,
                 attempts=3,
@@ -3105,16 +3184,42 @@ def db_history_clear(user_id: int) -> None:
 
 
 def _admin_history_rows_normalized(rows: list[dict] | None, limit: int | None = None) -> list[dict]:
+    """Normalize admin history rows from text_cache.
+
+    Admin Recent History intentionally uses text_cache as the source of truth,
+    because text_cache stores the actual text connected to Telegram callback
+    buttons/audio/OCR/transcript messages. conversation_history is still used
+    by the AI context system, but not by this admin history panel.
+    """
     clean: list[dict] = []
     for row in rows or []:
-        content = str(row.get("content") or "").strip()
+        content = str(
+            row.get("original_text")
+            or row.get("content")
+            or row.get("text")
+            or ""
+        ).strip()
         if not content:
             continue
+
+        raw_uid = row.get("user_id")
+        try:
+            uid = int(raw_uid or 0)
+        except Exception:
+            uid = 0
+        if not uid:
+            continue
+
         item = {
-            "user_id": int(row.get("user_id") or 0) if str(row.get("user_id") or "").lstrip("-").isdigit() else row.get("user_id"),
-            "role": _normalize_role(row.get("role")),
+            "user_id": uid,
+            "username": str(row.get("username") or "").strip(),
+            "message_id": row.get("message_id"),
+            "chat_id": row.get("chat_id"),
+            "role": "user",
             "content": content,
+            "original_text": content,
             "created_at": str(row.get("created_at") or ""),
+            "source": "text_cache",
         }
         clean.append(item)
     if limit is not None:
@@ -3123,35 +3228,28 @@ def _admin_history_rows_normalized(rows: list[dict] | None, limit: int | None = 
 
 
 def db_user_history_fetch(user_id: int, limit: int = 30) -> list[dict]:
-    """Admin full history view: Redis/memory first, then Supabase with retry."""
+    """Admin full history view from text_cache: Redis first, then Supabase.
+
+    This function no longer reads conversation_history for the admin Recent
+    History/User Detail screens. The user asked for Recent History to fetch
+    data from text_cache.
+    """
     user_id = int(user_id)
-    limit = max(1, min(80, int(limit or 30)))
+    limit = max(1, min(120, int(limit or 30)))
 
-    redis_rows = _redis_get_json_sync(_hist_redis_key(user_id), default=None)
+    redis_rows = _redis_get_json_sync(_text_cache_user_history_redis_key(user_id), default=None)
     if isinstance(redis_rows, list) and redis_rows:
-        rows = []
-        for r in redis_rows[-limit:]:
-            item = dict(r or {})
-            item["user_id"] = user_id
-            rows.append(item)
-        return _admin_history_rows_normalized(rows, limit=limit)
-
-    cached = _hist_cache_get(user_id)
-    if cached:
-        rows = []
-        for r in cached[-limit:]:
-            item = dict(r or {})
-            item["user_id"] = user_id
-            rows.append(item)
-        return _admin_history_rows_normalized(rows, limit=limit)
+        clean = _admin_history_rows_normalized(redis_rows, limit=limit)
+        if clean:
+            return clean[-limit:]
 
     if not supabase:
         return []
 
     res = db_call_sync(
-        f"admin_user_history_fetch:{user_id}",
-        lambda: supabase.table("conversation_history")
-            .select("user_id, role, content, created_at")
+        f"admin_text_cache_history_fetch:{user_id}",
+        lambda: supabase.table("text_cache")
+            .select("user_id, username, message_id, chat_id, original_text, created_at")
             .eq("user_id", user_id)
             .order("created_at", desc=True)
             .limit(limit)
@@ -3162,18 +3260,17 @@ def db_user_history_fetch(user_id: int, limit: int = 30) -> list[dict]:
     )
     rows = list(reversed(getattr(res, "data", None) or [])) if res else []
     clean = _admin_history_rows_normalized(rows, limit=limit)
-    if clean:
-        _hist_redis_save_sync(user_id, clean)
-        for item in clean:
-            _hist_cache_append(user_id, item.get("role"), item.get("content"))
+    if clean and redis_client is not None:
+        _redis_set_json_sync(_text_cache_user_history_redis_key(user_id), clean[-max(limit, 50):], REDIS_HISTORY_TTL_S)
     return clean
 
 
 def db_recent_history_users(limit_users: int = 80, scan_limit: int = 500) -> list[dict]:
-    """Return users ordered by their latest conversation_history activity.
+    """Return users ordered by latest text_cache activity.
 
-    This avoids fragile SQL/group-by calls. It scans the most recent rows, then
-    groups in Python so it works with normal Supabase REST tables.
+    Source of truth: text_cache, not conversation_history.
+    It scans recent text_cache rows and groups by user_id in Python so this
+    works with normal Supabase REST queries and does not require SQL functions.
     """
     limit_users = max(1, min(200, int(limit_users or 80)))
     scan_limit = max(limit_users, min(1000, int(scan_limit or 500)))
@@ -3185,14 +3282,14 @@ def db_recent_history_users(limit_users: int = 80, scan_limit: int = 500) -> lis
             if uid:
                 name_map[uid] = str(u.get("username") or "").strip()
     except Exception as exc:
-        _log_once(logging.WARNING, "recent_history_names_failed", f"recent history username lookup failed: {exc}")
+        _log_once(logging.WARNING, "recent_text_cache_names_failed", f"recent text_cache username lookup failed: {exc}")
 
     rows: list[dict] = []
     if supabase:
         res = db_call_sync(
-            "admin_recent_history_scan",
-            lambda: supabase.table("conversation_history")
-                .select("user_id, role, content, created_at")
+            "admin_recent_text_cache_scan",
+            lambda: supabase.table("text_cache")
+                .select("user_id, username, message_id, chat_id, original_text, created_at")
                 .order("created_at", desc=True)
                 .limit(scan_limit)
                 .execute(),
@@ -3202,31 +3299,33 @@ def db_recent_history_users(limit_users: int = 80, scan_limit: int = 500) -> lis
         )
         rows = getattr(res, "data", None) or [] if res else []
 
-    # Fallback: in-memory history from the current process.
-    if not rows:
-        for uid, dq in list(_hist_cache.items()):
-            if not dq:
-                continue
-            last = dict(list(dq)[-1])
-            last["user_id"] = int(uid)
-            rows.append(last)
+    # Fallback only to Redis per-user text_cache history if Supabase is down.
+    # This is still text_cache-derived data, not conversation_history.
+    if not rows and redis_client is not None:
+        for key in list(_redis_scan_keys_sync(_redis_key("text_history", "*"), limit=limit_users * 2)):
+            cached_rows = _redis_get_json_sync(key, default=[])
+            if isinstance(cached_rows, list) and cached_rows:
+                rows.append(cached_rows[-1])
 
     grouped: OrderedDict[int, dict] = OrderedDict()
     for row in rows:
-        try:
-            uid = int(row.get("user_id") or 0)
-        except Exception:
-            uid = 0
+        norm_rows = _admin_history_rows_normalized([row], limit=1)
+        if not norm_rows:
+            continue
+        item = norm_rows[0]
+        uid = int(item.get("user_id") or 0)
         if not uid:
             continue
         if uid not in grouped:
             grouped[uid] = {
                 "user_id": uid,
-                "username": name_map.get(uid, ""),
-                "role": _normalize_role(row.get("role")),
-                "content": str(row.get("content") or ""),
-                "created_at": str(row.get("created_at") or ""),
+                "username": item.get("username") or name_map.get(uid, ""),
+                "role": "user",
+                "content": item.get("content") or "",
+                "original_text": item.get("content") or "",
+                "created_at": str(item.get("created_at") or ""),
                 "turns": 0,
+                "source": "text_cache",
             }
         grouped[uid]["turns"] = int(grouped[uid].get("turns") or 0) + 1
         if len(grouped) >= limit_users and len(rows) >= scan_limit:
@@ -3243,17 +3342,17 @@ def _format_recent_history_panel_text(rows: list[dict], page: int, page_size: in
     if not rows:
         return (
             "🕘 <b>Recent User History</b>\n\n"
-            "No recent conversation history found.\n\n"
+            "No recent text_cache history found.\n\n"
             "Possible reasons:\n"
-            "• <code>conversation_history</code> table has no rows yet\n"
+            "• <code>text_cache</code> table has no rows with <code>user_id</code> yet\n"
             "• Supabase is temporarily unavailable\n"
-            "• Redis/memory cache was just restarted"
+            "• Redis cache was just restarted"
         )
 
     lines = [
         "🕘 <b>Recent User History</b>",
         "",
-        f"Users with history: <b>{len(rows)}</b>",
+        f"Users with text_cache history: <b>{len(rows)}</b>",
         f"Page: <b>{page + 1}/{total_pages}</b>",
         "",
     ]
@@ -3269,7 +3368,7 @@ def _format_recent_history_panel_text(rows: list[dict], page: int, page_size: in
             f"   {role} {preview}\n"
             f"   🕒 {created}"
         )
-    lines.append("\nTap a user below to view full recent history.")
+    lines.append("\nSource: <code>text_cache</code>. Tap a user below to view full cached text history.")
     return "\n".join(lines)[:3900]
 
 
@@ -3288,9 +3387,9 @@ def _format_user_full_history_text(user_id: int, rows: list[dict], page: int = 0
 
     if not rows:
         return (
-            "📜 <b>User Recent History</b>\n\n"
+            "📜 <b>User Recent Text Cache History</b>\n\n"
             f"User ID: <code>{user_id}</code>\n\n"
-            "No conversation history found for this user."
+            "No text_cache history found for this user."
         )
 
     start_i = page * page_size
@@ -3298,16 +3397,16 @@ def _format_user_full_history_text(user_id: int, rows: list[dict], page: int = 0
     chunk = rows[start_i:end_i]
 
     lines = [
-        "📜 <b>User Recent History</b>",
+        "📜 <b>User Recent Text Cache History</b>",
         "",
         f"User ID: <code>{user_id}</code>",
-        f"Showing <b>{start_i + 1}-{end_i}</b> of <b>{total}</b> recent turn(s)",
+        f"Showing <b>{start_i + 1}-{end_i}</b> of <b>{total}</b> text_cache item(s)",
         f"Page: <b>{page + 1}/{total_pages}</b>",
         "",
     ]
     max_total = 3850
     for i, row in enumerate(chunk, start=start_i + 1):
-        role = "👤 User" if _normalize_role(row.get("role")) == "user" else "🤖 Bot"
+        role = "👤 Text Cache"
         created = str(row.get("created_at") or "")[:19].replace("T", " ")
         content = html.escape(_history_compact_text(row.get("content"), 520))
         time_part = f" · 🕒 {html.escape(created)}" if created else ""
@@ -4366,7 +4465,7 @@ def get_recent_history_kb(rows: list[dict], page: int, page_size: int = 7) -> In
         username = str(item.get("username") or "").strip().lstrip("@")
         label_name = (username or str(uid))[:20]
         turns = int(item.get("turns") or 1)
-        role_icon = "👤" if _normalize_role(item.get("role")) == "user" else "🤖"
+        role_icon = "📝"
         kbd_rows.append([InlineKeyboardButton(
             f"{role_icon} {label_name} ({uid}) · {turns}",
             callback_data=f"history_user:{uid}:{page}",
