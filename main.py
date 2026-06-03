@@ -19,6 +19,10 @@ from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from datetime import datetime, timezone, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 from urllib.parse import urlencode
 try:
     from google import genai
@@ -156,6 +160,59 @@ def _detect_lang(text: str) -> str:
     alpha = sum(1 for c in text if c.isalpha())
     return "km" if alpha and khmer / alpha > 0.25 else "en"
 
+
+# ---------------------------------------------------------------------------
+# Local time display / schedule input
+# ---------------------------------------------------------------------------
+# Keep database/scheduler timestamps in UTC, but show and accept admin-facing
+# times in Phnom Penh local time by default: ICT, UTC+7, AM/PM format.
+APP_TIMEZONE_NAME = (
+    os.environ.get("APP_TIMEZONE")
+    or os.environ.get("WEB_ADMIN_TIMEZONE")
+    or "Asia/Phnom_Penh"
+).strip() or "Asia/Phnom_Penh"
+APP_TIMEZONE_ALIAS = (os.environ.get("APP_TIMEZONE_ALIAS") or "ICT").strip() or "ICT"
+APP_TIMEZONE_UTC_LABEL = (os.environ.get("APP_TIMEZONE_UTC_LABEL") or "UTC+7").strip() or "UTC+7"
+
+
+def _load_app_timezone():
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(APP_TIMEZONE_NAME)
+        except Exception:
+            pass
+    # Safe fallback for Phnom Penh / Cambodia ICT if tzdata is unavailable.
+    return timezone(timedelta(hours=7), APP_TIMEZONE_ALIAS)
+
+
+APP_TIMEZONE = _load_app_timezone()
+
+
+def _local_now() -> datetime:
+    return datetime.now(APP_TIMEZONE)
+
+
+def _to_local_time(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        # Database values should normally be timezone-aware UTC. If a raw/naive
+        # datetime reaches the UI, treat it as UTC to avoid double-shifting.
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(APP_TIMEZONE)
+
+
+def _local_to_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=APP_TIMEZONE)
+    return dt.astimezone(timezone.utc)
+
+
+def _fmt_local_dt(dt: datetime | None = None) -> str:
+    local_dt = _to_local_time(dt or datetime.now(timezone.utc))
+    return f"{local_dt.strftime('%Y-%m-%d %I:%M %p')} {APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})"
+
+
+def _fmt_local_time_hint() -> str:
+    return f"Phnom Penh local time — AM/PM, {APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})"
 
 
 # ---------------------------------------------------------------------------
@@ -1063,16 +1120,21 @@ def _web_status_badge(status: Any, row: dict | None = None) -> str:
 
 
 def _web_dt(value: Any) -> str:
-    return str(value or "").replace("T", " ").replace("+00:00", " UTC")[:24]
+    """Format timestamps for the web dashboard in Phnom Penh local time."""
+    if not value:
+        return ""
+    dt = value if isinstance(value, datetime) else _sched_parse_iso(value)
+    if dt:
+        return _fmt_local_dt(dt)
+    return _web_short(value, 32)
 
 
 def _web_dt_input_value(value: Any) -> str:
-    """Return a UTC datetime-local value for admin forms."""
+    """Return a datetime-local value in Phnom Penh local time for admin forms."""
     dt = _sched_parse_iso(value) if value else None
     if not dt:
         return ""
-    dt = _sched_to_utc(dt)
-    return dt.strftime("%Y-%m-%dT%H:%M")
+    return _to_local_time(dt).strftime("%Y-%m-%dT%H:%M")
 
 
 def _web_url(endpoint: str, **params: Any) -> str:
@@ -1206,7 +1268,7 @@ def _web_render(title: str, body: str, *, active: str = "dashboard", status_code
   <div class="footer"><div>Supabase: <b>{{ 'ON' if supabase_on else 'OFF' }}</b></div><div>Redis: <b>{{ 'ON' if redis_on else 'OFF' }}</b></div><div><a href="/ping">Ping</a> · <a href="/admin/logout">Logout</a></div></div>
 </aside>
 <main class="main">
-  <div class="top"><div><div class="h1">{{ title }}</div><div class="muted">Fast web control panel for Telegram bot operations</div></div><div class="top-right"><div>{{ now }}</div><div>UTC server time</div></div></div>
+  <div class="top"><div><div class="h1">{{ title }}</div><div class="muted">Fast web control panel for Telegram bot operations</div></div><div class="top-right"><div data-local-time>{{ now }}</div><div>{{ time_hint }}</div></div></div>
   {% for cat,msg in messages %}<div class="flash {{ cat }}">{{ msg }}</div>{% endfor %}
   {{ body|safe }}
 </main>
@@ -1220,7 +1282,7 @@ window.WEB_CSRF={{ csrf|tojson }};
   qsa('form').forEach(function(form){form.addEventListener('submit',function(){var btn=form.querySelector('button[type="submit"],button:not([type]),input[type="submit"]');if(btn&&!form.dataset.noDisable){setTimeout(function(){btn.disabled=true;btn.dataset.oldText=btn.innerText;btn.innerText='Working…'},0)}})});
   qsa('[data-count-target]').forEach(function(el){var target=qs(el.getAttribute('data-count-target'));function update(){if(target){el.textContent=target.value.length}};if(target){target.addEventListener('input',update);update();}});
   var live=qs('[data-live-status]');
-  if(live){setInterval(function(){fetch('/admin/status.json?light=1',{credentials:'same-origin'}).then(function(r){return r.ok?r.json():null}).then(function(data){if(!data||!data.ok)return;qsa('[data-metric]').forEach(function(el){var k=el.getAttribute('data-metric');if(data.metrics&&Object.prototype.hasOwnProperty.call(data.metrics,k)){el.textContent=data.metrics[k]}});var up=qs('[data-uptime]');if(up)up.textContent=data.uptime||'';}).catch(function(){});},30000)}
+  if(live){setInterval(function(){fetch('/admin/status.json?light=1',{credentials:'same-origin'}).then(function(r){return r.ok?r.json():null}).then(function(data){if(!data||!data.ok)return;qsa('[data-metric]').forEach(function(el){var k=el.getAttribute('data-metric');if(data.metrics&&Object.prototype.hasOwnProperty.call(data.metrics,k)){el.textContent=data.metrics[k]}});var up=qs('[data-uptime]');if(up)up.textContent=data.uptime||'';var lt=qs('[data-local-time]');if(lt&&data.local_time)lt.textContent=data.local_time;}).catch(function(){});},30000)}
 })();
 </script>
 </body>
@@ -1235,7 +1297,8 @@ window.WEB_CSRF={{ csrf|tojson }};
         admin_id=_web_current_admin_id(),
         csrf=csrf,
         messages=get_flashed_messages(with_categories=True),
-        now=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        now=_fmt_local_dt(),
+        time_hint=_fmt_local_time_hint(),
         supabase_on=bool(supabase),
         redis_on=bool(redis_client),
     ), status_code
@@ -1377,7 +1440,7 @@ def web_admin_home():
         if lock:
             lock_dt = _sched_parse_iso(lock.get("locked_until"))
             expired = bool(lock_dt and lock_dt < datetime.now(timezone.utc))
-            lock_html = f"{_web_badge('expired' if expired else 'active', 'warn' if expired else 'ok')}<br><span class='muted'>{_web_h(lock.get('owner'))}</span><br><code>{_web_h(lock.get('locked_until'))}</code>"
+            lock_html = f"{_web_badge('expired' if expired else 'active', 'warn' if expired else 'ok')}<br><span class='muted'>{_web_h(lock.get('owner'))}</span><br><code>{_web_h(_web_dt(lock.get('locked_until')))}</code>"
         else:
             lock_html = _web_badge("no row", "warn")
     else:
@@ -1641,7 +1704,7 @@ def web_admin_schedules():
         if can_edit:
             edit_block = f"""
             <details><summary>Edit schedule</summary>
-              <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_time'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>UTC time</label><input type='datetime-local' name='broadcast_at' value='{_web_h(_web_dt_input_value(row.get('broadcast_at')))}' required></div><button>Save Time</button></form>
+              <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_time'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>Phnom Penh time</label><input type='datetime-local' name='broadcast_at' value='{_web_h(_web_dt_input_value(row.get('broadcast_at')))}' required><div class='help'>AM/PM local time: {APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL}). Stored in UTC automatically.</div></div><button>Save Time</button></form>
               <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_text'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>Text / caption</label><textarea name='text' required>{_web_h(content)}</textarea></div><button>Save Text</button></form>
               <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_photo'><input type='hidden' name='row_id' value='{rid}'><div class='row'><div class='field'><label>Photo file ID</label><input name='photo_file_id' value='{_web_h(row.get('photo_file_id') or '')}'></div><div class='field'><label>Caption</label><input name='caption' value='{_web_h(row.get('caption') or '')}' maxlength='1024'></div></div><button class='secondary'>Save Photo</button></form>
             </details>
@@ -1658,7 +1721,7 @@ def web_admin_schedules():
         </tr>
         """)
     options = "".join(f"<option value='{s}' {'selected' if status==s else ''}>{s.title()}</option>" for s in ["all", "preview", "pending", "sending", "done", "failed", "cancelled"])
-    now_plus = (datetime.now(timezone.utc) + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M")
+    now_plus = (_local_now() + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M")
     body = f"""
     <div class='card'>
       <form method='get' class='row3'>
@@ -1667,7 +1730,7 @@ def web_admin_schedules():
         <div class='field'><label>&nbsp;</label><div class='actions'><button>Filter</button><a class='btn secondary' href='/admin/schedules'>Reset</a></div></div>
       </form>
     </div>
-    <div class='card'><h2>Create Schedule</h2><p class='muted'>Times are stored and shown in UTC. Use Preview first for safer broadcasts.</p><form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='create'><div class='row'><div class='field'><label>Broadcast UTC time</label><input type='datetime-local' name='broadcast_at' value='{now_plus}' required><div class='help'>Example: 2026-12-25 09:00 UTC</div></div><div class='field'><label>Mode</label><select name='confirmed'><option value='0'>Preview first</option><option value='1'>Confirm immediately</option></select></div></div><div class='field'><label>Text message <span><span data-count-target='#schedule-text'>0</span>/{TELE_MSG_LIMIT}</span></label><textarea id='schedule-text' name='text' maxlength='{TELE_MSG_LIMIT}' placeholder='Required for text-only schedule; used as photo caption when caption is empty'></textarea></div><div class='row'><div class='field'><label>Telegram photo_file_id optional</label><input name='photo_file_id'></div><div class='field'><label>Photo caption optional</label><input name='caption' maxlength='1024'></div></div><button>Create Schedule</button></form></div>
+    <div class='card'><h2>Create Schedule</h2><p class='muted'>Use Phnom Penh local time in AM/PM style ({APP_TIMEZONE_ALIAS}, {APP_TIMEZONE_UTC_LABEL}). The bot stores the final timestamp in UTC automatically. Use Preview first for safer broadcasts.</p><form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='create'><div class='row'><div class='field'><label>Broadcast Phnom Penh time</label><input type='datetime-local' name='broadcast_at' value='{now_plus}' required><div class='help'>Example: 2026-12-25 09:00 AM {APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})</div></div><div class='field'><label>Mode</label><select name='confirmed'><option value='0'>Preview first</option><option value='1'>Confirm immediately</option></select></div></div><div class='field'><label>Text message <span><span data-count-target='#schedule-text'>0</span>/{TELE_MSG_LIMIT}</span></label><textarea id='schedule-text' name='text' maxlength='{TELE_MSG_LIMIT}' placeholder='Required for text-only schedule; used as photo caption when caption is empty'></textarea></div><div class='row'><div class='field'><label>Telegram photo_file_id optional</label><input name='photo_file_id'></div><div class='field'><label>Photo caption optional</label><input name='caption' maxlength='1024'></div></div><button>Create Schedule</button></form></div>
     <div class='card'><div class='actions' style='justify-content:space-between'><h2>Schedules</h2><span class='muted'>{len(rows)} shown</span></div><div class='table-wrap'><table class='table'><thead><tr><th>ID</th><th>Status</th><th>Time</th><th>Content</th><th>Actions</th></tr></thead><tbody>{''.join(table_rows) or '<tr><td colspan=5><div class="empty">No schedules found.</div></td></tr>'}</tbody></table></div></div>
     """
     return _web_render("Schedules", body, active="schedules")
@@ -1684,7 +1747,7 @@ def web_admin_schedules_action():
         if action == "create":
             dt = _parse_dt(request.form.get("broadcast_at") or "")
             if not dt:
-                ok, msg = False, "Invalid time. Use YYYY-MM-DD HH:MM UTC."
+                ok, msg = False, "Invalid time. Use Phnom Penh local time: YYYY-MM-DD HH:MM or YYYY-MM-DD HH:MM AM/PM."
             else:
                 ok, msg = _web_sched_create(_web_current_admin_id(), dt, request.form.get("text") or "", request.form.get("photo_file_id") or "", request.form.get("caption") or "", str(request.form.get("confirmed") or "0") == "1")
         elif not row_id:
@@ -1696,7 +1759,7 @@ def web_admin_schedules_action():
         elif action == "edit_time":
             dt = _parse_dt(request.form.get("broadcast_at") or "")
             if not dt:
-                ok, msg = False, "Invalid time. Use YYYY-MM-DD HH:MM UTC."
+                ok, msg = False, "Invalid time. Use Phnom Penh local time: YYYY-MM-DD HH:MM or YYYY-MM-DD HH:MM AM/PM."
             else:
                 ok, reason, _row = db_sched_update_time(row_id, _web_current_admin_id(), dt)
                 msg = "time updated" if ok else f"time not updated: {reason}"
@@ -1971,6 +2034,9 @@ def web_admin_status_json():
         "ok": True,
         "metrics": dict(_RUNTIME_METRICS),
         "uptime": _format_uptime(),
+        "local_time": _fmt_local_dt(),
+        "timezone": APP_TIMEZONE_NAME,
+        "timezone_label": f"{APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})",
     }
     if not light:
         payload.update({
@@ -5160,16 +5226,37 @@ def db_sched_update_photo(row_id: int, admin_id: int, photo_file_id: str, captio
 # Datetime helpers
 # ---------------------------------------------------------------------------
 def _parse_dt(text: str) -> datetime | None:
-    for fmt in _DT_FORMATS:
+    """Parse admin-entered schedule time as Phnom Penh local time, return UTC."""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    raw = re.sub(r"\s+", " ", raw)
+    # Accept common local inputs, including AM/PM. HTML datetime-local sends
+    # 24-hour values, while Telegram admins may type AM/PM manually.
+    local_formats = list(_DT_FORMATS) + [
+        "%Y-%m-%d %I:%M %p", "%Y-%m-%d %I:%M:%S %p",
+        "%Y-%m-%dT%I:%M %p", "%Y-%m-%dT%I:%M:%S %p",
+        "%d/%m/%Y %I:%M %p", "%d-%m-%Y %I:%M %p",
+    ]
+    for fmt in local_formats:
         try:
-            return datetime.strptime(text.strip(), fmt).replace(tzinfo=timezone.utc)
+            local_dt = datetime.strptime(raw, fmt).replace(tzinfo=APP_TIMEZONE)
+            return _local_to_utc(local_dt)
         except ValueError:
             continue
-    return None
+
+    # Also accept ISO strings with explicit timezone offsets.
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=APP_TIMEZONE)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
 
 
 def _fmt_dt(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d %H:%M UTC")
+    return _fmt_local_dt(dt)
 
 
 # ---------------------------------------------------------------------------
@@ -6523,7 +6610,7 @@ async def _admin_start_schedule_from_button(query, context: ContextTypes.DEFAULT
     await safe_send(lambda: query.message.edit_text(
         "📅 <b>Scheduled Broadcast</b>\n\n"
         "ផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + Caption</b> ដែលចង់ Schedule ។\n"
-        "បន្ទាប់មក Bot នឹងសួរពេលវេលា UTC។\n\n"
+        "បន្ទាប់មក Bot នឹងសួរពេលវេលា Phnom Penh local time (ICT, UTC+7)។\n\n"
         "ចុច Cancel ឬវាយ /cancel ដើម្បីបោះបង់។",
         parse_mode="HTML",
         reply_markup=get_admin_action_kb(),
@@ -6730,10 +6817,11 @@ async def _handle_sched_content(update: Update, context: ContextTypes.DEFAULT_TY
     _sched_payload[user_id] = {"photo_file_id": photo_file_id, "caption": caption_text, "text": plain_text}
     context.user_data["sched_state"] = SCHED_WAIT_TIME
     await safe_send(lambda: msg.reply_text(
-        "🕐 <b>ពេលវេលា Broadcast (UTC)</b>\n\n"
+        "🕐 <b>ពេលវេលា Broadcast — Phnom Penh local time</b>\n\n"
         "វាយកាលបរិច្ឆេទ និងម៉ោង ។\n"
-        "ទម្រង់: <code>YYYY-MM-DD HH:MM</code>\n"
-        "ឧទាហរណ៍: <code>2025-12-25 09:00</code>",
+        "ទម្រង់: <code>YYYY-MM-DD HH:MM AM/PM</code> ឬ <code>YYYY-MM-DD HH:MM</code>\n"
+        "ម៉ោង: Phnom Penh, Cambodia — ICT (UTC+7)\n"
+        "ឧទាហរណ៍: <code>2025-12-25 09:00 AM</code> ឬ <code>2025-12-25 21:00</code>",
         parse_mode="HTML",
     ))
     return True
@@ -6748,13 +6836,13 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
 
     msg = update.message
     if not msg.text:
-        await safe_send(lambda: msg.reply_text("⚠️ ផ្ញើ Text ពេលវេលា (UTC)។"))
+        await safe_send(lambda: msg.reply_text("⚠️ ផ្ញើ Text ពេលវេលា Phnom Penh local time (ICT, UTC+7)។"))
         return True
 
     broadcast_at = _parse_dt(msg.text)
     if broadcast_at is None:
         await safe_send(lambda: msg.reply_text(
-            "❌ ទម្រង់ពេលវេលាខុស។\nឧទាហរណ៍ត្រឹមត្រូវ: <code>2025-12-25 09:00</code>",
+            "❌ ទម្រង់ពេលវេលាខុស។\nឧទាហរណ៍ត្រឹមត្រូវ: <code>2025-12-25 09:00 AM</code> ឬ <code>2025-12-25 21:00</code>",
             parse_mode="HTML",
         ))
         return True
@@ -6762,7 +6850,7 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
     now = datetime.now(timezone.utc)
     if broadcast_at <= now:
         await safe_send(lambda: msg.reply_text(
-            "❌ ពេលវេលាត្រូវតែជាអនាគត (UTC) ។\n"
+            "❌ ពេលវេលាត្រូវតែជាអនាគត តាមម៉ោង Phnom Penh (ICT, UTC+7)។\n"
             f"ឥឡូវ: <code>{_fmt_dt(now)}</code>",
             parse_mode="HTML",
         ))
@@ -6832,7 +6920,7 @@ def _sched_edit_error_text(row_id: int, reason: str) -> str:
         "not_found": "❌ រកមិនឃើញ Schedule ។",
         "not_owner": "⛔ Schedule នេះមិនមែនជារបស់អ្នកទេ។",
         "time_passed": f"⚠️ Schedule #{row_id} ជិត/ផុតពេលហើយ — មិនអាច Edit បាន។",
-        "new_time_in_past": "❌ ពេលថ្មីត្រូវតែជាអនាគត (UTC)។",
+        "new_time_in_past": "❌ ពេលថ្មីត្រូវតែជាអនាគត តាមម៉ោង Phnom Penh (ICT, UTC+7)។",
         "empty_text": "⚠️ អត្ថបទមិនអាចទទេបាន។",
         "caption_too_long": "⚠️ Caption វែងពេក។ Telegram caption limit ប្រហែល 1024 តួអក្សរ។",
         "text_too_long": f"⚠️ Text វែងពេក។ សូមឲ្យក្រោម {TELE_MSG_LIMIT} តួអក្សរ។",
@@ -6853,12 +6941,12 @@ async def _handle_sched_edit_time(update: Update, context: ContextTypes.DEFAULT_
         await safe_send(lambda: msg.reply_text("❌ Edit session expired. Open /schedules again."))
         return True
     if not msg.text:
-        await safe_send(lambda: msg.reply_text("⚠️ ផ្ញើ Text ពេលវេលា UTC។"))
+        await safe_send(lambda: msg.reply_text("⚠️ ផ្ញើ Text ពេលវេលា Phnom Penh local time (ICT, UTC+7)។"))
         return True
     new_dt = _parse_dt(msg.text)
     if new_dt is None:
         await safe_send(lambda: msg.reply_text(
-            "❌ ទម្រង់ពេលវេលាខុស។\nឧទាហរណ៍: <code>2026-12-25 09:00</code>",
+            "❌ ទម្រង់ពេលវេលាខុស។\nឧទាហរណ៍: <code>2026-12-25 09:00 AM</code> ឬ <code>2026-12-25 21:00</code>",
             parse_mode="HTML",
         ))
         return True
@@ -7184,9 +7272,10 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["sched_edit_row_id"] = row_id
         await safe_send(lambda: query.message.reply_text(
             f"✏️ <b>Edit Schedule #{row_id} Time</b>\n\n"
-            "ផ្ញើពេលវេលាថ្មីជា UTC។\n"
-            "Format: <code>YYYY-MM-DD HH:MM</code>\n"
-            "Example: <code>2026-12-25 09:00</code>\n\n"
+            "ផ្ញើពេលវេលាថ្មីតាមម៉ោង Phnom Penh (ICT, UTC+7)។\n"
+            "Format: <code>YYYY-MM-DD HH:MM AM/PM</code> or <code>YYYY-MM-DD HH:MM</code>\n"
+            "Timezone: Phnom Penh, Cambodia — ICT (UTC+7)\n"
+            "Example: <code>2026-12-25 09:00 AM</code> or <code>2026-12-25 21:00</code>\n\n"
             "វាយ /cancel ដើម្បីបោះបង់ edit។",
             parse_mode="HTML",
         ))
