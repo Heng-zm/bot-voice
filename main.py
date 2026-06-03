@@ -61,21 +61,32 @@ def _env_int(name: str, default: int, *, minimum: int | None = None, maximum: in
 
 
 def _default_cookie_secure() -> bool:
-    # Render/production traffic is normally HTTPS, but local HTTP testing needs
-    # non-secure cookies or the web admin login session will not persist.
+    # Default to a login-safe cookie. On many Render/proxy/local setups Flask
+    # sees requests as HTTP even when the browser uses HTTPS, and a Secure-only
+    # cookie can make /admin immediately redirect back to /admin/login.
+    # Production can still force secure cookies with WEB_COOKIE_SECURE=1.
     explicit = os.environ.get("WEB_COOKIE_SECURE")
     if explicit is not None:
         return _env_bool("WEB_COOKIE_SECURE", True)
-    external_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip().lower()
-    return external_url.startswith("https://") or _env_bool("RENDER", False)
+    return False
 
 
 app_flask = Flask(__name__)
 app_flask.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY") or os.environ.get("WEB_SECRET_KEY") or secrets.token_hex(32)
+app_flask.config["SESSION_COOKIE_NAME"] = os.environ.get("WEB_SESSION_COOKIE_NAME", "bot_admin_session")
 app_flask.config["SESSION_COOKIE_HTTPONLY"] = True
-app_flask.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app_flask.config["SESSION_COOKIE_SAMESITE"] = os.environ.get("WEB_COOKIE_SAMESITE", "Lax")
 app_flask.config["SESSION_COOKIE_SECURE"] = _default_cookie_secure()
+app_flask.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=_env_int("WEB_ADMIN_SESSION_DAYS", 14, minimum=1))
+app_flask.config["SESSION_REFRESH_EACH_REQUEST"] = True
 app_flask.config["MAX_CONTENT_LENGTH"] = _env_int("WEB_MAX_CONTENT_LENGTH", 64 * 1024 * 1024, minimum=1 * 1024 * 1024)
+
+try:
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    if _env_bool("WEB_TRUST_PROXY", _env_bool("RENDER", False)):
+        app_flask.wsgi_app = ProxyFix(app_flask.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
+except Exception:
+    pass
 
 
 @app_flask.after_request
@@ -1075,9 +1086,16 @@ _WEB_BROADCAST_JOBS_MAX = int(os.environ.get("WEB_BROADCAST_JOBS_MAX", "50"))
 WEB_BROADCAST_WORKERS = max(1, int(os.environ.get("WEB_BROADCAST_WORKERS", str(MAX_CONCURRENT_BROADCAST))))
 WEB_BROADCAST_DELAY_S = max(0.0, float(os.environ.get("WEB_BROADCAST_DELAY_S", "0.05")))
 WEB_TABLE_PAGE_SIZE = max(10, min(200, int(os.environ.get("WEB_TABLE_PAGE_SIZE", "50"))))
-WEB_COUNTS_CACHE_TTL_S = max(0.0, float(os.environ.get("WEB_COUNTS_CACHE_TTL_S", "10")))
+# V4.1: avoid hammering Supabase from mobile/live dashboard polling.
+WEB_COUNTS_CACHE_TTL_S = max(5.0, float(os.environ.get("WEB_COUNTS_CACHE_TTL_S", "30")))
+WEB_STATUS_POLL_SECONDS = max(10, int(os.environ.get("WEB_STATUS_POLL_SECONDS", "30")))
+WEB_LIVE_POLL_SECONDS = max(15, int(os.environ.get("WEB_LIVE_POLL_SECONDS", "30")))
+WEB_LIVE_SCHEDULES_CACHE_TTL_S = max(5.0, float(os.environ.get("WEB_LIVE_SCHEDULES_CACHE_TTL_S", "30")))
 _WEB_COUNTS_CACHE = {"ts": 0.0, "data": {}}
 _WEB_COUNTS_CACHE_LOCK = threading.Lock()
+_WEB_COUNTS_BUILD_LOCK = threading.Lock()
+_WEB_LIVE_SCHEDULES_CACHE = {"ts": 0.0, "rows": []}
+_WEB_LIVE_SCHEDULES_LOCK = threading.Lock()
 
 
 def _web_admin_enabled() -> bool:
@@ -1449,8 +1467,9 @@ window.WEB_CSRF={{ csrf|tojson }};
   function refreshStatus(){fetch('/admin/status.json?light=1',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null}).then(applyStatus).catch(function(){});}
   function refreshLiveDashboard(){var root=qs('[data-realtime-dashboard]');if(!root)return;fetch('/admin/live.json',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null}).then(function(data){if(!data||!data.ok)return;applyStatus(data);if(data.counts){qsa('[data-count]').forEach(function(el){var k=el.getAttribute('data-count');if(Object.prototype.hasOwnProperty.call(data.counts,k)){el.textContent=data.counts[k]}})}var jobs=qs('[data-live-jobs]');if(jobs&&typeof data.jobs_html==='string')jobs.innerHTML=data.jobs_html;var sch=qs('[data-live-schedules]');if(sch&&typeof data.schedules_html==='string')sch.innerHTML=data.schedules_html;var stamp=qs('[data-live-updated]');if(stamp&&data.local_time)stamp.textContent='Updated '+data.local_time;}).catch(function(){});}
   function refreshBroadcastJobs(){var target=qs('[data-broadcast-jobs]');if(!target)return;fetch('/admin/broadcast/jobs.json',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null}).then(function(data){if(!data||!data.ok)return;if(typeof data.rows_html==='string')target.innerHTML=data.rows_html;}).catch(function(){});}
-  if(live){refreshStatus();setInterval(refreshStatus,15000)}
-  if(qs('[data-realtime-dashboard]')){refreshLiveDashboard();setInterval(refreshLiveDashboard,10000)}
+  var hasRealtime=!!qs('[data-realtime-dashboard]');
+  if(live&&!hasRealtime){refreshStatus();setInterval(refreshStatus,{{ status_poll_ms }})}
+  if(hasRealtime){refreshLiveDashboard();setInterval(refreshLiveDashboard,{{ live_poll_ms }})}
   if(qs('[data-broadcast-jobs]')){refreshBroadcastJobs();setInterval(refreshBroadcastJobs,5000)}
 })();
 </script>
@@ -1471,6 +1490,8 @@ window.WEB_CSRF={{ csrf|tojson }};
         time_hint=_fmt_local_time_hint(),
         supabase_on=bool(supabase),
         redis_on=bool(redis_client),
+        status_poll_ms=WEB_STATUS_POLL_SECONDS * 1000,
+        live_poll_ms=WEB_LIVE_POLL_SECONDS * 1000,
     ), status_code
 
 
@@ -1505,6 +1526,7 @@ def web_admin_login():
             flask_flash("Admin ID is not in ADMIN_IDS.", "error")
         else:
             session.clear()
+            session.permanent = True
             session["web_admin_ok"] = True
             session["web_admin_id"] = int(admin_id)
             _web_csrf_token()
@@ -1547,57 +1569,85 @@ def _web_table_count(table: str, select_field: str = "id") -> int | None:
 
 
 def _web_counts(force: bool = False) -> dict:
+    """Return dashboard counts without opening many simultaneous Supabase calls.
+
+    V4.1 fix: /admin/status.json and /admin/live.json can be requested close
+    together by the browser. Before this guard, both could run count queries at
+    the same time and produce noisy [Errno 11] Resource temporarily unavailable
+    warnings. This function now coalesces refreshes and serves safe stale data
+    while another request is rebuilding the cache.
+    """
     now = time.monotonic()
     with _WEB_COUNTS_CACHE_LOCK:
         cached = dict(_WEB_COUNTS_CACHE.get("data") or {})
-        if cached and not force and now - float(_WEB_COUNTS_CACHE.get("ts") or 0.0) < WEB_COUNTS_CACHE_TTL_S:
+        age = now - float(_WEB_COUNTS_CACHE.get("ts") or 0.0)
+        if cached and not force and age < WEB_COUNTS_CACHE_TTL_S:
             return cached
 
-    counts = {"users": 0, "blocked": 0, "schedules": 0, "pending": 0, "sending": 0, "failed": 0, "api_keys": 0}
+    acquired = _WEB_COUNTS_BUILD_LOCK.acquire(blocking=False)
+    if not acquired:
+        # Another request is already refreshing counts. Return stale values instead
+        # of creating extra Supabase connections.
+        if cached:
+            return cached
+        _WEB_COUNTS_BUILD_LOCK.acquire()
 
     try:
-        counted = _web_table_count("user_prefs", "user_id")
-        counts["users"] = counted if counted is not None else (len(get_all_user_ids()) if supabase else 0)
-    except Exception:
-        pass
+        now = time.monotonic()
+        with _WEB_COUNTS_CACHE_LOCK:
+            cached = dict(_WEB_COUNTS_CACHE.get("data") or {})
+            age = now - float(_WEB_COUNTS_CACHE.get("ts") or 0.0)
+            if cached and not force and age < WEB_COUNTS_CACHE_TTL_S:
+                return cached
 
-    try:
-        counted = _web_table_count("blocked_users", "user_id")
-        counts["blocked"] = counted if counted is not None else db_blocked_user_count()
-    except Exception:
-        pass
+        counts = {"users": 0, "blocked": 0, "schedules": 0, "pending": 0, "sending": 0, "failed": 0, "api_keys": 0}
 
-    if supabase:
         try:
-            res = db_call_sync(
-                "web_sched_counts",
-                lambda: supabase.table("scheduled_broadcasts").select("id,status,error_msg").limit(5000).execute(),
-                default=None,
-                attempts=2,
-                critical=False,
-            )
-            rows = list(getattr(res, "data", None) or [])
-            counts["schedules"] = len(rows)
-            for r in rows:
-                st = str(r.get("status") or "").lower()
-                if st == "pending" and not _sched_is_draft(r):
-                    counts["pending"] += 1
-                elif st == "sending":
-                    counts["sending"] += 1
-                elif st == "failed":
-                    counts["failed"] += 1
+            counted = _web_table_count("user_prefs", "user_id")
+            counts["users"] = counted if counted is not None else (len(get_all_user_ids()) if supabase else 0)
         except Exception:
             pass
 
-    try:
-        counts["api_keys"] = int(db_ai_api_key_status().get("active_count") or 0)
-    except Exception:
-        pass
+        try:
+            counted = _web_table_count("blocked_users", "user_id")
+            counts["blocked"] = counted if counted is not None else db_blocked_user_count()
+        except Exception:
+            pass
 
-    with _WEB_COUNTS_CACHE_LOCK:
-        _WEB_COUNTS_CACHE["data"] = dict(counts)
-        _WEB_COUNTS_CACHE["ts"] = now
-    return counts
+        if supabase:
+            try:
+                res = db_call_sync(
+                    "web_sched_counts",
+                    lambda: supabase.table("scheduled_broadcasts").select("id,status,error_msg").limit(5000).execute(),
+                    default=None,
+                    attempts=1,
+                    critical=False,
+                )
+                rows = list(getattr(res, "data", None) or [])
+                counts["schedules"] = len(rows)
+                for r in rows:
+                    st = str(r.get("status") or "").lower()
+                    if st == "pending" and not _sched_is_draft(r):
+                        counts["pending"] += 1
+                    elif st == "sending":
+                        counts["sending"] += 1
+                    elif st == "failed":
+                        counts["failed"] += 1
+            except Exception:
+                pass
+
+        try:
+            counts["api_keys"] = int(db_ai_api_key_status().get("active_count") or 0)
+        except Exception:
+            pass
+
+        with _WEB_COUNTS_CACHE_LOCK:
+            _WEB_COUNTS_CACHE["data"] = dict(counts)
+            _WEB_COUNTS_CACHE["ts"] = time.monotonic()
+        return counts
+    finally:
+        with suppress(Exception):
+            _WEB_COUNTS_BUILD_LOCK.release()
 
 
 
@@ -1733,9 +1783,50 @@ def _web_sched_duplicate(row_id: int, admin_id: int, broadcast_at: datetime | No
 
 
 def _web_live_schedules(limit: int = 8) -> list[dict]:
-    rows = _web_sched_list("pending", "", limit=100)
-    rows = sorted(rows, key=lambda r: str(r.get("broadcast_at") or ""))
-    return rows[:max(1, int(limit or 8))]
+    """Light cached schedule preview for realtime dashboard.
+
+    Do not call the full schedules page query on every live poll. This keeps
+    mobile dashboard refreshes from competing with bot callbacks for Supabase
+    connections.
+    """
+    limit = max(1, int(limit or 8))
+    now = time.monotonic()
+    with _WEB_COUNTS_CACHE_LOCK:
+        cached_rows = list(_WEB_LIVE_SCHEDULES_CACHE.get("rows") or [])
+        age = now - float(_WEB_LIVE_SCHEDULES_CACHE.get("ts") or 0.0)
+        if cached_rows and age < WEB_LIVE_SCHEDULES_CACHE_TTL_S:
+            return cached_rows[:limit]
+
+    if not _WEB_LIVE_SCHEDULES_LOCK.acquire(blocking=False):
+        return cached_rows[:limit]
+
+    try:
+        if not supabase:
+            rows: list[dict] = []
+        else:
+            res = db_call_sync(
+                "web_live_schedules",
+                lambda: (
+                    supabase.table("scheduled_broadcasts")
+                    .select("id,admin_id,broadcast_at,plain_text,caption,photo_file_id,status,error_msg")
+                    .eq("status", SCHED_STATUS_PENDING)
+                    .order("broadcast_at")
+                    .limit(max(limit * 4, 20))
+                    .execute()
+                ),
+                default=None,
+                attempts=1,
+                critical=False,
+            )
+            rows = [r for r in list(getattr(res, "data", None) or []) if _sched_is_confirmed_pending(r)]
+        rows = sorted(rows, key=lambda r: str(r.get("broadcast_at") or ""))[:limit]
+        with _WEB_COUNTS_CACHE_LOCK:
+            _WEB_LIVE_SCHEDULES_CACHE["rows"] = list(rows)
+            _WEB_LIVE_SCHEDULES_CACHE["ts"] = time.monotonic()
+        return rows
+    finally:
+        with suppress(Exception):
+            _WEB_LIVE_SCHEDULES_LOCK.release()
 
 
 
@@ -1862,7 +1953,7 @@ def web_admin_home():
     body = f"""
     <div data-live-status data-realtime-dashboard></div>
     <div class='actions' style='justify-content:space-between;margin-bottom:12px'>
-      <span class='live-note'><span class='v3-live-dot'></span>Realtime dashboard refresh every 10 seconds</span>
+      <span class='live-note'><span class='v3-live-dot'></span>Realtime dashboard refresh every {WEB_LIVE_POLL_SECONDS} seconds</span>
       <span class='muted' data-live-updated>Updated {_web_h(_fmt_local_dt())}</span>
     </div>
     <div class='grid'>
@@ -1898,7 +1989,7 @@ def web_admin_home():
 @app_flask.route("/admin/health")
 @web_admin_required
 def web_admin_health():
-    counts = _web_counts(force=True)
+    counts = _web_counts(force=False)
     settings, settings_status = db_bot_settings_fetch_all()
     metric_rows = "".join(
         f"<tr><td>{_web_h(k.replace('_', ' ').title())}</td><td><b data-metric='{_web_h(k)}'>{int(v)}</b></td></tr>"
@@ -2579,9 +2670,7 @@ def web_admin_status_json():
         "timezone": APP_TIMEZONE_NAME,
         "timezone_label": f"{APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})",
     }
-    if light:
-        payload["counts"] = _web_counts()
-    else:
+    if not light:
         payload.update({
             "counts": _web_counts(),
             "scheduler_lock": db_lock_read(_SCHED_LOCK_KEY) if supabase else None,
@@ -2596,7 +2685,7 @@ def web_admin_status_json():
 @app_flask.route("/admin/live.json")
 @web_admin_required
 def web_admin_live_json():
-    counts = _web_counts(force=True)
+    counts = _web_counts(force=False)
     payload = {
         "ok": True,
         "counts": counts,
@@ -3103,6 +3192,10 @@ _SCHED_DUE_LIMIT      = max(1, int(os.environ.get("SCHED_DUE_LIMIT", "5")))
 _SCHED_SCAN_LIMIT     = max(25, int(os.environ.get("SCHED_SCAN_LIMIT", "250")))
 _SCHED_LOCK_ENABLED   = os.environ.get("SCHED_LOCK_ENABLED", "1") == "1"
 _SCHED_LOCK_REQUIRED  = os.environ.get("SCHED_LOCK_REQUIRED", "0") == "1"
+_SCHED_ADMIN_PENDING_CACHE_TTL_S = max(1.0, float(os.environ.get("SCHED_ADMIN_PENDING_CACHE_TTL_S", "8")))
+_sched_admin_pending_cache: dict[int, tuple[float, list[dict]]] = {}
+_sched_admin_pending_locks: dict[int, threading.Lock] = {}
+_sched_admin_pending_cache_lock = threading.Lock()
 _SCHED_LOCK_KEY       = os.environ.get("SCHED_LOCK_KEY", "scheduled_broadcast_runner").strip() or "scheduled_broadcast_runner"
 _SCHED_LOCK_TTL_S     = max(30, int(os.environ.get("SCHED_LOCK_TTL_S", str(max(90, _SCHED_POLL_INTERVAL * 3)))))
 _BOT_LOCK_OWNER       = os.environ.get("BOT_LOCK_OWNER", "").strip() or (
@@ -5560,6 +5653,23 @@ def _sched_is_confirmed_pending(row: dict | None) -> bool:
     return status == SCHED_STATUS_PENDING and error_clean == ""
 
 
+def _sched_admin_pending_cache_clear(admin_id: int | None = None) -> None:
+    with _sched_admin_pending_cache_lock:
+        if admin_id is None:
+            _sched_admin_pending_cache.clear()
+        else:
+            _sched_admin_pending_cache.pop(int(admin_id), None)
+
+
+def _sched_admin_pending_lock(admin_id: int) -> threading.Lock:
+    with _sched_admin_pending_cache_lock:
+        lock = _sched_admin_pending_locks.get(int(admin_id))
+        if lock is None:
+            lock = threading.Lock()
+            _sched_admin_pending_locks[int(admin_id)] = lock
+        return lock
+
+
 def db_sched_insert(payload: dict, admin_id: int, broadcast_at: datetime) -> dict:
     """Create a schedule preview row.
 
@@ -5587,6 +5697,7 @@ def db_sched_insert(payload: dict, admin_id: int, broadcast_at: datetime) -> dic
     )
     if not getattr(res, "data", None):
         raise RuntimeError("scheduled_broadcasts insert returned no row.")
+    _sched_admin_pending_cache_clear(admin_id)
     return res.data[0]
 
 
@@ -5696,6 +5807,7 @@ def db_sched_confirm(row_id: int, admin_id: int) -> tuple[bool, str, dict | None
     saved = (getattr(res, "data", None) or [None])[0]
     if not saved:
         return False, "race_lost", db_sched_fetch_one(row_id)
+    _sched_admin_pending_cache_clear(admin_id)
     return True, "confirmed", saved
 
 def db_sched_set_status(row_id: int, status: str, **extra) -> None:
@@ -5713,6 +5825,7 @@ def db_sched_set_status(row_id: int, status: str, **extra) -> None:
             ),
             default=None,
         )
+        _sched_admin_pending_cache_clear(None)
     except Exception as e:
         logger.error(f"db_sched_set_status #{row_id} -> {status}: {e}")
 
@@ -5775,20 +5888,43 @@ def db_sched_mark_stale_sending_failed() -> int:
 def db_sched_fetch_admin_pending(admin_id: int) -> list[dict]:
     if not supabase:
         return []
-    res = db_call_sync(
-        f"sched_fetch_admin_pending:{admin_id}",
-        lambda: (
-            supabase.table("scheduled_broadcasts")
-            .select("id, broadcast_at, plain_text, caption, photo_file_id, status, error_msg")
-            .eq("admin_id", int(admin_id))
-            .eq("status", SCHED_STATUS_PENDING)
-            .order("broadcast_at")
-            .execute()
-        ),
-        default=None,
-    )
-    rows = list(getattr(res, "data", None) or [])
-    return [r for r in rows if _sched_is_draft(r) or _sched_is_confirmed_pending(r)]
+    admin_id = int(admin_id)
+    now = time.monotonic()
+    with _sched_admin_pending_cache_lock:
+        cached = _sched_admin_pending_cache.get(admin_id)
+        if cached and now - cached[0] < _SCHED_ADMIN_PENDING_CACHE_TTL_S:
+            return list(cached[1])
+
+    lock = _sched_admin_pending_lock(admin_id)
+    if not lock.acquire(blocking=False):
+        # A concurrent callback/page is already fetching this list. Reuse stale
+        # data if available instead of opening a second Supabase request.
+        if cached:
+            return list(cached[1])
+        return []
+
+    try:
+        res = db_call_sync(
+            f"sched_fetch_admin_pending:{admin_id}",
+            lambda: (
+                supabase.table("scheduled_broadcasts")
+                .select("id, broadcast_at, plain_text, caption, photo_file_id, status, error_msg")
+                .eq("admin_id", admin_id)
+                .eq("status", SCHED_STATUS_PENDING)
+                .order("broadcast_at")
+                .execute()
+            ),
+            default=None,
+            attempts=1,
+        )
+        rows = list(getattr(res, "data", None) or [])
+        rows = [r for r in rows if _sched_is_draft(r) or _sched_is_confirmed_pending(r)]
+        with _sched_admin_pending_cache_lock:
+            _sched_admin_pending_cache[admin_id] = (time.monotonic(), list(rows))
+        return rows
+    finally:
+        with suppress(Exception):
+            lock.release()
 
 def db_sched_fetch_one(row_id: int) -> dict | None:
     if not supabase:
