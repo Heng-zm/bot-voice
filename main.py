@@ -1420,8 +1420,10 @@ CHAT_WAIT_MESSAGE      = 2
 SCHED_WAIT_MSG         = 3
 SCHED_WAIT_TIME        = 4
 USER_SEARCH_WAIT_QUERY = 5
-_SCHED_POLL_INTERVAL   = 60
+_SCHED_POLL_INTERVAL   = int(os.environ.get("SCHED_POLL_INTERVAL", "60"))
 _SCHED_SENDING_STALE_SECONDS = int(os.environ.get("SCHED_SENDING_STALE_SECONDS", "1800"))
+_SCHED_DUE_LIMIT      = max(1, int(os.environ.get("SCHED_DUE_LIMIT", "5")))
+_SCHED_SCAN_LIMIT     = max(25, int(os.environ.get("SCHED_SCAN_LIMIT", "250")))
 _DT_FORMATS = [
     "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S",
     "%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M",
@@ -3628,12 +3630,20 @@ def _sched_is_draft(row: dict | None) -> bool:
 
 
 def _sched_is_confirmed_pending(row: dict | None) -> bool:
+    """Return True only for rows that are safe for the scheduler to send.
+
+    Confirmed schedule = status pending + error_msg is NULL/empty.
+    Draft preview      = status pending + SCHED_DRAFT_MARKER.
+
+    This strict check prevents accidental sends for rows that are pending but
+    contain an error/debug marker in error_msg.
+    """
     if not row:
         return False
-    return (
-        str(row.get("status") or "").lower() == SCHED_STATUS_PENDING
-        and not _sched_is_draft(row)
-    )
+    status = str(row.get("status") or "").strip().lower()
+    error_msg = row.get("error_msg")
+    error_clean = "" if error_msg is None else str(error_msg).strip()
+    return status == SCHED_STATUS_PENDING and error_clean == ""
 
 
 def db_sched_insert(payload: dict, admin_id: int, broadcast_at: datetime) -> dict:
@@ -3666,7 +3676,7 @@ def db_sched_insert(payload: dict, admin_id: int, broadcast_at: datetime) -> dic
     return res.data[0]
 
 
-def db_sched_fetch_due(limit: int = 5) -> list[dict]:
+def db_sched_fetch_due(limit: int = _SCHED_DUE_LIMIT) -> list[dict]:
     if not supabase:
         return []
     now = _sched_iso()
@@ -3683,13 +3693,13 @@ def db_sched_fetch_due(limit: int = 5) -> list[dict]:
             .eq("status", SCHED_STATUS_PENDING)
             .lte("broadcast_at", now)
             .order("broadcast_at")
-            .limit(max(1000, int(limit or 5) * 50))
+            .limit(max(_SCHED_SCAN_LIMIT, int(limit or _SCHED_DUE_LIMIT) * 25))
             .execute()
         ),
         default=None,
     )
     rows = list(getattr(res, "data", None) or [])
-    return [r for r in rows if _sched_is_confirmed_pending(r)][: max(1, int(limit or 5))]
+    return [r for r in rows if _sched_is_confirmed_pending(r)][: max(1, int(limit or _SCHED_DUE_LIMIT))]
 
 def db_sched_claim(row_id: int) -> bool:
     """Atomically claim one confirmed pending schedule.
@@ -3715,6 +3725,7 @@ def db_sched_claim(row_id: int) -> bool:
             .update(update)
             .eq("id", int(row_id))
             .eq("status", SCHED_STATUS_PENDING)
+            .is_("error_msg", "null")
             .execute()
         ),
         default=None,
@@ -3979,10 +3990,11 @@ def get_schedules_list_kb(rows: list[dict], page: int, page_size: int = 5) -> In
     kbd_rows = []
     for r in chunk:
         try:
-            dt_str = _fmt_dt(datetime.fromisoformat(r["broadcast_at"]))
+            dt_str = _fmt_dt(datetime.fromisoformat(str(r["broadcast_at"]).replace("Z", "+00:00")))
         except Exception:
             dt_str = str(r.get("broadcast_at", "?"))
-        kbd_rows.append([InlineKeyboardButton(f"#{r['id']}  {dt_str}", callback_data=f"sched_view:{r['id']}")])
+        icon = "🟡" if _sched_is_draft(r) else "🟢"
+        kbd_rows.append([InlineKeyboardButton(f"{icon} #{r['id']}  {dt_str}", callback_data=f"sched_view:{r['id']}")])
     nav = []
     if page > 0:            nav.append(InlineKeyboardButton("⬅️", callback_data=f"sched_page:{page-1}"))
     nav.append(InlineKeyboardButton(f"{page+1}/{total}", callback_data="sched_noop"))
@@ -5045,7 +5057,10 @@ async def _admin_health_text() -> str:
         f"🔍 OCR: <b>{_ok_bad(bool(ocr_ready), 'READY', 'OFF')}</b>\n"
         f"🎧 FFmpeg: <b>{_ok_bad(ffmpeg_ok, 'OK', 'ERROR')}</b>\n"
         f"📁 Temp folder: <b>{_ok_bad(temp_ok, 'OK', 'ERROR')}</b>\n"
-        f"<code>{html.escape(str(temp_dir))}</code>"
+        f"<code>{html.escape(str(temp_dir))}</code>\n\n"
+        f"⏰ Scheduler poll: <b>{int(_SCHED_POLL_INTERVAL)}s</b>\n"
+        f"📦 Due batch: <b>{int(_SCHED_DUE_LIMIT)}</b> / scan <b>{int(_SCHED_SCAN_LIMIT)}</b>\n"
+        f"🏃 Active schedule jobs: <b>{len(_scheduler_active_ids)}</b>"
     )
 
 
@@ -5110,7 +5125,8 @@ async def _admin_open_schedules_panel(query, admin_id: int) -> None:
         ))
         return
     await safe_send(lambda: query.message.edit_text(
-        f"📋 <b>Scheduled Broadcasts ({len(rows)} pending)</b>\n"
+        f"📋 <b>Scheduled Broadcasts ({len(rows)} active/preview)</b>\n"
+        "🟡 Preview = មិនទាន់ Confirm, 🟢 Pending = រង់ចាំផ្ញើ។\n"
         "ចុចលើ Schedule ដើម្បីមើលលម្អិត ឬ Cancel ។",
         parse_mode="HTML",
         reply_markup=get_schedules_list_kb(rows, page=0),
@@ -5981,6 +5997,21 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
         )
 
 _scheduler_tasks: set[asyncio.Task] = set()
+_scheduler_active_ids: set[int] = set()
+
+
+def _scheduler_task_done(task: asyncio.Task, row_id: int) -> None:
+    _scheduler_tasks.discard(task)
+    _scheduler_active_ids.discard(row_id)
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        logger.warning("Could not inspect scheduled task #%s result: %s", row_id, e)
+        return
+    if exc:
+        logger.error("Scheduled broadcast task #%s crashed: %s", row_id, exc, exc_info=exc)
 
 
 async def _scheduler_loop(bot, stop_event: asyncio.Event) -> None:
@@ -5991,11 +6022,15 @@ async def _scheduler_loop(bot, stop_event: asyncio.Event) -> None:
             stale_count = await loop.run_in_executor(None, db_sched_mark_stale_sending_failed)
             if stale_count:
                 logger.warning(f"Recovered/expired {stale_count} scheduled broadcast row(s).")
-            due  = await loop.run_in_executor(None, db_sched_fetch_due)
+            due = await loop.run_in_executor(None, db_sched_fetch_due, _SCHED_DUE_LIMIT)
             for row in due:
+                row_id = int(row.get("id") or 0)
+                if not row_id or row_id in _scheduler_active_ids:
+                    continue
+                _scheduler_active_ids.add(row_id)
                 task = asyncio.create_task(_fire_scheduled_broadcast(bot, row))
                 _scheduler_tasks.add(task)
-                task.add_done_callback(_scheduler_tasks.discard)
+                task.add_done_callback(lambda t, rid=row_id: _scheduler_task_done(t, rid))
         except Exception as e:
             logger.error(f"Scheduler loop error: {e}")
         try:
@@ -7871,6 +7906,7 @@ async def _run_bot():
     if not supabase:
         _api_keys_memory_by_hash.clear()
     _scheduler_tasks.clear()
+    _scheduler_active_ids.clear()
 
     _BOT_START_TIME = time.time()
 
