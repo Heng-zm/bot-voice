@@ -976,6 +976,8 @@ def ai_info():
 _WEB_BROADCAST_JOBS: OrderedDict[str, dict] = OrderedDict()
 _WEB_BROADCAST_JOBS_LOCK = threading.Lock()
 _WEB_BROADCAST_JOBS_MAX = int(os.environ.get("WEB_BROADCAST_JOBS_MAX", "50"))
+WEB_BROADCAST_WORKERS = max(1, int(os.environ.get("WEB_BROADCAST_WORKERS", str(MAX_CONCURRENT_BROADCAST))))
+WEB_BROADCAST_DELAY_S = max(0.0, float(os.environ.get("WEB_BROADCAST_DELAY_S", "0.05")))
 
 
 def _web_admin_enabled() -> bool:
@@ -1362,18 +1364,34 @@ def _web_sched_list(status: str = "all", q: str = "", limit: int = 150) -> list[
     return rows
 
 
-def _web_sched_confirm_any(row_id: int) -> tuple[bool, str]:
-    row = db_sched_fetch_one(row_id)
+def _web_sched_confirm_any(row_id: int, admin_id: int) -> tuple[bool, str]:
+    """Confirm a schedule from the web dashboard using the same safe path as Telegram.
+
+    This avoids owner-bypass bugs and keeps the DB-compatible draft design:
+    status="pending" plus SCHED_DRAFT_MARKER until confirmation.
+    """
+    ok, reason, _row = db_sched_confirm(int(row_id), int(admin_id))
+    messages = {
+        "confirmed": "confirmed",
+        "already_confirmed": "already confirmed",
+        "not_found": "Schedule not found.",
+        "not_owner": "Schedule belongs to another admin.",
+        "expired": "Schedule expired and was cancelled.",
+        "race_lost": "Schedule changed before confirmation. Refresh and try again.",
+    }
+    return bool(ok), messages.get(str(reason), f"Cannot confirm schedule: {reason}")
+
+
+def _web_sched_cancel_any(row_id: int, admin_id: int) -> tuple[bool, str]:
+    row = db_sched_fetch_one(int(row_id))
     if not row:
         return False, "Schedule not found."
+    if int(row.get("admin_id") or 0) != int(admin_id):
+        return False, "Schedule belongs to another admin."
     if str(row.get("status") or "").lower() != SCHED_STATUS_PENDING:
-        return False, f"Cannot confirm status {row.get('status')}"
-    when = _sched_parse_iso(row.get("broadcast_at"))
-    if when and when <= datetime.now(timezone.utc):
-        db_sched_set_status(row_id, SCHED_STATUS_CANCELLED, error_msg="Expired before web confirmation")
-        return False, "Schedule expired and was cancelled."
-    res = db_call_sync(f"web_sched_confirm:{row_id}", lambda: supabase.table("scheduled_broadcasts").update({"error_msg": None}).eq("id", int(row_id)).eq("status", SCHED_STATUS_PENDING).execute(), default=None, attempts=2, critical=False)
-    return bool(getattr(res, "data", None)), "confirmed" if getattr(res, "data", None) else "not updated"
+        return False, f"Cannot cancel schedule with status {row.get('status')}."
+    db_sched_set_status(int(row_id), SCHED_STATUS_CANCELLED, error_msg="Cancelled from web dashboard")
+    return True, "cancelled"
 
 
 def _web_sched_create(admin_id: int, broadcast_at: datetime, text: str, photo_file_id: str = "", caption: str = "", confirmed: bool = False) -> tuple[bool, str]:
@@ -1382,6 +1400,8 @@ def _web_sched_create(admin_id: int, broadcast_at: datetime, text: str, photo_fi
     text = (text or "").strip()
     photo_file_id = (photo_file_id or "").strip()
     caption = (caption or "").strip()
+    if photo_file_id and not caption and text:
+        caption = text
     if not photo_file_id and not text:
         return False, "Broadcast text is required when no photo_file_id is provided."
     if photo_file_id and len(caption) > 1024:
@@ -1426,7 +1446,7 @@ def web_admin_schedules():
     options = "".join(f"<option value='{s}' {'selected' if status==s else ''}>{s.title()}</option>" for s in ["all", "preview", "pending", "sending", "done", "failed", "cancelled"])
     body = f"""
     <div class='card'><form method='get' class='row'><div class='field'><label>Status</label><select name='status'>{options}</select></div><div class='field'><label>Search ID/text</label><input name='q' value='{_web_h(q)}'></div><div class='field'><button>Filter</button></div></form></div>
-    <div class='card'><h2>Create Schedule</h2><form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='action' value='create'><div class='row'><div class='field'><label>Broadcast UTC time</label><input name='broadcast_at' placeholder='2026-12-25 09:00' required></div><div class='field'><label>Mode</label><select name='confirmed'><option value='0'>Preview first</option><option value='1'>Confirm immediately</option></select></div></div><div class='field'><label>Text message</label><textarea name='text' placeholder='Required for text-only schedule'></textarea></div><div class='row'><div class='field'><label>Telegram photo_file_id optional</label><input name='photo_file_id'></div><div class='field'><label>Photo caption optional</label><input name='caption'></div></div><button>Create Schedule</button></form></div>
+    <div class='card'><h2>Create Schedule</h2><form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='action' value='create'><div class='row'><div class='field'><label>Broadcast UTC time</label><input name='broadcast_at' placeholder='2026-12-25 09:00' required></div><div class='field'><label>Mode</label><select name='confirmed'><option value='0'>Preview first</option><option value='1'>Confirm immediately</option></select></div></div><div class='field'><label>Text message</label><textarea name='text' placeholder='Required for text-only schedule; used as photo caption when caption is empty'></textarea></div><div class='row'><div class='field'><label>Telegram photo_file_id optional</label><input name='photo_file_id'></div><div class='field'><label>Photo caption optional</label><input name='caption'></div></div><button>Create Schedule</button></form></div>
     <div class='card'><h2>Schedules</h2><table class='table'><thead><tr><th>ID</th><th>Status</th><th>Time</th><th>Content</th><th>Actions</th></tr></thead><tbody>{''.join(table_rows) or '<tr><td colspan=5>No schedules found.</td></tr>'}</tbody></table></div>
     """
     return _web_render("Schedules", body, active="schedules")
@@ -1449,28 +1469,23 @@ def web_admin_schedules_action():
         elif not row_id:
             ok, msg = False, "Missing schedule ID."
         elif action == "confirm":
-            ok, msg = _web_sched_confirm_any(row_id)
+            ok, msg = _web_sched_confirm_any(row_id, _web_current_admin_id())
         elif action == "cancel":
-            db_sched_set_status(row_id, SCHED_STATUS_CANCELLED, error_msg="Cancelled from web dashboard")
-            ok, msg = True, "cancelled"
+            ok, msg = _web_sched_cancel_any(row_id, _web_current_admin_id())
         elif action == "edit_time":
             dt = _parse_dt(request.form.get("broadcast_at") or "")
             if not dt:
                 ok, msg = False, "Invalid time. Use YYYY-MM-DD HH:MM UTC."
             else:
-                res = db_call_sync("web_sched_edit_time", lambda: supabase.table("scheduled_broadcasts").update({"broadcast_at": _sched_iso(dt)}).eq("id", row_id).eq("status", SCHED_STATUS_PENDING).execute(), default=None, attempts=2)
-                ok, msg = bool(getattr(res, "data", None)), "time updated" if getattr(res, "data", None) else "not updated"
+                ok, reason, _row = db_sched_update_time(row_id, _web_current_admin_id(), dt)
+                msg = "time updated" if ok else f"time not updated: {reason}"
         elif action == "edit_text":
-            row = db_sched_fetch_one(row_id)
-            text = (request.form.get("text") or "").strip()
-            if not row:
-                ok, msg = False, "not found"
-            elif not text:
-                ok, msg = False, "Text cannot be empty."
-            else:
-                update = {"caption": text, "plain_text": None} if row.get("photo_file_id") else {"plain_text": text, "caption": None}
-                res = db_call_sync("web_sched_edit_text", lambda: supabase.table("scheduled_broadcasts").update(update).eq("id", row_id).eq("status", SCHED_STATUS_PENDING).execute(), default=None, attempts=2)
-                ok, msg = bool(getattr(res, "data", None)), "text updated" if getattr(res, "data", None) else "not updated"
+            ok, reason, _row = db_sched_update_text(
+                row_id,
+                _web_current_admin_id(),
+                request.form.get("text") or "",
+            )
+            msg = "text updated" if ok else f"text not updated: {reason}"
     except Exception as exc:
         ok, msg = False, str(exc)
     flask_flash(("OK: " if ok else "ERROR: ") + msg, "success" if ok else "error")
@@ -1488,29 +1503,79 @@ def _web_broadcast_job_set(job_id: str, **updates) -> None:
 
 
 def _web_broadcast_worker(job_id: str, admin_id: int, text: str) -> None:
-    users = get_all_user_ids()
+    """Run web dashboard broadcast in bounded concurrent batches.
+
+    The Telegram bot path already sends broadcasts concurrently. This web path
+    now uses the same bounded-batch idea so large admin broadcasts do not take
+    one blocking HTTP request per user in serial.
+    """
+    raw_users = get_all_user_ids()
+    users: list[int] = []
+    for raw_uid in raw_users:
+        try:
+            users.append(int(raw_uid))
+        except Exception:
+            logger.warning("web broadcast skipped invalid user id: %r", raw_uid)
+
     total = len(users)
     sent = failed = blocked = 0
-    _web_broadcast_job_set(job_id, status="running", total=total, sent=0, failed=0, blocked=0, started_at=_sched_iso())
-    for uid in users:
-        if db_user_is_blocked(int(uid)):
-            blocked += 1
-            _web_broadcast_job_set(job_id, blocked=blocked)
-            continue
-        ok, msg = _web_send_telegram_message(int(uid), text)
-        if ok:
-            sent += 1
-        else:
-            low = msg.lower()
-            if "403" in low or "forbidden" in low or "bot was blocked" in low:
-                blocked += 1
-                db_user_set_blocked(int(uid), admin_id, True, "Telegram blocked during web broadcast")
-            else:
-                failed += 1
-        _web_broadcast_job_set(job_id, sent=sent, failed=failed, blocked=blocked)
-        time.sleep(float(os.environ.get("WEB_BROADCAST_DELAY_S", "0.05")))
-    _web_broadcast_job_set(job_id, status="done", sent=sent, failed=failed, blocked=blocked, finished_at=_sched_iso())
+    _web_broadcast_job_set(
+        job_id,
+        status="running",
+        total=total,
+        sent=0,
+        failed=0,
+        blocked=0,
+        started_at=_sched_iso(),
+    )
 
+    if not users:
+        _web_broadcast_job_set(job_id, status="done", finished_at=_sched_iso())
+        return
+
+    def _send_one(uid: int) -> str:
+        try:
+            if db_user_is_blocked(uid):
+                return "blocked"
+            ok, send_msg = _web_send_telegram_message(uid, text)
+            if ok:
+                return "sent"
+            low = str(send_msg or "").lower()
+            if "403" in low or "forbidden" in low or "bot was blocked" in low:
+                db_user_set_blocked(uid, admin_id, True, "Telegram blocked during web broadcast")
+                return "blocked"
+            logger.warning("web broadcast failed uid=%s: %s", uid, str(send_msg)[:240])
+            return "failed"
+        except Exception as exc:
+            logger.warning("web broadcast exception uid=%s: %s", uid, exc)
+            return "failed"
+
+    workers = max(1, min(WEB_BROADCAST_WORKERS, max(1, len(users))))
+    batch_size = max(1, BROADCAST_BATCH_SIZE)
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="web_broadcast") as pool:
+        for start in range(0, total, batch_size):
+            batch = users[start:start + batch_size]
+            results = list(pool.map(_send_one, batch))
+            for result in results:
+                if result == "sent":
+                    sent += 1
+                elif result == "blocked":
+                    blocked += 1
+                else:
+                    failed += 1
+
+            _web_broadcast_job_set(job_id, sent=sent, failed=failed, blocked=blocked)
+            if start + len(batch) < total and WEB_BROADCAST_DELAY_S:
+                time.sleep(WEB_BROADCAST_DELAY_S)
+
+    _web_broadcast_job_set(
+        job_id,
+        status="done",
+        sent=sent,
+        failed=failed,
+        blocked=blocked,
+        finished_at=_sched_iso(),
+    )
 
 @app_flask.route("/admin/broadcast", methods=["GET", "POST"])
 @web_admin_required
@@ -1858,7 +1923,8 @@ def _is_retryable_store_error(exc: BaseException | str) -> bool:
         "invalid key", "permission denied", "violates row-level security",
         "row-level security", "rls", "relation does not exist",
         "column does not exist", "undefined column", "syntax error",
-        "invalid input syntax",
+        "invalid input syntax", "check constraint", "violates check constraint",
+        "23514", "duplicate key", "unique constraint",
     )
     if any(word in msg for word in non_retryable_words):
         return False
