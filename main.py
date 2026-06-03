@@ -3565,126 +3565,276 @@ async def resolve_tts_text(
 # ---------------------------------------------------------------------------
 # Database helpers — scheduled broadcasts
 # ---------------------------------------------------------------------------
+SCHED_STATUS_DRAFT     = "draft"      # created after date input; cannot fire yet
+SCHED_STATUS_PENDING   = "pending"    # confirmed; scheduler may send it
+SCHED_STATUS_SENDING   = "sending"    # claimed by scheduler
+SCHED_STATUS_DONE      = "done"
+SCHED_STATUS_FAILED    = "failed"
+SCHED_STATUS_CANCELLED = "cancelled"
+
+_SCHED_CLAIM_RE = re.compile(r"sending_started_at=([^\s]+)")
+
+
+def _sched_to_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _sched_iso(dt: datetime | None = None) -> str:
+    return _sched_to_utc(dt or datetime.now(timezone.utc)).isoformat()
+
+
+def _sched_parse_iso(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        # Supabase/Postgres may return a trailing Z.
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return _sched_to_utc(dt)
+    except Exception:
+        return None
+
+
+def _sched_claim_marker(dt: datetime | None = None) -> str:
+    return f"sending_started_at={_sched_iso(dt)}"
+
+
+def _sched_claim_time(row: dict) -> datetime | None:
+    msg = str(row.get("error_msg") or "")
+    m = _SCHED_CLAIM_RE.search(msg)
+    if m:
+        return _sched_parse_iso(m.group(1))
+    # Backward-compatible fallback for old rows that were already in "sending"
+    # before this fix. Do not use this for newly claimed rows.
+    return _sched_parse_iso(row.get("broadcast_at"))
+
+
 def db_sched_insert(payload: dict, admin_id: int, broadcast_at: datetime) -> dict:
+    """Create a schedule preview row.
+
+    Important fix: new rows start as `draft`, not `pending`.
+    The scheduler only fetches `pending`, so the broadcast cannot fire until
+    the admin taps ✅ Confirm Schedule.
+    """
     if not supabase:
         raise RuntimeError("Supabase not configured.")
+
     row = {
-        "admin_id":       admin_id,
-        "photo_file_id":  payload.get("photo_file_id"),
-        "caption":        payload.get("caption"),
-        "plain_text":     payload.get("text"),
-        "broadcast_at":   broadcast_at.isoformat(),
-        "status":         "pending",
+        "admin_id":      int(admin_id),
+        "photo_file_id": payload.get("photo_file_id"),
+        "caption":       payload.get("caption"),
+        "plain_text":    payload.get("text"),
+        "broadcast_at":  _sched_iso(broadcast_at),
+        "status":        SCHED_STATUS_DRAFT,
+        "error_msg":     None,
     }
-    res = supabase.table("scheduled_broadcasts").insert(row).execute()
+    res = db_call_sync(
+        "sched_insert",
+        lambda: supabase.table("scheduled_broadcasts").insert(row).execute(),
+        critical=True,
+    )
+    if not getattr(res, "data", None):
+        raise RuntimeError("scheduled_broadcasts insert returned no row.")
     return res.data[0]
 
 
-def db_sched_fetch_due() -> list[dict]:
+def db_sched_fetch_due(limit: int = 5) -> list[dict]:
     if not supabase:
         return []
-    try:
-        now = datetime.now(timezone.utc).isoformat()
-        res = (
+    now = _sched_iso()
+    res = db_call_sync(
+        "sched_fetch_due",
+        lambda: (
             supabase.table("scheduled_broadcasts")
             .select("*")
-            .eq("status", "pending")
+            .eq("status", SCHED_STATUS_PENDING)
             .lte("broadcast_at", now)
             .order("broadcast_at")
+            .limit(max(1, int(limit or 5)))
             .execute()
-        )
-        return res.data or []
-    except Exception as e:
-        logger.error(f"db_sched_fetch_due: {e}")
-        return []
+        ),
+        default=None,
+    )
+    return list(getattr(res, "data", None) or [])
 
 
 def db_sched_claim(row_id: int) -> bool:
+    """Atomically claim one pending schedule.
+
+    The `error_msg` field stores a claim timestamp. This avoids the old bug
+    where a long-running broadcast scheduled far in the past could be marked
+    stale immediately because stale recovery used only `broadcast_at`.
+    """
     if not supabase:
         return False
-    try:
-        res = (
+    update = {
+        "status": SCHED_STATUS_SENDING,
+        "error_msg": _sched_claim_marker(),
+    }
+    res = db_call_sync(
+        f"sched_claim:{row_id}",
+        lambda: (
             supabase.table("scheduled_broadcasts")
-            .update({"status": "sending"})
-            .eq("id", row_id)
-            .eq("status", "pending")
+            .update(update)
+            .eq("id", int(row_id))
+            .eq("status", SCHED_STATUS_PENDING)
             .execute()
+        ),
+        default=None,
+    )
+    return bool(getattr(res, "data", None))
+
+
+def db_sched_confirm(row_id: int, admin_id: int) -> tuple[bool, str, dict | None]:
+    """Move a preview/draft schedule to pending after admin confirmation."""
+    row = db_sched_fetch_one(row_id)
+    if not row:
+        return False, "not_found", None
+    if int(row.get("admin_id") or 0) != int(admin_id):
+        return False, "not_owner", row
+
+    status = str(row.get("status") or "").lower()
+    if status == SCHED_STATUS_PENDING:
+        return True, "already_confirmed", row
+    if status != SCHED_STATUS_DRAFT:
+        return False, status or "invalid_status", row
+
+    broadcast_at = _sched_parse_iso(row.get("broadcast_at"))
+    if not broadcast_at or broadcast_at <= datetime.now(timezone.utc):
+        db_sched_set_status(
+            row_id,
+            SCHED_STATUS_CANCELLED,
+            error_msg="Cancelled: schedule time passed before admin confirmation.",
         )
-        return bool(res.data)
-    except Exception as e:
-        logger.error(f"db_sched_claim #{row_id}: {e}")
-        return False
+        return False, "expired", row
+
+    res = db_call_sync(
+        f"sched_confirm:{row_id}",
+        lambda: (
+            supabase.table("scheduled_broadcasts")
+            .update({"status": SCHED_STATUS_PENDING, "error_msg": None})
+            .eq("id", int(row_id))
+            .eq("admin_id", int(admin_id))
+            .eq("status", SCHED_STATUS_DRAFT)
+            .execute()
+        ),
+        default=None,
+    )
+    saved = (getattr(res, "data", None) or [None])[0]
+    if not saved:
+        return False, "race_lost", db_sched_fetch_one(row_id)
+    return True, "confirmed", saved
 
 
 def db_sched_set_status(row_id: int, status: str, **extra) -> None:
     if not supabase:
         return
-    with suppress(Exception):
-        supabase.table("scheduled_broadcasts").update({"status": status, **extra}).eq("id", row_id).execute()
+    update = {"status": str(status), **extra}
+    try:
+        db_call_sync(
+            f"sched_set_status:{row_id}:{status}",
+            lambda: (
+                supabase.table("scheduled_broadcasts")
+                .update(update)
+                .eq("id", int(row_id))
+                .execute()
+            ),
+            default=None,
+        )
+    except Exception as e:
+        logger.error(f"db_sched_set_status #{row_id} -> {status}: {e}")
 
 
 def db_sched_mark_stale_sending_failed() -> int:
-    """Recover scheduled broadcasts stuck in 'sending' after a crash.
+    """Recover schedules stuck in `sending` and expire unconfirmed drafts.
 
-    FIX: Uses broadcast_at as the age proxy (unchanged), but the cutoff
-    calculation now uses `_SCHED_SENDING_STALE_SECONDS` correctly relative to
-    UTC now so that broadcasts scheduled far in the past are recovered.
+    This version uses `sending_started_at` stored in `error_msg` when claiming.
+    That fixes false-failure for old due broadcasts that are actively sending.
     """
     if not supabase:
         return 0
-    try:
-        cutoff = datetime.fromtimestamp(
-            time.time() - max(60, _SCHED_SENDING_STALE_SECONDS), timezone.utc
-        ).isoformat()
-        res = (
+
+    now = datetime.now(timezone.utc)
+    cutoff = now.timestamp() - max(60, int(_SCHED_SENDING_STALE_SECONDS))
+    changed = 0
+
+    sending_res = db_call_sync(
+        "sched_fetch_sending_for_stale_check",
+        lambda: (
+            supabase.table("scheduled_broadcasts")
+            .select("id, broadcast_at, error_msg, status")
+            .eq("status", SCHED_STATUS_SENDING)
+            .limit(100)
+            .execute()
+        ),
+        default=None,
+    )
+    for row in list(getattr(sending_res, "data", None) or []):
+        started_at = _sched_claim_time(row)
+        if started_at and started_at.timestamp() <= cutoff:
+            db_sched_set_status(
+                int(row["id"]),
+                SCHED_STATUS_FAILED,
+                error_msg=f"Marked failed: stuck in sending for more than {_SCHED_SENDING_STALE_SECONDS}s",
+            )
+            changed += 1
+
+    # Draft rows are previews that were never confirmed. They must never fire.
+    # Once their requested time has passed, mark them cancelled to keep the DB clean.
+    draft_res = db_call_sync(
+        "sched_expire_old_drafts",
+        lambda: (
             supabase.table("scheduled_broadcasts")
             .update({
-                "status": "failed",
-                "error_msg": f"Marked failed: stuck in sending for more than {_SCHED_SENDING_STALE_SECONDS}s",
+                "status": SCHED_STATUS_CANCELLED,
+                "error_msg": "Cancelled: schedule draft expired before confirmation.",
             })
-            .eq("status", "sending")
-            .lte("broadcast_at", cutoff)
+            .eq("status", SCHED_STATUS_DRAFT)
+            .lte("broadcast_at", _sched_iso(now))
             .execute()
-        )
-        return len(res.data or [])
-    except Exception as e:
-        logger.error(f"db_sched_mark_stale_sending_failed: {e}")
-        return 0
+        ),
+        default=None,
+    )
+    changed += len(getattr(draft_res, "data", None) or [])
+    return changed
 
 
 def db_sched_fetch_admin_pending(admin_id: int) -> list[dict]:
     if not supabase:
         return []
-    try:
-        res = (
+    res = db_call_sync(
+        f"sched_fetch_admin_pending:{admin_id}",
+        lambda: (
             supabase.table("scheduled_broadcasts")
             .select("id, broadcast_at, plain_text, caption, photo_file_id, status")
-            .eq("admin_id", admin_id)
-            .eq("status", "pending")
+            .eq("admin_id", int(admin_id))
+            .eq("status", SCHED_STATUS_PENDING)
             .order("broadcast_at")
             .execute()
-        )
-        return res.data or []
-    except Exception as e:
-        logger.error(f"db_sched_fetch_admin_pending: {e}")
-        return []
+        ),
+        default=None,
+    )
+    return list(getattr(res, "data", None) or [])
 
 
 def db_sched_fetch_one(row_id: int) -> dict | None:
     if not supabase:
         return None
-    try:
-        res = (
+    res = db_call_sync(
+        f"sched_fetch_one:{row_id}",
+        lambda: (
             supabase.table("scheduled_broadcasts")
             .select("*")
-            .eq("id", row_id)
+            .eq("id", int(row_id))
             .limit(1)
             .execute()
-        )
-        return res.data[0] if res.data else None
-    except Exception as e:
-        logger.error(f"db_sched_fetch_one: {e}")
-        return None
+        ),
+        default=None,
+    )
+    rows = list(getattr(res, "data", None) or [])
+    return rows[0] if rows else None
 
 
 # ---------------------------------------------------------------------------
@@ -5231,7 +5381,9 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
         ))
         return True
 
-    payload = _sched_payload.pop(user_id, None)
+    # Do not pop until Supabase save succeeds. If the DB call fails, the admin
+    # can retry the time without re-sending the broadcast content.
+    payload = _sched_payload.get(user_id)
     if not payload:
         context.user_data.pop("sched_state", None)
         await safe_send(lambda: msg.reply_text(
@@ -5240,35 +5392,47 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
         ))
         return True
 
-    context.user_data.pop("sched_state", None)
     loop = asyncio.get_running_loop()
     try:
         row = await loop.run_in_executor(None, db_sched_insert, payload, user_id, broadcast_at)
     except Exception as e:
-        logger.error(f"db_sched_insert failed: {e}")
-        await safe_send(lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការ Save Schedule ។ សូមព្យាយាមម្តងទៀត។"))
+        logger.error(f"db_sched_insert failed: {e}", exc_info=True)
+        await safe_send(lambda: msg.reply_text(
+            "❌ មានបញ្ហាក្នុងការ Save Schedule ។ សូមព្យាយាមបញ្ចូលពេលវេលាម្តងទៀត។"
+        ))
         return True
 
-    row_id  = row["id"]
-    dt_str  = _fmt_dt(broadcast_at)
+    # Save succeeded. Clear conversation state. The DB row is still `draft`, so
+    # it cannot send until ✅ Confirm Schedule is pressed.
+    _sched_payload.pop(user_id, None)
+    context.user_data.pop("sched_state", None)
+
+    row_id = row["id"]
+    dt_str = _fmt_dt(broadcast_at)
 
     if payload.get("photo_file_id"):
         cap_preview = html.escape(payload["caption"]) if payload.get("caption") else "<i>(គ្មាន Caption)</i>"
         await safe_send(lambda: msg.reply_photo(
             photo=payload["photo_file_id"],
-            caption=(f"📅 <b>Preview Schedule #{row_id}</b>\n⏰ {dt_str}\n\n{cap_preview}"),
+            caption=(
+                f"📅 <b>Preview Schedule #{row_id}</b>\n"
+                f"⏰ {dt_str}\n"
+                "ស្ថានភាព: <b>Draft — មិនទាន់បញ្ជាក់</b>\n\n"
+                f"{cap_preview}"
+            ),
             parse_mode="HTML",
             reply_markup=get_sched_confirm_kb(row_id),
         ))
     else:
         await safe_send(lambda: msg.reply_text(
-            f"📅 <b>Preview Schedule #{row_id}</b>\n⏰ {dt_str}\n\n"
+            f"📅 <b>Preview Schedule #{row_id}</b>\n"
+            f"⏰ {dt_str}\n"
+            "ស្ថានភាព: <b>Draft — មិនទាន់បញ្ជាក់</b>\n\n"
             f"{html.escape(payload.get('text') or '')}",
             parse_mode="HTML",
             reply_markup=get_sched_confirm_kb(row_id),
         ))
     return True
-
 
 async def _cb_admin_dashboard(query, user_id: int, context, data: str):
     if not _is_admin(user_id):
@@ -5382,10 +5546,22 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
     ))
 
 
+def _callback_int_arg(data: str, prefix: str) -> int | None:
+    try:
+        if not str(data or "").startswith(prefix):
+            return None
+        value = str(data).split(":", 1)[1]
+        return int(value)
+    except Exception:
+        return None
+
+
 async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
+    query = update.callback_query
+    if not query:
+        return
     user_id = query.from_user.id
-    data    = query.data
+    data = query.data or ""
 
     if not _is_admin(user_id):
         with suppress(Exception):
@@ -5394,35 +5570,59 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with suppress(Exception):
         await query.answer()
 
+    if query.message is None:
+        return
+
     loop = asyncio.get_running_loop()
 
     if data.startswith("sched_ok:"):
-        row_id = int(data.split(":")[1])
-        row    = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
-        if not row:
-            await safe_send(lambda: query.message.reply_text("❌ រកមិនឃើញ Schedule ។"))
+        row_id = _callback_int_arg(data, "sched_ok:")
+        if row_id is None:
+            await safe_send(lambda: query.message.reply_text("❌ Invalid schedule id."))
             return
-        if row["status"] != "pending":
-            st = row["status"]
-            await safe_send(lambda: query.message.reply_text(
-                f"⚠️ Schedule #{row_id} មានស្ថានភាព <b>{st}</b> — មិនអាចបញ្ជាក់ទៀតទេ។",
-                parse_mode="HTML",
-            ))
+
+        ok, reason, row = await loop.run_in_executor(None, db_sched_confirm, row_id, user_id)
+        if not ok:
+            if reason == "not_found":
+                text = "❌ រកមិនឃើញ Schedule ។"
+            elif reason == "not_owner":
+                text = "⛔ Schedule នេះមិនមែនជារបស់អ្នកទេ។"
+            elif reason == "expired":
+                text = f"⚠️ Schedule #{row_id} ផុតពេលមុនពេលបញ្ជាក់ ដូច្នេះបានបោះបង់។"
+            else:
+                text = f"⚠️ Schedule #{row_id} មានស្ថានភាព <b>{html.escape(str(reason))}</b> — មិនអាចបញ្ជាក់ទេ។"
+            with suppress(Exception):
+                await query.message.edit_reply_markup(reply_markup=None)
+            await safe_send(lambda: query.message.reply_text(text, parse_mode="HTML"))
             return
-        dt_str = _fmt_dt(datetime.fromisoformat(row["broadcast_at"]))
+
+        try:
+            dt_str = _fmt_dt(datetime.fromisoformat(str(row["broadcast_at"]).replace("Z", "+00:00")))
+        except Exception:
+            dt_str = str(row.get("broadcast_at", "?")) if row else "?"
         with suppress(Exception):
             await query.message.edit_reply_markup(reply_markup=None)
+        status_note = "បានបញ្ជាក់រួចហើយ" if reason == "already_confirmed" else "បានបញ្ជាក់"
         await safe_send(lambda: query.message.reply_text(
-            f"✅ <b>Schedule #{row_id} បានបញ្ជាក់!</b>\n⏰ នឹង Broadcast នៅ {dt_str}",
+            f"✅ <b>Schedule #{row_id} {status_note}!</b>\n⏰ នឹង Broadcast នៅ {dt_str}",
             parse_mode="HTML",
         ))
         return
 
     if data.startswith("sched_no:"):
-        row_id = int(data.split(":")[1])
-        row    = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
-        if row and row["status"] == "pending":
-            await loop.run_in_executor(None, db_sched_set_status, row_id, "cancelled")
+        row_id = _callback_int_arg(data, "sched_no:")
+        if row_id is None:
+            await safe_send(lambda: query.message.reply_text("❌ Invalid schedule id."))
+            return
+        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
+        if not row:
+            await safe_send(lambda: query.message.reply_text("❌ រកមិនឃើញ Schedule ។"))
+            return
+        if int(row.get("admin_id") or 0) != int(user_id):
+            await safe_send(lambda: query.message.reply_text("⛔ Schedule នេះមិនមែនជារបស់អ្នកទេ។"))
+            return
+        if str(row.get("status")) in (SCHED_STATUS_DRAFT, SCHED_STATUS_PENDING):
+            await loop.run_in_executor(None, db_sched_set_status, row_id, SCHED_STATUS_CANCELLED)
         with suppress(Exception):
             await query.message.edit_reply_markup(reply_markup=None)
         await safe_send(lambda: query.message.reply_text(
@@ -5439,57 +5639,67 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("sched_page:"):
-        page = int(data.split(":")[1])
+        page = _callback_int_arg(data, "sched_page:")
+        if page is None:
+            return
         rows = await loop.run_in_executor(None, db_sched_fetch_admin_pending, user_id)
         with suppress(Exception):
             await query.message.edit_reply_markup(reply_markup=get_schedules_list_kb(rows, page=page))
         return
 
     if data.startswith("sched_view:"):
-        row_id = int(data.split(":")[1])
-        row    = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
+        row_id = _callback_int_arg(data, "sched_view:")
+        if row_id is None:
+            await safe_send(lambda: query.message.reply_text("❌ Invalid schedule id."))
+            return
+        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
         if not row:
             await safe_send(lambda: query.message.reply_text("❌ រកមិនឃើញ Schedule ។"))
             return
+        if int(row.get("admin_id") or 0) != int(user_id):
+            await safe_send(lambda: query.message.reply_text("⛔ Schedule នេះមិនមែនជារបស់អ្នកទេ។"))
+            return
         try:
-            dt_str = _fmt_dt(datetime.fromisoformat(row["broadcast_at"]))
+            dt_str = _fmt_dt(datetime.fromisoformat(str(row["broadcast_at"]).replace("Z", "+00:00")))
         except Exception:
             dt_str = str(row.get("broadcast_at", "?"))
-        content    = (row.get("plain_text") or row.get("caption") or "(photo)")[:300]
-        cancel_kb  = (
+        content = (row.get("plain_text") or row.get("caption") or "(photo)")[:300]
+        cancel_kb = (
             InlineKeyboardMarkup([[
                 InlineKeyboardButton("🗑️ Cancel Schedule", callback_data=f"sched_cancel_confirm:{row_id}")
             ]])
-            if row["status"] == "pending" else None
+            if row.get("status") in (SCHED_STATUS_DRAFT, SCHED_STATUS_PENDING) else None
         )
         await safe_send(lambda: query.message.reply_text(
             f"📋 <b>Schedule #{row_id}</b>\n⏰ {dt_str}\n"
-            f"ស្ថានភាព: <b>{row['status']}</b>\n\n{html.escape(content)}",
+            f"ស្ថានភាព: <b>{html.escape(str(row.get('status') or '?'))}</b>\n\n{html.escape(content)}",
             parse_mode="HTML",
             reply_markup=cancel_kb,
         ))
         return
 
     if data.startswith("sched_cancel_confirm:"):
-        row_id = int(data.split(":")[1])
-        row    = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
-        if not row or row.get("admin_id") != user_id:
+        row_id = _callback_int_arg(data, "sched_cancel_confirm:")
+        if row_id is None:
+            await safe_send(lambda: query.message.reply_text("❌ Invalid schedule id."))
+            return
+        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
+        if not row or int(row.get("admin_id") or 0) != int(user_id):
             await safe_send(lambda: query.message.reply_text("⛔ អ្នកមិនមានសិទ្ធិ cancel Schedule នេះ។"))
             return
-        if row["status"] != "pending":
-            st = row["status"]
+        if row.get("status") not in (SCHED_STATUS_DRAFT, SCHED_STATUS_PENDING):
+            st = html.escape(str(row.get("status") or "?"))
             await safe_send(lambda: query.message.reply_text(
                 f"⚠️ Schedule #{row_id} មានស្ថានភាព <b>{st}</b> — មិនអាច cancel ។",
                 parse_mode="HTML",
             ))
             return
-        await loop.run_in_executor(None, db_sched_set_status, row_id, "cancelled")
+        await loop.run_in_executor(None, db_sched_set_status, row_id, SCHED_STATUS_CANCELLED)
         with suppress(Exception):
             await query.message.edit_reply_markup(reply_markup=None)
         await safe_send(lambda: query.message.reply_text(
             f"✅ Schedule <b>#{row_id}</b> បានបោះបង់។", parse_mode="HTML"
         ))
-
 
 # ---------------------------------------------------------------------------
 # Subtitle/text document helpers
@@ -5679,23 +5889,26 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
 
 
 async def _fire_scheduled_broadcast(bot, row: dict) -> None:
-    row_id   = row["id"]
-    admin_id = row["admin_id"]
+    row_id = int(row["id"])
+    admin_id = int(row["admin_id"])
     logger.info(f"Firing scheduled broadcast #{row_id} for admin {admin_id}")
     loop = asyncio.get_running_loop()
 
     claimed = await loop.run_in_executor(None, db_sched_claim, row_id)
     if not claimed:
-        logger.warning(f"Scheduled broadcast #{row_id} already claimed — skipping.")
+        logger.warning(f"Scheduled broadcast #{row_id} already claimed/cancelled — skipping.")
         return
 
     sent = failed = blocked = 0
     try:
         pending = {
             "photo_file_id": row.get("photo_file_id"),
-            "caption":       row.get("caption") or "",
-            "text":          row.get("plain_text") or "",
+            "caption": row.get("caption") or "",
+            "text": row.get("plain_text") or "",
         }
+        if not pending["photo_file_id"] and not pending["text"]:
+            raise RuntimeError("Scheduled broadcast has no photo and no text.")
+
         sent, failed, blocked = await _run_broadcast_to_all(
             bot, admin_id, pending, label=f"Scheduled #{row_id}"
         )
@@ -5704,7 +5917,7 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
             functools.partial(
                 db_sched_set_status,
                 row_id,
-                "done",
+                SCHED_STATUS_DONE,
                 sent_count=sent,
                 failed_count=failed,
                 blocked_count=blocked,
@@ -5718,14 +5931,13 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
             functools.partial(
                 db_sched_set_status,
                 row_id,
-                "failed",
+                SCHED_STATUS_FAILED,
                 sent_count=sent,
                 failed_count=failed,
                 blocked_count=blocked,
                 error_msg=str(e)[:1000],
             ),
         )
-
 
 _scheduler_tasks: set[asyncio.Task] = set()
 
@@ -5737,7 +5949,7 @@ async def _scheduler_loop(bot, stop_event: asyncio.Event) -> None:
             loop = asyncio.get_running_loop()
             stale_count = await loop.run_in_executor(None, db_sched_mark_stale_sending_failed)
             if stale_count:
-                logger.warning(f"Marked {stale_count} stale scheduled broadcast(s) as failed.")
+                logger.warning(f"Recovered/expired {stale_count} scheduled broadcast row(s).")
             due  = await loop.run_in_executor(None, db_sched_fetch_due)
             for row in due:
                 task = asyncio.create_task(_fire_scheduled_broadcast(bot, row))
