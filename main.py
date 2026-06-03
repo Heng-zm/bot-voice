@@ -41,11 +41,49 @@ except Exception:
 
 
 # ── Flask Web Server ───────────────────────────────────────────────────────
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _env_int(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
+    try:
+        value = int(str(os.environ.get(name, default)).strip())
+    except Exception:
+        value = int(default)
+    if minimum is not None:
+        value = max(int(minimum), value)
+    if maximum is not None:
+        value = min(int(maximum), value)
+    return value
+
+
+def _default_cookie_secure() -> bool:
+    # Render/production traffic is normally HTTPS, but local HTTP testing needs
+    # non-secure cookies or the web admin login session will not persist.
+    explicit = os.environ.get("WEB_COOKIE_SECURE")
+    if explicit is not None:
+        return _env_bool("WEB_COOKIE_SECURE", True)
+    external_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip().lower()
+    return external_url.startswith("https://") or _env_bool("RENDER", False)
+
+
 app_flask = Flask(__name__)
 app_flask.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY") or os.environ.get("WEB_SECRET_KEY") or secrets.token_hex(32)
 app_flask.config["SESSION_COOKIE_HTTPONLY"] = True
 app_flask.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app_flask.config["SESSION_COOKIE_SECURE"] = os.environ.get("WEB_COOKIE_SECURE", "1") == "1"
+app_flask.config["SESSION_COOKIE_SECURE"] = _default_cookie_secure()
+app_flask.config["MAX_CONTENT_LENGTH"] = _env_int("WEB_MAX_CONTENT_LENGTH", 64 * 1024 * 1024, minimum=1 * 1024 * 1024)
+
+
+@app_flask.after_request
+def _web_security_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    return resp
 
 @app_flask.route("/")
 def health_check():
@@ -1157,6 +1195,13 @@ def _web_safe_return(default_endpoint: str = "web_admin_home") -> str:
     return url_for(default_endpoint)
 
 
+def _web_safe_next_url(target: str | None, default_endpoint: str = "web_admin_home") -> str:
+    target = str(target or "").strip()
+    if target.startswith("/") and not target.startswith("//"):
+        return target
+    return url_for(default_endpoint)
+
+
 def _web_return_input() -> str:
     return f"<input type='hidden' name='return_to' value='{_web_h(request.full_path)}'>"
 
@@ -1243,40 +1288,153 @@ def _web_render(title: str, body: str, *, active: str = "dashboard", status_code
         ("users", "Users", "/admin/users", "👥"),
         ("schedules", "Schedules", "/admin/schedules", "⏱"),
         ("broadcast", "Broadcast", "/admin/broadcast", "📣"),
+        ("health", "Health", "/admin/health", "🩺"),
         ("settings", "Settings", "/admin/settings", "⚙"),
         ("api", "API Keys", "/admin/api-keys", "🔑"),
         ("locks", "Locks", "/admin/locks", "🔒"),
         ("sql", "SQL", "/admin/sql", "☷"),
     ]
+    bottom_nav = [item for item in nav if item[0] in {"dashboard", "users", "schedules", "broadcast", "health"}]
     template = """
 <!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#0b1020">
+<meta name="theme-color" content="#0f172a">
 <title>{{ title }} - Bot Admin</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  darkMode: 'class',
+  theme: {
+    extend: {
+      fontFamily: { sans: ['Inter','ui-sans-serif','system-ui','-apple-system','Segoe UI','Roboto','Arial','Noto Sans Khmer','sans-serif'] },
+      boxShadow: { soft: '0 20px 60px rgba(15,23,42,.28)' }
+    }
+  }
+}
+</script>
+<style type="text/tailwindcss">
+@layer base{
+  *{@apply box-border}
+  html{@apply scroll-smooth bg-slate-950}
+  body{@apply min-h-screen m-0 bg-slate-950 text-slate-100 font-sans antialiased; background:radial-gradient(circle at top left,rgba(59,130,246,.22),transparent 30rem),radial-gradient(circle at bottom right,rgba(16,185,129,.12),transparent 28rem),linear-gradient(135deg,#020617,#0f172a 58%,#111827)}
+  a{@apply text-blue-200 no-underline transition hover:text-white}
+  code{@apply rounded-lg border border-white/10 bg-slate-950/80 px-1.5 py-0.5 text-xs text-slate-100}
+  pre{@apply max-h-[65vh] overflow-auto whitespace-pre-wrap rounded-2xl border border-white/10 bg-slate-950/90 p-4 text-sm text-slate-100}
+  input,select,textarea{@apply w-full rounded-2xl border border-white/10 bg-slate-950/80 px-4 py-3 text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-blue-400 focus:ring-4 focus:ring-blue-500/15}
+  textarea{@apply min-h-[130px] resize-y}
+  button,input[type=submit],.btn{@apply inline-flex min-h-10 items-center justify-center gap-2 rounded-2xl bg-blue-600 px-4 py-2.5 text-sm font-extrabold text-white shadow-sm transition hover:bg-blue-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-60}
+  h2{@apply text-lg font-black tracking-tight text-white}
+  h3{@apply text-base font-extrabold text-white}
+  summary{@apply cursor-pointer font-extrabold text-blue-200}
+  details{@apply mt-3}
+}
+@layer components{
+  .layout{@apply grid min-h-screen grid-cols-[280px_minmax(0,1fr)]}
+  .side{@apply sticky top-0 h-screen overflow-y-auto border-r border-white/10 bg-slate-950/75 p-5 backdrop-blur-2xl}
+  .brand{@apply flex items-center gap-3 text-2xl font-black tracking-tight text-white}
+  .brand-mark{@apply grid h-11 w-11 place-items-center rounded-2xl bg-gradient-to-br from-blue-500 to-violet-600 shadow-lg shadow-blue-500/20}
+  .sub,.muted,.help{@apply text-slate-400}
+  .sub{@apply my-4 text-xs}
+  .help{@apply mt-1.5 text-xs}
+  .nav{@apply grid gap-1.5}
+  .nav a{@apply flex items-center gap-3 rounded-2xl border border-transparent px-3 py-3 text-sm font-bold text-slate-200 hover:border-blue-300/20 hover:bg-blue-400/10}
+  .nav a.active{@apply border-blue-300/25 bg-blue-400/15 text-white shadow-sm}
+  .nav-ico{@apply w-6 text-center}
+  .main{@apply w-full max-w-[1500px] px-6 py-6 pb-28 lg:pb-6}
+  .top{@apply mb-5 flex items-start justify-between gap-4}
+  .h1{@apply text-3xl font-black tracking-tight text-white}
+  .top-right{@apply text-right text-xs text-slate-400}
+  .mobilebar{@apply sticky top-0 z-50 hidden items-center justify-between border-b border-white/10 bg-slate-950/90 px-4 py-3 backdrop-blur-2xl}
+  .menu-toggle{@apply hidden}
+  .card{@apply mb-4 rounded-3xl border border-white/10 bg-slate-900/75 p-5 shadow-soft backdrop-blur-xl}
+  .grid{@apply mb-4 grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4}
+  .grid2{@apply grid grid-cols-1 gap-4 xl:grid-cols-2}
+  .row{@apply grid grid-cols-1 gap-3 md:grid-cols-2}
+  .row3{@apply grid grid-cols-1 gap-3 lg:grid-cols-3}
+  .stat{@apply min-h-[110px] rounded-3xl border border-white/10 bg-gradient-to-b from-blue-500/10 to-slate-900/90 p-4 shadow-sm}
+  .stat b{@apply block text-3xl font-black tracking-tight text-white}
+  .stat small{@apply mt-1 block text-xs text-slate-400}
+  .stat-ok{@apply from-emerald-500/15}
+  .stat-warn{@apply from-amber-500/15}
+  .stat-danger{@apply from-red-500/15}
+  .badge{@apply inline-flex items-center gap-1 rounded-full border border-white/10 bg-slate-800/90 px-2.5 py-1 text-xs font-bold text-slate-300 whitespace-nowrap}
+  .badge-ok{@apply border-emerald-400/30 bg-emerald-500/15 text-emerald-200}
+  .badge-warn{@apply border-amber-400/30 bg-amber-500/15 text-amber-100}
+  .badge-danger{@apply border-red-400/30 bg-red-500/15 text-red-200}
+  .badge-info{@apply border-sky-400/30 bg-sky-500/15 text-sky-200}
+  .badge-muted{@apply bg-slate-700/50 text-slate-300}
+  .table-wrap{@apply overflow-auto rounded-2xl border border-white/10}
+  .table{@apply w-full min-w-[760px] border-collapse text-sm}
+  .table th{@apply sticky top-0 border-b border-white/10 bg-slate-950/80 px-3 py-3 text-left text-[11px] font-black uppercase tracking-wider text-slate-300 backdrop-blur}
+  .table td{@apply border-b border-white/10 px-3 py-3 align-top text-slate-100}
+  .table tr:last-child td{@apply border-b-0}
+  .table tbody tr{@apply transition hover:bg-white/[.035]}
+  .actions{@apply flex flex-wrap items-center gap-2}
+  .secondary{@apply bg-slate-700 hover:bg-slate-600}
+  .danger{@apply bg-red-600 hover:bg-red-500}
+  .ok{@apply bg-emerald-600 hover:bg-emerald-500}
+  .warn{@apply bg-amber-600 hover:bg-amber-500}
+  .ghost{@apply border border-white/10 bg-transparent text-slate-100 hover:bg-white/10}
+  .field{@apply my-2.5}
+  .field label{@apply mb-1.5 flex items-center justify-between gap-3 text-sm font-extrabold text-slate-300}
+  .flash{@apply mb-3 rounded-2xl border border-white/10 bg-slate-800/90 px-4 py-3 text-sm text-slate-100}
+  .flash.success{@apply border-emerald-400/30 bg-emerald-500/15 text-emerald-100}
+  .flash.error{@apply border-red-400/30 bg-red-500/15 text-red-100}
+  .flash.warning{@apply border-amber-400/30 bg-amber-500/15 text-amber-100}
+  .inline-form{@apply inline-flex}
+  .footer{@apply mt-6 grid gap-1.5 text-xs text-slate-400}
+  .progress{@apply mr-2 inline-flex h-2.5 w-32 overflow-hidden rounded-full border border-white/10 bg-slate-950 align-middle}
+  .progress span{@apply block h-full rounded-full bg-gradient-to-r from-blue-400 to-emerald-400 transition-all}
+  .kbd{@apply inline-flex rounded-lg border border-white/10 border-b-white/20 bg-slate-950 px-1.5 py-0.5 text-[11px] text-slate-300}
+  .pillbar{@apply flex flex-wrap gap-2}
+  .empty{@apply p-6 text-center text-slate-400}
+  .copybox{@apply break-all select-all}
+  .danger-zone{@apply border-red-400/25 bg-red-500/10}
+  .v3-live-dot{@apply mr-2 inline-block h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_0_6px_rgba(52,211,153,.12)]}
+  .mini-grid{@apply grid grid-cols-1 gap-3 md:grid-cols-3}
+  .mini-stat{@apply rounded-2xl border border-white/10 bg-slate-950/35 p-4}
+  .mini-stat b{@apply block text-2xl font-black text-white}
+  .mobile-card{@apply hidden}
+  .sticky-actions{@apply sticky bottom-24 z-20 rounded-2xl border border-white/10 bg-slate-950/85 p-3 shadow-soft backdrop-blur-xl lg:bottom-3}
+  .job-controls form{@apply inline-flex}
+  .live-note{@apply inline-flex items-center text-xs text-slate-400}
+  .nowrap{@apply whitespace-nowrap}
+  .detail-hero{@apply grid grid-cols-1 gap-4 xl:grid-cols-[1.2fr_.8fr]}
+  .history-item{@apply my-2 rounded-2xl border border-white/10 bg-slate-950/40 p-4}
+  .history-meta{@apply mb-2 flex flex-wrap gap-2 text-xs text-slate-400}
+  .touch-list{@apply grid gap-3}
+  .touch-item{@apply rounded-3xl border border-white/10 bg-slate-950/35 p-4}
+  .bottom-nav{@apply fixed inset-x-0 bottom-0 z-50 grid grid-cols-5 border-t border-white/10 bg-slate-950/95 px-2 pb-[calc(.5rem+env(safe-area-inset-bottom))] pt-2 backdrop-blur-2xl lg:hidden}
+  .bottom-nav a{@apply flex flex-col items-center justify-center gap-1 rounded-2xl px-1 py-2 text-[11px] font-bold text-slate-400}
+  .bottom-nav a.active{@apply bg-blue-500/15 text-white}
+  .mobile-search-sticky{@apply sticky top-[60px] z-30 bg-slate-950/70 backdrop-blur-xl}
+}
+</style>
 <style>
-:root{color-scheme:dark;--bg:#070b16;--bg2:#0b1224;--panel:rgba(17,26,46,.88);--panel2:rgba(23,35,61,.94);--text:#eef4ff;--muted:#9aa8bd;--line:rgba(148,163,184,.18);--blue:#3b82f6;--blue2:#60a5fa;--ok:#22c55e;--warn:#f59e0b;--danger:#ef4444;--info:#38bdf8;--shadow:0 18px 50px rgba(0,0,0,.28);--radius:20px}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;min-height:100vh;background:radial-gradient(circle at top left,rgba(59,130,246,.24),transparent 32rem),radial-gradient(circle at bottom right,rgba(34,197,94,.13),transparent 30rem),linear-gradient(135deg,var(--bg),var(--bg2) 55%,#111827);color:var(--text);font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,"Noto Sans Khmer",sans-serif}a{color:#bfdbfe;text-decoration:none}a:hover{text-decoration:none;color:#dbeafe}.layout{display:grid;grid-template-columns:280px minmax(0,1fr);min-height:100vh}.side{border-right:1px solid var(--line);background:rgba(7,12,25,.84);backdrop-filter:blur(18px);padding:20px;position:sticky;top:0;height:100vh;overflow:auto}.brand{display:flex;align-items:center;gap:10px;font-weight:900;font-size:22px;letter-spacing:-.03em}.brand-mark{display:grid;place-items:center;width:38px;height:38px;border-radius:14px;background:linear-gradient(135deg,var(--blue),#7c3aed);box-shadow:0 12px 32px rgba(59,130,246,.35)}.sub{color:var(--muted);font-size:12px;margin:8px 0 22px}.nav{display:grid;gap:5px}.nav a{display:flex;align-items:center;gap:10px;padding:11px 12px;border-radius:14px;color:var(--text);border:1px solid transparent}.nav a.active,.nav a:hover{background:rgba(96,165,250,.13);border-color:rgba(96,165,250,.24)}.nav-ico{width:24px;text-align:center}.main{padding:24px;max-width:1480px;width:100%}.top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:18px}.h1{font-size:29px;font-weight:900;letter-spacing:-.04em}.top-right{text-align:right;color:var(--muted);font-size:12px}.mobilebar{display:none;position:sticky;top:0;z-index:50;background:rgba(7,12,25,.9);backdrop-filter:blur(18px);border-bottom:1px solid var(--line);padding:10px 14px}.menu-toggle{display:none}.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px;margin-bottom:16px;box-shadow:var(--shadow)}.card h2,.card h3{margin:0 0 12px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:16px}.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.row3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.stat{background:linear-gradient(180deg,rgba(96,165,250,.12),rgba(15,23,42,.86));border:1px solid var(--line);border-radius:18px;padding:15px;min-height:100px}.stat b{font-size:28px;display:block;letter-spacing:-.04em}.stat small{display:block;color:var(--muted);margin-top:4px}.stat-ok{background:linear-gradient(180deg,rgba(34,197,94,.14),rgba(15,23,42,.86))}.stat-warn{background:linear-gradient(180deg,rgba(245,158,11,.14),rgba(15,23,42,.86))}.stat-danger{background:linear-gradient(180deg,rgba(239,68,68,.14),rgba(15,23,42,.86))}.muted{color:var(--muted)}.badge{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:999px;font-size:12px;border:1px solid var(--line);background:#1f2937;white-space:nowrap}.badge-ok{background:rgba(34,197,94,.13);color:#86efac;border-color:rgba(34,197,94,.34)}.badge-warn{background:rgba(245,158,11,.15);color:#fde68a;border-color:rgba(245,158,11,.34)}.badge-danger{background:rgba(239,68,68,.15);color:#fecaca;border-color:rgba(239,68,68,.36)}.badge-info{background:rgba(56,189,248,.14);color:#bae6fd;border-color:rgba(56,189,248,.35)}.badge-muted{background:rgba(148,163,184,.12);color:#cbd5e1}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:16px}.table{width:100%;border-collapse:collapse;min-width:760px}.table th,.table td{border-bottom:1px solid var(--line);padding:11px;text-align:left;vertical-align:top}.table tr:last-child td{border-bottom:0}.table th{color:#cbd5e1;font-size:11px;text-transform:uppercase;letter-spacing:.08em;background:rgba(15,23,42,.55);position:sticky;top:0}.table tbody tr:hover{background:rgba(148,163,184,.06)}.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.btn,button,input[type=submit]{display:inline-flex;align-items:center;justify-content:center;gap:7px;background:linear-gradient(135deg,var(--blue),#2563eb);color:white;border:0;border-radius:12px;padding:9px 13px;cursor:pointer;font-weight:800;min-height:38px}.btn:hover,button:hover,input[type=submit]:hover{filter:brightness(1.08);text-decoration:none}.btn:disabled,button:disabled{opacity:.6;cursor:not-allowed}.secondary{background:#334155!important}.danger{background:#dc2626!important}.ok{background:#16a34a!important}.warn{background:#d97706!important}.ghost{background:transparent!important;border:1px solid var(--line)!important;color:var(--text)!important}.field{margin:10px 0}.field label{display:flex;justify-content:space-between;gap:10px;color:#cbd5e1;margin-bottom:6px;font-weight:800}.help{color:var(--muted);font-size:12px;margin-top:5px}input,select,textarea{width:100%;background:#0f172a;color:var(--text);border:1px solid var(--line);border-radius:13px;padding:11px 12px;outline:none}input:focus,select:focus,textarea:focus{border-color:rgba(96,165,250,.8);box-shadow:0 0 0 3px rgba(59,130,246,.16)}textarea{min-height:120px;resize:vertical}.flash{border-radius:14px;padding:11px 13px;margin:8px 0 12px;background:#1e293b;border:1px solid var(--line)}.flash.success{background:rgba(34,197,94,.12);border-color:rgba(34,197,94,.35)}.flash.error{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.35)}.flash.warning{background:rgba(245,158,11,.12);border-color:rgba(245,158,11,.35)}code,pre{background:#020617;border:1px solid var(--line);border-radius:10px;padding:2px 5px}pre{padding:14px;overflow:auto;white-space:pre-wrap;max-height:65vh}.inline-form{display:inline}.footer{color:var(--muted);font-size:12px;margin-top:22px;display:grid;gap:6px}.progress{display:inline-flex;vertical-align:middle;width:120px;height:9px;border-radius:99px;background:#020617;border:1px solid var(--line);overflow:hidden;margin-right:7px}.progress span{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--blue2),var(--ok));transition:width .25s}.kbd{display:inline-flex;align-items:center;border:1px solid var(--line);border-bottom-width:2px;border-radius:8px;padding:1px 6px;background:#020617;color:#cbd5e1;font-size:11px}details{margin-top:10px}summary{cursor:pointer;color:#bfdbfe;font-weight:800}.pillbar{display:flex;gap:8px;flex-wrap:wrap}.empty{padding:22px;text-align:center;color:var(--muted)}.copybox{user-select:all;word-break:break-all}.danger-zone{border-color:rgba(239,68,68,.28);background:rgba(239,68,68,.06)}@media(max-width:1100px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.grid2,.row3{grid-template-columns:1fr}}@media(max-width:860px){.mobilebar{display:flex;justify-content:space-between;align-items:center}.layout{display:block}.side{display:none;position:fixed;z-index:60;inset:54px 0 0 0;height:auto;border-right:0;border-bottom:1px solid var(--line)}.menu-toggle:checked~.layout .side{display:block}.main{padding:16px}.top{align-items:flex-start}.grid,.grid2,.row{grid-template-columns:1fr}.h1{font-size:24px}.table{font-size:12px;min-width:720px}.card{padding:15px}}@media(max-width:520px){.grid{grid-template-columns:1fr}.actions .btn,.actions button{width:100%}.top{display:block}.top-right{text-align:left;margin-top:6px}}
-.v3-live-dot{display:inline-block;width:8px;height:8px;border-radius:99px;background:var(--ok);box-shadow:0 0 0 5px rgba(34,197,94,.12);margin-right:7px}.mini-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.mini-stat{border:1px solid var(--line);border-radius:16px;background:rgba(15,23,42,.54);padding:12px}.mini-stat b{display:block;font-size:20px}.mobile-card{display:none}.sticky-actions{position:sticky;bottom:12px;z-index:20;padding:10px;border:1px solid var(--line);border-radius:16px;background:rgba(15,23,42,.88);backdrop-filter:blur(16px);box-shadow:var(--shadow)}.job-controls form{display:inline-flex}.live-note{display:inline-flex;align-items:center;color:var(--muted);font-size:12px}.nowrap{white-space:nowrap}.detail-hero{display:grid;grid-template-columns:1.2fr .8fr;gap:14px}.history-item{border:1px solid var(--line);border-radius:14px;padding:12px;margin:8px 0;background:rgba(15,23,42,.55)}.history-meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin-bottom:6px}.touch-list{display:grid;gap:10px}.touch-item{border:1px solid var(--line);border-radius:16px;padding:13px;background:rgba(15,23,42,.5)}@media(max-width:860px){.desktop-table{display:none}.mobile-card{display:grid;gap:10px}.mini-grid,.detail-hero{grid-template-columns:1fr}.sticky-actions .actions{display:grid;grid-template-columns:1fr 1fr}.sticky-actions .actions>*{width:100%}input,select,textarea{font-size:16px}.btn,button,input[type=submit]{min-height:44px}.top-right{font-size:11px}.side{padding-bottom:calc(20px + env(safe-area-inset-bottom))}}@media(max-width:520px){.sticky-actions .actions{grid-template-columns:1fr}.pillbar{display:grid}.pillbar .btn{width:100%}.mini-stat b{font-size:18px}}
+@media(max-width:860px){.mobilebar{display:flex}.layout{display:block}.side{display:none;position:fixed;z-index:60;inset:58px 0 auto 0;height:calc(100vh - 58px);border-right:0;border-bottom:1px solid rgba(255,255,255,.1)}.menu-toggle:checked~.layout .side{display:block}.main{padding:16px 16px calc(92px + env(safe-area-inset-bottom))}.top{display:block}.top-right{text-align:left;margin-top:.4rem}.h1{font-size:1.55rem}.desktop-table{display:none}.mobile-card{display:grid;gap:.75rem}.table{font-size:12px;min-width:720px}.card{padding:16px}.sticky-actions .actions{display:grid;grid-template-columns:1fr 1fr}.sticky-actions .actions>*{width:100%}input,select,textarea{font-size:16px}button,input[type=submit],.btn{min-height:44px}.actions .btn,.actions button{width:auto}}
+@media(max-width:520px){.grid{grid-template-columns:1fr}.actions .btn,.actions button{width:100%}.sticky-actions .actions{grid-template-columns:1fr}.pillbar{display:grid}.pillbar .btn{width:100%}.mini-stat b{font-size:18px}}
 </style>
 </head>
 <body>
 <input id="menu-toggle" class="menu-toggle" type="checkbox">
-<div class="mobilebar"><label class="btn ghost" for="menu-toggle">☰ Menu</label><b>Bot Admin</b></div>
+<div class="mobilebar"><label class="btn ghost" for="menu-toggle">☰ Menu</label><b>Bot Admin V4</b></div>
 <div class="layout">
 <aside class="side">
   <div class="brand"><span class="brand-mark">🤖</span><span>Bot Admin</span></div>
-  <div class="sub">Admin ID: <code>{{ admin_id }}</code></div>
+  <div class="sub">System V4 · Admin ID: <code>{{ admin_id }}</code></div>
   <nav class="nav">{% for key,label,url,ico in nav %}<a class="{{ 'active' if key==active else '' }}" href="{{ url }}"><span class="nav-ico">{{ ico }}</span><span>{{ label }}</span></a>{% endfor %}</nav>
   <div class="footer"><div>Supabase: <b>{{ 'ON' if supabase_on else 'OFF' }}</b></div><div>Redis: <b>{{ 'ON' if redis_on else 'OFF' }}</b></div><div><a href="/ping">Ping</a> · <a href="/admin/logout">Logout</a></div></div>
 </aside>
 <main class="main">
-  <div class="top"><div><div class="h1">{{ title }}</div><div class="muted">Fast web control panel for Telegram bot operations</div></div><div class="top-right"><div data-local-time>{{ now }}</div><div>{{ time_hint }}</div></div></div>
+  <div class="top"><div><div class="h1">{{ title }}</div><div class="muted">Clean Tailwind admin panel · mobile V4 · safe Telegram operations</div></div><div class="top-right"><div data-local-time>{{ now }}</div><div>{{ time_hint }}</div></div></div>
   {% for cat,msg in messages %}<div class="flash {{ cat }}">{{ msg }}</div>{% endfor %}
   {{ body|safe }}
 </main>
 </div>
+<nav class="bottom-nav">{% for key,label,url,ico in bottom_nav %}<a class="{{ 'active' if key==active else '' }}" href="{{ url }}"><span>{{ ico }}</span><span>{{ label }}</span></a>{% endfor %}</nav>
 <script>
 window.WEB_CSRF={{ csrf|tojson }};
 (function(){
@@ -1285,11 +1443,12 @@ window.WEB_CSRF={{ csrf|tojson }};
   qsa('form[data-confirm]').forEach(function(form){form.addEventListener('submit',function(e){var msg=form.getAttribute('data-confirm')||'Are you sure?';if(!confirm(msg)){e.preventDefault();return false;}})});
   qsa('form').forEach(function(form){form.addEventListener('submit',function(){var btn=form.querySelector('button[type="submit"],button:not([type]),input[type="submit"]');if(btn&&!form.dataset.noDisable){setTimeout(function(){btn.disabled=true;btn.dataset.oldText=btn.innerText;btn.innerText='Working…'},0)}})});
   qsa('[data-count-target]').forEach(function(el){var target=qs(el.getAttribute('data-count-target'));function update(){if(target){el.textContent=target.value.length}};if(target){target.addEventListener('input',update);update();}});
+  qsa('[data-copy]').forEach(function(btn){btn.addEventListener('click',function(){var text=btn.getAttribute('data-copy')||'';navigator.clipboard&&navigator.clipboard.writeText(text).then(function(){btn.innerText='Copied'}).catch(function(){})})});
   var live=qs('[data-live-status]');
   function applyStatus(data){if(!data||!data.ok)return;qsa('[data-metric]').forEach(function(el){var k=el.getAttribute('data-metric');if(data.metrics&&Object.prototype.hasOwnProperty.call(data.metrics,k)){el.textContent=data.metrics[k]}});var up=qs('[data-uptime]');if(up)up.textContent=data.uptime||'';var lt=qs('[data-local-time]');if(lt&&data.local_time)lt.textContent=data.local_time;}
-  function refreshStatus(){fetch('/admin/status.json?light=1',{credentials:'same-origin'}).then(function(r){return r.ok?r.json():null}).then(applyStatus).catch(function(){});}
-  function refreshLiveDashboard(){var root=qs('[data-realtime-dashboard]');if(!root)return;fetch('/admin/live.json',{credentials:'same-origin'}).then(function(r){return r.ok?r.json():null}).then(function(data){if(!data||!data.ok)return;applyStatus(data);if(data.counts){qsa('[data-count]').forEach(function(el){var k=el.getAttribute('data-count');if(Object.prototype.hasOwnProperty.call(data.counts,k)){el.textContent=data.counts[k]}})}var jobs=qs('[data-live-jobs]');if(jobs&&typeof data.jobs_html==='string')jobs.innerHTML=data.jobs_html;var sch=qs('[data-live-schedules]');if(sch&&typeof data.schedules_html==='string')sch.innerHTML=data.schedules_html;var stamp=qs('[data-live-updated]');if(stamp&&data.local_time)stamp.textContent='Updated '+data.local_time;}).catch(function(){});}
-  function refreshBroadcastJobs(){var target=qs('[data-broadcast-jobs]');if(!target)return;fetch('/admin/broadcast/jobs.json',{credentials:'same-origin'}).then(function(r){return r.ok?r.json():null}).then(function(data){if(!data||!data.ok)return;if(typeof data.rows_html==='string')target.innerHTML=data.rows_html;}).catch(function(){});}
+  function refreshStatus(){fetch('/admin/status.json?light=1',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null}).then(applyStatus).catch(function(){});}
+  function refreshLiveDashboard(){var root=qs('[data-realtime-dashboard]');if(!root)return;fetch('/admin/live.json',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null}).then(function(data){if(!data||!data.ok)return;applyStatus(data);if(data.counts){qsa('[data-count]').forEach(function(el){var k=el.getAttribute('data-count');if(Object.prototype.hasOwnProperty.call(data.counts,k)){el.textContent=data.counts[k]}})}var jobs=qs('[data-live-jobs]');if(jobs&&typeof data.jobs_html==='string')jobs.innerHTML=data.jobs_html;var sch=qs('[data-live-schedules]');if(sch&&typeof data.schedules_html==='string')sch.innerHTML=data.schedules_html;var stamp=qs('[data-live-updated]');if(stamp&&data.local_time)stamp.textContent='Updated '+data.local_time;}).catch(function(){});}
+  function refreshBroadcastJobs(){var target=qs('[data-broadcast-jobs]');if(!target)return;fetch('/admin/broadcast/jobs.json',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null}).then(function(data){if(!data||!data.ok)return;if(typeof data.rows_html==='string')target.innerHTML=data.rows_html;}).catch(function(){});}
   if(live){refreshStatus();setInterval(refreshStatus,15000)}
   if(qs('[data-realtime-dashboard]')){refreshLiveDashboard();setInterval(refreshLiveDashboard,10000)}
   if(qs('[data-broadcast-jobs]')){refreshBroadcastJobs();setInterval(refreshBroadcastJobs,5000)}
@@ -1304,6 +1463,7 @@ window.WEB_CSRF={{ csrf|tojson }};
         body=body,
         active=active,
         nav=nav,
+        bottom_nav=bottom_nav,
         admin_id=_web_current_admin_id(),
         csrf=csrf,
         messages=get_flashed_messages(with_categories=True),
@@ -1349,7 +1509,7 @@ def web_admin_login():
             session["web_admin_id"] = int(admin_id)
             _web_csrf_token()
             flask_flash("Logged in.", "success")
-            return redirect(request.args.get("next") or url_for("web_admin_home"))
+            return redirect(_web_safe_next_url(request.args.get("next"), "web_admin_home"))
     default_admin = int(sorted(ADMIN_IDS)[0]) if ADMIN_IDS else 0
     body = f"""
     <div class='card' style='max-width:520px'>
@@ -1577,6 +1737,99 @@ def _web_live_schedules(limit: int = 8) -> list[dict]:
     rows = sorted(rows, key=lambda r: str(r.get("broadcast_at") or ""))
     return rows[:max(1, int(limit or 8))]
 
+
+
+def _web_health_item(label: str, ok: bool, detail: str = "", warn: bool = False) -> str:
+    kind = "ok" if ok and not warn else ("warn" if warn else "danger")
+    badge = _web_badge("OK" if ok and not warn else ("WARN" if warn else "ERROR"), kind)
+    return (
+        f"<tr><td><b>{_web_h(label)}</b><br><span class='muted'>{_web_h(detail)}</span></td>"
+        f"<td>{badge}</td></tr>"
+    )
+
+
+def _web_system_v4_rows() -> str:
+    """System V4 health checks for the web dashboard.
+
+    These checks are intentionally light and local. They do not send Telegram
+    messages or mutate Supabase/Redis state, so the health page is safe to
+    refresh from mobile.
+    """
+    rows: list[str] = []
+    rows.append(_web_health_item("Flask web admin", True, "Dashboard route is responding."))
+    rows.append(_web_health_item("Admin password", bool(_web_admin_password()), "ADMIN_WEB_PASSWORD or WEB_ADMIN_PASSWORD"))
+    rows.append(_web_health_item("Telegram token", bool(TELEGRAM_BOT_TOKEN), "Required for direct messages and broadcasts."))
+    rows.append(_web_health_item("Admin IDs", bool(ADMIN_IDS), f"{len(ADMIN_IDS)} admin id(s) configured.", warn=not bool(ADMIN_IDS)))
+    rows.append(_web_health_item("Supabase", bool(supabase), "Database client is configured."))
+    rows.append(_web_health_item("Redis", bool(redis_client), "Cache is optional but recommended.", warn=not bool(redis_client)))
+    try:
+        api_status = db_ai_api_key_status()
+        api_ok = bool(api_status.get("static_key") or api_status.get("active_count") or api_status.get("memory_count"))
+        api_detail = f"static={api_status.get('static_key')} active_dynamic={api_status.get('active_count')} memory={api_status.get('memory_count')}"
+        if api_status.get("error"):
+            api_detail += f" · {api_status.get('error')}"
+        rows.append(_web_health_item("AI API auth", api_ok, api_detail, warn=not api_ok))
+    except Exception as exc:
+        rows.append(_web_health_item("AI API auth", False, str(exc)[:220]))
+    rows.append(_web_health_item("AI provider", bool(_hf_client or _gemini), f"provider={AI_PROVIDER} model={HF_MODEL if AI_PROVIDER == 'hf' else GEMINI_MODEL}", warn=not bool(_hf_client or _gemini)))
+    ocr_disabled = _hf_ocr_is_temporarily_disabled() or _ocr_provider_is_temporarily_disabled("hf") or _ocr_provider_is_temporarily_disabled("gemini")
+    rows.append(_web_health_item("OCR provider", _ocr_configured(), f"provider={OCR_PROVIDER} model={HF_OCR_MODEL}; temporary_disabled={ocr_disabled}", warn=ocr_disabled or not _ocr_configured()))
+    if _SCHED_LOCK_ENABLED and supabase:
+        try:
+            lock = db_lock_read(_SCHED_LOCK_KEY)
+            if lock:
+                dt = _sched_parse_iso(lock.get("locked_until"))
+                expired = bool(dt and dt < datetime.now(timezone.utc))
+                rows.append(_web_health_item("Scheduler lock", True, f"owner={lock.get('owner')} until={_web_dt(lock.get('locked_until'))}", warn=expired))
+            else:
+                rows.append(_web_health_item("Scheduler lock", True, "No active lock row.", warn=True))
+        except Exception as exc:
+            rows.append(_web_health_item("Scheduler lock", False, str(exc)[:220]))
+    else:
+        rows.append(_web_health_item("Scheduler lock", bool(not _SCHED_LOCK_ENABLED), "Disabled or Supabase unavailable.", warn=True))
+    rows.append(_web_health_item("Timezone", True, f"{APP_TIMEZONE_NAME} · {_fmt_local_time_hint()}"))
+    rows.append(_web_health_item("Broadcast workers", WEB_BROADCAST_WORKERS > 0, f"workers={WEB_BROADCAST_WORKERS}, delay={WEB_BROADCAST_DELAY_S}s, max_jobs={_WEB_BROADCAST_JOBS_MAX}"))
+    return "".join(rows)
+
+
+def _web_env_check_rows() -> str:
+    checks = [
+        ("TELEGRAM_BOT_TOKEN", bool(TELEGRAM_BOT_TOKEN), "Required"),
+        ("ADMIN_IDS", bool(ADMIN_IDS), "Recommended"),
+        ("ADMIN_WEB_PASSWORD / WEB_ADMIN_PASSWORD", bool(_web_admin_password()), "Required for dashboard"),
+        ("FLASK_SECRET_KEY / WEB_SECRET_KEY", bool(os.environ.get("FLASK_SECRET_KEY") or os.environ.get("WEB_SECRET_KEY")), "Recommended persistent sessions"),
+        ("SUPABASE_URL", bool(os.environ.get("SUPABASE_URL") or globals().get("SB_URL")), "Recommended"),
+        ("SUPABASE_SERVICE_ROLE_KEY / SUPABASE_KEY", bool(os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY") or globals().get("SB_KEY")), "Recommended"),
+        ("REDIS_URL", bool(os.environ.get("REDIS_URL") or globals().get("REDIS_URL")), "Optional cache"),
+        ("HF_TOKEN / GEMINI_API_KEY", bool(os.environ.get("HF_TOKEN") or os.environ.get("GEMINI_API_KEY")), "Required for AI/OCR"),
+        ("RENDER_EXTERNAL_URL", bool(os.environ.get("RENDER_EXTERNAL_URL")), "Recommended for keep-alive"),
+    ]
+    out = []
+    for key, ok, note in checks:
+        out.append(f"<tr><td><code>{_web_h(key)}</code><br><span class='muted'>{_web_h(note)}</span></td><td>{_web_badge('SET' if ok else 'MISSING', 'ok' if ok else 'warn')}</td></tr>")
+    return "".join(out)
+
+
+def _web_user_detail_metrics(row: dict) -> dict:
+    history_rows = list(row.get("history") or [])
+    messages = len(history_rows)
+    chars = sum(len(str(h.get("content") or h.get("original_text") or "")) for h in history_rows)
+    first_dt = ""
+    last_dt = ""
+    if history_rows:
+        first_dt = _web_dt(history_rows[0].get("created_at") or "")
+        last_dt = _web_dt(history_rows[-1].get("created_at") or "")
+    last_text = ""
+    if history_rows:
+        last_text = _history_compact_text(history_rows[-1].get("content") or history_rows[-1].get("original_text") or "", 180)
+    return {
+        "messages": messages,
+        "chars": chars,
+        "first_seen": first_dt,
+        "last_seen": last_dt,
+        "last_text": last_text,
+    }
+
 @app_flask.route("/admin")
 @web_admin_required
 def web_admin_home():
@@ -1636,10 +1889,49 @@ def web_admin_home():
     </div>
     <div class='grid2'>
       <div class='card'><h2>Feature settings</h2><div class='table-wrap'><table class='table'>{setting_rows}</table></div><p><a class='btn secondary' href='/admin/settings'>Open settings</a></p></div>
-      <div class='card'><h2>Quick actions</h2><p class='muted'>Common admin tasks. Dangerous actions still require confirmation on their pages.</p><div class='actions'><a class='btn' href='/admin/users'>Manage Users</a><a class='btn' href='/admin/schedules'>Schedules</a><a class='btn' href='/admin/broadcast'>Broadcast</a><a class='btn secondary' href='/admin/sql'>SQL Setup</a></div></div>
+      <div class='card'><h2>Quick actions</h2><p class='muted'>Common admin tasks. Dangerous actions still require confirmation on their pages.</p><div class='actions'><a class='btn' href='/admin/users'>Manage Users</a><a class='btn' href='/admin/schedules'>Schedules</a><a class='btn' href='/admin/broadcast'>Broadcast</a><a class='btn secondary' href='/admin/health'>Health Center</a><a class='btn secondary' href='/admin/sql'>SQL Setup</a></div></div>
     </div>
     """
     return _web_render("Dashboard", body, active="dashboard")
+
+
+@app_flask.route("/admin/health")
+@web_admin_required
+def web_admin_health():
+    counts = _web_counts(force=True)
+    settings, settings_status = db_bot_settings_fetch_all()
+    metric_rows = "".join(
+        f"<tr><td>{_web_h(k.replace('_', ' ').title())}</td><td><b data-metric='{_web_h(k)}'>{int(v)}</b></td></tr>"
+        for k, v in _RUNTIME_METRICS.items()
+    ) or '<tr><td colspan="2"><div class="empty">No runtime metrics yet.</div></td></tr>'
+    settings_rows = "".join(
+        f"<tr><td>{_web_h(BOT_SETTING_LABELS.get(k,k))}<br><span class='muted'>{_web_h(BOT_SETTING_DESCRIPTIONS.get(k,''))}</span></td>"
+        f"<td>{_web_badge('ON' if _setting_bool_from(settings,k) else 'OFF', 'ok' if _setting_bool_from(settings,k) else 'muted')}</td></tr>"
+        for k in BOT_SETTING_DEFAULTS
+    )
+    body = f"""
+    <div data-live-status></div>
+    <div class='grid'>
+      {_web_count_card('users', 'Users', counts.get('users', 0), 'user_prefs total', 'ok' if counts.get('users') else '')}
+      {_web_count_card('pending', 'Pending', counts.get('pending', 0), 'confirmed schedules', 'warn' if counts.get('pending') else '')}
+      {_web_count_card('blocked', 'Blocked', counts.get('blocked', 0), 'skipped during sends', 'danger' if counts.get('blocked') else '')}
+      {_web_status_card('Uptime', _format_uptime(), 'process runtime', 'ok')}
+    </div>
+    <div class='grid2'>
+      <div class='card'><div class='actions' style='justify-content:space-between'><h2>System V4 Health Center</h2><span class='live-note'><span class='v3-live-dot'></span>safe local checks</span></div><div class='table-wrap'><table class='table'><tbody>{_web_system_v4_rows()}</tbody></table></div></div>
+      <div class='card'><h2>Environment Checklist</h2><div class='table-wrap'><table class='table'><tbody>{_web_env_check_rows()}</tbody></table></div><p class='help'>This page does not show secrets. It only shows SET/MISSING.</p></div>
+    </div>
+    <div class='grid2'>
+      <div class='card'><h2>Runtime Metrics</h2><div class='table-wrap'><table class='table'><tbody>{metric_rows}</tbody></table></div></div>
+      <div class='card'><h2>Feature Switches</h2><div class='table-wrap'><table class='table'><tbody>{settings_rows}</tbody></table></div><p class='help'>Settings DB: {_web_h(settings_status.get('error') or ('OK' if settings_status.get('db_ok') else 'memory fallback'))}</p><p><a class='btn secondary' href='/admin/settings'>Open settings</a></p></div>
+    </div>
+    <div class='card'><h2>System V4 Notes</h2><div class='mini-grid'>
+      <div class='mini-stat'><b>Mobile V4</b><span class='muted'>bottom nav, touch buttons, sticky actions</span></div>
+      <div class='mini-stat'><b>User Detail+</b><span class='muted'>profile, usage cards, recent text_cache</span></div>
+      <div class='mini-stat'><b>Cleaner UI</b><span class='muted'>Tailwind powered layout and responsive cards</span></div>
+    </div></div>
+    """
+    return _web_render("Health Center", body, active="health")
 
 
 def _web_fetch_users(q: str = "", page: int = 0, page_size: int = WEB_TABLE_PAGE_SIZE) -> list[dict]:
@@ -1754,40 +2046,90 @@ def web_admin_user_detail(user_id: int):
     csrf = _web_csrf_token()
     return_input = _web_return_input()
     username = row.get("username") or row.get("first_name") or "-"
-    history_rows = row.get("history") or []
+    history_rows = list(row.get("history") or [])
+    metrics = _web_user_detail_metrics(row)
+    tg_link = f"tg://user?id={int(user_id)}"
+    status_badge = _web_badge("blocked" if blocked else "active", "danger" if blocked else "ok")
+
     history_html = []
-    for h in reversed(history_rows[-40:]):
+    for h in reversed(history_rows[-60:]):
         created = _web_dt(h.get("created_at") or "")
         msg_id = h.get("message_id") or "-"
         chat_id = h.get("chat_id") or user_id
-        content = _web_h(_history_compact_text(h.get("content") or h.get("original_text") or "", 900))
+        content_raw = _history_compact_text(h.get("content") or h.get("original_text") or "", 1100)
+        content = _web_h(content_raw)
         history_html.append(
-            f"<div class='history-item'><div class='history-meta'><span>{_web_h(created)}</span><span>chat <code>{_web_h(chat_id)}</code></span><span>msg <code>{_web_h(msg_id)}</code></span></div><div>{content or '<span class=\"muted\">empty</span>'}</div></div>"
+            "<div class='history-item'>"
+            f"<div class='history-meta'><span>{_web_h(created)}</span><span>chat <code>{_web_h(chat_id)}</code></span><span>msg <code>{_web_h(msg_id)}</code></span><span>{_web_badge('text_cache','info')}</span></div>"
+            f"<div class='whitespace-pre-wrap'>{content or '<span class=\"muted\">empty</span>'}</div>"
+            "</div>"
         )
     if not history_html:
         history_html.append("<div class='empty'>No recent text_cache history found for this user.</div>")
-    status_badge = _web_badge("blocked" if blocked else "active", "danger" if blocked else "ok")
+
+    block_action = "unblock" if blocked else "block"
+    block_button_cls = "ok" if blocked else "danger"
+    block_button_text = "Unblock" if blocked else "Block"
+    block_confirm = "Unblock this user?" if blocked else "Block this user?"
+    error_html = f"<div class='flash warning'>{_web_h(row.get('error'))}</div>" if row.get("error") else ""
+    last_text_html = _web_h(metrics.get("last_text") or "No recent message")
+
     body = f"""
-    <div class='actions' style='margin-bottom:12px'><a class='btn secondary' href='/admin/users'>← Back to users</a><a class='btn secondary' href='/admin/users?q={int(user_id)}'>Search this ID</a></div>
+    <div class='actions' style='margin-bottom:12px'>
+      <a class='btn secondary' href='/admin/users'>← Back</a>
+      <a class='btn secondary' href='/admin/users?q={int(user_id)}'>Search ID</a>
+      <a class='btn ghost' href='{_web_h(tg_link)}'>Open Telegram</a>
+      <button type='button' class='btn ghost' data-copy='{int(user_id)}'>Copy ID</button>
+    </div>
+
     <div class='detail-hero'>
-      <div class='card'><h2>User Detail</h2><div class='table-wrap'><table class='table'>
-        <tr><td>User ID</td><td><code>{int(user_id)}</code></td></tr>
-        <tr><td>Username</td><td>{_web_h(username)}</td></tr>
-        <tr><td>Status</td><td>{status_badge}</td></tr>
-        <tr><td>Voice</td><td>{_web_h(row.get('gender') or 'female')}</td></tr>
-        <tr><td>Speed</td><td>{_web_h(row.get('speed') or DEFAULT_SPEED)}</td></tr>
-        <tr><td>Last active</td><td>{_web_h(_web_dt(row.get('last_active') or ''))}</td></tr>
-      </table></div>{f"<div class='flash warning'>{_web_h(row.get('error'))}</div>" if row.get('error') else ''}</div>
-      <div class='card'><h2>Actions</h2>
+      <div class='card'>
+        <div class='actions' style='justify-content:space-between'>
+          <div><h2>User Detail Upgrade</h2><p class='muted'>Profile, usage summary, and text_cache history</p></div>
+          {status_badge}
+        </div>
+        <div class='mini-grid' style='margin:14px 0'>
+          <div class='mini-stat'><span class='muted'>Messages</span><b>{_web_h(metrics.get('messages'))}</b><small class='muted'>loaded from text_cache</small></div>
+          <div class='mini-stat'><span class='muted'>Text size</span><b>{_web_h(metrics.get('chars'))}</b><small class='muted'>characters loaded</small></div>
+          <div class='mini-stat'><span class='muted'>Status</span><b>{'Blocked' if blocked else 'Active'}</b><small class='muted'>{_web_h(_web_dt(row.get('last_active') or '')) or 'no last_active'}</small></div>
+        </div>
+        <div class='table-wrap'><table class='table'>
+          <tr><td>User ID</td><td><code>{int(user_id)}</code></td></tr>
+          <tr><td>Username</td><td>{_web_h(username)}</td></tr>
+          <tr><td>Status</td><td>{status_badge}</td></tr>
+          <tr><td>Voice</td><td>{_web_h(row.get('gender') or 'female')}</td></tr>
+          <tr><td>Speed</td><td>{_web_h(row.get('speed') or DEFAULT_SPEED)}</td></tr>
+          <tr><td>Last active</td><td>{_web_h(_web_dt(row.get('last_active') or ''))}</td></tr>
+          <tr><td>First cached message</td><td>{_web_h(metrics.get('first_seen') or '-')}</td></tr>
+          <tr><td>Last cached message</td><td>{_web_h(metrics.get('last_seen') or '-')}</td></tr>
+        </table></div>
+        {error_html}
+      </div>
+
+      <div class='card'>
+        <h2>Mobile Quick Actions</h2>
+        <p class='muted'>Large touch controls for phone admin work.</p>
         <div class='sticky-actions'><div class='actions'>
-          <form method='post' action='/admin/users/action' {'data-confirm="Unblock this user?"' if blocked else 'data-confirm="Block this user?"'}><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='user_id' value='{int(user_id)}'><input type='hidden' name='action' value='{'unblock' if blocked else 'block'}'><button class='{'ok' if blocked else 'danger'}'>{'Unblock' if blocked else 'Block'}</button></form>
+          <form method='post' action='/admin/users/action' data-confirm='{_web_h(block_confirm)}'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='user_id' value='{int(user_id)}'><input type='hidden' name='action' value='{block_action}'><button class='{block_button_cls}'>{block_button_text}</button></form>
           <form method='post' action='/admin/users/action' data-confirm='Reset this user voice preferences?'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='user_id' value='{int(user_id)}'><input type='hidden' name='action' value='reset'><button class='secondary'>Reset prefs</button></form>
           <form method='post' action='/admin/users/action' data-confirm='Clear text_cache and conversation history for this user?'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='user_id' value='{int(user_id)}'><input type='hidden' name='action' value='clear_history'><button class='secondary'>Clear history</button></form>
         </div></div>
-        <form method='post' action='/admin/users/action' data-confirm='Send this message now?'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='send_message'><input type='hidden' name='user_id' value='{int(user_id)}'><div class='field'><label>Direct message <span><span data-count-target='#detail-direct-message'>0</span>/{TELE_MSG_LIMIT}</span></label><textarea id='detail-direct-message' name='message' maxlength='{TELE_MSG_LIMIT}' required></textarea></div><button>Send Message</button></form>
+        <form method='post' action='/admin/users/action' data-confirm='Send this message now?'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='send_message'><input type='hidden' name='user_id' value='{int(user_id)}'><div class='field'><label>Direct message <span><span data-count-target='#detail-direct-message'>0</span>/{TELE_MSG_LIMIT}</span></label><textarea id='detail-direct-message' name='message' maxlength='{TELE_MSG_LIMIT}' placeholder='Write message to this user...' required></textarea></div><button>Send Message</button></form>
       </div>
     </div>
-    <div class='card'><div class='actions' style='justify-content:space-between'><h2>Recent text_cache history</h2><span class='muted'>{len(history_rows)} loaded</span></div>{''.join(history_html)}</div>
+
+    <div class='grid2'>
+      <div class='card'><h2>Latest Message Preview</h2><p class='muted whitespace-pre-wrap'>{last_text_html}</p></div>
+      <div class='card'><h2>Admin Notes</h2><div class='touch-list'>
+        <div class='touch-item'><b>History source</b><div class='muted'>Recent history uses <code>text_cache</code>, not conversation_history.</div></div>
+        <div class='touch-item'><b>Broadcast safety</b><div class='muted'>Blocked users are skipped automatically during sends.</div></div>
+      </div></div>
+    </div>
+
+    <div class='card'>
+      <div class='actions' style='justify-content:space-between'><div><h2>Recent text_cache history</h2><p class='muted'>Newest first · {len(history_rows)} loaded</p></div><a class='btn secondary' href='/admin/users?q={int(user_id)}'>Open in users list</a></div>
+      {''.join(history_html)}
+    </div>
     """
     return _web_render("User Detail", body, active="users")
 
@@ -2115,7 +2457,9 @@ def web_admin_broadcast_action():
 def web_admin_broadcast_jobs_json():
     with _WEB_BROADCAST_JOBS_LOCK:
         jobs = [{"id": jid, **dict(row)} for jid, row in reversed(list(_WEB_BROADCAST_JOBS.items()))]
-    return jsonify({"ok": True, "jobs": jobs, "rows_html": _web_broadcast_job_rows_html(_web_csrf_token(), include_actions=True)})
+    resp = jsonify({"ok": True, "jobs": jobs, "rows_html": _web_broadcast_job_rows_html(_web_csrf_token(), include_actions=True)})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app_flask.route("/admin/settings", methods=["GET", "POST"])
@@ -3722,8 +4066,55 @@ def _paginated_fetch(select_fields: str) -> list[dict]:
     return all_rows
 
 
+USER_SEARCH_CACHE_TTL_S = float(os.environ.get("USER_SEARCH_CACHE_TTL_S", "20"))
+_user_search_cache: dict[str, Any] = {"ts": 0.0, "rows": []}
+_user_search_cache_lock = threading.Lock()
+
+
 def get_all_user_ids()         -> list[int]:  return [row["user_id"] for row in _paginated_fetch("user_id")]
 def get_all_users_with_names() -> list[dict]: return _paginated_fetch("user_id, username")
+
+
+def _get_user_search_rows_cached(force: bool = False) -> list[dict]:
+    now = time.monotonic()
+    with _user_search_cache_lock:
+        rows = list(_user_search_cache.get("rows") or [])
+        ts = float(_user_search_cache.get("ts") or 0.0)
+        if rows and not force and USER_SEARCH_CACHE_TTL_S > 0 and now - ts < USER_SEARCH_CACHE_TTL_S:
+            return rows
+
+    if not supabase:
+        return []
+
+    for fields in (
+        "user_id, username, gender, speed, last_active",
+        "user_id, username, gender, speed",
+        "user_id, username",
+    ):
+        rows = _paginated_fetch(fields)
+        if rows:
+            with _user_search_cache_lock:
+                _user_search_cache["ts"] = now
+                _user_search_cache["rows"] = list(rows)
+            return rows
+    return []
+
+
+def _dedupe_user_rows(rows: list[dict], limit: int) -> list[dict]:
+    seen: set[int] = set()
+    out: list[dict] = []
+    for row in rows:
+        try:
+            uid_int = int(row.get("user_id") or 0)
+        except Exception:
+            uid_int = 0
+        if not uid_int or uid_int in seen:
+            continue
+        seen.add(uid_int)
+        out.append(row)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _normalize_user_search_query(query: str) -> str:
@@ -3731,18 +4122,76 @@ def _normalize_user_search_query(query: str) -> str:
 
 
 def search_users_by_query(query: str, limit: int = 80) -> list[dict]:
-    """Search users by Telegram user ID or username.
+    """Search users by Telegram user ID or username with fast DB-first lookup.
 
-    This intentionally fetches the same safe fields as the user list, then
-    filters in Python. It avoids fragile Supabase `.or_()` syntax and keeps
-    working even when the table only has `user_id` and `username`.
+    Performance fix:
+    - Numeric searches try an exact indexed user_id lookup first.
+    - Username searches try Supabase ilike first.
+    - If the table/index/query shape is unavailable, it falls back to a short
+      in-memory cached scan so older deployments keep working.
     """
     q = _normalize_user_search_query(query)
+    limit = max(1, min(200, int(limit or 80)))
     if not q:
         return []
 
-    users = get_all_users_with_names()
-    if not users:
+    direct_rows: list[dict] = []
+    fields_try = (
+        "user_id, username, gender, speed, last_active",
+        "user_id, username, gender, speed",
+        "user_id, username",
+    )
+
+    if supabase:
+        if q.isdigit():
+            for fields in fields_try:
+                res = db_call_sync(
+                    f"search_user_exact:{q}:{fields}",
+                    lambda f=fields: supabase.table("user_prefs")
+                        .select(f)
+                        .eq("user_id", int(q))
+                        .limit(limit)
+                        .execute(),
+                    default=None,
+                    attempts=2,
+                    critical=False,
+                )
+                rows = list(getattr(res, "data", None) or []) if res is not None else []
+                if rows:
+                    direct_rows.extend(rows)
+                    break
+
+        username_q = q.lstrip("@")
+        if username_q and not username_q.isdigit():
+            for fields in fields_try:
+                res = db_call_sync(
+                    f"search_username_ilike:{username_q}:{fields}",
+                    lambda f=fields: supabase.table("user_prefs")
+                        .select(f)
+                        .ilike("username", f"%{username_q}%")
+                        .limit(limit)
+                        .execute(),
+                    default=None,
+                    attempts=2,
+                    critical=False,
+                )
+                rows = list(getattr(res, "data", None) or []) if res is not None else []
+                if rows:
+                    direct_rows.extend(rows)
+                    break
+
+    users = _get_user_search_rows_cached()
+    if direct_rows:
+        user_map: dict[int, dict] = {}
+        for row in direct_rows + users:
+            try:
+                uid = int(row.get("user_id") or 0)
+            except Exception:
+                uid = 0
+            if uid and uid not in user_map:
+                user_map[uid] = row
+        users = list(user_map.values())
+    elif not users:
         return []
 
     exact: list[dict] = []
@@ -3761,20 +4210,7 @@ def search_users_by_query(query: str, limit: int = 80) -> list[dict]:
         elif q in uid or q in username_l:
             contains.append(row)
 
-    seen: set[int] = set()
-    merged: list[dict] = []
-    for row in exact + prefix + contains:
-        try:
-            uid_int = int(row.get("user_id") or 0)
-        except Exception:
-            uid_int = 0
-        if not uid_int or uid_int in seen:
-            continue
-        seen.add(uid_int)
-        merged.append(row)
-        if len(merged) >= limit:
-            break
-    return merged
+    return _dedupe_user_rows(exact + prefix + contains, limit)
 
 
 def user_exists_in_db(user_id: int) -> bool:
@@ -4046,6 +4482,34 @@ def ensure_speed_column() -> None:
             "Could not verify user_prefs.speed. If missing, run:\n"
             "  ALTER TABLE user_prefs ADD COLUMN speed FLOAT DEFAULT 1.0;"
         )
+
+
+def startup_self_check() -> None:
+    """Log actionable setup problems once at startup without crashing the bot."""
+    checks: list[str] = []
+    if not TELEGRAM_BOT_TOKEN:
+        checks.append("TELEGRAM_BOT_TOKEN is missing")
+    if not ADMIN_IDS:
+        checks.append("ADMIN_IDS is empty; admin-only commands will reject everyone")
+    if not _web_admin_password() and _web_admin_enabled():
+        checks.append("ADMIN_WEB_PASSWORD / WEB_ADMIN_PASSWORD is missing; /admin web dashboard will stay locked")
+    if not os.environ.get("FLASK_SECRET_KEY") and not os.environ.get("WEB_SECRET_KEY"):
+        checks.append("FLASK_SECRET_KEY is not set; web admin sessions reset on every deploy/restart")
+    if supabase and not os.environ.get("SUPABASE_SERVICE_ROLE_KEY"):
+        checks.append("SUPABASE_SERVICE_ROLE_KEY is not set; admin tables may fail under RLS/publishable key")
+    if AI_PROVIDER == "hf" and not HF_TOKEN:
+        checks.append("HF_TOKEN is missing; /ai-assistant chat will be unavailable")
+    if OCR_PROVIDER in ("auto", "hf") and not HF_TOKEN:
+        checks.append("HF_TOKEN is missing; Hugging Face OCR will be unavailable")
+    if OCR_PROVIDER in ("auto", "gemini") and not GEMINI_API_KEY:
+        checks.append("GEMINI_API_KEY is missing; Gemini OCR/audio fallback will be unavailable")
+    if not REDIS_URL:
+        checks.append("REDIS_URL is missing; cache/history fallback will use memory + Supabase only")
+
+    if checks:
+        logger.warning("Startup self-check warnings:\n- %s", "\n- ".join(checks))
+    else:
+        logger.info("Startup self-check passed.")
 
 
 
@@ -9859,6 +10323,7 @@ def main():
 
     _sweep_stale_temps()
     ensure_speed_column()
+    startup_self_check()
 
     if not ADMIN_IDS:
         logger.warning(
