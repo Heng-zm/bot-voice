@@ -3565,12 +3565,19 @@ async def resolve_tts_text(
 # ---------------------------------------------------------------------------
 # Database helpers — scheduled broadcasts
 # ---------------------------------------------------------------------------
-SCHED_STATUS_DRAFT     = "draft"      # created after date input; cannot fire yet
+# IMPORTANT: keep these status values compatible with the existing
+# Supabase scheduled_broadcasts_status_check constraint.  Many deployed DBs
+# only allow: pending, sending, done, failed, cancelled.
+#
+# An unconfirmed preview is stored as status="pending" plus this error_msg
+# marker. The scheduler only sends pending rows where error_msg IS NULL.
+SCHED_STATUS_DRAFT     = "pending"    # DB-compatible unconfirmed preview marker state
 SCHED_STATUS_PENDING   = "pending"    # confirmed; scheduler may send it
 SCHED_STATUS_SENDING   = "sending"    # claimed by scheduler
 SCHED_STATUS_DONE      = "done"
 SCHED_STATUS_FAILED    = "failed"
 SCHED_STATUS_CANCELLED = "cancelled"
+SCHED_DRAFT_MARKER     = "__awaiting_admin_confirmation__"
 
 _SCHED_CLAIM_RE = re.compile(r"sending_started_at=([^\s]+)")
 
@@ -3611,11 +3618,30 @@ def _sched_claim_time(row: dict) -> datetime | None:
     return _sched_parse_iso(row.get("broadcast_at"))
 
 
+def _sched_is_draft(row: dict | None) -> bool:
+    if not row:
+        return False
+    return (
+        str(row.get("status") or "").lower() == SCHED_STATUS_PENDING
+        and str(row.get("error_msg") or "") == SCHED_DRAFT_MARKER
+    )
+
+
+def _sched_is_confirmed_pending(row: dict | None) -> bool:
+    if not row:
+        return False
+    return (
+        str(row.get("status") or "").lower() == SCHED_STATUS_PENDING
+        and not _sched_is_draft(row)
+    )
+
+
 def db_sched_insert(payload: dict, admin_id: int, broadcast_at: datetime) -> dict:
     """Create a schedule preview row.
 
-    Important fix: new rows start as `draft`, not `pending`.
-    The scheduler only fetches `pending`, so the broadcast cannot fire until
+    Important fix: new rows remain DB-compatible with status="pending", but
+    are tagged with SCHED_DRAFT_MARKER in error_msg. The scheduler only sends
+    pending rows where error_msg IS NULL, so the broadcast cannot fire until
     the admin taps ✅ Confirm Schedule.
     """
     if not supabase:
@@ -3627,8 +3653,8 @@ def db_sched_insert(payload: dict, admin_id: int, broadcast_at: datetime) -> dic
         "caption":       payload.get("caption"),
         "plain_text":    payload.get("text"),
         "broadcast_at":  _sched_iso(broadcast_at),
-        "status":        SCHED_STATUS_DRAFT,
-        "error_msg":     None,
+        "status":        SCHED_STATUS_PENDING,
+        "error_msg":     SCHED_DRAFT_MARKER,
     }
     res = db_call_sync(
         "sched_insert",
@@ -3644,6 +3670,11 @@ def db_sched_fetch_due(limit: int = 5) -> list[dict]:
     if not supabase:
         return []
     now = _sched_iso()
+
+    # Fetch DB-compatible pending rows and filter locally.
+    # Confirmed schedule: status="pending" and error_msg is NULL/empty.
+    # Unconfirmed preview: status="pending" and error_msg=SCHED_DRAFT_MARKER.
+    # This avoids requiring a DB migration for a new "draft" status.
     res = db_call_sync(
         "sched_fetch_due",
         lambda: (
@@ -3652,23 +3683,27 @@ def db_sched_fetch_due(limit: int = 5) -> list[dict]:
             .eq("status", SCHED_STATUS_PENDING)
             .lte("broadcast_at", now)
             .order("broadcast_at")
-            .limit(max(1, int(limit or 5)))
+            .limit(max(1000, int(limit or 5) * 50))
             .execute()
         ),
         default=None,
     )
-    return list(getattr(res, "data", None) or [])
-
+    rows = list(getattr(res, "data", None) or [])
+    return [r for r in rows if _sched_is_confirmed_pending(r)][: max(1, int(limit or 5))]
 
 def db_sched_claim(row_id: int) -> bool:
-    """Atomically claim one pending schedule.
+    """Atomically claim one confirmed pending schedule.
 
-    The `error_msg` field stores a claim timestamp. This avoids the old bug
-    where a long-running broadcast scheduled far in the past could be marked
-    stale immediately because stale recovery used only `broadcast_at`.
+    The scheduler never sends preview rows because `_sched_is_confirmed_pending`
+    requires error_msg to be empty before this function updates the row.
     """
     if not supabase:
         return False
+
+    current = db_sched_fetch_one(row_id)
+    if not _sched_is_confirmed_pending(current):
+        return False
+
     update = {
         "status": SCHED_STATUS_SENDING,
         "error_msg": _sched_claim_marker(),
@@ -3686,9 +3721,13 @@ def db_sched_claim(row_id: int) -> bool:
     )
     return bool(getattr(res, "data", None))
 
-
 def db_sched_confirm(row_id: int, admin_id: int) -> tuple[bool, str, dict | None]:
-    """Move a preview/draft schedule to pending after admin confirmation."""
+    """Confirm one schedule preview.
+
+    DB-compatible design:
+    - Before confirmation: status="pending" and error_msg=SCHED_DRAFT_MARKER
+    - After confirmation:  status="pending" and error_msg=NULL
+    """
     row = db_sched_fetch_one(row_id)
     if not row:
         return False, "not_found", None
@@ -3696,10 +3735,10 @@ def db_sched_confirm(row_id: int, admin_id: int) -> tuple[bool, str, dict | None
         return False, "not_owner", row
 
     status = str(row.get("status") or "").lower()
-    if status == SCHED_STATUS_PENDING:
-        return True, "already_confirmed", row
-    if status != SCHED_STATUS_DRAFT:
+    if status != SCHED_STATUS_PENDING:
         return False, status or "invalid_status", row
+    if not _sched_is_draft(row):
+        return True, "already_confirmed", row
 
     broadcast_at = _sched_parse_iso(row.get("broadcast_at"))
     if not broadcast_at or broadcast_at <= datetime.now(timezone.utc):
@@ -3717,7 +3756,8 @@ def db_sched_confirm(row_id: int, admin_id: int) -> tuple[bool, str, dict | None
             .update({"status": SCHED_STATUS_PENDING, "error_msg": None})
             .eq("id", int(row_id))
             .eq("admin_id", int(admin_id))
-            .eq("status", SCHED_STATUS_DRAFT)
+            .eq("status", SCHED_STATUS_PENDING)
+            .eq("error_msg", SCHED_DRAFT_MARKER)
             .execute()
         ),
         default=None,
@@ -3726,7 +3766,6 @@ def db_sched_confirm(row_id: int, admin_id: int) -> tuple[bool, str, dict | None
     if not saved:
         return False, "race_lost", db_sched_fetch_one(row_id)
     return True, "confirmed", saved
-
 
 def db_sched_set_status(row_id: int, status: str, **extra) -> None:
     if not supabase:
@@ -3791,7 +3830,8 @@ def db_sched_mark_stale_sending_failed() -> int:
                 "status": SCHED_STATUS_CANCELLED,
                 "error_msg": "Cancelled: schedule draft expired before confirmation.",
             })
-            .eq("status", SCHED_STATUS_DRAFT)
+            .eq("status", SCHED_STATUS_PENDING)
+            .eq("error_msg", SCHED_DRAFT_MARKER)
             .lte("broadcast_at", _sched_iso(now))
             .execute()
         ),
@@ -3808,7 +3848,7 @@ def db_sched_fetch_admin_pending(admin_id: int) -> list[dict]:
         f"sched_fetch_admin_pending:{admin_id}",
         lambda: (
             supabase.table("scheduled_broadcasts")
-            .select("id, broadcast_at, plain_text, caption, photo_file_id, status")
+            .select("id, broadcast_at, plain_text, caption, photo_file_id, status, error_msg")
             .eq("admin_id", int(admin_id))
             .eq("status", SCHED_STATUS_PENDING)
             .order("broadcast_at")
@@ -3816,8 +3856,8 @@ def db_sched_fetch_admin_pending(admin_id: int) -> list[dict]:
         ),
         default=None,
     )
-    return list(getattr(res, "data", None) or [])
-
+    rows = list(getattr(res, "data", None) or [])
+    return [r for r in rows if _sched_is_confirmed_pending(r)]
 
 def db_sched_fetch_one(row_id: int) -> dict | None:
     if not supabase:
@@ -5402,8 +5442,8 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
         ))
         return True
 
-    # Save succeeded. Clear conversation state. The DB row is still `draft`, so
-    # it cannot send until ✅ Confirm Schedule is pressed.
+    # Save succeeded. Clear conversation state. The DB row is an unconfirmed
+    # preview marker, so it cannot send until ✅ Confirm Schedule is pressed.
     _sched_payload.pop(user_id, None)
     context.user_data.pop("sched_state", None)
 
@@ -5417,7 +5457,7 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
             caption=(
                 f"📅 <b>Preview Schedule #{row_id}</b>\n"
                 f"⏰ {dt_str}\n"
-                "ស្ថានភាព: <b>Draft — មិនទាន់បញ្ជាក់</b>\n\n"
+                "ស្ថានភាព: <b>Preview — មិនទាន់បញ្ជាក់</b>\n\n"
                 f"{cap_preview}"
             ),
             parse_mode="HTML",
@@ -5427,7 +5467,7 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
         await safe_send(lambda: msg.reply_text(
             f"📅 <b>Preview Schedule #{row_id}</b>\n"
             f"⏰ {dt_str}\n"
-            "ស្ថានភាព: <b>Draft — មិនទាន់បញ្ជាក់</b>\n\n"
+            "ស្ថានភាព: <b>Preview — មិនទាន់បញ្ជាក់</b>\n\n"
             f"{html.escape(payload.get('text') or '')}",
             parse_mode="HTML",
             reply_markup=get_sched_confirm_kb(row_id),
@@ -5664,6 +5704,7 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             dt_str = str(row.get("broadcast_at", "?"))
         content = (row.get("plain_text") or row.get("caption") or "(photo)")[:300]
+        shown_status = "preview" if _sched_is_draft(row) else str(row.get("status") or "?")
         cancel_kb = (
             InlineKeyboardMarkup([[
                 InlineKeyboardButton("🗑️ Cancel Schedule", callback_data=f"sched_cancel_confirm:{row_id}")
@@ -5672,7 +5713,7 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await safe_send(lambda: query.message.reply_text(
             f"📋 <b>Schedule #{row_id}</b>\n⏰ {dt_str}\n"
-            f"ស្ថានភាព: <b>{html.escape(str(row.get('status') or '?'))}</b>\n\n{html.escape(content)}",
+            f"ស្ថានភាព: <b>{html.escape(shown_status)}</b>\n\n{html.escape(content)}",
             parse_mode="HTML",
             reply_markup=cancel_kb,
         ))
