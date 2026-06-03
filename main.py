@@ -12,12 +12,13 @@ import glob
 import hashlib
 import hmac
 import secrets
+import socket
 import requests
 import imageio_ffmpeg as _iio_ffmpeg
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 try:
     from google import genai
     from google.genai import types as genai_types
@@ -259,6 +260,28 @@ insert into public.bot_settings (key, value) values
   ('audio_transcribe_enabled', '1'),
   ('ai_resolver_enabled', '1')
 on conflict (key) do nothing;
+
+-- Distributed scheduler lock. Required for safe scheduled broadcasts when
+-- Render restarts quickly or when more than one worker/instance is running.
+create table if not exists public.bot_locks (
+  lock_key text primary key,
+  owner text not null,
+  locked_until timestamptz not null,
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists bot_locks_locked_until_idx
+  on public.bot_locks (locked_until);
+
+alter table public.bot_locks enable row level security;
+
+drop policy if exists "service_role_bot_locks_all" on public.bot_locks;
+create policy "service_role_bot_locks_all"
+on public.bot_locks
+for all
+to service_role
+using (true)
+with check (true);
 """
 
 def _extract_ai_request_key() -> str:
@@ -1420,10 +1443,20 @@ CHAT_WAIT_MESSAGE      = 2
 SCHED_WAIT_MSG         = 3
 SCHED_WAIT_TIME        = 4
 USER_SEARCH_WAIT_QUERY = 5
+SCHED_EDIT_WAIT_TIME   = 6
+SCHED_EDIT_WAIT_TEXT   = 7
+SCHED_EDIT_WAIT_PHOTO  = 8
 _SCHED_POLL_INTERVAL   = int(os.environ.get("SCHED_POLL_INTERVAL", "60"))
 _SCHED_SENDING_STALE_SECONDS = int(os.environ.get("SCHED_SENDING_STALE_SECONDS", "1800"))
 _SCHED_DUE_LIMIT      = max(1, int(os.environ.get("SCHED_DUE_LIMIT", "5")))
 _SCHED_SCAN_LIMIT     = max(25, int(os.environ.get("SCHED_SCAN_LIMIT", "250")))
+_SCHED_LOCK_ENABLED   = os.environ.get("SCHED_LOCK_ENABLED", "1") == "1"
+_SCHED_LOCK_REQUIRED  = os.environ.get("SCHED_LOCK_REQUIRED", "0") == "1"
+_SCHED_LOCK_KEY       = os.environ.get("SCHED_LOCK_KEY", "scheduled_broadcast_runner").strip() or "scheduled_broadcast_runner"
+_SCHED_LOCK_TTL_S     = max(30, int(os.environ.get("SCHED_LOCK_TTL_S", str(max(90, _SCHED_POLL_INTERVAL * 3)))))
+_BOT_LOCK_OWNER       = os.environ.get("BOT_LOCK_OWNER", "").strip() or (
+    f"{os.environ.get('RENDER_SERVICE_NAME', 'bot')}:{os.environ.get('RENDER_INSTANCE_ID', 'local')}:{socket.gethostname()}:{os.getpid()}:{secrets.token_hex(4)}"
+)
 _DT_FORMATS = [
     "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S",
     "%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M",
@@ -3564,6 +3597,115 @@ async def resolve_tts_text(
         return raw_text
 
 
+
+# ---------------------------------------------------------------------------
+# Distributed lock helpers — scheduler ownership across bot instances
+# ---------------------------------------------------------------------------
+def _lock_until_iso(ttl_s: int | float) -> str:
+    return _sched_iso(datetime.now(timezone.utc) + timedelta(seconds=max(1, int(ttl_s))))
+
+
+def db_lock_acquire(lock_key: str = _SCHED_LOCK_KEY, owner: str = _BOT_LOCK_OWNER, ttl_s: int = _SCHED_LOCK_TTL_S) -> bool:
+    """Acquire or renew a lightweight Supabase lock.
+
+    This intentionally does NOT use db_call_sync, because a missing bot_locks
+    table should not trip the global Supabase circuit breaker and break the bot.
+
+    Flow:
+    1) renew if this process already owns the lock
+    2) steal only if locked_until is in the past
+    3) insert if the lock row does not exist yet
+    """
+    if not _SCHED_LOCK_ENABLED:
+        return True
+    if not supabase:
+        return not _SCHED_LOCK_REQUIRED
+
+    lock_key = str(lock_key or _SCHED_LOCK_KEY)
+    owner = str(owner or _BOT_LOCK_OWNER)[:240]
+    now_iso = _sched_iso()
+    until_iso = _lock_until_iso(ttl_s)
+    update = {"owner": owner, "locked_until": until_iso, "updated_at": now_iso}
+
+    try:
+        # Fast path: renew our own lock.
+        res = (
+            supabase.table("bot_locks")
+            .update(update)
+            .eq("lock_key", lock_key)
+            .eq("owner", owner)
+            .execute()
+        )
+        if getattr(res, "data", None):
+            return True
+
+        # Safe takeover: only expired rows are updateable. Postgres re-checks
+        # this predicate after row locking, so two instances should not both win.
+        res = (
+            supabase.table("bot_locks")
+            .update(update)
+            .eq("lock_key", lock_key)
+            .lt("locked_until", now_iso)
+            .execute()
+        )
+        if getattr(res, "data", None):
+            return True
+
+        # First boot path: create the lock row. If another instance inserts
+        # first, the unique constraint fails and we simply do not own it.
+        try:
+            res = supabase.table("bot_locks").insert({"lock_key": lock_key, **update}).execute()
+            return bool(getattr(res, "data", None))
+        except Exception as insert_exc:
+            # Unique violation means another instance already owns/created it.
+            low = str(insert_exc).lower()
+            if "duplicate" in low or "23505" in low or "unique" in low:
+                return False
+            raise
+    except Exception as exc:
+        _log_once(
+            logging.WARNING,
+            f"sched_lock_unavailable:{type(exc).__name__}:{str(exc)[:120]}",
+            "Scheduler distributed lock unavailable. Run bot_locks SQL or set SCHED_LOCK_ENABLED=0. Error: %s",
+            exc,
+        )
+        return not _SCHED_LOCK_REQUIRED
+
+
+def db_lock_release(lock_key: str = _SCHED_LOCK_KEY, owner: str = _BOT_LOCK_OWNER) -> bool:
+    if not _SCHED_LOCK_ENABLED or not supabase:
+        return True
+    try:
+        res = (
+            supabase.table("bot_locks")
+            .delete()
+            .eq("lock_key", str(lock_key))
+            .eq("owner", str(owner)[:240])
+            .execute()
+        )
+        return bool(getattr(res, "data", None))
+    except Exception as exc:
+        _log_once(logging.WARNING, "sched_lock_release_failed", "Scheduler lock release failed: %s", exc)
+        return False
+
+
+def db_lock_read(lock_key: str = _SCHED_LOCK_KEY) -> dict | None:
+    if not supabase:
+        return None
+    try:
+        res = (
+            supabase.table("bot_locks")
+            .select("lock_key, owner, locked_until, updated_at")
+            .eq("lock_key", str(lock_key))
+            .limit(1)
+            .execute()
+        )
+        rows = list(getattr(res, "data", None) or [])
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Database helpers — scheduled broadcasts
 # ---------------------------------------------------------------------------
@@ -3714,6 +3856,11 @@ def db_sched_claim(row_id: int) -> bool:
     if not _sched_is_confirmed_pending(current):
         return False
 
+    now_iso = _sched_iso()
+    broadcast_at = _sched_parse_iso(current.get("broadcast_at"))
+    if not broadcast_at or broadcast_at > datetime.now(timezone.utc):
+        return False
+
     update = {
         "status": SCHED_STATUS_SENDING,
         "error_msg": _sched_claim_marker(),
@@ -3726,6 +3873,7 @@ def db_sched_claim(row_id: int) -> bool:
             .eq("id", int(row_id))
             .eq("status", SCHED_STATUS_PENDING)
             .is_("error_msg", "null")
+            .lte("broadcast_at", now_iso)
             .execute()
         ),
         default=None,
@@ -3868,7 +4016,7 @@ def db_sched_fetch_admin_pending(admin_id: int) -> list[dict]:
         default=None,
     )
     rows = list(getattr(res, "data", None) or [])
-    return [r for r in rows if _sched_is_confirmed_pending(r)]
+    return [r for r in rows if _sched_is_draft(r) or _sched_is_confirmed_pending(r)]
 
 def db_sched_fetch_one(row_id: int) -> dict | None:
     if not supabase:
@@ -3886,6 +4034,103 @@ def db_sched_fetch_one(row_id: int) -> dict | None:
     )
     rows = list(getattr(res, "data", None) or [])
     return rows[0] if rows else None
+
+
+def _sched_can_edit(row: dict | None, admin_id: int | None = None) -> tuple[bool, str]:
+    if not row:
+        return False, "not_found"
+    if admin_id is not None and int(row.get("admin_id") or 0) != int(admin_id):
+        return False, "not_owner"
+    if str(row.get("status") or "").lower() != SCHED_STATUS_PENDING:
+        return False, str(row.get("status") or "invalid_status")
+    broadcast_at = _sched_parse_iso(row.get("broadcast_at"))
+    if broadcast_at and broadcast_at <= datetime.now(timezone.utc):
+        return False, "time_passed"
+    return True, "editable"
+
+
+def db_sched_update_time(row_id: int, admin_id: int, broadcast_at: datetime) -> tuple[bool, str, dict | None]:
+    row = db_sched_fetch_one(row_id)
+    ok, reason = _sched_can_edit(row, admin_id)
+    if not ok:
+        return False, reason, row
+    if _sched_to_utc(broadcast_at) <= datetime.now(timezone.utc):
+        return False, "new_time_in_past", row
+
+    res = db_call_sync(
+        f"sched_update_time:{row_id}",
+        lambda: (
+            supabase.table("scheduled_broadcasts")
+            .update({"broadcast_at": _sched_iso(broadcast_at)})
+            .eq("id", int(row_id))
+            .eq("admin_id", int(admin_id))
+            .eq("status", SCHED_STATUS_PENDING)
+            .execute()
+        ),
+        default=None,
+    )
+    saved = (getattr(res, "data", None) or [None])[0]
+    return (True, "updated", saved) if saved else (False, "race_lost", db_sched_fetch_one(row_id))
+
+
+def db_sched_update_text(row_id: int, admin_id: int, text: str) -> tuple[bool, str, dict | None]:
+    text = (text or "").strip()
+    row = db_sched_fetch_one(row_id)
+    ok, reason = _sched_can_edit(row, admin_id)
+    if not ok:
+        return False, reason, row
+    if not text:
+        return False, "empty_text", row
+
+    has_photo = bool(row.get("photo_file_id"))
+    if has_photo and len(text) > 1024:
+        return False, "caption_too_long", row
+    if not has_photo and len(text) > TELE_MSG_LIMIT:
+        return False, "text_too_long", row
+
+    update = {"caption": text, "plain_text": None} if has_photo else {"plain_text": text, "caption": None}
+    res = db_call_sync(
+        f"sched_update_text:{row_id}",
+        lambda: (
+            supabase.table("scheduled_broadcasts")
+            .update(update)
+            .eq("id", int(row_id))
+            .eq("admin_id", int(admin_id))
+            .eq("status", SCHED_STATUS_PENDING)
+            .execute()
+        ),
+        default=None,
+    )
+    saved = (getattr(res, "data", None) or [None])[0]
+    return (True, "updated", saved) if saved else (False, "race_lost", db_sched_fetch_one(row_id))
+
+
+def db_sched_update_photo(row_id: int, admin_id: int, photo_file_id: str, caption: str = "") -> tuple[bool, str, dict | None]:
+    photo_file_id = (photo_file_id or "").strip()
+    caption = (caption or "").strip()
+    row = db_sched_fetch_one(row_id)
+    ok, reason = _sched_can_edit(row, admin_id)
+    if not ok:
+        return False, reason, row
+    if not photo_file_id:
+        return False, "empty_photo", row
+    if len(caption) > 1024:
+        return False, "caption_too_long", row
+
+    res = db_call_sync(
+        f"sched_update_photo:{row_id}",
+        lambda: (
+            supabase.table("scheduled_broadcasts")
+            .update({"photo_file_id": photo_file_id, "caption": caption, "plain_text": None})
+            .eq("id", int(row_id))
+            .eq("admin_id", int(admin_id))
+            .eq("status", SCHED_STATUS_PENDING)
+            .execute()
+        ),
+        default=None,
+    )
+    saved = (getattr(res, "data", None) or [None])[0]
+    return (True, "updated", saved) if saved else (False, "race_lost", db_sched_fetch_one(row_id))
 
 
 # ---------------------------------------------------------------------------
@@ -3908,10 +4153,34 @@ def _fmt_dt(dt: datetime) -> str:
 # Keyboard helpers
 # ---------------------------------------------------------------------------
 def get_sched_confirm_kb(row_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ បញ្ជាក់ Schedule", callback_data=f"sched_ok:{row_id}"),
-        InlineKeyboardButton("❌ បោះបង់",           callback_data=f"sched_no:{row_id}"),
-    ]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ បញ្ជាក់ Schedule", callback_data=f"sched_ok:{row_id}"),
+         InlineKeyboardButton("❌ បោះបង់",           callback_data=f"sched_no:{row_id}")],
+        [InlineKeyboardButton("✏️ Edit Time", callback_data=f"sched_edit_time:{row_id}"),
+         InlineKeyboardButton("📝 Edit Text", callback_data=f"sched_edit_text:{row_id}")],
+        [InlineKeyboardButton("🖼 Replace Photo", callback_data=f"sched_edit_photo:{row_id}")],
+    ])
+
+
+def get_sched_detail_kb(row: dict) -> InlineKeyboardMarkup:
+    row_id = int(row.get("id") or 0)
+    editable, _reason = _sched_can_edit(row, int(row.get("admin_id") or 0))
+    rows: list[list[InlineKeyboardButton]] = []
+    if _sched_is_draft(row):
+        rows.append([
+            InlineKeyboardButton("✅ Confirm", callback_data=f"sched_ok:{row_id}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"sched_no:{row_id}"),
+        ])
+    if editable:
+        rows.extend([
+            [InlineKeyboardButton("✏️ Edit Time", callback_data=f"sched_edit_time:{row_id}"),
+             InlineKeyboardButton("📝 Edit Text", callback_data=f"sched_edit_text:{row_id}")],
+            [InlineKeyboardButton("🖼 Replace Photo", callback_data=f"sched_edit_photo:{row_id}"),
+             InlineKeyboardButton("🗑️ Cancel Schedule", callback_data=f"sched_cancel_confirm:{row_id}")],
+        ])
+    rows.append([InlineKeyboardButton("⬅️ Schedules", callback_data="admin_schedules"),
+                 InlineKeyboardButton("❌ Close", callback_data="sched_close")])
+    return InlineKeyboardMarkup(rows)
 
 
 def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
@@ -4005,6 +4274,42 @@ def get_schedules_list_kb(rows: list[dict], page: int, page_size: int = 5) -> In
                      InlineKeyboardButton("📅 New", callback_data="admin_schedule_new")])
     kbd_rows.append([InlineKeyboardButton("❌ បិទ", callback_data="sched_close")])
     return InlineKeyboardMarkup(kbd_rows)
+
+
+
+def _sched_status_label(row: dict) -> str:
+    if _sched_is_draft(row):
+        return "preview"
+    return str(row.get("status") or "?")
+
+
+def _sched_content_preview(row: dict, limit: int = 500) -> str:
+    if row.get("photo_file_id"):
+        base = row.get("caption") or "(photo, no caption)"
+    else:
+        base = row.get("plain_text") or "(empty)"
+    base = str(base).strip()
+    if len(base) > limit:
+        base = base[:limit] + "…"
+    return base
+
+
+def _sched_detail_text(row: dict) -> str:
+    try:
+        dt = _sched_parse_iso(row.get("broadcast_at"))
+        dt_str = _fmt_dt(dt) if dt else str(row.get("broadcast_at", "?"))
+    except Exception:
+        dt_str = str(row.get("broadcast_at", "?"))
+    media = "Photo + caption" if row.get("photo_file_id") else "Text"
+    status = _sched_status_label(row)
+    content = html.escape(_sched_content_preview(row))
+    return (
+        f"📋 <b>Schedule #{int(row.get('id') or 0)}</b>\n"
+        f"⏰ {html.escape(dt_str)}\n"
+        f"ស្ថានភាព: <b>{html.escape(status)}</b>\n"
+        f"ប្រភេទ: <b>{html.escape(media)}</b>\n\n"
+        f"{content}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5059,6 +5364,9 @@ async def _admin_health_text() -> str:
         f"📁 Temp folder: <b>{_ok_bad(temp_ok, 'OK', 'ERROR')}</b>\n"
         f"<code>{html.escape(str(temp_dir))}</code>\n\n"
         f"⏰ Scheduler poll: <b>{int(_SCHED_POLL_INTERVAL)}s</b>\n"
+        f"🔐 Scheduler lock: <b>{'ON' if _SCHED_LOCK_ENABLED else 'OFF'}</b> / required <b>{'YES' if _SCHED_LOCK_REQUIRED else 'NO'}</b>\n"
+        f"📌 Lock status: <b>{html.escape(str(_scheduler_lock_last_status))}</b>\n"
+        f"🔑 Lock owner: <code>{html.escape(_BOT_LOCK_OWNER[:80])}</code>\n"
         f"📦 Due batch: <b>{int(_SCHED_DUE_LIMIT)}</b> / scan <b>{int(_SCHED_SCAN_LIMIT)}</b>\n"
         f"🏃 Active schedule jobs: <b>{len(_scheduler_active_ids)}</b>"
     )
@@ -5490,6 +5798,120 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
         ))
     return True
 
+
+def _sched_clear_edit_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("sched_state", None)
+    context.user_data.pop("sched_edit_row_id", None)
+
+
+def _sched_edit_error_text(row_id: int, reason: str) -> str:
+    mapping = {
+        "not_found": "❌ រកមិនឃើញ Schedule ។",
+        "not_owner": "⛔ Schedule នេះមិនមែនជារបស់អ្នកទេ។",
+        "time_passed": f"⚠️ Schedule #{row_id} ជិត/ផុតពេលហើយ — មិនអាច Edit បាន។",
+        "new_time_in_past": "❌ ពេលថ្មីត្រូវតែជាអនាគត (UTC)។",
+        "empty_text": "⚠️ អត្ថបទមិនអាចទទេបាន។",
+        "caption_too_long": "⚠️ Caption វែងពេក។ Telegram caption limit ប្រហែល 1024 តួអក្សរ។",
+        "text_too_long": f"⚠️ Text វែងពេក។ សូមឲ្យក្រោម {TELE_MSG_LIMIT} តួអក្សរ។",
+        "empty_photo": "⚠️ មិនមានរូបភាព។",
+        "race_lost": "⚠️ Schedule ត្រូវបានផ្លាស់ប្តូរដោយ process ផ្សេង។ សូម refresh ម្តងទៀត។",
+    }
+    return mapping.get(str(reason), f"⚠️ មិនអាច Edit Schedule #{row_id}: <b>{html.escape(str(reason))}</b>")
+
+
+async def _handle_sched_edit_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user_id = update.effective_user.id
+    if not _is_admin(user_id) or context.user_data.get("sched_state") != SCHED_EDIT_WAIT_TIME:
+        return False
+    msg = update.message
+    row_id = int(context.user_data.get("sched_edit_row_id") or 0)
+    if not row_id:
+        _sched_clear_edit_state(context)
+        await safe_send(lambda: msg.reply_text("❌ Edit session expired. Open /schedules again."))
+        return True
+    if not msg.text:
+        await safe_send(lambda: msg.reply_text("⚠️ ផ្ញើ Text ពេលវេលា UTC។"))
+        return True
+    new_dt = _parse_dt(msg.text)
+    if new_dt is None:
+        await safe_send(lambda: msg.reply_text(
+            "❌ ទម្រង់ពេលវេលាខុស។\nឧទាហរណ៍: <code>2026-12-25 09:00</code>",
+            parse_mode="HTML",
+        ))
+        return True
+    ok, reason, row = await asyncio.get_running_loop().run_in_executor(
+        None, db_sched_update_time, row_id, user_id, new_dt
+    )
+    if not ok:
+        await safe_send(lambda: msg.reply_text(_sched_edit_error_text(row_id, reason), parse_mode="HTML"))
+        return True
+    _sched_clear_edit_state(context)
+    await safe_send(lambda: msg.reply_text(
+        f"✅ Schedule <b>#{row_id}</b> time updated.\n⏰ New time: <b>{_fmt_dt(_sched_to_utc(new_dt))}</b>",
+        parse_mode="HTML",
+        reply_markup=get_sched_detail_kb(row),
+    ))
+    return True
+
+
+async def _handle_sched_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user_id = update.effective_user.id
+    if not _is_admin(user_id) or context.user_data.get("sched_state") != SCHED_EDIT_WAIT_TEXT:
+        return False
+    msg = update.message
+    row_id = int(context.user_data.get("sched_edit_row_id") or 0)
+    if not row_id:
+        _sched_clear_edit_state(context)
+        await safe_send(lambda: msg.reply_text("❌ Edit session expired. Open /schedules again."))
+        return True
+    if not msg.text or not msg.text.strip():
+        await safe_send(lambda: msg.reply_text("⚠️ ផ្ញើអត្ថបទថ្មី។"))
+        return True
+    ok, reason, row = await asyncio.get_running_loop().run_in_executor(
+        None, db_sched_update_text, row_id, user_id, msg.text
+    )
+    if not ok:
+        await safe_send(lambda: msg.reply_text(_sched_edit_error_text(row_id, reason), parse_mode="HTML"))
+        return True
+    _sched_clear_edit_state(context)
+    await safe_send(lambda: msg.reply_text(
+        f"✅ Schedule <b>#{row_id}</b> text/caption updated.",
+        parse_mode="HTML",
+        reply_markup=get_sched_detail_kb(row),
+    ))
+    return True
+
+
+async def _handle_sched_edit_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user_id = update.effective_user.id
+    if not _is_admin(user_id) or context.user_data.get("sched_state") != SCHED_EDIT_WAIT_PHOTO:
+        return False
+    msg = update.message
+    row_id = int(context.user_data.get("sched_edit_row_id") or 0)
+    if not row_id:
+        _sched_clear_edit_state(context)
+        await safe_send(lambda: msg.reply_text("❌ Edit session expired. Open /schedules again."))
+        return True
+    if not msg.photo:
+        await safe_send(lambda: msg.reply_text("⚠️ សូមផ្ញើរូបភាពថ្មី + Caption (optional)។"))
+        return True
+    photo_file_id = msg.photo[-1].file_id
+    caption = msg.caption or ""
+    ok, reason, row = await asyncio.get_running_loop().run_in_executor(
+        None, db_sched_update_photo, row_id, user_id, photo_file_id, caption
+    )
+    if not ok:
+        await safe_send(lambda: msg.reply_text(_sched_edit_error_text(row_id, reason), parse_mode="HTML"))
+        return True
+    _sched_clear_edit_state(context)
+    await safe_send(lambda: msg.reply_text(
+        f"✅ Schedule <b>#{row_id}</b> photo replaced.",
+        parse_mode="HTML",
+        reply_markup=get_sched_detail_kb(row),
+    ))
+    return True
+
+
 async def _cb_admin_dashboard(query, user_id: int, context, data: str):
     if not _is_admin(user_id):
         await safe_send(lambda: query.message.reply_text("⛔ Admin only."))
@@ -5498,6 +5920,7 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
     if data == "admin_close":
         context.user_data.pop("bc_state", None)
         context.user_data.pop("sched_state", None)
+        context.user_data.pop("sched_edit_row_id", None)
         _pending_broadcast.pop(user_id, None)
         _sched_payload.pop(user_id, None)
         with suppress(Exception):
@@ -5507,6 +5930,7 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
     if data in ("admin_home", "admin_refresh"):
         context.user_data.pop("bc_state", None)
         context.user_data.pop("sched_state", None)
+        context.user_data.pop("sched_edit_row_id", None)
         text = await _admin_home_text(user_id)
         await safe_send(lambda: query.message.edit_text(
             text,
@@ -5518,6 +5942,7 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
     if data == "admin_cancel_state":
         context.user_data.pop("bc_state", None)
         context.user_data.pop("sched_state", None)
+        context.user_data.pop("sched_edit_row_id", None)
         _pending_broadcast.pop(user_id, None)
         _sched_payload.pop(user_id, None)
         text = await _admin_home_text(user_id, title="✅ Admin action cancelled")
@@ -5715,23 +6140,71 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if int(row.get("admin_id") or 0) != int(user_id):
             await safe_send(lambda: query.message.reply_text("⛔ Schedule នេះមិនមែនជារបស់អ្នកទេ។"))
             return
-        try:
-            dt_str = _fmt_dt(datetime.fromisoformat(str(row["broadcast_at"]).replace("Z", "+00:00")))
-        except Exception:
-            dt_str = str(row.get("broadcast_at", "?"))
-        content = (row.get("plain_text") or row.get("caption") or "(photo)")[:300]
-        shown_status = "preview" if _sched_is_draft(row) else str(row.get("status") or "?")
-        cancel_kb = (
-            InlineKeyboardMarkup([[
-                InlineKeyboardButton("🗑️ Cancel Schedule", callback_data=f"sched_cancel_confirm:{row_id}")
-            ]])
-            if row.get("status") in (SCHED_STATUS_DRAFT, SCHED_STATUS_PENDING) else None
-        )
         await safe_send(lambda: query.message.reply_text(
-            f"📋 <b>Schedule #{row_id}</b>\n⏰ {dt_str}\n"
-            f"ស្ថានភាព: <b>{html.escape(shown_status)}</b>\n\n{html.escape(content)}",
+            _sched_detail_text(row),
             parse_mode="HTML",
-            reply_markup=cancel_kb,
+            reply_markup=get_sched_detail_kb(row),
+        ))
+        return
+
+    if data.startswith("sched_edit_time:"):
+        row_id = _callback_int_arg(data, "sched_edit_time:")
+        if row_id is None:
+            await safe_send(lambda: query.message.reply_text("❌ Invalid schedule id."))
+            return
+        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
+        ok, reason = _sched_can_edit(row, user_id)
+        if not ok:
+            await safe_send(lambda: query.message.reply_text(_sched_edit_error_text(row_id, reason), parse_mode="HTML"))
+            return
+        context.user_data["sched_state"] = SCHED_EDIT_WAIT_TIME
+        context.user_data["sched_edit_row_id"] = row_id
+        await safe_send(lambda: query.message.reply_text(
+            f"✏️ <b>Edit Schedule #{row_id} Time</b>\n\n"
+            "ផ្ញើពេលវេលាថ្មីជា UTC។\n"
+            "Format: <code>YYYY-MM-DD HH:MM</code>\n"
+            "Example: <code>2026-12-25 09:00</code>\n\n"
+            "វាយ /cancel ដើម្បីបោះបង់ edit។",
+            parse_mode="HTML",
+        ))
+        return
+
+    if data.startswith("sched_edit_text:"):
+        row_id = _callback_int_arg(data, "sched_edit_text:")
+        if row_id is None:
+            await safe_send(lambda: query.message.reply_text("❌ Invalid schedule id."))
+            return
+        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
+        ok, reason = _sched_can_edit(row, user_id)
+        if not ok:
+            await safe_send(lambda: query.message.reply_text(_sched_edit_error_text(row_id, reason), parse_mode="HTML"))
+            return
+        context.user_data["sched_state"] = SCHED_EDIT_WAIT_TEXT
+        context.user_data["sched_edit_row_id"] = row_id
+        target = "caption" if row.get("photo_file_id") else "text"
+        await safe_send(lambda: query.message.reply_text(
+            f"📝 <b>Edit Schedule #{row_id} {target}</b>\n\n"
+            "ផ្ញើអត្ថបទថ្មី។ វាយ /cancel ដើម្បីបោះបង់ edit។",
+            parse_mode="HTML",
+        ))
+        return
+
+    if data.startswith("sched_edit_photo:"):
+        row_id = _callback_int_arg(data, "sched_edit_photo:")
+        if row_id is None:
+            await safe_send(lambda: query.message.reply_text("❌ Invalid schedule id."))
+            return
+        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
+        ok, reason = _sched_can_edit(row, user_id)
+        if not ok:
+            await safe_send(lambda: query.message.reply_text(_sched_edit_error_text(row_id, reason), parse_mode="HTML"))
+            return
+        context.user_data["sched_state"] = SCHED_EDIT_WAIT_PHOTO
+        context.user_data["sched_edit_row_id"] = row_id
+        await safe_send(lambda: query.message.reply_text(
+            f"🖼 <b>Replace Schedule #{row_id} Photo</b>\n\n"
+            "ផ្ញើរូបភាពថ្មី + Caption (optional)។ វាយ /cancel ដើម្បីបោះបង់ edit។",
+            parse_mode="HTML",
         ))
         return
 
@@ -5945,16 +6418,17 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
         await _stop_timer(tts_stop, tts_timer)
 
 
-async def _fire_scheduled_broadcast(bot, row: dict) -> None:
+async def _fire_scheduled_broadcast(bot, row: dict, already_claimed: bool = False) -> None:
     row_id = int(row["id"])
     admin_id = int(row["admin_id"])
     logger.info(f"Firing scheduled broadcast #{row_id} for admin {admin_id}")
     loop = asyncio.get_running_loop()
 
-    claimed = await loop.run_in_executor(None, db_sched_claim, row_id)
-    if not claimed:
-        logger.warning(f"Scheduled broadcast #{row_id} already claimed/cancelled — skipping.")
-        return
+    if not already_claimed:
+        claimed = await loop.run_in_executor(None, db_sched_claim, row_id)
+        if not claimed:
+            logger.warning(f"Scheduled broadcast #{row_id} already claimed/cancelled — skipping.")
+            return
 
     sent = failed = blocked = 0
     try:
@@ -5998,6 +6472,7 @@ async def _fire_scheduled_broadcast(bot, row: dict) -> None:
 
 _scheduler_tasks: set[asyncio.Task] = set()
 _scheduler_active_ids: set[int] = set()
+_scheduler_lock_last_status = "not_started"
 
 
 def _scheduler_task_done(task: asyncio.Task, row_id: int) -> None:
@@ -6015,24 +6490,56 @@ def _scheduler_task_done(task: asyncio.Task, row_id: int) -> None:
 
 
 async def _scheduler_loop(bot, stop_event: asyncio.Event) -> None:
+    global _scheduler_lock_last_status
     logger.info("Scheduled broadcast loop started.")
     while not stop_event.is_set():
+        lock_acquired = False
         try:
             loop = asyncio.get_running_loop()
-            stale_count = await loop.run_in_executor(None, db_sched_mark_stale_sending_failed)
-            if stale_count:
-                logger.warning(f"Recovered/expired {stale_count} scheduled broadcast row(s).")
-            due = await loop.run_in_executor(None, db_sched_fetch_due, _SCHED_DUE_LIMIT)
-            for row in due:
-                row_id = int(row.get("id") or 0)
-                if not row_id or row_id in _scheduler_active_ids:
-                    continue
-                _scheduler_active_ids.add(row_id)
-                task = asyncio.create_task(_fire_scheduled_broadcast(bot, row))
-                _scheduler_tasks.add(task)
-                task.add_done_callback(lambda t, rid=row_id: _scheduler_task_done(t, rid))
+            lock_acquired = await loop.run_in_executor(
+                None, db_lock_acquire, _SCHED_LOCK_KEY, _BOT_LOCK_OWNER, _SCHED_LOCK_TTL_S
+            )
+            _scheduler_lock_last_status = "owned" if lock_acquired else "not_owner"
+            if not lock_acquired:
+                _log_once(
+                    logging.INFO,
+                    "sched_lock_not_owner",
+                    "Scheduler tick skipped because another bot instance owns lock %s",
+                    _SCHED_LOCK_KEY,
+                )
+            else:
+                stale_count = await loop.run_in_executor(None, db_sched_mark_stale_sending_failed)
+                if stale_count:
+                    logger.warning(f"Recovered/expired {stale_count} scheduled broadcast row(s).")
+                due = await loop.run_in_executor(None, db_sched_fetch_due, _SCHED_DUE_LIMIT)
+                for row in due:
+                    row_id = int(row.get("id") or 0)
+                    if not row_id or row_id in _scheduler_active_ids:
+                        continue
+
+                    # Claim before creating the async send task. This closes the
+                    # small race where another process could fetch the same due row
+                    # before the task gets CPU time. db_sched_claim also re-checks
+                    # broadcast_at <= now, so edit-time changes are respected.
+                    claimed = await loop.run_in_executor(None, db_sched_claim, row_id)
+                    if not claimed:
+                        continue
+
+                    _scheduler_active_ids.add(row_id)
+                    task = asyncio.create_task(_fire_scheduled_broadcast(bot, row, already_claimed=True))
+                    _scheduler_tasks.add(task)
+                    task.add_done_callback(lambda t, rid=row_id: _scheduler_task_done(t, rid))
         except Exception as e:
+            _scheduler_lock_last_status = f"error:{type(e).__name__}"
             logger.error(f"Scheduler loop error: {e}")
+        finally:
+            # Releasing lets another healthy instance take over on the next tick.
+            # The DB row claim protects individual broadcasts after task creation.
+            if lock_acquired:
+                with suppress(Exception):
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, db_lock_release, _SCHED_LOCK_KEY, _BOT_LOCK_OWNER
+                    )
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=float(_SCHED_POLL_INTERVAL))
         except asyncio.TimeoutError:
@@ -6951,10 +7458,11 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=target_id, text="ℹ️ Admin បានបញ្ចប់ Session Chat ។")
         cleared = True
 
-    if context.user_data.get("sched_state") in (SCHED_WAIT_MSG, SCHED_WAIT_TIME):
+    if context.user_data.get("sched_state") in (SCHED_WAIT_MSG, SCHED_WAIT_TIME, SCHED_EDIT_WAIT_TIME, SCHED_EDIT_WAIT_TEXT, SCHED_EDIT_WAIT_PHOTO):
         _sched_payload.pop(uid, None)
         context.user_data.pop("sched_state", None)
-        await safe_send(lambda: update.message.reply_text("❌ Schedule flow បានបោះបង់។"))
+        context.user_data.pop("sched_edit_row_id", None)
+        await safe_send(lambda: update.message.reply_text("❌ Schedule/Edit flow បានបោះបង់។"))
         cleared = True
 
     if context.user_data.get("user_search_state") == USER_SEARCH_WAIT_QUERY:
@@ -7047,7 +7555,11 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Admin flow intercepts
     if _is_admin(user_id):
-        if context.user_data.get("sched_state") == SCHED_WAIT_MSG:
+        sched_state = context.user_data.get("sched_state")
+        if sched_state == SCHED_EDIT_WAIT_PHOTO:
+            await _handle_sched_edit_photo(update, context)
+            return
+        if sched_state == SCHED_WAIT_MSG:
             await _handle_sched_content(update, context)
             return
         if context.user_data.get("bc_state") == BROADCAST_WAIT_MESSAGE:
@@ -7422,6 +7934,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if sched_state == SCHED_WAIT_TIME:
             await _handle_sched_datetime(update, context)
+            return
+        if sched_state == SCHED_EDIT_WAIT_TIME:
+            await _handle_sched_edit_time(update, context)
+            return
+        if sched_state == SCHED_EDIT_WAIT_TEXT:
+            await _handle_sched_edit_text(update, context)
+            return
+        if sched_state == SCHED_EDIT_WAIT_PHOTO:
+            await safe_send(lambda: msg.reply_text("⚠️ សូមផ្ញើរូបភាពថ្មី ឬ /cancel។"))
             return
         if context.user_data.get("bc_state") == BROADCAST_WAIT_MESSAGE:
             await broadcast_receive(update, context)
