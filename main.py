@@ -19,6 +19,7 @@ from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlencode
 try:
     from google import genai
     from google.genai import types as genai_types
@@ -978,6 +979,10 @@ _WEB_BROADCAST_JOBS_LOCK = threading.Lock()
 _WEB_BROADCAST_JOBS_MAX = int(os.environ.get("WEB_BROADCAST_JOBS_MAX", "50"))
 WEB_BROADCAST_WORKERS = max(1, int(os.environ.get("WEB_BROADCAST_WORKERS", str(MAX_CONCURRENT_BROADCAST))))
 WEB_BROADCAST_DELAY_S = max(0.0, float(os.environ.get("WEB_BROADCAST_DELAY_S", "0.05")))
+WEB_TABLE_PAGE_SIZE = max(10, min(200, int(os.environ.get("WEB_TABLE_PAGE_SIZE", "50"))))
+WEB_COUNTS_CACHE_TTL_S = max(0.0, float(os.environ.get("WEB_COUNTS_CACHE_TTL_S", "10")))
+_WEB_COUNTS_CACHE = {"ts": 0.0, "data": {}}
+_WEB_COUNTS_CACHE_LOCK = threading.Lock()
 
 
 def _web_admin_enabled() -> bool:
@@ -1061,44 +1066,163 @@ def _web_dt(value: Any) -> str:
     return str(value or "").replace("T", " ").replace("+00:00", " UTC")[:24]
 
 
+def _web_dt_input_value(value: Any) -> str:
+    """Return a UTC datetime-local value for admin forms."""
+    dt = _sched_parse_iso(value) if value else None
+    if not dt:
+        return ""
+    dt = _sched_to_utc(dt)
+    return dt.strftime("%Y-%m-%dT%H:%M")
+
+
+def _web_url(endpoint: str, **params: Any) -> str:
+    clean: dict[str, Any] = {}
+    for key, value in params.items():
+        if value is None or value == "":
+            continue
+        clean[str(key)] = value
+    base = endpoint if endpoint.startswith("/") else url_for(endpoint)
+    return base + (("?" + urlencode(clean, doseq=True)) if clean else "")
+
+
+def _web_safe_return(default_endpoint: str = "web_admin_home") -> str:
+    target = str(request.form.get("return_to") or request.referrer or "").strip()
+    if target.startswith("/") and not target.startswith("//"):
+        return target
+    return url_for(default_endpoint)
+
+
+def _web_return_input() -> str:
+    return f"<input type='hidden' name='return_to' value='{_web_h(request.full_path)}'>"
+
+
+def _web_progress_bar(done: Any, total: Any) -> str:
+    try:
+        done_i = max(0, int(done or 0))
+        total_i = max(0, int(total or 0))
+    except Exception:
+        done_i = total_i = 0
+    pct = int((done_i / total_i) * 100) if total_i else 0
+    pct = max(0, min(100, pct))
+    return f"<div class='progress' title='{done_i}/{total_i}'><span style='width:{pct}%'></span></div><span class='muted'>{pct}%</span>"
+
+
+def _web_blocked_ids_for_users(users: list[Any]) -> set[int]:
+    """Batch-load blocked status to avoid one Supabase query per table row/user."""
+    ids: list[int] = []
+    for item in users or []:
+        raw = item.get("user_id") if isinstance(item, dict) else item
+        try:
+            uid = int(raw)
+        except Exception:
+            continue
+        if uid not in ids:
+            ids.append(uid)
+
+    if not ids:
+        return set()
+
+    blocked = {uid for uid in ids if uid in _blocked_users_memory}
+    unknown: list[int] = []
+    for uid in ids:
+        cached = _blocked_cache_get(uid)
+        if cached is True:
+            blocked.add(uid)
+        elif cached is None:
+            unknown.append(uid)
+
+    if not unknown or not supabase:
+        for uid in unknown:
+            _blocked_cache_set(uid, uid in blocked)
+        return blocked
+
+    try:
+        found: set[int] = set()
+        chunk_size = 200
+        for start in range(0, len(unknown), chunk_size):
+            chunk = unknown[start:start + chunk_size]
+            res = db_call_sync(
+                f"web_blocked_batch:{start}",
+                lambda c=chunk: supabase.table("blocked_users").select("user_id").in_("user_id", c).execute(),
+                default=None,
+                attempts=2,
+                critical=False,
+            )
+            for row in list(getattr(res, "data", None) or []):
+                try:
+                    found.add(int(row.get("user_id")))
+                except Exception:
+                    pass
+        blocked.update(found)
+        for uid in unknown:
+            _blocked_cache_set(uid, uid in blocked)
+        return blocked
+    except Exception as exc:
+        logger.warning("web blocked batch lookup failed; falling back to per-user cache: %s", exc)
+        return {uid for uid in ids if db_user_is_blocked(uid)}
+
+
+def _web_status_card(label: str, value: Any, hint: str = "", kind: str = "") -> str:
+    kind_cls = f" stat-{kind}" if kind else ""
+    return (
+        f"<div class='stat{kind_cls}'><span class='muted'>{_web_h(label)}</span>"
+        f"<b>{_web_h(value)}</b>"
+        f"<small>{_web_h(hint)}</small></div>"
+    )
+
+
 def _web_render(title: str, body: str, *, active: str = "dashboard", status_code: int = 200):
     csrf = _web_csrf_token() if session.get("web_admin_ok") else ""
     nav = [
-        ("dashboard", "Dashboard", "/admin"),
-        ("users", "Users", "/admin/users"),
-        ("schedules", "Schedules", "/admin/schedules"),
-        ("broadcast", "Broadcast", "/admin/broadcast"),
-        ("settings", "Settings", "/admin/settings"),
-        ("api", "API Keys", "/admin/api-keys"),
-        ("locks", "Locks", "/admin/locks"),
-        ("sql", "SQL", "/admin/sql"),
+        ("dashboard", "Dashboard", "/admin", "▣"),
+        ("users", "Users", "/admin/users", "👥"),
+        ("schedules", "Schedules", "/admin/schedules", "⏱"),
+        ("broadcast", "Broadcast", "/admin/broadcast", "📣"),
+        ("settings", "Settings", "/admin/settings", "⚙"),
+        ("api", "API Keys", "/admin/api-keys", "🔑"),
+        ("locks", "Locks", "/admin/locks", "🔒"),
+        ("sql", "SQL", "/admin/sql", "☷"),
     ]
     template = """
 <!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b1020">
 <title>{{ title }} - Bot Admin</title>
 <style>
-:root{--bg:#0b1020;--panel:#111a2e;--panel2:#16223b;--text:#eef4ff;--muted:#94a3b8;--line:#27344f;--blue:#2563eb;--ok:#22c55e;--warn:#f59e0b;--danger:#ef4444;--info:#38bdf8}*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#08111f,#111827 55%,#172554);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}a{color:#93c5fd;text-decoration:none}a:hover{text-decoration:underline}.layout{display:grid;grid-template-columns:260px 1fr;min-height:100vh}.side{border-right:1px solid var(--line);background:rgba(9,14,28,.92);padding:20px;position:sticky;top:0;height:100vh}.brand{font-weight:850;font-size:21px}.sub{color:var(--muted);font-size:12px;margin:4px 0 20px}.nav a{display:block;padding:10px 12px;border-radius:12px;margin:4px 0;color:var(--text)}.nav a.active,.nav a:hover{background:var(--panel2);text-decoration:none}.main{padding:24px;max-width:1450px;width:100%}.top{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:20px}.h1{font-size:26px;font-weight:850}.card{background:rgba(17,26,46,.9);border:1px solid var(--line);border-radius:18px;padding:18px;margin-bottom:16px;box-shadow:0 12px 30px rgba(0,0,0,.2)}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.stat{background:var(--panel2);border:1px solid var(--line);border-radius:16px;padding:14px}.stat b{font-size:25px;display:block}.muted{color:var(--muted)}.badge{display:inline-block;padding:3px 9px;border-radius:999px;font-size:12px;border:1px solid var(--line);background:#1f2937}.badge-ok{background:rgba(34,197,94,.12);color:#86efac;border-color:rgba(34,197,94,.32)}.badge-warn{background:rgba(245,158,11,.14);color:#fde68a;border-color:rgba(245,158,11,.32)}.badge-danger{background:rgba(239,68,68,.14);color:#fecaca;border-color:rgba(239,68,68,.35)}.badge-info{background:rgba(56,189,248,.14);color:#bae6fd;border-color:rgba(56,189,248,.35)}.badge-muted{background:rgba(148,163,184,.12);color:#cbd5e1}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid var(--line);padding:10px;text-align:left;vertical-align:top}.table th{color:#cbd5e1;font-size:12px;text-transform:uppercase;letter-spacing:.05em}.actions{display:flex;gap:8px;flex-wrap:wrap}.btn,button,input[type=submit]{background:var(--blue);color:white;border:0;border-radius:10px;padding:9px 12px;cursor:pointer;font-weight:700}.btn:hover,button:hover,input[type=submit]:hover{filter:brightness(1.08);text-decoration:none}.secondary{background:#334155!important}.danger{background:#dc2626!important}.ok{background:#16a34a!important}.warn{background:#d97706!important}.field{margin:10px 0}.field label{display:block;color:#cbd5e1;margin-bottom:5px;font-weight:700}input,select,textarea{width:100%;background:#0f172a;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:10px}textarea{min-height:110px;resize:vertical}.flash{border-radius:12px;padding:10px 12px;margin:8px 0;background:#1e293b;border:1px solid var(--line)}.flash.success{background:rgba(34,197,94,.12);border-color:rgba(34,197,94,.35)}.flash.error{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.35)}.flash.warning{background:rgba(245,158,11,.12);border-color:rgba(245,158,11,.35)}code,pre{background:#020617;border:1px solid var(--line);border-radius:10px;padding:2px 5px}pre{padding:14px;overflow:auto;white-space:pre-wrap}.inline-form{display:inline}.footer{color:var(--muted);font-size:12px;margin-top:20px}@media(max-width:900px){.layout{display:block}.side{position:relative;height:auto}.grid,.grid2,.row{grid-template-columns:1fr}.main{padding:16px}.table{font-size:12px}}
+:root{color-scheme:dark;--bg:#070b16;--bg2:#0b1224;--panel:rgba(17,26,46,.88);--panel2:rgba(23,35,61,.94);--text:#eef4ff;--muted:#9aa8bd;--line:rgba(148,163,184,.18);--blue:#3b82f6;--blue2:#60a5fa;--ok:#22c55e;--warn:#f59e0b;--danger:#ef4444;--info:#38bdf8;--shadow:0 18px 50px rgba(0,0,0,.28);--radius:20px}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;min-height:100vh;background:radial-gradient(circle at top left,rgba(59,130,246,.24),transparent 32rem),radial-gradient(circle at bottom right,rgba(34,197,94,.13),transparent 30rem),linear-gradient(135deg,var(--bg),var(--bg2) 55%,#111827);color:var(--text);font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,"Noto Sans Khmer",sans-serif}a{color:#bfdbfe;text-decoration:none}a:hover{text-decoration:none;color:#dbeafe}.layout{display:grid;grid-template-columns:280px minmax(0,1fr);min-height:100vh}.side{border-right:1px solid var(--line);background:rgba(7,12,25,.84);backdrop-filter:blur(18px);padding:20px;position:sticky;top:0;height:100vh;overflow:auto}.brand{display:flex;align-items:center;gap:10px;font-weight:900;font-size:22px;letter-spacing:-.03em}.brand-mark{display:grid;place-items:center;width:38px;height:38px;border-radius:14px;background:linear-gradient(135deg,var(--blue),#7c3aed);box-shadow:0 12px 32px rgba(59,130,246,.35)}.sub{color:var(--muted);font-size:12px;margin:8px 0 22px}.nav{display:grid;gap:5px}.nav a{display:flex;align-items:center;gap:10px;padding:11px 12px;border-radius:14px;color:var(--text);border:1px solid transparent}.nav a.active,.nav a:hover{background:rgba(96,165,250,.13);border-color:rgba(96,165,250,.24)}.nav-ico{width:24px;text-align:center}.main{padding:24px;max-width:1480px;width:100%}.top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:18px}.h1{font-size:29px;font-weight:900;letter-spacing:-.04em}.top-right{text-align:right;color:var(--muted);font-size:12px}.mobilebar{display:none;position:sticky;top:0;z-index:50;background:rgba(7,12,25,.9);backdrop-filter:blur(18px);border-bottom:1px solid var(--line);padding:10px 14px}.menu-toggle{display:none}.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px;margin-bottom:16px;box-shadow:var(--shadow)}.card h2,.card h3{margin:0 0 12px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:16px}.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.row3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.stat{background:linear-gradient(180deg,rgba(96,165,250,.12),rgba(15,23,42,.86));border:1px solid var(--line);border-radius:18px;padding:15px;min-height:100px}.stat b{font-size:28px;display:block;letter-spacing:-.04em}.stat small{display:block;color:var(--muted);margin-top:4px}.stat-ok{background:linear-gradient(180deg,rgba(34,197,94,.14),rgba(15,23,42,.86))}.stat-warn{background:linear-gradient(180deg,rgba(245,158,11,.14),rgba(15,23,42,.86))}.stat-danger{background:linear-gradient(180deg,rgba(239,68,68,.14),rgba(15,23,42,.86))}.muted{color:var(--muted)}.badge{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:999px;font-size:12px;border:1px solid var(--line);background:#1f2937;white-space:nowrap}.badge-ok{background:rgba(34,197,94,.13);color:#86efac;border-color:rgba(34,197,94,.34)}.badge-warn{background:rgba(245,158,11,.15);color:#fde68a;border-color:rgba(245,158,11,.34)}.badge-danger{background:rgba(239,68,68,.15);color:#fecaca;border-color:rgba(239,68,68,.36)}.badge-info{background:rgba(56,189,248,.14);color:#bae6fd;border-color:rgba(56,189,248,.35)}.badge-muted{background:rgba(148,163,184,.12);color:#cbd5e1}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:16px}.table{width:100%;border-collapse:collapse;min-width:760px}.table th,.table td{border-bottom:1px solid var(--line);padding:11px;text-align:left;vertical-align:top}.table tr:last-child td{border-bottom:0}.table th{color:#cbd5e1;font-size:11px;text-transform:uppercase;letter-spacing:.08em;background:rgba(15,23,42,.55);position:sticky;top:0}.table tbody tr:hover{background:rgba(148,163,184,.06)}.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.btn,button,input[type=submit]{display:inline-flex;align-items:center;justify-content:center;gap:7px;background:linear-gradient(135deg,var(--blue),#2563eb);color:white;border:0;border-radius:12px;padding:9px 13px;cursor:pointer;font-weight:800;min-height:38px}.btn:hover,button:hover,input[type=submit]:hover{filter:brightness(1.08);text-decoration:none}.btn:disabled,button:disabled{opacity:.6;cursor:not-allowed}.secondary{background:#334155!important}.danger{background:#dc2626!important}.ok{background:#16a34a!important}.warn{background:#d97706!important}.ghost{background:transparent!important;border:1px solid var(--line)!important;color:var(--text)!important}.field{margin:10px 0}.field label{display:flex;justify-content:space-between;gap:10px;color:#cbd5e1;margin-bottom:6px;font-weight:800}.help{color:var(--muted);font-size:12px;margin-top:5px}input,select,textarea{width:100%;background:#0f172a;color:var(--text);border:1px solid var(--line);border-radius:13px;padding:11px 12px;outline:none}input:focus,select:focus,textarea:focus{border-color:rgba(96,165,250,.8);box-shadow:0 0 0 3px rgba(59,130,246,.16)}textarea{min-height:120px;resize:vertical}.flash{border-radius:14px;padding:11px 13px;margin:8px 0 12px;background:#1e293b;border:1px solid var(--line)}.flash.success{background:rgba(34,197,94,.12);border-color:rgba(34,197,94,.35)}.flash.error{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.35)}.flash.warning{background:rgba(245,158,11,.12);border-color:rgba(245,158,11,.35)}code,pre{background:#020617;border:1px solid var(--line);border-radius:10px;padding:2px 5px}pre{padding:14px;overflow:auto;white-space:pre-wrap;max-height:65vh}.inline-form{display:inline}.footer{color:var(--muted);font-size:12px;margin-top:22px;display:grid;gap:6px}.progress{display:inline-flex;vertical-align:middle;width:120px;height:9px;border-radius:99px;background:#020617;border:1px solid var(--line);overflow:hidden;margin-right:7px}.progress span{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--blue2),var(--ok));transition:width .25s}.kbd{display:inline-flex;align-items:center;border:1px solid var(--line);border-bottom-width:2px;border-radius:8px;padding:1px 6px;background:#020617;color:#cbd5e1;font-size:11px}details{margin-top:10px}summary{cursor:pointer;color:#bfdbfe;font-weight:800}.pillbar{display:flex;gap:8px;flex-wrap:wrap}.empty{padding:22px;text-align:center;color:var(--muted)}.copybox{user-select:all;word-break:break-all}.danger-zone{border-color:rgba(239,68,68,.28);background:rgba(239,68,68,.06)}@media(max-width:1100px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.grid2,.row3{grid-template-columns:1fr}}@media(max-width:860px){.mobilebar{display:flex;justify-content:space-between;align-items:center}.layout{display:block}.side{display:none;position:fixed;z-index:60;inset:54px 0 0 0;height:auto;border-right:0;border-bottom:1px solid var(--line)}.menu-toggle:checked~.layout .side{display:block}.main{padding:16px}.top{align-items:flex-start}.grid,.grid2,.row{grid-template-columns:1fr}.h1{font-size:24px}.table{font-size:12px;min-width:720px}.card{padding:15px}}@media(max-width:520px){.grid{grid-template-columns:1fr}.actions .btn,.actions button{width:100%}.top{display:block}.top-right{text-align:left;margin-top:6px}}
 </style>
 </head>
 <body>
+<input id="menu-toggle" class="menu-toggle" type="checkbox">
+<div class="mobilebar"><label class="btn ghost" for="menu-toggle">☰ Menu</label><b>Bot Admin</b></div>
 <div class="layout">
 <aside class="side">
-  <div class="brand">Bot Admin</div>
+  <div class="brand"><span class="brand-mark">🤖</span><span>Bot Admin</span></div>
   <div class="sub">Admin ID: <code>{{ admin_id }}</code></div>
-  <nav class="nav">{% for key,label,url in nav %}<a class="{{ 'active' if key==active else '' }}" href="{{ url }}">{{ label }}</a>{% endfor %}</nav>
-  <div class="footer"><div>Supabase: {{ 'ON' if supabase_on else 'OFF' }}</div><div>Redis: {{ 'ON' if redis_on else 'OFF' }}</div><div><a href="/ping">Ping</a> - <a href="/admin/logout">Logout</a></div></div>
+  <nav class="nav">{% for key,label,url,ico in nav %}<a class="{{ 'active' if key==active else '' }}" href="{{ url }}"><span class="nav-ico">{{ ico }}</span><span>{{ label }}</span></a>{% endfor %}</nav>
+  <div class="footer"><div>Supabase: <b>{{ 'ON' if supabase_on else 'OFF' }}</b></div><div>Redis: <b>{{ 'ON' if redis_on else 'OFF' }}</b></div><div><a href="/ping">Ping</a> · <a href="/admin/logout">Logout</a></div></div>
 </aside>
 <main class="main">
-  <div class="top"><div class="h1">{{ title }}</div><div>{{ now }}</div></div>
+  <div class="top"><div><div class="h1">{{ title }}</div><div class="muted">Fast web control panel for Telegram bot operations</div></div><div class="top-right"><div>{{ now }}</div><div>UTC server time</div></div></div>
   {% for cat,msg in messages %}<div class="flash {{ cat }}">{{ msg }}</div>{% endfor %}
   {{ body|safe }}
 </main>
 </div>
-<script>window.WEB_CSRF={{ csrf|tojson }};</script>
+<script>
+window.WEB_CSRF={{ csrf|tojson }};
+(function(){
+  function qs(sel,root){return (root||document).querySelector(sel)}
+  function qsa(sel,root){return Array.from((root||document).querySelectorAll(sel))}
+  qsa('form[data-confirm]').forEach(function(form){form.addEventListener('submit',function(e){var msg=form.getAttribute('data-confirm')||'Are you sure?';if(!confirm(msg)){e.preventDefault();return false;}})});
+  qsa('form').forEach(function(form){form.addEventListener('submit',function(){var btn=form.querySelector('button[type="submit"],button:not([type]),input[type="submit"]');if(btn&&!form.dataset.noDisable){setTimeout(function(){btn.disabled=true;btn.dataset.oldText=btn.innerText;btn.innerText='Working…'},0)}})});
+  qsa('[data-count-target]').forEach(function(el){var target=qs(el.getAttribute('data-count-target'));function update(){if(target){el.textContent=target.value.length}};if(target){target.addEventListener('input',update);update();}});
+  var live=qs('[data-live-status]');
+  if(live){setInterval(function(){fetch('/admin/status.json?light=1',{credentials:'same-origin'}).then(function(r){return r.ok?r.json():null}).then(function(data){if(!data||!data.ok)return;qsa('[data-metric]').forEach(function(el){var k=el.getAttribute('data-metric');if(data.metrics&&Object.prototype.hasOwnProperty.call(data.metrics,k)){el.textContent=data.metrics[k]}});var up=qs('[data-uptime]');if(up)up.textContent=data.uptime||'';}).catch(function(){});},30000)}
+})();
+</script>
 </body>
 </html>
 """
@@ -1173,19 +1297,52 @@ def web_admin_logout():
     return redirect(url_for("web_admin_login"))
 
 
-def _web_counts() -> dict:
+def _web_table_count(table: str, select_field: str = "id") -> int | None:
+    if not supabase:
+        return None
+    try:
+        res = (
+            supabase.table(table)
+            .select(select_field, count="exact")
+            .limit(1)
+            .execute()
+        )
+        count = getattr(res, "count", None)
+        return int(count) if count is not None else None
+    except Exception:
+        return None
+
+
+def _web_counts(force: bool = False) -> dict:
+    now = time.monotonic()
+    with _WEB_COUNTS_CACHE_LOCK:
+        cached = dict(_WEB_COUNTS_CACHE.get("data") or {})
+        if cached and not force and now - float(_WEB_COUNTS_CACHE.get("ts") or 0.0) < WEB_COUNTS_CACHE_TTL_S:
+            return cached
+
     counts = {"users": 0, "blocked": 0, "schedules": 0, "pending": 0, "sending": 0, "failed": 0, "api_keys": 0}
+
     try:
-        counts["users"] = len(get_all_user_ids()) if supabase else 0
+        counted = _web_table_count("user_prefs", "user_id")
+        counts["users"] = counted if counted is not None else (len(get_all_user_ids()) if supabase else 0)
     except Exception:
         pass
+
     try:
-        counts["blocked"] = db_blocked_user_count()
+        counted = _web_table_count("blocked_users", "user_id")
+        counts["blocked"] = counted if counted is not None else db_blocked_user_count()
     except Exception:
         pass
+
     if supabase:
         try:
-            res = db_call_sync("web_sched_counts", lambda: supabase.table("scheduled_broadcasts").select("id,status,error_msg").limit(5000).execute(), default=None, attempts=2, critical=False)
+            res = db_call_sync(
+                "web_sched_counts",
+                lambda: supabase.table("scheduled_broadcasts").select("id,status,error_msg").limit(5000).execute(),
+                default=None,
+                attempts=2,
+                critical=False,
+            )
             rows = list(getattr(res, "data", None) or [])
             counts["schedules"] = len(rows)
             for r in rows:
@@ -1198,10 +1355,15 @@ def _web_counts() -> dict:
                     counts["failed"] += 1
         except Exception:
             pass
+
     try:
         counts["api_keys"] = int(db_ai_api_key_status().get("active_count") or 0)
     except Exception:
         pass
+
+    with _WEB_COUNTS_CACHE_LOCK:
+        _WEB_COUNTS_CACHE["data"] = dict(counts)
+        _WEB_COUNTS_CACHE["ts"] = now
     return counts
 
 
@@ -1220,36 +1382,47 @@ def web_admin_home():
             lock_html = _web_badge("no row", "warn")
     else:
         lock_html = _web_badge("disabled", "muted")
-    metrics_rows = "".join(f"<tr><td>{_web_h(k)}</td><td><b>{int(v)}</b></td></tr>" for k, v in _RUNTIME_METRICS.items())
-    setting_rows = "".join(f"<tr><td>{_web_h(BOT_SETTING_LABELS.get(k,k))}</td><td>{_web_badge('ON' if _setting_bool_from(settings,k) else 'OFF', 'ok' if _setting_bool_from(settings,k) else 'muted')}</td></tr>" for k in BOT_SETTING_DEFAULTS)
+
+    metric_rows = []
+    for k, v in _RUNTIME_METRICS.items():
+        metric_rows.append(f"<tr><td>{_web_h(k.replace('_', ' ').title())}</td><td><b data-metric='{_web_h(k)}'>{int(v)}</b></td></tr>")
+    metrics_rows = "".join(metric_rows)
+
+    setting_rows = "".join(
+        f"<tr><td>{_web_h(BOT_SETTING_LABELS.get(k,k))}<br><span class='muted'>{_web_h(BOT_SETTING_DESCRIPTIONS.get(k,''))}</span></td>"
+        f"<td>{_web_badge('ON' if _setting_bool_from(settings,k) else 'OFF', 'ok' if _setting_bool_from(settings,k) else 'muted')}</td></tr>"
+        for k in BOT_SETTING_DEFAULTS
+    )
+
     body = f"""
+    <div data-live-status></div>
     <div class='grid'>
-      <div class='stat'><span class='muted'>Users</span><b>{counts['users']}</b></div>
-      <div class='stat'><span class='muted'>Blocked</span><b>{counts['blocked']}</b></div>
-      <div class='stat'><span class='muted'>Pending schedules</span><b>{counts['pending']}</b></div>
-      <div class='stat'><span class='muted'>API keys</span><b>{counts['api_keys']}</b></div>
+      {_web_status_card('Users', counts['users'], 'saved in user_prefs', 'ok' if counts['users'] else '')}
+      {_web_status_card('Blocked', counts['blocked'], 'auto skipped during sends', 'danger' if counts['blocked'] else '')}
+      {_web_status_card('Pending schedules', counts['pending'], f"{counts['sending']} sending / {counts['failed']} failed", 'warn' if counts['pending'] else '')}
+      {_web_status_card('Active API keys', counts['api_keys'], 'generated admin access keys', 'ok' if counts['api_keys'] else '')}
     </div>
     <div class='grid2'>
-      <div class='card'><h2>System</h2><table class='table'>
-        <tr><td>Uptime</td><td>{_web_h(_format_uptime())}</td></tr>
+      <div class='card'><h2>System health</h2><div class='table-wrap'><table class='table'>
+        <tr><td>Uptime</td><td><b data-uptime>{_web_h(_format_uptime())}</b></td></tr>
         <tr><td>Supabase</td><td>{_web_badge('ON' if supabase else 'OFF', 'ok' if supabase else 'danger')}</td></tr>
         <tr><td>Redis</td><td>{_web_badge('ON' if redis_client else 'OFF', 'ok' if redis_client else 'warn')}</td></tr>
-        <tr><td>AI</td><td>{_web_h(AI_PROVIDER)} / {_web_h(HF_MODEL)}</td></tr>
-        <tr><td>OCR</td><td>{_web_h(OCR_PROVIDER)} / {_web_h(HF_OCR_MODEL)}</td></tr>
+        <tr><td>AI</td><td>{_web_h(AI_PROVIDER)} / <code>{_web_h(HF_MODEL)}</code></td></tr>
+        <tr><td>OCR</td><td>{_web_h(OCR_PROVIDER)} / <code>{_web_h(HF_OCR_MODEL)}</code></td></tr>
         <tr><td>Scheduler lock</td><td>{lock_html}</td></tr>
-        <tr><td>Settings DB</td><td>{_web_badge('OK' if settings_status.get('db_ok') else 'MEMORY', 'ok' if settings_status.get('db_ok') else 'warn')}</td></tr>
-      </table></div>
-      <div class='card'><h2>Runtime metrics</h2><table class='table'>{metrics_rows}</table></div>
+        <tr><td>Settings DB</td><td>{_web_badge('OK' if settings_status.get('db_ok') else 'MEMORY', 'ok' if settings_status.get('db_ok') else 'warn')} <span class='muted'>{_web_h(settings_status.get('error') or '')}</span></td></tr>
+      </table></div></div>
+      <div class='card'><h2>Runtime metrics</h2><div class='table-wrap'><table class='table'>{metrics_rows}</table></div></div>
     </div>
     <div class='grid2'>
-      <div class='card'><h2>Feature settings</h2><table class='table'>{setting_rows}</table><p><a class='btn secondary' href='/admin/settings'>Open settings</a></p></div>
-      <div class='card'><h2>Quick actions</h2><div class='actions'><a class='btn' href='/admin/users'>Manage Users</a><a class='btn' href='/admin/schedules'>Schedules</a><a class='btn' href='/admin/broadcast'>Broadcast</a><a class='btn secondary' href='/admin/sql'>SQL</a></div></div>
+      <div class='card'><h2>Feature settings</h2><div class='table-wrap'><table class='table'>{setting_rows}</table></div><p><a class='btn secondary' href='/admin/settings'>Open settings</a></p></div>
+      <div class='card'><h2>Quick actions</h2><p class='muted'>Common admin tasks. Dangerous actions still require confirmation on their pages.</p><div class='actions'><a class='btn' href='/admin/users'>Manage Users</a><a class='btn' href='/admin/schedules'>Schedules</a><a class='btn' href='/admin/broadcast'>Broadcast</a><a class='btn secondary' href='/admin/sql'>SQL Setup</a></div></div>
     </div>
     """
     return _web_render("Dashboard", body, active="dashboard")
 
 
-def _web_fetch_users(q: str = "", page: int = 0, page_size: int = 50) -> list[dict]:
+def _web_fetch_users(q: str = "", page: int = 0, page_size: int = WEB_TABLE_PAGE_SIZE) -> list[dict]:
     q = (q or "").strip()
     if q:
         return search_users_by_query(q, limit=page_size)
@@ -1258,7 +1431,7 @@ def _web_fetch_users(q: str = "", page: int = 0, page_size: int = 50) -> list[di
     start = max(0, int(page)) * page_size
     end = start + page_size - 1
     for fields in ("user_id, username, gender, speed, last_active", "user_id, username, gender, speed", "user_id, username"):
-        res = db_call_sync(f"web_users:{fields}:{page}", lambda f=fields: supabase.table("user_prefs").select(f).range(start, end).execute(), default=None, attempts=2, critical=False)
+        res = db_call_sync(f"web_users:{fields}:{page}:{page_size}", lambda f=fields: supabase.table("user_prefs").select(f).range(start, end).execute(), default=None, attempts=2, critical=False)
         if res is not None:
             return list(getattr(res, "data", None) or [])
     return []
@@ -1291,25 +1464,52 @@ def _web_send_telegram_message(chat_id: int, text: str) -> tuple[bool, str]:
 def web_admin_users():
     q = (request.args.get("q") or "").strip()
     page = max(0, _web_int(request.args.get("page"), 0))
-    rows = _web_fetch_users(q, page=page)
+    page_size = max(10, min(200, _web_int(request.args.get("page_size"), WEB_TABLE_PAGE_SIZE)))
+    rows = _web_fetch_users(q, page=page, page_size=page_size)
+    blocked_ids = _web_blocked_ids_for_users(rows)
     table_rows = []
     csrf = _web_csrf_token()
+    return_input = _web_return_input()
     for row in rows:
         uid = _web_int(row.get("user_id"), 0)
-        blocked = db_user_is_blocked(uid) if uid else False
+        blocked = uid in blocked_ids
+        username = row.get("username") or "-"
+        profile_link = f"<a href='{_web_url('/admin/users', q=uid)}'><code>{uid}</code></a>"
         table_rows.append(f"""
-        <tr><td><code>{uid}</code></td><td>{_web_h(row.get('username') or '-')}</td><td>{_web_h(row.get('gender') or '-')}</td><td>{_web_h(row.get('speed') or '-')}</td><td>{_web_h(_web_dt(row.get('last_active') or '-'))}</td><td>{_web_badge('blocked' if blocked else 'active', 'danger' if blocked else 'ok')}</td><td><div class='actions'>
-        <form class='inline-form' method='post' action='/admin/users/action'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='user_id' value='{uid}'><input type='hidden' name='action' value='{'unblock' if blocked else 'block'}'><button class='{'ok' if blocked else 'danger'}'>{'Unblock' if blocked else 'Block'}</button></form>
-        <form class='inline-form' method='post' action='/admin/users/action'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='user_id' value='{uid}'><input type='hidden' name='action' value='reset'><button class='secondary'>Reset prefs</button></form>
-        <form class='inline-form' method='post' action='/admin/users/action'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='user_id' value='{uid}'><input type='hidden' name='action' value='clear_history'><button class='secondary'>Clear history</button></form>
-        </div></td></tr>
+        <tr>
+          <td>{profile_link}</td>
+          <td>{_web_h(username)}</td>
+          <td>{_web_h(row.get('gender') or '-')}</td>
+          <td>{_web_h(row.get('speed') or '-')}</td>
+          <td>{_web_h(_web_dt(row.get('last_active') or '-'))}</td>
+          <td>{_web_badge('blocked' if blocked else 'active', 'danger' if blocked else 'ok')}</td>
+          <td><div class='actions'>
+            <form class='inline-form' method='post' action='/admin/users/action' {'data-confirm="Unblock this user?"' if blocked else 'data-confirm="Block this user?"'}>
+              <input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='user_id' value='{uid}'><input type='hidden' name='action' value='{'unblock' if blocked else 'block'}'><button class='{'ok' if blocked else 'danger'}'>{'Unblock' if blocked else 'Block'}</button>
+            </form>
+            <form class='inline-form' method='post' action='/admin/users/action' data-confirm='Reset this user voice preferences?'>
+              <input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='user_id' value='{uid}'><input type='hidden' name='action' value='reset'><button class='secondary'>Reset prefs</button>
+            </form>
+            <form class='inline-form' method='post' action='/admin/users/action' data-confirm='Clear cached conversation/history for this user?'>
+              <input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='user_id' value='{uid}'><input type='hidden' name='action' value='clear_history'><button class='secondary'>Clear history</button>
+            </form>
+          </div></td>
+        </tr>
         """)
-    next_link = f"<a class='btn secondary' href='/admin/users?page={page+1}&q={_web_h(q)}'>Next</a>" if not q and len(rows) >= 50 else ""
-    prev_link = f"<a class='btn secondary' href='/admin/users?page={max(0,page-1)}&q={_web_h(q)}'>Previous</a>" if page > 0 else ""
+    next_link = f"<a class='btn secondary' href='{_web_url('/admin/users', page=page+1, page_size=page_size, q=q)}'>Next</a>" if not q and len(rows) >= page_size else ""
+    prev_link = f"<a class='btn secondary' href='{_web_url('/admin/users', page=max(0,page-1), page_size=page_size, q=q)}'>Previous</a>" if page > 0 else ""
     body = f"""
-    <div class='card'><form method='get' class='row'><div class='field'><label>Search user ID or username</label><input name='q' value='{_web_h(q)}'></div><div class='field'><label>&nbsp;</label><button>Search</button> <a class='btn secondary' href='/admin/users'>Reset</a></div></form></div>
-    <div class='card'><h2>Users</h2><table class='table'><thead><tr><th>ID</th><th>Username</th><th>Voice</th><th>Speed</th><th>Last active</th><th>Status</th><th>Actions</th></tr></thead><tbody>{''.join(table_rows) or '<tr><td colspan=7>No users found.</td></tr>'}</tbody></table><p class='actions'>{prev_link}{next_link}</p></div>
-    <div class='card'><h2>Send direct message</h2><form method='post' action='/admin/users/action'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='action' value='send_message'><div class='row'><div class='field'><label>User ID</label><input name='user_id' required></div><div class='field'><label>&nbsp;</label><button>Send</button></div></div><div class='field'><label>Message</label><textarea name='message' required></textarea></div></form></div>
+    <div class='card'>
+      <form method='get' class='row3'>
+        <div class='field'><label>Search user ID or username <span class='kbd'>Enter</span></label><input name='q' value='{_web_h(q)}' placeholder='123456789 or @username' autofocus></div>
+        <div class='field'><label>Rows per page</label><select name='page_size'>
+          {''.join(f"<option value='{n}' {'selected' if page_size==n else ''}>{n}</option>" for n in (25,50,100,200))}
+        </select></div>
+        <div class='field'><label>&nbsp;</label><div class='actions'><button>Search</button><a class='btn secondary' href='/admin/users'>Reset</a></div></div>
+      </form>
+    </div>
+    <div class='card'><div class='actions' style='justify-content:space-between'><h2>Users</h2><span class='muted'>Page {page + 1}{' · filtered' if q else ''}</span></div><div class='table-wrap'><table class='table'><thead><tr><th>ID</th><th>Username</th><th>Voice</th><th>Speed</th><th>Last active</th><th>Status</th><th>Actions</th></tr></thead><tbody>{''.join(table_rows) or '<tr><td colspan=7><div class="empty">No users found.</div></td></tr>'}</tbody></table></div><p class='actions'>{prev_link}{next_link}</p></div>
+    <div class='card'><h2>Send direct message</h2><form method='post' action='/admin/users/action' data-confirm='Send this message now?'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='send_message'><div class='row'><div class='field'><label>User ID</label><input name='user_id' inputmode='numeric' required></div><div class='field'><label>&nbsp;</label><button>Send</button></div></div><div class='field'><label>Message <span><span data-count-target='#direct-message-text'>0</span>/{TELE_MSG_LIMIT}</span></label><textarea id='direct-message-text' name='message' maxlength='{TELE_MSG_LIMIT}' required></textarea></div></form></div>
     """
     return _web_render("Users", body, active="users")
 
@@ -1323,7 +1523,7 @@ def web_admin_users_action():
     action = str(request.form.get("action") or "").strip()
     if not user_id:
         flask_flash("Missing user ID.", "error")
-        return redirect(url_for("web_admin_users"))
+        return redirect(_web_safe_return("web_admin_users"))
     if action == "block":
         ok, msg = db_user_set_blocked(user_id, admin_id, True, "Blocked from web dashboard")
     elif action == "unblock":
@@ -1338,7 +1538,7 @@ def web_admin_users_action():
     else:
         ok, msg = False, "Unknown action."
     flask_flash(("OK: " if ok else "ERROR: ") + msg, "success" if ok else "error")
-    return redirect(request.referrer or url_for("web_admin_users"))
+    return redirect(_web_safe_return("web_admin_users"))
 
 
 def _web_sched_list(status: str = "all", q: str = "", limit: int = 150) -> list[dict]:
@@ -1424,30 +1624,51 @@ def web_admin_schedules():
     q = (request.args.get("q") or "").strip()
     rows = _web_sched_list(status, q)
     csrf = _web_csrf_token()
+    return_input = _web_return_input()
     table_rows = []
     for row in rows:
         rid = _web_int(row.get("id"), 0)
         content = row.get("caption") or row.get("plain_text") or ""
-        can_edit, _reason = _sched_can_edit(row, None)
+        can_edit, edit_reason = _sched_can_edit(row, _web_current_admin_id())
+        is_pending = str(row.get("status") or "").lower() == SCHED_STATUS_PENDING
         confirm_btn = ""
         if _sched_is_draft(row):
-            confirm_btn = f"<form class='inline-form' method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='action' value='confirm'><input type='hidden' name='row_id' value='{rid}'><button class='ok'>Confirm</button></form>"
+            confirm_btn = f"<form class='inline-form' method='post' action='/admin/schedules/action' data-confirm='Confirm and allow this schedule to send at its time?'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='confirm'><input type='hidden' name='row_id' value='{rid}'><button class='ok'>Confirm</button></form>"
+        cancel_btn = ""
+        if is_pending:
+            cancel_btn = f"<form class='inline-form' method='post' action='/admin/schedules/action' data-confirm='Cancel this scheduled broadcast?'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='cancel'><input type='hidden' name='row_id' value='{rid}'><button class='danger'>Cancel</button></form>"
         edit_block = ""
         if can_edit:
             edit_block = f"""
-            <details><summary>Edit</summary>
-              <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='action' value='edit_time'><input type='hidden' name='row_id' value='{rid}'><input name='broadcast_at' placeholder='YYYY-MM-DD HH:MM UTC'><button>Save Time</button></form>
-              <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='action' value='edit_text'><input type='hidden' name='row_id' value='{rid}'><textarea name='text'>{_web_h(content)}</textarea><button>Save Text</button></form>
+            <details><summary>Edit schedule</summary>
+              <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_time'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>UTC time</label><input type='datetime-local' name='broadcast_at' value='{_web_h(_web_dt_input_value(row.get('broadcast_at')))}' required></div><button>Save Time</button></form>
+              <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_text'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>Text / caption</label><textarea name='text' required>{_web_h(content)}</textarea></div><button>Save Text</button></form>
+              <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_photo'><input type='hidden' name='row_id' value='{rid}'><div class='row'><div class='field'><label>Photo file ID</label><input name='photo_file_id' value='{_web_h(row.get('photo_file_id') or '')}'></div><div class='field'><label>Caption</label><input name='caption' value='{_web_h(row.get('caption') or '')}' maxlength='1024'></div></div><button class='secondary'>Save Photo</button></form>
             </details>
             """
+        elif is_pending:
+            edit_block = f"<div class='help'>Not editable: {_web_h(edit_reason)}</div>"
         table_rows.append(f"""
-        <tr><td><code>#{rid}</code><br><span class='muted'>admin {_web_h(row.get('admin_id'))}</span></td><td>{_web_status_badge(row.get('status'), row)}<br><span class='muted'>{_web_h(row.get('error_msg') or '')}</span></td><td>{_web_h(_web_dt(row.get('broadcast_at')))}</td><td>{_web_h(_web_short(content, 160))}<br>{_web_badge('photo' if row.get('photo_file_id') else 'text', 'info' if row.get('photo_file_id') else 'muted')}</td><td><div class='actions'>{confirm_btn}<form class='inline-form' method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='action' value='cancel'><input type='hidden' name='row_id' value='{rid}'><button class='danger'>Cancel</button></form></div>{edit_block}</td></tr>
+        <tr>
+          <td><code>#{rid}</code><br><span class='muted'>admin {_web_h(row.get('admin_id'))}</span></td>
+          <td>{_web_status_badge(row.get('status'), row)}<br><span class='muted'>{_web_h(row.get('error_msg') or '')}</span></td>
+          <td>{_web_h(_web_dt(row.get('broadcast_at')))}</td>
+          <td>{_web_h(_web_short(content, 180))}<br>{_web_badge('photo' if row.get('photo_file_id') else 'text', 'info' if row.get('photo_file_id') else 'muted')}</td>
+          <td><div class='actions'>{confirm_btn}{cancel_btn}</div>{edit_block}</td>
+        </tr>
         """)
     options = "".join(f"<option value='{s}' {'selected' if status==s else ''}>{s.title()}</option>" for s in ["all", "preview", "pending", "sending", "done", "failed", "cancelled"])
+    now_plus = (datetime.now(timezone.utc) + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M")
     body = f"""
-    <div class='card'><form method='get' class='row'><div class='field'><label>Status</label><select name='status'>{options}</select></div><div class='field'><label>Search ID/text</label><input name='q' value='{_web_h(q)}'></div><div class='field'><button>Filter</button></div></form></div>
-    <div class='card'><h2>Create Schedule</h2><form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='action' value='create'><div class='row'><div class='field'><label>Broadcast UTC time</label><input name='broadcast_at' placeholder='2026-12-25 09:00' required></div><div class='field'><label>Mode</label><select name='confirmed'><option value='0'>Preview first</option><option value='1'>Confirm immediately</option></select></div></div><div class='field'><label>Text message</label><textarea name='text' placeholder='Required for text-only schedule; used as photo caption when caption is empty'></textarea></div><div class='row'><div class='field'><label>Telegram photo_file_id optional</label><input name='photo_file_id'></div><div class='field'><label>Photo caption optional</label><input name='caption'></div></div><button>Create Schedule</button></form></div>
-    <div class='card'><h2>Schedules</h2><table class='table'><thead><tr><th>ID</th><th>Status</th><th>Time</th><th>Content</th><th>Actions</th></tr></thead><tbody>{''.join(table_rows) or '<tr><td colspan=5>No schedules found.</td></tr>'}</tbody></table></div>
+    <div class='card'>
+      <form method='get' class='row3'>
+        <div class='field'><label>Status</label><select name='status'>{options}</select></div>
+        <div class='field'><label>Search ID/text</label><input name='q' value='{_web_h(q)}' placeholder='ID, caption, or text'></div>
+        <div class='field'><label>&nbsp;</label><div class='actions'><button>Filter</button><a class='btn secondary' href='/admin/schedules'>Reset</a></div></div>
+      </form>
+    </div>
+    <div class='card'><h2>Create Schedule</h2><p class='muted'>Times are stored and shown in UTC. Use Preview first for safer broadcasts.</p><form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='create'><div class='row'><div class='field'><label>Broadcast UTC time</label><input type='datetime-local' name='broadcast_at' value='{now_plus}' required><div class='help'>Example: 2026-12-25 09:00 UTC</div></div><div class='field'><label>Mode</label><select name='confirmed'><option value='0'>Preview first</option><option value='1'>Confirm immediately</option></select></div></div><div class='field'><label>Text message <span><span data-count-target='#schedule-text'>0</span>/{TELE_MSG_LIMIT}</span></label><textarea id='schedule-text' name='text' maxlength='{TELE_MSG_LIMIT}' placeholder='Required for text-only schedule; used as photo caption when caption is empty'></textarea></div><div class='row'><div class='field'><label>Telegram photo_file_id optional</label><input name='photo_file_id'></div><div class='field'><label>Photo caption optional</label><input name='caption' maxlength='1024'></div></div><button>Create Schedule</button></form></div>
+    <div class='card'><div class='actions' style='justify-content:space-between'><h2>Schedules</h2><span class='muted'>{len(rows)} shown</span></div><div class='table-wrap'><table class='table'><thead><tr><th>ID</th><th>Status</th><th>Time</th><th>Content</th><th>Actions</th></tr></thead><tbody>{''.join(table_rows) or '<tr><td colspan=5><div class="empty">No schedules found.</div></td></tr>'}</tbody></table></div></div>
     """
     return _web_render("Schedules", body, active="schedules")
 
@@ -1486,10 +1707,18 @@ def web_admin_schedules_action():
                 request.form.get("text") or "",
             )
             msg = "text updated" if ok else f"text not updated: {reason}"
+        elif action == "edit_photo":
+            ok, reason, _row = db_sched_update_photo(
+                row_id,
+                _web_current_admin_id(),
+                request.form.get("photo_file_id") or "",
+                request.form.get("caption") or "",
+            )
+            msg = "photo updated" if ok else f"photo not updated: {reason}"
     except Exception as exc:
         ok, msg = False, str(exc)
     flask_flash(("OK: " if ok else "ERROR: ") + msg, "success" if ok else "error")
-    return redirect(request.referrer or url_for("web_admin_schedules"))
+    return redirect(_web_safe_return("web_admin_schedules"))
 
 
 def _web_broadcast_job_set(job_id: str, **updates) -> None:
@@ -1503,19 +1732,25 @@ def _web_broadcast_job_set(job_id: str, **updates) -> None:
 
 
 def _web_broadcast_worker(job_id: str, admin_id: int, text: str) -> None:
-    """Run web dashboard broadcast in bounded concurrent batches.
+    """Run web dashboard broadcast in bounded concurrent batches."""
+    try:
+        raw_users = get_all_user_ids()
+    except Exception as exc:
+        logger.error("web broadcast could not load users: %s", exc, exc_info=True)
+        _web_broadcast_job_set(job_id, status="failed", error=str(exc)[:500], finished_at=_sched_iso())
+        return
 
-    The Telegram bot path already sends broadcasts concurrently. This web path
-    now uses the same bounded-batch idea so large admin broadcasts do not take
-    one blocking HTTP request per user in serial.
-    """
-    raw_users = get_all_user_ids()
     users: list[int] = []
+    seen: set[int] = set()
     for raw_uid in raw_users:
         try:
-            users.append(int(raw_uid))
+            uid = int(raw_uid)
         except Exception:
             logger.warning("web broadcast skipped invalid user id: %r", raw_uid)
+            continue
+        if uid not in seen:
+            users.append(uid)
+            seen.add(uid)
 
     total = len(users)
     sent = failed = blocked = 0
@@ -1533,9 +1768,11 @@ def _web_broadcast_worker(job_id: str, admin_id: int, text: str) -> None:
         _web_broadcast_job_set(job_id, status="done", finished_at=_sched_iso())
         return
 
+    blocked_ids = _web_blocked_ids_for_users(users)
+
     def _send_one(uid: int) -> str:
         try:
-            if db_user_is_blocked(uid):
+            if uid in blocked_ids:
                 return "blocked"
             ok, send_msg = _web_send_telegram_message(uid, text)
             if ok:
@@ -1551,31 +1788,36 @@ def _web_broadcast_worker(job_id: str, admin_id: int, text: str) -> None:
             return "failed"
 
     workers = max(1, min(WEB_BROADCAST_WORKERS, max(1, len(users))))
-    batch_size = max(1, BROADCAST_BATCH_SIZE)
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="web_broadcast") as pool:
-        for start in range(0, total, batch_size):
-            batch = users[start:start + batch_size]
-            results = list(pool.map(_send_one, batch))
-            for result in results:
-                if result == "sent":
-                    sent += 1
-                elif result == "blocked":
-                    blocked += 1
-                else:
-                    failed += 1
+    batch_size = max(1, max(BROADCAST_BATCH_SIZE, workers))
+    try:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="web_broadcast") as pool:
+            for start in range(0, total, batch_size):
+                batch = users[start:start + batch_size]
+                results = list(pool.map(_send_one, batch))
+                for result in results:
+                    if result == "sent":
+                        sent += 1
+                    elif result == "blocked":
+                        blocked += 1
+                    else:
+                        failed += 1
 
-            _web_broadcast_job_set(job_id, sent=sent, failed=failed, blocked=blocked)
-            if start + len(batch) < total and WEB_BROADCAST_DELAY_S:
-                time.sleep(WEB_BROADCAST_DELAY_S)
+                _web_broadcast_job_set(job_id, sent=sent, failed=failed, blocked=blocked)
+                if start + len(batch) < total and WEB_BROADCAST_DELAY_S:
+                    time.sleep(WEB_BROADCAST_DELAY_S)
 
-    _web_broadcast_job_set(
-        job_id,
-        status="done",
-        sent=sent,
-        failed=failed,
-        blocked=blocked,
-        finished_at=_sched_iso(),
-    )
+        _web_broadcast_job_set(
+            job_id,
+            status="done",
+            sent=sent,
+            failed=failed,
+            blocked=blocked,
+            finished_at=_sched_iso(),
+        )
+    except Exception as exc:
+        logger.error("web broadcast worker failed job=%s: %s", job_id, exc, exc_info=True)
+        _web_broadcast_job_set(job_id, status="failed", sent=sent, failed=failed, blocked=blocked, error=str(exc)[:500], finished_at=_sched_iso())
+
 
 @app_flask.route("/admin/broadcast", methods=["GET", "POST"])
 @web_admin_required
@@ -1590,18 +1832,30 @@ def web_admin_broadcast():
         else:
             job_id = secrets.token_hex(6)
             _web_broadcast_job_set(job_id, status="queued", total=0, sent=0, failed=0, blocked=0, created_at=_sched_iso())
-            threading.Thread(target=_web_broadcast_worker, args=(job_id, _web_current_admin_id(), text), daemon=True).start()
+            threading.Thread(target=_web_broadcast_worker, args=(job_id, _web_current_admin_id(), text), daemon=True, name=f"web-broadcast-{job_id}").start()
             flask_flash(f"Broadcast job {job_id} started.", "success")
             return redirect(url_for("web_admin_broadcast"))
     with _WEB_BROADCAST_JOBS_LOCK:
         jobs = list(reversed(list(_WEB_BROADCAST_JOBS.items())))
-    job_rows = "".join(f"<tr><td><code>{_web_h(jid)}</code></td><td>{_web_status_badge(row.get('status'))}</td><td>{int(row.get('sent') or 0)}/{int(row.get('total') or 0)}</td><td>{int(row.get('blocked') or 0)}</td><td>{int(row.get('failed') or 0)}</td><td>{_web_h(row.get('started_at') or row.get('created_at') or '')}</td></tr>" for jid, row in jobs)
+    job_rows = ""
+    for jid, row in jobs:
+        sent = int(row.get('sent') or 0)
+        total = int(row.get('total') or 0)
+        job_rows += f"<tr><td><code>{_web_h(jid)}</code><br><span class='muted'>{_web_h(row.get('error') or '')}</span></td><td>{_web_status_badge(row.get('status'))}</td><td>{sent}/{total}<br>{_web_progress_bar(sent + int(row.get('blocked') or 0) + int(row.get('failed') or 0), total)}</td><td>{int(row.get('blocked') or 0)}</td><td>{int(row.get('failed') or 0)}</td><td>{_web_h(row.get('started_at') or row.get('created_at') or '')}</td></tr>"
     csrf = _web_csrf_token()
     body = f"""
-    <div class='card'><h2>Immediate text broadcast</h2><p class='muted'>Sends plain text to all users in user_prefs. Blocked users are skipped. Telegram 403 users are auto-marked blocked.</p><form method='post'><input type='hidden' name='csrf_token' value='{csrf}'><div class='field'><label>Message</label><textarea name='text' required></textarea></div><button class='danger'>Start Broadcast</button></form></div>
-    <div class='card'><h2>Recent web broadcast jobs</h2><table class='table'><thead><tr><th>Job</th><th>Status</th><th>Sent</th><th>Blocked</th><th>Failed</th><th>Started</th></tr></thead><tbody>{job_rows or '<tr><td colspan=6>No jobs yet.</td></tr>'}</tbody></table></div>
+    <div class='card danger-zone'><h2>Immediate text broadcast</h2><p class='muted'>Sends plain text to all users in user_prefs. Blocked users are skipped. Telegram 403 users are auto-marked blocked.</p><form method='post' data-confirm='Start this broadcast now? This sends to all users.'><input type='hidden' name='csrf_token' value='{csrf}'><div class='field'><label>Message <span><span data-count-target='#broadcast-text'>0</span>/{TELE_MSG_LIMIT}</span></label><textarea id='broadcast-text' name='text' maxlength='{TELE_MSG_LIMIT}' required></textarea><div class='help'>For scheduled sending, use the Schedules page instead.</div></div><button class='danger'>Start Broadcast</button></form></div>
+    <div class='card'><div class='actions' style='justify-content:space-between'><h2>Recent web broadcast jobs</h2><a class='btn secondary' href='/admin/broadcast'>Refresh</a></div><div class='table-wrap'><table class='table'><thead><tr><th>Job</th><th>Status</th><th>Progress</th><th>Blocked</th><th>Failed</th><th>Started</th></tr></thead><tbody>{job_rows or '<tr><td colspan=6><div class="empty">No jobs yet.</div></td></tr>'}</tbody></table></div></div>
     """
     return _web_render("Broadcast", body, active="broadcast")
+
+
+@app_flask.route("/admin/broadcast/jobs.json")
+@web_admin_required
+def web_admin_broadcast_jobs_json():
+    with _WEB_BROADCAST_JOBS_LOCK:
+        jobs = [{"id": jid, **dict(row)} for jid, row in reversed(list(_WEB_BROADCAST_JOBS.items()))]
+    return jsonify({"ok": True, "jobs": jobs})
 
 
 @app_flask.route("/admin/settings", methods=["GET", "POST"])
@@ -1619,8 +1873,12 @@ def web_admin_settings():
     rows = []
     for key in BOT_SETTING_DEFAULTS:
         enabled = _setting_bool_from(settings, key)
-        rows.append(f"<tr><td><b>{_web_h(BOT_SETTING_LABELS.get(key,key))}</b><br><span class='muted'>{_web_h(BOT_SETTING_DESCRIPTIONS.get(key,''))}</span></td><td>{_web_badge('ON' if enabled else 'OFF', 'ok' if enabled else 'muted')}</td><td><form method='post'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='key' value='{_web_h(key)}'><input type='hidden' name='enabled' value='{'0' if enabled else '1'}'><button class='{'danger' if enabled else 'ok'}'>{'Turn OFF' if enabled else 'Turn ON'}</button></form></td></tr>")
-    body = f"<div class='card'><h2>Bot Settings</h2><p>DB status: {_web_badge('OK' if status.get('db_ok') else 'MEMORY', 'ok' if status.get('db_ok') else 'warn')} {_web_h(status.get('error') or '')}</p><table class='table'><thead><tr><th>Setting</th><th>Status</th><th>Action</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+        rows.append(
+            f"<tr><td><b>{_web_h(BOT_SETTING_LABELS.get(key,key))}</b><br><span class='muted'>{_web_h(BOT_SETTING_DESCRIPTIONS.get(key,''))}</span></td>"
+            f"<td>{_web_badge('ON' if enabled else 'OFF', 'ok' if enabled else 'muted')}</td>"
+            f"<td><form method='post' data-confirm='Change this bot setting?'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='key' value='{_web_h(key)}'><input type='hidden' name='enabled' value='{'0' if enabled else '1'}'><button class='{'danger' if enabled else 'ok'}'>{'Turn OFF' if enabled else 'Turn ON'}</button></form></td></tr>"
+        )
+    body = f"""<div class='card'><h2>Bot Settings</h2><p>DB status: {_web_badge('OK' if status.get('db_ok') else 'MEMORY', 'ok' if status.get('db_ok') else 'warn')} <span class='muted'>{_web_h(status.get('error') or '')}</span></p><div class='table-wrap'><table class='table'><thead><tr><th>Setting</th><th>Status</th><th>Action</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div></div>"""
     return _web_render("Settings", body, active="settings")
 
 
@@ -1646,8 +1904,14 @@ def web_admin_api_keys():
         rows = []
         flask_flash(str(exc), "error")
     csrf = _web_csrf_token()
-    trs = "".join(f"<tr><td><code>{_web_h(r.get('id'))}</code></td><td>{_web_h(r.get('key_prefix'))}</td><td>{_web_h(r.get('note') or '')}</td><td>{_web_badge('active' if r.get('active') else 'revoked', 'ok' if r.get('active') else 'muted')}</td><td>{_web_h(_web_dt(r.get('created_at')))}</td><td><form class='inline-form' method='post'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='action' value='revoke'><input type='hidden' name='identifier' value='{_web_h(r.get('id'))}'><button class='danger'>Revoke</button></form></td></tr>" for r in rows)
-    body = f"<div class='card'><h2>Create API Key</h2><form method='post'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='action' value='create'><div class='field'><label>Note</label><input name='note' placeholder='frontend, mobile app, test'></div><button>Create key</button></form></div><div class='card'><h2>API Keys</h2><table class='table'><thead><tr><th>ID</th><th>Prefix</th><th>Note</th><th>Status</th><th>Created</th><th>Action</th></tr></thead><tbody>{trs or '<tr><td colspan=6>No keys.</td></tr>'}</tbody></table></div>"
+    trs = "".join(
+        f"<tr><td><code>{_web_h(r.get('id'))}</code></td><td><code>{_web_h(r.get('key_prefix'))}</code></td><td>{_web_h(r.get('note') or '')}</td><td>{_web_badge('active' if r.get('active') else 'revoked', 'ok' if r.get('active') else 'muted')}</td><td>{_web_h(_web_dt(r.get('created_at')))}</td><td><form class='inline-form' method='post' data-confirm='Revoke this API key? Existing clients using it will fail.'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='action' value='revoke'><input type='hidden' name='identifier' value='{_web_h(r.get('id'))}'><button class='danger'>Revoke</button></form></td></tr>"
+        for r in rows
+    )
+    body = f"""
+    <div class='card'><h2>Create API Key</h2><p class='muted'>The raw key is shown once in the success message. Store it in your frontend/backend env immediately.</p><form method='post'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='action' value='create'><div class='field'><label>Note</label><input name='note' placeholder='frontend, mobile app, test'></div><button>Create key</button></form></div>
+    <div class='card'><h2>API Keys</h2><div class='table-wrap'><table class='table'><thead><tr><th>ID</th><th>Prefix</th><th>Note</th><th>Status</th><th>Created</th><th>Action</th></tr></thead><tbody>{trs or '<tr><td colspan=6><div class="empty">No keys.</div></td></tr>'}</tbody></table></div></div>
+    """
     return _web_render("API Keys", body, active="api")
 
 
@@ -1663,7 +1927,7 @@ def web_admin_locks():
             flask_flash("Scheduler lock release attempted.", "success" if res is not None else "warning")
         return redirect(url_for("web_admin_locks"))
     lock = db_lock_read(_SCHED_LOCK_KEY) if supabase else None
-    body = f"<div class='card'><h2>Distributed Scheduler Lock</h2><table class='table'><tr><td>Enabled</td><td>{_web_badge('ON' if _SCHED_LOCK_ENABLED else 'OFF', 'ok' if _SCHED_LOCK_ENABLED else 'muted')}</td></tr><tr><td>Required</td><td>{_web_badge('YES' if _SCHED_LOCK_REQUIRED else 'NO', 'warn' if _SCHED_LOCK_REQUIRED else 'muted')}</td></tr><tr><td>Key</td><td><code>{_web_h(_SCHED_LOCK_KEY)}</code></td></tr><tr><td>Current row</td><td><pre>{_web_h(_json.dumps(lock, ensure_ascii=False, indent=2) if lock else 'No lock row found.')}</pre></td></tr></table><form method='post'><input type='hidden' name='csrf_token' value='{_web_csrf_token()}'><button class='danger'>Force release scheduler lock</button></form><p class='muted'>Only force release when the old owner is dead or Render restarted.</p></div>"
+    body = f"""<div class='card'><h2>Distributed Scheduler Lock</h2><div class='table-wrap'><table class='table'><tr><td>Enabled</td><td>{_web_badge('ON' if _SCHED_LOCK_ENABLED else 'OFF', 'ok' if _SCHED_LOCK_ENABLED else 'muted')}</td></tr><tr><td>Required</td><td>{_web_badge('YES' if _SCHED_LOCK_REQUIRED else 'NO', 'warn' if _SCHED_LOCK_REQUIRED else 'muted')}</td></tr><tr><td>Key</td><td><code>{_web_h(_SCHED_LOCK_KEY)}</code></td></tr><tr><td>Current row</td><td><pre>{_web_h(_json.dumps(lock, ensure_ascii=False, indent=2) if lock else 'No lock row found.')}</pre></td></tr></table></div><form method='post' data-confirm='Force release scheduler lock? Only do this if the old owner is dead.'><input type='hidden' name='csrf_token' value='{_web_csrf_token()}'><button class='danger'>Force release scheduler lock</button></form><p class='muted'>Only force release when the old owner is dead or Render restarted.</p></div>"""
     return _web_render("Locks", body, active="locks")
 
 
@@ -1702,7 +1966,20 @@ where status = 'pending';"""
 @app_flask.route("/admin/status.json")
 @web_admin_required
 def web_admin_status_json():
-    return jsonify({"ok": True, "counts": _web_counts(), "metrics": dict(_RUNTIME_METRICS), "scheduler_lock": db_lock_read(_SCHED_LOCK_KEY) if supabase else None, "uptime": _format_uptime()})
+    light = str(request.args.get("light") or "0") == "1"
+    payload = {
+        "ok": True,
+        "metrics": dict(_RUNTIME_METRICS),
+        "uptime": _format_uptime(),
+    }
+    if not light:
+        payload.update({
+            "counts": _web_counts(),
+            "scheduler_lock": db_lock_read(_SCHED_LOCK_KEY) if supabase else None,
+        })
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app_flask.route("/dashboard")
@@ -2204,6 +2481,7 @@ _BOT_LOCK_OWNER       = os.environ.get("BOT_LOCK_OWNER", "").strip() or (
 )
 _DT_FORMATS = [
     "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S",
     "%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M",
 ]
 
