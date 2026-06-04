@@ -2832,7 +2832,15 @@ def _audio_mime_for_gemini(filename: str | None, mime_type: str | None) -> str:
 
 
 _DB_EXECUTOR = ThreadPoolExecutor(
-    max_workers=max(4, MAX_CONCURRENT_TTS_USERS), thread_name_prefix="db_write"
+    # Keep Supabase writes bounded. Too many SDK threads can trigger
+    # [Errno 11] Resource temporarily unavailable on small Render instances.
+    max_workers=_env_int(
+        "DB_EXECUTOR_MAX_WORKERS",
+        min(4, max(2, MAX_CONCURRENT_TTS_USERS)),
+        minimum=1,
+        maximum=16,
+    ),
+    thread_name_prefix="db_write",
 )
 _AI_EXECUTOR = ThreadPoolExecutor(
     max_workers=max(2, MAX_CONCURRENT_AI), thread_name_prefix="ai"
@@ -5810,12 +5818,19 @@ def db_sched_confirm(row_id: int, admin_id: int) -> tuple[bool, str, dict | None
     _sched_admin_pending_cache_clear(admin_id)
     return True, "confirmed", saved
 
-def db_sched_set_status(row_id: int, status: str, **extra) -> None:
+def db_sched_set_status(row_id: int, status: str, *, critical: bool = False, **extra) -> bool:
+    """Update one scheduled broadcast status and report whether DB saved it.
+
+    `critical=True` is used by the scheduler finalizer. Without it, a failed
+    final update could be swallowed by db_call_sync and the row would remain
+    stuck in `sending` even though Telegram sending already finished.
+    """
     if not supabase:
-        return
+        return False
+
     update = {"status": str(status), **extra}
     try:
-        db_call_sync(
+        res = db_call_sync(
             f"sched_set_status:{row_id}:{status}",
             lambda: (
                 supabase.table("scheduled_broadcasts")
@@ -5824,10 +5839,22 @@ def db_sched_set_status(row_id: int, status: str, **extra) -> None:
                 .execute()
             ),
             default=None,
+            attempts=3 if critical else 2,
+            critical=critical,
         )
-        _sched_admin_pending_cache_clear(None)
+        ok = bool(getattr(res, "data", None))
+        if ok:
+            _sched_admin_pending_cache_clear(None)
+            return True
+        if critical:
+            raise RuntimeError(f"scheduled_broadcasts status update returned no row for id={row_id} status={status}")
+        logger.warning("db_sched_set_status #%s -> %s returned no saved row", row_id, status)
+        return False
     except Exception as e:
         logger.error(f"db_sched_set_status #{row_id} -> {status}: {e}")
+        if critical:
+            raise
+        return False
 
 
 def db_sched_mark_stale_sending_failed() -> int:
@@ -7052,18 +7079,35 @@ async def _run_broadcast_to_all(
         logger.error(f"{label}: _BROADCAST_SEMAPHORE not initialised.")
         return (0, 0, 0)
 
-    loop     = asyncio.get_running_loop()
-    user_ids = await loop.run_in_executor(None, get_all_user_ids)
-    total    = len(user_ids)
+    loop = asyncio.get_running_loop()
+    raw_user_ids = await loop.run_in_executor(None, get_all_user_ids)
 
-    if total == 0:
+    # Do not keep retrying users already known as unreachable/blocked.
+    # This prevents scheduled broadcasts from repeatedly logging "Chat not found"
+    # for the same invalid Telegram IDs.
+    existing_blocked_ids = await loop.run_in_executor(
+        None, functools.partial(_web_blocked_ids_for_users, raw_user_ids)
+    )
+    user_ids = [int(uid) for uid in raw_user_ids if int(uid) not in existing_blocked_ids]
+    total_registered = len(raw_user_ids)
+    total = len(user_ids)
+
+    if total_registered == 0:
         await safe_send(lambda: bot.send_message(
             chat_id=admin_id,
             text=f"⚠️ {label}: មិនមានអ្នកប្រើប្រាស់ registered ណាមួយទេ។",
         ))
         return (0, 0, 0)
 
-    sent = failed = blocked = 0
+    sent = failed = 0
+    blocked = max(0, total_registered - total)
+
+    if total == 0:
+        await safe_send(lambda: bot.send_message(
+            chat_id=admin_id,
+            text=f"⚠️ {label}: អ្នកប្រើប្រាស់ទាំងអស់ស្ថិតក្នុង blocked/unreachable list។",
+        ))
+        return (0, 0, blocked)
     photo_file_id = pending.get("photo_file_id")
     safe_caption  = _safe_broadcast_html(pending.get("caption"), 1024)
     safe_text     = _safe_broadcast_html(pending.get("text"), 4096)
@@ -7076,7 +7120,10 @@ async def _run_broadcast_to_all(
 
     progress_msg = await safe_send(lambda: bot.send_message(
         chat_id=admin_id,
-        text=f"📡 {label} — កំពុង Broadcast ទៅ {total} នាក់..."
+        text=(
+            f"📡 {label} — កំពុង Broadcast ទៅ {total} active user(s)...\n"
+            f"👥 Registered: {total_registered}  🚫 Skipped blocked: {blocked}"
+        )
     ))
 
     async def _send_one(uid: int) -> str:
@@ -7097,13 +7144,42 @@ async def _run_broadcast_to_all(
                             parse_mode="HTML",
                         )
                     return "sent"
-                except Forbidden:
+                except Forbidden as e:
+                    await loop.run_in_executor(
+                        None,
+                        functools.partial(
+                            db_user_set_blocked,
+                            int(uid),
+                            int(admin_id),
+                            True,
+                            f"Telegram Forbidden during broadcast: {str(e)[:180]}",
+                        ),
+                    )
                     return "blocked"
                 except RetryAfter as e:
                     await asyncio.sleep(e.retry_after + 1)
                     if attempt == 1:
                         return "failed"
                 except BadRequest as e:
+                    low = str(e).lower()
+                    if (
+                        "chat not found" in low
+                        or "user is deactivated" in low
+                        or "bot can't initiate conversation" in low
+                        or "bot can’t initiate conversation" in low
+                    ):
+                        logger.warning(f"{label}: marking unreachable uid={uid} as blocked: {e}")
+                        await loop.run_in_executor(
+                            None,
+                            functools.partial(
+                                db_user_set_blocked,
+                                int(uid),
+                                int(admin_id),
+                                True,
+                                f"Telegram unreachable during broadcast: {str(e)[:180]}",
+                            ),
+                        )
+                        return "blocked"
                     logger.error(f"{label} Telegram BadRequest uid={uid}: {e}")
                     return "failed"
                 except Exception as e:
@@ -7146,8 +7222,11 @@ async def _run_broadcast_to_all(
 
     report = (
         f"✅ <b>{html.escape(label)}</b> រួចរាល់!\n\n"
-        f"👥 សរុប: {total}\n📨 បានផ្ញើ: {sent}\n"
-        f"🚫 Blocked: {blocked}\n❌ Failed: {failed}"
+        f"👥 Registered: {total_registered}\n"
+        f"🎯 Active target: {total}\n"
+        f"📨 បានផ្ញើ: {sent}\n"
+        f"🚫 Blocked/unreachable: {blocked}\n"
+        f"❌ Failed: {failed}"
     )
     try:
         if progress_msg:
@@ -8380,6 +8459,7 @@ async def _fire_scheduled_broadcast(bot, row: dict, already_claimed: bool = Fals
                 db_sched_set_status,
                 row_id,
                 SCHED_STATUS_DONE,
+                critical=True,
                 sent_count=sent,
                 failed_count=failed,
                 blocked_count=blocked,
@@ -8394,6 +8474,7 @@ async def _fire_scheduled_broadcast(bot, row: dict, already_claimed: bool = Fals
                 db_sched_set_status,
                 row_id,
                 SCHED_STATUS_FAILED,
+                critical=True,
                 sent_count=sent,
                 failed_count=failed,
                 blocked_count=blocked,
