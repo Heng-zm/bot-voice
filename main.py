@@ -1303,8 +1303,10 @@ def _web_render(title: str, body: str, *, active: str = "dashboard", status_code
     csrf = _web_csrf_token() if session.get("web_admin_ok") else ""
     nav = [
         ("dashboard", "Dashboard", "/admin", "▣"),
+        ("analytics", "Analytics V2", "/admin/analytics", "📈"),
         ("users", "Users", "/admin/users", "👥"),
         ("schedules", "Schedules", "/admin/schedules", "⏱"),
+        ("calendar", "Calendar", "/admin/schedules/calendar", "🗓"),
         ("broadcast", "Broadcast", "/admin/broadcast", "📣"),
         ("health", "Health", "/admin/health", "🩺"),
         ("settings", "Settings", "/admin/settings", "⚙"),
@@ -1980,7 +1982,7 @@ def web_admin_home():
     </div>
     <div class='grid2'>
       <div class='card'><h2>Feature settings</h2><div class='table-wrap'><table class='table'>{setting_rows}</table></div><p><a class='btn secondary' href='/admin/settings'>Open settings</a></p></div>
-      <div class='card'><h2>Quick actions</h2><p class='muted'>Common admin tasks. Dangerous actions still require confirmation on their pages.</p><div class='actions'><a class='btn' href='/admin/users'>Manage Users</a><a class='btn' href='/admin/schedules'>Schedules</a><a class='btn' href='/admin/broadcast'>Broadcast</a><a class='btn secondary' href='/admin/health'>Health Center</a><a class='btn secondary' href='/admin/sql'>SQL Setup</a></div></div>
+      <div class='card'><h2>Quick actions</h2><p class='muted'>Common admin tasks. Dangerous actions still require confirmation on their pages.</p><div class='actions'><a class='btn' href='/admin/users'>Manage Users</a><a class='btn' href='/admin/analytics'>Analytics V2</a><a class='btn' href='/admin/schedules/calendar'>Calendar</a><a class='btn' href='/admin/schedules'>Schedules</a><a class='btn' href='/admin/broadcast'>Broadcast</a><a class='btn secondary' href='/admin/health'>Health Center</a><a class='btn secondary' href='/admin/sql'>SQL Setup</a></div></div>
     </div>
     """
     return _web_render("Dashboard", body, active="dashboard")
@@ -2108,6 +2110,10 @@ def web_admin_users():
     next_link = f"<a class='btn secondary' href='{_web_url('/admin/users', page=page+1, page_size=page_size, q=q)}'>Next</a>" if not q and len(rows) >= page_size else ""
     prev_link = f"<a class='btn secondary' href='{_web_url('/admin/users', page=max(0,page-1), page_size=page_size, q=q)}'>Previous</a>" if page > 0 else ""
     body = f"""
+    <div class='actions' style='justify-content:space-between;margin-bottom:12px'>
+      <div class='actions'><a class='btn secondary' href='/admin/schedules/calendar'>🗓 Calendar View</a><a class='btn secondary' href='/admin/analytics'>📈 Analytics V2</a></div>
+      <span class='muted'>List view · {_web_h(_fmt_local_time_hint())}</span>
+    </div>
     <div class='card'>
       <form method='get' class='row3'>
         <div class='field'><label>Search user ID or username <span class='kbd'>Enter</span></label><input name='q' value='{_web_h(q)}' placeholder='123456789 or @username' autofocus></div>
@@ -2326,6 +2332,356 @@ def _web_sched_create(admin_id: int, broadcast_at: datetime, text: str, photo_fi
         return True, f"created schedule #{res.data[0].get('id')}"
     return False, "insert failed"
 
+
+
+# ---------------------------------------------------------------------------
+# Admin Dashboard V5 — Analytics V2 + Schedule Calendar
+# ---------------------------------------------------------------------------
+
+def _web_safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return int(default)
+
+
+def _web_pct(part: int | float, total: int | float) -> int:
+    try:
+        total_f = float(total or 0)
+        if total_f <= 0:
+            return 0
+        return max(0, min(100, int((float(part or 0) / total_f) * 100)))
+    except Exception:
+        return 0
+
+
+def _web_metric_bar(label: str, value: int, total: int, *, kind: str = "info") -> str:
+    pct = _web_pct(value, total)
+    return (
+        "<div class='mini-stat'>"
+        f"<div class='actions' style='justify-content:space-between'><b>{_web_h(label)}</b><span class='muted'>{_web_h(value)}/{_web_h(total)}</span></div>"
+        f"<div class='progress' style='width:100%;margin-top:10px'><span style='width:{pct}%'></span></div>"
+        f"<small class='muted'>{pct}%</small>"
+        "</div>"
+    )
+
+
+def _web_schedule_status_key(row: dict) -> str:
+    if _sched_is_draft(row):
+        return "preview"
+    return str(row.get("status") or "unknown").strip().lower() or "unknown"
+
+
+def _web_schedule_select_fields() -> str:
+    return "id,admin_id,broadcast_at,plain_text,caption,photo_file_id,status,error_msg,sent_count,failed_count,blocked_count,created_at"
+
+
+def _web_sched_fetch_recent(limit: int = 5000) -> list[dict]:
+    if not supabase:
+        return []
+    res = db_call_sync(
+        "web_sched_recent_v5",
+        lambda: (
+            supabase.table("scheduled_broadcasts")
+            .select(_web_schedule_select_fields())
+            .order("broadcast_at", desc=True)
+            .limit(max(1, min(10000, int(limit or 5000))))
+            .execute()
+        ),
+        default=None,
+        attempts=2,
+        critical=False,
+    )
+    return list(getattr(res, "data", None) or [])
+
+
+def _web_sched_fetch_range(start_utc: datetime, end_utc: datetime, limit: int = 2000) -> list[dict]:
+    if not supabase:
+        return []
+    start_iso = _sched_iso(start_utc)
+    end_iso = _sched_iso(end_utc)
+    res = db_call_sync(
+        "web_sched_range_v5",
+        lambda: (
+            supabase.table("scheduled_broadcasts")
+            .select(_web_schedule_select_fields())
+            .gte("broadcast_at", start_iso)
+            .lt("broadcast_at", end_iso)
+            .order("broadcast_at")
+            .limit(max(1, min(5000, int(limit or 2000))))
+            .execute()
+        ),
+        default=None,
+        attempts=2,
+        critical=False,
+    )
+    return list(getattr(res, "data", None) or [])
+
+
+def _web_analytics_v2(days: int = 30) -> dict:
+    days = max(1, min(365, int(days or 30)))
+    rows = _web_sched_fetch_recent(5000)
+    now_utc = datetime.now(timezone.utc)
+    since_local = (_local_now() - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    since_utc = _local_to_utc(since_local)
+
+    status_counts: dict[str, int] = {}
+    day_counts: OrderedDict[str, dict] = OrderedDict()
+    for i in range(days):
+        d = _to_local_time(since_utc + timedelta(days=i)).date().isoformat()
+        day_counts[d] = {"schedules": 0, "sent": 0, "failed": 0, "blocked": 0}
+
+    sent = failed = blocked = 0
+    recent_sent = recent_failed = recent_blocked = 0
+    upcoming = overdue = previews = photo = text = 0
+    recent_errors: list[dict] = []
+
+    for row in rows:
+        status = _web_schedule_status_key(row)
+        status_counts[status] = status_counts.get(status, 0) + 1
+        sent_i = _web_safe_int(row.get("sent_count"))
+        failed_i = _web_safe_int(row.get("failed_count"))
+        blocked_i = _web_safe_int(row.get("blocked_count"))
+        sent += sent_i
+        failed += failed_i
+        blocked += blocked_i
+        if row.get("photo_file_id"):
+            photo += 1
+        else:
+            text += 1
+        if status == "preview":
+            previews += 1
+
+        dt = _sched_parse_iso(row.get("broadcast_at"))
+        if dt:
+            local_key = _to_local_time(dt).date().isoformat()
+            if local_key in day_counts:
+                day_counts[local_key]["schedules"] += 1
+                day_counts[local_key]["sent"] += sent_i
+                day_counts[local_key]["failed"] += failed_i
+                day_counts[local_key]["blocked"] += blocked_i
+                recent_sent += sent_i
+                recent_failed += failed_i
+                recent_blocked += blocked_i
+            if status == SCHED_STATUS_PENDING:
+                if dt >= now_utc:
+                    upcoming += 1
+                else:
+                    overdue += 1
+        if status == "failed" or row.get("error_msg"):
+            recent_errors.append(row)
+
+    total_delivery = sent + failed + blocked
+    recent_delivery = recent_sent + recent_failed + recent_blocked
+    return {
+        "days": days,
+        "rows": rows,
+        "status_counts": status_counts,
+        "total_schedules": len(rows),
+        "sent": sent,
+        "failed": failed,
+        "blocked": blocked,
+        "delivery_total": total_delivery,
+        "delivery_rate": _web_pct(sent, total_delivery),
+        "recent_sent": recent_sent,
+        "recent_failed": recent_failed,
+        "recent_blocked": recent_blocked,
+        "recent_delivery_total": recent_delivery,
+        "recent_delivery_rate": _web_pct(recent_sent, recent_delivery),
+        "upcoming": upcoming,
+        "overdue": overdue,
+        "previews": previews,
+        "photo": photo,
+        "text": text,
+        "day_counts": day_counts,
+        "recent_errors": recent_errors[:12],
+    }
+
+
+def _web_analytics_chart_html(day_counts: OrderedDict[str, dict]) -> str:
+    if not day_counts:
+        return "<div class='empty'>No analytics data.</div>"
+    max_value = max((int(v.get("schedules") or 0) for v in day_counts.values()), default=0) or 1
+    bars = []
+    for day, vals in day_counts.items():
+        count = int(vals.get("schedules") or 0)
+        height = max(8, int((count / max_value) * 120)) if count else 8
+        label = day[5:]
+        bars.append(
+            "<div style='display:flex;flex-direction:column;align-items:center;gap:7px;min-width:34px'>"
+            f"<div title='{_web_h(day)}: {_web_h(count)} schedule(s)' style='height:130px;display:flex;align-items:end;width:100%'><div style='height:{height}px;width:100%;border-radius:12px 12px 4px 4px;background:linear-gradient(to top,rgba(59,130,246,.85),rgba(16,185,129,.85));border:1px solid rgba(255,255,255,.12)'></div></div>"
+            f"<small class='muted'>{_web_h(label)}</small>"
+            "</div>"
+        )
+    return "<div style='display:flex;gap:10px;overflow-x:auto;padding:8px 2px 2px'>" + "".join(bars) + "</div>"
+
+
+def _web_analytics_error_rows(rows: list[dict]) -> str:
+    out = []
+    for row in rows:
+        content = row.get("caption") or row.get("plain_text") or ""
+        out.append(
+            f"<tr><td><code>#{_web_h(row.get('id'))}</code><br>{_web_status_badge(row.get('status'), row)}</td>"
+            f"<td>{_web_h(_web_dt(row.get('broadcast_at')))}</td>"
+            f"<td>{_web_h(_web_short(row.get('error_msg') or '-', 160))}</td>"
+            f"<td>{_web_h(_web_short(content, 120))}</td>"
+            f"<td><a class='btn secondary' href='/admin/schedules?q={_web_h(row.get('id'))}'>Open</a></td></tr>"
+        )
+    return "".join(out) or '<tr><td colspan=5><div class="empty">No recent schedule errors.</div></td></tr>'
+
+
+def _web_calendar_month_params(raw_month: str | None = None) -> tuple[int, int]:
+    raw = (raw_month or "").strip()
+    if re.match(r"^\d{4}-\d{2}$", raw):
+        year, month = raw.split("-", 1)
+        try:
+            y, m = int(year), int(month)
+            if 1 <= m <= 12:
+                return y, m
+        except Exception:
+            pass
+    now = _local_now()
+    return now.year, now.month
+
+
+def _web_calendar_month_shift(year: int, month: int, delta: int) -> tuple[int, int]:
+    month0 = (int(year) * 12 + (int(month) - 1)) + int(delta)
+    return month0 // 12, (month0 % 12) + 1
+
+
+def _web_calendar_bounds(year: int, month: int) -> tuple[datetime, datetime, datetime, datetime]:
+    start_local = datetime(int(year), int(month), 1, tzinfo=APP_TIMEZONE)
+    ny, nm = _web_calendar_month_shift(year, month, 1)
+    end_local = datetime(ny, nm, 1, tzinfo=APP_TIMEZONE)
+    return start_local, end_local, _local_to_utc(start_local), _local_to_utc(end_local)
+
+
+def _web_schedule_calendar_html(year: int, month: int, rows: list[dict]) -> str:
+    start_local, end_local, _start_utc, _end_utc = _web_calendar_bounds(year, month)
+    days_in_month = (end_local.date() - start_local.date()).days
+    first_weekday = start_local.weekday()  # Monday=0
+    today = _local_now().date()
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        dt = _sched_parse_iso(row.get("broadcast_at"))
+        if not dt:
+            continue
+        key = _to_local_time(dt).date().isoformat()
+        grouped.setdefault(key, []).append(row)
+
+    weekday_heads = "".join(f"<div class='muted' style='font-weight:900;text-align:center;padding:8px'>{d}</div>" for d in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
+    cells = ["<div></div>" for _ in range(first_weekday)]
+    for day in range(1, days_in_month + 1):
+        d = datetime(year, month, day, tzinfo=APP_TIMEZONE).date()
+        key = d.isoformat()
+        items = grouped.get(key, [])
+        border = "border:1px solid rgba(59,130,246,.45);box-shadow:0 0 0 1px rgba(59,130,246,.15) inset;" if d == today else "border:1px solid rgba(255,255,255,.10);"
+        item_html = []
+        for row in items[:4]:
+            dt = _sched_parse_iso(row.get("broadcast_at"))
+            local_time = _to_local_time(dt).strftime("%I:%M %p") if dt else ""
+            content = row.get("caption") or row.get("plain_text") or ""
+            status = _web_schedule_status_key(row)
+            kind = {"done": "ok", "failed": "danger", "cancelled": "muted", "sending": "info", "preview": "warn", "pending": "ok"}.get(status, "muted")
+            item_html.append(
+                f"<a href='/admin/schedules?q={_web_h(row.get('id'))}' style='display:block;margin-top:7px;padding:8px;border-radius:14px;background:rgba(15,23,42,.72);border:1px solid rgba(255,255,255,.08)'>"
+                f"<span class='badge badge-{kind}'>{_web_h(status)}</span><br>"
+                f"<small class='muted'>{_web_h(local_time)} · #{_web_h(row.get('id'))}</small><br>"
+                f"<span style='font-size:12px;color:#e2e8f0'>{_web_h(_web_short(content, 54))}</span>"
+                "</a>"
+            )
+        more = len(items) - 4
+        if more > 0:
+            item_html.append(f"<div class='help'>+{more} more schedule(s)</div>")
+        cells.append(
+            f"<div style='{border}min-height:160px;border-radius:22px;padding:12px;background:rgba(15,23,42,.45)'>"
+            f"<div class='actions' style='justify-content:space-between'><b>{day}</b><span class='badge badge-muted'>{len(items)}</span></div>"
+            + "".join(item_html) +
+            "</div>"
+        )
+    while len(cells) % 7:
+        cells.append("<div></div>")
+    return weekday_heads + "".join(cells)
+
+
+@app_flask.route("/admin/analytics")
+@web_admin_required
+def web_admin_analytics():
+    days = max(7, min(90, _web_int(request.args.get("days"), 30)))
+    data = _web_analytics_v2(days)
+    status_counts = data["status_counts"]
+    total_schedules = max(1, int(data["total_schedules"] or 0))
+    status_rows = "".join(
+        _web_metric_bar(label.title(), int(status_counts.get(label, 0)), total_schedules, kind="info")
+        for label in ["preview", "pending", "sending", "done", "failed", "cancelled"]
+    )
+    day_chart = _web_analytics_chart_html(data["day_counts"])
+    error_rows = _web_analytics_error_rows(data["recent_errors"])
+    body = f"""
+    <div class='actions' style='justify-content:space-between;margin-bottom:12px'>
+      <div class='pillbar'>
+        <a class='btn {'secondary' if days != 7 else ''}' href='/admin/analytics?days=7'>7 days</a>
+        <a class='btn {'secondary' if days != 30 else ''}' href='/admin/analytics?days=30'>30 days</a>
+        <a class='btn {'secondary' if days != 90 else ''}' href='/admin/analytics?days=90'>90 days</a>
+      </div>
+      <div class='actions'><a class='btn secondary' href='/admin/schedules/calendar'>Calendar</a><a class='btn secondary' href='/admin/broadcast'>Broadcast</a></div>
+    </div>
+    <div class='grid'>
+      {_web_status_card('Delivery rate', str(data['delivery_rate']) + '%', f"{data['sent']} sent / {data['delivery_total']} total", 'ok' if data['delivery_rate'] >= 90 else 'warn')}
+      {_web_status_card('Recent delivery', str(data['recent_delivery_rate']) + '%', f"last {days} days", 'ok' if data['recent_delivery_rate'] >= 90 else 'warn')}
+      {_web_status_card('Upcoming', data['upcoming'], f"{data['previews']} preview / {data['overdue']} overdue", 'warn' if data['upcoming'] else '')}
+      {_web_status_card('Blocked users hit', data['blocked'], 'broadcast blocked/unreachable count', 'danger' if data['blocked'] else '')}
+    </div>
+    <div class='grid2'>
+      <div class='card'><h2>Schedule Activity · Last {days} days</h2><p class='muted'>Counts are grouped using Phnom Penh local dates.</p>{day_chart}</div>
+      <div class='card'><h2>Delivery Breakdown</h2><div class='mini-grid'>
+        {_web_metric_bar('Sent', data['sent'], max(1, data['delivery_total']))}
+        {_web_metric_bar('Failed', data['failed'], max(1, data['delivery_total']))}
+        {_web_metric_bar('Blocked', data['blocked'], max(1, data['delivery_total']))}
+      </div><div class='mini-grid' style='margin-top:12px'>
+        {_web_metric_bar('Text schedules', data['text'], total_schedules)}
+        {_web_metric_bar('Photo schedules', data['photo'], total_schedules)}
+        {_web_metric_bar('Overdue pending', data['overdue'], total_schedules)}
+      </div></div>
+    </div>
+    <div class='card'><h2>Status Mix</h2><div class='mini-grid'>{status_rows}</div></div>
+    <div class='card'><div class='actions' style='justify-content:space-between'><h2>Recent Failed / Warning Schedules</h2><a class='btn secondary' href='/admin/schedules?status=failed'>Open failed</a></div><div class='table-wrap'><table class='table'><thead><tr><th>ID</th><th>Time</th><th>Error</th><th>Content</th><th>Action</th></tr></thead><tbody>{error_rows}</tbody></table></div></div>
+    """
+    return _web_render("Analytics V2", body, active="analytics")
+
+
+@app_flask.route("/admin/schedules/calendar")
+@web_admin_required
+def web_admin_schedule_calendar():
+    year, month = _web_calendar_month_params(request.args.get("month"))
+    prev_y, prev_m = _web_calendar_month_shift(year, month, -1)
+    next_y, next_m = _web_calendar_month_shift(year, month, 1)
+    start_local, end_local, start_utc, end_utc = _web_calendar_bounds(year, month)
+    rows = _web_sched_fetch_range(start_utc, end_utc, limit=2500)
+    calendar_html = _web_schedule_calendar_html(year, month, rows)
+    month_label = start_local.strftime("%B %Y")
+    body = f"""
+    <div class='actions' style='justify-content:space-between;margin-bottom:12px'>
+      <div class='actions'>
+        <a class='btn secondary' href='/admin/schedules/calendar?month={prev_y:04d}-{prev_m:02d}'>← Previous</a>
+        <a class='btn' href='/admin/schedules/calendar'>This Month</a>
+        <a class='btn secondary' href='/admin/schedules/calendar?month={next_y:04d}-{next_m:02d}'>Next →</a>
+      </div>
+      <div class='actions'><a class='btn secondary' href='/admin/schedules'>List View</a><a class='btn secondary' href='/admin/analytics'>Analytics</a></div>
+    </div>
+    <div class='grid'>
+      {_web_status_card('Month', month_label, f"{_web_h(_fmt_local_time_hint())}", 'ok')}
+      {_web_status_card('Schedules', len(rows), 'inside this calendar month', 'ok' if rows else '')}
+      {_web_status_card('Preview', sum(1 for r in rows if _sched_is_draft(r)), 'must confirm before sending', 'warn')}
+      {_web_status_card('Confirmed pending', sum(1 for r in rows if _sched_is_confirmed_pending(r)), 'scheduler can send these', 'ok')}
+    </div>
+    <div class='card'>
+      <div class='actions' style='justify-content:space-between'><div><h2>Schedule Calendar View · {month_label}</h2><p class='muted'>Month range: {_web_h(_web_dt(start_utc))} → {_web_h(_web_dt(end_utc))}</p></div><a class='btn' href='/admin/schedules'>Create Schedule</a></div>
+      <div style='display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:10px;min-width:880px'>{calendar_html}</div>
+    </div>
+    <div class='card'><h2>Mobile note</h2><p class='muted'>On phone, swipe horizontally inside the calendar card. Tap any schedule card to open it in the list view.</p></div>
+    """
+    return _web_render("Schedule Calendar", body, active="calendar")
 
 @app_flask.route("/admin/schedules")
 @web_admin_required
@@ -2653,7 +3009,11 @@ where status = 'pending' and error_msg is null;
 
 create index if not exists scheduled_broadcasts_admin_pending_idx
 on public.scheduled_broadcasts (admin_id, broadcast_at)
-where status = 'pending';"""
+where status = 'pending';
+
+-- Recommended for Admin Dashboard V5 Analytics + Calendar month range queries
+create index if not exists scheduled_broadcasts_calendar_idx
+on public.scheduled_broadcasts (broadcast_at, status);"""
     body = f"<div class='card'><h2>Required / Recommended SQL</h2><p>Run in Supabase SQL Editor.</p></div><div class='card'><h3>bot_locks</h3><pre>{_web_h(locks_sql)}</pre></div><div class='card'><h3>Admin V2 tables</h3><pre>{_web_h(ADMIN_V2_TABLES_SQL)}</pre></div><div class='card'><h3>Schedule indexes</h3><pre>{_web_h(schedule_indexes)}</pre></div>"
     return _web_render("SQL", body, active="sql")
 
