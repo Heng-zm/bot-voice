@@ -2351,6 +2351,14 @@ def _web_system_v4_rows() -> str:
     rows.append(_web_health_item("AI provider", bool(_hf_client or _gemini), f"provider={AI_PROVIDER} model={HF_MODEL if AI_PROVIDER == 'hf' else GEMINI_MODEL}", warn=not bool(_hf_client or _gemini)))
     ocr_disabled = _hf_ocr_is_temporarily_disabled() or _ocr_provider_is_temporarily_disabled("hf") or _ocr_provider_is_temporarily_disabled("gemini")
     rows.append(_web_health_item("OCR provider", _ocr_configured(), f"provider={OCR_PROVIDER} model={HF_OCR_MODEL}; temporary_disabled={ocr_disabled}", warn=ocr_disabled or not _ocr_configured()))
+    local_mms_ok, local_mms_detail = _local_mms_tts_dependency_status()
+    local_mms_disabled = _local_mms_tts_is_temporarily_disabled()
+    rows.append(_web_health_item(
+        "Local MMS Khmer TTS",
+        local_mms_ok,
+        local_mms_detail + f"; cooldown_remaining={_local_mms_tts_disabled_remaining_s()}s",
+        warn=local_mms_disabled or not local_mms_ok,
+    ))
     hf_tts_configured = bool(GradioClient is not None and HF_TTS_SPACE and HF_TTS_API_NAME)
     hf_tts_disabled = _hf_tts_is_temporarily_disabled()
     rows.append(_web_health_item("Khmer HF Space TTS", hf_tts_configured, _tts_provider_summary() + f"; cooldown_remaining={_hf_tts_disabled_remaining_s()}s", warn=hf_tts_disabled or not hf_tts_configured))
@@ -2382,7 +2390,9 @@ def _web_env_check_rows() -> str:
         ("SUPABASE_SERVICE_ROLE_KEY / SUPABASE_KEY", bool(os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY") or globals().get("SB_KEY")), "Recommended"),
         ("REDIS_URL", bool(os.environ.get("REDIS_URL") or globals().get("REDIS_URL")), "Optional cache"),
         ("HF_TOKEN / GEMINI_API_KEY", bool(os.environ.get("HF_TOKEN") or os.environ.get("GEMINI_API_KEY")), "Required for AI/OCR"),
-        ("gradio_client", GradioClient is not None, "Required for Khmer HF Space TTS"),
+        ("torch + transformers + scipy", _local_mms_tts_dependencies_available(), "Required for local facebook/mms-tts-khm"),
+        ("LOCAL_MMS_TTS_MODEL", bool(LOCAL_MMS_TTS_MODEL), "Default: facebook/mms-tts-khm"),
+        ("gradio_client", GradioClient is not None, "Required for Khmer HF Space TTS fallback"),
         ("HF_TTS_SPACE", bool(HF_TTS_SPACE), "Default: mrrtmob/khmer-tts"),
         ("RENDER_EXTERNAL_URL", bool(os.environ.get("RENDER_EXTERNAL_URL")), "Recommended for keep-alive"),
     ]
@@ -3672,12 +3682,33 @@ EDGE_TTS_RETRY_DELAY_S    = _env_float("EDGE_TTS_RETRY_DELAY_S", 0.8, minimum=0.
 EDGE_TTS_STREAM_TIMEOUT_S = _env_float("EDGE_TTS_STREAM_TIMEOUT_S", 45.0, minimum=15.0, maximum=180.0)
 EDGE_TTS_CROSS_LANG_FALLBACK = _env_bool("EDGE_TTS_CROSS_LANG_FALLBACK", False)
 
-# Khmer TTS V2: optional Hugging Face Gradio Space provider.
-# Confirmed normal endpoint from `Client.view_api()` for mrrtmob/khmer-tts:
+# Khmer TTS V3: local facebook/mms-tts-khm first, with HF Space and Edge fallbacks.
+# Recommended production routing:
+#   KHMER_TTS_PROVIDER=local_mms  -> local Transformers VITS model
+#   KHMER_TTS_PROVIDER=hf_space   -> mrrtmob/khmer-tts Gradio Space
+#   KHMER_TTS_PROVIDER=edge       -> Microsoft Edge TTS only
+TTS_PROVIDER             = (os.environ.get("TTS_PROVIDER") or "auto").strip().lower()       # auto | edge | local_mms | hf_space | khmer_hf_space
+KHMER_TTS_PROVIDER       = (os.environ.get("KHMER_TTS_PROVIDER") or "local_mms").strip().lower()  # local_mms | hf_space | edge
+
+# Local MMS Khmer TTS. Loaded lazily on first Khmer request so startup stays fast.
+LOCAL_MMS_TTS_MODEL      = (os.environ.get("LOCAL_MMS_TTS_MODEL") or os.environ.get("MMS_TTS_MODEL") or "facebook/mms-tts-khm").strip()
+LOCAL_MMS_TTS_DEVICE     = (os.environ.get("LOCAL_MMS_TTS_DEVICE") or "auto").strip().lower()  # auto | cpu | cuda
+LOCAL_MMS_TTS_MAX_CHARS  = _env_int("LOCAL_MMS_TTS_MAX_CHARS", 280, minimum=40, maximum=700)
+LOCAL_MMS_TTS_TIMEOUT_S  = _env_float("LOCAL_MMS_TTS_TIMEOUT_S", 120.0, minimum=20.0, maximum=600.0)
+LOCAL_MMS_TTS_RETRIES    = _env_int("LOCAL_MMS_TTS_RETRIES", 1, minimum=1, maximum=4)
+LOCAL_MMS_TTS_RETRY_DELAY_S = _env_float("LOCAL_MMS_TTS_RETRY_DELAY_S", 1.0, minimum=0.1, maximum=20.0)
+LOCAL_MMS_TTS_EDGE_FALLBACK = _env_bool("LOCAL_MMS_TTS_EDGE_FALLBACK", True)
+LOCAL_MMS_TTS_HF_FALLBACK   = _env_bool("LOCAL_MMS_TTS_HF_FALLBACK", True)
+LOCAL_MMS_TTS_FAILURE_LIMIT = _env_int("LOCAL_MMS_TTS_FAILURE_LIMIT", 2, minimum=1, maximum=20)
+LOCAL_MMS_TTS_COOLDOWN_S    = _env_float("LOCAL_MMS_TTS_COOLDOWN_S", 300.0, minimum=30.0, maximum=3600.0)
+LOCAL_MMS_TTS_CACHE_ENABLED = _env_bool("LOCAL_MMS_TTS_CACHE_ENABLED", True)
+LOCAL_MMS_TTS_CACHE_DIR     = (os.environ.get("LOCAL_MMS_TTS_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "khmer_mms_tts_cache")).strip()
+LOCAL_MMS_TTS_CACHE_TTL_S   = _env_float("LOCAL_MMS_TTS_CACHE_TTL_S", 7 * 86400.0, minimum=60.0, maximum=30 * 86400.0)
+LOCAL_MMS_TTS_CACHE_MAX_FILES = _env_int("LOCAL_MMS_TTS_CACHE_MAX_FILES", 500, minimum=20, maximum=5000)
+
+# Khmer HF Space fallback. Confirmed normal endpoint from `Client.view_api()` for mrrtmob/khmer-tts:
 #   client.predict(text, "kiri", 0.6, 0.95, 1.1, 2048, api_name="/lambda")
-# Keep Edge TTS as fallback because public Spaces can cold-start, sleep, or rate-limit.
-TTS_PROVIDER             = (os.environ.get("TTS_PROVIDER") or "auto").strip().lower()       # auto | edge | hf_space | khmer_hf_space
-KHMER_TTS_PROVIDER       = (os.environ.get("KHMER_TTS_PROVIDER") or "hf_space").strip().lower()  # hf_space | edge
+# Keep Edge TTS as final fallback because public Spaces can cold-start, sleep, or rate-limit.
 HF_TTS_SPACE             = (os.environ.get("HF_TTS_SPACE") or "mrrtmob/khmer-tts").strip()
 HF_TTS_API_NAME          = (os.environ.get("HF_TTS_API_NAME") or "/lambda").strip()
 HF_TTS_TOKEN             = (os.environ.get("HF_TTS_TOKEN") or os.environ.get("HF_TOKEN") or "").strip()
@@ -4704,14 +4735,23 @@ _prefs_cache_lock: asyncio.Lock | None = None
 _prefs_cache_thread_lock = threading.RLock()
 
 TTS_MODEL_OPTIONS = {
-    "auto": ("Auto", "Kiri → Edge TTS"),
-    "hf_space": ("Kiri", ""),
+    "auto": ("Auto", "MMS Khmer → Kiri → Edge"),
+    "local_mms": ("MMS Khmer", "facebook/mms-tts-khm"),
+    "hf_space": ("Kiri", "HF Space"),
     "edge": ("Edge TTS", ""),
 }
 TTS_MODEL_ALIASES = {
     "auto": "auto",
     "default": "auto",
     "server": "auto",
+    "mms": "local_mms",
+    "mms_tts": "local_mms",
+    "mms_tts_khm": "local_mms",
+    "facebook_mms": "local_mms",
+    "facebook_mms_tts_khm": "local_mms",
+    "local_mms": "local_mms",
+    "local_mms_tts": "local_mms",
+    "khmer_mms": "local_mms",
     "hf": "hf_space",
     "hf_space": "hf_space",
     "khmer_hf": "hf_space",
@@ -5749,6 +5789,8 @@ def startup_self_check() -> None:
         checks.append("HF_TOKEN is missing; Hugging Face OCR will be unavailable")
     if OCR_PROVIDER in ("auto", "gemini") and not GEMINI_API_KEY:
         checks.append("GEMINI_API_KEY is missing; Gemini OCR/audio fallback will be unavailable")
+    if _should_try_local_mms_khmer_tts("សាកល្បង", "auto") and not _local_mms_tts_dependencies_available():
+        checks.append("Local MMS Khmer TTS is selected but dependencies are missing. Add `torch`, `transformers`, `accelerate`, and `scipy` to requirements.txt; bot will fall back to HF Space/Edge.")
     if (TTS_PROVIDER in {"auto", "hf", "hf_space", "khmer_hf_space", "khmer-tts"} or KHMER_TTS_PROVIDER in {"hf", "hf_space", "khmer_hf_space", "khmer-tts"}) and GradioClient is None:
         checks.append("gradio_client is missing; Khmer HF Space TTS will fall back to Edge. Add `gradio_client` to requirements.txt")
     if _should_try_hf_khmer_tts("សាកល្បង", "hf_space") and not HF_TTS_SPACE:
@@ -7627,7 +7669,18 @@ async def _edge_tts_stream_with_retry(chunk_text: str, voices: list[str]) -> tup
     raise RuntimeError(f"edge-tts failed after retries/fallbacks. {detail}")
 
 
-# Khmer HF Space provider state. Protected by a lock because Gradio calls run in worker threads.
+# Local MMS + Khmer HF Space provider state. Locks are needed because the
+# heavy model and Gradio calls run inside worker threads.
+_LOCAL_MMS_TTS_STATE_LOCK = threading.Lock()
+_LOCAL_MMS_TTS_MODEL_LOCK = threading.RLock()
+_LOCAL_MMS_TTS_FAILURES = 0
+_LOCAL_MMS_TTS_DISABLED_UNTIL = 0.0
+_LOCAL_MMS_TTS_TOKENIZER: Any = None
+_LOCAL_MMS_TTS_MODEL_OBJ: Any = None
+_LOCAL_MMS_TTS_DEVICE_USED = "cpu"
+_LOCAL_MMS_TTS_SAMPLE_RATE = 16000
+_LOCAL_MMS_TTS_CACHE_LAST_PRUNE = 0.0
+
 _HF_TTS_STATE_LOCK = threading.Lock()
 _HF_TTS_FAILURES = 0
 _HF_TTS_DISABLED_UNTIL = 0.0
@@ -7636,10 +7689,294 @@ _HF_TTS_DISABLED_UNTIL = 0.0
 def _tts_provider_summary() -> str:
     return (
         f"provider={TTS_PROVIDER}, khmer={KHMER_TTS_PROVIDER}, "
+        f"local_mms={LOCAL_MMS_TTS_MODEL}, "
         f"hf_space={HF_TTS_SPACE}{HF_TTS_API_NAME}, "
         f"gradio_client={'on' if GradioClient is not None else 'missing'}, "
-        f"edge_fallback={'on' if HF_TTS_EDGE_FALLBACK else 'off'}"
+        f"fallbacks=hf:{'on' if LOCAL_MMS_TTS_HF_FALLBACK else 'off'}/edge:{'on' if LOCAL_MMS_TTS_EDGE_FALLBACK else 'off'}"
     )
+
+
+def _local_mms_tts_dependencies_available() -> bool:
+    try:
+        import importlib.util
+        required = ("torch", "transformers", "scipy")
+        return all(importlib.util.find_spec(name) is not None for name in required)
+    except Exception:
+        return False
+
+
+def _local_mms_tts_dependency_status() -> tuple[bool, str]:
+    ok = _local_mms_tts_dependencies_available()
+    detail = (
+        f"model={LOCAL_MMS_TTS_MODEL}; device={LOCAL_MMS_TTS_DEVICE}; "
+        f"cache={'on' if LOCAL_MMS_TTS_CACHE_ENABLED else 'off'}"
+    )
+    if not ok:
+        detail += "; missing one of: torch, transformers, scipy"
+    return ok, detail
+
+
+def _local_mms_tts_is_temporarily_disabled() -> bool:
+    with _LOCAL_MMS_TTS_STATE_LOCK:
+        return time.monotonic() < _LOCAL_MMS_TTS_DISABLED_UNTIL
+
+
+def _local_mms_tts_disabled_remaining_s() -> int:
+    with _LOCAL_MMS_TTS_STATE_LOCK:
+        return max(0, int(_LOCAL_MMS_TTS_DISABLED_UNTIL - time.monotonic()))
+
+
+def _local_mms_tts_record_success() -> None:
+    global _LOCAL_MMS_TTS_FAILURES, _LOCAL_MMS_TTS_DISABLED_UNTIL
+    with _LOCAL_MMS_TTS_STATE_LOCK:
+        _LOCAL_MMS_TTS_FAILURES = 0
+        _LOCAL_MMS_TTS_DISABLED_UNTIL = 0.0
+
+
+def _local_mms_tts_record_failure(exc: BaseException | str) -> None:
+    global _LOCAL_MMS_TTS_FAILURES, _LOCAL_MMS_TTS_DISABLED_UNTIL
+    with _LOCAL_MMS_TTS_STATE_LOCK:
+        _LOCAL_MMS_TTS_FAILURES += 1
+        if _LOCAL_MMS_TTS_FAILURES >= LOCAL_MMS_TTS_FAILURE_LIMIT:
+            _LOCAL_MMS_TTS_DISABLED_UNTIL = time.monotonic() + LOCAL_MMS_TTS_COOLDOWN_S
+            logger.warning(
+                "Local MMS Khmer TTS temporarily disabled for %.0fs after %s failure(s): %s",
+                LOCAL_MMS_TTS_COOLDOWN_S,
+                _LOCAL_MMS_TTS_FAILURES,
+                exc,
+            )
+
+
+def _local_mms_tts_cache_key(text: str, speed: float) -> str:
+    raw = f"mms-khm-v1:{LOCAL_MMS_TTS_MODEL}:{_rounded_speed(speed)}:{text}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _local_mms_tts_cache_path(text: str, speed: float) -> str:
+    return os.path.join(LOCAL_MMS_TTS_CACHE_DIR, _local_mms_tts_cache_key(text, speed) + ".ogg")
+
+
+def _local_mms_tts_cache_prune() -> None:
+    global _LOCAL_MMS_TTS_CACHE_LAST_PRUNE
+    if not LOCAL_MMS_TTS_CACHE_ENABLED:
+        return
+    now = time.monotonic()
+    if now - _LOCAL_MMS_TTS_CACHE_LAST_PRUNE < 300:
+        return
+    _LOCAL_MMS_TTS_CACHE_LAST_PRUNE = now
+    try:
+        os.makedirs(LOCAL_MMS_TTS_CACHE_DIR, exist_ok=True)
+        paths = sorted(
+            glob.glob(os.path.join(LOCAL_MMS_TTS_CACHE_DIR, "*.ogg")),
+            key=lambda p: os.path.getmtime(p),
+        )
+        cutoff = time.time() - LOCAL_MMS_TTS_CACHE_TTL_S
+        for path in list(paths):
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except OSError:
+                pass
+        paths = sorted(
+            glob.glob(os.path.join(LOCAL_MMS_TTS_CACHE_DIR, "*.ogg")),
+            key=lambda p: os.path.getmtime(p),
+        )
+        overflow = max(0, len(paths) - LOCAL_MMS_TTS_CACHE_MAX_FILES)
+        for path in paths[:overflow]:
+            with suppress(OSError):
+                os.remove(path)
+    except Exception as exc:
+        logger.debug("Local MMS TTS cache prune skipped: %s", exc)
+
+
+def _local_mms_tts_cache_get(text: str, speed: float, output_path: str) -> bytes | None:
+    if not LOCAL_MMS_TTS_CACHE_ENABLED:
+        return None
+    try:
+        path = _local_mms_tts_cache_path(text, speed)
+        if not os.path.exists(path):
+            return None
+        if time.time() - os.path.getmtime(path) > LOCAL_MMS_TTS_CACHE_TTL_S:
+            with suppress(OSError):
+                os.remove(path)
+            return None
+        with open(path, "rb") as fh:
+            data = fh.read()
+        if not data:
+            return None
+        with open(output_path, "wb") as out:
+            out.write(data)
+        os.utime(path, None)
+        return data
+    except Exception as exc:
+        logger.debug("Local MMS TTS cache read skipped: %s", exc)
+        return None
+
+
+def _local_mms_tts_cache_put(text: str, speed: float, data: bytes) -> None:
+    if not LOCAL_MMS_TTS_CACHE_ENABLED or not data:
+        return
+    try:
+        os.makedirs(LOCAL_MMS_TTS_CACHE_DIR, exist_ok=True)
+        path = _local_mms_tts_cache_path(text, speed)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp_path, path)
+        _local_mms_tts_cache_prune()
+    except Exception as exc:
+        logger.debug("Local MMS TTS cache write skipped: %s", exc)
+
+
+def _local_mms_tts_resolve_device(torch_module: Any) -> str:
+    if LOCAL_MMS_TTS_DEVICE in {"cpu", "cuda"}:
+        if LOCAL_MMS_TTS_DEVICE == "cuda" and not torch_module.cuda.is_available():
+            logger.warning("LOCAL_MMS_TTS_DEVICE=cuda requested but CUDA is unavailable. Falling back to CPU.")
+            return "cpu"
+        return LOCAL_MMS_TTS_DEVICE
+    return "cuda" if torch_module.cuda.is_available() else "cpu"
+
+
+def _local_mms_tts_load_sync() -> tuple[Any, Any, Any, str, int]:
+    """Lazy-load facebook/mms-tts-khm once per process."""
+    global _LOCAL_MMS_TTS_TOKENIZER, _LOCAL_MMS_TTS_MODEL_OBJ
+    global _LOCAL_MMS_TTS_DEVICE_USED, _LOCAL_MMS_TTS_SAMPLE_RATE
+
+    with _LOCAL_MMS_TTS_MODEL_LOCK:
+        if _LOCAL_MMS_TTS_TOKENIZER is not None and _LOCAL_MMS_TTS_MODEL_OBJ is not None:
+            import torch
+            return (
+                _LOCAL_MMS_TTS_TOKENIZER,
+                _LOCAL_MMS_TTS_MODEL_OBJ,
+                torch,
+                _LOCAL_MMS_TTS_DEVICE_USED,
+                _LOCAL_MMS_TTS_SAMPLE_RATE,
+            )
+
+        try:
+            import torch
+            from transformers import AutoTokenizer, VitsModel
+        except Exception as exc:
+            raise RuntimeError(
+                "Local MMS Khmer TTS dependencies are missing. Add `torch`, `transformers`, "
+                "`accelerate`, and `scipy` to requirements.txt."
+            ) from exc
+
+        if not LOCAL_MMS_TTS_MODEL:
+            raise RuntimeError("LOCAL_MMS_TTS_MODEL is empty.")
+
+        tokenizer = AutoTokenizer.from_pretrained(LOCAL_MMS_TTS_MODEL)
+        model = VitsModel.from_pretrained(LOCAL_MMS_TTS_MODEL)
+        device = _local_mms_tts_resolve_device(torch)
+        model.to(device)
+        model.eval()
+
+        _LOCAL_MMS_TTS_TOKENIZER = tokenizer
+        _LOCAL_MMS_TTS_MODEL_OBJ = model
+        _LOCAL_MMS_TTS_DEVICE_USED = device
+        _LOCAL_MMS_TTS_SAMPLE_RATE = int(getattr(model.config, "sampling_rate", 16000) or 16000)
+        logger.info(
+            "Local MMS Khmer TTS loaded: model=%s device=%s sample_rate=%s",
+            LOCAL_MMS_TTS_MODEL,
+            _LOCAL_MMS_TTS_DEVICE_USED,
+            _LOCAL_MMS_TTS_SAMPLE_RATE,
+        )
+        return tokenizer, model, torch, _LOCAL_MMS_TTS_DEVICE_USED, _LOCAL_MMS_TTS_SAMPLE_RATE
+
+
+def _local_mms_tts_chunk_to_wav_sync(chunk_text: str, wav_path: str) -> str:
+    """Generate one Khmer WAV chunk using local facebook/mms-tts-khm."""
+    tokenizer, model, torch, device, sample_rate = _local_mms_tts_load_sync()
+    try:
+        from scipy.io import wavfile
+    except Exception as exc:
+        raise RuntimeError("scipy is required for Local MMS Khmer TTS WAV output.") from exc
+
+    cleaned = _clean_tts_text_for_edge(chunk_text)
+    if not cleaned:
+        raise ValueError("Local MMS Khmer TTS received empty chunk")
+
+    inputs = tokenizer(cleaned, return_tensors="pt")
+    inputs = {key: value.to(device) for key, value in inputs.items()}
+    with torch.inference_mode():
+        waveform = model(**inputs).waveform
+
+    audio = waveform.squeeze().detach().float().cpu().numpy()
+    if getattr(audio, "size", 0) <= 0:
+        raise RuntimeError("Local MMS Khmer TTS returned empty waveform")
+    wavfile.write(wav_path, sample_rate, audio)
+    return wav_path
+
+
+def _should_try_local_mms_khmer_tts(text: str, tts_model: str = "auto") -> bool:
+    if _detect_tts_lang_key(text) != "km":
+        return False
+
+    user_model = _normalize_tts_model(tts_model)
+    if user_model == "edge":
+        return False
+    if user_model == "local_mms":
+        return True
+    if user_model == "hf_space":
+        return False
+
+    mode = (TTS_PROVIDER or "auto").strip().lower().replace("-", "_")
+    khmer_mode = (KHMER_TTS_PROVIDER or "local_mms").strip().lower().replace("-", "_")
+    local_modes = {"local_mms", "local_mms_tts", "mms", "mms_tts", "mms_tts_khm", "facebook_mms", "facebook_mms_tts_khm"}
+    if mode in {"edge", "edge_tts"} or khmer_mode in {"edge", "edge_tts"}:
+        return False
+    if mode in local_modes or khmer_mode in local_modes:
+        return True
+    if mode == "auto" and khmer_mode in {"auto", "local_mms"}:
+        return True
+    return False
+
+
+async def _generate_voice_local_mms(text: str, speed: float, output_path: str) -> bytes:
+    """Generate Khmer TTS locally with facebook/mms-tts-khm and convert to Telegram OGG/Opus."""
+    if _local_mms_tts_is_temporarily_disabled():
+        raise RuntimeError(f"Local MMS Khmer TTS cooldown active ({_local_mms_tts_disabled_remaining_s()}s remaining)")
+
+    cached = _local_mms_tts_cache_get(text, speed, output_path)
+    if cached:
+        logger.info("Local MMS Khmer TTS cache hit (%s bytes)", len(cached))
+        return cached
+
+    chunks = _split_text_chunks(text, max_chars=LOCAL_MMS_TTS_MAX_CHARS)
+    if not chunks:
+        raise ValueError("Local MMS Khmer TTS: no speakable text chunks")
+
+    loop = asyncio.get_running_loop()
+    with tempfile.TemporaryDirectory(prefix="mms_khmer_tts_") as tmpdir:
+        input_paths: list[str] = []
+        for idx, chunk_text in enumerate(chunks, 1):
+            wav_path = os.path.join(tmpdir, f"chunk_{idx:03d}.wav")
+            last_error: Exception | None = None
+            for attempt in range(1, LOCAL_MMS_TTS_RETRIES + 1):
+                try:
+                    await asyncio.wait_for(
+                        loop.run_in_executor(_AI_EXECUTOR, _local_mms_tts_chunk_to_wav_sync, chunk_text, wav_path),
+                        timeout=LOCAL_MMS_TTS_TIMEOUT_S,
+                    )
+                    input_paths.append(wav_path)
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < LOCAL_MMS_TTS_RETRIES:
+                        await asyncio.sleep(LOCAL_MMS_TTS_RETRY_DELAY_S * attempt)
+            if not os.path.exists(wav_path):
+                preview = chunk_text[:80].replace("\n", " ")
+                raise RuntimeError(
+                    f"Local MMS Khmer TTS failed at chunk {idx}/{len(chunks)} ({preview!r}): {last_error}"
+                )
+
+        converted = await _convert_audio_files_to_telegram_voice(input_paths, speed, output_path)
+        if not converted:
+            raise RuntimeError("Local MMS Khmer TTS produced empty converted output")
+        _local_mms_tts_cache_put(text, speed, converted)
+        _local_mms_tts_record_success()
+        logger.info("Local MMS Khmer TTS generated %s chunk(s) via %s", len(chunks), LOCAL_MMS_TTS_MODEL)
+        return converted
 
 
 def _hf_tts_is_temporarily_disabled() -> bool:
@@ -7678,19 +8015,23 @@ def _should_try_hf_khmer_tts(text: str, tts_model: str = "auto") -> bool:
         return False
 
     user_model = _normalize_tts_model(tts_model)
-    if user_model == "edge":
+    if user_model in {"edge", "local_mms"}:
         return False
     if user_model == "hf_space":
         return True
 
-    # Auto mode follows server-level env config.
-    mode = (TTS_PROVIDER or "auto").strip().lower()
-    khmer_mode = (KHMER_TTS_PROVIDER or "hf_space").strip().lower()
+    # Auto mode follows server-level env config. Local MMS is tried before this
+    # function; this HF Space path is now a fallback or an explicit server choice.
+    mode = (TTS_PROVIDER or "auto").strip().lower().replace("-", "_")
+    khmer_mode = (KHMER_TTS_PROVIDER or "local_mms").strip().lower().replace("-", "_")
     if mode in {"edge", "edge_tts"} or khmer_mode in {"edge", "edge_tts"}:
         return False
-    if mode in {"hf", "hf_space", "khmer_hf_space", "khmer-tts", "auto"}:
+    if mode in {"hf", "hf_space", "khmer_hf_space", "khmer_tts"}:
         return True
-    return khmer_mode in {"hf", "hf_space", "khmer_hf_space", "khmer-tts"}
+    if khmer_mode in {"hf", "hf_space", "khmer_hf_space", "khmer_tts"}:
+        return True
+    # Keep legacy Auto behavior as a fallback when Local MMS fails.
+    return mode == "auto" and LOCAL_MMS_TTS_HF_FALLBACK
 
 
 def _extract_hf_audio_path_or_url(audio_obj: Any) -> str:
@@ -7948,7 +8289,8 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
     """Generate Telegram voice audio using the user's selected TTS model.
 
     User model routing:
-      - auto: server default; Khmer usually uses HF Space, English uses Edge.
+      - auto: server default; Khmer uses Local MMS first, then HF Space, then Edge.
+      - local_mms: force facebook/mms-tts-khm for Khmer text; English still uses Edge.
       - hf_space: force mrrtmob/khmer-tts for Khmer text; English still uses Edge.
       - edge: force Edge TTS for all supported languages.
     """
@@ -7957,7 +8299,29 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
         raise ValueError("generate_voice: text must not be empty")
 
     user_model = _normalize_tts_model(tts_model)
-    if _should_try_hf_khmer_tts(text, user_model):
+    tried_local_mms = False
+
+    if _should_try_local_mms_khmer_tts(text, user_model):
+        tried_local_mms = True
+        try:
+            return await _generate_voice_local_mms(text, speed, output_path)
+        except Exception as exc:
+            _local_mms_tts_record_failure(exc)
+            logger.warning(
+                "Local MMS Khmer TTS failed; user_model=%s hf_fallback=%s edge_fallback=%s: %s",
+                user_model,
+                LOCAL_MMS_TTS_HF_FALLBACK,
+                LOCAL_MMS_TTS_EDGE_FALLBACK,
+                exc,
+            )
+            if not LOCAL_MMS_TTS_EDGE_FALLBACK and not LOCAL_MMS_TTS_HF_FALLBACK:
+                raise RuntimeError(f"Local MMS Khmer TTS failed and all fallback is disabled: {exc}") from exc
+
+    should_try_hf = _should_try_hf_khmer_tts(text, user_model)
+    if tried_local_mms and not LOCAL_MMS_TTS_HF_FALLBACK:
+        should_try_hf = False
+
+    if should_try_hf:
         try:
             return await _generate_voice_hf_space(text, speed, output_path)
         except Exception as exc:
@@ -11072,8 +11436,9 @@ async def cmd_ttsmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prefs = await get_user_prefs_async(user_id)
     await safe_send(lambda: update.message.reply_text(
         "🤖 <b>ជ្រើសរើសម៉ូដែល TTS</b>\n\n"
-        "Auto: Khmer HF Space សម្រាប់ខ្មែរ និង Edge fallback\n"
-        "Khmer HF: ប្រើ mrrtmob/khmer-tts សម្រាប់អត្ថបទខ្មែរ\n"
+        "Auto: MMS Khmer → Kiri HF Space → Edge fallback\n"
+        "MMS Khmer: ប្រើ facebook/mms-tts-khm នៅលើ server\n"
+        "Kiri: ប្រើ mrrtmob/khmer-tts HF Space សម្រាប់អត្ថបទខ្មែរ\n"
         "Edge: ប្រើ Microsoft Edge TTS គ្រប់ភាសា",
         parse_mode="HTML",
         reply_markup=get_tts_model_kb(prefs.get("tts_model", "auto")),
