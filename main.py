@@ -11071,18 +11071,85 @@ async def _cb_hide_tts_model(query, user_id: int, context):
 
 
 async def _cb_tts_model(query, user_id: int, context, data: str):
+    """Save the selected TTS model and regenerate the current voice message.
+
+    UX rule:
+      - When the user taps Auto / Khmer HF / Edge from the model menu, save it.
+      - If the original text for this voice message can be resolved, immediately
+        regenerate the same text with the selected model.
+      - If the original text cannot be found, only save the preference and return
+        to the main keyboard.
+    """
     if query.message is None:
         return
 
-    model = update_user_tts_model(user_id, data.replace("ttsmodel_", "", 1))
-    prefs = await get_user_prefs_async(user_id)
+    chat_id = query.message.chat.id
+    requested_model = data.replace("ttsmodel_", "", 1)
+    model = update_user_tts_model(user_id, requested_model)
+
+    original_text, prefs = await asyncio.gather(
+        get_callback_original_text(query, user_id),
+        get_user_prefs_async(user_id),
+    )
     prefs["tts_model"] = model
 
-    await safe_send(lambda: query.message.edit_reply_markup(
-        reply_markup=get_main_kb(prefs["gender"], model)
-    ))
-    with suppress(Exception):
-        await query.answer(f"TTS model: {_tts_model_label(model)}", show_alert=False)
+    gender = prefs["gender"]
+    speed  = prefs["speed"]
+
+    if not original_text:
+        await safe_send(lambda: query.message.edit_reply_markup(
+            reply_markup=get_main_kb(gender, model)
+        ))
+        await safe_send(lambda: query.message.reply_text(
+            "✅ បានប្តូរម៉ូដែល TTS រួច។\n"
+            "❌ រកអត្ថបទដើមមិនឃើញ ដូច្នេះមិនអាចបង្កើតសំឡេងឡើងវិញបានទេ។\n"
+            "សូមផ្ញើអត្ថបទម្តងទៀត។"
+        ))
+        return
+
+    if await _check_cooldown(query.message, user_id):
+        await safe_send(lambda: query.message.edit_reply_markup(
+            reply_markup=get_main_kb(gender, model)
+        ))
+        return
+
+    file_path  = _make_temp_ogg()
+    stop_event = asyncio.Event()
+    timer_task = asyncio.create_task(send_status_timer(chat_id, context.bot, stop_event))
+    lock       = _get_user_lock(user_id)
+
+    try:
+        async with lock:
+            try:
+                audio_bytes = await generate_voice_limited(original_text, gender, speed, file_path, model)
+                with suppress(Exception):
+                    await query.message.delete()
+                new_msg = await safe_send(
+                    lambda ab=audio_bytes: context.bot.send_voice(
+                        chat_id=chat_id,
+                        voice=io.BytesIO(ab),
+                        caption=f"🗣️ {BOT_TAG}",
+                        reply_markup=get_main_kb(gender, model),
+                    )
+                )
+                if new_msg:
+                    save_text_cache(
+                        new_msg.message_id, original_text,
+                        chat_id=chat_id, user_id=user_id,
+                        username=query.from_user.username or query.from_user.first_name,
+                    )
+                    set_last_tts_text(user_id, original_text)
+                    record_turn(user_id, "assistant", original_text)
+                _set_last_tts(user_id)
+            except Exception as e:
+                logger.error("tts model regenerate error: %s", e, exc_info=True)
+                with suppress(Exception):
+                    await safe_send(lambda: context.bot.send_message(
+                        chat_id=chat_id, text="❌ មានបញ្ហាក្នុងការបង្កើតសំឡេងឡើងវិញ។"
+                    ))
+    finally:
+        await _stop_timer(stop_event, timer_task)
+        _cleanup(file_path)
 
 
 async def get_callback_original_text(query, user_id: int) -> str | None:
