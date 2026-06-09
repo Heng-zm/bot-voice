@@ -6,7 +6,6 @@ import inspect
 import threading
 import time
 import contextvars
-import contextlib
 import html
 import functools
 import tempfile
@@ -308,19 +307,8 @@ def abort(status_code: int = 400):
     raise HTTPException(status_code=status_code)
 
 
-@functools.lru_cache(maxsize=32)
-def _compiled_jinja_template(template: str) -> Template:
-    """Cache compiled Jinja templates used by the admin dashboard.
-
-    The dashboard layout is a large inline template rendered on nearly every
-    admin request. Recompiling it for every page adds avoidable CPU overhead,
-    especially on small Render instances and during frequent status polling.
-    """
-    return Template(template)
-
-
 def render_template_string(template: str, **context: Any) -> str:
-    return _compiled_jinja_template(template).render(**context)
+    return Template(template).render(**context)
 
 
 def flask_flash(message: str, category: str = "message") -> None:
@@ -1699,15 +1687,13 @@ def _web_progress_bar(done: Any, total: Any) -> str:
 def _web_blocked_ids_for_users(users: list[Any]) -> set[int]:
     """Batch-load blocked status to avoid one Supabase query per table row/user."""
     ids: list[int] = []
-    seen_ids: set[int] = set()
     for item in users or []:
         raw = item.get("user_id") if isinstance(item, dict) else item
         try:
             uid = int(raw)
         except Exception:
             continue
-        if uid not in seen_ids:
-            seen_ids.add(uid)
+        if uid not in ids:
             ids.append(uid)
 
     if not ids:
@@ -1762,29 +1748,22 @@ def _web_status_card(label: str, value: Any, hint: str = "", kind: str = "") -> 
     )
 
 
-_WEB_NAV_ITEMS = (
-    ("dashboard", "Dashboard", "/admin", "▣"),
-    ("analytics", "Analytics V2", "/admin/analytics", "📈"),
-    ("users", "Users", "/admin/users", "👥"),
-    ("schedules", "Schedules", "/admin/schedules", "⏱"),
-    ("calendar", "Calendar", "/admin/schedules/calendar", "🗓"),
-    ("broadcast", "Broadcast", "/admin/broadcast", "📣"),
-    ("health", "Health", "/admin/health", "🩺"),
-    ("settings", "Settings", "/admin/settings", "⚙"),
-    ("api", "API Keys", "/admin/api-keys", "🔑"),
-    ("locks", "Locks", "/admin/locks", "🔒"),
-    ("sql", "SQL", "/admin/sql", "☷"),
-)
-_WEB_BOTTOM_NAV_ITEMS = tuple(
-    item for item in _WEB_NAV_ITEMS
-    if item[0] in {"dashboard", "users", "schedules", "broadcast", "health"}
-)
-
-
 def _web_render(title: str, body: str, *, active: str = "dashboard", status_code: int = 200):
     csrf = _web_csrf_token() if session.get("web_admin_ok") else ""
-    nav = _WEB_NAV_ITEMS
-    bottom_nav = _WEB_BOTTOM_NAV_ITEMS
+    nav = [
+        ("dashboard", "Dashboard", "/admin", "▣"),
+        ("analytics", "Analytics V2", "/admin/analytics", "📈"),
+        ("users", "Users", "/admin/users", "👥"),
+        ("schedules", "Schedules", "/admin/schedules", "⏱"),
+        ("calendar", "Calendar", "/admin/schedules/calendar", "🗓"),
+        ("broadcast", "Broadcast", "/admin/broadcast", "📣"),
+        ("health", "Health", "/admin/health", "🩺"),
+        ("settings", "Settings", "/admin/settings", "⚙"),
+        ("api", "API Keys", "/admin/api-keys", "🔑"),
+        ("locks", "Locks", "/admin/locks", "🔒"),
+        ("sql", "SQL", "/admin/sql", "☷"),
+    ]
+    bottom_nav = [item for item in nav if item[0] in {"dashboard", "users", "schedules", "broadcast", "health"}]
     template = """
 <!doctype html>
 <html lang="en">
@@ -2352,14 +2331,6 @@ def _web_system_v4_rows() -> str:
     rows.append(_web_health_item("AI provider", bool(_hf_client or _gemini), f"provider={AI_PROVIDER} model={HF_MODEL if AI_PROVIDER == 'hf' else GEMINI_MODEL}", warn=not bool(_hf_client or _gemini)))
     ocr_disabled = _hf_ocr_is_temporarily_disabled() or _ocr_provider_is_temporarily_disabled("hf") or _ocr_provider_is_temporarily_disabled("gemini")
     rows.append(_web_health_item("OCR provider", _ocr_configured(), f"provider={OCR_PROVIDER} model={HF_OCR_MODEL}; temporary_disabled={ocr_disabled}", warn=ocr_disabled or not _ocr_configured()))
-    local_mms_ok, local_mms_detail = _local_mms_tts_dependency_status()
-    local_mms_disabled = _local_mms_tts_is_temporarily_disabled()
-    rows.append(_web_health_item(
-        "Local MMS Khmer TTS",
-        local_mms_ok,
-        local_mms_detail + f"; cooldown_remaining={_local_mms_tts_disabled_remaining_s()}s",
-        warn=local_mms_disabled or not local_mms_ok,
-    ))
     hf_tts_configured = bool(GradioClient is not None and HF_TTS_SPACE and HF_TTS_API_NAME)
     hf_tts_disabled = _hf_tts_is_temporarily_disabled()
     rows.append(_web_health_item("Khmer HF Space TTS", hf_tts_configured, _tts_provider_summary() + f"; cooldown_remaining={_hf_tts_disabled_remaining_s()}s", warn=hf_tts_disabled or not hf_tts_configured))
@@ -2391,9 +2362,7 @@ def _web_env_check_rows() -> str:
         ("SUPABASE_SERVICE_ROLE_KEY / SUPABASE_KEY", bool(os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY") or globals().get("SB_KEY")), "Recommended"),
         ("REDIS_URL", bool(os.environ.get("REDIS_URL") or globals().get("REDIS_URL")), "Optional cache"),
         ("HF_TOKEN / GEMINI_API_KEY", bool(os.environ.get("HF_TOKEN") or os.environ.get("GEMINI_API_KEY")), "Required for AI/OCR"),
-        ("torch + transformers + scipy", _local_mms_tts_dependencies_available(), "Required for local facebook/mms-tts-khm"),
-        ("LOCAL_MMS_TTS_MODEL", bool(LOCAL_MMS_TTS_MODEL), "Default: facebook/mms-tts-khm"),
-        ("gradio_client", GradioClient is not None, "Required for Khmer HF Space TTS fallback"),
+        ("gradio_client", GradioClient is not None, "Required for Khmer HF Space TTS"),
         ("HF_TTS_SPACE", bool(HF_TTS_SPACE), "Default: mrrtmob/khmer-tts"),
         ("RENDER_EXTERNAL_URL", bool(os.environ.get("RENDER_EXTERNAL_URL")), "Recommended for keep-alive"),
     ]
@@ -3682,52 +3651,13 @@ EDGE_TTS_RETRIES          = _env_int("EDGE_TTS_RETRIES", 3, minimum=1, maximum=8
 EDGE_TTS_RETRY_DELAY_S    = _env_float("EDGE_TTS_RETRY_DELAY_S", 0.8, minimum=0.2, maximum=10.0)
 EDGE_TTS_STREAM_TIMEOUT_S = _env_float("EDGE_TTS_STREAM_TIMEOUT_S", 45.0, minimum=15.0, maximum=180.0)
 EDGE_TTS_CROSS_LANG_FALLBACK = _env_bool("EDGE_TTS_CROSS_LANG_FALLBACK", False)
-# FFmpeg can start slowly on small Render instances when CPU/RAM is under load.
-# Keep these configurable and always kill the child process on conversion timeout.
-FFMPEG_START_TIMEOUT_S = _env_float("FFMPEG_START_TIMEOUT_S", 20.0, minimum=3.0, maximum=120.0)
-FFMPEG_CONVERT_TIMEOUT_S = _env_float("FFMPEG_CONVERT_TIMEOUT_S", 120.0, minimum=20.0, maximum=600.0)
-FFMPEG_READ_TIMEOUT_S = _env_float("FFMPEG_READ_TIMEOUT_S", 15.0, minimum=5.0, maximum=120.0)
 
-# Khmer TTS V3: local facebook/mms-tts-khm first, with HF Space and Edge fallbacks.
-# Recommended production routing:
-#   KHMER_TTS_PROVIDER=local_mms  -> local Transformers VITS model
-#   KHMER_TTS_PROVIDER=hf_space   -> mrrtmob/khmer-tts Gradio Space
-#   KHMER_TTS_PROVIDER=edge       -> Microsoft Edge TTS only
-TTS_PROVIDER             = (os.environ.get("TTS_PROVIDER") or "auto").strip().lower()       # auto | edge | local_mms | hf_space | khmer_hf_space
-KHMER_TTS_PROVIDER       = (os.environ.get("KHMER_TTS_PROVIDER") or "local_mms").strip().lower()  # local_mms | hf_space | edge
-
-# Local MMS Khmer TTS. Loaded lazily on first Khmer request so startup stays fast.
-LOCAL_MMS_TTS_MODEL      = (os.environ.get("LOCAL_MMS_TTS_MODEL") or os.environ.get("MMS_TTS_MODEL") or "facebook/mms-tts-khm").strip()
-LOCAL_MMS_TTS_DEVICE     = (os.environ.get("LOCAL_MMS_TTS_DEVICE") or "auto").strip().lower()  # auto | cpu | cuda
-LOCAL_MMS_TTS_MAX_CHARS  = _env_int("LOCAL_MMS_TTS_MAX_CHARS", 280, minimum=40, maximum=700)
-LOCAL_MMS_TTS_TIMEOUT_S  = _env_float("LOCAL_MMS_TTS_TIMEOUT_S", 120.0, minimum=20.0, maximum=600.0)
-LOCAL_MMS_TTS_RETRIES    = _env_int("LOCAL_MMS_TTS_RETRIES", 1, minimum=1, maximum=4)
-LOCAL_MMS_TTS_RETRY_DELAY_S = _env_float("LOCAL_MMS_TTS_RETRY_DELAY_S", 1.0, minimum=0.1, maximum=20.0)
-LOCAL_MMS_TTS_EDGE_FALLBACK = _env_bool("LOCAL_MMS_TTS_EDGE_FALLBACK", True)
-LOCAL_MMS_TTS_HF_FALLBACK   = _env_bool("LOCAL_MMS_TTS_HF_FALLBACK", True)
-LOCAL_MMS_TTS_FAILURE_LIMIT = _env_int("LOCAL_MMS_TTS_FAILURE_LIMIT", 2, minimum=1, maximum=20)
-LOCAL_MMS_TTS_COOLDOWN_S    = _env_float("LOCAL_MMS_TTS_COOLDOWN_S", 300.0, minimum=30.0, maximum=3600.0)
-LOCAL_MMS_TTS_LOG_TRACEBACK = _env_bool("LOCAL_MMS_TTS_LOG_TRACEBACK", True)
-LOCAL_MMS_TTS_CACHE_ENABLED = _env_bool("LOCAL_MMS_TTS_CACHE_ENABLED", True)
-LOCAL_MMS_TTS_CACHE_DIR     = (os.environ.get("LOCAL_MMS_TTS_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "khmer_mms_tts_cache")).strip()
-LOCAL_MMS_TTS_CACHE_TTL_S   = _env_float("LOCAL_MMS_TTS_CACHE_TTL_S", 7 * 86400.0, minimum=60.0, maximum=30 * 86400.0)
-LOCAL_MMS_TTS_CACHE_MAX_FILES = _env_int("LOCAL_MMS_TTS_CACHE_MAX_FILES", 500, minimum=20, maximum=5000)
-# IMPORTANT: an asyncio timeout cannot kill an already-running PyTorch worker
-# thread. If Local MMS times out, the worker may keep consuming CPU/RAM. By
-# default we DO NOT start HF/Edge fallback while that worker is still active,
-# because doing so can overload small Render instances and make FFmpeg time out.
-LOCAL_MMS_TTS_TIMEOUT_FALLBACK = _env_bool("LOCAL_MMS_TTS_TIMEOUT_FALLBACK", False)
-LOCAL_MMS_TTS_BLOCK_FALLBACK_WHILE_BUSY = _env_bool("LOCAL_MMS_TTS_BLOCK_FALLBACK_WHILE_BUSY", True)
-LOCAL_MMS_TTS_SKIP_BOT_STATUS_TEXT = _env_bool("LOCAL_MMS_TTS_SKIP_BOT_STATUS_TEXT", True)
-# Keep local VITS generation isolated from Gemini/HF text inference. On small
-# Render CPU instances, one local MMS worker is the safest default.
-LOCAL_MMS_TTS_WORKERS = _env_int("LOCAL_MMS_TTS_WORKERS", 1, minimum=1, maximum=4)
-LOCAL_MMS_TTS_CPU_THREADS = _env_int("LOCAL_MMS_TTS_CPU_THREADS", 1, minimum=1, maximum=8)
-LOCAL_MMS_TTS_CACHE_VERSION = (os.environ.get("LOCAL_MMS_TTS_CACHE_VERSION") or "v2").strip() or "v2"
-
-# Khmer HF Space fallback. Confirmed normal endpoint from `Client.view_api()` for mrrtmob/khmer-tts:
+# Khmer TTS V2: optional Hugging Face Gradio Space provider.
+# Confirmed normal endpoint from `Client.view_api()` for mrrtmob/khmer-tts:
 #   client.predict(text, "kiri", 0.6, 0.95, 1.1, 2048, api_name="/lambda")
-# Keep Edge TTS as final fallback because public Spaces can cold-start, sleep, or rate-limit.
+# Keep Edge TTS as fallback because public Spaces can cold-start, sleep, or rate-limit.
+TTS_PROVIDER             = (os.environ.get("TTS_PROVIDER") or "auto").strip().lower()       # auto | edge | hf_space | khmer_hf_space
+KHMER_TTS_PROVIDER       = (os.environ.get("KHMER_TTS_PROVIDER") or "hf_space").strip().lower()  # hf_space | edge
 HF_TTS_SPACE             = (os.environ.get("HF_TTS_SPACE") or "mrrtmob/khmer-tts").strip()
 HF_TTS_API_NAME          = (os.environ.get("HF_TTS_API_NAME") or "/lambda").strip()
 HF_TTS_TOKEN             = (os.environ.get("HF_TTS_TOKEN") or os.environ.get("HF_TOKEN") or "").strip()
@@ -3804,15 +3734,10 @@ _DB_EXECUTOR = ThreadPoolExecutor(
 _AI_EXECUTOR = ThreadPoolExecutor(
     max_workers=max(2, MAX_CONCURRENT_AI), thread_name_prefix="ai"
 )
-_LOCAL_MMS_TTS_EXECUTOR = ThreadPoolExecutor(
-    max_workers=LOCAL_MMS_TTS_WORKERS,
-    thread_name_prefix="local_mms_tts",
-)
 
 _AI_SEMAPHORE:         asyncio.Semaphore | None = None
 _BROADCAST_SEMAPHORE:  asyncio.Semaphore | None = None
 _TTS_CHUNK_SEMAPHORE:  asyncio.Semaphore | None = None
-_LOCAL_MMS_TTS_SEMAPHORE: asyncio.Semaphore | None = None
 
 # ---------------------------------------------------------------------------
 # Redis/Supabase safe retry + cache helpers
@@ -3868,12 +3793,6 @@ _log_once_seen: dict[str, float] = {}
 def _log_once(level: int, key: str, message: str, *args, exc_info=False) -> None:
     """Log repeated outage errors once per TTL so callbacks don't flood logs."""
     now = time.monotonic()
-    # Keep the de-duplication map bounded during long-running deployments.
-    if len(_log_once_seen) > 2048:
-        cutoff = now - (_LOG_ONCE_TTL_S * 2)
-        for old_key, old_ts in list(_log_once_seen.items()):
-            if old_ts < cutoff:
-                _log_once_seen.pop(old_key, None)
     last = _log_once_seen.get(key, 0.0)
     if now - last < _LOG_ONCE_TTL_S:
         return
@@ -4759,23 +4678,14 @@ _prefs_cache_lock: asyncio.Lock | None = None
 _prefs_cache_thread_lock = threading.RLock()
 
 TTS_MODEL_OPTIONS = {
-    "auto": ("Auto", "MMS Khmer → Kiri → Edge"),
-    "local_mms": ("MMS Khmer", "facebook/mms-tts-khm"),
-    "hf_space": ("Kiri", "HF Space"),
+    "auto": ("Auto", "Kiri → Edge TTS"),
+    "hf_space": ("Kiri", ""),
     "edge": ("Edge TTS", ""),
 }
 TTS_MODEL_ALIASES = {
     "auto": "auto",
     "default": "auto",
     "server": "auto",
-    "mms": "local_mms",
-    "mms_tts": "local_mms",
-    "mms_tts_khm": "local_mms",
-    "facebook_mms": "local_mms",
-    "facebook_mms_tts_khm": "local_mms",
-    "local_mms": "local_mms",
-    "local_mms_tts": "local_mms",
-    "khmer_mms": "local_mms",
     "hf": "hf_space",
     "hf_space": "hf_space",
     "khmer_hf": "hf_space",
@@ -4810,39 +4720,15 @@ _USER_PREFS_TTS_MODEL_COLUMN_OK: bool | None = None
 _USER_PREFS_TTS_MODEL_LAST_CHECK = 0.0
 _USER_PREFS_TTS_MODEL_RECHECK_S = max(60.0, float(os.environ.get("TTS_MODEL_COLUMN_RECHECK_S", "300")))
 
-USER_PREFS_TTS_MODEL_SQL = """-- Run in Supabase SQL Editor if users cannot save TTS model choice.
--- Fixes: user_prefs_tts_model_check rejecting the new local_mms model.
-
+USER_PREFS_TTS_MODEL_SQL = """-- Run in Supabase SQL Editor if users cannot save TTS model choice
 alter table public.user_prefs
 add column if not exists tts_model text default 'auto';
 
-alter table public.user_prefs
-alter column tts_model set default 'auto';
-
--- Convert old/alias values to the normalized values used by the bot before
--- recreating the CHECK constraint. This prevents migration failure on old rows.
 update public.user_prefs
-set tts_model = case
-  when tts_model is null or trim(tts_model) = '' then 'auto'
-  when lower(replace(trim(tts_model), '-', '_')) in ('auto', 'default', 'server') then 'auto'
-  when lower(replace(trim(tts_model), '-', '_')) in ('local_mms', 'local_mms_tts', 'mms', 'mms_tts', 'mms_tts_khm', 'facebook_mms', 'facebook_mms_tts_khm', 'khmer_mms') then 'local_mms'
-  when lower(replace(trim(tts_model), '-', '_')) in ('hf', 'hf_space', 'khmer_hf', 'khmer_hf_space', 'khmer_tts', 'mrrtmob') then 'hf_space'
-  when lower(replace(trim(tts_model), '-', '_')) in ('edge', 'edge_tts', 'msedge') then 'edge'
-  else 'auto'
-end;
+set tts_model = 'auto'
+where tts_model is null;
 
-alter table public.user_prefs
-alter column tts_model set not null;
-
-alter table public.user_prefs
-drop constraint if exists user_prefs_tts_model_check;
-
-alter table public.user_prefs
-add constraint user_prefs_tts_model_check
-check (tts_model in ('auto', 'local_mms', 'hf_space', 'edge'));
-
--- Refresh PostgREST/Supabase API schema cache so writes stop returning stale
--- schema/constraint errors after ALTER TABLE.
+-- Refresh PostgREST/Supabase API schema cache so writes stop returning PGRST204.
 notify pgrst, 'reload schema';
 """
 
@@ -4860,19 +4746,6 @@ def _is_missing_tts_model_column_error(exc: Exception | str) -> bool:
         )
     )
 
-
-def _is_tts_model_constraint_error(exc: Exception | str) -> bool:
-    """Return True when Supabase rejects a valid bot model because DB CHECK is stale."""
-    msg = str(exc).lower()
-    return (
-        "tts_model" in msg
-        and (
-            "23514" in msg
-            or "user_prefs_tts_model_check" in msg
-            or "check constraint" in msg
-            or "violates check" in msg
-        )
-    )
 
 def _set_tts_model_column_status(value: bool) -> None:
     global _USER_PREFS_TTS_MODEL_COLUMN_OK, _USER_PREFS_TTS_MODEL_LAST_CHECK
@@ -5559,7 +5432,7 @@ def update_user_tts_model(user_id: int, tts_model: str) -> str:
         _log_once(
             logging.WARNING,
             "tts_model_column_missing_write_skipped",
-            "Skipped Supabase tts_model write because user_prefs.tts_model is not available or its CHECK constraint is stale. SQL:\n%s",
+            "Skipped Supabase tts_model write because user_prefs.tts_model is not available yet. SQL:\n%s",
             USER_PREFS_TTS_MODEL_SQL,
         )
         return model
@@ -5583,19 +5456,6 @@ def update_user_tts_model(user_id: int, tts_model: str) -> str:
                     logging.WARNING,
                     "tts_model_column_missing_write",
                     "Could not save tts_model because the optional column is missing or Supabase schema cache is stale. SQL:\n%s",
-                    USER_PREFS_TTS_MODEL_SQL,
-                )
-                return
-            if _is_tts_model_constraint_error(exc):
-                # The bot already cached the preference in memory/Redis above, so
-                # Telegram callbacks continue working. Stop hammering Supabase
-                # until the admin runs the migration and the periodic recheck opens.
-                _set_tts_model_column_status(False)
-                _log_once(
-                    logging.WARNING,
-                    "tts_model_constraint_stale_write",
-                    "Could not save tts_model=%s because Supabase user_prefs_tts_model_check is stale. Run SQL:\n%s",
-                    model,
                     USER_PREFS_TTS_MODEL_SQL,
                 )
                 return
@@ -5832,7 +5692,7 @@ def ensure_tts_model_column() -> None:
     try:
         supabase.table("user_prefs").select("tts_model").limit(1).execute()
         _set_tts_model_column_status(True)
-        logger.info("tts_model column present. If local_mms still fails to save, run USER_PREFS_TTS_MODEL_SQL to refresh the CHECK constraint.")
+        logger.info("tts_model column present.")
     except Exception as exc:
         if _is_missing_tts_model_column_error(exc):
             _set_tts_model_column_status(False)
@@ -5863,8 +5723,6 @@ def startup_self_check() -> None:
         checks.append("HF_TOKEN is missing; Hugging Face OCR will be unavailable")
     if OCR_PROVIDER in ("auto", "gemini") and not GEMINI_API_KEY:
         checks.append("GEMINI_API_KEY is missing; Gemini OCR/audio fallback will be unavailable")
-    if _should_try_local_mms_khmer_tts("សាកល្បង", "auto") and not _local_mms_tts_dependencies_available():
-        checks.append("Local MMS Khmer TTS is selected but dependencies are missing. Add `torch`, `transformers`, `accelerate`, and `scipy` to requirements.txt; bot will fall back to HF Space/Edge.")
     if (TTS_PROVIDER in {"auto", "hf", "hf_space", "khmer_hf_space", "khmer-tts"} or KHMER_TTS_PROVIDER in {"hf", "hf_space", "khmer_hf_space", "khmer-tts"}) and GradioClient is None:
         checks.append("gradio_client is missing; Khmer HF Space TTS will fall back to Edge. Add `gradio_client` to requirements.txt")
     if _should_try_hf_khmer_tts("សាកល្បង", "hf_space") and not HF_TTS_SPACE:
@@ -7743,20 +7601,7 @@ async def _edge_tts_stream_with_retry(chunk_text: str, voices: list[str]) -> tup
     raise RuntimeError(f"edge-tts failed after retries/fallbacks. {detail}")
 
 
-# Local MMS + Khmer HF Space provider state. Locks are needed because the
-# heavy model and Gradio calls run inside worker threads.
-_LOCAL_MMS_TTS_STATE_LOCK = threading.Lock()
-_LOCAL_MMS_TTS_MODEL_LOCK = threading.RLock()
-_LOCAL_MMS_TTS_FAILURES = 0
-_LOCAL_MMS_TTS_DISABLED_UNTIL = 0.0
-_LOCAL_MMS_TTS_TOKENIZER: Any = None
-_LOCAL_MMS_TTS_MODEL_OBJ: Any = None
-_LOCAL_MMS_TTS_DEVICE_USED = "cpu"
-_LOCAL_MMS_TTS_SAMPLE_RATE = 16000
-_LOCAL_MMS_TTS_CACHE_LAST_PRUNE = 0.0
-_LOCAL_MMS_TTS_CACHE_LOCK = threading.RLock()
-_LOCAL_MMS_TTS_ACTIVE_WORKERS = 0
-
+# Khmer HF Space provider state. Protected by a lock because Gradio calls run in worker threads.
 _HF_TTS_STATE_LOCK = threading.Lock()
 _HF_TTS_FAILURES = 0
 _HF_TTS_DISABLED_UNTIL = 0.0
@@ -7765,420 +7610,11 @@ _HF_TTS_DISABLED_UNTIL = 0.0
 def _tts_provider_summary() -> str:
     return (
         f"provider={TTS_PROVIDER}, khmer={KHMER_TTS_PROVIDER}, "
-        f"local_mms={LOCAL_MMS_TTS_MODEL}, workers={LOCAL_MMS_TTS_WORKERS}, cpu_threads={LOCAL_MMS_TTS_CPU_THREADS}, "
         f"hf_space={HF_TTS_SPACE}{HF_TTS_API_NAME}, "
         f"gradio_client={'on' if GradioClient is not None else 'missing'}, "
-        f"fallbacks=hf:{'on' if LOCAL_MMS_TTS_HF_FALLBACK else 'off'}/edge:{'on' if LOCAL_MMS_TTS_EDGE_FALLBACK else 'off'}, "
-        f"timeout_fallback={'on' if LOCAL_MMS_TTS_TIMEOUT_FALLBACK else 'off'}, "
-        f"block_busy={'on' if LOCAL_MMS_TTS_BLOCK_FALLBACK_WHILE_BUSY else 'off'}"
+        f"edge_fallback={'on' if HF_TTS_EDGE_FALLBACK else 'off'}"
     )
 
-
-def _local_mms_tts_dependencies_available() -> bool:
-    try:
-        import importlib.util
-        required = ("torch", "transformers", "scipy")
-        return all(importlib.util.find_spec(name) is not None for name in required)
-    except Exception:
-        return False
-
-
-def _local_mms_tts_dependency_status() -> tuple[bool, str]:
-    ok = _local_mms_tts_dependencies_available()
-    detail = (
-        f"model={LOCAL_MMS_TTS_MODEL}; device={LOCAL_MMS_TTS_DEVICE}; "
-        f"workers={LOCAL_MMS_TTS_WORKERS}; cpu_threads={LOCAL_MMS_TTS_CPU_THREADS}; "
-        f"cache={'on' if LOCAL_MMS_TTS_CACHE_ENABLED else 'off'}; "
-        f"timeout_fallback={'on' if LOCAL_MMS_TTS_TIMEOUT_FALLBACK else 'off'}; "
-        f"block_busy={'on' if LOCAL_MMS_TTS_BLOCK_FALLBACK_WHILE_BUSY else 'off'}"
-    )
-    if not ok:
-        detail += "; missing one of: torch, transformers, scipy"
-    return ok, detail
-
-
-def _exception_detail(exc: BaseException | str | None) -> str:
-    """Return useful text even for blank exceptions like asyncio.TimeoutError.
-
-    Some async/worker exceptions stringify to an empty value, which previously
-    produced logs ending in only `... failed at chunk: `. This helper keeps the
-    provider logs actionable and makes cooldown/fallback decisions easier to
-    diagnose on Render.
-    """
-    if exc is None:
-        return "unknown error"
-    if isinstance(exc, str):
-        return exc.strip() or "unknown error"
-    name = type(exc).__name__
-    msg = str(exc).strip()
-    if msg:
-        return f"{name}: {msg}"
-    rep = repr(exc).strip()
-    return rep if rep and rep != name + "()" else name
-
-
-def _local_mms_timeout_error(chunk_index: int, chunk_total: int) -> RuntimeError:
-    return RuntimeError(
-        f"TimeoutError: Local MMS Khmer TTS timed out after {LOCAL_MMS_TTS_TIMEOUT_S:.0f}s "
-        f"at chunk {chunk_index}/{chunk_total}. The model may still be downloading/loading, "
-        "or this Render instance may not have enough CPU/RAM for local PyTorch TTS."
-    )
-
-
-def _local_mms_tts_is_temporarily_disabled() -> bool:
-    with _LOCAL_MMS_TTS_STATE_LOCK:
-        return time.monotonic() < _LOCAL_MMS_TTS_DISABLED_UNTIL
-
-
-def _local_mms_tts_disabled_remaining_s() -> int:
-    with _LOCAL_MMS_TTS_STATE_LOCK:
-        return max(0, int(_LOCAL_MMS_TTS_DISABLED_UNTIL - time.monotonic()))
-
-
-def _local_mms_tts_active_count() -> int:
-    with _LOCAL_MMS_TTS_STATE_LOCK:
-        return int(_LOCAL_MMS_TTS_ACTIVE_WORKERS)
-
-
-def _local_mms_tts_worker_started() -> None:
-    global _LOCAL_MMS_TTS_ACTIVE_WORKERS
-    with _LOCAL_MMS_TTS_STATE_LOCK:
-        _LOCAL_MMS_TTS_ACTIVE_WORKERS += 1
-
-
-def _local_mms_tts_worker_finished() -> None:
-    global _LOCAL_MMS_TTS_ACTIVE_WORKERS
-    with _LOCAL_MMS_TTS_STATE_LOCK:
-        _LOCAL_MMS_TTS_ACTIVE_WORKERS = max(0, _LOCAL_MMS_TTS_ACTIVE_WORKERS - 1)
-
-
-def _is_local_mms_timeout_exception(exc: BaseException | str | None) -> bool:
-    detail = _exception_detail(exc).lower()
-    return "local mms" in detail and "timeout" in detail
-
-
-def _local_mms_tts_submit_chunk(loop: asyncio.AbstractEventLoop, chunk_text: str, wav_path: str):
-    """Submit a Local MMS worker and track it until the sync thread exits.
-
-    asyncio cancellation/timeouts do not stop a running ThreadPoolExecutor job.
-    Tracking active workers lets the router avoid starting HF/Edge fallback while
-    PyTorch is still consuming CPU/RAM in the background.
-    """
-    _local_mms_tts_worker_started()
-    fut = loop.run_in_executor(
-        _LOCAL_MMS_TTS_EXECUTOR,
-        _local_mms_tts_chunk_to_wav_sync,
-        chunk_text,
-        wav_path,
-    )
-
-    def _done(done_fut):
-        _local_mms_tts_worker_finished()
-        try:
-            done_fut.result()
-        except asyncio.CancelledError:
-            logger.warning("Local MMS worker future was cancelled; underlying sync work may have already finished.")
-        except Exception as exc:
-            logger.warning("Local MMS worker finished with error after timeout/cancel: %s", _exception_detail(exc))
-
-    fut.add_done_callback(_done)
-    return fut
-
-
-def _local_mms_tts_record_success() -> None:
-    global _LOCAL_MMS_TTS_FAILURES, _LOCAL_MMS_TTS_DISABLED_UNTIL
-    with _LOCAL_MMS_TTS_STATE_LOCK:
-        _LOCAL_MMS_TTS_FAILURES = 0
-        _LOCAL_MMS_TTS_DISABLED_UNTIL = 0.0
-
-
-def _local_mms_tts_record_failure(exc: BaseException | str) -> None:
-    global _LOCAL_MMS_TTS_FAILURES, _LOCAL_MMS_TTS_DISABLED_UNTIL
-    with _LOCAL_MMS_TTS_STATE_LOCK:
-        _LOCAL_MMS_TTS_FAILURES += 1
-        if _LOCAL_MMS_TTS_FAILURES >= LOCAL_MMS_TTS_FAILURE_LIMIT:
-            _LOCAL_MMS_TTS_DISABLED_UNTIL = time.monotonic() + LOCAL_MMS_TTS_COOLDOWN_S
-            logger.warning(
-                "Local MMS Khmer TTS temporarily disabled for %.0fs after %s failure(s): %s",
-                LOCAL_MMS_TTS_COOLDOWN_S,
-                _LOCAL_MMS_TTS_FAILURES,
-                _exception_detail(exc),
-            )
-
-
-def _local_mms_tts_cache_key(text: str, speed: float) -> str:
-    raw = f"mms-khm:{LOCAL_MMS_TTS_CACHE_VERSION}:{LOCAL_MMS_TTS_MODEL}:{_rounded_speed(speed)}:{text}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def _local_mms_tts_cache_path(text: str, speed: float) -> str:
-    return os.path.join(LOCAL_MMS_TTS_CACHE_DIR, _local_mms_tts_cache_key(text, speed) + ".ogg")
-
-
-def _local_mms_tts_cache_prune() -> None:
-    global _LOCAL_MMS_TTS_CACHE_LAST_PRUNE
-    if not LOCAL_MMS_TTS_CACHE_ENABLED:
-        return
-    now = time.monotonic()
-    if now - _LOCAL_MMS_TTS_CACHE_LAST_PRUNE < 300:
-        return
-    with _LOCAL_MMS_TTS_CACHE_LOCK:
-        now = time.monotonic()
-        if now - _LOCAL_MMS_TTS_CACHE_LAST_PRUNE < 300:
-            return
-        _LOCAL_MMS_TTS_CACHE_LAST_PRUNE = now
-        try:
-            os.makedirs(LOCAL_MMS_TTS_CACHE_DIR, exist_ok=True)
-            entries: list[tuple[float, str]] = []
-            cutoff = time.time() - LOCAL_MMS_TTS_CACHE_TTL_S
-            for entry in os.scandir(LOCAL_MMS_TTS_CACHE_DIR):
-                if not entry.is_file() or not entry.name.endswith(".ogg"):
-                    continue
-                try:
-                    mtime = entry.stat().st_mtime
-                except OSError:
-                    continue
-                if mtime < cutoff:
-                    with suppress(OSError):
-                        os.remove(entry.path)
-                    continue
-                entries.append((mtime, entry.path))
-            entries.sort(key=lambda item: item[0])
-            overflow = max(0, len(entries) - LOCAL_MMS_TTS_CACHE_MAX_FILES)
-            for _mtime, path in entries[:overflow]:
-                with suppress(OSError):
-                    os.remove(path)
-        except Exception as exc:
-            logger.debug("Local MMS TTS cache prune skipped: %s", exc)
-
-def _local_mms_tts_cache_get(text: str, speed: float, output_path: str) -> bytes | None:
-    if not LOCAL_MMS_TTS_CACHE_ENABLED:
-        return None
-    try:
-        path = _local_mms_tts_cache_path(text, speed)
-        if not os.path.exists(path):
-            return None
-        if time.time() - os.path.getmtime(path) > LOCAL_MMS_TTS_CACHE_TTL_S:
-            with suppress(OSError):
-                os.remove(path)
-            return None
-        with open(path, "rb") as fh:
-            data = fh.read()
-        if not data:
-            return None
-        with open(output_path, "wb") as out:
-            out.write(data)
-        os.utime(path, None)
-        return data
-    except Exception as exc:
-        logger.debug("Local MMS TTS cache read skipped: %s", exc)
-        return None
-
-
-def _local_mms_tts_cache_put(text: str, speed: float, data: bytes) -> None:
-    if not LOCAL_MMS_TTS_CACHE_ENABLED or not data:
-        return
-    try:
-        os.makedirs(LOCAL_MMS_TTS_CACHE_DIR, exist_ok=True)
-        path = _local_mms_tts_cache_path(text, speed)
-        tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
-        with _LOCAL_MMS_TTS_CACHE_LOCK:
-            with open(tmp_path, "wb") as fh:
-                fh.write(data)
-            os.replace(tmp_path, path)
-        _local_mms_tts_cache_prune()
-    except Exception as exc:
-        with suppress(Exception):
-            if 'tmp_path' in locals():
-                os.remove(tmp_path)
-        logger.debug("Local MMS TTS cache write skipped: %s", exc)
-
-def _local_mms_tts_resolve_device(torch_module: Any) -> str:
-    if LOCAL_MMS_TTS_DEVICE in {"cpu", "cuda"}:
-        if LOCAL_MMS_TTS_DEVICE == "cuda" and not torch_module.cuda.is_available():
-            logger.warning("LOCAL_MMS_TTS_DEVICE=cuda requested but CUDA is unavailable. Falling back to CPU.")
-            return "cpu"
-        return LOCAL_MMS_TTS_DEVICE
-    return "cuda" if torch_module.cuda.is_available() else "cpu"
-
-
-def _local_mms_tts_configure_torch_runtime(torch_module: Any) -> None:
-    """Keep local MMS CPU usage predictable on small Render instances."""
-    threads = max(1, int(LOCAL_MMS_TTS_CPU_THREADS or 1))
-    with suppress(Exception):
-        torch_module.set_num_threads(threads)
-    # set_num_interop_threads can only be called before inter-op work starts.
-    # Ignore the RuntimeError on warm reloads instead of breaking TTS.
-    with suppress(Exception):
-        torch_module.set_num_interop_threads(max(1, min(threads, 2)))
-
-
-def _local_mms_tts_load_sync() -> tuple[Any, Any, Any, str, int]:
-    """Lazy-load facebook/mms-tts-khm once per process."""
-    global _LOCAL_MMS_TTS_TOKENIZER, _LOCAL_MMS_TTS_MODEL_OBJ
-    global _LOCAL_MMS_TTS_DEVICE_USED, _LOCAL_MMS_TTS_SAMPLE_RATE
-
-    with _LOCAL_MMS_TTS_MODEL_LOCK:
-        if _LOCAL_MMS_TTS_TOKENIZER is not None and _LOCAL_MMS_TTS_MODEL_OBJ is not None:
-            import torch
-            return (
-                _LOCAL_MMS_TTS_TOKENIZER,
-                _LOCAL_MMS_TTS_MODEL_OBJ,
-                torch,
-                _LOCAL_MMS_TTS_DEVICE_USED,
-                _LOCAL_MMS_TTS_SAMPLE_RATE,
-            )
-
-        try:
-            import torch
-            from transformers import AutoTokenizer, VitsModel
-            _local_mms_tts_configure_torch_runtime(torch)
-        except Exception as exc:
-            raise RuntimeError(
-                "Local MMS Khmer TTS dependencies are missing. Add `torch`, `transformers`, "
-                "`accelerate`, and `scipy` to requirements.txt."
-            ) from exc
-
-        if not LOCAL_MMS_TTS_MODEL:
-            raise RuntimeError("LOCAL_MMS_TTS_MODEL is empty.")
-
-        tokenizer = AutoTokenizer.from_pretrained(LOCAL_MMS_TTS_MODEL)
-        model = VitsModel.from_pretrained(LOCAL_MMS_TTS_MODEL)
-        device = _local_mms_tts_resolve_device(torch)
-        model.to(device)
-        model.eval()
-
-        _LOCAL_MMS_TTS_TOKENIZER = tokenizer
-        _LOCAL_MMS_TTS_MODEL_OBJ = model
-        _LOCAL_MMS_TTS_DEVICE_USED = device
-        _LOCAL_MMS_TTS_SAMPLE_RATE = int(getattr(model.config, "sampling_rate", 16000) or 16000)
-        logger.info(
-            "Local MMS Khmer TTS loaded: model=%s device=%s sample_rate=%s",
-            LOCAL_MMS_TTS_MODEL,
-            _LOCAL_MMS_TTS_DEVICE_USED,
-            _LOCAL_MMS_TTS_SAMPLE_RATE,
-        )
-        return tokenizer, model, torch, _LOCAL_MMS_TTS_DEVICE_USED, _LOCAL_MMS_TTS_SAMPLE_RATE
-
-
-def _local_mms_tts_chunk_to_wav_sync(chunk_text: str, wav_path: str) -> str:
-    """Generate one Khmer WAV chunk using local facebook/mms-tts-khm."""
-    tokenizer, model, torch, device, sample_rate = _local_mms_tts_load_sync()
-    try:
-        from scipy.io import wavfile
-    except Exception as exc:
-        raise RuntimeError("scipy is required for Local MMS Khmer TTS WAV output.") from exc
-
-    cleaned = _clean_tts_text_for_edge(chunk_text)
-    if not cleaned:
-        raise ValueError("Local MMS Khmer TTS received empty chunk")
-
-    inputs = tokenizer(cleaned, return_tensors="pt")
-    inputs = {key: value.to(device) for key, value in inputs.items()}
-    with torch.inference_mode():
-        waveform = model(**inputs).waveform
-
-    audio = waveform.squeeze().detach().float().cpu().numpy()
-    if getattr(audio, "size", 0) <= 0:
-        raise RuntimeError("Local MMS Khmer TTS returned empty waveform")
-    wavfile.write(wav_path, sample_rate, audio)
-    return wav_path
-
-
-def _should_try_local_mms_khmer_tts(text: str, tts_model: str = "auto") -> bool:
-    if _detect_tts_lang_key(text) != "km":
-        return False
-
-    user_model = _normalize_tts_model(tts_model)
-    if user_model == "edge":
-        return False
-    if user_model == "local_mms":
-        return True
-    if user_model == "hf_space":
-        return False
-
-    mode = (TTS_PROVIDER or "auto").strip().lower().replace("-", "_")
-    khmer_mode = (KHMER_TTS_PROVIDER or "local_mms").strip().lower().replace("-", "_")
-    local_modes = {"local_mms", "local_mms_tts", "mms", "mms_tts", "mms_tts_khm", "facebook_mms", "facebook_mms_tts_khm"}
-    if mode in {"edge", "edge_tts"} or khmer_mode in {"edge", "edge_tts"}:
-        return False
-    if mode in local_modes or khmer_mode in local_modes:
-        return True
-    if mode == "auto" and khmer_mode in {"auto", "local_mms"}:
-        return True
-    return False
-
-
-async def _generate_voice_local_mms(text: str, speed: float, output_path: str) -> bytes:
-    """Generate Khmer TTS locally with facebook/mms-tts-khm and convert to Telegram OGG/Opus."""
-    # A cache hit should still work during provider cooldown because it does not
-    # touch the model. This keeps repeated buttons/regenerate fast and reliable.
-    cached = _local_mms_tts_cache_get(text, speed, output_path)
-    if cached:
-        logger.info("Local MMS Khmer TTS cache hit (%s bytes)", len(cached))
-        return cached
-
-    if _local_mms_tts_is_temporarily_disabled():
-        raise RuntimeError(f"Local MMS Khmer TTS cooldown active ({_local_mms_tts_disabled_remaining_s()}s remaining)")
-
-    chunks = _split_text_chunks(text, max_chars=LOCAL_MMS_TTS_MAX_CHARS)
-    if not chunks:
-        raise ValueError("Local MMS Khmer TTS: no speakable text chunks")
-
-    sem = _LOCAL_MMS_TTS_SEMAPHORE
-    sem_cm = sem if sem is not None else contextlib.nullcontext()
-
-    async with sem_cm:
-        # Re-check cache after waiting in the semaphore queue; another request
-        # may have generated the same audio while this one was waiting.
-        cached = _local_mms_tts_cache_get(text, speed, output_path)
-        if cached:
-            logger.info("Local MMS Khmer TTS cache hit after wait (%s bytes)", len(cached))
-            return cached
-
-        loop = asyncio.get_running_loop()
-        with tempfile.TemporaryDirectory(prefix="mms_khmer_tts_") as tmpdir:
-            input_paths: list[str] = []
-            for idx, chunk_text in enumerate(chunks, 1):
-                wav_path = os.path.join(tmpdir, f"chunk_{idx:03d}.wav")
-                last_error: Exception | None = None
-                for attempt in range(1, LOCAL_MMS_TTS_RETRIES + 1):
-                    try:
-                        fut = _local_mms_tts_submit_chunk(loop, chunk_text, wav_path)
-                        # Use shield so wait_for does not cancel the Future. A
-                        # running ThreadPoolExecutor job cannot be killed anyway;
-                        # cancellation only hides the real completion/error.
-                        await asyncio.wait_for(
-                            asyncio.shield(fut),
-                            timeout=LOCAL_MMS_TTS_TIMEOUT_S,
-                        )
-                        input_paths.append(wav_path)
-                        break
-                    except Exception as exc:
-                        if isinstance(exc, asyncio.TimeoutError):
-                            last_error = _local_mms_timeout_error(idx, len(chunks))
-                        else:
-                            last_error = exc
-                        if attempt < LOCAL_MMS_TTS_RETRIES:
-                            await asyncio.sleep(LOCAL_MMS_TTS_RETRY_DELAY_S * attempt)
-                wav_ok = False
-                try:
-                    wav_ok = os.path.exists(wav_path) and os.path.getsize(wav_path) > 44
-                except OSError:
-                    wav_ok = False
-                if not wav_ok:
-                    preview = chunk_text[:80].replace("\n", " ")
-                    raise RuntimeError(
-                        f"Local MMS Khmer TTS failed at chunk {idx}/{len(chunks)} ({preview!r}): {_exception_detail(last_error)}"
-                    )
-
-            converted = await _convert_audio_files_to_telegram_voice(input_paths, speed, output_path)
-            if not converted:
-                raise RuntimeError("Local MMS Khmer TTS produced empty converted output")
-            _local_mms_tts_cache_put(text, speed, converted)
-            _local_mms_tts_record_success()
-            logger.info("Local MMS Khmer TTS generated %s chunk(s) via %s", len(chunks), LOCAL_MMS_TTS_MODEL)
-            return converted
 
 def _hf_tts_is_temporarily_disabled() -> bool:
     with _HF_TTS_STATE_LOCK:
@@ -8216,23 +7652,19 @@ def _should_try_hf_khmer_tts(text: str, tts_model: str = "auto") -> bool:
         return False
 
     user_model = _normalize_tts_model(tts_model)
-    if user_model in {"edge", "local_mms"}:
+    if user_model == "edge":
         return False
     if user_model == "hf_space":
         return True
 
-    # Auto mode follows server-level env config. Local MMS is tried before this
-    # function; this HF Space path is now a fallback or an explicit server choice.
-    mode = (TTS_PROVIDER or "auto").strip().lower().replace("-", "_")
-    khmer_mode = (KHMER_TTS_PROVIDER or "local_mms").strip().lower().replace("-", "_")
+    # Auto mode follows server-level env config.
+    mode = (TTS_PROVIDER or "auto").strip().lower()
+    khmer_mode = (KHMER_TTS_PROVIDER or "hf_space").strip().lower()
     if mode in {"edge", "edge_tts"} or khmer_mode in {"edge", "edge_tts"}:
         return False
-    if mode in {"hf", "hf_space", "khmer_hf_space", "khmer_tts"}:
+    if mode in {"hf", "hf_space", "khmer_hf_space", "khmer-tts", "auto"}:
         return True
-    if khmer_mode in {"hf", "hf_space", "khmer_hf_space", "khmer_tts"}:
-        return True
-    # Keep legacy Auto behavior as a fallback when Local MMS fails.
-    return mode == "auto" and LOCAL_MMS_TTS_HF_FALLBACK
+    return khmer_mode in {"hf", "hf_space", "khmer_hf_space", "khmer-tts"}
 
 
 def _extract_hf_audio_path_or_url(audio_obj: Any) -> str:
@@ -8305,37 +7737,6 @@ def _hf_tts_space_predict_sync(chunk_text: str) -> bytes:
     return data
 
 
-async def _terminate_process_safely(proc: Any) -> None:
-    if proc is None or getattr(proc, "returncode", None) is not None:
-        return
-    with suppress(Exception):
-        proc.kill()
-    with suppress(Exception):
-        await asyncio.wait_for(proc.wait(), timeout=5)
-
-
-def _ffmpeg_convert_timeout(input_count: int = 1, data_bytes: int = 0) -> float:
-    # Give FFmpeg more room for large Edge MP3 payloads or multi-chunk HF/MMS
-    # conversions, but keep a bounded timeout so callbacks do not hang forever.
-    base = float(FFMPEG_CONVERT_TIMEOUT_S)
-    by_inputs = max(0, int(input_count or 1) - 1) * 20.0
-    by_size = max(0, int(data_bytes or 0)) / (512 * 1024) * 5.0
-    return min(600.0, max(base, base + by_inputs + by_size))
-
-
-async def _read_file_bytes_async(path: str, timeout: float | None = None) -> bytes:
-    try:
-        loop = asyncio.get_running_loop()
-        return await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: open(path, "rb").read()),
-            timeout=timeout or FFMPEG_READ_TIMEOUT_S,
-        )
-    except asyncio.TimeoutError:
-        raise RuntimeError(f"Timed out reading output audio file after {timeout or FFMPEG_READ_TIMEOUT_S:.0f}s")
-    except OSError as exc:
-        raise RuntimeError(f"Failed to read output audio file: {exc}") from exc
-
-
 async def _convert_audio_files_to_telegram_voice(input_paths: list[str], speed: float, output_path: str) -> bytes:
     """Convert one or more audio files into Telegram voice-compatible OGG/Opus."""
     if not input_paths:
@@ -8361,7 +7762,6 @@ async def _convert_audio_files_to_telegram_voice(input_paths: list[str], speed: 
 
     cmd += ["-vn", "-c:a", "libopus", "-b:a", "32k", output_path]
 
-    proc = None
     try:
         proc = await asyncio.wait_for(
             asyncio.create_subprocess_exec(
@@ -8369,25 +7769,26 @@ async def _convert_audio_files_to_telegram_voice(input_paths: list[str], speed: 
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             ),
-            timeout=FFMPEG_START_TIMEOUT_S,
+            timeout=5,
         )
-        _, stderr_data = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=_ffmpeg_convert_timeout(input_count=len(input_paths)),
-        )
-    except asyncio.TimeoutError as exc:
-        await _terminate_process_safely(proc)
-        phase = "start" if proc is None else "convert"
-        raise RuntimeError(
-            f"FFmpeg {phase} timed out while converting TTS audio "
-            f"(start_timeout={FFMPEG_START_TIMEOUT_S:.0f}s, convert_timeout={_ffmpeg_convert_timeout(input_count=len(input_paths)):.0f}s)"
-        ) from exc
+        _, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=max(60, 20 * len(input_paths)))
+    except asyncio.TimeoutError:
+        raise RuntimeError("FFmpeg timed out while converting HF TTS audio")
 
     if proc.returncode != 0:
         snippet = (stderr_data or b"").decode(errors="replace")[-600:]
         raise RuntimeError(f"FFmpeg failed converting HF TTS audio (code {proc.returncode}): {snippet}")
 
-    return await _read_file_bytes_async(output_path, timeout=FFMPEG_READ_TIMEOUT_S)
+    try:
+        loop = asyncio.get_running_loop()
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: open(output_path, "rb").read()),
+            timeout=10,
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError("Timed out reading converted HF TTS output")
+    except OSError as exc:
+        raise RuntimeError(f"Failed to read converted HF TTS output: {exc}") from exc
 
 
 async def _generate_voice_hf_space(text: str, speed: float, output_path: str) -> bytes:
@@ -8436,13 +7837,7 @@ async def _generate_voice_hf_space(text: str, speed: float, output_path: str) ->
 
 
 def _tts_user_error_message(exc: Exception | str) -> str:
-    msg = _exception_detail(exc).lower()
-    if "local mms" in msg and ("timeout" in msg or "worker still active" in msg or "fallback was skipped" in msg):
-        return (
-            "❌ Local MMS Khmer TTS យឺតពេក ឬ Render CPU/RAM មិនគ្រប់គ្រាន់។\n"
-            "✅ ដើម្បីកុំឲ្យ Bot គាំង ខ្ញុំបានបញ្ឈប់ fallback ពេល MMS worker នៅរត់។\n"
-            "សូមប្តូរ TTS Model ទៅ Edge ឬដាក់ KHMER_TTS_PROVIDER=edge រួច redeploy។"
-        )
+    msg = str(exc).lower()
     if "no audio" in msg or "edge-tts failed" in msg:
         return (
             "❌ TTS service មិនបានបញ្ជូនសំឡេងមកវិញ។\n"
@@ -8492,7 +7887,6 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
         cmd += ["-filter:a", af]
     cmd += ["-c:a", "libopus", "-b:a", "32k", output_path]
 
-    proc = None
     try:
         proc = await asyncio.wait_for(
             asyncio.create_subprocess_exec(
@@ -8501,35 +7895,34 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             ),
-            timeout=FFMPEG_START_TIMEOUT_S,
+            timeout=5,
         )
-        _, stderr_data = await asyncio.wait_for(
-            proc.communicate(input=mp3_data),
-            timeout=_ffmpeg_convert_timeout(input_count=len(text_chunks), data_bytes=len(mp3_data)),
-        )
-    except asyncio.TimeoutError as exc:
-        await _terminate_process_safely(proc)
-        phase = "start" if proc is None else "convert"
-        raise RuntimeError(
-            f"FFmpeg {phase} timed out for Edge TTS "
-            f"(chunks={len(text_chunks)}, mp3_bytes={len(mp3_data)}, "
-            f"start_timeout={FFMPEG_START_TIMEOUT_S:.0f}s, "
-            f"convert_timeout={_ffmpeg_convert_timeout(input_count=len(text_chunks), data_bytes=len(mp3_data)):.0f}s)"
-        ) from exc
+        _, stderr_data = await asyncio.wait_for(proc.communicate(input=mp3_data), timeout=60)
+    except asyncio.TimeoutError:
+        raise RuntimeError("FFmpeg timed out after 60s")
 
     if proc.returncode != 0:
         snippet = (stderr_data or b"").decode(errors="replace")[-400:]
         raise RuntimeError(f"FFmpeg failed (code {proc.returncode}): {snippet}")
 
-    return await _read_file_bytes_async(output_path, timeout=FFMPEG_READ_TIMEOUT_S)
+    try:
+        loop        = asyncio.get_running_loop()
+        audio_bytes = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: open(output_path, "rb").read()),
+            timeout=10,
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError("Timed out reading output audio file")
+    except OSError as e:
+        raise RuntimeError(f"Failed to read output audio file: {e}") from e
+    return audio_bytes
 
 
 async def generate_voice(text: str, gender: str, speed: float, output_path: str, tts_model: str = "auto") -> bytes:
     """Generate Telegram voice audio using the user's selected TTS model.
 
     User model routing:
-      - auto: server default; Khmer uses Local MMS first, then HF Space, then Edge.
-      - local_mms: force facebook/mms-tts-khm for Khmer text; English still uses Edge.
+      - auto: server default; Khmer usually uses HF Space, English uses Edge.
       - hf_space: force mrrtmob/khmer-tts for Khmer text; English still uses Edge.
       - edge: force Edge TTS for all supported languages.
     """
@@ -8538,49 +7931,7 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
         raise ValueError("generate_voice: text must not be empty")
 
     user_model = _normalize_tts_model(tts_model)
-    tried_local_mms = False
-
-    if _should_try_local_mms_khmer_tts(text, user_model):
-        tried_local_mms = True
-        try:
-            return await _generate_voice_local_mms(text, speed, output_path)
-        except Exception as exc:
-            _local_mms_tts_record_failure(exc)
-            logger.warning(
-                "Local MMS Khmer TTS failed; user_model=%s hf_fallback=%s edge_fallback=%s: %s",
-                user_model,
-                LOCAL_MMS_TTS_HF_FALLBACK,
-                LOCAL_MMS_TTS_EDGE_FALLBACK,
-                _exception_detail(exc),
-                exc_info=LOCAL_MMS_TTS_LOG_TRACEBACK,
-            )
-            active_workers = _local_mms_tts_active_count()
-            if _is_local_mms_timeout_exception(exc) and not LOCAL_MMS_TTS_TIMEOUT_FALLBACK:
-                raise RuntimeError(
-                    "Local MMS Khmer TTS timed out. Fallback was skipped because the PyTorch "
-                    "worker may still be running in the background; starting Edge/HF now can "
-                    "overload Render and make FFmpeg time out. Set KHMER_TTS_PROVIDER=edge "
-                    "for stable production, or set LOCAL_MMS_TTS_TIMEOUT_FALLBACK=true on a "
-                    "larger instance."
-                ) from exc
-            if active_workers > 0 and LOCAL_MMS_TTS_BLOCK_FALLBACK_WHILE_BUSY:
-                raise RuntimeError(
-                    f"Local MMS Khmer TTS worker still active ({active_workers}). Fallback skipped "
-                    "to prevent CPU/RAM overload and FFmpeg timeout."
-                ) from exc
-            if not LOCAL_MMS_TTS_EDGE_FALLBACK and not LOCAL_MMS_TTS_HF_FALLBACK:
-                raise RuntimeError(
-                    f"Local MMS Khmer TTS failed and all fallback is disabled: {_exception_detail(exc)}"
-                ) from exc
-
-    should_try_hf = _should_try_hf_khmer_tts(text, user_model)
-    # Important: when the user explicitly selects local_mms, the normal HF
-    # routing helper intentionally returns False. After a Local MMS failure,
-    # still allow HF Space as the configured fallback before Edge.
-    if tried_local_mms:
-        should_try_hf = bool(LOCAL_MMS_TTS_HF_FALLBACK and _detect_tts_lang_key(text) == "km")
-
-    if should_try_hf:
+    if _should_try_hf_khmer_tts(text, user_model):
         try:
             return await _generate_voice_hf_space(text, speed, output_path)
         except Exception as exc:
@@ -8589,10 +7940,10 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
                 "HF Khmer TTS failed; user_model=%s edge fallback=%s: %s",
                 user_model,
                 HF_TTS_EDGE_FALLBACK,
-                _exception_detail(exc),
+                exc,
             )
             if not HF_TTS_EDGE_FALLBACK:
-                raise RuntimeError(f"HF Khmer TTS failed and Edge fallback is disabled: {_exception_detail(exc)}") from exc
+                raise RuntimeError(f"HF Khmer TTS failed and Edge fallback is disabled: {exc}") from exc
 
     return await _generate_voice_edge(text, gender, speed, output_path)
 
@@ -11695,9 +11046,8 @@ async def cmd_ttsmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prefs = await get_user_prefs_async(user_id)
     await safe_send(lambda: update.message.reply_text(
         "🤖 <b>ជ្រើសរើសម៉ូដែល TTS</b>\n\n"
-        "Auto: MMS Khmer → Kiri HF Space → Edge fallback\n"
-        "MMS Khmer: ប្រើ facebook/mms-tts-khm នៅលើ server\n"
-        "Kiri: ប្រើ mrrtmob/khmer-tts HF Space សម្រាប់អត្ថបទខ្មែរ\n"
+        "Auto: Khmer HF Space សម្រាប់ខ្មែរ និង Edge fallback\n"
+        "Khmer HF: ប្រើ mrrtmob/khmer-tts សម្រាប់អត្ថបទខ្មែរ\n"
         "Edge: ប្រើ Microsoft Edge TTS គ្រប់ភាសា",
         parse_mode="HTML",
         reply_markup=get_tts_model_kb(prefs.get("tts_model", "auto")),
@@ -12332,38 +11682,10 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
         _cleanup(file_path)
 
 
-def _is_bot_status_text_for_tts(text: str | None) -> bool:
-    if not LOCAL_MMS_TTS_SKIP_BOT_STATUS_TEXT:
-        return False
-    t = re.sub(r"\s+", " ", str(text or "")).strip()
-    if not t:
-        return False
-    blocked_prefixes = (
-        "🔄 កំពុងប្តូរម៉ូដែល TTS",
-        "✅ បានប្តូរម៉ូដែល TTS",
-        "❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង",
-    )
-    if any(t.startswith(prefix) for prefix in blocked_prefixes):
-        return True
-    blocked_phrases = (
-        "កំពុងប្តូរម៉ូដែល TTS",
-        "បង្កើតសំឡេងឡើងវិញ",
-        "រកអត្ថបទដើមមិនឃើញ",
-    )
-    return any(phrase in t for phrase in blocked_phrases)
-
-
-def _valid_callback_tts_text(text: str | None) -> str | None:
-    value = str(text or "").strip()
-    if not value or _is_bot_status_text_for_tts(value):
-        return None
-    return value
-
-
 async def get_callback_original_text(query, user_id: int) -> str | None:
     """Resolve the TTS text for a callback button (3-tier fallback)."""
     if query.message is None:
-        return _valid_callback_tts_text(get_last_tts_text(user_id))
+        return get_last_tts_text(user_id)
 
     chat_id = query.message.chat.id
     msg_id  = query.message.message_id
@@ -12372,14 +11694,13 @@ async def get_callback_original_text(query, user_id: int) -> str | None:
     # 1. Exact text_cache
     try:
         original_text = await loop.run_in_executor(None, get_text_cache, msg_id, chat_id)
-        original_text = _valid_callback_tts_text(original_text)
         if original_text:
             return original_text
     except Exception as e:
         logger.warning(f"get_callback_original_text text_cache failed user={user_id}: {e}")
 
     # 2. Latest generated TTS from memory
-    original_text = _valid_callback_tts_text(get_last_tts_text(user_id))
+    original_text = get_last_tts_text(user_id)
     if original_text:
         return original_text
 
@@ -12394,7 +11715,6 @@ async def get_callback_original_text(query, user_id: int) -> str | None:
         for row in reversed(history or []):
             role    = _normalize_role(row.get("role", ""))
             content = str(row.get("content", "") or "").strip()
-            content = _valid_callback_tts_text(content)
             if role == "assistant" and content:
                 set_last_tts_text(user_id, content)
                 return content
@@ -12734,7 +12054,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 async def _run_bot():
     global _BOT_START_TIME, _AI_SEMAPHORE, _BROADCAST_SEMAPHORE
-    global _prefs_cache_lock, _TTS_CHUNK_SEMAPHORE, _LOCAL_MMS_TTS_SEMAPHORE
+    global _prefs_cache_lock, _TTS_CHUNK_SEMAPHORE
 
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
@@ -12743,7 +12063,6 @@ async def _run_bot():
     _BROADCAST_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_BROADCAST)
     _prefs_cache_lock    = asyncio.Lock()
     _TTS_CHUNK_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TTS_USERS)
-    _LOCAL_MMS_TTS_SEMAPHORE = asyncio.Semaphore(LOCAL_MMS_TTS_WORKERS)
 
     # FIX: Reset ALL mutable in-memory state on restart to prevent stale data
     # accumulation across crash-restart cycles.
