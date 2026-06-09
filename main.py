@@ -3547,7 +3547,7 @@ def _redis_get_json_sync(key: str, default: Any = None) -> Any:
 
 def _redis_set_json_sync(key: str, value: Any, ttl: int) -> bool:
     raw = _json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    ok = redis_call_sync(f"set:{key}", lambda: redis_client.setex(key, max(1, int(ttl)), raw), default=False)
+    ok = redis_call_sync(f"set:{key}", lambda: redis_client.set(key, raw, ex=max(1, int(ttl))), default=False)
     return bool(ok)
 
 
@@ -3586,7 +3586,7 @@ async def _redis_get_json(key: str, default: Any = None) -> Any:
 
 async def _redis_set_json(key: str, value: Any, ttl: int) -> bool:
     raw = _json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    ok = await redis_call(f"set:{key}", lambda: redis_client.setex(key, max(1, int(ttl)), raw), default=False)
+    ok = await redis_call(f"set:{key}", lambda: redis_client.set(key, raw, ex=max(1, int(ttl))), default=False)
     return bool(ok)
 
 
@@ -4232,6 +4232,86 @@ def _tts_model_label(value: Any) -> str:
 
 DEFAULT_USER_PREFS: dict = {"gender": "female", "speed": DEFAULT_SPEED, "tts_model": _normalize_tts_model(DEFAULT_TTS_MODEL)}
 
+# Optional Supabase column state. Older deployments may not have
+# user_prefs.tts_model yet, and PostgREST may keep a stale schema cache right
+# after ALTER TABLE. Treat that as a soft feature-migration issue, never as a
+# Telegram callback failure.
+_USER_PREFS_TTS_MODEL_COLUMN_OK: bool | None = None
+_USER_PREFS_TTS_MODEL_LAST_CHECK = 0.0
+_USER_PREFS_TTS_MODEL_RECHECK_S = max(60.0, float(os.environ.get("TTS_MODEL_COLUMN_RECHECK_S", "300")))
+
+USER_PREFS_TTS_MODEL_SQL = """-- Run in Supabase SQL Editor if users cannot save TTS model choice
+alter table public.user_prefs
+add column if not exists tts_model text default 'auto';
+
+update public.user_prefs
+set tts_model = 'auto'
+where tts_model is null;
+
+-- Refresh PostgREST/Supabase API schema cache so writes stop returning PGRST204.
+notify pgrst, 'reload schema';
+"""
+
+
+def _is_missing_tts_model_column_error(exc: Exception | str) -> bool:
+    msg = str(exc).lower()
+    return (
+        "tts_model" in msg
+        and (
+            "42703" in msg
+            or "pgrst204" in msg
+            or "schema cache" in msg
+            or "does not exist" in msg
+            or "could not find" in msg
+        )
+    )
+
+
+def _set_tts_model_column_status(value: bool) -> None:
+    global _USER_PREFS_TTS_MODEL_COLUMN_OK, _USER_PREFS_TTS_MODEL_LAST_CHECK
+    _USER_PREFS_TTS_MODEL_COLUMN_OK = bool(value)
+    _USER_PREFS_TTS_MODEL_LAST_CHECK = time.monotonic()
+
+
+def _should_try_tts_model_column() -> bool:
+    if _USER_PREFS_TTS_MODEL_COLUMN_OK is True:
+        return True
+    if _USER_PREFS_TTS_MODEL_COLUMN_OK is False:
+        # Recheck occasionally so a running bot can recover after SQL + schema
+        # cache reload, without a forced redeploy.
+        return (time.monotonic() - _USER_PREFS_TTS_MODEL_LAST_CHECK) >= _USER_PREFS_TTS_MODEL_RECHECK_S
+    return True
+
+
+def _user_prefs_select_sync(user_id: int, include_tts_model: bool):
+    fields = "gender, speed, tts_model" if include_tts_model else "gender, speed"
+    return (
+        supabase.table("user_prefs")
+        .select(fields)
+        .eq("user_id", int(user_id))
+        .limit(1)
+        .execute()
+    )
+
+
+def _cache_user_tts_model_preference_sync(user_id: int, model: str) -> None:
+    """Save the chosen TTS model immediately in local/Redis cache.
+
+    This keeps the UI responsive and prevents missing optional Supabase columns
+    from resetting the user's choice during the current session.
+    """
+    user_id = int(user_id)
+    model = _normalize_tts_model(model)
+    prefs = _get_cached_prefs_sync(user_id)
+    if prefs is None and redis_client is not None:
+        cached = _redis_get_json_sync(_prefs_redis_key(user_id), default=None)
+        prefs = cached if isinstance(cached, dict) else None
+    prefs = _normalize_user_prefs(prefs)
+    prefs["tts_model"] = model
+    _cache_prefs_sync(user_id, prefs)
+    if redis_client is not None:
+        _redis_set_json_sync(_prefs_redis_key(user_id), prefs, REDIS_PREFS_TTL_S)
+
 
 def _prefs_redis_key(user_id: int) -> str:
     return _redis_key("prefs", int(user_id))
@@ -4322,34 +4402,42 @@ async def get_user_prefs_async(user_id: int) -> dict:
         return defaults
 
     try:
-        res = await db_call(
-            f"get_user_prefs:{user_id}",
-            lambda: supabase.table("user_prefs")
-                .select("gender, speed, tts_model")
-                .eq("user_id", user_id)
-                .limit(1)
-                .execute(),
-            default=None,
-            attempts=3,
-            timeout=12,
-            critical=False,
-        )
-        if res is None:
-            # Older deployments may not have the optional tts_model column yet.
-            res = await db_call(
-                f"get_user_prefs:{user_id}:legacy",
-                lambda: supabase.table("user_prefs")
-                    .select("gender, speed")
-                    .eq("user_id", user_id)
-                    .limit(1)
-                    .execute(),
-                default=None,
-                attempts=2,
-                timeout=12,
-                critical=False,
-            )
+        rows = None
+        loop = asyncio.get_running_loop()
 
-        rows = getattr(res, "data", None) if res else None
+        if _should_try_tts_model_column():
+            try:
+                res = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        _DB_EXECUTOR,
+                        functools.partial(_user_prefs_select_sync, user_id, True),
+                    ),
+                    timeout=12,
+                )
+                _set_tts_model_column_status(True)
+                rows = getattr(res, "data", None) if res else None
+            except Exception as exc:
+                if _is_missing_tts_model_column_error(exc):
+                    _set_tts_model_column_status(False)
+                    _log_once(
+                        logging.WARNING,
+                        "user_prefs_tts_model_missing_read",
+                        "user_prefs.tts_model is missing or Supabase schema cache is stale. Using legacy prefs until SQL is applied. SQL:\n%s",
+                        USER_PREFS_TTS_MODEL_SQL,
+                    )
+                else:
+                    raise
+
+        if rows is None:
+            res = await asyncio.wait_for(
+                loop.run_in_executor(
+                    _DB_EXECUTOR,
+                    functools.partial(_user_prefs_select_sync, user_id, False),
+                ),
+                timeout=12,
+            )
+            rows = getattr(res, "data", None) if res else None
+
         prefs = _normalize_user_prefs((rows or [None])[0])
         await _async_cache_prefs(user_id, prefs, write_redis=True)
         return prefs
@@ -4837,26 +4925,45 @@ def update_user_tts_model(user_id: int, tts_model: str) -> str:
     """Persist the user's preferred TTS model/provider.
 
     Returns the normalized model key so callback handlers can use it immediately
-    even before the async Supabase write completes.
+    even before the async Supabase write completes. Missing optional Supabase
+    column is handled as a soft migration state, not an error.
     """
+    user_id = int(user_id)
     model = _normalize_tts_model(tts_model)
-    _invalidate_prefs(user_id)
+    _cache_user_tts_model_preference_sync(user_id, model)
+
     if not supabase:
         return model
 
-    def _run():
-        res = db_call_sync(
-            f"update_user_tts_model:{user_id}",
-            lambda: supabase.table("user_prefs").update({"tts_model": model}).eq("user_id", user_id).execute(),
-            default=None,
-            attempts=3,
-            critical=False,
+    if not _should_try_tts_model_column():
+        _log_once(
+            logging.WARNING,
+            "tts_model_column_missing_write_skipped",
+            "Skipped Supabase tts_model write because user_prefs.tts_model is not available yet. SQL:\n%s",
+            USER_PREFS_TTS_MODEL_SQL,
         )
-        if res is None:
+        return model
+
+    def _run():
+        try:
+            supabase.table("user_prefs").update({"tts_model": model}).eq("user_id", user_id).execute()
+            _set_tts_model_column_status(True)
+        except Exception as exc:
+            if _is_missing_tts_model_column_error(exc):
+                _set_tts_model_column_status(False)
+                _log_once(
+                    logging.WARNING,
+                    "tts_model_column_missing_write",
+                    "Could not save tts_model because the optional column is missing or Supabase schema cache is stale. SQL:\n%s",
+                    USER_PREFS_TTS_MODEL_SQL,
+                )
+                return
             _log_once(
-                logging.ERROR,
-                "tts_model_column_or_update_error",
-                "update_user_tts_model failed. If the column is missing, run: ALTER TABLE user_prefs ADD COLUMN tts_model TEXT DEFAULT 'auto';",
+                logging.WARNING,
+                f"update_user_tts_model_failed:{type(exc).__name__}:{str(exc)[:120]}",
+                "update_user_tts_model failed for user=%s: %s",
+                user_id,
+                exc,
             )
 
     _submit_db(_run)
@@ -5081,20 +5188,19 @@ def ensure_tts_model_column() -> None:
         logger.info("ensure_tts_model_column: Supabase not configured, skipping.")
         return
 
-    res = db_call_sync(
-        "ensure_tts_model_column",
-        lambda: supabase.table("user_prefs").select("tts_model").limit(1).execute(),
-        default=None,
-        attempts=2,
-        critical=False,
-    )
-    if res is not None:
+    try:
+        supabase.table("user_prefs").select("tts_model").limit(1).execute()
+        _set_tts_model_column_status(True)
         logger.info("tts_model column present.")
-    else:
-        logger.warning(
-            "Could not verify user_prefs.tts_model. If missing, run:\n"
-            "  ALTER TABLE user_prefs ADD COLUMN tts_model TEXT DEFAULT 'auto';"
-        )
+    except Exception as exc:
+        if _is_missing_tts_model_column_error(exc):
+            _set_tts_model_column_status(False)
+            logger.warning(
+                "Optional user_prefs.tts_model is not available yet. User TTS model choice will work in cache, but permanent save needs SQL:\n%s",
+                USER_PREFS_TTS_MODEL_SQL,
+            )
+            return
+        logger.warning("Could not verify user_prefs.tts_model: %s", exc)
 
 
 def startup_self_check() -> None:
@@ -5345,16 +5451,36 @@ def db_user_set_blocked(user_id: int, admin_id: int, blocked: bool, reason: str 
 def db_user_reset_prefs(user_id: int) -> tuple[bool, str]:
     user_id = int(user_id)
     _invalidate_prefs(user_id)
+    _cache_user_tts_model_preference_sync(user_id, _normalize_tts_model(DEFAULT_TTS_MODEL))
     if not supabase:
         return True, "memory-only"
+
+    full_payload = {
+        "user_id": user_id,
+        "gender": "female",
+        "speed": DEFAULT_SPEED,
+        "tts_model": _normalize_tts_model(DEFAULT_TTS_MODEL),
+    }
+    legacy_payload = {
+        "user_id": user_id,
+        "gender": "female",
+        "speed": DEFAULT_SPEED,
+    }
+
     try:
-        supabase.table("user_prefs").upsert({
-            "user_id": user_id,
-            "gender": "female",
-            "speed": DEFAULT_SPEED,
-            "tts_model": _normalize_tts_model(DEFAULT_TTS_MODEL),
-        }, on_conflict="user_id").execute()
-        return True, "reset"
+        if _should_try_tts_model_column():
+            supabase.table("user_prefs").upsert(full_payload, on_conflict="user_id").execute()
+            _set_tts_model_column_status(True)
+            return True, "reset"
+    except Exception as e:
+        if _is_missing_tts_model_column_error(e):
+            _set_tts_model_column_status(False)
+        else:
+            return False, str(e)
+
+    try:
+        supabase.table("user_prefs").upsert(legacy_payload, on_conflict="user_id").execute()
+        return True, "reset (tts_model column pending)"
     except Exception as e:
         return False, str(e)
 
