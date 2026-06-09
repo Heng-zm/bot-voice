@@ -10,3 +10,10 @@ pypdf
 python-docx
 redis
 gradio_client
+fastapi
+uvicorn[standard]
+httpx
+pydantic-settings
+jinja2
+itsdangerous
+python-multipart
