@@ -162,6 +162,25 @@ def _default_cookie_secure() -> bool:
     return bool(getattr(SETTINGS, "WEB_COOKIE_SECURE", False))
 
 
+def _cookie_samesite() -> str:
+    """Return a Starlette-safe SameSite value.
+
+    A mistyped WEB_COOKIE_SAMESITE used to make the dashboard fail during
+    startup. Keep bad env values safe by falling back to lax.
+    """
+    value = str(getattr(SETTINGS, "WEB_COOKIE_SAMESITE", "lax") or "lax").strip().lower()
+    return value if value in {"lax", "strict", "none"} else "lax"
+
+
+def _web_max_content_length() -> int:
+    return _env_int(
+        "WEB_MAX_CONTENT_LENGTH",
+        64 * 1024 * 1024,
+        minimum=1 * 1024 * 1024,
+        maximum=256 * 1024 * 1024,
+    )
+
+
 _request_ctx: contextvars.ContextVar[Any] = contextvars.ContextVar("fastapi_request_ctx")
 _session_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar("fastapi_session_ctx")
 
@@ -207,12 +226,22 @@ class _LocalProxy:
 class _MultiDictCompat(dict):
     def get(self, key, default=None, type=None):
         value = super().get(key, default)
+        if isinstance(value, list):
+            value = value[-1] if value else default
         if type is not None and value is not None:
             try:
                 return type(value)
             except Exception:
                 return default
         return value
+
+    def getlist(self, key):
+        value = super().get(key, [])
+        if isinstance(value, list):
+            return list(value)
+        if value is None:
+            return []
+        return [value]
 
 
 class _UploadFileCompat:
@@ -278,8 +307,19 @@ def abort(status_code: int = 400):
     raise HTTPException(status_code=status_code)
 
 
+@functools.lru_cache(maxsize=32)
+def _compiled_jinja_template(template: str) -> Template:
+    """Cache compiled Jinja templates used by the admin dashboard.
+
+    The dashboard layout is a large inline template rendered on nearly every
+    admin request. Recompiling it for every page adds avoidable CPU overhead,
+    especially on small Render instances and during frequent status polling.
+    """
+    return Template(template)
+
+
 def render_template_string(template: str, **context: Any) -> str:
-    return Template(template).render(**context)
+    return _compiled_jinja_template(template).render(**context)
 
 
 def flask_flash(message: str, category: str = "message") -> None:
@@ -327,7 +367,7 @@ class FastAPICompatApp:
             secret_key=secret_key,
             session_cookie=str(getattr(SETTINGS, "WEB_SESSION_COOKIE_NAME", "bot_admin_session") or "bot_admin_session"),
             https_only=_default_cookie_secure(),
-            same_site=str(getattr(SETTINGS, "WEB_COOKIE_SAMESITE", "lax") or "lax").lower(),
+            same_site=_cookie_samesite(),
             max_age=max(3600, int(getattr(SETTINGS, "WEB_ADMIN_SESSION_DAYS", 14) or 14) * 86400),
         )
 
@@ -348,16 +388,59 @@ class FastAPICompatApp:
         form_data: dict[str, Any] = {}
         files_data: dict[str, Any] = {}
         content_type = req.headers.get("content-type", "")
+        max_body = _web_max_content_length()
+
+        content_length = req.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > max_body:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Request body too large. Max {max_body} bytes.",
+                    )
+            except ValueError:
+                pass
+
+        def _store_multi(target: dict[str, Any], key: str, value: Any) -> None:
+            if key in target:
+                current = target[key]
+                if isinstance(current, list):
+                    current.append(value)
+                else:
+                    target[key] = [current, value]
+            else:
+                target[key] = value
+
         if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
             form = await req.form()
+            total_read = 0
             for key, value in form.multi_items():
                 if hasattr(value, "read") and hasattr(value, "filename"):
                     data = await value.read()
-                    files_data[key] = _UploadFileCompat(value.filename, getattr(value, "content_type", "") or "application/octet-stream", data)
+                    total_read += len(data)
+                    if total_read > max_body:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"Uploaded data too large. Max {max_body} bytes.",
+                        )
+                    _store_multi(
+                        files_data,
+                        key,
+                        _UploadFileCompat(
+                            value.filename,
+                            getattr(value, "content_type", "") or "application/octet-stream",
+                            data,
+                        ),
+                    )
                 else:
-                    form_data[key] = value
+                    _store_multi(form_data, key, value)
         else:
             raw_body = await req.body()
+            if len(raw_body) > max_body:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Request body too large. Max {max_body} bytes.",
+                )
             if raw_body and "application/json" in content_type:
                 try:
                     json_body = _json.loads(raw_body.decode("utf-8"))
@@ -431,11 +514,11 @@ app = app_flask.fastapi
 app_flask.config["SECRET_KEY"] = getattr(SETTINGS, "FLASK_SECRET_KEY", "") or getattr(SETTINGS, "WEB_SECRET_KEY", "") or secrets.token_hex(32)
 app_flask.config["SESSION_COOKIE_NAME"] = getattr(SETTINGS, "WEB_SESSION_COOKIE_NAME", "bot_admin_session")
 app_flask.config["SESSION_COOKIE_HTTPONLY"] = True
-app_flask.config["SESSION_COOKIE_SAMESITE"] = getattr(SETTINGS, "WEB_COOKIE_SAMESITE", "Lax")
+app_flask.config["SESSION_COOKIE_SAMESITE"] = _cookie_samesite().capitalize()
 app_flask.config["SESSION_COOKIE_SECURE"] = _default_cookie_secure()
 app_flask.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=_env_int("WEB_ADMIN_SESSION_DAYS", 14, minimum=1))
 app_flask.config["SESSION_REFRESH_EACH_REQUEST"] = True
-app_flask.config["MAX_CONTENT_LENGTH"] = _env_int("WEB_MAX_CONTENT_LENGTH", 64 * 1024 * 1024, minimum=1 * 1024 * 1024)
+app_flask.config["MAX_CONTENT_LENGTH"] = _web_max_content_length()
 
 @app_flask.after_request
 def _web_security_headers(resp):
@@ -1457,6 +1540,11 @@ _WEB_BROADCAST_JOBS_LOCK = threading.Lock()
 _WEB_BROADCAST_JOBS_MAX = int(os.environ.get("WEB_BROADCAST_JOBS_MAX", "50"))
 WEB_BROADCAST_WORKERS = max(1, _env_int("WEB_BROADCAST_WORKERS", MAX_CONCURRENT_BROADCAST))
 WEB_BROADCAST_DELAY_S = max(0.0, _env_float("WEB_BROADCAST_DELAY_S", 0.05))
+WEB_BROADCAST_MAX_ACTIVE_JOBS = max(1, _env_int("WEB_BROADCAST_MAX_ACTIVE_JOBS", 2, minimum=1, maximum=10))
+_WEB_BROADCAST_EXECUTOR = ThreadPoolExecutor(
+    max_workers=WEB_BROADCAST_MAX_ACTIVE_JOBS,
+    thread_name_prefix="web_broadcast_job",
+)
 WEB_TABLE_PAGE_SIZE = max(10, min(200, _env_int("WEB_TABLE_PAGE_SIZE", 50)))
 # V4.1: avoid hammering Supabase from mobile/live dashboard polling.
 WEB_COUNTS_CACHE_TTL_S = max(5.0, _env_float("WEB_COUNTS_CACHE_TTL_S", 30.0))
@@ -1610,13 +1698,15 @@ def _web_progress_bar(done: Any, total: Any) -> str:
 def _web_blocked_ids_for_users(users: list[Any]) -> set[int]:
     """Batch-load blocked status to avoid one Supabase query per table row/user."""
     ids: list[int] = []
+    seen_ids: set[int] = set()
     for item in users or []:
         raw = item.get("user_id") if isinstance(item, dict) else item
         try:
             uid = int(raw)
         except Exception:
             continue
-        if uid not in ids:
+        if uid not in seen_ids:
+            seen_ids.add(uid)
             ids.append(uid)
 
     if not ids:
@@ -1671,22 +1761,29 @@ def _web_status_card(label: str, value: Any, hint: str = "", kind: str = "") -> 
     )
 
 
+_WEB_NAV_ITEMS = (
+    ("dashboard", "Dashboard", "/admin", "▣"),
+    ("analytics", "Analytics V2", "/admin/analytics", "📈"),
+    ("users", "Users", "/admin/users", "👥"),
+    ("schedules", "Schedules", "/admin/schedules", "⏱"),
+    ("calendar", "Calendar", "/admin/schedules/calendar", "🗓"),
+    ("broadcast", "Broadcast", "/admin/broadcast", "📣"),
+    ("health", "Health", "/admin/health", "🩺"),
+    ("settings", "Settings", "/admin/settings", "⚙"),
+    ("api", "API Keys", "/admin/api-keys", "🔑"),
+    ("locks", "Locks", "/admin/locks", "🔒"),
+    ("sql", "SQL", "/admin/sql", "☷"),
+)
+_WEB_BOTTOM_NAV_ITEMS = tuple(
+    item for item in _WEB_NAV_ITEMS
+    if item[0] in {"dashboard", "users", "schedules", "broadcast", "health"}
+)
+
+
 def _web_render(title: str, body: str, *, active: str = "dashboard", status_code: int = 200):
     csrf = _web_csrf_token() if session.get("web_admin_ok") else ""
-    nav = [
-        ("dashboard", "Dashboard", "/admin", "▣"),
-        ("analytics", "Analytics V2", "/admin/analytics", "📈"),
-        ("users", "Users", "/admin/users", "👥"),
-        ("schedules", "Schedules", "/admin/schedules", "⏱"),
-        ("calendar", "Calendar", "/admin/schedules/calendar", "🗓"),
-        ("broadcast", "Broadcast", "/admin/broadcast", "📣"),
-        ("health", "Health", "/admin/health", "🩺"),
-        ("settings", "Settings", "/admin/settings", "⚙"),
-        ("api", "API Keys", "/admin/api-keys", "🔑"),
-        ("locks", "Locks", "/admin/locks", "🔒"),
-        ("sql", "SQL", "/admin/sql", "☷"),
-    ]
-    bottom_nav = [item for item in nav if item[0] in {"dashboard", "users", "schedules", "broadcast", "health"}]
+    nav = _WEB_NAV_ITEMS
+    bottom_nav = _WEB_BOTTOM_NAV_ITEMS
     template = """
 <!doctype html>
 <html lang="en">
@@ -2072,6 +2169,21 @@ def _web_broadcast_job_control(job_id: str, action: str) -> tuple[bool, str]:
         return True, msg
 
 
+def _web_broadcast_active_count() -> int:
+    active_states = {"queued", "running", "paused", "cancelling"}
+    with _WEB_BROADCAST_JOBS_LOCK:
+        return sum(
+            1
+            for row in _WEB_BROADCAST_JOBS.values()
+            if str(row.get("status") or "").lower() in active_states
+        )
+
+
+def _submit_web_broadcast_job(job_id: str, admin_id: int, text: str) -> None:
+    future = _WEB_BROADCAST_EXECUTOR.submit(_web_broadcast_worker, job_id, admin_id, text)
+    future.add_done_callback(_log_future_exception)
+
+
 def _web_broadcast_job_rows_html(csrf: str | None = None, *, include_actions: bool = True) -> str:
     csrf = csrf or _web_csrf_token()
     with _WEB_BROADCAST_JOBS_LOCK:
@@ -2419,7 +2531,13 @@ def _web_fetch_users(q: str = "", page: int = 0, page_size: int = WEB_TABLE_PAGE
     return []
 
 
-def _web_send_telegram_message(chat_id: int, text: str) -> tuple[bool, str]:
+def _web_send_telegram_message(
+    chat_id: int,
+    text: str,
+    *,
+    admin_id: int | None = None,
+    client: httpx.Client | None = None,
+) -> tuple[bool, str]:
     if not TELEGRAM_BOT_TOKEN:
         return False, "TELEGRAM_BOT_TOKEN missing."
     text = (text or "").strip()
@@ -2427,10 +2545,25 @@ def _web_send_telegram_message(chat_id: int, text: str) -> tuple[bool, str]:
         return False, "Message is empty."
     if len(text) > TELE_MSG_LIMIT:
         return False, f"Message too long. Max {TELE_MSG_LIMIT}."
+
+    created_client = False
+    tg_client = client
     try:
-        resp = httpx.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": int(chat_id), "text": text, "disable_web_page_preview": True}, timeout=20)
+        if tg_client is None:
+            tg_client = httpx.Client(timeout=20)
+            created_client = True
+
+        resp = tg_client.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": int(chat_id), "text": text, "disable_web_page_preview": True},
+            timeout=20,
+        )
         if resp.status_code == 403:
-            db_user_set_blocked(int(chat_id), _web_current_admin_id(), True, "Telegram Forbidden from web send")
+            blocker_admin_id = int(admin_id or 0)
+            if not blocker_admin_id:
+                with suppress(Exception):
+                    blocker_admin_id = _web_current_admin_id()
+            db_user_set_blocked(int(chat_id), blocker_admin_id, True, "Telegram Forbidden from web send")
         if not (200 <= resp.status_code < 300):
             return False, f"Telegram HTTP {resp.status_code}: {resp.text[:300]}"
         payload = resp.json()
@@ -2439,6 +2572,10 @@ def _web_send_telegram_message(chat_id: int, text: str) -> tuple[bool, str]:
         return True, "sent"
     except Exception as exc:
         return False, str(exc)
+    finally:
+        if created_client and tg_client is not None:
+            with suppress(Exception):
+                tg_client.close()
 
 
 @app_flask.route("/admin/users")
@@ -2627,7 +2764,7 @@ def web_admin_users_action():
         db_history_clear(user_id)
         ok, msg = True, "history clear queued"
     elif action == "send_message":
-        ok, msg = _web_send_telegram_message(user_id, request.form.get("message") or "")
+        ok, msg = _web_send_telegram_message(user_id, request.form.get("message") or "", admin_id=_web_current_admin_id())
     else:
         ok, msg = False, "Unknown action."
     flask_flash(("OK: " if ok else "ERROR: ") + msg, "success" if ok else "error")
@@ -3190,7 +3327,7 @@ def _web_broadcast_worker(job_id: str, admin_id: int, text: str) -> None:
                 return "skipped"
             if uid in blocked_ids:
                 return "blocked"
-            ok, send_msg = _web_send_telegram_message(uid, text)
+            ok, send_msg = _web_send_telegram_message(uid, text, admin_id=admin_id, client=tg_client)
             if ok:
                 return "sent"
             low = str(send_msg or "").lower()
@@ -3205,33 +3342,35 @@ def _web_broadcast_worker(job_id: str, admin_id: int, text: str) -> None:
 
     workers = max(1, min(WEB_BROADCAST_WORKERS, max(1, len(users))))
     batch_size = max(1, max(BROADCAST_BATCH_SIZE, workers))
+    limits = httpx.Limits(max_keepalive_connections=max(1, workers), max_connections=max(2, workers * 2))
     try:
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="web_broadcast") as pool:
-            for start in range(0, total, batch_size):
-                if not _wait_if_paused():
-                    skipped += max(0, total - start)
-                    _web_broadcast_job_set(job_id, status="cancelled", skipped=skipped, sent=sent, failed=failed, blocked=blocked, finished_at=_sched_iso())
-                    return
-                _web_broadcast_job_set(job_id, status="running")
-                batch = users[start:start + batch_size]
-                results = list(pool.map(_send_one, batch))
-                for result in results:
-                    if result == "sent":
-                        sent += 1
-                    elif result == "blocked":
-                        blocked += 1
-                    elif result == "skipped":
-                        skipped += 1
-                    else:
-                        failed += 1
+        with httpx.Client(timeout=20, limits=limits) as tg_client:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="web_broadcast") as pool:
+                for start in range(0, total, batch_size):
+                    if not _wait_if_paused():
+                        skipped += max(0, total - start)
+                        _web_broadcast_job_set(job_id, status="cancelled", skipped=skipped, sent=sent, failed=failed, blocked=blocked, finished_at=_sched_iso())
+                        return
+                    _web_broadcast_job_set(job_id, status="running")
+                    batch = users[start:start + batch_size]
+                    results = list(pool.map(_send_one, batch))
+                    for result in results:
+                        if result == "sent":
+                            sent += 1
+                        elif result == "blocked":
+                            blocked += 1
+                        elif result == "skipped":
+                            skipped += 1
+                        else:
+                            failed += 1
 
-                _web_broadcast_job_set(job_id, sent=sent, failed=failed, blocked=blocked, skipped=skipped)
-                if _control_state() == "cancel":
-                    skipped += max(0, total - (start + len(batch)))
-                    _web_broadcast_job_set(job_id, status="cancelled", skipped=skipped, sent=sent, failed=failed, blocked=blocked, finished_at=_sched_iso())
-                    return
-                if start + len(batch) < total and WEB_BROADCAST_DELAY_S:
-                    time.sleep(WEB_BROADCAST_DELAY_S)
+                    _web_broadcast_job_set(job_id, sent=sent, failed=failed, blocked=blocked, skipped=skipped)
+                    if _control_state() == "cancel":
+                        skipped += max(0, total - (start + len(batch)))
+                        _web_broadcast_job_set(job_id, status="cancelled", skipped=skipped, sent=sent, failed=failed, blocked=blocked, finished_at=_sched_iso())
+                        return
+                    if start + len(batch) < total and WEB_BROADCAST_DELAY_S:
+                        time.sleep(WEB_BROADCAST_DELAY_S)
 
         _web_broadcast_job_set(job_id, status="done", control="done", sent=sent, failed=failed, blocked=blocked, skipped=skipped, finished_at=_sched_iso())
     except Exception as exc:
@@ -3250,11 +3389,18 @@ def web_admin_broadcast():
         elif len(text) > TELE_MSG_LIMIT:
             flask_flash(f"Broadcast too long. Max {TELE_MSG_LIMIT} characters.", "error")
         else:
-            job_id = secrets.token_hex(6)
-            _web_broadcast_job_set(job_id, status="queued", control="run", total=0, sent=0, failed=0, blocked=0, skipped=0, created_at=_sched_iso())
-            threading.Thread(target=_web_broadcast_worker, args=(job_id, _web_current_admin_id(), text), daemon=True, name=f"web-broadcast-{job_id}").start()
-            flask_flash(f"Broadcast job {job_id} started.", "success")
-            return redirect(url_for("web_admin_broadcast"))
+            active_jobs = _web_broadcast_active_count()
+            if active_jobs >= WEB_BROADCAST_MAX_ACTIVE_JOBS:
+                flask_flash(
+                    f"Too many active broadcast jobs ({active_jobs}/{WEB_BROADCAST_MAX_ACTIVE_JOBS}). Pause/cancel or wait for one to finish.",
+                    "error",
+                )
+            else:
+                job_id = secrets.token_hex(6)
+                _web_broadcast_job_set(job_id, status="queued", control="run", total=0, sent=0, failed=0, blocked=0, skipped=0, created_at=_sched_iso())
+                _submit_web_broadcast_job(job_id, _web_current_admin_id(), text)
+                flask_flash(f"Broadcast job {job_id} started.", "success")
+                return redirect(url_for("web_admin_broadcast"))
     csrf = _web_csrf_token()
     job_rows = _web_broadcast_job_rows_html(csrf, include_actions=True)
     body = f"""
@@ -3667,6 +3813,12 @@ _log_once_seen: dict[str, float] = {}
 def _log_once(level: int, key: str, message: str, *args, exc_info=False) -> None:
     """Log repeated outage errors once per TTL so callbacks don't flood logs."""
     now = time.monotonic()
+    # Keep the de-duplication map bounded during long-running deployments.
+    if len(_log_once_seen) > 2048:
+        cutoff = now - (_LOG_ONCE_TTL_S * 2)
+        for old_key, old_ts in list(_log_once_seen.items()):
+            if old_ts < cutoff:
+                _log_once_seen.pop(old_key, None)
     last = _log_once_seen.get(key, 0.0)
     if now - last < _LOG_ONCE_TTL_S:
         return
@@ -4549,11 +4701,12 @@ _PREFS_TTL      = 300.0
 _PREFS_MAX_SIZE = 10_000
 _prefs_cache: OrderedDict[int, tuple[dict, float]] = OrderedDict()
 _prefs_cache_lock: asyncio.Lock | None = None
+_prefs_cache_thread_lock = threading.RLock()
 
 TTS_MODEL_OPTIONS = {
-    "auto": ("Auto", "Khmer HF Space → Edge fallback"),
-    "hf_space": ("Khmer HF", "mrrtmob/khmer-tts for Khmer text"),
-    "edge": ("Edge", "Microsoft Edge TTS for all languages"),
+    "auto": ("Auto", "Kiri → Edge TTS"),
+    "hf_space": ("Kiri", ""),
+    "edge": ("Edge TTS", ""),
 }
 TTS_MODEL_ALIASES = {
     "auto": "auto",
@@ -4691,24 +4844,27 @@ def _normalize_user_prefs(row: dict | None) -> dict:
 
 
 def _cache_prefs_sync(user_id: int, prefs: dict) -> None:
-    _prefs_cache.pop(user_id, None)
-    _prefs_cache[user_id] = (_normalize_user_prefs(prefs), time.monotonic())
-    while len(_prefs_cache) > _PREFS_MAX_SIZE:
-        _prefs_cache.popitem(last=False)
+    with _prefs_cache_thread_lock:
+        _prefs_cache.pop(user_id, None)
+        _prefs_cache[user_id] = (_normalize_user_prefs(prefs), time.monotonic())
+        while len(_prefs_cache) > _PREFS_MAX_SIZE:
+            _prefs_cache.popitem(last=False)
 
 
 def _get_cached_prefs_sync(user_id: int) -> dict | None:
-    entry = _prefs_cache.get(user_id)
-    if entry and time.monotonic() - entry[1] < _PREFS_TTL:
-        _prefs_cache.move_to_end(user_id)
-        return dict(entry[0])
-    if entry:
-        _prefs_cache.pop(user_id, None)
-    return None
+    with _prefs_cache_thread_lock:
+        entry = _prefs_cache.get(user_id)
+        if entry and time.monotonic() - entry[1] < _PREFS_TTL:
+            _prefs_cache.move_to_end(user_id)
+            return dict(entry[0])
+        if entry:
+            _prefs_cache.pop(user_id, None)
+        return None
 
 
 def _invalidate_prefs(user_id: int) -> None:
-    _prefs_cache.pop(user_id, None)
+    with _prefs_cache_thread_lock:
+        _prefs_cache.pop(user_id, None)
     if redis_client is not None:
         _submit_db(lambda: _redis_delete_sync(_prefs_redis_key(user_id)))
 
