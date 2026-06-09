@@ -7,9 +7,11 @@ import threading
 import time
 import contextvars
 import html
+import json as _json
 import functools
 import tempfile
 import glob
+import gc
 import hashlib
 import hmac
 import secrets
@@ -33,9 +35,10 @@ except Exception:
     genai_types = None
 from fastapi import FastAPI, Request as FastAPIRequest, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response as StarletteResponse
+from fastapi.encoders import jsonable_encoder
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.concurrency import run_in_threadpool
-from jinja2 import Template
+from jinja2 import Environment, Template
 try:
     from pydantic_settings import BaseSettings, SettingsConfigDict
 except Exception:
@@ -48,6 +51,48 @@ except Exception:
     acreate_client = None
     AsyncClient = object
 from typing import Any, Callable
+
+
+# ── Fast JSON codec helpers ────────────────────────────────────────────────
+# Prefer binary JSON parsers to avoid raw_body.decode(...) copies on hot paths.
+# The fallback is the stdlib json module, so the app still boots without extras.
+try:
+    import orjson as _orjson
+except Exception:
+    _orjson = None
+try:
+    import ujson as _ujson
+except Exception:
+    _ujson = None
+
+
+def _json_loads_fast(data: bytes | bytearray | memoryview | str | None) -> Any:
+    if data is None:
+        return None
+    if _orjson is not None:
+        return _orjson.loads(data)
+    if _ujson is not None:
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            data = bytes(data).decode("utf-8")
+        return _ujson.loads(data)
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        data = bytes(data).decode("utf-8")
+    return _json.loads(data)
+
+
+def _json_dumps_fast(content: Any) -> bytes:
+    if _orjson is not None:
+        return _orjson.dumps(content)
+    if _ujson is not None:
+        return _ujson.dumps(content, ensure_ascii=False).encode("utf-8")
+    return _json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+class _FastJSONResponse(StarletteResponse):
+    media_type = "application/json"
+
+    def render(self, content: Any) -> bytes:
+        return _json_dumps_fast(content)
 
 # Load local .env before any environment-driven config is read.
 # This keeps local/dev runs consistent with Render environment variables.
@@ -108,6 +153,22 @@ class AppSettings(BaseSettings):
     WEB_LIVE_SCHEDULES_CACHE_TTL_S: float = 30.0
     AI_API_KEY_CACHE_TTL_S: float = 60.0
     AI_API_KEY_TOUCH_INTERVAL_S: float = 60.0
+    WEB_SLOW_REQUEST_MS: float = 1500.0
+    WEB_ADMIN_AUDIT_MAX: int = 300
+    TELEGRAM_CONCURRENT_UPDATES: int = 8
+    TELEGRAM_CONNECTION_POOL_SIZE: int = 24
+    BOT_MODE: str = "POLLING"
+    TELEGRAM_WEBHOOK_URL: str = ""
+    TELEGRAM_WEBHOOK_SECRET_TOKEN: str = ""
+    HTTP_MAX_CONNECTIONS: int = 100
+    HTTP_MAX_KEEPALIVE_CONNECTIONS: int = 20
+    USER_RATE_LIMIT_PER_SECOND: int = 3
+    USER_RATE_LIMIT_WINDOW_S: float = 1.0
+    API_RATE_LIMIT_PER_SECOND: int = 20
+    API_RATE_LIMIT_WINDOW_S: float = 1.0
+    RATE_LIMIT_REDIS_TTL_S: int = 30
+    CACHE_ASIDE_DEFAULT_TTL_S: int = 3600
+    WEB_BROADCAST_QUEUE_MAXSIZE: int = 200
 
 try:
     SETTINGS = AppSettings()
@@ -276,7 +337,7 @@ class _RequestCompat:
         if not self._raw_body:
             return None if silent else {}
         try:
-            return _json.loads(self._raw_body.decode("utf-8"))
+            return _json_loads_fast(self._raw_body)
         except Exception:
             if silent:
                 return None
@@ -288,7 +349,11 @@ session = _LocalProxy(_session_ctx)
 
 
 def jsonify(obj: Any = None, **kwargs: Any):
-    return JSONResponse(obj if obj is not None else kwargs)
+    # FastAPI/Starlette JSONResponse cannot serialize datetime, Decimal, UUID,
+    # or Pydantic objects directly. jsonable_encoder keeps dashboard/API JSON
+    # responses safe even when Supabase/client libraries return richer types.
+    # _FastJSONResponse uses orjson/ujson when installed and falls back safely.
+    return _FastJSONResponse(jsonable_encoder(obj if obj is not None else kwargs))
 
 
 def Response(content: Any = "", status: int = 200, status_code: int | None = None, mimetype: str | None = None, media_type: str | None = None, headers: dict | None = None):
@@ -307,8 +372,36 @@ def abort(status_code: int = 400):
     raise HTTPException(status_code=status_code)
 
 
+_JINJA_TEMPLATE_CACHE_MAX = 256
+_JINJA_TEMPLATE_CACHE: OrderedDict[tuple[int, str], tuple[str, Any]] = OrderedDict()
+_JINJA_TEMPLATE_CACHE_LOCK = threading.RLock()
+_JINJA_ENV = Environment(autoescape=False, enable_async=False)
+
+
 def render_template_string(template: str, **context: Any) -> str:
-    return Template(template).render(**context)
+    # Compile each unique template string once. The compatibility layer uses
+    # large inline dashboard templates, so this avoids repeated Jinja parsing
+    # on every admin page render while keeping Flask's function name intact.
+    template = str(template or "")
+    key = (len(template), hashlib.sha256(template.encode("utf-8")).hexdigest())
+    compiled = None
+    with _JINJA_TEMPLATE_CACHE_LOCK:
+        cached = _JINJA_TEMPLATE_CACHE.get(key)
+        if cached and cached[0] == template:
+            compiled = cached[1]
+            _JINJA_TEMPLATE_CACHE.move_to_end(key)
+    if compiled is None:
+        try:
+            compiled = _JINJA_ENV.from_string(template)
+        except Exception:
+            # Preserve old fallback behavior if a third-party Jinja extension or
+            # unusual template edge case is not accepted by the shared env.
+            return Template(template).render(**context)
+        with _JINJA_TEMPLATE_CACHE_LOCK:
+            _JINJA_TEMPLATE_CACHE[key] = (template, compiled)
+            while len(_JINJA_TEMPLATE_CACHE) > _JINJA_TEMPLATE_CACHE_MAX:
+                _JINJA_TEMPLATE_CACHE.popitem(last=False)
+    return compiled.render(**context)
 
 
 def flask_flash(message: str, category: str = "message") -> None:
@@ -371,6 +464,28 @@ class FastAPICompatApp:
         path = re.sub(r"<(\w+)>", r"{\1}", path)
         return path
 
+    @staticmethod
+    def _path_converters(path: str) -> dict[str, str]:
+        converters: dict[str, str] = {}
+        for kind, name in re.findall(r"<(?:(int|str):)?(\w+)>", path):
+            converters[name] = kind or "str"
+        return converters
+
+    @staticmethod
+    def _cast_path_params(params: dict[str, Any], converters: dict[str, str]) -> dict[str, Any]:
+        casted = dict(params)
+        for name, kind in converters.items():
+            if name not in casted:
+                continue
+            if kind == "int":
+                try:
+                    casted[name] = int(casted[name])
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=404)
+            else:
+                casted[name] = str(casted[name])
+        return casted
+
     async def _prepare_context(self, req: FastAPIRequest):
         raw_body = b""
         json_body = None
@@ -379,16 +494,22 @@ class FastAPICompatApp:
         content_type = req.headers.get("content-type", "")
         max_body = _web_max_content_length()
 
+        # Do the hard limit check before Starlette reads/parses the request
+        # body. This prevents obvious memory-flood uploads from ever reaching
+        # req.body(), req.form(), or UploadFile.read().
         content_length = req.headers.get("content-length")
         if content_length:
             try:
-                if int(content_length) > max_body:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"Request body too large. Max {max_body} bytes.",
-                    )
+                content_length_i = int(str(content_length).strip())
+                if content_length_i < 0:
+                    raise ValueError
             except ValueError:
-                pass
+                raise HTTPException(status_code=400, detail="Invalid Content-Length header.")
+            if content_length_i > max_body:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Request body too large. Max {max_body} bytes.",
+                )
 
         def _store_multi(target: dict[str, Any], key: str, value: Any) -> None:
             if key in target:
@@ -401,7 +522,14 @@ class FastAPICompatApp:
                 target[key] = value
 
         if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
-            form = await req.form()
+            try:
+                form = await req.form(max_part_size=max_body)
+            except TypeError:
+                # Older Starlette versions do not expose max_part_size. The
+                # upfront Content-Length guard above still protects normal
+                # browser/API clients; the manual read guard below remains a
+                # second line of defense.
+                form = await req.form()
             total_read = 0
             for key, value in form.multi_items():
                 if hasattr(value, "read") and hasattr(value, "filename"):
@@ -424,15 +552,24 @@ class FastAPICompatApp:
                 else:
                     _store_multi(form_data, key, value)
         else:
-            raw_body = await req.body()
-            if len(raw_body) > max_body:
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"Request body too large. Max {max_body} bytes.",
-                )
+            # Stream instead of await req.body() so requests without a trusted
+            # Content-Length cannot allocate unbounded memory before rejection.
+            chunks: list[bytes] = []
+            total_read = 0
+            async for chunk in req.stream():
+                if not chunk:
+                    continue
+                total_read += len(chunk)
+                if total_read > max_body:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Request body too large. Max {max_body} bytes.",
+                    )
+                chunks.append(chunk)
+            raw_body = b"".join(chunks)
             if raw_body and "application/json" in content_type:
                 try:
-                    json_body = _json.loads(raw_body.decode("utf-8"))
+                    json_body = _json_loads_fast(raw_body)
                 except Exception:
                     json_body = None
         compat = _RequestCompat(req, form_data, files_data, raw_body, json_body)
@@ -450,7 +587,7 @@ class FastAPICompatApp:
             if status_code is not None:
                 resp.status_code = status_code
         elif isinstance(result, (dict, list)):
-            resp = JSONResponse(result, status_code=status_code or 200)
+            resp = _FastJSONResponse(jsonable_encoder(result), status_code=status_code or 200)
         elif isinstance(result, bytes):
             resp = Response(result, status=status_code or 200)
         elif result is None:
@@ -466,12 +603,13 @@ class FastAPICompatApp:
     def route(self, path: str, methods: list[str] | tuple[str, ...] | None = None):
         route_methods = list(methods or ["GET"])
         fastapi_path = self._convert_path(path)
+        converters = self._path_converters(path)
         def decorator(func: Callable):
             async def endpoint(starlette_request: FastAPIRequest):
                 req_token = sess_token = None
                 try:
                     req_token, sess_token = await self._prepare_context(starlette_request)
-                    kwargs = dict(starlette_request.path_params)
+                    kwargs = self._cast_path_params(dict(starlette_request.path_params), converters)
                     if inspect.iscoroutinefunction(func):
                         result = await func(**kwargs)
                     else:
@@ -509,6 +647,86 @@ app_flask.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=_env_int("WEB_AD
 app_flask.config["SESSION_REFRESH_EACH_REQUEST"] = True
 app_flask.config["MAX_CONTENT_LENGTH"] = _web_max_content_length()
 
+# ── Admin Performance V5 runtime knobs ──────────────────────────────────────
+# These are intentionally env-tunable so Render small instances can stay stable.
+WEB_SLOW_REQUEST_MS = _env_float("WEB_SLOW_REQUEST_MS", 1500.0, minimum=100.0, maximum=60_000.0)
+WEB_ADMIN_AUDIT_MAX = _env_int("WEB_ADMIN_AUDIT_MAX", 300, minimum=50, maximum=5_000)
+TELEGRAM_CONCURRENT_UPDATES = _env_int("TELEGRAM_CONCURRENT_UPDATES", 8, minimum=1, maximum=64)
+TELEGRAM_CONNECTION_POOL_SIZE = _env_int("TELEGRAM_CONNECTION_POOL_SIZE", 24, minimum=4, maximum=256)
+_WEB_ACTIVE_REQUESTS = 0
+_WEB_ACTIVE_REQUESTS_LOCK = threading.Lock()
+_WEB_SLOW_REQUESTS = deque(maxlen=200)
+_WEB_ADMIN_AUDIT = deque(maxlen=WEB_ADMIN_AUDIT_MAX)
+
+
+@app.middleware("http")
+async def _web_request_id_and_timing(req: FastAPIRequest, call_next):
+    """Attach request id, latency, active-request count, and slow-request logs.
+
+    Admin V5 adds lightweight performance telemetry without exposing secrets.
+    It helps identify slow dashboard endpoints, Supabase pressure, and browser
+    polling storms while keeping the response body unchanged.
+    """
+    global _WEB_ACTIVE_REQUESTS
+    request_id = (req.headers.get("X-Request-ID") or secrets.token_hex(8)).strip()[:64]
+    started = time.monotonic()
+    with _WEB_ACTIVE_REQUESTS_LOCK:
+        _WEB_ACTIVE_REQUESTS += 1
+        active_now = _WEB_ACTIVE_REQUESTS
+    try:
+        resp = await call_next(req)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Unhandled web request error request_id=%s method=%s path=%s active=%s",
+            request_id,
+            req.method,
+            req.url.path,
+            active_now,
+        )
+        raise
+    finally:
+        with _WEB_ACTIVE_REQUESTS_LOCK:
+            _WEB_ACTIVE_REQUESTS = max(0, _WEB_ACTIVE_REQUESTS - 1)
+
+    elapsed_ms = (time.monotonic() - started) * 1000.0
+    resp.headers.setdefault("X-Request-ID", request_id)
+    resp.headers.setdefault("X-Response-Time-ms", f"{elapsed_ms:.1f}")
+    resp.headers.setdefault("X-Active-Requests", str(active_now))
+
+    if elapsed_ms >= WEB_SLOW_REQUEST_MS:
+        item = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "request_id": request_id,
+            "method": req.method,
+            "path": req.url.path,
+            "status": int(getattr(resp, "status_code", 0) or 0),
+            "elapsed_ms": round(elapsed_ms, 1),
+            "active": int(active_now),
+        }
+        _WEB_SLOW_REQUESTS.appendleft(item)
+        logging.getLogger(__name__).warning(
+            "Slow web request request_id=%s method=%s path=%s status=%s elapsed_ms=%.1f active=%s",
+            request_id,
+            req.method,
+            req.url.path,
+            item["status"],
+            elapsed_ms,
+            active_now,
+        )
+    return resp
+
+
+@app.middleware("http")
+async def _hot_api_rate_limit_middleware(req: FastAPIRequest, call_next):
+    # Protect expensive public AI endpoints without touching admin dashboard or
+    # Telegram webhook traffic. Telegram updates are throttled per chat/user in
+    # the Telegram handler pipeline, not by shared Telegram source IP.
+    if req.url.path.startswith("/ai-assistant"):
+        if not await _api_rate_limit_allowed(req):
+            return _FastJSONResponse({"ok": False, "error": "Too many requests. Please slow down.", "code": 429}, status_code=429)
+    return await call_next(req)
+
+
 @app_flask.after_request
 def _web_security_headers(resp):
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -523,6 +741,71 @@ def health_check():
 @app_flask.route("/ping")
 def ping():
     return "pong", 200
+
+
+@app_flask.route("/readyz")
+def readyz():
+    """Small deployment health endpoint for Render/UptimeRobot.
+
+    It intentionally exposes only boolean readiness, never tokens or secrets.
+    """
+    ffmpeg_path = globals().get("_FFMPEG_EXE", "")
+    payload = {
+        "ok": True,
+        "web": True,
+        "telegram_token_configured": bool(globals().get("TELEGRAM_BOT_TOKEN")),
+        "supabase_configured": bool(globals().get("supabase")),
+        "redis_configured": bool(globals().get("redis_client")),
+        "ffmpeg_ok": bool(ffmpeg_path and os.path.exists(str(ffmpeg_path))),
+        "bot_mode": globals().get("BOT_MODE", "POLLING"),
+        "webhook_ready": bool(globals().get("_TELEGRAM_APP")),
+    }
+    fmt = globals().get("_format_uptime")
+    if callable(fmt):
+        with suppress(Exception):
+            payload["uptime"] = fmt()
+    return jsonify(payload)
+
+
+@app.post("/telegram-webhook", include_in_schema=False)
+async def telegram_webhook(req: FastAPIRequest):
+    """Telegram webhook ingestion path for horizontal-scale deployments.
+
+    Enable with BOT_MODE=WEBHOOK and point Telegram setWebhook to this route.
+    In webhook mode, each node can process raw Update JSON behind a load
+    balancer; polling mode remains available for single-node compatibility.
+    """
+    app_obj = globals().get("_TELEGRAM_APP")
+    if app_obj is None:
+        raise HTTPException(status_code=503, detail="Telegram application is not ready.")
+
+    expected_secret = str(globals().get("TELEGRAM_WEBHOOK_SECRET_TOKEN") or "").strip()
+    if expected_secret:
+        got_secret = (req.headers.get("X-Telegram-Bot-Api-Secret-Token") or "").strip()
+        if not hmac.compare_digest(got_secret, expected_secret):
+            raise HTTPException(status_code=403, detail="Invalid webhook secret.")
+
+    max_body = _web_max_content_length()
+    content_length = req.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > max_body:
+                raise HTTPException(status_code=413, detail=f"Request body too large. Max {max_body} bytes.")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length header.")
+
+    raw = await req.body()
+    if len(raw) > max_body:
+        raise HTTPException(status_code=413, detail=f"Request body too large. Max {max_body} bytes.")
+    try:
+        data = _json_loads_fast(raw)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid Telegram update JSON.")
+
+    update = Update.de_json(data, app_obj.bot)
+    await app_obj.process_update(update)
+    return _FastJSONResponse({"ok": True})
+
 
 async def run_fastapi():
     """Run the FastAPI dashboard inside the main asyncio runtime."""
@@ -551,7 +834,7 @@ async def keep_alive_async(stop_event: asyncio.Event | None = None):
     await asyncio.sleep(10)
     headers = {"User-Agent": "Mozilla/5.0 (AsyncKeepAlive/2.0)", "Accept": "text/plain,*/*"}
 
-    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True, limits=HTTPX_HIGH_CONCURRENCY_LIMITS) as client:
         while stop_event is None or not stop_event.is_set():
             urls = [render_url]
             if not render_url.endswith("/ping"):
@@ -588,7 +871,6 @@ def keep_alive():
 
 # ── AI Assistant REST API ──────────────────────────────────────────────────
 import base64
-import json as _json
 
 try:
     from huggingface_hub import InferenceClient
@@ -1534,6 +1816,10 @@ _WEB_BROADCAST_EXECUTOR = ThreadPoolExecutor(
     max_workers=WEB_BROADCAST_MAX_ACTIVE_JOBS,
     thread_name_prefix="web_broadcast_job",
 )
+_WEB_BROADCAST_QUEUE: asyncio.Queue | None = None
+_WEB_BROADCAST_QUEUE_LOOP: asyncio.AbstractEventLoop | None = None
+_WEB_BROADCAST_QUEUE_TASKS: list[asyncio.Task] = []
+_WEB_BROADCAST_QUEUE_STOP = object()
 WEB_TABLE_PAGE_SIZE = max(10, min(200, _env_int("WEB_TABLE_PAGE_SIZE", 50)))
 # V4.1: avoid hammering Supabase from mobile/live dashboard polling.
 WEB_COUNTS_CACHE_TTL_S = max(5.0, _env_float("WEB_COUNTS_CACHE_TTL_S", 30.0))
@@ -1758,12 +2044,13 @@ def _web_render(title: str, body: str, *, active: str = "dashboard", status_code
         ("calendar", "Calendar", "/admin/schedules/calendar", "🗓"),
         ("broadcast", "Broadcast", "/admin/broadcast", "📣"),
         ("health", "Health", "/admin/health", "🩺"),
+        ("control", "Control", "/admin/control", "🛡️"),
         ("settings", "Settings", "/admin/settings", "⚙"),
         ("api", "API Keys", "/admin/api-keys", "🔑"),
         ("locks", "Locks", "/admin/locks", "🔒"),
         ("sql", "SQL", "/admin/sql", "☷"),
     ]
-    bottom_nav = [item for item in nav if item[0] in {"dashboard", "users", "schedules", "broadcast", "health"}]
+    bottom_nav = [item for item in nav if item[0] in {"dashboard", "users", "schedules", "broadcast", "control"}]
     template = """
 <!doctype html>
 <html lang="en">
@@ -2159,7 +2446,67 @@ def _web_broadcast_active_count() -> int:
         )
 
 
+async def _web_broadcast_queue_consumer(worker_id: int) -> None:
+    logger.info("Web broadcast queue worker %s started.", worker_id)
+    while True:
+        item = await _WEB_BROADCAST_QUEUE.get()  # type: ignore[union-attr]
+        try:
+            if item is _WEB_BROADCAST_QUEUE_STOP:
+                return
+            job_id, admin_id, text = item
+            await asyncio.to_thread(_web_broadcast_worker, job_id, admin_id, text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("web broadcast queue worker failed: %s", exc, exc_info=True)
+            with suppress(Exception):
+                _web_broadcast_job_set(str(item[0]), status="failed", error=str(exc)[:500], finished_at=_sched_iso())
+        finally:
+            with suppress(Exception):
+                _WEB_BROADCAST_QUEUE.task_done()  # type: ignore[union-attr]
+
+
+def _start_web_broadcast_queue_workers() -> None:
+    global _WEB_BROADCAST_QUEUE, _WEB_BROADCAST_QUEUE_LOOP, _WEB_BROADCAST_QUEUE_TASKS
+    loop = asyncio.get_running_loop()
+    if _WEB_BROADCAST_QUEUE is not None and _WEB_BROADCAST_QUEUE_LOOP is loop:
+        return
+    _WEB_BROADCAST_QUEUE = asyncio.Queue(maxsize=WEB_BROADCAST_QUEUE_MAXSIZE)
+    _WEB_BROADCAST_QUEUE_LOOP = loop
+    _WEB_BROADCAST_QUEUE_TASKS = [
+        asyncio.create_task(_web_broadcast_queue_consumer(i + 1), name=f"web-broadcast-queue-{i + 1}")
+        for i in range(WEB_BROADCAST_MAX_ACTIVE_JOBS)
+    ]
+
+
+async def _stop_web_broadcast_queue_workers() -> None:
+    global _WEB_BROADCAST_QUEUE_TASKS
+    if _WEB_BROADCAST_QUEUE is not None:
+        for _ in _WEB_BROADCAST_QUEUE_TASKS:
+            with suppress(Exception):
+                _WEB_BROADCAST_QUEUE.put_nowait(_WEB_BROADCAST_QUEUE_STOP)
+    for task in list(_WEB_BROADCAST_QUEUE_TASKS):
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+    _WEB_BROADCAST_QUEUE_TASKS = []
+
+
 def _submit_web_broadcast_job(job_id: str, admin_id: int, text: str) -> None:
+    """Submit a web broadcast without blocking the FastAPI/admin request path."""
+    item = (str(job_id), int(admin_id or 0), str(text or ""))
+    queue = _WEB_BROADCAST_QUEUE
+    loop = _WEB_BROADCAST_QUEUE_LOOP
+    if queue is not None and loop is not None and loop.is_running():
+        def _enqueue() -> None:
+            try:
+                queue.put_nowait(item)
+            except asyncio.QueueFull:
+                _web_broadcast_job_set(job_id, status="failed", error="Broadcast queue is full; try again later.", finished_at=_sched_iso())
+        loop.call_soon_threadsafe(_enqueue)
+        return
+
+    # Safe fallback for early startup/tests: keep old executor behavior.
     future = _WEB_BROADCAST_EXECUTOR.submit(_web_broadcast_worker, job_id, admin_id, text)
     future.add_done_callback(_log_future_exception)
 
@@ -2451,7 +2798,7 @@ def web_admin_home():
     </div>
     <div class='grid2'>
       <div class='card'><h2>Feature settings</h2><div class='table-wrap'><table class='table'>{setting_rows}</table></div><p><a class='btn secondary' href='/admin/settings'>Open settings</a></p></div>
-      <div class='card'><h2>Quick actions</h2><p class='muted'>Common admin tasks. Dangerous actions still require confirmation on their pages.</p><div class='actions'><a class='btn' href='/admin/users'>Manage Users</a><a class='btn' href='/admin/analytics'>Analytics V2</a><a class='btn' href='/admin/schedules/calendar'>Calendar</a><a class='btn' href='/admin/schedules'>Schedules</a><a class='btn' href='/admin/broadcast'>Broadcast</a><a class='btn secondary' href='/admin/health'>Health Center</a><a class='btn secondary' href='/admin/sql'>SQL Setup</a></div></div>
+      <div class='card'><h2>Quick actions</h2><p class='muted'>Common admin tasks. Dangerous actions still require confirmation on their pages.</p><div class='actions'><a class='btn' href='/admin/users'>Manage Users</a><a class='btn' href='/admin/analytics'>Analytics V2</a><a class='btn' href='/admin/schedules/calendar'>Calendar</a><a class='btn' href='/admin/schedules'>Schedules</a><a class='btn' href='/admin/broadcast'>Broadcast</a><a class='btn secondary' href='/admin/health'>Health Center</a><a class='btn secondary' href='/admin/control'>Control Center</a><a class='btn secondary' href='/admin/sql'>SQL Setup</a></div></div>
     </div>
     """
     return _web_render("Dashboard", body, active="dashboard")
@@ -2912,12 +3259,57 @@ def _web_sched_fetch_range(start_utc: datetime, end_utc: datetime, limit: int = 
     return list(getattr(res, "data", None) or [])
 
 
+def _web_sched_fetch_analytics_window(since_utc: datetime, limit: int = 20000) -> list[dict]:
+    """Fetch analytics rows using DB-side date filtering and pagination.
+
+    Previous code downloaded the newest 5,000 schedules and filtered by date in
+    Python. This pushes the last-N-days boundary to Postgres via created_at and
+    pages results so analytics do not silently stop at the first broad payload.
+    """
+    if not supabase:
+        return []
+    since_iso = _sched_iso(since_utc)
+    max_rows = max(100, min(100000, _env_int("WEB_ANALYTICS_MAX_ROWS", int(limit or 20000), minimum=100, maximum=100000)))
+    page_size = max(100, min(1000, _env_int("WEB_ANALYTICS_PAGE_SIZE", 1000, minimum=100, maximum=1000)))
+    rows: list[dict] = []
+    offset = 0
+    while len(rows) < max_rows:
+        upper = min(offset + page_size - 1, max_rows - 1)
+        res = db_call_sync(
+            f"web_sched_analytics_window:{offset}",
+            lambda lo=offset, hi=upper: (
+                supabase.table("scheduled_broadcasts")
+                .select(_web_schedule_select_fields())
+                .gte("created_at", since_iso)
+                .order("created_at", desc=True)
+                .range(lo, hi)
+                .execute()
+            ),
+            default=None,
+            attempts=2,
+            critical=False,
+        )
+        batch = list(getattr(res, "data", None) or [])
+        if not batch:
+            break
+        rows.extend(batch)
+        if len(batch) < (upper - offset + 1):
+            break
+        offset += page_size
+    if len(rows) >= max_rows:
+        logger.warning(
+            "analytics row cap reached max_rows=%s since=%s; raise WEB_ANALYTICS_MAX_ROWS or add DB aggregates",
+            max_rows, since_iso,
+        )
+    return rows
+
+
 def _web_analytics_v2(days: int = 30) -> dict:
     days = max(1, min(365, int(days or 30)))
-    rows = _web_sched_fetch_recent(5000)
     now_utc = datetime.now(timezone.utc)
     since_local = (_local_now() - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
     since_utc = _local_to_utc(since_local)
+    rows = _web_sched_fetch_analytics_window(since_utc)
 
     status_counts: dict[str, int] = {}
     day_counts: OrderedDict[str, dict] = OrderedDict()
@@ -3322,7 +3714,10 @@ def _web_broadcast_worker(job_id: str, admin_id: int, text: str) -> None:
 
     workers = max(1, min(WEB_BROADCAST_WORKERS, max(1, len(users))))
     batch_size = max(1, max(BROADCAST_BATCH_SIZE, workers))
-    limits = httpx.Limits(max_keepalive_connections=max(1, workers), max_connections=max(2, workers * 2))
+    limits = httpx.Limits(
+        max_keepalive_connections=max(HTTP_MAX_KEEPALIVE_CONNECTIONS, workers),
+        max_connections=max(HTTP_MAX_CONNECTIONS, workers * 2),
+    )
     try:
         with httpx.Client(timeout=20, limits=limits) as tg_client:
             with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="web_broadcast") as pool:
@@ -3521,6 +3916,250 @@ on public.scheduled_broadcasts (broadcast_at, status);"""
     return _web_render("SQL", body, active="sql")
 
 
+# ── Admin Control Center V5 ─────────────────────────────────────────────────
+def _web_counts_invalidate() -> None:
+    with _WEB_COUNTS_CACHE_LOCK:
+        _WEB_COUNTS_CACHE["ts"] = 0.0
+        _WEB_COUNTS_CACHE["data"] = {}
+    with _WEB_LIVE_SCHEDULES_LOCK:
+        _WEB_LIVE_SCHEDULES_CACHE["ts"] = 0.0
+        _WEB_LIVE_SCHEDULES_CACHE["rows"] = []
+
+
+def _web_admin_audit(action: str, detail: str = "") -> None:
+    item = {
+        "at": _fmt_local_dt(),
+        "admin_id": _web_current_admin_id(),
+        "action": str(action or "")[:80],
+        "detail": _web_short(detail, 300),
+        "path": getattr(request, "path", ""),
+    }
+    _WEB_ADMIN_AUDIT.appendleft(item)
+    logger.info("admin_audit admin_id=%s action=%s detail=%s", item["admin_id"], item["action"], item["detail"])
+
+
+def _semaphore_snapshot(sem: asyncio.Semaphore | None, configured: int) -> dict:
+    if sem is None:
+        return {"configured": int(configured), "available": None, "in_use": None}
+    available = int(getattr(sem, "_value", 0))
+    return {
+        "configured": int(configured),
+        "available": max(0, available),
+        "in_use": max(0, int(configured) - max(0, available)),
+    }
+
+
+def _breaker_snapshot(breaker: Any) -> dict:
+    if breaker is None:
+        return {"configured": False}
+    return {
+        "configured": True,
+        "name": getattr(breaker, "name", ""),
+        "failures": int(getattr(breaker, "failures", 0) or 0),
+        "open": bool(breaker.is_open()) if hasattr(breaker, "is_open") else False,
+        "open_remaining_s": max(0, int(float(getattr(breaker, "open_until", 0.0) or 0.0) - time.monotonic())),
+    }
+
+
+def _runtime_performance_snapshot(light: bool = False) -> dict:
+    with _WEB_ACTIVE_REQUESTS_LOCK:
+        active_requests = int(_WEB_ACTIVE_REQUESTS)
+
+    active_jobs = _web_broadcast_active_count() if "_web_broadcast_active_count" in globals() else 0
+    pending_sched = len(_scheduler_active_ids) if "_scheduler_active_ids" in globals() else 0
+
+    snap = {
+        "uptime": _format_uptime(),
+        "local_time": _fmt_local_dt(),
+        "web": {
+            "active_requests": active_requests,
+            "slow_request_threshold_ms": WEB_SLOW_REQUEST_MS,
+            "recent_slow_requests": [] if light else list(_WEB_SLOW_REQUESTS)[:20],
+            "counts_cache_ttl_s": WEB_COUNTS_CACHE_TTL_S,
+            "live_poll_s": WEB_LIVE_POLL_SECONDS,
+        },
+        "telegram": {
+            "concurrent_updates": TELEGRAM_CONCURRENT_UPDATES,
+            "connection_pool_size": TELEGRAM_CONNECTION_POOL_SIZE,
+            "allowed_updates": ["message", "callback_query"],
+        },
+        "semaphores": {
+            "tts": _semaphore_snapshot(_TTS_CHUNK_SEMAPHORE, MAX_CONCURRENT_TTS_USERS),
+            "ai": _semaphore_snapshot(_AI_SEMAPHORE, MAX_CONCURRENT_AI),
+            "broadcast": _semaphore_snapshot(_BROADCAST_SEMAPHORE, MAX_CONCURRENT_BROADCAST),
+        },
+        "broadcast": {
+            "active_jobs": active_jobs,
+            "max_active_jobs": WEB_BROADCAST_MAX_ACTIVE_JOBS,
+            "workers": WEB_BROADCAST_WORKERS,
+            "delay_s": WEB_BROADCAST_DELAY_S,
+            "recent_jobs": [] if light else list(_WEB_BROADCAST_JOBS.values())[:20],
+        },
+        "scheduler": {
+            "active_ids": pending_sched,
+            "lock_enabled": bool(_SCHED_LOCK_ENABLED),
+            "lock_required": bool(_SCHED_LOCK_REQUIRED),
+        },
+        "stores": {
+            "supabase": bool(supabase),
+            "redis": bool(redis_client),
+            "supabase_breaker": _breaker_snapshot(globals().get("supabase_breaker")),
+            "redis_breaker": _breaker_snapshot(globals().get("redis_breaker")),
+        },
+        "cooldowns": {
+            "hf_tts_remaining_s": _hf_tts_disabled_remaining_s() if "_hf_tts_disabled_remaining_s" in globals() else 0,
+            "hf_ocr_disabled": bool(_hf_ocr_is_temporarily_disabled()) if "_hf_ocr_is_temporarily_disabled" in globals() else False,
+            "hf_ocr_provider_disabled": bool(_ocr_provider_is_temporarily_disabled("hf")) if "_ocr_provider_is_temporarily_disabled" in globals() else False,
+            "gemini_ocr_provider_disabled": bool(_ocr_provider_is_temporarily_disabled("gemini")) if "_ocr_provider_is_temporarily_disabled" in globals() else False,
+        },
+        "metrics": dict(_RUNTIME_METRICS),
+    }
+
+    if not light:
+        with suppress(Exception):
+            import resource
+            rss_kb = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+            snap["process"] = {"max_rss_kb": rss_kb}
+        with suppress(Exception):
+            snap.setdefault("process", {})["loadavg"] = list(os.getloadavg())
+    return snap
+
+
+def _reset_hf_tts_cooldown() -> None:
+    if "_HF_TTS_STATE_LOCK" in globals():
+        with globals()["_HF_TTS_STATE_LOCK"]:
+            globals()["_HF_TTS_FAILURES"] = 0
+            globals()["_HF_TTS_DISABLED_UNTIL"] = 0.0
+
+
+def _reset_ocr_cooldowns() -> None:
+    if "_hf_ocr_state_lock" in globals():
+        with globals()["_hf_ocr_state_lock"]:
+            globals()["_hf_ocr_failures"] = 0
+            globals()["_hf_ocr_disabled_until"] = 0.0
+    if "_ocr_provider_state_lock" in globals():
+        with globals()["_ocr_provider_state_lock"]:
+            for key in list(globals().get("_ocr_provider_failures", {}).keys()):
+                globals()["_ocr_provider_failures"][key] = 0
+            for key in list(globals().get("_ocr_provider_disabled_until", {}).keys()):
+                globals()["_ocr_provider_disabled_until"][key] = 0.0
+
+
+@app_flask.route("/admin/performance.json")
+@web_admin_required
+def web_admin_performance_json():
+    resp = jsonify({"ok": True, "performance": _runtime_performance_snapshot(light=False)})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app_flask.route("/admin/control")
+@web_admin_required
+def web_admin_control():
+    perf = _runtime_performance_snapshot(light=False)
+    csrf = _web_csrf_token()
+    actions = [
+        ("refresh_caches", "Refresh dashboard caches", "Clear dashboard counts/live schedule cache and reload bot settings on next read.", "secondary"),
+        ("clear_runtime_metrics", "Reset runtime metrics", "Set in-memory runtime counters back to zero.", "warn"),
+        ("reset_hf_tts", "Reset HF TTS cooldown", "Use after fixing Hugging Face / Gradio Space errors.", "warn"),
+        ("reset_ocr", "Reset OCR cooldowns", "Use after fixing HF/Gemini OCR networking or quota problems.", "warn"),
+        ("purge_temp", "Purge temp files", "Run the temp sweeper and garbage collector now.", "secondary"),
+        ("cancel_web_broadcasts", "Cancel active web broadcasts", "Ask all running web broadcast jobs to stop safely.", "danger"),
+        ("pause_all", "Emergency pause", "Maintenance ON and public TTS/OCR/audio/voice features OFF.", "danger"),
+        ("resume_all", "Resume normal service", "Maintenance OFF and public features ON.", "ok"),
+        ("release_lock", "Force release scheduler lock", "Only use if Render restarted and the old scheduler owner is dead.", "danger"),
+    ]
+    action_rows = "".join(
+        f"<tr><td><b>{_web_h(label)}</b><br><span class='muted'>{_web_h(desc)}</span></td>"
+        f"<td><form method='post' action='/admin/control/action' data-confirm='Run admin action: {_web_h(label)}?'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='action' value='{_web_h(action)}'><button class='{_web_h(kind)}'>{_web_h(label)}</button></form></td></tr>"
+        for action, label, desc, kind in actions
+    )
+    audit_rows = "".join(
+        f"<tr><td>{_web_h(item.get('at'))}</td><td><code>{_web_h(item.get('admin_id'))}</code></td><td>{_web_h(item.get('action'))}</td><td>{_web_h(item.get('detail'))}</td></tr>"
+        for item in list(_WEB_ADMIN_AUDIT)[:50]
+    ) or '<tr><td colspan="4"><div class="empty">No admin actions recorded in this process yet.</div></td></tr>'
+    body = f"""
+    <div data-live-status></div>
+    <div class='grid'>
+      {_web_status_card('Web active requests', perf['web']['active_requests'], f"slow threshold {WEB_SLOW_REQUEST_MS:.0f} ms", 'ok' if perf['web']['active_requests'] < 5 else 'warn')}
+      {_web_status_card('TTS in use', perf['semaphores']['tts']['in_use'], f"max {MAX_CONCURRENT_TTS_USERS}", 'warn' if perf['semaphores']['tts']['in_use'] else '')}
+      {_web_status_card('AI in use', perf['semaphores']['ai']['in_use'], f"max {MAX_CONCURRENT_AI}", 'warn' if perf['semaphores']['ai']['in_use'] else '')}
+      {_web_status_card('Broadcast jobs', perf['broadcast']['active_jobs'], f"max active {WEB_BROADCAST_MAX_ACTIVE_JOBS}", 'warn' if perf['broadcast']['active_jobs'] else '')}
+    </div>
+    <div class='grid2'>
+      <div class='card'><h2>Admin Control Actions</h2><p class='muted'>High-impact actions are protected by CSRF and confirmation. They affect this running process immediately.</p><div class='table-wrap'><table class='table'><thead><tr><th>Action</th><th>Run</th></tr></thead><tbody>{action_rows}</tbody></table></div></div>
+      <div class='card'><h2>Performance Snapshot</h2><pre>{_web_h(_json.dumps(perf, ensure_ascii=False, indent=2, default=str))}</pre><p><a class='btn secondary' href='/admin/performance.json'>Open JSON</a></p></div>
+    </div>
+    <div class='card'><h2>Recent Admin Audit</h2><div class='table-wrap'><table class='table'><thead><tr><th>Time</th><th>Admin</th><th>Action</th><th>Detail</th></tr></thead><tbody>{audit_rows}</tbody></table></div></div>
+    """
+    return _web_render("Control Center", body, active="control")
+
+
+@app_flask.route("/admin/control/action", methods=["POST"])
+@web_admin_required
+def web_admin_control_action():
+    _web_check_csrf()
+    action = str(request.form.get("action") or "").strip()
+    ok = True
+    msg = "Done."
+    try:
+        if action == "refresh_caches":
+            _web_counts_invalidate()
+            _api_key_cache_clear()
+            with _blocked_cache_lock:
+                _blocked_user_cache.clear()
+            _bot_settings_cache["ts"] = 0.0
+            msg = "Dashboard, settings, API-key, and blocked-user caches refreshed."
+        elif action == "clear_runtime_metrics":
+            for key in list(_RUNTIME_METRICS.keys()):
+                _RUNTIME_METRICS[key] = 0
+            msg = "Runtime metrics reset."
+        elif action == "reset_hf_tts":
+            _reset_hf_tts_cooldown()
+            msg = "HF TTS cooldown reset."
+        elif action == "reset_ocr":
+            _reset_ocr_cooldowns()
+            msg = "OCR cooldowns reset."
+        elif action == "purge_temp":
+            with suppress(Exception):
+                _sweep_stale_temps()
+            gc.collect()
+            msg = "Temp sweep and garbage collection completed."
+        elif action == "cancel_web_broadcasts":
+            count = 0
+            with _WEB_BROADCAST_JOBS_LOCK:
+                for job in _WEB_BROADCAST_JOBS.values():
+                    if str(job.get("status")) in {"queued", "running", "paused"}:
+                        job["control"] = "cancel"
+                        count += 1
+            msg = f"Cancel requested for {count} active web broadcast job(s)."
+        elif action == "pause_all":
+            for key in ("maintenance_mode", "tts_enabled", "ocr_enabled", "voice_transcribe_enabled", "audio_transcribe_enabled", "ai_resolver_enabled"):
+                db_bot_setting_set(key, key == "maintenance_mode", _web_current_admin_id())
+            _bot_settings_cache["ts"] = 0.0
+            msg = "Emergency pause enabled. Maintenance is ON and public features are OFF."
+        elif action == "resume_all":
+            db_bot_setting_set("maintenance_mode", False, _web_current_admin_id())
+            for key in ("tts_enabled", "ocr_enabled", "voice_transcribe_enabled", "audio_transcribe_enabled", "ai_resolver_enabled"):
+                db_bot_setting_set(key, True, _web_current_admin_id())
+            _bot_settings_cache["ts"] = 0.0
+            msg = "Normal service resumed."
+        elif action == "release_lock":
+            if not supabase:
+                ok, msg = False, "Supabase is not configured."
+            else:
+                res = db_call_sync("web_control_lock_release", lambda: supabase.table("bot_locks").delete().eq("lock_key", _SCHED_LOCK_KEY).execute(), default=None, attempts=2, critical=False)
+                ok = res is not None
+                msg = "Scheduler lock release attempted." if ok else "Scheduler lock release failed."
+        else:
+            ok, msg = False, "Unknown control action."
+    except Exception as exc:
+        ok, msg = False, str(exc)[:500]
+    _web_admin_audit(action, msg)
+    flask_flash(("OK: " if ok else "ERROR: ") + msg, "success" if ok else "error")
+    return redirect(url_for("web_admin_control"))
+
+
 @app_flask.route("/admin/status.json")
 @web_admin_required
 def web_admin_status_json():
@@ -3532,6 +4171,7 @@ def web_admin_status_json():
         "local_time": _fmt_local_dt(),
         "timezone": APP_TIMEZONE_NAME,
         "timezone_label": f"{APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})",
+        "performance": _runtime_performance_snapshot(light=True),
     }
     if not light:
         payload.update({
@@ -3556,6 +4196,7 @@ def web_admin_live_json():
         "uptime": _format_uptime(),
         "local_time": _fmt_local_dt(),
         "timezone_label": f"{APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})",
+        "performance": _runtime_performance_snapshot(light=True),
         "jobs_html": _web_broadcast_job_rows_html(_web_csrf_token(), include_actions=False),
         "schedules_html": _web_schedule_rows_html(_web_live_schedules(), _web_csrf_token(), ""),
     }
@@ -3627,6 +4268,32 @@ REDIS_PREFS_TTL_S        = int(os.environ.get("REDIS_PREFS_TTL_S", "1800"))
 REDIS_TEXT_CACHE_TTL_S   = int(os.environ.get("REDIS_TEXT_CACHE_TTL_S", "86400"))
 REDIS_HISTORY_TTL_S      = int(os.environ.get("REDIS_HISTORY_TTL_S", "86400"))
 REDIS_SOCKET_TIMEOUT_S   = float(os.environ.get("REDIS_SOCKET_TIMEOUT_S", "3"))
+CACHE_ASIDE_DEFAULT_TTL_S = _env_int("CACHE_ASIDE_DEFAULT_TTL_S", 3600, minimum=30, maximum=86400)
+HTTP_MAX_CONNECTIONS = _env_int("HTTP_MAX_CONNECTIONS", 100, minimum=10, maximum=1000)
+HTTP_MAX_KEEPALIVE_CONNECTIONS = _env_int("HTTP_MAX_KEEPALIVE_CONNECTIONS", 20, minimum=2, maximum=500)
+HTTPX_HIGH_CONCURRENCY_LIMITS = httpx.Limits(
+    max_connections=HTTP_MAX_CONNECTIONS,
+    max_keepalive_connections=HTTP_MAX_KEEPALIVE_CONNECTIONS,
+)
+BOT_MODE = (os.environ.get("BOT_MODE") or getattr(SETTINGS, "BOT_MODE", "POLLING") or "POLLING").strip().upper()
+if BOT_MODE not in {"POLLING", "WEBHOOK"}:
+    BOT_MODE = "POLLING"
+TELEGRAM_WEBHOOK_URL = (os.environ.get("TELEGRAM_WEBHOOK_URL") or getattr(SETTINGS, "TELEGRAM_WEBHOOK_URL", "") or "").strip()
+TELEGRAM_WEBHOOK_SECRET_TOKEN = (os.environ.get("TELEGRAM_WEBHOOK_SECRET_TOKEN") or getattr(SETTINGS, "TELEGRAM_WEBHOOK_SECRET_TOKEN", "") or "").strip()
+SUPABASE_DB_POOLER_URL = (
+    os.environ.get("SUPABASE_DB_POOLER_URL")
+    or os.environ.get("DATABASE_URL_POOLER")
+    or os.environ.get("SUPABASE_POOLER_URL")
+    or ""
+).strip()
+USER_RATE_LIMIT_PER_SECOND = _env_int("USER_RATE_LIMIT_PER_SECOND", 3, minimum=1, maximum=100)
+USER_RATE_LIMIT_WINDOW_S = _env_float("USER_RATE_LIMIT_WINDOW_S", 1.0, minimum=0.25, maximum=60.0)
+USER_RATE_LIMIT_NOTICE_COOLDOWN_S = _env_float("USER_RATE_LIMIT_NOTICE_COOLDOWN_S", 8.0, minimum=1.0, maximum=300.0)
+API_RATE_LIMIT_PER_SECOND = _env_int("API_RATE_LIMIT_PER_SECOND", 20, minimum=1, maximum=1000)
+API_RATE_LIMIT_WINDOW_S = _env_float("API_RATE_LIMIT_WINDOW_S", 1.0, minimum=0.25, maximum=60.0)
+RATE_LIMIT_REDIS_TTL_S = _env_int("RATE_LIMIT_REDIS_TTL_S", 30, minimum=2, maximum=3600)
+RATE_LIMIT_ENABLED = _env_bool("RATE_LIMIT_ENABLED", True)
+WEB_BROADCAST_QUEUE_MAXSIZE = _env_int("WEB_BROADCAST_QUEUE_MAXSIZE", 200, minimum=10, maximum=10000)
 GEMINI_API_KEY:     str = ""
 ADMIN_IDS:  set[int]    = set()
 GEMINI_MODEL            = ""
@@ -3680,6 +4347,8 @@ HF_TTS_QUOTA_COOLDOWN_S  = _env_float("HF_TTS_QUOTA_COOLDOWN_S", 1800.0, minimum
 HF_TTS_NO_AUDIO_COOLDOWN_S = _env_float("HF_TTS_NO_AUDIO_COOLDOWN_S", 600.0, minimum=60.0, maximum=3600.0)
 HF_TTS_CLIENT_CACHE      = _env_bool("HF_TTS_CLIENT_CACHE", True)
 HF_TTS_SERIALIZE_CALLS   = _env_bool("HF_TTS_SERIALIZE_CALLS", True)
+FFMPEG_START_TIMEOUT_S  = _env_float("FFMPEG_START_TIMEOUT_S", 5.0, minimum=1.0, maximum=30.0)
+FFMPEG_CONVERT_TIMEOUT_S = _env_float("FFMPEG_CONVERT_TIMEOUT_S", 75.0, minimum=15.0, maximum=300.0)
 DEFAULT_SPEED           = 1.0
 TELE_MSG_LIMIT          = 4000
 USER_COOLDOWN_S         = 3.0
@@ -4022,16 +4691,14 @@ def _redis_get_json_sync(key: str, default: Any = None) -> Any:
     if not raw:
         return default
     try:
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8")
-        return _json.loads(raw)
+        return _json_loads_fast(raw)
     except Exception as exc:
         _log_once(logging.WARNING, f"redis_bad_json:{key}", "Invalid Redis JSON for %s: %s", key, exc)
         return default
 
 
 def _redis_set_json_sync(key: str, value: Any, ttl: int) -> bool:
-    raw = _json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    raw = _json_dumps_fast(value)
     ok = redis_call_sync(f"set:{key}", lambda: redis_client.set(key, raw, ex=max(1, int(ttl))), default=False)
     return bool(ok)
 
@@ -4061,22 +4728,175 @@ async def _redis_get_json(key: str, default: Any = None) -> Any:
     if not raw:
         return default
     try:
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8")
-        return _json.loads(raw)
+        return _json_loads_fast(raw)
     except Exception as exc:
         _log_once(logging.WARNING, f"redis_bad_json:{key}", "Invalid Redis JSON for %s: %s", key, exc)
         return default
 
 
 async def _redis_set_json(key: str, value: Any, ttl: int) -> bool:
-    raw = _json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    raw = _json_dumps_fast(value)
     ok = await redis_call(f"set:{key}", lambda: redis_client.set(key, raw, ex=max(1, int(ttl))), default=False)
     return bool(ok)
 
 
 async def _redis_delete(key: str) -> None:
     await redis_call(f"delete:{key}", lambda: redis_client.delete(key), default=None)
+
+
+# ---------------------------------------------------------------------------
+# High-concurrency Redis cache-aside + rate limiting helpers
+# ---------------------------------------------------------------------------
+_RATE_LIMIT_MEMORY: dict[str, deque[float]] = {}
+_RATE_LIMIT_MEMORY_LOCK = asyncio.Lock()
+_RATE_LIMIT_NOTICE_MEMORY: dict[str, float] = {}
+
+
+def _cache_payload(value: Any) -> dict[str, Any]:
+    return {"v": value, "cached_at": time.time()}
+
+
+def _cache_payload_value(payload: Any, default: Any = None) -> Any:
+    if isinstance(payload, dict) and "v" in payload:
+        return payload.get("v", default)
+    return payload if payload is not None else default
+
+
+async def _redis_cache_get_many_json(keys: list[str]) -> dict[str, Any]:
+    """Fetch multiple JSON cache keys through one Redis round trip.
+
+    redis-py is synchronous in this project, so the pipeline runs via the
+    existing async retry wrapper, which offloads it from the event loop.
+    """
+    if redis_client is None or not keys:
+        return {}
+
+    def _run():
+        pipe = redis_client.pipeline(transaction=False)
+        for key in keys:
+            pipe.get(key)
+        return pipe.execute()
+
+    raw_values = await redis_call("pipeline_get_json", _run, default=None, timeout=2.0, attempts=1)
+    if not raw_values:
+        return {}
+
+    out: dict[str, Any] = {}
+    for key, raw in zip(keys, raw_values):
+        if not raw:
+            continue
+        try:
+            out[key] = _json_loads_fast(raw)
+        except Exception as exc:
+            _log_once(logging.WARNING, f"redis_bad_json:{key}", "Invalid Redis JSON for %s: %s", key, exc)
+    return out
+
+
+async def _redis_cache_set_many_json(items: dict[str, Any], ttl: int) -> bool:
+    if redis_client is None or not items:
+        return False
+    ttl_i = max(1, int(ttl or CACHE_ASIDE_DEFAULT_TTL_S))
+    encoded = {str(k): _json_dumps_fast(v) for k, v in items.items()}
+
+    def _run():
+        pipe = redis_client.pipeline(transaction=False)
+        for key, raw in encoded.items():
+            pipe.set(key, raw, ex=ttl_i)
+        pipe.execute()
+        return True
+
+    return bool(await redis_call("pipeline_set_json", _run, default=False, timeout=3.0, attempts=1))
+
+
+async def _rate_limit_check(key: str, limit: int, window_s: float) -> tuple[bool, int]:
+    """Sliding-window limiter with Redis ZSET backing and in-memory fallback."""
+    if not RATE_LIMIT_ENABLED:
+        return True, 0
+    limit_i = max(1, int(limit or 1))
+    window = max(0.25, float(window_s or 1.0))
+    now = time.time()
+    redis_key = _redis_key("rl", key)
+
+    if redis_client is not None:
+        cutoff = now - window
+        member = f"{now:.6f}:{secrets.token_hex(4)}"
+
+        def _run():
+            # One pipeline round trip; non-transactional for speed. Minor race is
+            # acceptable here because this is a protective throttle, not billing.
+            pipe = redis_client.pipeline(transaction=False)
+            pipe.zremrangebyscore(redis_key, 0, cutoff)
+            pipe.zcard(redis_key)
+            pipe.zadd(redis_key, {member: now})
+            pipe.expire(redis_key, max(RATE_LIMIT_REDIS_TTL_S, int(window) + 2))
+            results = pipe.execute()
+            return int(results[1] or 0)
+
+        try:
+            count_before = await redis_call("rate_limit", _run, default=None, timeout=1.25, attempts=1)
+            if count_before is not None:
+                allowed = int(count_before) < limit_i
+                return allowed, max(0, limit_i - int(count_before) - (1 if allowed else 0))
+        except Exception as exc:
+            _log_once(logging.WARNING, "rate_limit_redis_fallback", "Redis rate limiter fallback: %s", exc)
+
+    async with _RATE_LIMIT_MEMORY_LOCK:
+        dq = _RATE_LIMIT_MEMORY.setdefault(key, deque())
+        cutoff = now - window
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        allowed = len(dq) < limit_i
+        if allowed:
+            dq.append(now)
+        # Opportunistic cleanup so offline Redis mode stays bounded.
+        if len(_RATE_LIMIT_MEMORY) > 100_000:
+            stale_before = now - max(window * 4, 60.0)
+            for old_key in list(_RATE_LIMIT_MEMORY.keys())[:5000]:
+                old_dq = _RATE_LIMIT_MEMORY.get(old_key)
+                if not old_dq or (old_dq and old_dq[-1] < stale_before):
+                    _RATE_LIMIT_MEMORY.pop(old_key, None)
+        return allowed, max(0, limit_i - len(dq))
+
+
+def _update_rate_limit_key(update: Any) -> str:
+    uid = getattr(getattr(update, "effective_user", None), "id", None)
+    chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
+    if uid is not None:
+        return f"tg:user:{int(uid)}"
+    if chat_id is not None:
+        return f"tg:chat:{int(chat_id)}"
+    return "tg:anonymous"
+
+
+async def _telegram_rate_limit_guard(update: Any, context: Any) -> None:
+    if not isinstance(update, Update):
+        return
+    key = _update_rate_limit_key(update)
+    allowed, _remaining = await _rate_limit_check(key, USER_RATE_LIMIT_PER_SECOND, USER_RATE_LIMIT_WINDOW_S)
+    if allowed:
+        return
+    _metric_inc("rate_limited")
+    now = time.monotonic()
+    last = _RATE_LIMIT_NOTICE_MEMORY.get(key, 0.0)
+    if now - last >= USER_RATE_LIMIT_NOTICE_COOLDOWN_S:
+        _RATE_LIMIT_NOTICE_MEMORY[key] = now
+        msg = getattr(update, "effective_message", None)
+        if msg is not None:
+            with suppress(Exception):
+                await msg.reply_text("⏳ Too many requests. Please slow down.")
+    raise ApplicationHandlerStop
+
+
+async def _api_rate_limit_allowed(req: FastAPIRequest) -> bool:
+    if not RATE_LIMIT_ENABLED:
+        return True
+    host = req.client.host if req.client else "unknown"
+    auth = (req.headers.get("authorization") or req.headers.get("x-api-key") or "").strip()
+    if auth.lower().startswith("bearer "):
+        auth = auth[7:].strip()
+    identity = hashlib.sha256(auth.encode("utf-8")).hexdigest()[:24] if auth else host
+    allowed, _remaining = await _rate_limit_check(f"api:{req.url.path}:{identity}", API_RATE_LIMIT_PER_SECOND, API_RATE_LIMIT_WINDOW_S)
+    return allowed
 
 
 # ---------------------------------------------------------------------------
@@ -4168,6 +4988,7 @@ supabase_async: Any = None
 redis_client = None
 _gemini    = None
 _hf_client = None
+_TELEGRAM_APP: Any = None
 
 # OCR circuit-breaker state
 _hf_ocr_disabled_until = 0.0
@@ -4609,7 +5430,10 @@ def _init_clients() -> None:
             if SB_KEY.startswith("sb_publishable_") or "publishable" in SB_KEY.lower():
                 logger.warning("SUPABASE_KEY looks like a publishable key. Admin tables such as ai_api_keys should use SUPABASE_SERVICE_ROLE_KEY on the server.")
             supabase = create_client(SB_URL, SB_KEY)
-            logger.info("Supabase client initialised.")
+            if SUPABASE_DB_POOLER_URL:
+                logger.info("Supabase DB pooler URL configured for direct PostgreSQL workloads (transaction pooler / Supavisor recommended on port 6543).")
+            else:
+                logger.info("Supabase client initialised. For any direct PostgreSQL queries, configure SUPABASE_DB_POOLER_URL with the Supabase pooler/Supavisor transaction endpoint on port 6543 to avoid socket exhaustion.")
         except Exception as e:
             logger.error(f"Supabase init failed: {e}")
             supabase = None
@@ -4629,6 +5453,7 @@ def _init_clients() -> None:
                     socket_connect_timeout=REDIS_SOCKET_TIMEOUT_S,
                     health_check_interval=30,
                     retry_on_timeout=True,
+                    max_connections=_env_int("REDIS_MAX_CONNECTIONS", 100, minimum=2, maximum=1000),
                 )
                 redis_client.ping()
                 logger.info("Redis cache initialised.")
@@ -4882,7 +5707,9 @@ async def get_user_prefs_async(user_id: int) -> dict:
         return cached
 
     redis_key = _prefs_redis_key(user_id)
-    redis_prefs = await _redis_get_json(redis_key, default=None)
+    redis_map = await _redis_cache_get_many_json([redis_key])
+    redis_prefs = redis_map.get(redis_key)
+    redis_prefs = _cache_payload_value(redis_prefs, redis_prefs)
     if isinstance(redis_prefs, dict):
         prefs = _normalize_user_prefs(redis_prefs)
         await _async_cache_prefs(user_id, prefs, write_redis=False)
@@ -5013,9 +5840,6 @@ async def safe_send(coro_factory, retries: int = 3, delay: float = 2.0):
             logger.warning(f"Telegram BadRequest (not retried): {e}")
             raise
         except (TimedOut, NetworkError) as e:
-            if _is_message_not_modified_error(e):
-                logger.debug("Telegram edit skipped: message is not modified.")
-                return None
             last_exc = e
             if attempt < retries - 1:
                 logger.warning(f"Network error (attempt {attempt + 1}): {e}")
@@ -5023,9 +5847,6 @@ async def safe_send(coro_factory, retries: int = 3, delay: float = 2.0):
             else:
                 raise
         except TelegramError as e:
-            if _is_message_not_modified_error(e):
-                logger.debug("Telegram edit skipped: message is not modified.")
-                return None
             logger.error(f"Telegram error: {e}")
             raise
     if last_exc:
@@ -5630,6 +6451,10 @@ def get_text_cache(msg_id: int, chat_id: int = 0) -> str | None:
       2) Redis cache
       3) Supabase with retry
       4) return None if unavailable
+
+    This remains sync for backwards compatibility. Async handlers should call
+    get_text_cache_async() so Redis/Supabase blocking clients never stall the
+    Telegram/FastAPI event loop.
     """
     cached = _get_text_cache_memory_sync(msg_id, chat_id)
     if cached:
@@ -5665,6 +6490,63 @@ def get_text_cache(msg_id: int, chat_id: int = 0) -> str | None:
             _remember_text_cache_sync(msg_id, chat_id, text_value)
             _write_text_cache_redis_sync(msg_id, chat_id, text_value)
             return text_value
+
+    return None
+
+
+async def get_text_cache_async(msg_id: int, chat_id: int = 0) -> str | None:
+    """Async-safe Redis cache-aside text reader for callbacks/web handlers.
+
+    Hot path stays memory/Redis-first. On Redis miss, Supabase is queried in the
+    bounded DB executor, then both memory and Redis are refreshed. If Redis is
+    offline, this falls back to the existing Supabase/default flow.
+    """
+    cached = _get_text_cache_memory_sync(msg_id, chat_id)
+    if cached:
+        return cached
+
+    redis_key = _text_cache_redis_key(msg_id, chat_id)
+    redis_values = await _redis_cache_get_many_json([redis_key])
+    redis_payload = redis_values.get(redis_key)
+    if isinstance(redis_payload, dict):
+        redis_text = str(redis_payload.get("text") or _cache_payload_value(redis_payload, "") or "").strip()
+        if redis_text:
+            _remember_text_cache_sync(msg_id, chat_id, redis_text)
+            return redis_text
+
+    if not supabase:
+        return None
+
+    try:
+        res = await db_call(
+            f"get_text_cache_async:{chat_id}:{msg_id}",
+            lambda: supabase.table("text_cache")
+                .select("original_text")
+                .eq("message_id", int(msg_id))
+                .eq("chat_id", int(chat_id))
+                .limit(1)
+                .execute(),
+            default=None,
+            attempts=2,
+            timeout=6.0,
+            critical=False,
+        )
+        rows = getattr(res, "data", None) if res else None
+        if rows:
+            text_value = (rows[0].get("original_text") or "").strip()
+            if text_value:
+                _remember_text_cache_sync(msg_id, chat_id, text_value)
+                await _redis_cache_set_many_json({redis_key: {"text": text_value}}, REDIS_TEXT_CACHE_TTL_S)
+                return text_value
+    except Exception as exc:
+        _log_once(
+            logging.WARNING,
+            f"text_cache_async_fallback:{type(exc).__name__}:{str(exc)[:120]}",
+            "get_text_cache_async fallback chat=%s msg=%s: %s",
+            chat_id,
+            msg_id,
+            exc,
+        )
 
     return None
 
@@ -5724,6 +6606,10 @@ def startup_self_check() -> None:
         checks.append("FLASK_SECRET_KEY is not set; web admin sessions reset on every deploy/restart")
     if supabase and not os.environ.get("SUPABASE_SERVICE_ROLE_KEY"):
         checks.append("SUPABASE_SERVICE_ROLE_KEY is not set; admin tables may fail under RLS/publishable key")
+    if supabase and not SUPABASE_DB_POOLER_URL:
+        checks.append("SUPABASE_DB_POOLER_URL is not set; direct PostgreSQL workloads should use the Supabase pooler/Supavisor transaction URL on port 6543")
+    if BOT_MODE == "WEBHOOK" and not TELEGRAM_WEBHOOK_URL:
+        checks.append("BOT_MODE=WEBHOOK but TELEGRAM_WEBHOOK_URL is missing; /telegram-webhook will receive updates only after setWebhook is configured")
     if AI_PROVIDER == "hf" and not HF_TOKEN:
         checks.append("HF_TOKEN is missing; /ai-assistant chat will be unavailable")
     if OCR_PROVIDER in ("auto", "hf") and not HF_TOKEN:
@@ -5828,6 +6714,10 @@ def bot_setting_bool_cached(key: str, default: bool = True) -> bool:
     return _setting_bool_from(_bot_settings_cache.get("data") or BOT_SETTING_DEFAULTS, key, default)
 
 
+def _bot_settings_redis_key() -> str:
+    return _redis_key("settings", "bot", "v1")
+
+
 def db_bot_settings_fetch_all() -> tuple[dict[str, str], dict]:
     data = dict(BOT_SETTING_DEFAULTS)
     data.update(_bot_settings_memory)
@@ -5851,10 +6741,27 @@ async def get_bot_settings_async(force: bool = False) -> tuple[dict[str, str], d
     now = time.monotonic()
     if not force and now - float(_bot_settings_cache.get("ts") or 0.0) < _SETTINGS_CACHE_TTL_S:
         return dict(_bot_settings_cache["data"]), dict(_bot_settings_cache["status"])
+
+    redis_key = _bot_settings_redis_key()
+    if not force:
+        cached_map = await _redis_cache_get_many_json([redis_key])
+        payload = cached_map.get(redis_key)
+        cached_data = _cache_payload_value(payload, None)
+        if isinstance(cached_data, dict):
+            data = dict(BOT_SETTING_DEFAULTS)
+            data.update({k: str(v) for k, v in cached_data.items() if k in BOT_SETTING_DEFAULTS})
+            status = {"db_ok": True, "error": "", "memory": False, "cache": "redis"}
+            _bot_settings_cache["data"] = dict(data)
+            _bot_settings_cache["status"] = dict(status)
+            _bot_settings_cache["ts"] = now
+            return data, status
+
     data, status = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, db_bot_settings_fetch_all)
     _bot_settings_cache["data"] = dict(data)
     _bot_settings_cache["status"] = dict(status)
     _bot_settings_cache["ts"] = now
+    if status.get("db_ok") or not supabase:
+        await _redis_cache_set_many_json({redis_key: _cache_payload(dict(data))}, CACHE_ASIDE_DEFAULT_TTL_S)
     return data, status
 
 
@@ -5865,6 +6772,7 @@ def db_bot_setting_set(key: str, enabled: bool, admin_id: int) -> tuple[bool, st
     _bot_settings_memory[key] = value
     if not supabase:
         _bot_settings_cache["ts"] = 0.0
+        _submit_db(lambda: _redis_delete_sync(_bot_settings_redis_key()))
         return True, "saved in memory only"
     try:
         supabase.table("bot_settings").upsert({
@@ -5874,9 +6782,11 @@ def db_bot_setting_set(key: str, enabled: bool, admin_id: int) -> tuple[bool, st
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }, on_conflict="key").execute()
         _bot_settings_cache["ts"] = 0.0
+        _redis_delete_sync(_bot_settings_redis_key())
         return True, "saved"
     except Exception as e:
         _bot_settings_cache["ts"] = 0.0
+        _redis_delete_sync(_bot_settings_redis_key())
         return False, str(e)
 
 
@@ -5925,8 +6835,14 @@ def db_blocked_user_count() -> int:
     if not supabase:
         return len(_blocked_users_memory)
     try:
-        res = supabase.table("blocked_users").select("user_id").execute()
-        return len(res.data or [])
+        res = (
+            supabase.table("blocked_users")
+            .select("user_id", count="exact")
+            .limit(1)
+            .execute()
+        )
+        db_count = int(getattr(res, "count", None) or 0)
+        return max(db_count, len(_blocked_users_memory))
     except Exception:
         return len(_blocked_users_memory)
 
@@ -7965,6 +8881,22 @@ def _audio_suffix_from_bytes(data: bytes) -> str:
     return ".audio"
 
 
+async def _terminate_subprocess(proc: asyncio.subprocess.Process | None, label: str) -> None:
+    """Best-effort cleanup for timed-out FFmpeg/subprocess jobs.
+
+    Without this, a timed-out conversion can leave an orphan process alive on
+    small Render instances, causing the next TTS request to become slower.
+    """
+    if proc is None or proc.returncode is not None:
+        return
+    with suppress(ProcessLookupError):
+        proc.kill()
+    try:
+        await asyncio.wait_for(proc.communicate(), timeout=5)
+    except Exception as exc:
+        logger.warning("Could not fully clean up %s subprocess: %s", label, exc)
+
+
 def _hf_tts_make_client_sync():
     if GradioClient is None:
         raise RuntimeError("gradio_client is not installed. Add `gradio_client` to requirements.txt.")
@@ -8070,6 +9002,7 @@ async def _convert_audio_files_to_telegram_voice(input_paths: list[str], speed: 
 
     cmd += ["-vn", "-c:a", "libopus", "-b:a", "32k", output_path]
 
+    proc: asyncio.subprocess.Process | None = None
     try:
         proc = await asyncio.wait_for(
             asyncio.create_subprocess_exec(
@@ -8077,10 +9010,14 @@ async def _convert_audio_files_to_telegram_voice(input_paths: list[str], speed: 
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             ),
-            timeout=5,
+            timeout=FFMPEG_START_TIMEOUT_S,
         )
-        _, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=max(60, 20 * len(input_paths)))
+        timeout_s = max(FFMPEG_CONVERT_TIMEOUT_S, 20 * len(input_paths))
+        _, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"FFmpeg executable not found: {_FFMPEG_EXE}") from exc
     except asyncio.TimeoutError:
+        await _terminate_subprocess(proc, "HF TTS FFmpeg")
         raise RuntimeError("FFmpeg timed out while converting HF TTS audio")
 
     if proc.returncode != 0:
@@ -8195,6 +9132,7 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
         cmd += ["-filter:a", af]
     cmd += ["-c:a", "libopus", "-b:a", "32k", output_path]
 
+    proc: asyncio.subprocess.Process | None = None
     try:
         proc = await asyncio.wait_for(
             asyncio.create_subprocess_exec(
@@ -8203,11 +9141,14 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             ),
-            timeout=5,
+            timeout=FFMPEG_START_TIMEOUT_S,
         )
-        _, stderr_data = await asyncio.wait_for(proc.communicate(input=mp3_data), timeout=60)
+        _, stderr_data = await asyncio.wait_for(proc.communicate(input=mp3_data), timeout=FFMPEG_CONVERT_TIMEOUT_S)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"FFmpeg executable not found: {_FFMPEG_EXE}") from exc
     except asyncio.TimeoutError:
-        raise RuntimeError("FFmpeg timed out after 60s")
+        await _terminate_subprocess(proc, "Edge TTS FFmpeg")
+        raise RuntimeError(f"FFmpeg timed out after {FFMPEG_CONVERT_TIMEOUT_S:.0f}s")
 
     if proc.returncode != 0:
         snippet = (stderr_data or b"").decode(errors="replace")[-400:]
@@ -9032,11 +9973,39 @@ async def _admin_summary_counts(admin_id: int) -> dict:
             "maintenance_mode": False,
         }
         try:
-            counts["total_users"] = len(get_all_user_ids()) if supabase else 0
+            if supabase:
+                res = db_call_sync(
+                    "admin_total_users_count",
+                    lambda: (
+                        supabase.table("user_prefs")
+                        .select("user_id", count="exact")
+                        .limit(1)
+                        .execute()
+                    ),
+                    default=None,
+                    attempts=2,
+                    critical=False,
+                )
+                counts["total_users"] = int(getattr(res, "count", None) or 0)
         except Exception as e:
             logger.warning(f"admin user count failed: {e}")
         try:
-            counts["pending_sched"] = len(db_sched_fetch_admin_pending(admin_id)) if supabase else 0
+            if supabase:
+                res = db_call_sync(
+                    f"admin_pending_sched_count:{admin_id}",
+                    lambda: (
+                        supabase.table("scheduled_broadcasts")
+                        .select("id", count="exact")
+                        .eq("admin_id", int(admin_id))
+                        .eq("status", SCHED_STATUS_PENDING)
+                        .limit(1)
+                        .execute()
+                    ),
+                    default=None,
+                    attempts=2,
+                    critical=False,
+                )
+                counts["pending_sched"] = int(getattr(res, "count", None) or 0)
         except Exception as e:
             logger.warning(f"admin schedule count failed: {e}")
         try:
@@ -10150,7 +11119,7 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
     loop    = asyncio.get_running_loop()
 
     full_text, prefs = await asyncio.gather(
-        loop.run_in_executor(None, get_text_cache, src_msg_id, chat_id),
+        get_text_cache_async(src_msg_id, chat_id),
         get_user_prefs_async(user_id),
     )
 
@@ -12012,7 +12981,7 @@ async def get_callback_original_text(query, user_id: int) -> str | None:
 
     # 1. Exact text_cache
     try:
-        original_text = await loop.run_in_executor(None, get_text_cache, msg_id, chat_id)
+        original_text = await get_text_cache_async(msg_id, chat_id)
         if original_text:
             return original_text
     except Exception as e:
@@ -12184,7 +13153,7 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
     chat_id = query.message.chat.id
     loop    = asyncio.get_running_loop()
     original_text, prefs = await asyncio.gather(
-        loop.run_in_executor(None, get_text_cache, transcript_msg_id, chat_id),
+        get_text_cache_async(transcript_msg_id, chat_id),
         get_user_prefs_async(user_id),
     )
 
@@ -12247,7 +13216,7 @@ async def _cb_audio_tts(query, user_id: int, context, data: str):
     loop       = asyncio.get_running_loop()
 
     full_text, prefs = await asyncio.gather(
-        loop.run_in_executor(None, get_text_cache, src_msg_id, chat_id),
+        get_text_cache_async(src_msg_id, chat_id),
         get_user_prefs_async(user_id),
     )
     if not full_text:
@@ -12373,7 +13342,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 async def _run_bot():
     global _BOT_START_TIME, _AI_SEMAPHORE, _BROADCAST_SEMAPHORE
-    global _prefs_cache_lock, _TTS_CHUNK_SEMAPHORE
+    global _prefs_cache_lock, _TTS_CHUNK_SEMAPHORE, _TELEGRAM_APP
 
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
@@ -12402,16 +13371,25 @@ async def _run_bot():
 
     _BOT_START_TIME = time.time()
 
-    app = (
+    builder = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
         .connect_timeout(30)
         .read_timeout(30)
         .write_timeout(30)
         .pool_timeout(30)
-        .build()
     )
+    # Admin Performance V5: tune update processing and HTTP connection pool.
+    # hasattr keeps compatibility with older python-telegram-bot versions.
+    if hasattr(builder, "concurrent_updates"):
+        builder = builder.concurrent_updates(TELEGRAM_CONCURRENT_UPDATES)
+    if hasattr(builder, "connection_pool_size"):
+        builder = builder.connection_pool_size(TELEGRAM_CONNECTION_POOL_SIZE)
+    app = builder.build()
+    _TELEGRAM_APP = app
 
+    # Anti-flood guard must run before stale-drop and all expensive handlers.
+    app.add_handler(TypeHandler(Update, _telegram_rate_limit_guard), group=-2)
     app.add_handler(TypeHandler(Update, _drop_stale_updates), group=-1)
 
     # Commands
@@ -12459,7 +13437,7 @@ async def _run_bot():
     app.add_error_handler(error_handler)
 
     logger.info(
-        f"Bot polling started. Admins: {ADMIN_IDS or 'none configured'} | "
+        f"Bot starting in {BOT_MODE} mode. Admins: {ADMIN_IDS or 'none configured'} | "
         f"HF: {HF_MODEL} | OCR provider: {OCR_PROVIDER} | "
         f"HF OCR: {HF_OCR_MODEL} | Gemini: {_gemini is not None} | "
         f"TTS: {_tts_provider_summary()}"
@@ -12473,10 +13451,28 @@ async def _run_bot():
     async with app:
         await app.initialize()
         await app.start()
-        await app.updater.start_polling(
-            allowed_updates=["message", "callback_query"],
-            drop_pending_updates=True,
-        )
+        polling_started = False
+        if BOT_MODE == "WEBHOOK":
+            if TELEGRAM_WEBHOOK_URL:
+                webhook_kwargs = {
+                    "url": TELEGRAM_WEBHOOK_URL,
+                    "allowed_updates": ["message", "callback_query"],
+                    "drop_pending_updates": True,
+                }
+                if TELEGRAM_WEBHOOK_SECRET_TOKEN:
+                    webhook_kwargs["secret_token"] = TELEGRAM_WEBHOOK_SECRET_TOKEN
+                await app.bot.set_webhook(**webhook_kwargs)
+                logger.info("Telegram webhook configured: %s", TELEGRAM_WEBHOOK_URL)
+            else:
+                logger.warning("BOT_MODE=WEBHOOK but TELEGRAM_WEBHOOK_URL is empty. Configure setWebhook manually to /telegram-webhook.")
+        else:
+            await app.updater.start_polling(
+                allowed_updates=["message", "callback_query"],
+                drop_pending_updates=True,
+            )
+            polling_started = True
+            logger.info("Telegram polling started.")
+
         # Start background jobs only after the Telegram application is fully ready.
         sched_task = asyncio.create_task(_scheduler_loop(app.bot, sched_stop))
         sweep_task = asyncio.create_task(_periodic_temp_sweep(sweep_stop))
@@ -12485,6 +13481,9 @@ async def _run_bot():
         finally:
             sched_stop.set()
             sweep_stop.set()
+            if polling_started and app.updater is not None:
+                with suppress(Exception):
+                    await app.updater.stop()
             for task in (sched_task, sweep_task):
                 if task is None:
                     continue
@@ -12516,9 +13515,12 @@ async def _async_main_once():
         f"Bot + FastAPI are starting... (AI: {AI_PROVIDER} | HF: {HF_MODEL} | "
         f"OCR: {OCR_PROVIDER} | HF OCR: {HF_OCR_MODEL} | "
         f"TTS: {TTS_PROVIDER}/{KHMER_TTS_PROVIDER} | user_model_default: {_normalize_tts_model(DEFAULT_TTS_MODEL)} | "
-        f"Redis: {'on' if redis_client is not None else 'off'})"
+        f"Redis: {'on' if redis_client is not None else 'off'} | "
+        f"TG mode: {BOT_MODE} | TG updates: {TELEGRAM_CONCURRENT_UPDATES} | TG pool: {TELEGRAM_CONNECTION_POOL_SIZE} | "
+        f"HTTP pool: {HTTP_MAX_CONNECTIONS}/{HTTP_MAX_KEEPALIVE_CONNECTIONS})"
     )
 
+    _start_web_broadcast_queue_workers()
     keepalive_stop = asyncio.Event()
     tasks = [
         asyncio.create_task(run_fastapi(), name="fastapi-web"),
@@ -12535,6 +13537,7 @@ async def _async_main_once():
                 raise exc
     finally:
         keepalive_stop.set()
+        await _stop_web_broadcast_queue_workers()
         for task in tasks:
             if not task.done():
                 task.cancel()
