@@ -158,10 +158,11 @@ class AppSettings(BaseSettings):
     TELEGRAM_CONCURRENT_UPDATES: int = 8
     TELEGRAM_CONNECTION_POOL_SIZE: int = 24
     BOT_MODE: str = "POLLING"
-    TELEGRAM_WEBHOOK_URL: str = ""
-    TELEGRAM_WEBHOOK_SECRET_TOKEN: str = ""
+    TELEGRAM_WEBHOOK_URL: str | None = None
+    TELEGRAM_WEBHOOK_SECRET_TOKEN: str | None = None
     HTTP_MAX_CONNECTIONS: int = 100
     HTTP_MAX_KEEPALIVE_CONNECTIONS: int = 20
+    REDIS_MAX_CONNECTIONS: int = 100
     USER_RATE_LIMIT_PER_SECOND: int = 3
     USER_RATE_LIMIT_WINDOW_S: float = 1.0
     API_RATE_LIMIT_PER_SECOND: int = 20
@@ -757,7 +758,7 @@ def readyz():
         "supabase_configured": bool(globals().get("supabase")),
         "redis_configured": bool(globals().get("redis_client")),
         "ffmpeg_ok": bool(ffmpeg_path and os.path.exists(str(ffmpeg_path))),
-        "bot_mode": globals().get("BOT_MODE", "POLLING"),
+        "bot_mode": _run_state_bot_mode() if "_run_state_bot_mode" in globals() else globals().get("BOT_MODE", "POLLING"),
         "webhook_ready": bool(globals().get("_TELEGRAM_APP")),
     }
     fmt = globals().get("_format_uptime")
@@ -767,25 +768,61 @@ def readyz():
     return jsonify(payload)
 
 
-@app.post("/telegram-webhook", include_in_schema=False)
-async def telegram_webhook(req: FastAPIRequest):
-    """Telegram webhook ingestion path for horizontal-scale deployments.
+def _runtime_webhook_secret_token() -> str:
+    """Return the active Telegram webhook secret without exposing it in logs.
 
-    Enable with BOT_MODE=WEBHOOK and point Telegram setWebhook to this route.
-    In webhook mode, each node can process raw Update JSON behind a load
-    balancer; polling mode remains available for single-node compatibility.
+    RUN_STATE is authoritative so in-bot secret rotation takes effect
+    immediately for webhook path validation and setWebhook registration.
     """
-    app_obj = globals().get("_TELEGRAM_APP")
-    if app_obj is None:
-        raise HTTPException(status_code=503, detail="Telegram application is not ready.")
+    run_state = globals().get("RUN_STATE")
+    if isinstance(run_state, dict):
+        value = run_state.get("TELEGRAM_WEBHOOK_SECRET_TOKEN")
+        if value:
+            return str(value).strip()
+    return str(
+        globals().get("TELEGRAM_WEBHOOK_SECRET_TOKEN")
+        or getattr(SETTINGS, "TELEGRAM_WEBHOOK_SECRET_TOKEN", "")
+        or ""
+    ).strip()
 
-    expected_secret = str(globals().get("TELEGRAM_WEBHOOK_SECRET_TOKEN") or "").strip()
-    if expected_secret:
-        got_secret = (req.headers.get("X-Telegram-Bot-Api-Secret-Token") or "").strip()
-        if not hmac.compare_digest(got_secret, expected_secret):
-            raise HTTPException(status_code=403, detail="Invalid webhook secret.")
 
-    max_body = _web_max_content_length()
+def generate_new_webhook_token() -> str:
+    """Generate a new 32-character URL-safe Telegram webhook secret token."""
+    token = secrets.token_urlsafe(24)
+    if len(token) < 32:
+        token = (token + secrets.token_urlsafe(24))[:32]
+    return token[:32]
+
+
+def _runtime_webhook_base_url() -> str:
+    return str(
+        globals().get("TELEGRAM_WEBHOOK_URL")
+        or getattr(SETTINGS, "TELEGRAM_WEBHOOK_URL", "")
+        or ""
+    ).strip().rstrip("/")
+
+
+def _telegram_webhook_target_url() -> str:
+    """Canonical public Telegram webhook URL registered with setWebhook.
+
+    Telegram calls this exact route.  The token is URL-escaped for path safety
+    while the Bot API secret header still carries the raw token value.
+    """
+    base_url = _runtime_webhook_base_url()
+    secret_token = _runtime_webhook_secret_token()
+    if not base_url:
+        raise RuntimeError("BOT_MODE=WEBHOOK requires TELEGRAM_WEBHOOK_URL.")
+    if not secret_token:
+        raise RuntimeError("BOT_MODE=WEBHOOK requires TELEGRAM_WEBHOOK_SECRET_TOKEN.")
+    return f"{base_url}/tg-webhook-{quote(secret_token, safe='')}"
+
+
+async def _read_limited_webhook_body(req: FastAPIRequest, max_body: int) -> bytes:
+    """Read Telegram webhook payloads with a hard body cap.
+
+    Content-Length is rejected before body streaming.  The chunked stream path
+    also enforces the cap so a missing/lying header cannot flood memory.
+    """
     content_length = req.headers.get("content-length")
     if content_length:
         try:
@@ -794,17 +831,116 @@ async def telegram_webhook(req: FastAPIRequest):
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid Content-Length header.")
 
-    raw = await req.body()
-    if len(raw) > max_body:
-        raise HTTPException(status_code=413, detail=f"Request body too large. Max {max_body} bytes.")
-    try:
-        data = _json_loads_fast(raw)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid Telegram update JSON.")
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in req.stream():
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > max_body:
+            raise HTTPException(status_code=413, detail=f"Request body too large. Max {max_body} bytes.")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
-    update = Update.de_json(data, app_obj.bot)
-    await app_obj.process_update(update)
-    return _FastJSONResponse({"ok": True})
+
+async def _process_telegram_webhook_request(req: FastAPIRequest, path_secret_token: str | None = None):
+    """Validate, parse, and dispatch a Telegram webhook update.
+
+    Security errors intentionally return 403.  Internal parse/handler failures
+    are logged and acknowledged with HTTP 200 so Telegram does not repeatedly
+    redeliver a bad or already-accepted update forever.
+    """
+    if "_run_state_bot_mode" in globals() and _run_state_bot_mode() != "WEBHOOK":
+        webhook_logger.info("Webhook update ignored because BOT_MODE=%s.", _run_state_bot_mode())
+        return _FastJSONResponse({"status": "ignored", "reason": "not_webhook_mode"}, status_code=200)
+
+    expected_secret = _runtime_webhook_secret_token()
+    if not expected_secret:
+        webhook_logger.error("Rejected Telegram webhook request because TELEGRAM_WEBHOOK_SECRET_TOKEN is not configured.")
+        raise HTTPException(status_code=503, detail="Telegram webhook secret is not configured.")
+
+    if path_secret_token is not None and not hmac.compare_digest(str(path_secret_token), expected_secret):
+        webhook_logger.warning("Rejected Telegram webhook request with invalid path secret from %s", req.client.host if req.client else "unknown")
+        raise HTTPException(status_code=403, detail="Invalid webhook path secret.")
+
+    got_secret = (req.headers.get("X-Telegram-Bot-Api-Secret-Token") or "").strip()
+    if not hmac.compare_digest(got_secret, expected_secret):
+        webhook_logger.warning("Rejected Telegram webhook request with invalid secret header from %s", req.client.host if req.client else "unknown")
+        raise HTTPException(status_code=403, detail="Invalid webhook secret.")
+
+    app_obj = globals().get("telegram_application") or globals().get("_TELEGRAM_APP")
+    if app_obj is None:
+        webhook_logger.warning("Telegram webhook update acknowledged before application was ready.")
+        return _FastJSONResponse({"status": "ok", "warning": "telegram_application_not_ready"}, status_code=200)
+
+    max_body = min(_web_max_content_length(), 2 * 1024 * 1024)
+    try:
+        raw = await _read_limited_webhook_body(req, max_body)
+        data = _json_loads_fast(raw)
+        update = Update.de_json(data, app_obj.bot)
+        await app_obj.process_update(update)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        webhook_logger.error("Telegram webhook ingestion failed but was acknowledged: %s", exc, exc_info=True)
+        return _FastJSONResponse({"status": "ok", "warning": "processing_failed"}, status_code=200)
+
+    return _FastJSONResponse({"status": "ok"}, status_code=200)
+
+
+@app.post("/tg-webhook-{secret_token}", include_in_schema=False)
+async def telegram_webhook_ingest(secret_token: str, req: FastAPIRequest):
+    return await _process_telegram_webhook_request(req, secret_token)
+
+
+@app.post("/telegram-webhook", include_in_schema=False)
+async def telegram_webhook(req: FastAPIRequest):
+    """Backward-compatible webhook route kept for older deployments.
+
+    New deployments should use /tg-webhook-{secret_token}; setWebhook now
+    registers that canonical route automatically.
+    """
+    return await _process_telegram_webhook_request(req, None)
+
+
+async def _configure_telegram_webhook_via_http() -> None:
+    """Configure Telegram webhook using the explicitly pooled HTTPX client.
+
+    This keeps webhook setup independent from the polling updater and makes the
+    deployment mode safe for horizontally scaled FastAPI nodes.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
+    secret_token = _runtime_webhook_secret_token()
+    target_url = _telegram_webhook_target_url()
+
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+    payload = {
+        "url": target_url,
+        "allowed_updates": ["message", "callback_query"],
+        "drop_pending_updates": True,
+        "secret_token": secret_token,
+    }
+    timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout, limits=_make_httpx_limits_from_run_state()) as client:
+        resp = await client.post(api_url, json=payload)
+    try:
+        data = _json_loads_fast(resp.content)
+    except Exception:
+        data = {"ok": False, "description": resp.text[:500]}
+    if resp.status_code >= 400 or not bool(data.get("ok")):
+        raise RuntimeError(f"Telegram setWebhook failed status={resp.status_code} response={str(data)[:500]}")
+    webhook_logger.info(
+        "Telegram webhook configured via HTTPX url=%s max_connections=%s keepalive=%s",
+        target_url,
+        _run_state_http_max_connections(),
+        min(max(2, int(HTTP_MAX_KEEPALIVE_CONNECTIONS or 20)), _run_state_http_max_connections()),
+    )
+
+
+async def set_telegram_webhook() -> None:
+    """Public compatibility wrapper used by runtime admin orchestration."""
+    await _configure_telegram_webhook_via_http()
 
 
 async def run_fastapi():
@@ -4243,6 +4379,10 @@ from telegram.ext import (
     CallbackQueryHandler,
     ApplicationHandlerStop,
 )
+try:
+    from telegram.request import HTTPXRequest
+except Exception:
+    HTTPXRequest = None
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -4255,6 +4395,9 @@ for _noisy in ("httpx", "httpcore", "urllib3", "telegram",
                "google_genai.models", "google.genai", "google"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+webhook_logger = logging.getLogger("telegram_webhook")
+rate_limit_logger = logging.getLogger("rate_limit")
+broadcast_queue_logger = logging.getLogger("broadcast_queue")
 
 # ---------------------------------------------------------------------------
 # Config  (populated by _init_clients)
@@ -4271,6 +4414,7 @@ REDIS_SOCKET_TIMEOUT_S   = float(os.environ.get("REDIS_SOCKET_TIMEOUT_S", "3"))
 CACHE_ASIDE_DEFAULT_TTL_S = _env_int("CACHE_ASIDE_DEFAULT_TTL_S", 3600, minimum=30, maximum=86400)
 HTTP_MAX_CONNECTIONS = _env_int("HTTP_MAX_CONNECTIONS", 100, minimum=10, maximum=1000)
 HTTP_MAX_KEEPALIVE_CONNECTIONS = _env_int("HTTP_MAX_KEEPALIVE_CONNECTIONS", 20, minimum=2, maximum=500)
+REDIS_MAX_CONNECTIONS = _env_int("REDIS_MAX_CONNECTIONS", 100, minimum=2, maximum=1000)
 HTTPX_HIGH_CONCURRENCY_LIMITS = httpx.Limits(
     max_connections=HTTP_MAX_CONNECTIONS,
     max_keepalive_connections=HTTP_MAX_KEEPALIVE_CONNECTIONS,
@@ -4278,8 +4422,8 @@ HTTPX_HIGH_CONCURRENCY_LIMITS = httpx.Limits(
 BOT_MODE = (os.environ.get("BOT_MODE") or getattr(SETTINGS, "BOT_MODE", "POLLING") or "POLLING").strip().upper()
 if BOT_MODE not in {"POLLING", "WEBHOOK"}:
     BOT_MODE = "POLLING"
-TELEGRAM_WEBHOOK_URL = (os.environ.get("TELEGRAM_WEBHOOK_URL") or getattr(SETTINGS, "TELEGRAM_WEBHOOK_URL", "") or "").strip()
-TELEGRAM_WEBHOOK_SECRET_TOKEN = (os.environ.get("TELEGRAM_WEBHOOK_SECRET_TOKEN") or getattr(SETTINGS, "TELEGRAM_WEBHOOK_SECRET_TOKEN", "") or "").strip()
+TELEGRAM_WEBHOOK_URL = (os.environ.get("TELEGRAM_WEBHOOK_URL") or getattr(SETTINGS, "TELEGRAM_WEBHOOK_URL", None) or "").strip()
+TELEGRAM_WEBHOOK_SECRET_TOKEN = (os.environ.get("TELEGRAM_WEBHOOK_SECRET_TOKEN") or getattr(SETTINGS, "TELEGRAM_WEBHOOK_SECRET_TOKEN", None) or "").strip()
 SUPABASE_DB_POOLER_URL = (
     os.environ.get("SUPABASE_DB_POOLER_URL")
     or os.environ.get("DATABASE_URL_POOLER")
@@ -4294,6 +4438,662 @@ API_RATE_LIMIT_WINDOW_S = _env_float("API_RATE_LIMIT_WINDOW_S", 1.0, minimum=0.2
 RATE_LIMIT_REDIS_TTL_S = _env_int("RATE_LIMIT_REDIS_TTL_S", 30, minimum=2, maximum=3600)
 RATE_LIMIT_ENABLED = _env_bool("RATE_LIMIT_ENABLED", True)
 WEB_BROADCAST_QUEUE_MAXSIZE = _env_int("WEB_BROADCAST_QUEUE_MAXSIZE", 200, minimum=10, maximum=10000)
+
+# ---------------------------------------------------------------------------
+# Live runtime configuration state for in-bot admin controls
+# ---------------------------------------------------------------------------
+# Keep the legacy globals above for compatibility with the rest of the script,
+# but hot-path logic reads through RUN_STATE so verified admins can safely tune
+# selected values without restarting the process.
+RUN_STATE: dict[str, Any] = {
+    "BOT_MODE": BOT_MODE,
+    "USER_RATE_LIMIT_PER_SECOND": USER_RATE_LIMIT_PER_SECOND,
+    "HTTP_MAX_CONNECTIONS": HTTP_MAX_CONNECTIONS,
+    "TELEGRAM_WEBHOOK_SECRET_TOKEN": TELEGRAM_WEBHOOK_SECRET_TOKEN,
+}
+RUN_STATE_LOCK = asyncio.Lock()
+ACTIVE_ADMIN_CONVERSATIONS: dict[int, dict[str, Any]] = {}
+ACTIVE_ADMIN_CONVERSATIONS_LOCK = asyncio.Lock()
+_TELEGRAM_POLLING_ACTIVE = False
+_TELEGRAM_POLLING_LOCK: asyncio.Lock | None = None
+# Tracks the single active long-polling lifecycle guard.  It prevents duplicate
+# getUpdates workers and gives runtime mode switches one concrete task to
+# cancel before Telegram webhook operations, avoiding 409 polling/webhook
+# conflicts.
+ACTIVE_POLLING_TASK: asyncio.Task | None = None
+_RUNTIME_STATE_RESTORED_FROM_REDIS = False
+_RUN_STATE_REDIS_KEYS = ("BOT_MODE", "USER_RATE_LIMIT_PER_SECOND", "HTTP_MAX_CONNECTIONS", "TELEGRAM_WEBHOOK_SECRET_TOKEN")
+
+
+def _run_state_get(key: str, default: Any = None) -> Any:
+    return RUN_STATE.get(key, default)
+
+
+def _run_state_bot_mode() -> str:
+    mode = str(RUN_STATE.get("BOT_MODE") or BOT_MODE or "POLLING").strip().upper()
+    return mode if mode in {"POLLING", "WEBHOOK"} else "POLLING"
+
+
+def _run_state_user_rate_limit() -> int:
+    try:
+        return max(1, int(RUN_STATE.get("USER_RATE_LIMIT_PER_SECOND", USER_RATE_LIMIT_PER_SECOND)))
+    except Exception:
+        return max(1, int(USER_RATE_LIMIT_PER_SECOND or 3))
+
+
+def _run_state_http_max_connections() -> int:
+    try:
+        return max(10, int(RUN_STATE.get("HTTP_MAX_CONNECTIONS", HTTP_MAX_CONNECTIONS)))
+    except Exception:
+        return max(10, int(HTTP_MAX_CONNECTIONS or 100))
+
+
+def _make_httpx_limits_from_run_state() -> httpx.Limits:
+    max_connections = _run_state_http_max_connections()
+    keepalive = min(max(2, int(HTTP_MAX_KEEPALIVE_CONNECTIONS or 20)), max_connections)
+    return httpx.Limits(max_connections=max_connections, max_keepalive_connections=keepalive)
+
+
+def _sync_run_state_from_globals() -> None:
+    RUN_STATE["BOT_MODE"] = BOT_MODE if BOT_MODE in {"POLLING", "WEBHOOK"} else "POLLING"
+    RUN_STATE["USER_RATE_LIMIT_PER_SECOND"] = max(1, int(USER_RATE_LIMIT_PER_SECOND or 3))
+    RUN_STATE["HTTP_MAX_CONNECTIONS"] = max(10, int(HTTP_MAX_CONNECTIONS or 100))
+    RUN_STATE["TELEGRAM_WEBHOOK_SECRET_TOKEN"] = str(TELEGRAM_WEBHOOK_SECRET_TOKEN or "").strip()
+
+
+async def _persist_run_state_key(key: str, value: Any) -> bool:
+    """Persist runtime admin overrides so container restarts keep the last value.
+
+    The colon key is the primary format.  The underscore key is written as a
+    compatibility mirror because earlier deployment notes referenced that name.
+    """
+    if redis_client is None:
+        return False
+    raw_value = str(value)
+    primary_key = f"RUN_STATE:{key}"
+    compat_key = f"RUN_STATE_{key}"
+    extra_keys: list[str] = []
+    if key == "TELEGRAM_WEBHOOK_SECRET_TOKEN":
+        # Required stable alias for webhook secret rotation persistence.
+        extra_keys.append("RUN_STATE_WEBHOOK_SECRET")
+
+    def _run():
+        pipe = redis_client.pipeline(transaction=False)
+        pipe.set(primary_key, raw_value)
+        pipe.set(compat_key, raw_value)
+        for extra_key in extra_keys:
+            pipe.set(extra_key, raw_value)
+        pipe.execute()
+        return True
+
+    try:
+        ok = await redis_call(
+            f"run_state_set:{key}",
+            _run,
+            default=False,
+            attempts=2,
+            timeout=2.0,
+            critical=False,
+        )
+        if ok:
+            safe_value = "<redacted>" if key == "TELEGRAM_WEBHOOK_SECRET_TOKEN" else raw_value
+            webhook_logger.info("Runtime state persisted to Redis keys=%s,%s value=%s", primary_key, compat_key, safe_value)
+        return bool(ok)
+    except Exception as exc:
+        webhook_logger.warning("Runtime state Redis persist failed key=%s: %s", key, exc)
+        return False
+
+
+async def _restore_run_state_from_redis() -> bool:
+    """Load persisted runtime admin overrides after Redis is initialised.
+
+    Redis is optional.  Startup verifies connectivity with ping before any key
+    lookup.  If Redis is down, slow, or unready, the app falls back to env values
+    already loaded into RUN_STATE and continues booting.
+    """
+    global _RUNTIME_STATE_RESTORED_FROM_REDIS
+    if redis_client is None:
+        webhook_logger.info("Runtime state restore skipped: Redis is not configured.")
+        return False
+
+    primary_keys = [f"RUN_STATE:{key}" for key in _RUN_STATE_REDIS_KEYS]
+    compat_keys = [f"RUN_STATE_{key}" for key in _RUN_STATE_REDIS_KEYS]
+    extra_restore_keys = ["RUN_STATE_WEBHOOK_SECRET"]
+
+    def _ping():
+        return redis_client.ping()
+
+    def _fetch_values():
+        pipe = redis_client.pipeline(transaction=False)
+        for redis_key in primary_keys + compat_keys + extra_restore_keys:
+            pipe.get(redis_key)
+        return pipe.execute()
+
+    try:
+        await asyncio.wait_for(asyncio.to_thread(_ping), timeout=2.5)
+        values = await redis_call(
+            "run_state_restore",
+            _fetch_values,
+            default=None,
+            attempts=2,
+            timeout=3.0,
+            critical=False,
+        )
+    except Exception as rexc:
+        webhook_logger.warning("Redis fallback triggered. Connection not ready during boot recovery: %s", rexc)
+        return False
+
+    if not values:
+        webhook_logger.info("Runtime state restore found no Redis overrides; using env defaults.")
+        return False
+
+    n = len(_RUN_STATE_REDIS_KEYS)
+    primary_values = list(values[:n])
+    compat_values = list(values[n:n * 2])
+    restored: dict[str, Any] = {}
+
+    for idx, key in enumerate(_RUN_STATE_REDIS_KEYS):
+        raw = primary_values[idx] if idx < len(primary_values) else None
+        if raw in (None, "") and idx < len(compat_values):
+            raw = compat_values[idx]
+        if raw in (None, "") and key == "TELEGRAM_WEBHOOK_SECRET_TOKEN":
+            extra_idx = n * 2
+            if extra_idx < len(values):
+                raw = values[extra_idx]
+        if raw is None or raw == "":
+            continue
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="ignore")
+        try:
+            if key == "BOT_MODE":
+                mode = str(raw).strip().upper()
+                if mode not in {"POLLING", "WEBHOOK"}:
+                    webhook_logger.warning("Ignoring invalid persisted BOT_MODE=%r", raw)
+                    continue
+                await _update_run_state(key, mode, persist=False)
+                restored[key] = mode
+            elif key in {"USER_RATE_LIMIT_PER_SECOND", "HTTP_MAX_CONNECTIONS"}:
+                value = int(str(raw).strip())
+                await _update_run_state(key, value, persist=False)
+                restored[key] = value
+            elif key == "TELEGRAM_WEBHOOK_SECRET_TOKEN":
+                token = str(raw).strip()
+                if not token:
+                    continue
+                await _update_run_state(key, token, persist=False)
+                restored[key] = "<redacted>"
+            else:
+                await _update_run_state(key, raw, persist=False)
+                restored[key] = raw
+        except Exception as exc:
+            webhook_logger.warning("Ignoring invalid persisted runtime state %s=%r: %s", key, raw, exc)
+
+    _RUNTIME_STATE_RESTORED_FROM_REDIS = bool(restored)
+    if restored:
+        webhook_logger.info("Runtime state recovered from Redis before startup activation: %s", restored)
+    else:
+        webhook_logger.info("Runtime state restore completed with no valid overrides.")
+    return bool(restored)
+
+
+async def _update_run_state(key: str, value: Any, *, persist: bool = True) -> None:
+    global BOT_MODE, USER_RATE_LIMIT_PER_SECOND, HTTP_MAX_CONNECTIONS, HTTPX_HIGH_CONCURRENCY_LIMITS
+    global TELEGRAM_WEBHOOK_SECRET_TOKEN
+    persisted_value: Any = value
+    async with RUN_STATE_LOCK:
+        if key == "BOT_MODE":
+            mode = str(value or "POLLING").strip().upper()
+            if mode not in {"POLLING", "WEBHOOK"}:
+                raise ValueError("BOT_MODE must be POLLING or WEBHOOK")
+            RUN_STATE["BOT_MODE"] = mode
+            BOT_MODE = mode
+            persisted_value = mode
+        elif key == "USER_RATE_LIMIT_PER_SECOND":
+            limit = max(1, min(100, int(value)))
+            RUN_STATE["USER_RATE_LIMIT_PER_SECOND"] = limit
+            USER_RATE_LIMIT_PER_SECOND = limit
+            persisted_value = limit
+        elif key == "HTTP_MAX_CONNECTIONS":
+            max_conn = max(10, min(1000, int(value)))
+            RUN_STATE["HTTP_MAX_CONNECTIONS"] = max_conn
+            HTTP_MAX_CONNECTIONS = max_conn
+            HTTPX_HIGH_CONCURRENCY_LIMITS = _make_httpx_limits_from_run_state()
+            persisted_value = max_conn
+        elif key == "TELEGRAM_WEBHOOK_SECRET_TOKEN":
+            token = str(value or "").strip()
+            if not token:
+                raise ValueError("TELEGRAM_WEBHOOK_SECRET_TOKEN cannot be empty")
+            RUN_STATE["TELEGRAM_WEBHOOK_SECRET_TOKEN"] = token
+            TELEGRAM_WEBHOOK_SECRET_TOKEN = token
+            persisted_value = token
+        else:
+            RUN_STATE[key] = value
+            persisted_value = value
+
+    if persist and key in _RUN_STATE_REDIS_KEYS:
+        await _persist_run_state_key(key, persisted_value)
+
+def _runtime_admin_text() -> str:
+    mode = _run_state_bot_mode()
+    rate_limit = _run_state_user_rate_limit()
+    http_conn = _run_state_http_max_connections()
+    polling_status = "ON" if globals().get("_TELEGRAM_POLLING_ACTIVE") else "OFF"
+    webhook_ready = "YES" if TELEGRAM_WEBHOOK_URL and _runtime_webhook_secret_token() else "NO"
+    return (
+        "🛠️ <b>ផ្ទាំងគ្រប់គ្រង Admin Runtime</b>\n\n"
+        "តម្លៃសំខាន់ៗបច្ចុប្បន្ន៖\n"
+        f"• Bot Mode: <b>{html.escape(mode)}</b>\n"
+        f"• Polling Active: <b>{html.escape(polling_status)}</b>\n"
+        f"• Webhook Config Ready: <b>{html.escape(webhook_ready)}</b>\n"
+        f"• User Rate Limit: <b>{rate_limit} req/{USER_RATE_LIMIT_WINDOW_S:g}s</b>\n"
+        f"• HTTP Max Connections: <b>{http_conn}</b>\n\n"
+        "ជ្រើសរើសសកម្មភាពខាងក្រោម ដើម្បីកែប្រែ Runtime ដោយមិនបាច់ Restart។"
+    )
+
+
+def get_runtime_admin_kb() -> Any:
+    mode = _run_state_bot_mode()
+    target = "WEBHOOK" if mode != "WEBHOOK" else "POLLING"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🔄 Switch to {target}", callback_data=f"rtadmin_switch:{target}")],
+        [InlineKeyboardButton("⚡ Modify Rate Limit", callback_data="rtadmin_rate")],
+        [InlineKeyboardButton("🔄 Rotate Webhook Secret", callback_data="rtadmin_rotate_secret")],
+        [InlineKeyboardButton("❌ Close Menu", callback_data="rtadmin_close")],
+    ])
+
+
+def _refresh_runtime_admin_markup() -> Any:
+    return get_runtime_admin_kb()
+
+
+def _runtime_admin_log_state(action: str, admin_id: int, extra: str = "") -> None:
+    logger.info(
+        "Runtime admin action=%s admin_id=%s mode=%s user_rate_limit=%s http_max_connections=%s %s",
+        action,
+        admin_id,
+        _run_state_bot_mode(),
+        _run_state_user_rate_limit(),
+        _run_state_http_max_connections(),
+        extra,
+    )
+
+
+async def _cancel_active_polling_task(reason: str = "runtime_switch") -> None:
+    """Cancel the tracked polling lifecycle task exactly once.
+
+    This guard prevents duplicate long-polling workers and ensures mode changes
+    cannot leave getUpdates running while a webhook is active.
+    """
+    global ACTIVE_POLLING_TASK
+    task = ACTIVE_POLLING_TASK
+    if task is None:
+        return
+    if task.done():
+        ACTIVE_POLLING_TASK = None
+        return
+    current = asyncio.current_task()
+    webhook_logger.info("Cancelling active polling task reason=%s task=%s", reason, task.get_name() if hasattr(task, "get_name") else task)
+    task.cancel()
+    if task is not current:
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+    ACTIVE_POLLING_TASK = None
+    webhook_logger.info("Active polling task cancellation completed reason=%s", reason)
+
+
+async def _telegram_polling_task_guard(app_obj: Any) -> None:
+    """Small lifecycle guard for the active updater polling session.
+
+    python-telegram-bot owns the actual getUpdates worker internally after
+    updater.start_polling(); this task gives the runtime controller a single
+    cancellable handle and exits if BOT_MODE changes away from POLLING.
+    """
+    global ACTIVE_POLLING_TASK
+    try:
+        while True:
+            if _run_state_bot_mode() != "POLLING":
+                webhook_logger.info("Polling guard detected BOT_MODE=%s; stopping updater to prevent 409 conflicts.", _run_state_bot_mode())
+                await _telegram_stop_polling_runtime(app_obj, cancel_task=False)
+                break
+            await asyncio.sleep(1.0)
+    except asyncio.CancelledError:
+        webhook_logger.info("Polling guard task cancelled.")
+        raise
+    except Exception as exc:
+        webhook_logger.error("Polling guard failed: %s", exc, exc_info=True)
+    finally:
+        if ACTIVE_POLLING_TASK is asyncio.current_task():
+            ACTIVE_POLLING_TASK = None
+
+
+def _telegram_polling_lock() -> asyncio.Lock:
+    global _TELEGRAM_POLLING_LOCK
+    if _TELEGRAM_POLLING_LOCK is None:
+        _TELEGRAM_POLLING_LOCK = asyncio.Lock()
+    return _TELEGRAM_POLLING_LOCK
+
+
+def _telegram_app_updater(app_obj: Any) -> Any:
+    return getattr(app_obj, "updater", None) if app_obj is not None else None
+
+
+async def _telegram_start_polling_runtime(app_obj: Any) -> bool:
+    global _TELEGRAM_POLLING_ACTIVE, ACTIVE_POLLING_TASK
+    updater = _telegram_app_updater(app_obj)
+    if updater is None:
+        webhook_logger.warning("Cannot start polling dynamically: Telegram updater is unavailable.")
+        return False
+    if _run_state_bot_mode() != "POLLING":
+        webhook_logger.info("Polling start skipped because BOT_MODE=%s.", _run_state_bot_mode())
+        return False
+
+    # Always cancel any stale guard before starting a fresh polling session.
+    await _cancel_active_polling_task("before_start_polling")
+
+    async with _telegram_polling_lock():
+        if _TELEGRAM_POLLING_ACTIVE:
+            webhook_logger.info("Polling updater already active; duplicate start suppressed.")
+            if ACTIVE_POLLING_TASK is None or ACTIVE_POLLING_TASK.done():
+                ACTIVE_POLLING_TASK = asyncio.create_task(_telegram_polling_task_guard(app_obj), name="telegram-polling-guard")
+            return True
+        await updater.start_polling(
+            allowed_updates=["message", "callback_query"],
+            drop_pending_updates=True,
+        )
+        _TELEGRAM_POLLING_ACTIVE = True
+        ACTIVE_POLLING_TASK = asyncio.create_task(_telegram_polling_task_guard(app_obj), name="telegram-polling-guard")
+        webhook_logger.info("Telegram long polling started dynamically; guard task created.")
+        return True
+
+
+async def _telegram_stop_polling_runtime(app_obj: Any, *, cancel_task: bool = True) -> bool:
+    global _TELEGRAM_POLLING_ACTIVE
+    updater = _telegram_app_updater(app_obj)
+    if cancel_task:
+        await _cancel_active_polling_task("stop_polling")
+    if updater is None:
+        _TELEGRAM_POLLING_ACTIVE = False
+        return False
+    async with _telegram_polling_lock():
+        if not _TELEGRAM_POLLING_ACTIVE:
+            return True
+        with suppress(Exception):
+            await updater.stop()
+        _TELEGRAM_POLLING_ACTIVE = False
+        webhook_logger.info("Telegram long polling stopped dynamically.")
+        return True
+
+
+async def _delete_telegram_webhook_via_http(drop_pending: bool = True) -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
+    timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout, limits=_make_httpx_limits_from_run_state()) as client:
+        resp = await client.post(api_url, json={"drop_pending_updates": bool(drop_pending)})
+    try:
+        data = _json_loads_fast(resp.content)
+    except Exception:
+        data = {"ok": False, "description": resp.text[:500]}
+    if resp.status_code >= 400 or not bool(data.get("ok")):
+        raise RuntimeError(f"Telegram deleteWebhook failed status={resp.status_code} response={str(data)[:500]}")
+    webhook_logger.info("Telegram webhook deleted via HTTPX.")
+
+
+async def _switch_telegram_runtime_mode(target_mode: str, admin_id: int = 0) -> str:
+    target = str(target_mode or "POLLING").strip().upper()
+    if target not in {"POLLING", "WEBHOOK"}:
+        raise ValueError("Invalid target Telegram mode.")
+    app_obj = globals().get("_TELEGRAM_APP")
+    if app_obj is None:
+        raise RuntimeError("Telegram application is not ready yet.")
+
+    if target == "WEBHOOK":
+        if not TELEGRAM_WEBHOOK_URL or not _runtime_webhook_secret_token():
+            raise RuntimeError("TELEGRAM_WEBHOOK_URL and TELEGRAM_WEBHOOK_SECRET_TOKEN are required before switching to WEBHOOK.")
+        webhook_logger.info("Runtime switch to WEBHOOK requested by admin_id=%s", admin_id)
+        # Hard-stop any getUpdates worker before setWebhook to avoid Telegram 409.
+        await _cancel_active_polling_task("switch_to_webhook")
+        await _telegram_stop_polling_runtime(app_obj, cancel_task=False)
+        await _configure_telegram_webhook_via_http()
+        await _update_run_state("BOT_MODE", "WEBHOOK")
+        _runtime_admin_log_state("switch_webhook", admin_id)
+        return "WEBHOOK"
+
+    webhook_logger.info("Runtime switch to POLLING requested by admin_id=%s", admin_id)
+    # Remove webhook first, verify Telegram accepted it, then start one polling worker.
+    await _cancel_active_polling_task("switch_to_polling_pre_delete")
+    await _delete_telegram_webhook_via_http(drop_pending=True)
+    await _update_run_state("BOT_MODE", "POLLING")
+    await _telegram_start_polling_runtime(app_obj)
+    _runtime_admin_log_state("switch_polling", admin_id)
+    return "POLLING"
+
+
+def _runtime_admin_notice_text() -> str:
+    return "⏳ Too many requests. Please slow down."
+
+
+def _is_runtime_admin_callback(data: str) -> bool:
+    return str(data or "").startswith("rtadmin_")
+
+
+async def _runtime_admin_callback(update: Any, context: Any) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    admin_id = query.from_user.id if query.from_user else 0
+    data = query.data or ""
+    if not _is_admin(admin_id):
+        with suppress(Exception):
+            await query.answer("⛔ អ្នកមិនមានសិទ្ធិ។", show_alert=True)
+        return
+    if query.message is None:
+        with suppress(Exception):
+            await query.answer()
+        return
+
+    if data == "rtadmin_close":
+        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+            ACTIVE_ADMIN_CONVERSATIONS.pop(admin_id, None)
+        with suppress(Exception):
+            await query.answer("Closed")
+        with suppress(Exception):
+            await query.message.delete()
+        return
+
+    if data == "rtadmin_rate":
+        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+            ACTIVE_ADMIN_CONVERSATIONS[admin_id] = {"state": "awaiting_rate_limit", "ts": time.monotonic()}
+        with suppress(Exception):
+            await query.answer("Send a number", show_alert=False)
+        await safe_send(lambda: query.message.edit_text(
+            "⚡ <b>កែប្រែ Rate Limit</b>\n\n"
+            f"តម្លៃបច្ចុប្បន្ន: <b>{_run_state_user_rate_limit()} req/{USER_RATE_LIMIT_WINDOW_S:g}s</b>\n\n"
+            "សូមផ្ញើលេខគត់ថ្មី ឧទាហរណ៍ <code>3</code> ឬ <code>5</code>។\n"
+            "បើចង់កែ HTTP pool សូមផ្ញើ <code>http 120</code>។",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="rtadmin_cancel")]]),
+        ))
+        return
+
+    if data == "rtadmin_cancel":
+        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+            ACTIVE_ADMIN_CONVERSATIONS.pop(admin_id, None)
+        with suppress(Exception):
+            await query.answer("Cancelled")
+        await safe_send(lambda: query.message.edit_text(
+            _runtime_admin_text(),
+            parse_mode="HTML",
+            reply_markup=_refresh_runtime_admin_markup(),
+        ))
+        return
+
+    if data == "rtadmin_rotate_secret":
+        with suppress(Exception):
+            await query.answer("Rotating secret…", show_alert=False)
+        new_token = generate_new_webhook_token()
+        try:
+            await _update_run_state("TELEGRAM_WEBHOOK_SECRET_TOKEN", new_token, persist=True)
+            logger.info(f"Admin {admin_id} rotated Webhook Secret Token.")
+            webhook_logger.info("Webhook secret rotated by admin_id=%s mode=%s", admin_id, _run_state_bot_mode())
+            if _run_state_bot_mode() == "WEBHOOK":
+                await set_telegram_webhook()
+            new_path = f"/tg-webhook-{new_token}"
+            await safe_send(lambda: query.message.edit_text(
+                _runtime_admin_text()
+                + "\n\n✅ Webhook secret updated!"
+                + f"\nNew URL path: <code>{html.escape(new_path)}</code>",
+                parse_mode="HTML",
+                reply_markup=_refresh_runtime_admin_markup(),
+                disable_web_page_preview=True,
+            ))
+        except Exception as exc:
+            webhook_logger.error("Webhook secret rotation failed admin_id=%s: %s", admin_id, exc, exc_info=True)
+            await safe_send(lambda: query.message.edit_text(
+                _runtime_admin_text() + f"\n\n❌ Rotate secret failed: <code>{html.escape(str(exc)[:800])}</code>",
+                parse_mode="HTML",
+                reply_markup=_refresh_runtime_admin_markup(),
+                disable_web_page_preview=True,
+            ))
+        return
+
+    if data.startswith("rtadmin_switch:"):
+        target = data.split(":", 1)[1].strip().upper()
+        with suppress(Exception):
+            await query.answer("Switching…", show_alert=False)
+        try:
+            mode = await _switch_telegram_runtime_mode(target, admin_id=admin_id)
+            await safe_send(lambda: query.message.edit_text(
+                _runtime_admin_text() + f"\n\n✅ បានប្ដូរទៅ <b>{html.escape(mode)}</b> រួចរាល់។",
+                parse_mode="HTML",
+                reply_markup=_refresh_runtime_admin_markup(),
+                disable_web_page_preview=True,
+            ))
+        except Exception as exc:
+            webhook_logger.error("Runtime mode switch failed admin_id=%s target=%s: %s", admin_id, target, exc, exc_info=True)
+            await safe_send(lambda: query.message.edit_text(
+                _runtime_admin_text() + f"\n\n❌ ប្ដូរ Mode មិនបាន: <code>{html.escape(str(exc)[:800])}</code>",
+                parse_mode="HTML",
+                reply_markup=_refresh_runtime_admin_markup(),
+                disable_web_page_preview=True,
+            ))
+        return
+
+    with suppress(Exception):
+        await query.answer()
+
+
+async def _handle_runtime_admin_text(update: Any, context: Any) -> bool:
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user or not _is_admin(user.id):
+        return False
+    async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+        state = dict(ACTIVE_ADMIN_CONVERSATIONS.get(user.id) or {})
+    if state.get("state") != "awaiting_rate_limit":
+        return False
+
+    raw = (msg.text or "").strip()
+    if raw.lower() in {"/cancel", "cancel", "បោះបង់"}:
+        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+            ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
+        await safe_send(lambda: msg.reply_text(
+            _runtime_admin_text(),
+            parse_mode="HTML",
+            reply_markup=_refresh_runtime_admin_markup(),
+        ))
+        return True
+
+    http_match = re.fullmatch(r"(?i)(?:http|connections?|pool)\s*[:= ]\s*(\d+)", raw)
+    if http_match:
+        value = int(http_match.group(1))
+        if value < 10 or value > 1000:
+            await safe_send(lambda: msg.reply_text("⚠️ HTTP Max Connections ត្រូវនៅចន្លោះ 10 ដល់ 1000។"))
+            return True
+        await _update_run_state("HTTP_MAX_CONNECTIONS", value)
+        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+            ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
+        _runtime_admin_log_state("update_http_max_connections", user.id, extra=f"new_http_max={value}")
+        await safe_send(lambda: msg.reply_text(
+            _runtime_admin_text() + f"\n\n✅ HTTP Max Connections ត្រូវបានកែទៅ <b>{value}</b>។",
+            parse_mode="HTML",
+            reply_markup=_refresh_runtime_admin_markup(),
+            disable_web_page_preview=True,
+        ))
+        return True
+
+    if not raw.isdigit():
+        await safe_send(lambda: msg.reply_text(
+            "⚠️ សូមផ្ញើលេខគត់សម្រាប់ Rate Limit ឧទាហរណ៍ <code>3</code> ឬ <code>http 120</code> សម្រាប់ HTTP pool។",
+            parse_mode="HTML",
+        ))
+        return True
+
+    value = int(raw)
+    if value < 1 or value > 100:
+        await safe_send(lambda: msg.reply_text("⚠️ តម្លៃ Rate Limit ត្រូវនៅចន្លោះ 1 ដល់ 100។"))
+        return True
+
+    await _update_run_state("USER_RATE_LIMIT_PER_SECOND", value)
+    async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+        ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
+    _runtime_admin_log_state("update_rate_limit", user.id, extra=f"new_limit={value}")
+    await safe_send(lambda: msg.reply_text(
+        _runtime_admin_text() + f"\n\n✅ Rate Limit ត្រូវបានកែទៅ <b>{value}</b> req/{USER_RATE_LIMIT_WINDOW_S:g}s។",
+        parse_mode="HTML",
+        reply_markup=_refresh_runtime_admin_markup(),
+        disable_web_page_preview=True,
+    ))
+    return True
+
+
+def _runtime_admin_bootstrap_state() -> None:
+    logger.info(
+        "Runtime admin state ready mode=%s user_rate_limit=%s http_max_connections=%s restored_from_redis=%s",
+        _run_state_bot_mode(),
+        _run_state_user_rate_limit(),
+        _run_state_http_max_connections(),
+        bool(globals().get("_RUNTIME_STATE_RESTORED_FROM_REDIS")),
+    )
+
+
+def _refresh_arch_runtime_settings() -> None:
+    """Re-read high-concurrency env settings after load_dotenv().
+
+    The globals are preserved for backward compatibility, but startup now
+    refreshes them from SETTINGS/env so Render secret updates and local .env
+    changes are reflected before clients, queues, webhook setup, and rate
+    limiters are initialised.
+    """
+    global CACHE_ASIDE_DEFAULT_TTL_S, HTTP_MAX_CONNECTIONS, HTTP_MAX_KEEPALIVE_CONNECTIONS
+    global REDIS_MAX_CONNECTIONS, HTTPX_HIGH_CONCURRENCY_LIMITS
+    global BOT_MODE, TELEGRAM_WEBHOOK_URL, TELEGRAM_WEBHOOK_SECRET_TOKEN
+    global USER_RATE_LIMIT_PER_SECOND, USER_RATE_LIMIT_WINDOW_S
+    global API_RATE_LIMIT_PER_SECOND, API_RATE_LIMIT_WINDOW_S, RATE_LIMIT_REDIS_TTL_S
+    global WEB_BROADCAST_QUEUE_MAXSIZE
+
+    CACHE_ASIDE_DEFAULT_TTL_S = _env_int("CACHE_ASIDE_DEFAULT_TTL_S", 3600, minimum=30, maximum=86400)
+    HTTP_MAX_CONNECTIONS = _env_int("HTTP_MAX_CONNECTIONS", 100, minimum=10, maximum=1000)
+    HTTP_MAX_KEEPALIVE_CONNECTIONS = _env_int("HTTP_MAX_KEEPALIVE_CONNECTIONS", 20, minimum=2, maximum=500)
+    REDIS_MAX_CONNECTIONS = _env_int("REDIS_MAX_CONNECTIONS", 100, minimum=2, maximum=1000)
+    HTTPX_HIGH_CONCURRENCY_LIMITS = httpx.Limits(
+        max_connections=HTTP_MAX_CONNECTIONS,
+        max_keepalive_connections=HTTP_MAX_KEEPALIVE_CONNECTIONS,
+    )
+    BOT_MODE = (os.environ.get("BOT_MODE") or getattr(SETTINGS, "BOT_MODE", "POLLING") or "POLLING").strip().upper()
+    if BOT_MODE not in {"POLLING", "WEBHOOK"}:
+        webhook_logger.warning("Unsupported BOT_MODE=%r; falling back to POLLING.", BOT_MODE)
+        BOT_MODE = "POLLING"
+    TELEGRAM_WEBHOOK_URL = (os.environ.get("TELEGRAM_WEBHOOK_URL") or getattr(SETTINGS, "TELEGRAM_WEBHOOK_URL", None) or "").strip()
+    TELEGRAM_WEBHOOK_SECRET_TOKEN = (os.environ.get("TELEGRAM_WEBHOOK_SECRET_TOKEN") or getattr(SETTINGS, "TELEGRAM_WEBHOOK_SECRET_TOKEN", None) or "").strip()
+    USER_RATE_LIMIT_PER_SECOND = _env_int("USER_RATE_LIMIT_PER_SECOND", 3, minimum=1, maximum=100)
+    USER_RATE_LIMIT_WINDOW_S = _env_float("USER_RATE_LIMIT_WINDOW_S", 1.0, minimum=0.25, maximum=60.0)
+    API_RATE_LIMIT_PER_SECOND = _env_int("API_RATE_LIMIT_PER_SECOND", 20, minimum=1, maximum=1000)
+    API_RATE_LIMIT_WINDOW_S = _env_float("API_RATE_LIMIT_WINDOW_S", 1.0, minimum=0.25, maximum=60.0)
+    RATE_LIMIT_REDIS_TTL_S = _env_int("RATE_LIMIT_REDIS_TTL_S", 30, minimum=2, maximum=3600)
+    WEB_BROADCAST_QUEUE_MAXSIZE = _env_int("WEB_BROADCAST_QUEUE_MAXSIZE", 200, minimum=10, maximum=10000)
+    _sync_run_state_from_globals()
 GEMINI_API_KEY:     str = ""
 ADMIN_IDS:  set[int]    = set()
 GEMINI_MODEL            = ""
@@ -4872,7 +5672,7 @@ async def _telegram_rate_limit_guard(update: Any, context: Any) -> None:
     if not isinstance(update, Update):
         return
     key = _update_rate_limit_key(update)
-    allowed, _remaining = await _rate_limit_check(key, USER_RATE_LIMIT_PER_SECOND, USER_RATE_LIMIT_WINDOW_S)
+    allowed, _remaining = await _rate_limit_check(key, _run_state_user_rate_limit(), USER_RATE_LIMIT_WINDOW_S)
     if allowed:
         return
     _metric_inc("rate_limited")
@@ -4883,7 +5683,7 @@ async def _telegram_rate_limit_guard(update: Any, context: Any) -> None:
         msg = getattr(update, "effective_message", None)
         if msg is not None:
             with suppress(Exception):
-                await msg.reply_text("⏳ Too many requests. Please slow down.")
+                await msg.reply_text(_runtime_admin_notice_text())
     raise ApplicationHandlerStop
 
 
@@ -4989,6 +5789,9 @@ redis_client = None
 _gemini    = None
 _hf_client = None
 _TELEGRAM_APP: Any = None
+# Public alias used by the FastAPI webhook dispatcher. Keep both names for
+# compatibility with older helper code and current Telegram ingestion logic.
+telegram_application: Any = None
 
 # OCR circuit-breaker state
 _hf_ocr_disabled_until = 0.0
@@ -5453,10 +6256,10 @@ def _init_clients() -> None:
                     socket_connect_timeout=REDIS_SOCKET_TIMEOUT_S,
                     health_check_interval=30,
                     retry_on_timeout=True,
-                    max_connections=_env_int("REDIS_MAX_CONNECTIONS", 100, minimum=2, maximum=1000),
+                    max_connections=REDIS_MAX_CONNECTIONS,
                 )
                 redis_client.ping()
-                logger.info("Redis cache initialised.")
+                logger.info("Redis cache initialised with max_connections=%s.", REDIS_MAX_CONNECTIONS)
             except Exception as e:
                 logger.warning(f"Redis init failed — cache disabled: {e}")
                 redis_client = None
@@ -10251,11 +11054,12 @@ async def _admin_start_schedule_from_button(query, context: ContextTypes.DEFAULT
 
 @admin_only
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = await _admin_home_text(update.effective_user.id)
+    # Runtime Admin Panel: live operational controls without app restart.
     await safe_send(lambda: update.message.reply_text(
-        text,
+        _runtime_admin_text(),
         parse_mode="HTML",
-        reply_markup=get_admin_dashboard_kb(),
+        reply_markup=get_runtime_admin_kb(),
+        disable_web_page_preview=True,
     ))
 
 
@@ -12731,6 +13535,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Admin flow intercepts
     if _is_admin(user_id):
+        if await _handle_runtime_admin_text(update, context):
+            return
         if await _handle_user_search_text(update, context):
             return
 
@@ -13282,7 +14088,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # already call query.answer(). Do NOT answer here — it would cause a
     # "query is too old" double-answer error on Telegram's side.
     _HANDLED_EXACT = {"bc_confirm", "bc_cancel", "users_close", "noop"}
-    _HANDLED_PREFIX = ("sched_", "users_page:", "users_search", "user_", "history_")
+    _HANDLED_PREFIX = ("sched_", "users_page:", "users_search", "user_", "history_", "rtadmin_")
     if data in _HANDLED_EXACT or any(data.startswith(p) for p in _HANDLED_PREFIX):
         return
 
@@ -13342,10 +14148,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 async def _run_bot():
     global _BOT_START_TIME, _AI_SEMAPHORE, _BROADCAST_SEMAPHORE
-    global _prefs_cache_lock, _TTS_CHUNK_SEMAPHORE, _TELEGRAM_APP
+    global _prefs_cache_lock, _TTS_CHUNK_SEMAPHORE, _TELEGRAM_APP, telegram_application
 
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
+
+    # This application lifecycle supports both webhook and polling.  The
+    # getUpdates worker itself is guarded separately by ACTIVE_POLLING_TASK;
+    # if mode is WEBHOOK, no polling updater is started.
 
     _AI_SEMAPHORE        = asyncio.Semaphore(MAX_CONCURRENT_AI)
     _BROADCAST_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_BROADCAST)
@@ -13384,9 +14194,10 @@ async def _run_bot():
     if hasattr(builder, "concurrent_updates"):
         builder = builder.concurrent_updates(TELEGRAM_CONCURRENT_UPDATES)
     if hasattr(builder, "connection_pool_size"):
-        builder = builder.connection_pool_size(TELEGRAM_CONNECTION_POOL_SIZE)
+        builder = builder.connection_pool_size(_run_state_http_max_connections())
     app = builder.build()
     _TELEGRAM_APP = app
+    telegram_application = app
 
     # Anti-flood guard must run before stale-drop and all expensive handlers.
     app.add_handler(TypeHandler(Update, _telegram_rate_limit_guard), group=-2)
@@ -13420,6 +14231,7 @@ async def _run_bot():
         pattern=r"^(?:users_(?:page:\d+|search(?:_page:\d+)?|close)|noop|history_(?:page:\d+|refresh|close|user:\d+(?::\d+)?)|user_(?:view|chat|block|unblock|resetprefs|clearhist|history):\d+(?::[psh]\d+)?(?::\d+)?)$",
     ))
     app.add_handler(CallbackQueryHandler(sched_callback,      pattern=r"^sched_"))
+    app.add_handler(CallbackQueryHandler(_runtime_admin_callback, pattern=r"^rtadmin_"))
     app.add_handler(CallbackQueryHandler(on_callback))
 
     # Message handlers
@@ -13437,7 +14249,7 @@ async def _run_bot():
     app.add_error_handler(error_handler)
 
     logger.info(
-        f"Bot starting in {BOT_MODE} mode. Admins: {ADMIN_IDS or 'none configured'} | "
+        f"Bot starting in {_run_state_bot_mode()} mode. Admins: {ADMIN_IDS or 'none configured'} | "
         f"HF: {HF_MODEL} | OCR provider: {OCR_PROVIDER} | "
         f"HF OCR: {HF_OCR_MODEL} | Gemini: {_gemini is not None} | "
         f"TTS: {_tts_provider_summary()}"
@@ -13452,38 +14264,38 @@ async def _run_bot():
         await app.initialize()
         await app.start()
         polling_started = False
-        if BOT_MODE == "WEBHOOK":
-            if TELEGRAM_WEBHOOK_URL:
-                webhook_kwargs = {
-                    "url": TELEGRAM_WEBHOOK_URL,
-                    "allowed_updates": ["message", "callback_query"],
-                    "drop_pending_updates": True,
-                }
-                if TELEGRAM_WEBHOOK_SECRET_TOKEN:
-                    webhook_kwargs["secret_token"] = TELEGRAM_WEBHOOK_SECRET_TOKEN
-                await app.bot.set_webhook(**webhook_kwargs)
-                logger.info("Telegram webhook configured: %s", TELEGRAM_WEBHOOK_URL)
-            else:
-                logger.warning("BOT_MODE=WEBHOOK but TELEGRAM_WEBHOOK_URL is empty. Configure setWebhook manually to /telegram-webhook.")
+        if _run_state_bot_mode() == "WEBHOOK":
+            await _cancel_active_polling_task("startup_webhook_mode")
+            await _configure_telegram_webhook_via_http()
+            webhook_logger.info("Telegram polling updater is disabled because BOT_MODE=WEBHOOK.")
         else:
-            await app.updater.start_polling(
-                allowed_updates=["message", "callback_query"],
-                drop_pending_updates=True,
-            )
-            polling_started = True
+            # Startup may follow a previous webhook deployment; delete it before
+            # long polling to prevent Telegram 409 Conflict.
+            with suppress(Exception):
+                await _delete_telegram_webhook_via_http(drop_pending=True)
+            polling_started = await _telegram_start_polling_runtime(app)
             logger.info("Telegram polling started.")
 
         # Start background jobs only after the Telegram application is fully ready.
         sched_task = asyncio.create_task(_scheduler_loop(app.bot, sched_stop))
         sweep_task = asyncio.create_task(_periodic_temp_sweep(sweep_stop))
         try:
-            await asyncio.Event().wait()
+            while True:
+                # Early polling-loop exit guard requested for runtime mode switches.
+                # In webhook mode the Telegram application stays alive so the
+                # FastAPI /telegram-webhook route can continue processing updates;
+                # only the updater polling worker is stopped.
+                if polling_started and _run_state_bot_mode() != "POLLING":
+                    webhook_logger.info("_run_bot observed BOT_MODE=%s while polling_started; stopping polling worker.", _run_state_bot_mode())
+                    await _telegram_stop_polling_runtime(app)
+                    polling_started = False
+                await asyncio.sleep(1.0)
         finally:
             sched_stop.set()
             sweep_stop.set()
             if polling_started and app.updater is not None:
                 with suppress(Exception):
-                    await app.updater.stop()
+                    await _telegram_stop_polling_runtime(app)
             for task in (sched_task, sweep_task):
                 if task is None:
                     continue
@@ -13496,9 +14308,16 @@ async def _run_bot():
 # Main
 # ---------------------------------------------------------------------------
 async def _async_main_once():
+    global ACTIVE_POLLING_TASK
     load_dotenv()
+    _refresh_arch_runtime_settings()
     _init_clients()
     await _init_async_clients()
+    try:
+        await _restore_run_state_from_redis()
+    except Exception as rexc:
+        webhook_logger.warning("Redis fallback triggered. Runtime state restore failed during boot: %s", rexc)
+    _runtime_admin_bootstrap_state()
 
     _sweep_stale_temps()
     ensure_speed_column()
@@ -13516,15 +14335,16 @@ async def _async_main_once():
         f"OCR: {OCR_PROVIDER} | HF OCR: {HF_OCR_MODEL} | "
         f"TTS: {TTS_PROVIDER}/{KHMER_TTS_PROVIDER} | user_model_default: {_normalize_tts_model(DEFAULT_TTS_MODEL)} | "
         f"Redis: {'on' if redis_client is not None else 'off'} | "
-        f"TG mode: {BOT_MODE} | TG updates: {TELEGRAM_CONCURRENT_UPDATES} | TG pool: {TELEGRAM_CONNECTION_POOL_SIZE} | "
+        f"TG mode: {_run_state_bot_mode()} | TG updates: {TELEGRAM_CONCURRENT_UPDATES} | TG pool: {_run_state_http_max_connections()} | "
         f"HTTP pool: {HTTP_MAX_CONNECTIONS}/{HTTP_MAX_KEEPALIVE_CONNECTIONS})"
     )
 
     _start_web_broadcast_queue_workers()
     keepalive_stop = asyncio.Event()
+    telegram_app_task = asyncio.create_task(_run_bot(), name="telegram-bot")
     tasks = [
         asyncio.create_task(run_fastapi(), name="fastapi-web"),
-        asyncio.create_task(_run_bot(), name="telegram-bot"),
+        telegram_app_task,
     ]
     if (os.environ.get("RENDER_EXTERNAL_URL") or getattr(SETTINGS, "RENDER_EXTERNAL_URL", "") or "").strip():
         tasks.append(asyncio.create_task(keep_alive_async(keepalive_stop), name="async-keep-alive"))
