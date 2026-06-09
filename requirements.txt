@@ -17,3 +17,8 @@ pydantic-settings
 jinja2
 itsdangerous
 python-multipart
+torch
+transformers
+accelerate
+scipy
+safetensors
