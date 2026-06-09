@@ -4551,9 +4551,9 @@ _prefs_cache: OrderedDict[int, tuple[dict, float]] = OrderedDict()
 _prefs_cache_lock: asyncio.Lock | None = None
 
 TTS_MODEL_OPTIONS = {
-    "auto": ("Auto", "Khmer HF Space → Edge fallback"),
-    "hf_space": ("Khmer HF", "mrrtmob/khmer-tts for Khmer text"),
-    "edge": ("Edge", "Microsoft Edge TTS for all languages"),
+    "auto": ("Auto", "Kiri → Edge TTS"),
+    "hf_space": ("Kiri", ""),
+    "edge": ("Edge TTS", ""),
 }
 TTS_MODEL_ALIASES = {
     "auto": "auto",
