@@ -162,25 +162,6 @@ def _default_cookie_secure() -> bool:
     return bool(getattr(SETTINGS, "WEB_COOKIE_SECURE", False))
 
 
-def _cookie_samesite() -> str:
-    """Return a Starlette-safe SameSite value.
-
-    A mistyped WEB_COOKIE_SAMESITE used to make the dashboard fail during
-    startup. Keep bad env values safe by falling back to lax.
-    """
-    value = str(getattr(SETTINGS, "WEB_COOKIE_SAMESITE", "lax") or "lax").strip().lower()
-    return value if value in {"lax", "strict", "none"} else "lax"
-
-
-def _web_max_content_length() -> int:
-    return _env_int(
-        "WEB_MAX_CONTENT_LENGTH",
-        64 * 1024 * 1024,
-        minimum=1 * 1024 * 1024,
-        maximum=256 * 1024 * 1024,
-    )
-
-
 _request_ctx: contextvars.ContextVar[Any] = contextvars.ContextVar("fastapi_request_ctx")
 _session_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar("fastapi_session_ctx")
 
@@ -226,22 +207,12 @@ class _LocalProxy:
 class _MultiDictCompat(dict):
     def get(self, key, default=None, type=None):
         value = super().get(key, default)
-        if isinstance(value, list):
-            value = value[-1] if value else default
         if type is not None and value is not None:
             try:
                 return type(value)
             except Exception:
                 return default
         return value
-
-    def getlist(self, key):
-        value = super().get(key, [])
-        if isinstance(value, list):
-            return list(value)
-        if value is None:
-            return []
-        return [value]
 
 
 class _UploadFileCompat:
@@ -356,7 +327,7 @@ class FastAPICompatApp:
             secret_key=secret_key,
             session_cookie=str(getattr(SETTINGS, "WEB_SESSION_COOKIE_NAME", "bot_admin_session") or "bot_admin_session"),
             https_only=_default_cookie_secure(),
-            same_site=_cookie_samesite(),
+            same_site=str(getattr(SETTINGS, "WEB_COOKIE_SAMESITE", "lax") or "lax").lower(),
             max_age=max(3600, int(getattr(SETTINGS, "WEB_ADMIN_SESSION_DAYS", 14) or 14) * 86400),
         )
 
@@ -377,59 +348,16 @@ class FastAPICompatApp:
         form_data: dict[str, Any] = {}
         files_data: dict[str, Any] = {}
         content_type = req.headers.get("content-type", "")
-        max_body = _web_max_content_length()
-
-        content_length = req.headers.get("content-length")
-        if content_length:
-            try:
-                if int(content_length) > max_body:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"Request body too large. Max {max_body} bytes.",
-                    )
-            except ValueError:
-                pass
-
-        def _store_multi(target: dict[str, Any], key: str, value: Any) -> None:
-            if key in target:
-                current = target[key]
-                if isinstance(current, list):
-                    current.append(value)
-                else:
-                    target[key] = [current, value]
-            else:
-                target[key] = value
-
         if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
             form = await req.form()
-            total_read = 0
             for key, value in form.multi_items():
                 if hasattr(value, "read") and hasattr(value, "filename"):
                     data = await value.read()
-                    total_read += len(data)
-                    if total_read > max_body:
-                        raise HTTPException(
-                            status_code=413,
-                            detail=f"Uploaded data too large. Max {max_body} bytes.",
-                        )
-                    _store_multi(
-                        files_data,
-                        key,
-                        _UploadFileCompat(
-                            value.filename,
-                            getattr(value, "content_type", "") or "application/octet-stream",
-                            data,
-                        ),
-                    )
+                    files_data[key] = _UploadFileCompat(value.filename, getattr(value, "content_type", "") or "application/octet-stream", data)
                 else:
-                    _store_multi(form_data, key, value)
+                    form_data[key] = value
         else:
             raw_body = await req.body()
-            if len(raw_body) > max_body:
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"Request body too large. Max {max_body} bytes.",
-                )
             if raw_body and "application/json" in content_type:
                 try:
                     json_body = _json.loads(raw_body.decode("utf-8"))
@@ -503,11 +431,11 @@ app = app_flask.fastapi
 app_flask.config["SECRET_KEY"] = getattr(SETTINGS, "FLASK_SECRET_KEY", "") or getattr(SETTINGS, "WEB_SECRET_KEY", "") or secrets.token_hex(32)
 app_flask.config["SESSION_COOKIE_NAME"] = getattr(SETTINGS, "WEB_SESSION_COOKIE_NAME", "bot_admin_session")
 app_flask.config["SESSION_COOKIE_HTTPONLY"] = True
-app_flask.config["SESSION_COOKIE_SAMESITE"] = _cookie_samesite().capitalize()
+app_flask.config["SESSION_COOKIE_SAMESITE"] = getattr(SETTINGS, "WEB_COOKIE_SAMESITE", "Lax")
 app_flask.config["SESSION_COOKIE_SECURE"] = _default_cookie_secure()
 app_flask.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=_env_int("WEB_ADMIN_SESSION_DAYS", 14, minimum=1))
 app_flask.config["SESSION_REFRESH_EACH_REQUEST"] = True
-app_flask.config["MAX_CONTENT_LENGTH"] = _web_max_content_length()
+app_flask.config["MAX_CONTENT_LENGTH"] = _env_int("WEB_MAX_CONTENT_LENGTH", 64 * 1024 * 1024, minimum=1 * 1024 * 1024)
 
 @app_flask.after_request
 def _web_security_headers(resp):
@@ -1529,11 +1457,6 @@ _WEB_BROADCAST_JOBS_LOCK = threading.Lock()
 _WEB_BROADCAST_JOBS_MAX = int(os.environ.get("WEB_BROADCAST_JOBS_MAX", "50"))
 WEB_BROADCAST_WORKERS = max(1, _env_int("WEB_BROADCAST_WORKERS", MAX_CONCURRENT_BROADCAST))
 WEB_BROADCAST_DELAY_S = max(0.0, _env_float("WEB_BROADCAST_DELAY_S", 0.05))
-WEB_BROADCAST_MAX_ACTIVE_JOBS = max(1, _env_int("WEB_BROADCAST_MAX_ACTIVE_JOBS", 2, minimum=1, maximum=10))
-_WEB_BROADCAST_EXECUTOR = ThreadPoolExecutor(
-    max_workers=WEB_BROADCAST_MAX_ACTIVE_JOBS,
-    thread_name_prefix="web_broadcast_job",
-)
 WEB_TABLE_PAGE_SIZE = max(10, min(200, _env_int("WEB_TABLE_PAGE_SIZE", 50)))
 # V4.1: avoid hammering Supabase from mobile/live dashboard polling.
 WEB_COUNTS_CACHE_TTL_S = max(5.0, _env_float("WEB_COUNTS_CACHE_TTL_S", 30.0))
@@ -2149,21 +2072,6 @@ def _web_broadcast_job_control(job_id: str, action: str) -> tuple[bool, str]:
         return True, msg
 
 
-def _web_broadcast_active_count() -> int:
-    active_states = {"queued", "running", "paused", "cancelling"}
-    with _WEB_BROADCAST_JOBS_LOCK:
-        return sum(
-            1
-            for row in _WEB_BROADCAST_JOBS.values()
-            if str(row.get("status") or "").lower() in active_states
-        )
-
-
-def _submit_web_broadcast_job(job_id: str, admin_id: int, text: str) -> None:
-    future = _WEB_BROADCAST_EXECUTOR.submit(_web_broadcast_worker, job_id, admin_id, text)
-    future.add_done_callback(_log_future_exception)
-
-
 def _web_broadcast_job_rows_html(csrf: str | None = None, *, include_actions: bool = True) -> str:
     csrf = csrf or _web_csrf_token()
     with _WEB_BROADCAST_JOBS_LOCK:
@@ -2511,13 +2419,7 @@ def _web_fetch_users(q: str = "", page: int = 0, page_size: int = WEB_TABLE_PAGE
     return []
 
 
-def _web_send_telegram_message(
-    chat_id: int,
-    text: str,
-    *,
-    admin_id: int | None = None,
-    client: httpx.Client | None = None,
-) -> tuple[bool, str]:
+def _web_send_telegram_message(chat_id: int, text: str) -> tuple[bool, str]:
     if not TELEGRAM_BOT_TOKEN:
         return False, "TELEGRAM_BOT_TOKEN missing."
     text = (text or "").strip()
@@ -2525,25 +2427,10 @@ def _web_send_telegram_message(
         return False, "Message is empty."
     if len(text) > TELE_MSG_LIMIT:
         return False, f"Message too long. Max {TELE_MSG_LIMIT}."
-
-    created_client = False
-    tg_client = client
     try:
-        if tg_client is None:
-            tg_client = httpx.Client(timeout=20)
-            created_client = True
-
-        resp = tg_client.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": int(chat_id), "text": text, "disable_web_page_preview": True},
-            timeout=20,
-        )
+        resp = httpx.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": int(chat_id), "text": text, "disable_web_page_preview": True}, timeout=20)
         if resp.status_code == 403:
-            blocker_admin_id = int(admin_id or 0)
-            if not blocker_admin_id:
-                with suppress(Exception):
-                    blocker_admin_id = _web_current_admin_id()
-            db_user_set_blocked(int(chat_id), blocker_admin_id, True, "Telegram Forbidden from web send")
+            db_user_set_blocked(int(chat_id), _web_current_admin_id(), True, "Telegram Forbidden from web send")
         if not (200 <= resp.status_code < 300):
             return False, f"Telegram HTTP {resp.status_code}: {resp.text[:300]}"
         payload = resp.json()
@@ -2552,10 +2439,6 @@ def _web_send_telegram_message(
         return True, "sent"
     except Exception as exc:
         return False, str(exc)
-    finally:
-        if created_client and tg_client is not None:
-            with suppress(Exception):
-                tg_client.close()
 
 
 @app_flask.route("/admin/users")
@@ -2744,7 +2627,7 @@ def web_admin_users_action():
         db_history_clear(user_id)
         ok, msg = True, "history clear queued"
     elif action == "send_message":
-        ok, msg = _web_send_telegram_message(user_id, request.form.get("message") or "", admin_id=_web_current_admin_id())
+        ok, msg = _web_send_telegram_message(user_id, request.form.get("message") or "")
     else:
         ok, msg = False, "Unknown action."
     flask_flash(("OK: " if ok else "ERROR: ") + msg, "success" if ok else "error")
@@ -3307,7 +3190,7 @@ def _web_broadcast_worker(job_id: str, admin_id: int, text: str) -> None:
                 return "skipped"
             if uid in blocked_ids:
                 return "blocked"
-            ok, send_msg = _web_send_telegram_message(uid, text, admin_id=admin_id, client=tg_client)
+            ok, send_msg = _web_send_telegram_message(uid, text)
             if ok:
                 return "sent"
             low = str(send_msg or "").lower()
@@ -3322,35 +3205,33 @@ def _web_broadcast_worker(job_id: str, admin_id: int, text: str) -> None:
 
     workers = max(1, min(WEB_BROADCAST_WORKERS, max(1, len(users))))
     batch_size = max(1, max(BROADCAST_BATCH_SIZE, workers))
-    limits = httpx.Limits(max_keepalive_connections=max(1, workers), max_connections=max(2, workers * 2))
     try:
-        with httpx.Client(timeout=20, limits=limits) as tg_client:
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="web_broadcast") as pool:
-                for start in range(0, total, batch_size):
-                    if not _wait_if_paused():
-                        skipped += max(0, total - start)
-                        _web_broadcast_job_set(job_id, status="cancelled", skipped=skipped, sent=sent, failed=failed, blocked=blocked, finished_at=_sched_iso())
-                        return
-                    _web_broadcast_job_set(job_id, status="running")
-                    batch = users[start:start + batch_size]
-                    results = list(pool.map(_send_one, batch))
-                    for result in results:
-                        if result == "sent":
-                            sent += 1
-                        elif result == "blocked":
-                            blocked += 1
-                        elif result == "skipped":
-                            skipped += 1
-                        else:
-                            failed += 1
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="web_broadcast") as pool:
+            for start in range(0, total, batch_size):
+                if not _wait_if_paused():
+                    skipped += max(0, total - start)
+                    _web_broadcast_job_set(job_id, status="cancelled", skipped=skipped, sent=sent, failed=failed, blocked=blocked, finished_at=_sched_iso())
+                    return
+                _web_broadcast_job_set(job_id, status="running")
+                batch = users[start:start + batch_size]
+                results = list(pool.map(_send_one, batch))
+                for result in results:
+                    if result == "sent":
+                        sent += 1
+                    elif result == "blocked":
+                        blocked += 1
+                    elif result == "skipped":
+                        skipped += 1
+                    else:
+                        failed += 1
 
-                    _web_broadcast_job_set(job_id, sent=sent, failed=failed, blocked=blocked, skipped=skipped)
-                    if _control_state() == "cancel":
-                        skipped += max(0, total - (start + len(batch)))
-                        _web_broadcast_job_set(job_id, status="cancelled", skipped=skipped, sent=sent, failed=failed, blocked=blocked, finished_at=_sched_iso())
-                        return
-                    if start + len(batch) < total and WEB_BROADCAST_DELAY_S:
-                        time.sleep(WEB_BROADCAST_DELAY_S)
+                _web_broadcast_job_set(job_id, sent=sent, failed=failed, blocked=blocked, skipped=skipped)
+                if _control_state() == "cancel":
+                    skipped += max(0, total - (start + len(batch)))
+                    _web_broadcast_job_set(job_id, status="cancelled", skipped=skipped, sent=sent, failed=failed, blocked=blocked, finished_at=_sched_iso())
+                    return
+                if start + len(batch) < total and WEB_BROADCAST_DELAY_S:
+                    time.sleep(WEB_BROADCAST_DELAY_S)
 
         _web_broadcast_job_set(job_id, status="done", control="done", sent=sent, failed=failed, blocked=blocked, skipped=skipped, finished_at=_sched_iso())
     except Exception as exc:
@@ -3369,18 +3250,11 @@ def web_admin_broadcast():
         elif len(text) > TELE_MSG_LIMIT:
             flask_flash(f"Broadcast too long. Max {TELE_MSG_LIMIT} characters.", "error")
         else:
-            active_jobs = _web_broadcast_active_count()
-            if active_jobs >= WEB_BROADCAST_MAX_ACTIVE_JOBS:
-                flask_flash(
-                    f"Too many active broadcast jobs ({active_jobs}/{WEB_BROADCAST_MAX_ACTIVE_JOBS}). Pause/cancel or wait for one to finish.",
-                    "error",
-                )
-            else:
-                job_id = secrets.token_hex(6)
-                _web_broadcast_job_set(job_id, status="queued", control="run", total=0, sent=0, failed=0, blocked=0, skipped=0, created_at=_sched_iso())
-                _submit_web_broadcast_job(job_id, _web_current_admin_id(), text)
-                flask_flash(f"Broadcast job {job_id} started.", "success")
-                return redirect(url_for("web_admin_broadcast"))
+            job_id = secrets.token_hex(6)
+            _web_broadcast_job_set(job_id, status="queued", control="run", total=0, sent=0, failed=0, blocked=0, skipped=0, created_at=_sched_iso())
+            threading.Thread(target=_web_broadcast_worker, args=(job_id, _web_current_admin_id(), text), daemon=True, name=f"web-broadcast-{job_id}").start()
+            flask_flash(f"Broadcast job {job_id} started.", "success")
+            return redirect(url_for("web_admin_broadcast"))
     csrf = _web_csrf_token()
     job_rows = _web_broadcast_job_rows_html(csrf, include_actions=True)
     body = f"""
@@ -3673,13 +3547,6 @@ HF_TTS_RETRY_DELAY_S     = _env_float("HF_TTS_RETRY_DELAY_S", 2.0, minimum=0.2, 
 HF_TTS_EDGE_FALLBACK     = _env_bool("HF_TTS_EDGE_FALLBACK", True)
 HF_TTS_FAILURE_LIMIT     = _env_int("HF_TTS_FAILURE_LIMIT", 3, minimum=1, maximum=20)
 HF_TTS_COOLDOWN_S        = _env_float("HF_TTS_COOLDOWN_S", 300.0, minimum=30.0, maximum=3600.0)
-# Public HF ZeroGPU Spaces can run out of daily quota. When this happens, retrying
-# every user request only creates log spam and slow responses, so quota errors use
-# a longer cooldown and immediately fall back to Edge TTS when fallback is enabled.
-HF_TTS_QUOTA_COOLDOWN_S  = _env_float("HF_TTS_QUOTA_COOLDOWN_S", 1800.0, minimum=300.0, maximum=86400.0)
-HF_TTS_NO_AUDIO_COOLDOWN_S = _env_float("HF_TTS_NO_AUDIO_COOLDOWN_S", 600.0, minimum=60.0, maximum=3600.0)
-HF_TTS_CLIENT_CACHE      = _env_bool("HF_TTS_CLIENT_CACHE", True)
-HF_TTS_SERIALIZE_CALLS   = _env_bool("HF_TTS_SERIALIZE_CALLS", True)
 DEFAULT_SPEED           = 1.0
 TELE_MSG_LIMIT          = 4000
 USER_COOLDOWN_S         = 3.0
@@ -4682,12 +4549,11 @@ _PREFS_TTL      = 300.0
 _PREFS_MAX_SIZE = 10_000
 _prefs_cache: OrderedDict[int, tuple[dict, float]] = OrderedDict()
 _prefs_cache_lock: asyncio.Lock | None = None
-_prefs_cache_thread_lock = threading.RLock()
 
 TTS_MODEL_OPTIONS = {
-    "auto": ("Auto", "Kiri → Edge TTS"),
-    "hf_space": ("Kiri", ""),
-    "edge": ("Edge TTS", ""),
+    "auto": ("Auto", "Khmer HF Space → Edge fallback"),
+    "hf_space": ("Khmer HF", "mrrtmob/khmer-tts for Khmer text"),
+    "edge": ("Edge", "Microsoft Edge TTS for all languages"),
 }
 TTS_MODEL_ALIASES = {
     "auto": "auto",
@@ -4825,27 +4691,24 @@ def _normalize_user_prefs(row: dict | None) -> dict:
 
 
 def _cache_prefs_sync(user_id: int, prefs: dict) -> None:
-    with _prefs_cache_thread_lock:
-        _prefs_cache.pop(user_id, None)
-        _prefs_cache[user_id] = (_normalize_user_prefs(prefs), time.monotonic())
-        while len(_prefs_cache) > _PREFS_MAX_SIZE:
-            _prefs_cache.popitem(last=False)
+    _prefs_cache.pop(user_id, None)
+    _prefs_cache[user_id] = (_normalize_user_prefs(prefs), time.monotonic())
+    while len(_prefs_cache) > _PREFS_MAX_SIZE:
+        _prefs_cache.popitem(last=False)
 
 
 def _get_cached_prefs_sync(user_id: int) -> dict | None:
-    with _prefs_cache_thread_lock:
-        entry = _prefs_cache.get(user_id)
-        if entry and time.monotonic() - entry[1] < _PREFS_TTL:
-            _prefs_cache.move_to_end(user_id)
-            return dict(entry[0])
-        if entry:
-            _prefs_cache.pop(user_id, None)
-        return None
+    entry = _prefs_cache.get(user_id)
+    if entry and time.monotonic() - entry[1] < _PREFS_TTL:
+        _prefs_cache.move_to_end(user_id)
+        return dict(entry[0])
+    if entry:
+        _prefs_cache.pop(user_id, None)
+    return None
 
 
 def _invalidate_prefs(user_id: int) -> None:
-    with _prefs_cache_thread_lock:
-        _prefs_cache.pop(user_id, None)
+    _prefs_cache.pop(user_id, None)
     if redis_client is not None:
         _submit_db(lambda: _redis_delete_sync(_prefs_redis_key(user_id)))
 
@@ -7610,12 +7473,8 @@ async def _edge_tts_stream_with_retry(chunk_text: str, voices: list[str]) -> tup
 
 # Khmer HF Space provider state. Protected by a lock because Gradio calls run in worker threads.
 _HF_TTS_STATE_LOCK = threading.Lock()
-_HF_TTS_CLIENT_LOCK = threading.Lock()
-_HF_TTS_CLIENT_CALL_LOCK = threading.Lock()
 _HF_TTS_FAILURES = 0
 _HF_TTS_DISABLED_UNTIL = 0.0
-_HF_TTS_CLIENT = None
-_HF_TTS_CLIENT_KEY: tuple[str, str] | None = None
 
 
 def _tts_provider_summary() -> str:
@@ -7644,69 +7503,18 @@ def _hf_tts_record_success() -> None:
         _HF_TTS_DISABLED_UNTIL = 0.0
 
 
-def _hf_tts_error_text(exc: BaseException | str) -> str:
-    return str(exc or "").strip()
-
-
-def _hf_tts_is_quota_error(exc: BaseException | str) -> bool:
-    msg = _hf_tts_error_text(exc).lower()
-    return (
-        "zerogpu quota" in msg
-        or "exceeded your free" in msg
-        or "quota" in msg and "exceeded" in msg
-        or "0s left" in msg
-    )
-
-
-def _hf_tts_is_no_audio_error(exc: BaseException | str) -> bool:
-    msg = _hf_tts_error_text(exc).lower()
-    return "returned no audio path" in msg or "returned empty audio" in msg or "no audio" in msg
-
-
 def _hf_tts_record_failure(exc: BaseException | str) -> None:
-    """Record real HF TTS failures and open a cooldown when retries are harmful.
-
-    Cooldown-only errors are intentionally not counted by generate_voice(). Quota
-    failures are disabled immediately because the next request cannot fix the
-    account-level ZeroGPU quota. "No audio path" gets a medium cooldown after
-    the normal failure threshold because Spaces sometimes return malformed tuples
-    during cold starts or overloaded periods.
-    """
     global _HF_TTS_FAILURES, _HF_TTS_DISABLED_UNTIL
-    exc_text = _hf_tts_error_text(exc)[:500]
-    now = time.monotonic()
-    cooldown = 0.0
-    reason = "failure-threshold"
-
     with _HF_TTS_STATE_LOCK:
         _HF_TTS_FAILURES += 1
-        previous_until = _HF_TTS_DISABLED_UNTIL
-        already_disabled = now < previous_until
-
-        if _hf_tts_is_quota_error(exc):
-            cooldown = HF_TTS_QUOTA_COOLDOWN_S
-            reason = "quota"
-        elif _HF_TTS_FAILURES >= HF_TTS_FAILURE_LIMIT:
-            cooldown = HF_TTS_NO_AUDIO_COOLDOWN_S if _hf_tts_is_no_audio_error(exc) else HF_TTS_COOLDOWN_S
-            reason = "no-audio" if _hf_tts_is_no_audio_error(exc) else "failure-threshold"
-
-        if cooldown > 0:
-            _HF_TTS_DISABLED_UNTIL = max(previous_until, now + cooldown)
-            should_log = (not already_disabled) or (_HF_TTS_DISABLED_UNTIL > previous_until + 1.0)
-        else:
-            should_log = False
-
-        failures = _HF_TTS_FAILURES
-        remaining = max(0, int(_HF_TTS_DISABLED_UNTIL - now))
-
-    if should_log:
-        logger.warning(
-            "HF Khmer TTS temporarily disabled for %ss after %s failure(s), reason=%s: %s",
-            remaining,
-            failures,
-            reason,
-            exc_text,
-        )
+        if _HF_TTS_FAILURES >= HF_TTS_FAILURE_LIMIT:
+            _HF_TTS_DISABLED_UNTIL = time.monotonic() + HF_TTS_COOLDOWN_S
+            logger.warning(
+                "HF Khmer TTS temporarily disabled for %.0fs after %s failure(s): %s",
+                HF_TTS_COOLDOWN_S,
+                _HF_TTS_FAILURES,
+                exc,
+            )
 
 
 def _should_try_hf_khmer_tts(text: str, tts_model: str = "auto") -> bool:
@@ -7716,13 +7524,6 @@ def _should_try_hf_khmer_tts(text: str, tts_model: str = "auto") -> bool:
     user_model = _normalize_tts_model(tts_model)
     if user_model == "edge":
         return False
-
-    # When HF is cooling down and Edge fallback is enabled, do not call the HF
-    # Space at all. This avoids repeated "Loaded as API" messages, avoids
-    # extending cooldown on cooldown-only errors, and gives users a fast reply.
-    if _hf_tts_is_temporarily_disabled() and HF_TTS_EDGE_FALLBACK:
-        return False
-
     if user_model == "hf_space":
         return True
 
@@ -7737,15 +7538,6 @@ def _should_try_hf_khmer_tts(text: str, tts_model: str = "auto") -> bool:
 
 
 def _extract_hf_audio_path_or_url(audio_obj: Any) -> str:
-    """Extract an audio file path/URL from Gradio result shapes.
-
-    Some Gradio Spaces return nested tuples/lists such as (audio, metadata) or
-    dictionaries containing path/url fields. The previous parser only inspected
-    result[0], which caused false "returned no audio path. result=tuple" errors
-    when the audio object was nested deeper.
-    """
-    if audio_obj is None:
-        return ""
     if isinstance(audio_obj, str):
         return audio_obj
     if isinstance(audio_obj, dict):
@@ -7753,15 +7545,6 @@ def _extract_hf_audio_path_or_url(audio_obj: Any) -> str:
             val = audio_obj.get(key)
             if val:
                 return str(val)
-        for val in audio_obj.values():
-            nested = _extract_hf_audio_path_or_url(val)
-            if nested:
-                return nested
-    if isinstance(audio_obj, (tuple, list)):
-        for item in audio_obj:
-            nested = _extract_hf_audio_path_or_url(item)
-            if nested:
-                return nested
     for attr in ("path", "url", "name"):
         val = getattr(audio_obj, attr, None)
         if val:
@@ -7782,58 +7565,33 @@ def _audio_suffix_from_bytes(data: bytes) -> str:
     return ".audio"
 
 
-def _hf_tts_make_client_sync():
+def _hf_tts_space_predict_sync(chunk_text: str) -> bytes:
+    """Blocking Gradio call for mrrtmob/khmer-tts. Run only in an executor."""
     if GradioClient is None:
         raise RuntimeError("gradio_client is not installed. Add `gradio_client` to requirements.txt.")
     if not HF_TTS_SPACE:
         raise RuntimeError("HF_TTS_SPACE is empty.")
+
+    # HF_TOKEN is optional for public Spaces, but useful for authenticated/rate-limited calls.
     if HF_TTS_TOKEN:
         try:
-            return GradioClient(HF_TTS_SPACE, hf_token=HF_TTS_TOKEN)
+            client = GradioClient(HF_TTS_SPACE, hf_token=HF_TTS_TOKEN)
         except TypeError:
-            return GradioClient(HF_TTS_SPACE)
-    return GradioClient(HF_TTS_SPACE)
-
-
-def _hf_tts_get_client_sync():
-    """Return a cached Gradio client so each chunk/request does not reload the API."""
-    global _HF_TTS_CLIENT, _HF_TTS_CLIENT_KEY
-    if not HF_TTS_CLIENT_CACHE:
-        return _hf_tts_make_client_sync()
-
-    # Do not store the full token in the cache key; the process env is static in
-    # normal deployments, and this is enough to rebuild if token presence changes.
-    key = (HF_TTS_SPACE, "token" if HF_TTS_TOKEN else "public")
-    with _HF_TTS_CLIENT_LOCK:
-        if _HF_TTS_CLIENT is not None and _HF_TTS_CLIENT_KEY == key:
-            return _HF_TTS_CLIENT
-        _HF_TTS_CLIENT = _hf_tts_make_client_sync()
-        _HF_TTS_CLIENT_KEY = key
-        return _HF_TTS_CLIENT
-
-
-def _hf_tts_space_predict_sync(chunk_text: str) -> bytes:
-    """Blocking Gradio call for mrrtmob/khmer-tts. Run only in an executor."""
-    client = _hf_tts_get_client_sync()
-
-    def _predict():
-        return client.predict(
-            chunk_text,
-            HF_TTS_VOICE,
-            HF_TTS_TEMP,
-            HF_TTS_TOP_P,
-            HF_TTS_REP_PEN,
-            HF_TTS_MAX_TOK,
-            api_name=HF_TTS_API_NAME,
-        )
-
-    if HF_TTS_SERIALIZE_CALLS:
-        with _HF_TTS_CLIENT_CALL_LOCK:
-            result = _predict()
+            client = GradioClient(HF_TTS_SPACE)
     else:
-        result = _predict()
+        client = GradioClient(HF_TTS_SPACE)
 
-    path_or_url = _extract_hf_audio_path_or_url(result)
+    result = client.predict(
+        chunk_text,
+        HF_TTS_VOICE,
+        HF_TTS_TEMP,
+        HF_TTS_TOP_P,
+        HF_TTS_REP_PEN,
+        HF_TTS_MAX_TOK,
+        api_name=HF_TTS_API_NAME,
+    )
+    audio_obj = result[0] if isinstance(result, (tuple, list)) and result else result
+    path_or_url = _extract_hf_audio_path_or_url(audio_obj)
     if not path_or_url:
         raise RuntimeError(f"HF TTS returned no audio path. result={type(result).__name__}")
 
@@ -8047,24 +7805,13 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
         try:
             return await _generate_voice_hf_space(text, speed, output_path)
         except Exception as exc:
-            low = str(exc).lower()
-            cooldown_only = "cooldown active" in low
-            if not cooldown_only:
-                _hf_tts_record_failure(exc)
-                logger.warning(
-                    "HF Khmer TTS failed; user_model=%s edge fallback=%s cooldown_remaining=%ss: %s",
-                    user_model,
-                    HF_TTS_EDGE_FALLBACK,
-                    _hf_tts_disabled_remaining_s(),
-                    exc,
-                )
-            else:
-                logger.info(
-                    "HF Khmer TTS skipped due to cooldown; user_model=%s edge fallback=%s cooldown_remaining=%ss",
-                    user_model,
-                    HF_TTS_EDGE_FALLBACK,
-                    _hf_tts_disabled_remaining_s(),
-                )
+            _hf_tts_record_failure(exc)
+            logger.warning(
+                "HF Khmer TTS failed; user_model=%s edge fallback=%s: %s",
+                user_model,
+                HF_TTS_EDGE_FALLBACK,
+                exc,
+            )
             if not HF_TTS_EDGE_FALLBACK:
                 raise RuntimeError(f"HF Khmer TTS failed and Edge fallback is disabled: {exc}") from exc
 
@@ -8737,7 +8484,7 @@ async def _run_broadcast_to_all(
                         or "bot can't initiate conversation" in low
                         or "bot can’t initiate conversation" in low
                     ):
-                        logger.info(f"{label}: marking unreachable uid={uid} as blocked: {e}")
+                        logger.warning(f"{label}: marking unreachable uid={uid} as blocked: {e}")
                         await loop.run_in_executor(
                             None,
                             functools.partial(
