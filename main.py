@@ -3682,6 +3682,11 @@ EDGE_TTS_RETRIES          = _env_int("EDGE_TTS_RETRIES", 3, minimum=1, maximum=8
 EDGE_TTS_RETRY_DELAY_S    = _env_float("EDGE_TTS_RETRY_DELAY_S", 0.8, minimum=0.2, maximum=10.0)
 EDGE_TTS_STREAM_TIMEOUT_S = _env_float("EDGE_TTS_STREAM_TIMEOUT_S", 45.0, minimum=15.0, maximum=180.0)
 EDGE_TTS_CROSS_LANG_FALLBACK = _env_bool("EDGE_TTS_CROSS_LANG_FALLBACK", False)
+# FFmpeg can start slowly on small Render instances when CPU/RAM is under load.
+# Keep these configurable and always kill the child process on conversion timeout.
+FFMPEG_START_TIMEOUT_S = _env_float("FFMPEG_START_TIMEOUT_S", 20.0, minimum=3.0, maximum=120.0)
+FFMPEG_CONVERT_TIMEOUT_S = _env_float("FFMPEG_CONVERT_TIMEOUT_S", 120.0, minimum=20.0, maximum=600.0)
+FFMPEG_READ_TIMEOUT_S = _env_float("FFMPEG_READ_TIMEOUT_S", 15.0, minimum=5.0, maximum=120.0)
 
 # Khmer TTS V3: local facebook/mms-tts-khm first, with HF Space and Edge fallbacks.
 # Recommended production routing:
@@ -3702,10 +3707,18 @@ LOCAL_MMS_TTS_EDGE_FALLBACK = _env_bool("LOCAL_MMS_TTS_EDGE_FALLBACK", True)
 LOCAL_MMS_TTS_HF_FALLBACK   = _env_bool("LOCAL_MMS_TTS_HF_FALLBACK", True)
 LOCAL_MMS_TTS_FAILURE_LIMIT = _env_int("LOCAL_MMS_TTS_FAILURE_LIMIT", 2, minimum=1, maximum=20)
 LOCAL_MMS_TTS_COOLDOWN_S    = _env_float("LOCAL_MMS_TTS_COOLDOWN_S", 300.0, minimum=30.0, maximum=3600.0)
+LOCAL_MMS_TTS_LOG_TRACEBACK = _env_bool("LOCAL_MMS_TTS_LOG_TRACEBACK", True)
 LOCAL_MMS_TTS_CACHE_ENABLED = _env_bool("LOCAL_MMS_TTS_CACHE_ENABLED", True)
 LOCAL_MMS_TTS_CACHE_DIR     = (os.environ.get("LOCAL_MMS_TTS_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "khmer_mms_tts_cache")).strip()
 LOCAL_MMS_TTS_CACHE_TTL_S   = _env_float("LOCAL_MMS_TTS_CACHE_TTL_S", 7 * 86400.0, minimum=60.0, maximum=30 * 86400.0)
 LOCAL_MMS_TTS_CACHE_MAX_FILES = _env_int("LOCAL_MMS_TTS_CACHE_MAX_FILES", 500, minimum=20, maximum=5000)
+# IMPORTANT: an asyncio timeout cannot kill an already-running PyTorch worker
+# thread. If Local MMS times out, the worker may keep consuming CPU/RAM. By
+# default we DO NOT start HF/Edge fallback while that worker is still active,
+# because doing so can overload small Render instances and make FFmpeg time out.
+LOCAL_MMS_TTS_TIMEOUT_FALLBACK = _env_bool("LOCAL_MMS_TTS_TIMEOUT_FALLBACK", False)
+LOCAL_MMS_TTS_BLOCK_FALLBACK_WHILE_BUSY = _env_bool("LOCAL_MMS_TTS_BLOCK_FALLBACK_WHILE_BUSY", True)
+LOCAL_MMS_TTS_SKIP_BOT_STATUS_TEXT = _env_bool("LOCAL_MMS_TTS_SKIP_BOT_STATUS_TEXT", True)
 # Keep local VITS generation isolated from Gemini/HF text inference. On small
 # Render CPU instances, one local MMS worker is the safest default.
 LOCAL_MMS_TTS_WORKERS = _env_int("LOCAL_MMS_TTS_WORKERS", 1, minimum=1, maximum=4)
@@ -7742,6 +7755,7 @@ _LOCAL_MMS_TTS_DEVICE_USED = "cpu"
 _LOCAL_MMS_TTS_SAMPLE_RATE = 16000
 _LOCAL_MMS_TTS_CACHE_LAST_PRUNE = 0.0
 _LOCAL_MMS_TTS_CACHE_LOCK = threading.RLock()
+_LOCAL_MMS_TTS_ACTIVE_WORKERS = 0
 
 _HF_TTS_STATE_LOCK = threading.Lock()
 _HF_TTS_FAILURES = 0
@@ -7754,7 +7768,9 @@ def _tts_provider_summary() -> str:
         f"local_mms={LOCAL_MMS_TTS_MODEL}, workers={LOCAL_MMS_TTS_WORKERS}, cpu_threads={LOCAL_MMS_TTS_CPU_THREADS}, "
         f"hf_space={HF_TTS_SPACE}{HF_TTS_API_NAME}, "
         f"gradio_client={'on' if GradioClient is not None else 'missing'}, "
-        f"fallbacks=hf:{'on' if LOCAL_MMS_TTS_HF_FALLBACK else 'off'}/edge:{'on' if LOCAL_MMS_TTS_EDGE_FALLBACK else 'off'}"
+        f"fallbacks=hf:{'on' if LOCAL_MMS_TTS_HF_FALLBACK else 'off'}/edge:{'on' if LOCAL_MMS_TTS_EDGE_FALLBACK else 'off'}, "
+        f"timeout_fallback={'on' if LOCAL_MMS_TTS_TIMEOUT_FALLBACK else 'off'}, "
+        f"block_busy={'on' if LOCAL_MMS_TTS_BLOCK_FALLBACK_WHILE_BUSY else 'off'}"
     )
 
 
@@ -7772,11 +7788,41 @@ def _local_mms_tts_dependency_status() -> tuple[bool, str]:
     detail = (
         f"model={LOCAL_MMS_TTS_MODEL}; device={LOCAL_MMS_TTS_DEVICE}; "
         f"workers={LOCAL_MMS_TTS_WORKERS}; cpu_threads={LOCAL_MMS_TTS_CPU_THREADS}; "
-        f"cache={'on' if LOCAL_MMS_TTS_CACHE_ENABLED else 'off'}"
+        f"cache={'on' if LOCAL_MMS_TTS_CACHE_ENABLED else 'off'}; "
+        f"timeout_fallback={'on' if LOCAL_MMS_TTS_TIMEOUT_FALLBACK else 'off'}; "
+        f"block_busy={'on' if LOCAL_MMS_TTS_BLOCK_FALLBACK_WHILE_BUSY else 'off'}"
     )
     if not ok:
         detail += "; missing one of: torch, transformers, scipy"
     return ok, detail
+
+
+def _exception_detail(exc: BaseException | str | None) -> str:
+    """Return useful text even for blank exceptions like asyncio.TimeoutError.
+
+    Some async/worker exceptions stringify to an empty value, which previously
+    produced logs ending in only `... failed at chunk: `. This helper keeps the
+    provider logs actionable and makes cooldown/fallback decisions easier to
+    diagnose on Render.
+    """
+    if exc is None:
+        return "unknown error"
+    if isinstance(exc, str):
+        return exc.strip() or "unknown error"
+    name = type(exc).__name__
+    msg = str(exc).strip()
+    if msg:
+        return f"{name}: {msg}"
+    rep = repr(exc).strip()
+    return rep if rep and rep != name + "()" else name
+
+
+def _local_mms_timeout_error(chunk_index: int, chunk_total: int) -> RuntimeError:
+    return RuntimeError(
+        f"TimeoutError: Local MMS Khmer TTS timed out after {LOCAL_MMS_TTS_TIMEOUT_S:.0f}s "
+        f"at chunk {chunk_index}/{chunk_total}. The model may still be downloading/loading, "
+        "or this Render instance may not have enough CPU/RAM for local PyTorch TTS."
+    )
 
 
 def _local_mms_tts_is_temporarily_disabled() -> bool:
@@ -7787,6 +7833,56 @@ def _local_mms_tts_is_temporarily_disabled() -> bool:
 def _local_mms_tts_disabled_remaining_s() -> int:
     with _LOCAL_MMS_TTS_STATE_LOCK:
         return max(0, int(_LOCAL_MMS_TTS_DISABLED_UNTIL - time.monotonic()))
+
+
+def _local_mms_tts_active_count() -> int:
+    with _LOCAL_MMS_TTS_STATE_LOCK:
+        return int(_LOCAL_MMS_TTS_ACTIVE_WORKERS)
+
+
+def _local_mms_tts_worker_started() -> None:
+    global _LOCAL_MMS_TTS_ACTIVE_WORKERS
+    with _LOCAL_MMS_TTS_STATE_LOCK:
+        _LOCAL_MMS_TTS_ACTIVE_WORKERS += 1
+
+
+def _local_mms_tts_worker_finished() -> None:
+    global _LOCAL_MMS_TTS_ACTIVE_WORKERS
+    with _LOCAL_MMS_TTS_STATE_LOCK:
+        _LOCAL_MMS_TTS_ACTIVE_WORKERS = max(0, _LOCAL_MMS_TTS_ACTIVE_WORKERS - 1)
+
+
+def _is_local_mms_timeout_exception(exc: BaseException | str | None) -> bool:
+    detail = _exception_detail(exc).lower()
+    return "local mms" in detail and "timeout" in detail
+
+
+def _local_mms_tts_submit_chunk(loop: asyncio.AbstractEventLoop, chunk_text: str, wav_path: str):
+    """Submit a Local MMS worker and track it until the sync thread exits.
+
+    asyncio cancellation/timeouts do not stop a running ThreadPoolExecutor job.
+    Tracking active workers lets the router avoid starting HF/Edge fallback while
+    PyTorch is still consuming CPU/RAM in the background.
+    """
+    _local_mms_tts_worker_started()
+    fut = loop.run_in_executor(
+        _LOCAL_MMS_TTS_EXECUTOR,
+        _local_mms_tts_chunk_to_wav_sync,
+        chunk_text,
+        wav_path,
+    )
+
+    def _done(done_fut):
+        _local_mms_tts_worker_finished()
+        try:
+            done_fut.result()
+        except asyncio.CancelledError:
+            logger.warning("Local MMS worker future was cancelled; underlying sync work may have already finished.")
+        except Exception as exc:
+            logger.warning("Local MMS worker finished with error after timeout/cancel: %s", _exception_detail(exc))
+
+    fut.add_done_callback(_done)
+    return fut
 
 
 def _local_mms_tts_record_success() -> None:
@@ -7806,7 +7902,7 @@ def _local_mms_tts_record_failure(exc: BaseException | str) -> None:
                 "Local MMS Khmer TTS temporarily disabled for %.0fs after %s failure(s): %s",
                 LOCAL_MMS_TTS_COOLDOWN_S,
                 _LOCAL_MMS_TTS_FAILURES,
-                exc,
+                _exception_detail(exc),
             )
 
 
@@ -8048,25 +8144,32 @@ async def _generate_voice_local_mms(text: str, speed: float, output_path: str) -
                 last_error: Exception | None = None
                 for attempt in range(1, LOCAL_MMS_TTS_RETRIES + 1):
                     try:
+                        fut = _local_mms_tts_submit_chunk(loop, chunk_text, wav_path)
+                        # Use shield so wait_for does not cancel the Future. A
+                        # running ThreadPoolExecutor job cannot be killed anyway;
+                        # cancellation only hides the real completion/error.
                         await asyncio.wait_for(
-                            loop.run_in_executor(
-                                _LOCAL_MMS_TTS_EXECUTOR,
-                                _local_mms_tts_chunk_to_wav_sync,
-                                chunk_text,
-                                wav_path,
-                            ),
+                            asyncio.shield(fut),
                             timeout=LOCAL_MMS_TTS_TIMEOUT_S,
                         )
                         input_paths.append(wav_path)
                         break
                     except Exception as exc:
-                        last_error = exc
+                        if isinstance(exc, asyncio.TimeoutError):
+                            last_error = _local_mms_timeout_error(idx, len(chunks))
+                        else:
+                            last_error = exc
                         if attempt < LOCAL_MMS_TTS_RETRIES:
                             await asyncio.sleep(LOCAL_MMS_TTS_RETRY_DELAY_S * attempt)
-                if not os.path.exists(wav_path):
+                wav_ok = False
+                try:
+                    wav_ok = os.path.exists(wav_path) and os.path.getsize(wav_path) > 44
+                except OSError:
+                    wav_ok = False
+                if not wav_ok:
                     preview = chunk_text[:80].replace("\n", " ")
                     raise RuntimeError(
-                        f"Local MMS Khmer TTS failed at chunk {idx}/{len(chunks)} ({preview!r}): {last_error}"
+                        f"Local MMS Khmer TTS failed at chunk {idx}/{len(chunks)} ({preview!r}): {_exception_detail(last_error)}"
                     )
 
             converted = await _convert_audio_files_to_telegram_voice(input_paths, speed, output_path)
@@ -8202,6 +8305,37 @@ def _hf_tts_space_predict_sync(chunk_text: str) -> bytes:
     return data
 
 
+async def _terminate_process_safely(proc: Any) -> None:
+    if proc is None or getattr(proc, "returncode", None) is not None:
+        return
+    with suppress(Exception):
+        proc.kill()
+    with suppress(Exception):
+        await asyncio.wait_for(proc.wait(), timeout=5)
+
+
+def _ffmpeg_convert_timeout(input_count: int = 1, data_bytes: int = 0) -> float:
+    # Give FFmpeg more room for large Edge MP3 payloads or multi-chunk HF/MMS
+    # conversions, but keep a bounded timeout so callbacks do not hang forever.
+    base = float(FFMPEG_CONVERT_TIMEOUT_S)
+    by_inputs = max(0, int(input_count or 1) - 1) * 20.0
+    by_size = max(0, int(data_bytes or 0)) / (512 * 1024) * 5.0
+    return min(600.0, max(base, base + by_inputs + by_size))
+
+
+async def _read_file_bytes_async(path: str, timeout: float | None = None) -> bytes:
+    try:
+        loop = asyncio.get_running_loop()
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: open(path, "rb").read()),
+            timeout=timeout or FFMPEG_READ_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"Timed out reading output audio file after {timeout or FFMPEG_READ_TIMEOUT_S:.0f}s")
+    except OSError as exc:
+        raise RuntimeError(f"Failed to read output audio file: {exc}") from exc
+
+
 async def _convert_audio_files_to_telegram_voice(input_paths: list[str], speed: float, output_path: str) -> bytes:
     """Convert one or more audio files into Telegram voice-compatible OGG/Opus."""
     if not input_paths:
@@ -8227,6 +8361,7 @@ async def _convert_audio_files_to_telegram_voice(input_paths: list[str], speed: 
 
     cmd += ["-vn", "-c:a", "libopus", "-b:a", "32k", output_path]
 
+    proc = None
     try:
         proc = await asyncio.wait_for(
             asyncio.create_subprocess_exec(
@@ -8234,26 +8369,25 @@ async def _convert_audio_files_to_telegram_voice(input_paths: list[str], speed: 
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             ),
-            timeout=5,
+            timeout=FFMPEG_START_TIMEOUT_S,
         )
-        _, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=max(60, 20 * len(input_paths)))
-    except asyncio.TimeoutError:
-        raise RuntimeError("FFmpeg timed out while converting HF TTS audio")
+        _, stderr_data = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=_ffmpeg_convert_timeout(input_count=len(input_paths)),
+        )
+    except asyncio.TimeoutError as exc:
+        await _terminate_process_safely(proc)
+        phase = "start" if proc is None else "convert"
+        raise RuntimeError(
+            f"FFmpeg {phase} timed out while converting TTS audio "
+            f"(start_timeout={FFMPEG_START_TIMEOUT_S:.0f}s, convert_timeout={_ffmpeg_convert_timeout(input_count=len(input_paths)):.0f}s)"
+        ) from exc
 
     if proc.returncode != 0:
         snippet = (stderr_data or b"").decode(errors="replace")[-600:]
         raise RuntimeError(f"FFmpeg failed converting HF TTS audio (code {proc.returncode}): {snippet}")
 
-    try:
-        loop = asyncio.get_running_loop()
-        return await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: open(output_path, "rb").read()),
-            timeout=10,
-        )
-    except asyncio.TimeoutError:
-        raise RuntimeError("Timed out reading converted HF TTS output")
-    except OSError as exc:
-        raise RuntimeError(f"Failed to read converted HF TTS output: {exc}") from exc
+    return await _read_file_bytes_async(output_path, timeout=FFMPEG_READ_TIMEOUT_S)
 
 
 async def _generate_voice_hf_space(text: str, speed: float, output_path: str) -> bytes:
@@ -8302,7 +8436,13 @@ async def _generate_voice_hf_space(text: str, speed: float, output_path: str) ->
 
 
 def _tts_user_error_message(exc: Exception | str) -> str:
-    msg = str(exc).lower()
+    msg = _exception_detail(exc).lower()
+    if "local mms" in msg and ("timeout" in msg or "worker still active" in msg or "fallback was skipped" in msg):
+        return (
+            "❌ Local MMS Khmer TTS យឺតពេក ឬ Render CPU/RAM មិនគ្រប់គ្រាន់។\n"
+            "✅ ដើម្បីកុំឲ្យ Bot គាំង ខ្ញុំបានបញ្ឈប់ fallback ពេល MMS worker នៅរត់។\n"
+            "សូមប្តូរ TTS Model ទៅ Edge ឬដាក់ KHMER_TTS_PROVIDER=edge រួច redeploy។"
+        )
     if "no audio" in msg or "edge-tts failed" in msg:
         return (
             "❌ TTS service មិនបានបញ្ជូនសំឡេងមកវិញ។\n"
@@ -8352,6 +8492,7 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
         cmd += ["-filter:a", af]
     cmd += ["-c:a", "libopus", "-b:a", "32k", output_path]
 
+    proc = None
     try:
         proc = await asyncio.wait_for(
             asyncio.create_subprocess_exec(
@@ -8360,27 +8501,27 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             ),
-            timeout=5,
+            timeout=FFMPEG_START_TIMEOUT_S,
         )
-        _, stderr_data = await asyncio.wait_for(proc.communicate(input=mp3_data), timeout=60)
-    except asyncio.TimeoutError:
-        raise RuntimeError("FFmpeg timed out after 60s")
+        _, stderr_data = await asyncio.wait_for(
+            proc.communicate(input=mp3_data),
+            timeout=_ffmpeg_convert_timeout(input_count=len(text_chunks), data_bytes=len(mp3_data)),
+        )
+    except asyncio.TimeoutError as exc:
+        await _terminate_process_safely(proc)
+        phase = "start" if proc is None else "convert"
+        raise RuntimeError(
+            f"FFmpeg {phase} timed out for Edge TTS "
+            f"(chunks={len(text_chunks)}, mp3_bytes={len(mp3_data)}, "
+            f"start_timeout={FFMPEG_START_TIMEOUT_S:.0f}s, "
+            f"convert_timeout={_ffmpeg_convert_timeout(input_count=len(text_chunks), data_bytes=len(mp3_data)):.0f}s)"
+        ) from exc
 
     if proc.returncode != 0:
         snippet = (stderr_data or b"").decode(errors="replace")[-400:]
         raise RuntimeError(f"FFmpeg failed (code {proc.returncode}): {snippet}")
 
-    try:
-        loop        = asyncio.get_running_loop()
-        audio_bytes = await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: open(output_path, "rb").read()),
-            timeout=10,
-        )
-    except asyncio.TimeoutError:
-        raise RuntimeError("Timed out reading output audio file")
-    except OSError as e:
-        raise RuntimeError(f"Failed to read output audio file: {e}") from e
-    return audio_bytes
+    return await _read_file_bytes_async(output_path, timeout=FFMPEG_READ_TIMEOUT_S)
 
 
 async def generate_voice(text: str, gender: str, speed: float, output_path: str, tts_model: str = "auto") -> bytes:
@@ -8410,14 +8551,34 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
                 user_model,
                 LOCAL_MMS_TTS_HF_FALLBACK,
                 LOCAL_MMS_TTS_EDGE_FALLBACK,
-                exc,
+                _exception_detail(exc),
+                exc_info=LOCAL_MMS_TTS_LOG_TRACEBACK,
             )
+            active_workers = _local_mms_tts_active_count()
+            if _is_local_mms_timeout_exception(exc) and not LOCAL_MMS_TTS_TIMEOUT_FALLBACK:
+                raise RuntimeError(
+                    "Local MMS Khmer TTS timed out. Fallback was skipped because the PyTorch "
+                    "worker may still be running in the background; starting Edge/HF now can "
+                    "overload Render and make FFmpeg time out. Set KHMER_TTS_PROVIDER=edge "
+                    "for stable production, or set LOCAL_MMS_TTS_TIMEOUT_FALLBACK=true on a "
+                    "larger instance."
+                ) from exc
+            if active_workers > 0 and LOCAL_MMS_TTS_BLOCK_FALLBACK_WHILE_BUSY:
+                raise RuntimeError(
+                    f"Local MMS Khmer TTS worker still active ({active_workers}). Fallback skipped "
+                    "to prevent CPU/RAM overload and FFmpeg timeout."
+                ) from exc
             if not LOCAL_MMS_TTS_EDGE_FALLBACK and not LOCAL_MMS_TTS_HF_FALLBACK:
-                raise RuntimeError(f"Local MMS Khmer TTS failed and all fallback is disabled: {exc}") from exc
+                raise RuntimeError(
+                    f"Local MMS Khmer TTS failed and all fallback is disabled: {_exception_detail(exc)}"
+                ) from exc
 
     should_try_hf = _should_try_hf_khmer_tts(text, user_model)
-    if tried_local_mms and not LOCAL_MMS_TTS_HF_FALLBACK:
-        should_try_hf = False
+    # Important: when the user explicitly selects local_mms, the normal HF
+    # routing helper intentionally returns False. After a Local MMS failure,
+    # still allow HF Space as the configured fallback before Edge.
+    if tried_local_mms:
+        should_try_hf = bool(LOCAL_MMS_TTS_HF_FALLBACK and _detect_tts_lang_key(text) == "km")
 
     if should_try_hf:
         try:
@@ -8428,10 +8589,10 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
                 "HF Khmer TTS failed; user_model=%s edge fallback=%s: %s",
                 user_model,
                 HF_TTS_EDGE_FALLBACK,
-                exc,
+                _exception_detail(exc),
             )
             if not HF_TTS_EDGE_FALLBACK:
-                raise RuntimeError(f"HF Khmer TTS failed and Edge fallback is disabled: {exc}") from exc
+                raise RuntimeError(f"HF Khmer TTS failed and Edge fallback is disabled: {_exception_detail(exc)}") from exc
 
     return await _generate_voice_edge(text, gender, speed, output_path)
 
@@ -12171,10 +12332,38 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
         _cleanup(file_path)
 
 
+def _is_bot_status_text_for_tts(text: str | None) -> bool:
+    if not LOCAL_MMS_TTS_SKIP_BOT_STATUS_TEXT:
+        return False
+    t = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not t:
+        return False
+    blocked_prefixes = (
+        "🔄 កំពុងប្តូរម៉ូដែល TTS",
+        "✅ បានប្តូរម៉ូដែល TTS",
+        "❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង",
+    )
+    if any(t.startswith(prefix) for prefix in blocked_prefixes):
+        return True
+    blocked_phrases = (
+        "កំពុងប្តូរម៉ូដែល TTS",
+        "បង្កើតសំឡេងឡើងវិញ",
+        "រកអត្ថបទដើមមិនឃើញ",
+    )
+    return any(phrase in t for phrase in blocked_phrases)
+
+
+def _valid_callback_tts_text(text: str | None) -> str | None:
+    value = str(text or "").strip()
+    if not value or _is_bot_status_text_for_tts(value):
+        return None
+    return value
+
+
 async def get_callback_original_text(query, user_id: int) -> str | None:
     """Resolve the TTS text for a callback button (3-tier fallback)."""
     if query.message is None:
-        return get_last_tts_text(user_id)
+        return _valid_callback_tts_text(get_last_tts_text(user_id))
 
     chat_id = query.message.chat.id
     msg_id  = query.message.message_id
@@ -12183,13 +12372,14 @@ async def get_callback_original_text(query, user_id: int) -> str | None:
     # 1. Exact text_cache
     try:
         original_text = await loop.run_in_executor(None, get_text_cache, msg_id, chat_id)
+        original_text = _valid_callback_tts_text(original_text)
         if original_text:
             return original_text
     except Exception as e:
         logger.warning(f"get_callback_original_text text_cache failed user={user_id}: {e}")
 
     # 2. Latest generated TTS from memory
-    original_text = get_last_tts_text(user_id)
+    original_text = _valid_callback_tts_text(get_last_tts_text(user_id))
     if original_text:
         return original_text
 
@@ -12204,6 +12394,7 @@ async def get_callback_original_text(query, user_id: int) -> str | None:
         for row in reversed(history or []):
             role    = _normalize_role(row.get("role", ""))
             content = str(row.get("content", "") or "").strip()
+            content = _valid_callback_tts_text(content)
             if role == "assistant" and content:
                 set_last_tts_text(user_id, content)
                 return content
