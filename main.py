@@ -1887,6 +1887,9 @@ def _web_system_v4_rows() -> str:
     rows.append(_web_health_item("AI provider", bool(_hf_client or _gemini), f"provider={AI_PROVIDER} model={HF_MODEL if AI_PROVIDER == 'hf' else GEMINI_MODEL}", warn=not bool(_hf_client or _gemini)))
     ocr_disabled = _hf_ocr_is_temporarily_disabled() or _ocr_provider_is_temporarily_disabled("hf") or _ocr_provider_is_temporarily_disabled("gemini")
     rows.append(_web_health_item("OCR provider", _ocr_configured(), f"provider={OCR_PROVIDER} model={HF_OCR_MODEL}; temporary_disabled={ocr_disabled}", warn=ocr_disabled or not _ocr_configured()))
+    hf_tts_configured = bool(GradioClient is not None and HF_TTS_SPACE and HF_TTS_API_NAME)
+    hf_tts_disabled = _hf_tts_is_temporarily_disabled()
+    rows.append(_web_health_item("Khmer HF Space TTS", hf_tts_configured, _tts_provider_summary() + f"; cooldown_remaining={_hf_tts_disabled_remaining_s()}s", warn=hf_tts_disabled or not hf_tts_configured))
     if _SCHED_LOCK_ENABLED and supabase:
         try:
             lock = db_lock_read(_SCHED_LOCK_KEY)
@@ -1915,6 +1918,8 @@ def _web_env_check_rows() -> str:
         ("SUPABASE_SERVICE_ROLE_KEY / SUPABASE_KEY", bool(os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY") or globals().get("SB_KEY")), "Recommended"),
         ("REDIS_URL", bool(os.environ.get("REDIS_URL") or globals().get("REDIS_URL")), "Optional cache"),
         ("HF_TOKEN / GEMINI_API_KEY", bool(os.environ.get("HF_TOKEN") or os.environ.get("GEMINI_API_KEY")), "Required for AI/OCR"),
+        ("gradio_client", GradioClient is not None, "Required for Khmer HF Space TTS"),
+        ("HF_TTS_SPACE", bool(HF_TTS_SPACE), "Default: mrrtmob/khmer-tts"),
         ("RENDER_EXTERNAL_URL", bool(os.environ.get("RENDER_EXTERNAL_URL")), "Recommended for keep-alive"),
     ]
     out = []
@@ -3089,6 +3094,10 @@ def web_admin_dashboard_alias():
 _FFMPEG_EXE = _iio_ffmpeg.get_ffmpeg_exe()
 
 import edge_tts
+try:
+    from gradio_client import Client as GradioClient
+except Exception:
+    GradioClient = None
 import io
 from dotenv import load_dotenv
 from telegram import (
@@ -3159,11 +3168,33 @@ TTS_CHUNK_CHARS         = 900
 # Edge TTS can intermittently return NoAudioReceived on Render when a voice
 # is busy, text is too long, or websocket audio chunks stop arriving.
 # These values keep each Edge request small and allow retry/fallback voices.
-EDGE_TTS_CHUNK_CHARS      = max(120, min(700, int(os.environ.get("EDGE_TTS_CHUNK_CHARS", "600"))))
-EDGE_TTS_RETRIES          = max(1, int(os.environ.get("EDGE_TTS_RETRIES", "3")))
-EDGE_TTS_RETRY_DELAY_S    = max(0.2, float(os.environ.get("EDGE_TTS_RETRY_DELAY_S", "0.8")))
-EDGE_TTS_STREAM_TIMEOUT_S = max(15.0, float(os.environ.get("EDGE_TTS_STREAM_TIMEOUT_S", "45")))
-EDGE_TTS_CROSS_LANG_FALLBACK = os.environ.get("EDGE_TTS_CROSS_LANG_FALLBACK", "0") == "1"
+EDGE_TTS_CHUNK_CHARS      = _env_int("EDGE_TTS_CHUNK_CHARS", 600, minimum=120, maximum=700)
+EDGE_TTS_RETRIES          = _env_int("EDGE_TTS_RETRIES", 3, minimum=1, maximum=8)
+EDGE_TTS_RETRY_DELAY_S    = _env_float("EDGE_TTS_RETRY_DELAY_S", 0.8, minimum=0.2, maximum=10.0)
+EDGE_TTS_STREAM_TIMEOUT_S = _env_float("EDGE_TTS_STREAM_TIMEOUT_S", 45.0, minimum=15.0, maximum=180.0)
+EDGE_TTS_CROSS_LANG_FALLBACK = _env_bool("EDGE_TTS_CROSS_LANG_FALLBACK", False)
+
+# Khmer TTS V2: optional Hugging Face Gradio Space provider.
+# Confirmed normal endpoint from `Client.view_api()` for mrrtmob/khmer-tts:
+#   client.predict(text, "kiri", 0.6, 0.95, 1.1, 2048, api_name="/lambda")
+# Keep Edge TTS as fallback because public Spaces can cold-start, sleep, or rate-limit.
+TTS_PROVIDER             = (os.environ.get("TTS_PROVIDER") or "auto").strip().lower()       # auto | edge | hf_space | khmer_hf_space
+KHMER_TTS_PROVIDER       = (os.environ.get("KHMER_TTS_PROVIDER") or "hf_space").strip().lower()  # hf_space | edge
+HF_TTS_SPACE             = (os.environ.get("HF_TTS_SPACE") or "mrrtmob/khmer-tts").strip()
+HF_TTS_API_NAME          = (os.environ.get("HF_TTS_API_NAME") or "/lambda").strip()
+HF_TTS_TOKEN             = (os.environ.get("HF_TTS_TOKEN") or os.environ.get("HF_TOKEN") or "").strip()
+HF_TTS_VOICE             = (os.environ.get("HF_TTS_VOICE") or "kiri").strip()
+HF_TTS_TEMP              = _env_float("HF_TTS_TEMP", 0.6, minimum=0.05, maximum=2.0)
+HF_TTS_TOP_P             = _env_float("HF_TTS_TOP_P", 0.95, minimum=0.05, maximum=1.0)
+HF_TTS_REP_PEN           = _env_float("HF_TTS_REP_PEN", 1.1, minimum=0.5, maximum=3.0)
+HF_TTS_MAX_TOK           = _env_int("HF_TTS_MAX_TOK", 2048, minimum=128, maximum=4096)
+HF_TTS_MAX_CHARS         = _env_int("HF_TTS_MAX_CHARS", 300, minimum=50, maximum=1200)
+HF_TTS_TIMEOUT_S         = _env_float("HF_TTS_TIMEOUT_S", 90.0, minimum=15.0, maximum=240.0)
+HF_TTS_RETRIES           = _env_int("HF_TTS_RETRIES", 2, minimum=1, maximum=5)
+HF_TTS_RETRY_DELAY_S     = _env_float("HF_TTS_RETRY_DELAY_S", 2.0, minimum=0.2, maximum=20.0)
+HF_TTS_EDGE_FALLBACK     = _env_bool("HF_TTS_EDGE_FALLBACK", True)
+HF_TTS_FAILURE_LIMIT     = _env_int("HF_TTS_FAILURE_LIMIT", 3, minimum=1, maximum=20)
+HF_TTS_COOLDOWN_S        = _env_float("HF_TTS_COOLDOWN_S", 300.0, minimum=30.0, maximum=3600.0)
 DEFAULT_SPEED           = 1.0
 TELE_MSG_LIMIT          = 4000
 USER_COOLDOWN_S         = 3.0
@@ -4166,7 +4197,40 @@ _PREFS_MAX_SIZE = 10_000
 _prefs_cache: OrderedDict[int, tuple[dict, float]] = OrderedDict()
 _prefs_cache_lock: asyncio.Lock | None = None
 
-DEFAULT_USER_PREFS: dict = {"gender": "female", "speed": DEFAULT_SPEED}
+TTS_MODEL_OPTIONS = {
+    "auto": ("Auto", "Khmer HF Space → Edge fallback"),
+    "hf_space": ("Khmer HF", "mrrtmob/khmer-tts for Khmer text"),
+    "edge": ("Edge", "Microsoft Edge TTS for all languages"),
+}
+TTS_MODEL_ALIASES = {
+    "auto": "auto",
+    "default": "auto",
+    "server": "auto",
+    "hf": "hf_space",
+    "hf_space": "hf_space",
+    "khmer_hf": "hf_space",
+    "khmer_hf_space": "hf_space",
+    "khmer-tts": "hf_space",
+    "mrrtmob": "hf_space",
+    "edge": "edge",
+    "edge_tts": "edge",
+    "msedge": "edge",
+}
+DEFAULT_TTS_MODEL = (os.environ.get("DEFAULT_TTS_MODEL") or os.environ.get("USER_DEFAULT_TTS_MODEL") or "auto").strip().lower()
+
+
+def _normalize_tts_model(value: Any) -> str:
+    raw = str(value or DEFAULT_TTS_MODEL or "auto").strip().lower().replace("-", "_")
+    return TTS_MODEL_ALIASES.get(raw, "auto")
+
+
+def _tts_model_label(value: Any) -> str:
+    key = _normalize_tts_model(value)
+    label, hint = TTS_MODEL_OPTIONS.get(key, TTS_MODEL_OPTIONS["auto"])
+    return f"{label} — {hint}"
+
+
+DEFAULT_USER_PREFS: dict = {"gender": "female", "speed": DEFAULT_SPEED, "tts_model": _normalize_tts_model(DEFAULT_TTS_MODEL)}
 
 
 def _prefs_redis_key(user_id: int) -> str:
@@ -4187,6 +4251,8 @@ def _normalize_user_prefs(row: dict | None) -> dict:
         prefs["speed"] = max(_SPEED_MIN, min(_SPEED_MAX, float(raw_speed)))
     except Exception:
         prefs["speed"] = DEFAULT_SPEED
+
+    prefs["tts_model"] = _normalize_tts_model(row.get("tts_model", prefs.get("tts_model")))
 
     return prefs
 
@@ -4259,7 +4325,7 @@ async def get_user_prefs_async(user_id: int) -> dict:
         res = await db_call(
             f"get_user_prefs:{user_id}",
             lambda: supabase.table("user_prefs")
-                .select("gender, speed")
+                .select("gender, speed, tts_model")
                 .eq("user_id", user_id)
                 .limit(1)
                 .execute(),
@@ -4268,6 +4334,20 @@ async def get_user_prefs_async(user_id: int) -> dict:
             timeout=12,
             critical=False,
         )
+        if res is None:
+            # Older deployments may not have the optional tts_model column yet.
+            res = await db_call(
+                f"get_user_prefs:{user_id}:legacy",
+                lambda: supabase.table("user_prefs")
+                    .select("gender, speed")
+                    .eq("user_id", user_id)
+                    .limit(1)
+                    .execute(),
+                default=None,
+                attempts=2,
+                timeout=12,
+                critical=False,
+            )
 
         rows = getattr(res, "data", None) if res else None
         prefs = _normalize_user_prefs((rows or [None])[0])
@@ -4753,6 +4833,36 @@ def update_user_speed(user_id: int, speed: float) -> None:
     _submit_db(_run)
 
 
+def update_user_tts_model(user_id: int, tts_model: str) -> str:
+    """Persist the user's preferred TTS model/provider.
+
+    Returns the normalized model key so callback handlers can use it immediately
+    even before the async Supabase write completes.
+    """
+    model = _normalize_tts_model(tts_model)
+    _invalidate_prefs(user_id)
+    if not supabase:
+        return model
+
+    def _run():
+        res = db_call_sync(
+            f"update_user_tts_model:{user_id}",
+            lambda: supabase.table("user_prefs").update({"tts_model": model}).eq("user_id", user_id).execute(),
+            default=None,
+            attempts=3,
+            critical=False,
+        )
+        if res is None:
+            _log_once(
+                logging.ERROR,
+                "tts_model_column_or_update_error",
+                "update_user_tts_model failed. If the column is missing, run: ALTER TABLE user_prefs ADD COLUMN tts_model TEXT DEFAULT 'auto';",
+            )
+
+    _submit_db(_run)
+    return model
+
+
 _rls_warned = False
 
 # Fast cache for callback buttons: memory -> Redis -> Supabase.
@@ -4965,6 +5075,28 @@ def ensure_speed_column() -> None:
         )
 
 
+
+def ensure_tts_model_column() -> None:
+    if not supabase:
+        logger.info("ensure_tts_model_column: Supabase not configured, skipping.")
+        return
+
+    res = db_call_sync(
+        "ensure_tts_model_column",
+        lambda: supabase.table("user_prefs").select("tts_model").limit(1).execute(),
+        default=None,
+        attempts=2,
+        critical=False,
+    )
+    if res is not None:
+        logger.info("tts_model column present.")
+    else:
+        logger.warning(
+            "Could not verify user_prefs.tts_model. If missing, run:\n"
+            "  ALTER TABLE user_prefs ADD COLUMN tts_model TEXT DEFAULT 'auto';"
+        )
+
+
 def startup_self_check() -> None:
     """Log actionable setup problems once at startup without crashing the bot."""
     checks: list[str] = []
@@ -4984,6 +5116,10 @@ def startup_self_check() -> None:
         checks.append("HF_TOKEN is missing; Hugging Face OCR will be unavailable")
     if OCR_PROVIDER in ("auto", "gemini") and not GEMINI_API_KEY:
         checks.append("GEMINI_API_KEY is missing; Gemini OCR/audio fallback will be unavailable")
+    if (TTS_PROVIDER in {"auto", "hf", "hf_space", "khmer_hf_space", "khmer-tts"} or KHMER_TTS_PROVIDER in {"hf", "hf_space", "khmer_hf_space", "khmer-tts"}) and GradioClient is None:
+        checks.append("gradio_client is missing; Khmer HF Space TTS will fall back to Edge. Add `gradio_client` to requirements.txt")
+    if _should_try_hf_khmer_tts("សាកល្បង", "hf_space") and not HF_TTS_SPACE:
+        checks.append("HF_TTS_SPACE is empty; Khmer HF Space TTS is disabled")
     if not REDIS_URL:
         checks.append("REDIS_URL is missing; cache/history fallback will use memory + Supabase only")
 
@@ -5216,6 +5352,7 @@ def db_user_reset_prefs(user_id: int) -> tuple[bool, str]:
             "user_id": user_id,
             "gender": "female",
             "speed": DEFAULT_SPEED,
+            "tts_model": _normalize_tts_model(DEFAULT_TTS_MODEL),
         }, on_conflict="user_id").execute()
         return True, "reset"
     except Exception as e:
@@ -5248,6 +5385,7 @@ def _format_user_detail_text(row: dict) -> str:
     username = html.escape(str(row.get("username") or row.get("first_name") or "-"))
     gender = html.escape(str(row.get("gender") or "female"))
     speed = html.escape(str(row.get("speed") or DEFAULT_SPEED))
+    tts_model = html.escape(_tts_model_label(row.get("tts_model") or DEFAULT_TTS_MODEL))
     last_active = html.escape(str(row.get("last_active") or "-")[:19].replace("T", " "))
     blocked = "🚫 BLOCKED" if row.get("blocked") else "✅ ACTIVE"
     history_rows = row.get("history") or []
@@ -5266,6 +5404,7 @@ def _format_user_detail_text(row: dict) -> str:
         f"Status: <b>{blocked}</b>\n"
         f"Voice: <b>{gender}</b>\n"
         f"Speed: <b>{speed}x</b>\n"
+        f"TTS model: <b>{tts_model}</b>\n"
         f"Last active: <b>{last_active}</b>\n\n"
         "<b>Recent history</b>\n"
         f"{history_text}"
@@ -6814,6 +6953,241 @@ async def _edge_tts_stream_with_retry(chunk_text: str, voices: list[str]) -> tup
     raise RuntimeError(f"edge-tts failed after retries/fallbacks. {detail}")
 
 
+# Khmer HF Space provider state. Protected by a lock because Gradio calls run in worker threads.
+_HF_TTS_STATE_LOCK = threading.Lock()
+_HF_TTS_FAILURES = 0
+_HF_TTS_DISABLED_UNTIL = 0.0
+
+
+def _tts_provider_summary() -> str:
+    return (
+        f"provider={TTS_PROVIDER}, khmer={KHMER_TTS_PROVIDER}, "
+        f"hf_space={HF_TTS_SPACE}{HF_TTS_API_NAME}, "
+        f"gradio_client={'on' if GradioClient is not None else 'missing'}, "
+        f"edge_fallback={'on' if HF_TTS_EDGE_FALLBACK else 'off'}"
+    )
+
+
+def _hf_tts_is_temporarily_disabled() -> bool:
+    with _HF_TTS_STATE_LOCK:
+        return time.monotonic() < _HF_TTS_DISABLED_UNTIL
+
+
+def _hf_tts_disabled_remaining_s() -> int:
+    with _HF_TTS_STATE_LOCK:
+        return max(0, int(_HF_TTS_DISABLED_UNTIL - time.monotonic()))
+
+
+def _hf_tts_record_success() -> None:
+    global _HF_TTS_FAILURES, _HF_TTS_DISABLED_UNTIL
+    with _HF_TTS_STATE_LOCK:
+        _HF_TTS_FAILURES = 0
+        _HF_TTS_DISABLED_UNTIL = 0.0
+
+
+def _hf_tts_record_failure(exc: BaseException | str) -> None:
+    global _HF_TTS_FAILURES, _HF_TTS_DISABLED_UNTIL
+    with _HF_TTS_STATE_LOCK:
+        _HF_TTS_FAILURES += 1
+        if _HF_TTS_FAILURES >= HF_TTS_FAILURE_LIMIT:
+            _HF_TTS_DISABLED_UNTIL = time.monotonic() + HF_TTS_COOLDOWN_S
+            logger.warning(
+                "HF Khmer TTS temporarily disabled for %.0fs after %s failure(s): %s",
+                HF_TTS_COOLDOWN_S,
+                _HF_TTS_FAILURES,
+                exc,
+            )
+
+
+def _should_try_hf_khmer_tts(text: str, tts_model: str = "auto") -> bool:
+    if _detect_tts_lang_key(text) != "km":
+        return False
+
+    user_model = _normalize_tts_model(tts_model)
+    if user_model == "edge":
+        return False
+    if user_model == "hf_space":
+        return True
+
+    # Auto mode follows server-level env config.
+    mode = (TTS_PROVIDER or "auto").strip().lower()
+    khmer_mode = (KHMER_TTS_PROVIDER or "hf_space").strip().lower()
+    if mode in {"edge", "edge_tts"} or khmer_mode in {"edge", "edge_tts"}:
+        return False
+    if mode in {"hf", "hf_space", "khmer_hf_space", "khmer-tts", "auto"}:
+        return True
+    return khmer_mode in {"hf", "hf_space", "khmer_hf_space", "khmer-tts"}
+
+
+def _extract_hf_audio_path_or_url(audio_obj: Any) -> str:
+    if isinstance(audio_obj, str):
+        return audio_obj
+    if isinstance(audio_obj, dict):
+        for key in ("path", "url", "name"):
+            val = audio_obj.get(key)
+            if val:
+                return str(val)
+    for attr in ("path", "url", "name"):
+        val = getattr(audio_obj, attr, None)
+        if val:
+            return str(val)
+    return ""
+
+
+def _audio_suffix_from_bytes(data: bytes) -> str:
+    head = data[:16]
+    if head.startswith(b"RIFF"):
+        return ".wav"
+    if head.startswith(b"OggS"):
+        return ".ogg"
+    if head.startswith(b"ID3") or head[:2] in {b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"}:
+        return ".mp3"
+    if b"ftyp" in head:
+        return ".mp4"
+    return ".audio"
+
+
+def _hf_tts_space_predict_sync(chunk_text: str) -> bytes:
+    """Blocking Gradio call for mrrtmob/khmer-tts. Run only in an executor."""
+    if GradioClient is None:
+        raise RuntimeError("gradio_client is not installed. Add `gradio_client` to requirements.txt.")
+    if not HF_TTS_SPACE:
+        raise RuntimeError("HF_TTS_SPACE is empty.")
+
+    # HF_TOKEN is optional for public Spaces, but useful for authenticated/rate-limited calls.
+    if HF_TTS_TOKEN:
+        try:
+            client = GradioClient(HF_TTS_SPACE, hf_token=HF_TTS_TOKEN)
+        except TypeError:
+            client = GradioClient(HF_TTS_SPACE)
+    else:
+        client = GradioClient(HF_TTS_SPACE)
+
+    result = client.predict(
+        chunk_text,
+        HF_TTS_VOICE,
+        HF_TTS_TEMP,
+        HF_TTS_TOP_P,
+        HF_TTS_REP_PEN,
+        HF_TTS_MAX_TOK,
+        api_name=HF_TTS_API_NAME,
+    )
+    audio_obj = result[0] if isinstance(result, (tuple, list)) and result else result
+    path_or_url = _extract_hf_audio_path_or_url(audio_obj)
+    if not path_or_url:
+        raise RuntimeError(f"HF TTS returned no audio path. result={type(result).__name__}")
+
+    if re.match(r"^https?://", path_or_url, re.I):
+        resp = requests.get(path_or_url, timeout=(10, HF_TTS_TIMEOUT_S))
+        resp.raise_for_status()
+        data = resp.content or b""
+    else:
+        with open(path_or_url, "rb") as fh:
+            data = fh.read()
+    if not data:
+        raise RuntimeError("HF TTS returned empty audio.")
+    return data
+
+
+async def _convert_audio_files_to_telegram_voice(input_paths: list[str], speed: float, output_path: str) -> bytes:
+    """Convert one or more audio files into Telegram voice-compatible OGG/Opus."""
+    if not input_paths:
+        raise RuntimeError("No audio files to convert.")
+
+    speed_key = _rounded_speed(speed)
+    af = _build_atempo_chain(speed_key) if abs(speed_key - DEFAULT_SPEED) > 1e-4 else None
+
+    cmd = [_FFMPEG_EXE, "-y"]
+    for path in input_paths:
+        cmd += ["-i", path]
+
+    if len(input_paths) > 1:
+        concat_inputs = "".join(f"[{idx}:a]" for idx in range(len(input_paths)))
+        filter_complex = f"{concat_inputs}concat=n={len(input_paths)}:v=0:a=1[a0]"
+        map_label = "[a0]"
+        if af:
+            filter_complex += f";[a0]{af}[aout]"
+            map_label = "[aout]"
+        cmd += ["-filter_complex", filter_complex, "-map", map_label]
+    elif af:
+        cmd += ["-filter:a", af]
+
+    cmd += ["-vn", "-c:a", "libopus", "-b:a", "32k", output_path]
+
+    try:
+        proc = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            ),
+            timeout=5,
+        )
+        _, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=max(60, 20 * len(input_paths)))
+    except asyncio.TimeoutError:
+        raise RuntimeError("FFmpeg timed out while converting HF TTS audio")
+
+    if proc.returncode != 0:
+        snippet = (stderr_data or b"").decode(errors="replace")[-600:]
+        raise RuntimeError(f"FFmpeg failed converting HF TTS audio (code {proc.returncode}): {snippet}")
+
+    try:
+        loop = asyncio.get_running_loop()
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: open(output_path, "rb").read()),
+            timeout=10,
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError("Timed out reading converted HF TTS output")
+    except OSError as exc:
+        raise RuntimeError(f"Failed to read converted HF TTS output: {exc}") from exc
+
+
+async def _generate_voice_hf_space(text: str, speed: float, output_path: str) -> bytes:
+    """Generate Khmer TTS with mrrtmob/khmer-tts and convert to Telegram voice."""
+    if _hf_tts_is_temporarily_disabled():
+        raise RuntimeError(f"HF Khmer TTS cooldown active ({_hf_tts_disabled_remaining_s()}s remaining)")
+
+    chunks = _split_text_chunks(text, max_chars=HF_TTS_MAX_CHARS)
+    if not chunks:
+        raise ValueError("HF Khmer TTS: no speakable text chunks")
+
+    loop = asyncio.get_running_loop()
+    with tempfile.TemporaryDirectory(prefix="hf_khmer_tts_") as tmpdir:
+        input_paths: list[str] = []
+        for idx, chunk_text in enumerate(chunks, 1):
+            last_error: Exception | None = None
+            audio_bytes = b""
+            for attempt in range(1, HF_TTS_RETRIES + 1):
+                try:
+                    audio_bytes = await asyncio.wait_for(
+                        loop.run_in_executor(_AI_EXECUTOR, _hf_tts_space_predict_sync, chunk_text),
+                        timeout=HF_TTS_TIMEOUT_S,
+                    )
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < HF_TTS_RETRIES:
+                        await asyncio.sleep(HF_TTS_RETRY_DELAY_S * attempt)
+            if not audio_bytes:
+                preview = chunk_text[:80].replace("\n", " ")
+                raise RuntimeError(
+                    f"HF Khmer TTS failed at chunk {idx}/{len(chunks)} ({preview!r}): {last_error}"
+                )
+            suffix = _audio_suffix_from_bytes(audio_bytes)
+            in_path = os.path.join(tmpdir, f"chunk_{idx:03d}{suffix}")
+            with open(in_path, "wb") as fh:
+                fh.write(audio_bytes)
+            input_paths.append(in_path)
+
+        converted = await _convert_audio_files_to_telegram_voice(input_paths, speed, output_path)
+        if not converted:
+            raise RuntimeError("HF Khmer TTS produced empty converted output")
+        _hf_tts_record_success()
+        logger.info("HF Khmer TTS generated %s chunk(s) via %s%s", len(chunks), HF_TTS_SPACE, HF_TTS_API_NAME)
+        return converted
+
+
 def _tts_user_error_message(exc: Exception | str) -> str:
     msg = str(exc).lower()
     if "no audio" in msg or "edge-tts failed" in msg:
@@ -6828,7 +7202,7 @@ def _tts_user_error_message(exc: Exception | str) -> str:
     return "❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"
 
 
-async def generate_voice(text: str, gender: str, speed: float, output_path: str) -> bytes:
+async def _generate_voice_edge(text: str, gender: str, speed: float, output_path: str) -> bytes:
     text = _clean_tts_text_for_edge(text)
     if not text:
         raise ValueError("generate_voice: text must not be empty")
@@ -6896,12 +7270,42 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str)
     return audio_bytes
 
 
-async def generate_voice_limited(text: str, gender: str, speed: float, output_path: str) -> bytes:
+async def generate_voice(text: str, gender: str, speed: float, output_path: str, tts_model: str = "auto") -> bytes:
+    """Generate Telegram voice audio using the user's selected TTS model.
+
+    User model routing:
+      - auto: server default; Khmer usually uses HF Space, English uses Edge.
+      - hf_space: force mrrtmob/khmer-tts for Khmer text; English still uses Edge.
+      - edge: force Edge TTS for all supported languages.
+    """
+    text = _clean_tts_text_for_edge(text)
+    if not text:
+        raise ValueError("generate_voice: text must not be empty")
+
+    user_model = _normalize_tts_model(tts_model)
+    if _should_try_hf_khmer_tts(text, user_model):
+        try:
+            return await _generate_voice_hf_space(text, speed, output_path)
+        except Exception as exc:
+            _hf_tts_record_failure(exc)
+            logger.warning(
+                "HF Khmer TTS failed; user_model=%s edge fallback=%s: %s",
+                user_model,
+                HF_TTS_EDGE_FALLBACK,
+                exc,
+            )
+            if not HF_TTS_EDGE_FALLBACK:
+                raise RuntimeError(f"HF Khmer TTS failed and Edge fallback is disabled: {exc}") from exc
+
+    return await _generate_voice_edge(text, gender, speed, output_path)
+
+
+async def generate_voice_limited(text: str, gender: str, speed: float, output_path: str, tts_model: str = "auto") -> bytes:
     sem = _TTS_CHUNK_SEMAPHORE
     if sem is None:
-        return await generate_voice(text, gender, speed, output_path)
+        return await generate_voice(text, gender, speed, output_path, tts_model)
     async with sem:
-        return await generate_voice(text, gender, speed, output_path)
+        return await generate_voice(text, gender, speed, output_path, tts_model)
 
 
 # ---------------------------------------------------------------------------
@@ -7105,6 +7509,7 @@ async def _deliver_paged_tts(
     speed: float,
     user_id: int,
     username: str,
+    tts_model: str = "auto",
 ) -> None:
     chunks = _split_text_chunks(text)
     if not chunks:
@@ -7117,13 +7522,13 @@ async def _deliver_paged_tts(
     for i, chunk in enumerate(chunks, 1):
         file_path = _make_temp_ogg()
         try:
-            audio_bytes = await generate_voice_limited(chunk, gender, speed, file_path)
+            audio_bytes = await generate_voice_limited(chunk, gender, speed, file_path, tts_model)
             sent = await safe_send(
                 lambda ab=audio_bytes, ci=i, ct=total: bot.send_voice(
                     chat_id=chat_id,
                     voice=io.BytesIO(ab),
                     caption=f"🗣️ {BOT_TAG}  [{ci}/{ct}]",
-                    reply_markup=get_main_kb(gender),
+                    reply_markup=get_main_kb(gender, tts_model),
                 )
             )
             if sent:
@@ -7151,14 +7556,27 @@ async def _deliver_paged_tts(
 # ---------------------------------------------------------------------------
 # Keyboard builders
 # ---------------------------------------------------------------------------
-def get_main_kb(gender: str) -> InlineKeyboardMarkup:
+def get_main_kb(gender: str, tts_model: str = "auto") -> InlineKeyboardMarkup:
     f_btn = "👩 សំឡេងស្រី" + (" ✅" if gender == "female" else "")
     m_btn = "👨 សំឡេងប្រុស" + (" ✅" if gender == "male" else "")
+    model_key = _normalize_tts_model(tts_model)
+    model_btn = f"🤖 ម៉ូដែល TTS: {TTS_MODEL_OPTIONS.get(model_key, TTS_MODEL_OPTIONS['auto'])[0]}"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f_btn, callback_data="tg_female"),
          InlineKeyboardButton(m_btn, callback_data="tg_male")],
-        [InlineKeyboardButton("🎚️ ល្បឿនសំឡេង", callback_data="show_speed")],
+        [InlineKeyboardButton("🎚️ ល្បឿនសំឡេង", callback_data="show_speed"),
+         InlineKeyboardButton(model_btn, callback_data="show_tts_model")],
     ])
+
+
+def get_tts_model_kb(current_model: str = "auto") -> InlineKeyboardMarkup:
+    current = _normalize_tts_model(current_model)
+    rows: list[list[InlineKeyboardButton]] = []
+    for key, (label, hint) in TTS_MODEL_OPTIONS.items():
+        suffix = " ✅" if key == current else ""
+        rows.append([InlineKeyboardButton(f"{label}{suffix} — {hint}", callback_data=f"ttsmodel_{key}")])
+    rows.append([InlineKeyboardButton("🔙 ត្រឡប់", callback_data="hide_tts_model")])
+    return InlineKeyboardMarkup(rows)
 
 
 def get_speed_kb(current_speed: float) -> InlineKeyboardMarkup:
@@ -8781,6 +9199,7 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
 
     gender = prefs["gender"]
     speed  = prefs["speed"]
+    tts_model = prefs.get("tts_model", "auto")
     uname  = query.from_user.username or query.from_user.first_name or str(user_id)
 
     with suppress(Exception):
@@ -8796,7 +9215,7 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
             await _deliver_paged_tts(
                 chat_id=chat_id, bot=context.bot,
                 text=full_text, gender=gender, speed=speed,
-                user_id=user_id, username=uname,
+                user_id=user_id, username=uname, tts_model=tts_model,
             )
             record_turn(user_id, "assistant", full_text[:CONV_CONTEXT_MAX_CHARS])
             _set_last_tts(user_id)
@@ -9962,13 +10381,28 @@ async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (lbl for _, (lbl, val) in SPEED_OPTIONS.items() if abs(val - prefs["speed"]) < 0.01),
         f"{prefs['speed']}x",
     )
+    model_label = _tts_model_label(prefs.get("tts_model", "auto"))
     await safe_send(lambda: update.message.reply_text(
         f"⚙️ <b>ការកំណត់របស់អ្នក</b>\n\n"
         f"🗣️ សំឡេង: <b>{gender_label}</b>\n"
-        f"🎚️ ល្បឿន: <b>{speed_label}</b>\n\n"
+        f"🎚️ ល្បឿន: <b>{speed_label}</b>\n"
+        f"🤖 ម៉ូដែល TTS: <b>{html.escape(model_label)}</b>\n\n"
         "ផ្ញើ text ណាមួយ ហើយប្រើប៊ូតុងក្រោមសំឡេង ដើម្បីប្តូរ។",
         parse_mode="HTML",
-        reply_markup=get_main_kb(prefs["gender"]),
+        reply_markup=get_main_kb(prefs["gender"], prefs.get("tts_model", "auto")),
+    ))
+
+
+async def cmd_ttsmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    prefs = await get_user_prefs_async(user_id)
+    await safe_send(lambda: update.message.reply_text(
+        "🤖 <b>ជ្រើសរើសម៉ូដែល TTS</b>\n\n"
+        "Auto: Khmer HF Space សម្រាប់ខ្មែរ និង Edge fallback\n"
+        "Khmer HF: ប្រើ mrrtmob/khmer-tts សម្រាប់អត្ថបទខ្មែរ\n"
+        "Edge: ប្រើ Microsoft Edge TTS គ្រប់ភាសា",
+        parse_mode="HTML",
+        reply_markup=get_tts_model_kb(prefs.get("tts_model", "auto")),
     ))
 
 
@@ -10436,9 +10870,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resolve_tts_text(user_id, stripped, loop),
     )
 
-    gender   = prefs["gender"]
-    speed    = prefs["speed"]
-    tts_text = tts_text.strip() or stripped
+    gender    = prefs["gender"]
+    speed     = prefs["speed"]
+    tts_model = prefs.get("tts_model", "auto")
+    tts_text  = tts_text.strip() or stripped
 
     file_path  = _make_temp_ogg()
     stop_event = asyncio.Event()
@@ -10449,12 +10884,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with lock:
         try:
-            audio_bytes = await generate_voice_limited(tts_text, gender, speed, file_path)
+            audio_bytes = await generate_voice_limited(tts_text, gender, speed, file_path, tts_model)
             sent_msg    = await safe_send(
                 lambda ab=audio_bytes: msg.reply_voice(
                     voice=io.BytesIO(ab),
                     caption=f"🗣️ {BOT_TAG}",
-                    reply_markup=get_main_kb(gender),
+                    reply_markup=get_main_kb(gender, tts_model),
                 )
             )
             if sent_msg:
@@ -10491,8 +10926,37 @@ async def _cb_show_speed(query, user_id: int, context):
 async def _cb_hide_speed(query, user_id: int, context):
     prefs = await get_user_prefs_async(user_id)
     await safe_send(lambda: query.message.edit_reply_markup(
-        reply_markup=get_main_kb(prefs["gender"])
+        reply_markup=get_main_kb(prefs["gender"], prefs.get("tts_model", "auto"))
     ))
+
+
+async def _cb_show_tts_model(query, user_id: int, context):
+    prefs = await get_user_prefs_async(user_id)
+    await safe_send(lambda: query.message.edit_reply_markup(
+        reply_markup=get_tts_model_kb(prefs.get("tts_model", "auto"))
+    ))
+
+
+async def _cb_hide_tts_model(query, user_id: int, context):
+    prefs = await get_user_prefs_async(user_id)
+    await safe_send(lambda: query.message.edit_reply_markup(
+        reply_markup=get_main_kb(prefs["gender"], prefs.get("tts_model", "auto"))
+    ))
+
+
+async def _cb_tts_model(query, user_id: int, context, data: str):
+    if query.message is None:
+        return
+
+    model = update_user_tts_model(user_id, data.replace("ttsmodel_", "", 1))
+    prefs = await get_user_prefs_async(user_id)
+    prefs["tts_model"] = model
+
+    await safe_send(lambda: query.message.edit_reply_markup(
+        reply_markup=get_main_kb(prefs["gender"], model)
+    ))
+    with suppress(Exception):
+        await query.answer(f"TTS model: {_tts_model_label(model)}", show_alert=False)
 
 
 async def get_callback_original_text(query, user_id: int) -> str | None:
@@ -10558,6 +11022,7 @@ async def _cb_speed(query, user_id: int, context, data: str):
         return
 
     gender = prefs["gender"]
+    tts_model = prefs.get("tts_model", "auto")
     update_user_speed(user_id, new_speed)
 
     file_path  = _make_temp_ogg()
@@ -10568,7 +11033,7 @@ async def _cb_speed(query, user_id: int, context, data: str):
     try:
         async with lock:
             try:
-                audio_bytes = await generate_voice_limited(original_text, gender, new_speed, file_path)
+                audio_bytes = await generate_voice_limited(original_text, gender, new_speed, file_path, tts_model)
                 with suppress(Exception):
                     await query.message.delete()
                 # FIX: was query.message.chat.send_voice() which is not a valid method.
@@ -10578,7 +11043,7 @@ async def _cb_speed(query, user_id: int, context, data: str):
                         chat_id=chat_id,
                         voice=io.BytesIO(ab),
                         caption=f"🗣️ {BOT_TAG}",
-                        reply_markup=get_main_kb(g),
+                        reply_markup=get_main_kb(g, tts_model),
                     )
                 )
                 if new_msg:
@@ -10622,6 +11087,7 @@ async def _cb_gender(query, user_id: int, context, data: str):
         return
 
     speed = prefs["speed"]
+    tts_model = prefs.get("tts_model", "auto")
     update_user_gender(user_id, new_gender)
 
     file_path  = _make_temp_ogg()
@@ -10632,7 +11098,7 @@ async def _cb_gender(query, user_id: int, context, data: str):
     try:
         async with lock:
             try:
-                audio_bytes = await generate_voice_limited(original_text, new_gender, speed, file_path)
+                audio_bytes = await generate_voice_limited(original_text, new_gender, speed, file_path, tts_model)
                 with suppress(Exception):
                     await query.message.delete()
                 # FIX: was query.message.chat.send_voice() — Chat object has no send_voice.
@@ -10642,7 +11108,7 @@ async def _cb_gender(query, user_id: int, context, data: str):
                         chat_id=chat_id,
                         voice=io.BytesIO(ab),
                         caption=f"🗣️ {BOT_TAG}",
-                        reply_markup=get_main_kb(ng),
+                        reply_markup=get_main_kb(ng, tts_model),
                     )
                 )
                 if new_msg:
@@ -10689,6 +11155,7 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
 
     gender     = prefs["gender"]
     speed      = prefs["speed"]
+    tts_model  = prefs.get("tts_model", "auto")
     file_path  = _make_temp_ogg()
     stop_event = asyncio.Event()
     timer_task = asyncio.create_task(send_status_timer(chat_id, context.bot, stop_event))
@@ -10697,14 +11164,14 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
     try:
         async with lock:
             try:
-                audio_bytes = await generate_voice_limited(original_text, gender, speed, file_path)
+                audio_bytes = await generate_voice_limited(original_text, gender, speed, file_path, tts_model)
                 # FIX: was query.message.chat.send_voice() — Chat object has no send_voice.
                 new_msg = await safe_send(
                     lambda ab=audio_bytes, g=gender: context.bot.send_voice(
                         chat_id=chat_id,
                         voice=io.BytesIO(ab),
                         caption=f"🗣️ {BOT_TAG}",
-                        reply_markup=get_main_kb(g),
+                        reply_markup=get_main_kb(g, tts_model),
                     )
                 )
                 if new_msg:
@@ -10750,6 +11217,7 @@ async def _cb_audio_tts(query, user_id: int, context, data: str):
 
     gender    = prefs["gender"]
     speed     = prefs["speed"]
+    tts_model = prefs.get("tts_model", "auto")
     uname     = query.from_user.username or query.from_user.first_name or str(user_id)
 
     # FIX: Only remove the button markup AFTER TTS succeeds. If we remove it
@@ -10765,7 +11233,7 @@ async def _cb_audio_tts(query, user_id: int, context, data: str):
                 await _deliver_paged_tts(
                     chat_id=chat_id, bot=context.bot,
                     text=full_text, gender=gender, speed=speed,
-                    user_id=user_id, username=uname,
+                    user_id=user_id, username=uname, tts_model=tts_model,
                 )
                 record_turn(user_id, "assistant", full_text[:CONV_CONTEXT_MAX_CHARS])
                 # Remove markup only after successful delivery
@@ -10808,6 +11276,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cb_show_speed(query, user_id, context)
         elif data == "hide_speed":
             await _cb_hide_speed(query, user_id, context)
+        elif data == "show_tts_model":
+            await _cb_show_tts_model(query, user_id, context)
+        elif data == "hide_tts_model":
+            await _cb_hide_tts_model(query, user_id, context)
+        elif data.startswith("ttsmodel_"):
+            await _cb_tts_model(query, user_id, context, data)
         elif data in SPEED_OPTIONS:
             await _cb_speed(query, user_id, context, data)
         elif data in ("tg_female", "tg_male"):
@@ -10894,6 +11368,7 @@ async def _run_bot():
     app.add_handler(CommandHandler("start",           on_start))
     app.add_handler(CommandHandler("help",            on_help))
     app.add_handler(CommandHandler("myprefs",         cmd_myprefs))
+    app.add_handler(CommandHandler("ttsmodel",        cmd_ttsmodel))
     app.add_handler(CommandHandler("clear",           cmd_clear))
     app.add_handler(CommandHandler("broadcast",       broadcast_start))
     app.add_handler(CommandHandler("schedule",        cmd_schedule))
@@ -10936,7 +11411,8 @@ async def _run_bot():
     logger.info(
         f"Bot polling started. Admins: {ADMIN_IDS or 'none configured'} | "
         f"HF: {HF_MODEL} | OCR provider: {OCR_PROVIDER} | "
-        f"HF OCR: {HF_OCR_MODEL} | Gemini: {_gemini is not None}"
+        f"HF OCR: {HF_OCR_MODEL} | Gemini: {_gemini is not None} | "
+        f"TTS: {_tts_provider_summary()}"
     )
 
     sched_stop = asyncio.Event()
@@ -10982,6 +11458,7 @@ def main():
 
     _sweep_stale_temps()
     ensure_speed_column()
+    ensure_tts_model_column()
     startup_self_check()
 
     if not ADMIN_IDS:
@@ -10993,6 +11470,7 @@ def main():
     print(
         f"Bot is starting... (AI: {AI_PROVIDER} | HF: {HF_MODEL} | "
         f"OCR: {OCR_PROVIDER} | HF OCR: {HF_OCR_MODEL} | "
+        f"TTS: {TTS_PROVIDER}/{KHMER_TTS_PROVIDER} | user_model_default: {_normalize_tts_model(DEFAULT_TTS_MODEL)} | "
         f"Redis: {'on' if redis_client is not None else 'off'})"
     )
 
