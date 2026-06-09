@@ -3673,6 +3673,13 @@ HF_TTS_RETRY_DELAY_S     = _env_float("HF_TTS_RETRY_DELAY_S", 2.0, minimum=0.2, 
 HF_TTS_EDGE_FALLBACK     = _env_bool("HF_TTS_EDGE_FALLBACK", True)
 HF_TTS_FAILURE_LIMIT     = _env_int("HF_TTS_FAILURE_LIMIT", 3, minimum=1, maximum=20)
 HF_TTS_COOLDOWN_S        = _env_float("HF_TTS_COOLDOWN_S", 300.0, minimum=30.0, maximum=3600.0)
+# Public HF ZeroGPU Spaces can run out of daily quota. When this happens, retrying
+# every user request only creates log spam and slow responses, so quota errors use
+# a longer cooldown and immediately fall back to Edge TTS when fallback is enabled.
+HF_TTS_QUOTA_COOLDOWN_S  = _env_float("HF_TTS_QUOTA_COOLDOWN_S", 1800.0, minimum=300.0, maximum=86400.0)
+HF_TTS_NO_AUDIO_COOLDOWN_S = _env_float("HF_TTS_NO_AUDIO_COOLDOWN_S", 600.0, minimum=60.0, maximum=3600.0)
+HF_TTS_CLIENT_CACHE      = _env_bool("HF_TTS_CLIENT_CACHE", True)
+HF_TTS_SERIALIZE_CALLS   = _env_bool("HF_TTS_SERIALIZE_CALLS", True)
 DEFAULT_SPEED           = 1.0
 TELE_MSG_LIMIT          = 4000
 USER_COOLDOWN_S         = 3.0
@@ -7603,8 +7610,12 @@ async def _edge_tts_stream_with_retry(chunk_text: str, voices: list[str]) -> tup
 
 # Khmer HF Space provider state. Protected by a lock because Gradio calls run in worker threads.
 _HF_TTS_STATE_LOCK = threading.Lock()
+_HF_TTS_CLIENT_LOCK = threading.Lock()
+_HF_TTS_CLIENT_CALL_LOCK = threading.Lock()
 _HF_TTS_FAILURES = 0
 _HF_TTS_DISABLED_UNTIL = 0.0
+_HF_TTS_CLIENT = None
+_HF_TTS_CLIENT_KEY: tuple[str, str] | None = None
 
 
 def _tts_provider_summary() -> str:
@@ -7633,18 +7644,69 @@ def _hf_tts_record_success() -> None:
         _HF_TTS_DISABLED_UNTIL = 0.0
 
 
+def _hf_tts_error_text(exc: BaseException | str) -> str:
+    return str(exc or "").strip()
+
+
+def _hf_tts_is_quota_error(exc: BaseException | str) -> bool:
+    msg = _hf_tts_error_text(exc).lower()
+    return (
+        "zerogpu quota" in msg
+        or "exceeded your free" in msg
+        or "quota" in msg and "exceeded" in msg
+        or "0s left" in msg
+    )
+
+
+def _hf_tts_is_no_audio_error(exc: BaseException | str) -> bool:
+    msg = _hf_tts_error_text(exc).lower()
+    return "returned no audio path" in msg or "returned empty audio" in msg or "no audio" in msg
+
+
 def _hf_tts_record_failure(exc: BaseException | str) -> None:
+    """Record real HF TTS failures and open a cooldown when retries are harmful.
+
+    Cooldown-only errors are intentionally not counted by generate_voice(). Quota
+    failures are disabled immediately because the next request cannot fix the
+    account-level ZeroGPU quota. "No audio path" gets a medium cooldown after
+    the normal failure threshold because Spaces sometimes return malformed tuples
+    during cold starts or overloaded periods.
+    """
     global _HF_TTS_FAILURES, _HF_TTS_DISABLED_UNTIL
+    exc_text = _hf_tts_error_text(exc)[:500]
+    now = time.monotonic()
+    cooldown = 0.0
+    reason = "failure-threshold"
+
     with _HF_TTS_STATE_LOCK:
         _HF_TTS_FAILURES += 1
-        if _HF_TTS_FAILURES >= HF_TTS_FAILURE_LIMIT:
-            _HF_TTS_DISABLED_UNTIL = time.monotonic() + HF_TTS_COOLDOWN_S
-            logger.warning(
-                "HF Khmer TTS temporarily disabled for %.0fs after %s failure(s): %s",
-                HF_TTS_COOLDOWN_S,
-                _HF_TTS_FAILURES,
-                exc,
-            )
+        previous_until = _HF_TTS_DISABLED_UNTIL
+        already_disabled = now < previous_until
+
+        if _hf_tts_is_quota_error(exc):
+            cooldown = HF_TTS_QUOTA_COOLDOWN_S
+            reason = "quota"
+        elif _HF_TTS_FAILURES >= HF_TTS_FAILURE_LIMIT:
+            cooldown = HF_TTS_NO_AUDIO_COOLDOWN_S if _hf_tts_is_no_audio_error(exc) else HF_TTS_COOLDOWN_S
+            reason = "no-audio" if _hf_tts_is_no_audio_error(exc) else "failure-threshold"
+
+        if cooldown > 0:
+            _HF_TTS_DISABLED_UNTIL = max(previous_until, now + cooldown)
+            should_log = (not already_disabled) or (_HF_TTS_DISABLED_UNTIL > previous_until + 1.0)
+        else:
+            should_log = False
+
+        failures = _HF_TTS_FAILURES
+        remaining = max(0, int(_HF_TTS_DISABLED_UNTIL - now))
+
+    if should_log:
+        logger.warning(
+            "HF Khmer TTS temporarily disabled for %ss after %s failure(s), reason=%s: %s",
+            remaining,
+            failures,
+            reason,
+            exc_text,
+        )
 
 
 def _should_try_hf_khmer_tts(text: str, tts_model: str = "auto") -> bool:
@@ -7654,6 +7716,13 @@ def _should_try_hf_khmer_tts(text: str, tts_model: str = "auto") -> bool:
     user_model = _normalize_tts_model(tts_model)
     if user_model == "edge":
         return False
+
+    # When HF is cooling down and Edge fallback is enabled, do not call the HF
+    # Space at all. This avoids repeated "Loaded as API" messages, avoids
+    # extending cooldown on cooldown-only errors, and gives users a fast reply.
+    if _hf_tts_is_temporarily_disabled() and HF_TTS_EDGE_FALLBACK:
+        return False
+
     if user_model == "hf_space":
         return True
 
@@ -7667,19 +7736,220 @@ def _should_try_hf_khmer_tts(text: str, tts_model: str = "auto") -> bool:
     return khmer_mode in {"hf", "hf_space", "khmer_hf_space", "khmer-tts"}
 
 
+_HF_TTS_AUDIO_EXTENSIONS = {".wav", ".mp3", ".ogg", ".flac", ".aac", ".m4a", ".mp4", ".webm", ".opus"}
+
+
+def _hf_tts_is_probable_audio_ref(value: Any) -> bool:
+    """Return True only for real Gradio audio references.
+
+    mrrtmob/khmer-tts may include status strings in its tuple result, for
+    example "Characters: 238/300". Treating those strings as file paths causes
+    FileNotFoundError. We therefore accept only HTTP(S) URLs or existing local
+    files, and reject known UI/status labels.
+    """
+    if value is None:
+        return False
+    text = str(value).strip()
+    if not text:
+        return False
+
+    low = text.lower()
+    if low.startswith(("characters:", "character:", "duration:", "status:", "error:", "warning:")):
+        return False
+    if "characters:" in low and re.search(r"\b\d+\s*/\s*\d+\b", low):
+        return False
+
+    if re.match(r"^https?://", text, re.I):
+        return True
+
+    # Gradio normally returns a real temporary path for local files. Do not
+    # accept arbitrary strings just because they look like filenames.
+    try:
+        return os.path.isfile(text)
+    except (OSError, ValueError):
+        return False
+
+
 def _extract_hf_audio_path_or_url(audio_obj: Any) -> str:
+    """Extract a valid audio file path/URL from Gradio result shapes.
+
+    Some Gradio Spaces return nested tuples/lists such as (audio, metadata) or
+    dictionaries containing path/url fields. Status strings like
+    "Characters: 238/300" must be ignored because they are not audio files.
+    """
+    if audio_obj is None:
+        return ""
     if isinstance(audio_obj, str):
-        return audio_obj
+        return audio_obj.strip() if _hf_tts_is_probable_audio_ref(audio_obj) else ""
     if isinstance(audio_obj, dict):
+        # Prefer explicit audio references first. Validate them before returning.
         for key in ("path", "url", "name"):
             val = audio_obj.get(key)
-            if val:
-                return str(val)
+            if _hf_tts_is_probable_audio_ref(val):
+                return str(val).strip()
+        for val in audio_obj.values():
+            nested = _extract_hf_audio_path_or_url(val)
+            if nested:
+                return nested
+    if isinstance(audio_obj, (tuple, list)):
+        for item in audio_obj:
+            nested = _extract_hf_audio_path_or_url(item)
+            if nested:
+                return nested
     for attr in ("path", "url", "name"):
         val = getattr(audio_obj, attr, None)
-        if val:
-            return str(val)
+        if _hf_tts_is_probable_audio_ref(val):
+            return str(val).strip()
     return ""
+
+
+def _hf_tts_dict_get_any(data: dict, keys: tuple[str, ...]) -> Any:
+    """Return the first present dict value without using `or` on numpy arrays."""
+    for key in keys:
+        if key in data and data.get(key) is not None:
+            return data.get(key)
+    return None
+
+
+def _hf_tts_array_like_to_wav_bytes(sample_rate: Any, samples: Any) -> bytes:
+    """Encode Gradio Audio(type='numpy') output into WAV bytes.
+
+    mrrtmob/khmer-tts declares `gr.Audio(type="numpy")`, so the Python-side
+    result can be `(24000, audio_samples)` instead of a temporary file path.
+    Telegram/FFmpeg can consume WAV bytes reliably, so convert int/float arrays
+    or nested Python lists to a small WAV file in memory.
+    """
+    if samples is None:
+        return b""
+    try:
+        sr = int(sample_rate)
+    except Exception:
+        return b""
+    if sr < 8000 or sr > 192000:
+        return b""
+
+    import io
+    import wave
+    channels = 1
+    pcm = b""
+
+    try:
+        import numpy as _np  # Optional; gradio/numpy is usually present with HF TTS.
+        arr = _np.asarray(samples)
+        if arr.size <= 0:
+            return b""
+        arr = _np.squeeze(arr)
+        if arr.ndim == 0:
+            return b""
+        if arr.ndim == 2:
+            # Accept either [frames, channels] or [channels, frames].
+            if arr.shape[0] in (1, 2) and arr.shape[1] > arr.shape[0]:
+                arr = arr.T
+            if arr.shape[1] in (1, 2):
+                channels = int(arr.shape[1])
+            else:
+                arr = arr[:, 0]
+                channels = 1
+        elif arr.ndim > 2:
+            arr = arr.reshape(-1)
+            channels = 1
+
+        if _np.issubdtype(arr.dtype, _np.floating):
+            arr = _np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=-1.0)
+            arr = _np.clip(arr, -1.0, 1.0)
+            arr = (arr * 32767).astype("<i2")
+        elif arr.dtype != _np.int16:
+            arr = _np.clip(arr, -32768, 32767).astype("<i2")
+        else:
+            arr = arr.astype("<i2", copy=False)
+        pcm = arr.tobytes()
+    except Exception:
+        # Pure-Python fallback for JSON/list-like arrays.
+        from array import array
+        try:
+            seq = samples.tolist() if hasattr(samples, "tolist") else samples
+        except Exception:
+            seq = samples
+        if not isinstance(seq, (list, tuple)) or not seq:
+            return b""
+        flat: list[Any] = []
+        if isinstance(seq[0], (list, tuple)):
+            first_len = len(seq[0])
+            if first_len in (1, 2):
+                channels = first_len
+                for frame in seq:
+                    for value in list(frame)[:channels]:
+                        flat.append(value)
+            else:
+                for row in seq:
+                    if isinstance(row, (list, tuple)):
+                        flat.extend(row)
+                    else:
+                        flat.append(row)
+                channels = 1
+        else:
+            flat = list(seq)
+            channels = 1
+        if not flat:
+            return b""
+        pcm_arr = array("h")
+        for value in flat:
+            try:
+                f = float(value)
+                if -1.0 <= f <= 1.0:
+                    f = f * 32767
+                pcm_arr.append(max(-32768, min(32767, int(f))))
+            except Exception:
+                pcm_arr.append(0)
+        pcm = pcm_arr.tobytes()
+
+    if not pcm:
+        return b""
+
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav:
+        wav.setnchannels(max(1, min(2, int(channels or 1))))
+        wav.setsampwidth(2)
+        wav.setframerate(sr)
+        wav.writeframes(pcm)
+    return out.getvalue()
+
+
+def _extract_hf_audio_bytes_from_result(audio_obj: Any) -> bytes:
+    """Extract actual audio bytes from Gradio result shapes.
+
+    Supports both common result formats:
+      - file/path/url dictionaries or strings handled elsewhere
+      - numpy audio tuples such as `(24000, audio_samples)` returned by
+        `gr.Audio(type="numpy")`
+    Non-audio UI/status strings such as `Characters: 238/300` are ignored.
+    """
+    if audio_obj is None:
+        return b""
+
+    if isinstance(audio_obj, dict):
+        sr = _hf_tts_dict_get_any(audio_obj, ("sample_rate", "sampling_rate", "rate", "sr"))
+        samples = _hf_tts_dict_get_any(audio_obj, ("data", "array", "samples", "audio"))
+        data = _hf_tts_array_like_to_wav_bytes(sr, samples)
+        if data:
+            return data
+        for value in audio_obj.values():
+            data = _extract_hf_audio_bytes_from_result(value)
+            if data:
+                return data
+        return b""
+
+    if isinstance(audio_obj, (tuple, list)):
+        # Gradio Audio(type='numpy') convention: (sample_rate, audio_samples).
+        if len(audio_obj) >= 2:
+            data = _hf_tts_array_like_to_wav_bytes(audio_obj[0], audio_obj[1])
+            if data:
+                return data
+        for item in audio_obj:
+            data = _extract_hf_audio_bytes_from_result(item)
+            if data:
+                return data
+    return b""
 
 
 def _audio_suffix_from_bytes(data: bytes) -> str:
@@ -7695,41 +7965,79 @@ def _audio_suffix_from_bytes(data: bytes) -> str:
     return ".audio"
 
 
-def _hf_tts_space_predict_sync(chunk_text: str) -> bytes:
-    """Blocking Gradio call for mrrtmob/khmer-tts. Run only in an executor."""
+def _hf_tts_make_client_sync():
     if GradioClient is None:
         raise RuntimeError("gradio_client is not installed. Add `gradio_client` to requirements.txt.")
     if not HF_TTS_SPACE:
         raise RuntimeError("HF_TTS_SPACE is empty.")
-
-    # HF_TOKEN is optional for public Spaces, but useful for authenticated/rate-limited calls.
     if HF_TTS_TOKEN:
         try:
-            client = GradioClient(HF_TTS_SPACE, hf_token=HF_TTS_TOKEN)
+            return GradioClient(HF_TTS_SPACE, hf_token=HF_TTS_TOKEN)
         except TypeError:
-            client = GradioClient(HF_TTS_SPACE)
-    else:
-        client = GradioClient(HF_TTS_SPACE)
+            return GradioClient(HF_TTS_SPACE)
+    return GradioClient(HF_TTS_SPACE)
 
-    result = client.predict(
-        chunk_text,
-        HF_TTS_VOICE,
-        HF_TTS_TEMP,
-        HF_TTS_TOP_P,
-        HF_TTS_REP_PEN,
-        HF_TTS_MAX_TOK,
-        api_name=HF_TTS_API_NAME,
-    )
-    audio_obj = result[0] if isinstance(result, (tuple, list)) and result else result
-    path_or_url = _extract_hf_audio_path_or_url(audio_obj)
+
+def _hf_tts_get_client_sync():
+    """Return a cached Gradio client so each chunk/request does not reload the API."""
+    global _HF_TTS_CLIENT, _HF_TTS_CLIENT_KEY
+    if not HF_TTS_CLIENT_CACHE:
+        return _hf_tts_make_client_sync()
+
+    # Do not store the full token in the cache key; the process env is static in
+    # normal deployments, and this is enough to rebuild if token presence changes.
+    key = (HF_TTS_SPACE, "token" if HF_TTS_TOKEN else "public")
+    with _HF_TTS_CLIENT_LOCK:
+        if _HF_TTS_CLIENT is not None and _HF_TTS_CLIENT_KEY == key:
+            return _HF_TTS_CLIENT
+        _HF_TTS_CLIENT = _hf_tts_make_client_sync()
+        _HF_TTS_CLIENT_KEY = key
+        return _HF_TTS_CLIENT
+
+
+def _hf_tts_space_predict_sync(chunk_text: str) -> bytes:
+    """Blocking Gradio call for mrrtmob/khmer-tts. Run only in an executor."""
+    client = _hf_tts_get_client_sync()
+
+    def _predict():
+        return client.predict(
+            chunk_text,
+            HF_TTS_VOICE,
+            HF_TTS_TEMP,
+            HF_TTS_TOP_P,
+            HF_TTS_REP_PEN,
+            HF_TTS_MAX_TOK,
+            api_name=HF_TTS_API_NAME,
+        )
+
+    if HF_TTS_SERIALIZE_CALLS:
+        with _HF_TTS_CLIENT_CALL_LOCK:
+            result = _predict()
+    else:
+        result = _predict()
+
+    # The Space uses `gr.Audio(type="numpy")`, so successful responses may be
+    # `(24000, np.ndarray)` instead of a file path. Extract audio bytes first,
+    # then fall back to file/URL references. Ignore secondary UI strings such as
+    # `Characters: 238/300`.
+    data = _extract_hf_audio_bytes_from_result(result)
+    if data:
+        return data
+
+    path_or_url = _extract_hf_audio_path_or_url(result)
     if not path_or_url:
-        raise RuntimeError(f"HF TTS returned no audio path. result={type(result).__name__}")
+        result_preview = _web_short(result, 240) if "_web_short" in globals() else str(result)[:240]
+        raise RuntimeError(
+            f"HF TTS returned no valid audio data/file/url. result_type={type(result).__name__} result={result_preview!r}"
+        )
 
     if re.match(r"^https?://", path_or_url, re.I):
         resp = httpx.get(path_or_url, timeout=HF_TTS_TIMEOUT_S)
         resp.raise_for_status()
         data = resp.content or b""
     else:
+        if not os.path.isfile(path_or_url):
+            raise RuntimeError(f"HF TTS returned missing audio file: {path_or_url!r}")
         with open(path_or_url, "rb") as fh:
             data = fh.read()
     if not data:
@@ -7935,13 +8243,24 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
         try:
             return await _generate_voice_hf_space(text, speed, output_path)
         except Exception as exc:
-            _hf_tts_record_failure(exc)
-            logger.warning(
-                "HF Khmer TTS failed; user_model=%s edge fallback=%s: %s",
-                user_model,
-                HF_TTS_EDGE_FALLBACK,
-                exc,
-            )
+            low = str(exc).lower()
+            cooldown_only = "cooldown active" in low
+            if not cooldown_only:
+                _hf_tts_record_failure(exc)
+                logger.warning(
+                    "HF Khmer TTS failed; user_model=%s edge fallback=%s cooldown_remaining=%ss: %s",
+                    user_model,
+                    HF_TTS_EDGE_FALLBACK,
+                    _hf_tts_disabled_remaining_s(),
+                    exc,
+                )
+            else:
+                logger.info(
+                    "HF Khmer TTS skipped due to cooldown; user_model=%s edge fallback=%s cooldown_remaining=%ss",
+                    user_model,
+                    HF_TTS_EDGE_FALLBACK,
+                    _hf_tts_disabled_remaining_s(),
+                )
             if not HF_TTS_EDGE_FALLBACK:
                 raise RuntimeError(f"HF Khmer TTS failed and Edge fallback is disabled: {exc}") from exc
 
@@ -8614,7 +8933,7 @@ async def _run_broadcast_to_all(
                         or "bot can't initiate conversation" in low
                         or "bot can’t initiate conversation" in low
                     ):
-                        logger.warning(f"{label}: marking unreachable uid={uid} as blocked: {e}")
+                        logger.info(f"{label}: marking unreachable uid={uid} as blocked: {e}")
                         await loop.run_in_executor(
                             None,
                             functools.partial(
