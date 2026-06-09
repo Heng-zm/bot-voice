@@ -5,6 +5,7 @@ import asyncio
 import inspect
 import threading
 import time
+import contextvars
 import html
 import functools
 import tempfile
@@ -13,7 +14,7 @@ import hashlib
 import hmac
 import secrets
 import socket
-import requests
+import httpx
 import imageio_ffmpeg as _iio_ffmpeg
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -23,15 +24,29 @@ try:
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 try:
     from google import genai
     from google.genai import types as genai_types
 except Exception:
     genai = None
     genai_types = None
-from flask import Flask
+from fastapi import FastAPI, Request as FastAPIRequest, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response as StarletteResponse
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.concurrency import run_in_threadpool
+from jinja2 import Template
+try:
+    from pydantic_settings import BaseSettings, SettingsConfigDict
+except Exception:
+    BaseSettings = object
+    SettingsConfigDict = dict
 from supabase import create_client, Client
+try:
+    from supabase import acreate_client, AsyncClient
+except Exception:
+    acreate_client = None
+    AsyncClient = object
 from typing import Any, Callable
 
 # Load local .env before any environment-driven config is read.
@@ -48,17 +63,76 @@ except Exception:
     redis_lib = None
 
 
-# ── Flask Web Server ───────────────────────────────────────────────────────
+# ── FastAPI Web Server + typed settings ─────────────────────────────────────
+class AppSettings(BaseSettings):
+    """Centralised environment configuration.
+
+    The old helper functions (_env_bool/_env_int/_env_float) remain as safe
+    compatibility wrappers, but critical web/server values now come from this
+    typed settings object so bad env values fail predictably instead of being
+    spread through the file.
+    """
+    if hasattr(BaseSettings, "model_config") or BaseSettings is not object:
+        model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
+
+    PORT: int = 8080
+    RENDER: bool = False
+    RENDER_EXTERNAL_URL: str = ""
+    WEB_TRUST_PROXY: bool = False
+    FLASK_SECRET_KEY: str = ""
+    WEB_SECRET_KEY: str = ""
+    WEB_SESSION_COOKIE_NAME: str = "bot_admin_session"
+    WEB_COOKIE_SAMESITE: str = "lax"
+    WEB_COOKIE_SECURE: bool = False
+    WEB_ADMIN_SESSION_DAYS: int = 14
+    WEB_MAX_CONTENT_LENGTH: int = 64 * 1024 * 1024
+    MAX_CONCURRENT_TTS_USERS: int = 6
+    MAX_CONCURRENT_AI: int = 3
+    MAX_CONCURRENT_GEMINI: int = 3
+    MAX_CONCURRENT_BROADCAST: int = 3
+    BROADCAST_BATCH_SIZE: int = 3
+    BROADCAST_INTER_BATCH_DELAY: float = 0.20
+    TTS_RESOLVER_AI_ENABLED: bool = False
+    APP_TIMEZONE: str = "Asia/Phnom_Penh"
+    WEB_ADMIN_TIMEZONE: str = ""
+    APP_TIMEZONE_ALIAS: str = "ICT"
+    APP_TIMEZONE_UTC_LABEL: str = "UTC+7"
+    BOT_SETTINGS_CACHE_TTL_S: float = 30.0
+    WEB_BROADCAST_JOBS_MAX: int = 50
+    WEB_BROADCAST_WORKERS: int = 3
+    WEB_BROADCAST_DELAY_S: float = 0.05
+    WEB_TABLE_PAGE_SIZE: int = 50
+    WEB_COUNTS_CACHE_TTL_S: float = 30.0
+    WEB_STATUS_POLL_SECONDS: int = 30
+    WEB_LIVE_POLL_SECONDS: int = 30
+    WEB_LIVE_SCHEDULES_CACHE_TTL_S: float = 30.0
+    AI_API_KEY_CACHE_TTL_S: float = 60.0
+    AI_API_KEY_TOUCH_INTERVAL_S: float = 60.0
+
+try:
+    SETTINGS = AppSettings()
+except Exception as exc:
+    # Keep the bot bootable even if pydantic-settings is not installed locally.
+    logging.getLogger(__name__).warning("Pydantic settings fallback activated: %s", exc)
+    class _FallbackSettings:
+        def __getattr__(self, name):
+            return os.environ.get(name, "")
+    SETTINGS = _FallbackSettings()
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
-        return bool(default)
+        raw = getattr(SETTINGS, name, default)
+    if isinstance(raw, bool):
+        return raw
     return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
 def _env_int(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
+    raw = os.environ.get(name, getattr(SETTINGS, name, default))
     try:
-        value = int(str(os.environ.get(name, default)).strip())
+        value = int(str(raw).strip())
     except Exception:
         value = int(default)
     if minimum is not None:
@@ -69,8 +143,9 @@ def _env_int(name: str, default: int, *, minimum: int | None = None, maximum: in
 
 
 def _env_float(name: str, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
+    raw = os.environ.get(name, getattr(SETTINGS, name, default))
     try:
-        value = float(str(os.environ.get(name, default)).strip())
+        value = float(str(raw).strip())
     except Exception:
         value = float(default)
     if minimum is not None:
@@ -81,33 +156,286 @@ def _env_float(name: str, default: float, *, minimum: float | None = None, maxim
 
 
 def _default_cookie_secure() -> bool:
-    # Default to a login-safe cookie. On many Render/proxy/local setups Flask
-    # sees requests as HTTP even when the browser uses HTTPS, and a Secure-only
-    # cookie can make /admin immediately redirect back to /admin/login.
-    # Production can still force secure cookies with WEB_COOKIE_SECURE=1.
     explicit = os.environ.get("WEB_COOKIE_SECURE")
     if explicit is not None:
         return _env_bool("WEB_COOKIE_SECURE", True)
-    return False
+    return bool(getattr(SETTINGS, "WEB_COOKIE_SECURE", False))
 
 
-app_flask = Flask(__name__)
-app_flask.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY") or os.environ.get("WEB_SECRET_KEY") or secrets.token_hex(32)
-app_flask.config["SESSION_COOKIE_NAME"] = os.environ.get("WEB_SESSION_COOKIE_NAME", "bot_admin_session")
+_request_ctx: contextvars.ContextVar[Any] = contextvars.ContextVar("fastapi_request_ctx")
+_session_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar("fastapi_session_ctx")
+
+
+class _LocalProxy:
+    def __init__(self, ctx: contextvars.ContextVar):
+        object.__setattr__(self, "_ctx", ctx)
+
+    def _get_current_object(self):
+        return object.__getattribute__(self, "_ctx").get()
+
+    def __getattr__(self, name):
+        return getattr(self._get_current_object(), name)
+
+    def __setattr__(self, name, value):
+        setattr(self._get_current_object(), name, value)
+
+    def __getitem__(self, key):
+        return self._get_current_object()[key]
+
+    def __setitem__(self, key, value):
+        self._get_current_object()[key] = value
+
+    def __delitem__(self, key):
+        del self._get_current_object()[key]
+
+    def get(self, *args, **kwargs):
+        return self._get_current_object().get(*args, **kwargs)
+
+    def pop(self, *args, **kwargs):
+        return self._get_current_object().pop(*args, **kwargs)
+
+    def clear(self):
+        return self._get_current_object().clear()
+
+    def setdefault(self, *args, **kwargs):
+        return self._get_current_object().setdefault(*args, **kwargs)
+
+    def __contains__(self, item):
+        return item in self._get_current_object()
+
+
+class _MultiDictCompat(dict):
+    def get(self, key, default=None, type=None):
+        value = super().get(key, default)
+        if type is not None and value is not None:
+            try:
+                return type(value)
+            except Exception:
+                return default
+        return value
+
+
+class _UploadFileCompat:
+    def __init__(self, filename: str, content_type: str, data: bytes):
+        self.filename = filename or "upload.bin"
+        self.content_type = content_type or "application/octet-stream"
+        self.mimetype = self.content_type
+        self._data = data or b""
+
+    def read(self) -> bytes:
+        return self._data
+
+
+class _RequestCompat:
+    def __init__(self, req: FastAPIRequest, form: dict, files: dict, raw_body: bytes, json_body: Any):
+        self._req = req
+        self.method = req.method
+        self.headers = req.headers
+        self.args = _MultiDictCompat(dict(req.query_params))
+        self.form = _MultiDictCompat(form)
+        self.files = _MultiDictCompat(files)
+        self.content_type = req.headers.get("content-type", "")
+        self.referrer = req.headers.get("referer", "")
+        self.path = req.url.path
+        self.full_path = req.url.path + (("?" + req.url.query) if req.url.query else "")
+        self._raw_body = raw_body or b""
+        self._json_body = json_body
+
+    def get_json(self, force: bool = False, silent: bool = False):
+        if self._json_body is not None:
+            return self._json_body
+        if not self._raw_body:
+            return None if silent else {}
+        try:
+            return _json.loads(self._raw_body.decode("utf-8"))
+        except Exception:
+            if silent:
+                return None
+            raise
+
+
+request = _LocalProxy(_request_ctx)
+session = _LocalProxy(_session_ctx)
+
+
+def jsonify(obj: Any = None, **kwargs: Any):
+    return JSONResponse(obj if obj is not None else kwargs)
+
+
+def Response(content: Any = "", status: int = 200, status_code: int | None = None, mimetype: str | None = None, media_type: str | None = None, headers: dict | None = None):
+    return StarletteResponse(content=content, status_code=status_code or status, media_type=media_type or mimetype, headers=headers)
+
+
+def redirect(location: str, code: int = 302):
+    return RedirectResponse(url=location, status_code=code)
+
+
+def stream_with_context(generator):
+    return generator
+
+
+def abort(status_code: int = 400):
+    raise HTTPException(status_code=status_code)
+
+
+def render_template_string(template: str, **context: Any) -> str:
+    return Template(template).render(**context)
+
+
+def flask_flash(message: str, category: str = "message") -> None:
+    flashes = list(session.get("_flashes", []))
+    flashes.append((category, message))
+    session["_flashes"] = flashes
+
+
+def get_flashed_messages(with_categories: bool = False):
+    flashes = list(session.pop("_flashes", []))
+    if with_categories:
+        return flashes
+    return [msg for _cat, msg in flashes]
+
+
+def url_for(endpoint: str, **params: Any) -> str:
+    try:
+        clean = {k: str(v) for k, v in params.items() if v is not None}
+        return str(app_flask.fastapi.url_path_for(endpoint, **clean))
+    except Exception:
+        return "/" + endpoint.replace("web_admin_", "admin/").replace("_", "-")
+
+
+class FastAPICompatApp:
+    """Small Flask-style compatibility layer over FastAPI.
+
+    This lets the existing admin/AI route bodies keep working while the actual
+    ASGI server, sessions, CORS/security headers, and lifecycle run on FastAPI.
+    It removes the old separate Flask thread and makes future route migrations
+    incremental instead of risky all-at-once rewrites.
+    """
+    def __init__(self):
+        self.config: dict[str, Any] = {}
+        self.after_request_funcs: list[Callable[[Any], Any]] = []
+        secret_key = (
+            getattr(SETTINGS, "FLASK_SECRET_KEY", "")
+            or getattr(SETTINGS, "WEB_SECRET_KEY", "")
+            or os.environ.get("FLASK_SECRET_KEY", "")
+            or os.environ.get("WEB_SECRET_KEY", "")
+            or secrets.token_hex(32)
+        )
+        self.fastapi = FastAPI(title="Telegram Bot Admin", docs_url=None, redoc_url=None)
+        self.fastapi.add_middleware(
+            SessionMiddleware,
+            secret_key=secret_key,
+            session_cookie=str(getattr(SETTINGS, "WEB_SESSION_COOKIE_NAME", "bot_admin_session") or "bot_admin_session"),
+            https_only=_default_cookie_secure(),
+            same_site=str(getattr(SETTINGS, "WEB_COOKIE_SAMESITE", "lax") or "lax").lower(),
+            max_age=max(3600, int(getattr(SETTINGS, "WEB_ADMIN_SESSION_DAYS", 14) or 14) * 86400),
+        )
+
+    def after_request(self, fn: Callable[[Any], Any]):
+        self.after_request_funcs.append(fn)
+        return fn
+
+    @staticmethod
+    def _convert_path(path: str) -> str:
+        path = re.sub(r"<int:(\w+)>", r"{\1}", path)
+        path = re.sub(r"<str:(\w+)>", r"{\1}", path)
+        path = re.sub(r"<(\w+)>", r"{\1}", path)
+        return path
+
+    async def _prepare_context(self, req: FastAPIRequest):
+        raw_body = b""
+        json_body = None
+        form_data: dict[str, Any] = {}
+        files_data: dict[str, Any] = {}
+        content_type = req.headers.get("content-type", "")
+        if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
+            form = await req.form()
+            for key, value in form.multi_items():
+                if hasattr(value, "read") and hasattr(value, "filename"):
+                    data = await value.read()
+                    files_data[key] = _UploadFileCompat(value.filename, getattr(value, "content_type", "") or "application/octet-stream", data)
+                else:
+                    form_data[key] = value
+        else:
+            raw_body = await req.body()
+            if raw_body and "application/json" in content_type:
+                try:
+                    json_body = _json.loads(raw_body.decode("utf-8"))
+                except Exception:
+                    json_body = None
+        compat = _RequestCompat(req, form_data, files_data, raw_body, json_body)
+        req_token = _request_ctx.set(compat)
+        sess_token = _session_ctx.set(req.session)
+        return req_token, sess_token
+
+    def _finalize_response(self, result: Any):
+        status_code = None
+        if isinstance(result, tuple):
+            if len(result) >= 2:
+                result, status_code = result[0], int(result[1])
+        if isinstance(result, StarletteResponse):
+            resp = result
+            if status_code is not None:
+                resp.status_code = status_code
+        elif isinstance(result, (dict, list)):
+            resp = JSONResponse(result, status_code=status_code or 200)
+        elif isinstance(result, bytes):
+            resp = Response(result, status=status_code or 200)
+        elif result is None:
+            resp = Response("", status=status_code or 204)
+        else:
+            resp = HTMLResponse(str(result), status_code=status_code or 200)
+        for fn in self.after_request_funcs:
+            maybe_resp = fn(resp)
+            if maybe_resp is not None:
+                resp = maybe_resp
+        return resp
+
+    def route(self, path: str, methods: list[str] | tuple[str, ...] | None = None):
+        route_methods = list(methods or ["GET"])
+        fastapi_path = self._convert_path(path)
+        def decorator(func: Callable):
+            async def endpoint(starlette_request: FastAPIRequest):
+                req_token = sess_token = None
+                try:
+                    req_token, sess_token = await self._prepare_context(starlette_request)
+                    kwargs = dict(starlette_request.path_params)
+                    if inspect.iscoroutinefunction(func):
+                        result = await func(**kwargs)
+                    else:
+                        result = await run_in_threadpool(lambda: func(**kwargs))
+                    return self._finalize_response(result)
+                finally:
+                    if sess_token is not None:
+                        _session_ctx.reset(sess_token)
+                    if req_token is not None:
+                        _request_ctx.reset(req_token)
+            endpoint.__name__ = func.__name__ + "_asgi"
+            self.fastapi.add_api_route(
+                fastapi_path,
+                endpoint,
+                methods=route_methods,
+                name=func.__name__,
+                include_in_schema=False,
+            )
+            return func
+        return decorator
+
+    def run(self, host: str = "0.0.0.0", port: int = 8080, **kwargs: Any):
+        import uvicorn
+        uvicorn.run(self.fastapi, host=host, port=port, **kwargs)
+
+
+app_flask = FastAPICompatApp()
+app = app_flask.fastapi
+app_flask.config["SECRET_KEY"] = getattr(SETTINGS, "FLASK_SECRET_KEY", "") or getattr(SETTINGS, "WEB_SECRET_KEY", "") or secrets.token_hex(32)
+app_flask.config["SESSION_COOKIE_NAME"] = getattr(SETTINGS, "WEB_SESSION_COOKIE_NAME", "bot_admin_session")
 app_flask.config["SESSION_COOKIE_HTTPONLY"] = True
-app_flask.config["SESSION_COOKIE_SAMESITE"] = os.environ.get("WEB_COOKIE_SAMESITE", "Lax")
+app_flask.config["SESSION_COOKIE_SAMESITE"] = getattr(SETTINGS, "WEB_COOKIE_SAMESITE", "Lax")
 app_flask.config["SESSION_COOKIE_SECURE"] = _default_cookie_secure()
 app_flask.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=_env_int("WEB_ADMIN_SESSION_DAYS", 14, minimum=1))
 app_flask.config["SESSION_REFRESH_EACH_REQUEST"] = True
 app_flask.config["MAX_CONTENT_LENGTH"] = _env_int("WEB_MAX_CONTENT_LENGTH", 64 * 1024 * 1024, minimum=1 * 1024 * 1024)
-
-try:
-    from werkzeug.middleware.proxy_fix import ProxyFix
-    if _env_bool("WEB_TRUST_PROXY", _env_bool("RENDER", False)):
-        app_flask.wsgi_app = ProxyFix(app_flask.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
-except Exception:
-    pass
-
 
 @app_flask.after_request
 def _web_security_headers(resp):
@@ -124,47 +452,71 @@ def health_check():
 def ping():
     return "pong", 200
 
-def run_flask():
+async def run_fastapi():
+    """Run the FastAPI dashboard inside the main asyncio runtime."""
+    import uvicorn
     port = _env_int("PORT", 8080, minimum=1, maximum=65535)
-    app_flask.run(host="0.0.0.0", port=port, threaded=True)
+    config = uvicorn.Config(
+        app,
+        host="0.0.0.0",
+        port=port,
+        log_level=os.environ.get("UVICORN_LOG_LEVEL", "info").lower(),
+        proxy_headers=_env_bool("WEB_TRUST_PROXY", _env_bool("RENDER", False)),
+        forwarded_allow_ips="*" if _env_bool("WEB_TRUST_PROXY", _env_bool("RENDER", False)) else None,
+    )
+    server = uvicorn.Server(config)
+    await server.serve()
 
-def keep_alive():
-    """Self-ping every 4 min as secondary keep-alive layer."""
+
+async def keep_alive_async(stop_event: asyncio.Event | None = None):
+    """Self-ping every 4 min with non-blocking HTTPX instead of requests."""
     logger_ka = logging.getLogger("keep_alive")
-    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    render_url = (os.environ.get("RENDER_EXTERNAL_URL") or getattr(SETTINGS, "RENDER_EXTERNAL_URL", "") or "").strip().rstrip("/")
     if not render_url:
         logger_ka.warning("RENDER_EXTERNAL_URL not set — self-ping disabled.")
         return
 
-    time.sleep(10)
-    headers = {"User-Agent": "Mozilla/5.0 (KeepAlive/1.0)", "Accept": "text/plain,*/*"}
+    await asyncio.sleep(10)
+    headers = {"User-Agent": "Mozilla/5.0 (AsyncKeepAlive/2.0)", "Accept": "text/plain,*/*"}
 
-    while True:
-        urls = [render_url]
-        if not render_url.endswith("/ping"):
-            urls.append(f"{render_url}/ping")
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+        while stop_event is None or not stop_event.is_set():
+            urls = [render_url]
+            if not render_url.endswith("/ping"):
+                urls.append(f"{render_url}/ping")
 
-        ok = False
-        for url in urls:
+            ok = False
+            for url in urls:
+                try:
+                    r = await client.get(url, headers=headers)
+                    if 200 <= r.status_code < 400:
+                        logger_ka.info(f"Keep-alive OK -> {r.status_code} {url}")
+                        ok = True
+                        break
+                    logger_ka.warning(f"Keep-alive non-OK -> {r.status_code} {url}")
+                except Exception as e:
+                    logger_ka.warning(f"Keep-alive failed for {url}: {e}")
+
+            if not ok:
+                logger_ka.warning("Keep-alive failed for all URLs. Check RENDER_EXTERNAL_URL.")
+
             try:
-                r = requests.get(url, headers=headers, timeout=10)
-                if 200 <= r.status_code < 400:
-                    logger_ka.info(f"Keep-alive OK -> {r.status_code} {url}")
-                    ok = True
-                    break
-                logger_ka.warning(f"Keep-alive non-OK -> {r.status_code} {url}")
-            except Exception as e:
-                logger_ka.warning(f"Keep-alive failed for {url}: {e}")
+                await asyncio.wait_for(stop_event.wait(), timeout=240) if stop_event else await asyncio.sleep(240)
+            except asyncio.TimeoutError:
+                pass
 
-        if not ok:
-            logger_ka.warning("Keep-alive failed for all URLs. Check RENDER_EXTERNAL_URL.")
 
-        time.sleep(240)
+def run_flask():
+    """Backward-compatible alias. Prefer run_fastapi()."""
+    asyncio.run(run_fastapi())
+
+def keep_alive():
+    """Backward-compatible alias. Prefer keep_alive_async()."""
+    asyncio.run(keep_alive_async())
 
 # ── AI Assistant REST API ──────────────────────────────────────────────────
 import base64
 import json as _json
-from flask import request, jsonify, Response, stream_with_context, session, redirect, url_for, render_template_string, flash as flask_flash, get_flashed_messages, abort
 
 try:
     from huggingface_hub import InferenceClient
@@ -1096,21 +1448,21 @@ def ai_info():
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 
-# ── Flask Web Admin Dashboard ───────────────────────────────────────────────
+# ── FastAPI Web Admin Dashboard ───────────────────────────────────────────────
 # Full-control web dashboard for the Telegram bot. It reuses the existing
 # Supabase helpers, Redis state, Telegram token, bot settings, API-key manager,
 # scheduled-broadcast functions, and distributed scheduler lock.
 _WEB_BROADCAST_JOBS: OrderedDict[str, dict] = OrderedDict()
 _WEB_BROADCAST_JOBS_LOCK = threading.Lock()
 _WEB_BROADCAST_JOBS_MAX = int(os.environ.get("WEB_BROADCAST_JOBS_MAX", "50"))
-WEB_BROADCAST_WORKERS = max(1, int(os.environ.get("WEB_BROADCAST_WORKERS", str(MAX_CONCURRENT_BROADCAST))))
-WEB_BROADCAST_DELAY_S = max(0.0, float(os.environ.get("WEB_BROADCAST_DELAY_S", "0.05")))
-WEB_TABLE_PAGE_SIZE = max(10, min(200, int(os.environ.get("WEB_TABLE_PAGE_SIZE", "50"))))
+WEB_BROADCAST_WORKERS = max(1, _env_int("WEB_BROADCAST_WORKERS", MAX_CONCURRENT_BROADCAST))
+WEB_BROADCAST_DELAY_S = max(0.0, _env_float("WEB_BROADCAST_DELAY_S", 0.05))
+WEB_TABLE_PAGE_SIZE = max(10, min(200, _env_int("WEB_TABLE_PAGE_SIZE", 50)))
 # V4.1: avoid hammering Supabase from mobile/live dashboard polling.
-WEB_COUNTS_CACHE_TTL_S = max(5.0, float(os.environ.get("WEB_COUNTS_CACHE_TTL_S", "30")))
-WEB_STATUS_POLL_SECONDS = max(10, int(os.environ.get("WEB_STATUS_POLL_SECONDS", "30")))
-WEB_LIVE_POLL_SECONDS = max(15, int(os.environ.get("WEB_LIVE_POLL_SECONDS", "30")))
-WEB_LIVE_SCHEDULES_CACHE_TTL_S = max(5.0, float(os.environ.get("WEB_LIVE_SCHEDULES_CACHE_TTL_S", "30")))
+WEB_COUNTS_CACHE_TTL_S = max(5.0, _env_float("WEB_COUNTS_CACHE_TTL_S", 30.0))
+WEB_STATUS_POLL_SECONDS = max(10, _env_int("WEB_STATUS_POLL_SECONDS", 30))
+WEB_LIVE_POLL_SECONDS = max(15, _env_int("WEB_LIVE_POLL_SECONDS", 30))
+WEB_LIVE_SCHEDULES_CACHE_TTL_S = max(5.0, _env_float("WEB_LIVE_SCHEDULES_CACHE_TTL_S", 30.0))
 _WEB_COUNTS_CACHE = {"ts": 0.0, "data": {}}
 _WEB_COUNTS_CACHE_LOCK = threading.Lock()
 _WEB_COUNTS_BUILD_LOCK = threading.Lock()
@@ -1869,7 +2221,7 @@ def _web_system_v4_rows() -> str:
     refresh from mobile.
     """
     rows: list[str] = []
-    rows.append(_web_health_item("Flask web admin", True, "Dashboard route is responding."))
+    rows.append(_web_health_item("FastAPI web admin", True, "ASGI dashboard route is responding."))
     rows.append(_web_health_item("Admin password", bool(_web_admin_password()), "ADMIN_WEB_PASSWORD or WEB_ADMIN_PASSWORD"))
     rows.append(_web_health_item("Telegram token", bool(TELEGRAM_BOT_TOKEN), "Required for direct messages and broadcasts."))
     rows.append(_web_health_item("Admin IDs", bool(ADMIN_IDS), f"{len(ADMIN_IDS)} admin id(s) configured.", warn=not bool(ADMIN_IDS)))
@@ -2076,10 +2428,10 @@ def _web_send_telegram_message(chat_id: int, text: str) -> tuple[bool, str]:
     if len(text) > TELE_MSG_LIMIT:
         return False, f"Message too long. Max {TELE_MSG_LIMIT}."
     try:
-        resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": int(chat_id), "text": text, "disable_web_page_preview": True}, timeout=20)
+        resp = httpx.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": int(chat_id), "text": text, "disable_web_page_preview": True}, timeout=20)
         if resp.status_code == 403:
             db_user_set_blocked(int(chat_id), _web_current_admin_id(), True, "Telegram Forbidden from web send")
-        if not resp.ok:
+        if not (200 <= resp.status_code < 300):
             return False, f"Telegram HTTP {resp.status_code}: {resp.text[:300]}"
         payload = resp.json()
         if not payload.get("ok"):
@@ -3679,6 +4031,7 @@ def get_last_tts_text(user_id: int) -> str | None:
 # Supabase + AI clients
 # ---------------------------------------------------------------------------
 supabase: Client | None = None
+supabase_async: Any = None
 redis_client = None
 _gemini    = None
 _hf_client = None
@@ -3896,7 +4249,7 @@ def _hf_ocr_via_rest(image_data: bytes) -> str:
         raise RuntimeError("HF_TOKEN is missing.")
 
     model_id  = (HF_OCR_MODEL or "microsoft/trocr-base-printed").strip()
-    url_model = requests.utils.quote(model_id, safe="")
+    url_model = quote(model_id, safe="")
     url       = f"https://api-inference.huggingface.co/models/{url_model}"
     headers   = {
         "Authorization":    f"Bearer {HF_TOKEN}",
@@ -3908,7 +4261,7 @@ def _hf_ocr_via_rest(image_data: bytes) -> str:
     last_body = ""
     for attempt in range(3):
         try:
-            resp = requests.post(url, headers=headers, data=image_data, timeout=OCR_TIMEOUT_SECONDS)
+            resp = httpx.post(url, headers=headers, content=image_data, timeout=OCR_TIMEOUT_SECONDS)
             last_body = resp.text[:700]
 
             if resp.status_code in (503, 504, 429) and attempt < 2:
@@ -3917,7 +4270,7 @@ def _hf_ocr_via_rest(image_data: bytes) -> str:
                     wait_s = max(wait_s, float(resp.json().get("estimated_time", wait_s)))
                 except Exception:
                     pass
-                time.sleep(min(wait_s, 10.0))
+                time.sleep(min(wait_s, 10.0))  # sync retry sleep; function runs in AI executor
                 continue
 
             if not (200 <= resp.status_code < 300):
@@ -4198,9 +4551,9 @@ _prefs_cache: OrderedDict[int, tuple[dict, float]] = OrderedDict()
 _prefs_cache_lock: asyncio.Lock | None = None
 
 TTS_MODEL_OPTIONS = {
-    "auto": ("Auto", "Kiri → Edge TTS"),
-    "hf_space": ("Kiri"),
-    "edge": ("Edge", "Edge TTS"),
+    "auto": ("Auto", "Khmer HF Space → Edge fallback"),
+    "hf_space": ("Khmer HF", "mrrtmob/khmer-tts for Khmer text"),
+    "edge": ("Edge", "Microsoft Edge TTS for all languages"),
 }
 TTS_MODEL_ALIASES = {
     "auto": "auto",
@@ -6017,6 +6370,27 @@ def record_turn(user_id: int, role: str, content: str) -> None:
     db_history_append(user_id, role, content)
 
 
+
+
+async def _init_async_clients() -> None:
+    """Initialise optional async clients for new async code paths.
+
+    Existing database helpers still use the proven sync Supabase client through
+    the guarded DB executor. New FastAPI-native routes can use supabase_async
+    when the installed supabase-py version exposes acreate_client().
+    """
+    global supabase_async
+    if not SB_URL or not SB_KEY or acreate_client is None:
+        supabase_async = None
+        return
+    try:
+        maybe_client = acreate_client(SB_URL, SB_KEY)
+        supabase_async = await maybe_client if inspect.isawaitable(maybe_client) else maybe_client
+        logger.info("Async Supabase client initialised.")
+    except Exception as e:
+        supabase_async = None
+        logger.warning(f"Async Supabase init unavailable; using guarded sync DB executor: {e}")
+
 # ---------------------------------------------------------------------------
 # TTS text resolver (history-aware)
 # ---------------------------------------------------------------------------
@@ -7222,7 +7596,7 @@ def _hf_tts_space_predict_sync(chunk_text: str) -> bytes:
         raise RuntimeError(f"HF TTS returned no audio path. result={type(result).__name__}")
 
     if re.match(r"^https?://", path_or_url, re.I):
-        resp = requests.get(path_or_url, timeout=(10, HF_TTS_TIMEOUT_S))
+        resp = httpx.get(path_or_url, timeout=HF_TTS_TIMEOUT_S)
         resp.raise_for_status()
         data = resp.content or b""
     else:
@@ -11673,15 +12047,10 @@ async def _run_bot():
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main():
+async def _async_main_once():
     load_dotenv()
     _init_clients()
-
-    threading.Thread(target=run_flask, daemon=True).start()
-    print("Flask health-check server started.")
-
-    threading.Thread(target=keep_alive, daemon=True).start()
-    print("Keep-alive thread started.")
+    await _init_async_clients()
 
     _sweep_stale_temps()
     ensure_speed_column()
@@ -11695,20 +12064,49 @@ def main():
         )
 
     print(
-        f"Bot is starting... (AI: {AI_PROVIDER} | HF: {HF_MODEL} | "
+        f"Bot + FastAPI are starting... (AI: {AI_PROVIDER} | HF: {HF_MODEL} | "
         f"OCR: {OCR_PROVIDER} | HF OCR: {HF_OCR_MODEL} | "
         f"TTS: {TTS_PROVIDER}/{KHMER_TTS_PROVIDER} | user_model_default: {_normalize_tts_model(DEFAULT_TTS_MODEL)} | "
         f"Redis: {'on' if redis_client is not None else 'off'})"
     )
 
+    keepalive_stop = asyncio.Event()
+    tasks = [
+        asyncio.create_task(run_fastapi(), name="fastapi-web"),
+        asyncio.create_task(_run_bot(), name="telegram-bot"),
+    ]
+    if (os.environ.get("RENDER_EXTERNAL_URL") or getattr(SETTINGS, "RENDER_EXTERNAL_URL", "") or "").strip():
+        tasks.append(asyncio.create_task(keep_alive_async(keepalive_stop), name="async-keep-alive"))
+
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        for task in done:
+            exc = task.exception()
+            if exc:
+                raise exc
+    finally:
+        keepalive_stop.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+
+
+def main():
     while True:
         try:
-            asyncio.run(_run_bot())
+            asyncio.run(_async_main_once())
+        except KeyboardInterrupt:
+            logger.info("Shutdown requested.")
+            break
         except Exception as e:
-            logger.error(f"Bot crashed: {e} — restarting in 5s...", exc_info=True)
+            logger.error(f"Runtime crashed: {e} — restarting in 5s...", exc_info=True)
+            time.sleep(5)
         else:
-            logger.warning("Polling stopped — restarting in 5s...")
-        time.sleep(5)
+            logger.warning("Runtime stopped — restarting in 5s...")
+            time.sleep(5)
 
 
 if __name__ == "__main__":
