@@ -4797,15 +4797,39 @@ _USER_PREFS_TTS_MODEL_COLUMN_OK: bool | None = None
 _USER_PREFS_TTS_MODEL_LAST_CHECK = 0.0
 _USER_PREFS_TTS_MODEL_RECHECK_S = max(60.0, float(os.environ.get("TTS_MODEL_COLUMN_RECHECK_S", "300")))
 
-USER_PREFS_TTS_MODEL_SQL = """-- Run in Supabase SQL Editor if users cannot save TTS model choice
+USER_PREFS_TTS_MODEL_SQL = """-- Run in Supabase SQL Editor if users cannot save TTS model choice.
+-- Fixes: user_prefs_tts_model_check rejecting the new local_mms model.
+
 alter table public.user_prefs
 add column if not exists tts_model text default 'auto';
 
-update public.user_prefs
-set tts_model = 'auto'
-where tts_model is null;
+alter table public.user_prefs
+alter column tts_model set default 'auto';
 
--- Refresh PostgREST/Supabase API schema cache so writes stop returning PGRST204.
+-- Convert old/alias values to the normalized values used by the bot before
+-- recreating the CHECK constraint. This prevents migration failure on old rows.
+update public.user_prefs
+set tts_model = case
+  when tts_model is null or trim(tts_model) = '' then 'auto'
+  when lower(replace(trim(tts_model), '-', '_')) in ('auto', 'default', 'server') then 'auto'
+  when lower(replace(trim(tts_model), '-', '_')) in ('local_mms', 'local_mms_tts', 'mms', 'mms_tts', 'mms_tts_khm', 'facebook_mms', 'facebook_mms_tts_khm', 'khmer_mms') then 'local_mms'
+  when lower(replace(trim(tts_model), '-', '_')) in ('hf', 'hf_space', 'khmer_hf', 'khmer_hf_space', 'khmer_tts', 'mrrtmob') then 'hf_space'
+  when lower(replace(trim(tts_model), '-', '_')) in ('edge', 'edge_tts', 'msedge') then 'edge'
+  else 'auto'
+end;
+
+alter table public.user_prefs
+alter column tts_model set not null;
+
+alter table public.user_prefs
+drop constraint if exists user_prefs_tts_model_check;
+
+alter table public.user_prefs
+add constraint user_prefs_tts_model_check
+check (tts_model in ('auto', 'local_mms', 'hf_space', 'edge'));
+
+-- Refresh PostgREST/Supabase API schema cache so writes stop returning stale
+-- schema/constraint errors after ALTER TABLE.
 notify pgrst, 'reload schema';
 """
 
@@ -4823,6 +4847,19 @@ def _is_missing_tts_model_column_error(exc: Exception | str) -> bool:
         )
     )
 
+
+def _is_tts_model_constraint_error(exc: Exception | str) -> bool:
+    """Return True when Supabase rejects a valid bot model because DB CHECK is stale."""
+    msg = str(exc).lower()
+    return (
+        "tts_model" in msg
+        and (
+            "23514" in msg
+            or "user_prefs_tts_model_check" in msg
+            or "check constraint" in msg
+            or "violates check" in msg
+        )
+    )
 
 def _set_tts_model_column_status(value: bool) -> None:
     global _USER_PREFS_TTS_MODEL_COLUMN_OK, _USER_PREFS_TTS_MODEL_LAST_CHECK
@@ -5509,7 +5546,7 @@ def update_user_tts_model(user_id: int, tts_model: str) -> str:
         _log_once(
             logging.WARNING,
             "tts_model_column_missing_write_skipped",
-            "Skipped Supabase tts_model write because user_prefs.tts_model is not available yet. SQL:\n%s",
+            "Skipped Supabase tts_model write because user_prefs.tts_model is not available or its CHECK constraint is stale. SQL:\n%s",
             USER_PREFS_TTS_MODEL_SQL,
         )
         return model
@@ -5533,6 +5570,19 @@ def update_user_tts_model(user_id: int, tts_model: str) -> str:
                     logging.WARNING,
                     "tts_model_column_missing_write",
                     "Could not save tts_model because the optional column is missing or Supabase schema cache is stale. SQL:\n%s",
+                    USER_PREFS_TTS_MODEL_SQL,
+                )
+                return
+            if _is_tts_model_constraint_error(exc):
+                # The bot already cached the preference in memory/Redis above, so
+                # Telegram callbacks continue working. Stop hammering Supabase
+                # until the admin runs the migration and the periodic recheck opens.
+                _set_tts_model_column_status(False)
+                _log_once(
+                    logging.WARNING,
+                    "tts_model_constraint_stale_write",
+                    "Could not save tts_model=%s because Supabase user_prefs_tts_model_check is stale. Run SQL:\n%s",
+                    model,
                     USER_PREFS_TTS_MODEL_SQL,
                 )
                 return
@@ -5769,7 +5819,7 @@ def ensure_tts_model_column() -> None:
     try:
         supabase.table("user_prefs").select("tts_model").limit(1).execute()
         _set_tts_model_column_status(True)
-        logger.info("tts_model column present.")
+        logger.info("tts_model column present. If local_mms still fails to save, run USER_PREFS_TTS_MODEL_SQL to refresh the CHECK constraint.")
     except Exception as exc:
         if _is_missing_tts_model_column_error(exc):
             _set_tts_model_column_status(False)
