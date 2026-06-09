@@ -6,6 +6,7 @@ import inspect
 import threading
 import time
 import contextvars
+import contextlib
 import html
 import functools
 import tempfile
@@ -3705,6 +3706,11 @@ LOCAL_MMS_TTS_CACHE_ENABLED = _env_bool("LOCAL_MMS_TTS_CACHE_ENABLED", True)
 LOCAL_MMS_TTS_CACHE_DIR     = (os.environ.get("LOCAL_MMS_TTS_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "khmer_mms_tts_cache")).strip()
 LOCAL_MMS_TTS_CACHE_TTL_S   = _env_float("LOCAL_MMS_TTS_CACHE_TTL_S", 7 * 86400.0, minimum=60.0, maximum=30 * 86400.0)
 LOCAL_MMS_TTS_CACHE_MAX_FILES = _env_int("LOCAL_MMS_TTS_CACHE_MAX_FILES", 500, minimum=20, maximum=5000)
+# Keep local VITS generation isolated from Gemini/HF text inference. On small
+# Render CPU instances, one local MMS worker is the safest default.
+LOCAL_MMS_TTS_WORKERS = _env_int("LOCAL_MMS_TTS_WORKERS", 1, minimum=1, maximum=4)
+LOCAL_MMS_TTS_CPU_THREADS = _env_int("LOCAL_MMS_TTS_CPU_THREADS", 1, minimum=1, maximum=8)
+LOCAL_MMS_TTS_CACHE_VERSION = (os.environ.get("LOCAL_MMS_TTS_CACHE_VERSION") or "v2").strip() or "v2"
 
 # Khmer HF Space fallback. Confirmed normal endpoint from `Client.view_api()` for mrrtmob/khmer-tts:
 #   client.predict(text, "kiri", 0.6, 0.95, 1.1, 2048, api_name="/lambda")
@@ -3785,10 +3791,15 @@ _DB_EXECUTOR = ThreadPoolExecutor(
 _AI_EXECUTOR = ThreadPoolExecutor(
     max_workers=max(2, MAX_CONCURRENT_AI), thread_name_prefix="ai"
 )
+_LOCAL_MMS_TTS_EXECUTOR = ThreadPoolExecutor(
+    max_workers=LOCAL_MMS_TTS_WORKERS,
+    thread_name_prefix="local_mms_tts",
+)
 
 _AI_SEMAPHORE:         asyncio.Semaphore | None = None
 _BROADCAST_SEMAPHORE:  asyncio.Semaphore | None = None
 _TTS_CHUNK_SEMAPHORE:  asyncio.Semaphore | None = None
+_LOCAL_MMS_TTS_SEMAPHORE: asyncio.Semaphore | None = None
 
 # ---------------------------------------------------------------------------
 # Redis/Supabase safe retry + cache helpers
@@ -7680,6 +7691,7 @@ _LOCAL_MMS_TTS_MODEL_OBJ: Any = None
 _LOCAL_MMS_TTS_DEVICE_USED = "cpu"
 _LOCAL_MMS_TTS_SAMPLE_RATE = 16000
 _LOCAL_MMS_TTS_CACHE_LAST_PRUNE = 0.0
+_LOCAL_MMS_TTS_CACHE_LOCK = threading.RLock()
 
 _HF_TTS_STATE_LOCK = threading.Lock()
 _HF_TTS_FAILURES = 0
@@ -7689,7 +7701,7 @@ _HF_TTS_DISABLED_UNTIL = 0.0
 def _tts_provider_summary() -> str:
     return (
         f"provider={TTS_PROVIDER}, khmer={KHMER_TTS_PROVIDER}, "
-        f"local_mms={LOCAL_MMS_TTS_MODEL}, "
+        f"local_mms={LOCAL_MMS_TTS_MODEL}, workers={LOCAL_MMS_TTS_WORKERS}, cpu_threads={LOCAL_MMS_TTS_CPU_THREADS}, "
         f"hf_space={HF_TTS_SPACE}{HF_TTS_API_NAME}, "
         f"gradio_client={'on' if GradioClient is not None else 'missing'}, "
         f"fallbacks=hf:{'on' if LOCAL_MMS_TTS_HF_FALLBACK else 'off'}/edge:{'on' if LOCAL_MMS_TTS_EDGE_FALLBACK else 'off'}"
@@ -7709,6 +7721,7 @@ def _local_mms_tts_dependency_status() -> tuple[bool, str]:
     ok = _local_mms_tts_dependencies_available()
     detail = (
         f"model={LOCAL_MMS_TTS_MODEL}; device={LOCAL_MMS_TTS_DEVICE}; "
+        f"workers={LOCAL_MMS_TTS_WORKERS}; cpu_threads={LOCAL_MMS_TTS_CPU_THREADS}; "
         f"cache={'on' if LOCAL_MMS_TTS_CACHE_ENABLED else 'off'}"
     )
     if not ok:
@@ -7748,7 +7761,7 @@ def _local_mms_tts_record_failure(exc: BaseException | str) -> None:
 
 
 def _local_mms_tts_cache_key(text: str, speed: float) -> str:
-    raw = f"mms-khm-v1:{LOCAL_MMS_TTS_MODEL}:{_rounded_speed(speed)}:{text}"
+    raw = f"mms-khm:{LOCAL_MMS_TTS_CACHE_VERSION}:{LOCAL_MMS_TTS_MODEL}:{_rounded_speed(speed)}:{text}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -7763,31 +7776,34 @@ def _local_mms_tts_cache_prune() -> None:
     now = time.monotonic()
     if now - _LOCAL_MMS_TTS_CACHE_LAST_PRUNE < 300:
         return
-    _LOCAL_MMS_TTS_CACHE_LAST_PRUNE = now
-    try:
-        os.makedirs(LOCAL_MMS_TTS_CACHE_DIR, exist_ok=True)
-        paths = sorted(
-            glob.glob(os.path.join(LOCAL_MMS_TTS_CACHE_DIR, "*.ogg")),
-            key=lambda p: os.path.getmtime(p),
-        )
-        cutoff = time.time() - LOCAL_MMS_TTS_CACHE_TTL_S
-        for path in list(paths):
-            try:
-                if os.path.getmtime(path) < cutoff:
+    with _LOCAL_MMS_TTS_CACHE_LOCK:
+        now = time.monotonic()
+        if now - _LOCAL_MMS_TTS_CACHE_LAST_PRUNE < 300:
+            return
+        _LOCAL_MMS_TTS_CACHE_LAST_PRUNE = now
+        try:
+            os.makedirs(LOCAL_MMS_TTS_CACHE_DIR, exist_ok=True)
+            entries: list[tuple[float, str]] = []
+            cutoff = time.time() - LOCAL_MMS_TTS_CACHE_TTL_S
+            for entry in os.scandir(LOCAL_MMS_TTS_CACHE_DIR):
+                if not entry.is_file() or not entry.name.endswith(".ogg"):
+                    continue
+                try:
+                    mtime = entry.stat().st_mtime
+                except OSError:
+                    continue
+                if mtime < cutoff:
+                    with suppress(OSError):
+                        os.remove(entry.path)
+                    continue
+                entries.append((mtime, entry.path))
+            entries.sort(key=lambda item: item[0])
+            overflow = max(0, len(entries) - LOCAL_MMS_TTS_CACHE_MAX_FILES)
+            for _mtime, path in entries[:overflow]:
+                with suppress(OSError):
                     os.remove(path)
-            except OSError:
-                pass
-        paths = sorted(
-            glob.glob(os.path.join(LOCAL_MMS_TTS_CACHE_DIR, "*.ogg")),
-            key=lambda p: os.path.getmtime(p),
-        )
-        overflow = max(0, len(paths) - LOCAL_MMS_TTS_CACHE_MAX_FILES)
-        for path in paths[:overflow]:
-            with suppress(OSError):
-                os.remove(path)
-    except Exception as exc:
-        logger.debug("Local MMS TTS cache prune skipped: %s", exc)
-
+        except Exception as exc:
+            logger.debug("Local MMS TTS cache prune skipped: %s", exc)
 
 def _local_mms_tts_cache_get(text: str, speed: float, output_path: str) -> bytes | None:
     if not LOCAL_MMS_TTS_CACHE_ENABLED:
@@ -7819,14 +7835,17 @@ def _local_mms_tts_cache_put(text: str, speed: float, data: bytes) -> None:
     try:
         os.makedirs(LOCAL_MMS_TTS_CACHE_DIR, exist_ok=True)
         path = _local_mms_tts_cache_path(text, speed)
-        tmp_path = path + ".tmp"
-        with open(tmp_path, "wb") as fh:
-            fh.write(data)
-        os.replace(tmp_path, path)
+        tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with _LOCAL_MMS_TTS_CACHE_LOCK:
+            with open(tmp_path, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp_path, path)
         _local_mms_tts_cache_prune()
     except Exception as exc:
+        with suppress(Exception):
+            if 'tmp_path' in locals():
+                os.remove(tmp_path)
         logger.debug("Local MMS TTS cache write skipped: %s", exc)
-
 
 def _local_mms_tts_resolve_device(torch_module: Any) -> str:
     if LOCAL_MMS_TTS_DEVICE in {"cpu", "cuda"}:
@@ -7835,6 +7854,17 @@ def _local_mms_tts_resolve_device(torch_module: Any) -> str:
             return "cpu"
         return LOCAL_MMS_TTS_DEVICE
     return "cuda" if torch_module.cuda.is_available() else "cpu"
+
+
+def _local_mms_tts_configure_torch_runtime(torch_module: Any) -> None:
+    """Keep local MMS CPU usage predictable on small Render instances."""
+    threads = max(1, int(LOCAL_MMS_TTS_CPU_THREADS or 1))
+    with suppress(Exception):
+        torch_module.set_num_threads(threads)
+    # set_num_interop_threads can only be called before inter-op work starts.
+    # Ignore the RuntimeError on warm reloads instead of breaking TTS.
+    with suppress(Exception):
+        torch_module.set_num_interop_threads(max(1, min(threads, 2)))
 
 
 def _local_mms_tts_load_sync() -> tuple[Any, Any, Any, str, int]:
@@ -7856,6 +7886,7 @@ def _local_mms_tts_load_sync() -> tuple[Any, Any, Any, str, int]:
         try:
             import torch
             from transformers import AutoTokenizer, VitsModel
+            _local_mms_tts_configure_torch_runtime(torch)
         except Exception as exc:
             raise RuntimeError(
                 "Local MMS Khmer TTS dependencies are missing. Add `torch`, `transformers`, "
@@ -7934,50 +7965,67 @@ def _should_try_local_mms_khmer_tts(text: str, tts_model: str = "auto") -> bool:
 
 async def _generate_voice_local_mms(text: str, speed: float, output_path: str) -> bytes:
     """Generate Khmer TTS locally with facebook/mms-tts-khm and convert to Telegram OGG/Opus."""
-    if _local_mms_tts_is_temporarily_disabled():
-        raise RuntimeError(f"Local MMS Khmer TTS cooldown active ({_local_mms_tts_disabled_remaining_s()}s remaining)")
-
+    # A cache hit should still work during provider cooldown because it does not
+    # touch the model. This keeps repeated buttons/regenerate fast and reliable.
     cached = _local_mms_tts_cache_get(text, speed, output_path)
     if cached:
         logger.info("Local MMS Khmer TTS cache hit (%s bytes)", len(cached))
         return cached
 
+    if _local_mms_tts_is_temporarily_disabled():
+        raise RuntimeError(f"Local MMS Khmer TTS cooldown active ({_local_mms_tts_disabled_remaining_s()}s remaining)")
+
     chunks = _split_text_chunks(text, max_chars=LOCAL_MMS_TTS_MAX_CHARS)
     if not chunks:
         raise ValueError("Local MMS Khmer TTS: no speakable text chunks")
 
-    loop = asyncio.get_running_loop()
-    with tempfile.TemporaryDirectory(prefix="mms_khmer_tts_") as tmpdir:
-        input_paths: list[str] = []
-        for idx, chunk_text in enumerate(chunks, 1):
-            wav_path = os.path.join(tmpdir, f"chunk_{idx:03d}.wav")
-            last_error: Exception | None = None
-            for attempt in range(1, LOCAL_MMS_TTS_RETRIES + 1):
-                try:
-                    await asyncio.wait_for(
-                        loop.run_in_executor(_AI_EXECUTOR, _local_mms_tts_chunk_to_wav_sync, chunk_text, wav_path),
-                        timeout=LOCAL_MMS_TTS_TIMEOUT_S,
+    sem = _LOCAL_MMS_TTS_SEMAPHORE
+    sem_cm = sem if sem is not None else contextlib.nullcontext()
+
+    async with sem_cm:
+        # Re-check cache after waiting in the semaphore queue; another request
+        # may have generated the same audio while this one was waiting.
+        cached = _local_mms_tts_cache_get(text, speed, output_path)
+        if cached:
+            logger.info("Local MMS Khmer TTS cache hit after wait (%s bytes)", len(cached))
+            return cached
+
+        loop = asyncio.get_running_loop()
+        with tempfile.TemporaryDirectory(prefix="mms_khmer_tts_") as tmpdir:
+            input_paths: list[str] = []
+            for idx, chunk_text in enumerate(chunks, 1):
+                wav_path = os.path.join(tmpdir, f"chunk_{idx:03d}.wav")
+                last_error: Exception | None = None
+                for attempt in range(1, LOCAL_MMS_TTS_RETRIES + 1):
+                    try:
+                        await asyncio.wait_for(
+                            loop.run_in_executor(
+                                _LOCAL_MMS_TTS_EXECUTOR,
+                                _local_mms_tts_chunk_to_wav_sync,
+                                chunk_text,
+                                wav_path,
+                            ),
+                            timeout=LOCAL_MMS_TTS_TIMEOUT_S,
+                        )
+                        input_paths.append(wav_path)
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        if attempt < LOCAL_MMS_TTS_RETRIES:
+                            await asyncio.sleep(LOCAL_MMS_TTS_RETRY_DELAY_S * attempt)
+                if not os.path.exists(wav_path):
+                    preview = chunk_text[:80].replace("\n", " ")
+                    raise RuntimeError(
+                        f"Local MMS Khmer TTS failed at chunk {idx}/{len(chunks)} ({preview!r}): {last_error}"
                     )
-                    input_paths.append(wav_path)
-                    break
-                except Exception as exc:
-                    last_error = exc
-                    if attempt < LOCAL_MMS_TTS_RETRIES:
-                        await asyncio.sleep(LOCAL_MMS_TTS_RETRY_DELAY_S * attempt)
-            if not os.path.exists(wav_path):
-                preview = chunk_text[:80].replace("\n", " ")
-                raise RuntimeError(
-                    f"Local MMS Khmer TTS failed at chunk {idx}/{len(chunks)} ({preview!r}): {last_error}"
-                )
 
-        converted = await _convert_audio_files_to_telegram_voice(input_paths, speed, output_path)
-        if not converted:
-            raise RuntimeError("Local MMS Khmer TTS produced empty converted output")
-        _local_mms_tts_cache_put(text, speed, converted)
-        _local_mms_tts_record_success()
-        logger.info("Local MMS Khmer TTS generated %s chunk(s) via %s", len(chunks), LOCAL_MMS_TTS_MODEL)
-        return converted
-
+            converted = await _convert_audio_files_to_telegram_voice(input_paths, speed, output_path)
+            if not converted:
+                raise RuntimeError("Local MMS Khmer TTS produced empty converted output")
+            _local_mms_tts_cache_put(text, speed, converted)
+            _local_mms_tts_record_success()
+            logger.info("Local MMS Khmer TTS generated %s chunk(s) via %s", len(chunks), LOCAL_MMS_TTS_MODEL)
+            return converted
 
 def _hf_tts_is_temporarily_disabled() -> bool:
     with _HF_TTS_STATE_LOCK:
@@ -12445,7 +12493,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 async def _run_bot():
     global _BOT_START_TIME, _AI_SEMAPHORE, _BROADCAST_SEMAPHORE
-    global _prefs_cache_lock, _TTS_CHUNK_SEMAPHORE
+    global _prefs_cache_lock, _TTS_CHUNK_SEMAPHORE, _LOCAL_MMS_TTS_SEMAPHORE
 
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
@@ -12454,6 +12502,7 @@ async def _run_bot():
     _BROADCAST_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_BROADCAST)
     _prefs_cache_lock    = asyncio.Lock()
     _TTS_CHUNK_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TTS_USERS)
+    _LOCAL_MMS_TTS_SEMAPHORE = asyncio.Semaphore(LOCAL_MMS_TTS_WORKERS)
 
     # FIX: Reset ALL mutable in-memory state on restart to prevent stale data
     # accumulation across crash-restart cycles.
