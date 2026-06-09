@@ -9,3 +9,4 @@ requests
 pypdf
 python-docx
 redis
+gradio_client
