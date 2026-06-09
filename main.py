@@ -4198,9 +4198,9 @@ _prefs_cache: OrderedDict[int, tuple[dict, float]] = OrderedDict()
 _prefs_cache_lock: asyncio.Lock | None = None
 
 TTS_MODEL_OPTIONS = {
-    "auto": ("Auto", "Khmer HF Space → Edge fallback"),
-    "hf_space": ("Khmer HF", "mrrtmob/khmer-tts for Khmer text"),
-    "edge": ("Edge", "Microsoft Edge TTS for all languages"),
+    "auto": ("Auto", "Kiri → Edge TTS"),
+    "hf_space": ("Kiri"),
+    "edge": ("Edge", "Edge TTS"),
 }
 TTS_MODEL_ALIASES = {
     "auto": "auto",
@@ -4924,12 +4924,22 @@ def update_user_speed(user_id: int, speed: float) -> None:
 def update_user_tts_model(user_id: int, tts_model: str) -> str:
     """Persist the user's preferred TTS model/provider.
 
-    Returns the normalized model key so callback handlers can use it immediately
-    even before the async Supabase write completes. Missing optional Supabase
-    column is handled as a soft migration state, not an error.
+    Returns the normalized model key immediately so callback handlers can
+    regenerate voice without waiting on Supabase. The preference is saved to
+    memory/Redis first, then persisted in Supabase in the background.
+
+    Important production behavior:
+      - Missing optional user_prefs.tts_model never breaks Telegram callbacks.
+      - Upsert is used instead of update so first-time users persist correctly.
+      - Existing cached gender/speed are included to avoid NOT NULL/default
+        problems on older user_prefs schemas.
     """
     user_id = int(user_id)
     model = _normalize_tts_model(tts_model)
+
+    # Fast path: update local + Redis cache before any database work. This makes
+    # the button state correct immediately and survives Render process restarts
+    # when Redis is configured, even before the optional Supabase column exists.
     _cache_user_tts_model_preference_sync(user_id, model)
 
     if not supabase:
@@ -4944,9 +4954,17 @@ def update_user_tts_model(user_id: int, tts_model: str) -> str:
         )
         return model
 
+    cached_prefs = _normalize_user_prefs(_get_cached_prefs_sync(user_id))
+    payload = {
+        "user_id": user_id,
+        "gender": cached_prefs.get("gender", "female"),
+        "speed": cached_prefs.get("speed", DEFAULT_SPEED),
+        "tts_model": model,
+    }
+
     def _run():
         try:
-            supabase.table("user_prefs").update({"tts_model": model}).eq("user_id", user_id).execute()
+            supabase.table("user_prefs").upsert(payload, on_conflict="user_id").execute()
             _set_tts_model_column_status(True)
         except Exception as exc:
             if _is_missing_tts_model_column_error(exc):
@@ -11107,11 +11125,16 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
         ))
         return
 
-    if await _check_cooldown(query.message, user_id):
-        await safe_send(lambda: query.message.edit_reply_markup(
-            reply_markup=get_main_kb(gender, model)
-        ))
-        return
+    # Model changes are an edit/regenerate action, not a new user message, so do
+    # not block them with the normal text-message cooldown. The per-user lock and
+    # global TTS semaphore still prevent duplicate concurrent generation.
+    with suppress(Exception):
+        await query.message.edit_reply_markup(reply_markup=get_main_kb(gender, model))
+
+    status_msg = await safe_send(lambda: context.bot.send_message(
+        chat_id=chat_id,
+        text=f"🔄 កំពុងប្តូរម៉ូដែល TTS ទៅ {html.escape(TTS_MODEL_OPTIONS.get(model, TTS_MODEL_OPTIONS['auto'])[0])} ហើយបង្កើតសំឡេងឡើងវិញ...",
+    ))
 
     file_path  = _make_temp_ogg()
     stop_event = asyncio.Event()
@@ -11140,6 +11163,9 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
                     )
                     set_last_tts_text(user_id, original_text)
                     record_turn(user_id, "assistant", original_text)
+                with suppress(Exception):
+                    if status_msg:
+                        await status_msg.delete()
                 _set_last_tts(user_id)
             except Exception as e:
                 logger.error("tts model regenerate error: %s", e, exc_info=True)
@@ -11441,9 +11467,17 @@ async def _cb_audio_tts(query, user_id: int, context, data: str):
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
+    query = update.callback_query
+    if query is None:
+        return
+
     user_id = query.from_user.id
-    data    = query.data
+    data    = (query.data or "").strip()
+
+    if not data:
+        with suppress(Exception):
+            await query.answer()
+        return
 
     if query.message is None:
         logger.debug(f"on_callback: no message for data={data!r}")
