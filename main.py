@@ -34,6 +34,14 @@ from flask import Flask
 from supabase import create_client, Client
 from typing import Any, Callable
 
+# Load local .env before any environment-driven config is read.
+# This keeps local/dev runs consistent with Render environment variables.
+try:
+    from dotenv import load_dotenv as _early_load_dotenv
+    _early_load_dotenv()
+except Exception:
+    pass
+
 try:
     import redis as redis_lib
 except Exception:
@@ -57,6 +65,18 @@ def _env_int(name: str, default: int, *, minimum: int | None = None, maximum: in
         value = max(int(minimum), value)
     if maximum is not None:
         value = min(int(maximum), value)
+    return value
+
+
+def _env_float(name: str, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
+    try:
+        value = float(str(os.environ.get(name, default)).strip())
+    except Exception:
+        value = float(default)
+    if minimum is not None:
+        value = max(float(minimum), value)
+    if maximum is not None:
+        value = min(float(maximum), value)
     return value
 
 
@@ -105,7 +125,7 @@ def ping():
     return "pong", 200
 
 def run_flask():
-    port = int(os.environ.get("PORT", 8080))
+    port = _env_int("PORT", 8080, minimum=1, maximum=65535)
     app_flask.run(host="0.0.0.0", port=port, threaded=True)
 
 def keep_alive():
@@ -176,12 +196,12 @@ _AI_SYSTEM_PROMPT = (
 # ---------------------------------------------------------------------------
 # Concurrency limits
 # ---------------------------------------------------------------------------
-MAX_CONCURRENT_TTS_USERS   = int(os.environ.get("MAX_CONCURRENT_TTS_USERS", "6"))
-MAX_CONCURRENT_AI          = int(os.environ.get("MAX_CONCURRENT_AI", os.environ.get("MAX_CONCURRENT_GEMINI", "3")))
-MAX_CONCURRENT_BROADCAST   = int(os.environ.get("MAX_CONCURRENT_BROADCAST", "3"))
-BROADCAST_BATCH_SIZE       = max(1, int(os.environ.get("BROADCAST_BATCH_SIZE", str(MAX_CONCURRENT_BROADCAST))))
-BROADCAST_INTER_BATCH_DELAY = float(os.environ.get("BROADCAST_INTER_BATCH_DELAY", "0.20"))
-TTS_RESOLVER_AI_ENABLED    = os.environ.get("TTS_RESOLVER_AI_ENABLED", "0") == "1"
+MAX_CONCURRENT_TTS_USERS   = _env_int("MAX_CONCURRENT_TTS_USERS", 6, minimum=1, maximum=50)
+MAX_CONCURRENT_AI          = _env_int("MAX_CONCURRENT_AI", _env_int("MAX_CONCURRENT_GEMINI", 3, minimum=1), minimum=1, maximum=50)
+MAX_CONCURRENT_BROADCAST   = _env_int("MAX_CONCURRENT_BROADCAST", 3, minimum=1, maximum=50)
+BROADCAST_BATCH_SIZE       = _env_int("BROADCAST_BATCH_SIZE", MAX_CONCURRENT_BROADCAST, minimum=1, maximum=500)
+BROADCAST_INTER_BATCH_DELAY = _env_float("BROADCAST_INTER_BATCH_DELAY", 0.20, minimum=0.0, maximum=30.0)
+TTS_RESOLVER_AI_ENABLED    = _env_bool("TTS_RESOLVER_AI_ENABLED", False)
 
 # ---------------------------------------------------------------------------
 # Subtitle/Text document support
@@ -4065,7 +4085,7 @@ def _init_clients() -> None:
             ADMIN_IDS.add(int(_aid))
 
     if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
+        logger.error("TELEGRAM_BOT_TOKEN is not set. Telegram polling will not start until the env var is configured.")
 
     if SB_URL and SB_KEY:
         try:
@@ -9112,175 +9132,219 @@ async def _handle_user_search_text(update: Update, context: ContextTypes.DEFAULT
 
 
 async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
-    user_id = query.from_user.id
-    data    = query.data
+    query = update.callback_query
+    if not query:
+        return
+
+    user_id = query.from_user.id if query.from_user else 0
+    data = query.data or ""
 
     if not _is_admin(user_id):
         with suppress(Exception):
             await query.answer("⛔ អ្នកមិនមានសិទ្ធិ។", show_alert=True)
         return
+
     with suppress(Exception):
         await query.answer()
 
-    if data == "users_close":
-        context.user_data.pop("user_search_state", None)
-        with suppress(Exception):
-            await query.message.delete()
+    if query.message is None:
         return
 
-    if data == "noop":
-        return
+    def _int_part(parts: list[str], index: int, default: int = 0) -> int:
+        try:
+            return int(parts[index])
+        except Exception:
+            return int(default)
 
-    if data in ("history_refresh", "history_page:0"):
-        await _admin_open_recent_history_panel(query, page=0)
-        return
+    async def _invalid_callback() -> None:
+        await safe_send(lambda: query.message.reply_text("⚠️ Invalid or expired button data. Please refresh this panel."))
 
-    if data == "history_close":
-        with suppress(Exception):
-            await query.message.delete()
-        return
+    try:
+        if data == "users_close":
+            context.user_data.pop("user_search_state", None)
+            with suppress(Exception):
+                await query.message.delete()
+            return
 
-    if data.startswith("history_page:"):
-        page = int(data.split(":", 1)[1])
-        await _admin_open_recent_history_panel(query, page=page)
-        return
+        if data == "noop":
+            return
 
-    if data.startswith("history_user:"):
-        parts = data.split(":")
-        target_id = int(parts[1])
-        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
-        row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
-        await safe_send(lambda: query.message.edit_text(
-            _format_user_detail_text(row),
-            parse_mode="HTML",
-            reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=f"h{page}"),
-        ))
-        return
+        if data in ("history_refresh", "history_page:0"):
+            await _admin_open_recent_history_panel(query, page=0)
+            return
 
-    if data == "users_search":
-        context.user_data["user_search_state"] = USER_SEARCH_WAIT_QUERY
-        await safe_send(lambda: query.message.edit_text(
-            "🔎 <b>Search User</b>\n\n"
-            "Send a Telegram user ID or username.\n\n"
-            "Examples:\n"
-            "<code>1272791365</code>\n"
-            "<code>heng</code>\n"
-            "<code>@username</code>\n\n"
-            "Use /cancel to stop search.",
-            parse_mode="HTML",
-            reply_markup=get_user_search_prompt_kb(),
-        ))
-        return
+        if data == "history_close":
+            with suppress(Exception):
+                await query.message.delete()
+            return
 
-    if data.startswith("users_search_page:"):
-        page = int(data.split(":", 1)[1])
-        await _show_user_search_results(query, context, page=page)
-        return
+        if data.startswith("history_page:"):
+            page = _web_int(data.split(":", 1)[1], 0)
+            await _admin_open_recent_history_panel(query, page=page)
+            return
 
-    if data.startswith("users_page:"):
-        page  = int(data.split(":")[1])
-        users = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, get_all_users_with_names)
-        page = _clamp_users_page(users, page)
-        await safe_send(lambda: query.message.edit_text(
-            f"👥 <b>User Management ({len(users)} users)</b>\n"
-            "Select a user, or press 🔎 Search User to find by ID/username.",
-            parse_mode="HTML",
-            reply_markup=get_users_page_kb(users, page=page),
-        ))
-        return
-
-    if data.startswith("user_view:"):
-        parts = data.split(":")
-        target_id = int(parts[1])
-        back_ref = parts[2] if len(parts) > 2 else "p0"
-        row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
-        await safe_send(lambda: query.message.edit_text(
-            _format_user_detail_text(row),
-            parse_mode="HTML",
-            reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
-        ))
-        return
-
-    if data.startswith("user_history:"):
-        parts = data.split(":")
-        target_id = int(parts[1])
-        back_ref = parts[2] if len(parts) > 2 else "p0"
-        page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
-        await _show_user_full_history(query, target_id, back_ref=back_ref, page=page)
-        return
-
-    if data.startswith("user_chat:"):
-        target_id = int(data.split(":", 1)[1])
-        exists = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: user_exists_in_db(target_id))
-        if not exists:
+        if data.startswith("history_user:"):
+            parts = data.split(":")
+            target_id = _int_part(parts, 1, 0)
+            page = _int_part(parts, 2, 0)
+            if target_id <= 0:
+                await _invalid_callback()
+                return
+            row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
             await safe_send(lambda: query.message.edit_text(
-                f"❌ User <code>{target_id}</code> មិនមាននៅក្នុង Database ។",
+                _format_user_detail_text(row),
                 parse_mode="HTML",
-                reply_markup=get_admin_dashboard_kb(),
+                reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=f"h{page}"),
             ))
             return
-        await _open_chat_session(context.bot, user_id, target_id, context)
-        await safe_send(lambda: query.message.edit_text(
-            f"💬 <b>Chat Mode បើក</b>\n\nកំពុង Chat ជាមួយ User <code>{target_id}</code>\n"
-            "សារ/រូបភាព/Voice ផ្ញើនឹងទៅដល់ User ។\n\n"
-            "វាយ /endchat ឬ /cancel ដើម្បីបញ្ចប់។",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
-                InlineKeyboardButton("❌ End Chat", callback_data="admin_cancel_state"),
-            ]]),
-        ))
-        return
 
-    if data.startswith(("user_block:", "user_unblock:")):
-        parts = data.split(":")
-        action = parts[0]
-        target_id = int(parts[1])
-        back_ref = parts[2] if len(parts) > 2 else "p0"
-        blocked = action == "user_block"
-        ok, info = await asyncio.get_running_loop().run_in_executor(
-            _DB_EXECUTOR,
-            lambda: db_user_set_blocked(target_id, user_id, blocked),
-        )
-        row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
-        notice = "✅ User blocked." if blocked else "✅ User unblocked."
-        if not ok:
-            notice = f"⚠️ Saved memory only / DB issue: {info[:500]}"
-        await safe_send(lambda: query.message.edit_text(
-            notice + "\n\n" + _format_user_detail_text(row),
-            parse_mode="HTML",
-            reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
-        ))
-        return
+        if data == "users_search":
+            context.user_data["user_search_state"] = USER_SEARCH_WAIT_QUERY
+            await safe_send(lambda: query.message.edit_text(
+                "🔎 <b>Search User</b>\n\n"
+                "Send a Telegram user ID or username.\n\n"
+                "Examples:\n"
+                "<code>1272791365</code>\n"
+                "<code>heng</code>\n"
+                "<code>@username</code>\n\n"
+                "Use /cancel to stop search.",
+                parse_mode="HTML",
+                reply_markup=get_user_search_prompt_kb(),
+            ))
+            return
 
-    if data.startswith("user_resetprefs:"):
-        parts = data.split(":")
-        target_id = int(parts[1])
-        back_ref = parts[2] if len(parts) > 2 else "p0"
-        ok, info = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_reset_prefs(target_id))
-        row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
-        notice = "✅ User preferences reset." if ok else f"❌ Reset failed: {info[:500]}"
-        await safe_send(lambda: query.message.edit_text(
-            notice + "\n\n" + _format_user_detail_text(row),
-            parse_mode="HTML",
-            reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
-        ))
-        return
+        if data.startswith("users_search_page:"):
+            page = _web_int(data.split(":", 1)[1], 0)
+            await _show_user_search_results(query, context, page=page)
+            return
 
-    if data.startswith("user_clearhist:"):
-        parts = data.split(":")
-        target_id = int(parts[1])
-        back_ref = parts[2] if len(parts) > 2 else "p0"
-        await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_history_clear(target_id))
-        row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
-        await safe_send(lambda: query.message.edit_text(
-            "✅ User conversation history cleared.\n\n" + _format_user_detail_text(row),
-            parse_mode="HTML",
-            reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
-        ))
-        return
+        if data.startswith("users_page:"):
+            page = _web_int(data.split(":", 1)[1], 0)
+            users = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, get_all_users_with_names)
+            page = _clamp_users_page(users, page)
+            await safe_send(lambda: query.message.edit_text(
+                f"👥 <b>User Management ({len(users)} users)</b>\n"
+                "Select a user, or press 🔎 Search User to find by ID/username.",
+                parse_mode="HTML",
+                reply_markup=get_users_page_kb(users, page=page),
+            ))
+            return
 
+        if data.startswith("user_view:"):
+            parts = data.split(":")
+            target_id = _int_part(parts, 1, 0)
+            back_ref = parts[2] if len(parts) > 2 else "p0"
+            if target_id <= 0:
+                await _invalid_callback()
+                return
+            row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
+            await safe_send(lambda: query.message.edit_text(
+                _format_user_detail_text(row),
+                parse_mode="HTML",
+                reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
+            ))
+            return
+
+        if data.startswith("user_history:"):
+            parts = data.split(":")
+            target_id = _int_part(parts, 1, 0)
+            back_ref = parts[2] if len(parts) > 2 else "p0"
+            page = _int_part(parts, 3, 0)
+            if target_id <= 0:
+                await _invalid_callback()
+                return
+            await _show_user_full_history(query, target_id, back_ref=back_ref, page=page)
+            return
+
+        if data.startswith("user_chat:"):
+            target_id = _web_int(data.split(":", 1)[1], 0)
+            if target_id <= 0:
+                await _invalid_callback()
+                return
+            exists = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: user_exists_in_db(target_id))
+            if not exists:
+                await safe_send(lambda: query.message.edit_text(
+                    f"❌ User <code>{target_id}</code> មិនមាននៅក្នុង Database ។",
+                    parse_mode="HTML",
+                    reply_markup=get_admin_dashboard_kb(),
+                ))
+                return
+            await _open_chat_session(context.bot, user_id, target_id, context)
+            await safe_send(lambda: query.message.edit_text(
+                f"💬 <b>Chat Mode បើក</b>\n\nកំពុង Chat ជាមួយ User <code>{target_id}</code>\n"
+                "សារ/រូបភាព/Voice ផ្ញើនឹងទៅដល់ User ។\n\n"
+                "វាយ /endchat ឬ /cancel ដើម្បីបញ្ចប់។",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+                    InlineKeyboardButton("❌ End Chat", callback_data="admin_cancel_state"),
+                ]]),
+            ))
+            return
+
+        if data.startswith(("user_block:", "user_unblock:")):
+            parts = data.split(":")
+            action = parts[0]
+            target_id = _int_part(parts, 1, 0)
+            back_ref = parts[2] if len(parts) > 2 else "p0"
+            if target_id <= 0:
+                await _invalid_callback()
+                return
+            blocked = action == "user_block"
+            ok, info = await asyncio.get_running_loop().run_in_executor(
+                _DB_EXECUTOR,
+                lambda: db_user_set_blocked(target_id, user_id, blocked),
+            )
+            row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
+            notice = "✅ User blocked." if blocked else "✅ User unblocked."
+            if not ok:
+                notice = f"⚠️ Saved memory only / DB issue: {info[:500]}"
+            await safe_send(lambda: query.message.edit_text(
+                notice + "\n\n" + _format_user_detail_text(row),
+                parse_mode="HTML",
+                reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
+            ))
+            return
+
+        if data.startswith("user_resetprefs:"):
+            parts = data.split(":")
+            target_id = _int_part(parts, 1, 0)
+            back_ref = parts[2] if len(parts) > 2 else "p0"
+            if target_id <= 0:
+                await _invalid_callback()
+                return
+            ok, info = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_reset_prefs(target_id))
+            row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
+            notice = "✅ User preferences reset." if ok else f"❌ Reset failed: {info[:500]}"
+            await safe_send(lambda: query.message.edit_text(
+                notice + "\n\n" + _format_user_detail_text(row),
+                parse_mode="HTML",
+                reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
+            ))
+            return
+
+        if data.startswith("user_clearhist:"):
+            parts = data.split(":")
+            target_id = _int_part(parts, 1, 0)
+            back_ref = parts[2] if len(parts) > 2 else "p0"
+            if target_id <= 0:
+                await _invalid_callback()
+                return
+            await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_history_clear(target_id))
+            row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
+            await safe_send(lambda: query.message.edit_text(
+                "✅ User conversation history cleared.\n\n" + _format_user_detail_text(row),
+                parse_mode="HTML",
+                reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
+            ))
+            return
+
+        logger.debug("users_page_callback: unhandled data=%r", data)
+
+    except Exception as exc:
+        logger.error("users_page_callback failed [data=%s]: %s", data, exc, exc_info=True)
+        with suppress(Exception):
+            await safe_send(lambda: query.message.reply_text("⚠️ Admin user panel error. Please refresh and try again."))
 
 async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
     async def _do():
@@ -10602,7 +10666,10 @@ async def _cb_gender(query, user_id: int, context, data: str):
 
 
 async def _cb_tts_transcript(query, user_id: int, context, data: str):
-    transcript_msg_id = int(data.split(":")[1])
+    transcript_msg_id = _callback_int_arg(data, "tts_transcript:")
+    if transcript_msg_id is None:
+        await safe_send(lambda: query.message.reply_text("❌ Invalid transcript id."))
+        return
     if query.message is None:
         return
 
@@ -10661,7 +10728,12 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
 
 
 async def _cb_audio_tts(query, user_id: int, context, data: str):
-    src_msg_id = int(data.split(":")[1])
+    if query.message is None:
+        return
+    src_msg_id = _callback_int_arg(data, "audio_tts:")
+    if src_msg_id is None:
+        await safe_send(lambda: query.message.reply_text("❌ Invalid audio transcript id."))
+        return
     chat_id    = query.message.chat.id
     loop       = asyncio.get_running_loop()
 
@@ -10779,6 +10851,9 @@ async def _run_bot():
     global _BOT_START_TIME, _AI_SEMAPHORE, _BROADCAST_SEMAPHORE
     global _prefs_cache_lock, _TTS_CHUNK_SEMAPHORE
 
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
+
     _AI_SEMAPHORE        = asyncio.Semaphore(MAX_CONCURRENT_AI)
     _BROADCAST_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_BROADCAST)
     _prefs_cache_lock    = asyncio.Lock()
@@ -10837,7 +10912,9 @@ async def _run_bot():
     app.add_handler(CallbackQueryHandler(broadcast_callback,  pattern=r"^bc_(confirm|cancel)$"))
     app.add_handler(CallbackQueryHandler(
         users_page_callback,
-        pattern=r"^(users_page:\d+|users_search|users_search_page:\d+|users_close|noop|history_(page:\d+|refresh|close|user:\d+:\d+)|user_(view|chat|block|unblock|resetprefs|clearhist|history):\d+(?::[psh]\d+)?)$",
+        # Route every admin user/history button here, including paged callbacks like
+        # user_history:<id>:p0:<page>. The callback function validates IDs safely.
+        pattern=r"^(?:users_(?:page:\d+|search(?:_page:\d+)?|close)|noop|history_(?:page:\d+|refresh|close|user:\d+(?::\d+)?)|user_(?:view|chat|block|unblock|resetprefs|clearhist|history):\d+(?::[psh]\d+)?(?::\d+)?)$",
     ))
     app.add_handler(CallbackQueryHandler(sched_callback,      pattern=r"^sched_"))
     app.add_handler(CallbackQueryHandler(on_callback))
@@ -10864,8 +10941,8 @@ async def _run_bot():
 
     sched_stop = asyncio.Event()
     sweep_stop = asyncio.Event()
-    sched_task = asyncio.create_task(_scheduler_loop(app.bot, sched_stop))
-    sweep_task = asyncio.create_task(_periodic_temp_sweep(sweep_stop))
+    sched_task: asyncio.Task | None = None
+    sweep_task: asyncio.Task | None = None
 
     async with app:
         await app.initialize()
@@ -10874,12 +10951,17 @@ async def _run_bot():
             allowed_updates=["message", "callback_query"],
             drop_pending_updates=True,
         )
+        # Start background jobs only after the Telegram application is fully ready.
+        sched_task = asyncio.create_task(_scheduler_loop(app.bot, sched_stop))
+        sweep_task = asyncio.create_task(_periodic_temp_sweep(sweep_stop))
         try:
             await asyncio.Event().wait()
         finally:
             sched_stop.set()
             sweep_stop.set()
             for task in (sched_task, sweep_task):
+                if task is None:
+                    continue
                 task.cancel()
                 with suppress(asyncio.CancelledError, Exception):
                     await task
