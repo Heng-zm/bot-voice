@@ -38,7 +38,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from fastapi.encoders import jsonable_encoder
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.concurrency import run_in_threadpool
-from jinja2 import Environment, Template
+from jinja2 import Environment, Template, select_autoescape
 try:
     from pydantic_settings import BaseSettings, SettingsConfigDict
 except Exception:
@@ -51,6 +51,87 @@ except Exception:
     acreate_client = None
     AsyncClient = object
 from typing import Any, Callable
+
+
+def _resolve_maybe_awaitable_sync(value: Any) -> Any:
+    """Resolve sync or async SDK return values from worker/sync code paths.
+
+    supabase-py v2 exposes both synchronous and asynchronous clients. Most of
+    this bot intentionally runs database work in bounded worker threads. If an
+    async Supabase builder is accidentally used there, execute() returns an
+    awaitable; resolve it immediately in that worker thread instead of leaking
+    an un-awaited coroutine.
+    """
+    if not inspect.isawaitable(value):
+        return value
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(value)
+    if running_loop.is_running():
+        raise RuntimeError(
+            "Async Supabase result returned inside the main event loop. "
+            "Run this database call through db_call/db_call_sync or await it explicitly."
+        )
+    return running_loop.run_until_complete(value)
+
+
+class _SyncExecuteProxy:
+    """Proxy query builders so .execute() works with sync or async Supabase clients."""
+
+    __slots__ = ("_obj",)
+
+    def __init__(self, obj: Any):
+        object.__setattr__(self, "_obj", obj)
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(object.__getattribute__(self, "_obj"), name)
+        if not callable(attr):
+            return attr
+
+        def _wrapped(*args: Any, **kwargs: Any) -> Any:
+            result = attr(*args, **kwargs)
+            if name == "execute":
+                return _resolve_maybe_awaitable_sync(result)
+            return _wrap_supabase_object(result)
+
+        return _wrapped
+
+
+def _wrap_supabase_object(obj: Any) -> Any:
+    if obj is None or isinstance(obj, (str, bytes, bytearray, int, float, bool, list, tuple, dict, set)):
+        return obj
+    if isinstance(obj, _SyncExecuteProxy):
+        return obj
+    if hasattr(obj, "execute"):
+        return _SyncExecuteProxy(obj)
+    return obj
+
+
+class _SupabaseClientV2Compat:
+    """Small compatibility wrapper for existing sync-style Supabase call sites."""
+
+    __slots__ = ("_client",)
+
+    def __init__(self, client: Any):
+        object.__setattr__(self, "_client", client)
+
+    def table(self, *args: Any, **kwargs: Any) -> Any:
+        return _wrap_supabase_object(object.__getattribute__(self, "_client").table(*args, **kwargs))
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(object.__getattribute__(self, "_client"), name)
+        if not callable(attr):
+            return attr
+
+        def _wrapped(*args: Any, **kwargs: Any) -> Any:
+            return _wrap_supabase_object(attr(*args, **kwargs))
+
+        return _wrapped
+
+
+def _supabase_v2_compat_client(client: Any) -> Any:
+    return None if client is None else _SupabaseClientV2Compat(client)
 
 
 # ── Fast JSON codec helpers ────────────────────────────────────────────────
@@ -376,7 +457,7 @@ def abort(status_code: int = 400):
 _JINJA_TEMPLATE_CACHE_MAX = 256
 _JINJA_TEMPLATE_CACHE: OrderedDict[tuple[int, str], tuple[str, Any]] = OrderedDict()
 _JINJA_TEMPLATE_CACHE_LOCK = threading.RLock()
-_JINJA_ENV = Environment(autoescape=False, enable_async=False)
+_JINJA_ENV = Environment(autoescape=select_autoescape(["html", "xml"]), enable_async=False)
 
 
 def render_template_string(template: str, **context: Any) -> str:
@@ -397,7 +478,7 @@ def render_template_string(template: str, **context: Any) -> str:
         except Exception:
             # Preserve old fallback behavior if a third-party Jinja extension or
             # unusual template edge case is not accepted by the shared env.
-            return Template(template).render(**context)
+            return Template(template, autoescape=select_autoescape(["html", "xml"])).render(**context)
         with _JINJA_TEMPLATE_CACHE_LOCK:
             _JINJA_TEMPLATE_CACHE[key] = (template, compiled)
             while len(_JINJA_TEMPLATE_CACHE) > _JINJA_TEMPLATE_CACHE_MAX:
@@ -5085,6 +5166,10 @@ async def _switch_telegram_runtime_mode(target_mode: str, admin_id: int = 0) -> 
     # Remove webhook first, verify Telegram accepted it, then start one polling worker.
     await _cancel_active_polling_task("switch_to_polling_pre_delete")
     await _delete_telegram_webhook_via_http(drop_pending=True)
+    # Telegram may still release the previous webhook/getUpdates state shortly
+    # after deleteWebhook returns. A short grace delay prevents intermittent
+    # 409 Conflict errors when polling starts immediately.
+    await asyncio.sleep(1.5)
     await _update_run_state("BOT_MODE", "POLLING")
     await _telegram_start_polling_runtime(app_obj)
     _runtime_admin_log_state("switch_polling", admin_id)
@@ -5544,7 +5629,7 @@ def retry_call_sync(
     last_exc: BaseException | None = None
     for attempt in range(1, max(1, attempts) + 1):
         try:
-            result = factory()
+            result = _resolve_maybe_awaitable_sync(factory())
             if breaker:
                 breaker.record_success()
             return result
@@ -5609,7 +5694,10 @@ async def retry_call(
     last_exc: BaseException | None = None
     for attempt in range(1, max(1, attempts) + 1):
         try:
-            result = await asyncio.wait_for(asyncio.to_thread(factory), timeout=timeout)
+            result = await asyncio.wait_for(
+                asyncio.to_thread(lambda: _resolve_maybe_awaitable_sync(factory())),
+                timeout=timeout,
+            )
             if breaker:
                 breaker.record_success()
             return result
@@ -6453,7 +6541,7 @@ def _init_clients() -> None:
         try:
             if SB_KEY.startswith("sb_publishable_") or "publishable" in SB_KEY.lower():
                 logger.warning("SUPABASE_KEY looks like a publishable key. Admin tables such as ai_api_keys should use SUPABASE_SERVICE_ROLE_KEY on the server.")
-            supabase = create_client(SB_URL, SB_KEY)
+            supabase = _supabase_v2_compat_client(create_client(SB_URL, SB_KEY))
             if SUPABASE_DB_POOLER_URL:
                 logger.info("Supabase DB pooler URL configured for direct PostgreSQL workloads (transaction pooler / Supavisor recommended on port 6543).")
             else:
@@ -6799,17 +6887,48 @@ async def get_user_prefs_async(user_id: int) -> dict:
 # ---------------------------------------------------------------------------
 _USER_LOCK_MAX = 5_000
 _user_locks: OrderedDict[int, asyncio.Lock] = OrderedDict()
+_user_locks_guard = threading.RLock()
+
+
+def _evict_idle_user_locks() -> int:
+    """Evict only unlocked user locks from the LRU cache.
+
+    Never remove a locked/in-use asyncio.Lock. Evicting an active lock creates a
+    second lock for the same user and silently bypasses the per-user concurrency
+    limit. If every cached lock is active, keep the cache temporarily above the
+    soft limit and trim it on a later request when idle locks exist.
+    """
+    evicted = 0
+    while len(_user_locks) > _USER_LOCK_MAX:
+        victim_id = None
+        for uid, lock in _user_locks.items():
+            if not lock.locked():
+                victim_id = uid
+                break
+        if victim_id is None:
+            logger.warning(
+                "User lock cache exceeded soft limit (%s/%s), but all locks are active; "
+                "skipping eviction to preserve concurrency limits.",
+                len(_user_locks),
+                _USER_LOCK_MAX,
+            )
+            break
+        _user_locks.pop(victim_id, None)
+        evicted += 1
+    return evicted
 
 
 def _get_user_lock(user_id: int) -> asyncio.Lock:
-    if user_id in _user_locks:
-        _user_locks.move_to_end(user_id)
-        return _user_locks[user_id]
-    lock = asyncio.Lock()
-    _user_locks[user_id] = lock
-    while len(_user_locks) > _USER_LOCK_MAX:
-        _user_locks.popitem(last=False)
-    return lock
+    with _user_locks_guard:
+        lock = _user_locks.get(user_id)
+        if lock is not None:
+            _user_locks.move_to_end(user_id)
+            return lock
+
+        lock = asyncio.Lock()
+        _user_locks[user_id] = lock
+        _evict_idle_user_locks()
+        return lock
 
 
 # ---------------------------------------------------------------------------
@@ -6881,25 +7000,158 @@ async def safe_send(coro_factory, retries: int = 3, delay: float = 2.0):
 # ---------------------------------------------------------------------------
 # Telegram-safe text pagination
 # ---------------------------------------------------------------------------
-def _paginate_plain(text: str, limit: int = TELE_MSG_LIMIT) -> list[str]:
-    text = text.strip()
-    if not text:
+def _paginate_plain(text: str, limit: int = TELE_MSG_LIMIT, header: str = "") -> list[str]:
+    """Split plain text into Telegram-sized pages.
+
+    `header` is prepended to every page and included in the limit calculation.
+    This keeps command output consistent without forcing callers to subtract
+    header sizes manually.
+    """
+    text = str(text or "").strip()
+    header = str(header or "")
+    if not text and not header:
         return []
-    if len(text) <= limit:
-        return [text]
-    pages = []
+
+    limit = max(1, int(limit or TELE_MSG_LIMIT))
+    body_limit = max(1, limit - len(header))
+    pages: list[str] = []
+
     while text:
-        if len(text) <= limit:
-            pages.append(text)
+        if len(text) <= body_limit:
+            pages.append(header + text)
             break
-        cut = text.rfind("\n", 0, limit)
+
+        cut = text.rfind("\n", 0, body_limit + 1)
         if cut <= 0:
-            cut = limit
-        pages.append(text[:cut])
-        remainder = text[cut:].lstrip()
-        if not remainder:
-            break
-        text = remainder
+            cut = text.rfind(" ", 0, body_limit + 1)
+        if cut <= 0:
+            cut = body_limit
+
+        page = text[:cut].rstrip()
+        if page:
+            pages.append(header + page)
+        text = text[cut:].lstrip()
+
+    if not pages and header:
+        pages.append(header.rstrip())
+    return [p for p in pages if p]
+
+
+def _take_escaped_prefix(text: str, escaped_limit: int) -> tuple[str, str]:
+    """Return the largest raw prefix whose html.escape() fits escaped_limit."""
+    if escaped_limit <= 0:
+        return "", text
+    if len(html.escape(text)) <= escaped_limit:
+        return text, ""
+
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(html.escape(text[:mid])) <= escaped_limit:
+            lo = mid
+        else:
+            hi = mid - 1
+    if lo <= 0:
+        lo = 1
+    return text[:lo], text[lo:]
+
+
+def _paginate_pre_html(text: str, limit: int = TELE_MSG_LIMIT, header: str = "") -> list[str]:
+    """Paginate plain text as HTML <pre> blocks without splitting entities/tags."""
+    text = str(text or "").strip()
+    header = str(header or "")
+    wrapper_len = len("<pre></pre>")
+    body_limit = max(1, int(limit or TELE_MSG_LIMIT) - len(header) - wrapper_len)
+    pages: list[str] = []
+
+    while text:
+        raw, rest = _take_escaped_prefix(text, body_limit)
+        if rest:
+            # Prefer a clean boundary if it still leaves useful content.
+            for sep in ("\n", " "):
+                cut = raw.rfind(sep)
+                if cut > 0 and len(html.escape(raw[:cut].rstrip())) <= body_limit:
+                    rest = raw[cut:] + rest
+                    raw = raw[:cut].rstrip()
+                    break
+        raw = raw.rstrip()
+        if raw:
+            pages.append(f"{header}<pre>{html.escape(raw)}</pre>")
+        text = rest.lstrip()
+
+    if not pages and header:
+        pages.append(header.rstrip())
+    return pages
+
+
+def _html_safe_cut(text: str, limit: int) -> int:
+    """Pick a cut position that does not land inside an HTML tag or entity."""
+    if len(text) <= limit:
+        return len(text)
+    cut = max(1, min(limit, len(text)))
+
+    # Avoid splitting a tag token such as <code> or </b>.
+    last_lt = text.rfind("<", 0, cut)
+    last_gt = text.rfind(">", 0, cut)
+    if last_lt > last_gt:
+        cut = max(1, last_lt)
+
+    # Avoid splitting an HTML entity such as &amp; or &#123;.
+    last_amp = text.rfind("&", 0, cut)
+    last_semi = text.rfind(";", 0, cut)
+    if last_amp > last_semi and cut - last_amp <= 12:
+        cut = max(1, last_amp)
+
+    # Prefer human-readable boundaries before falling back to a hard safe cut.
+    for sep in ("\n\n", "\n", " "):
+        boundary = text.rfind(sep, 0, cut)
+        if boundary > 0:
+            return boundary
+    return cut
+
+
+def _paginate_html(text: str, limit: int = TELE_MSG_LIMIT, header: str = "") -> list[str]:
+    """Split already-escaped Telegram HTML without cutting through tags.
+
+    This function is intentionally conservative: it first paginates on paragraph
+    and line boundaries, then uses _html_safe_cut only for unusually long blocks.
+    `header` is prepended to every page and included in the limit calculation.
+    """
+    text = str(text or "").strip()
+    header = str(header or "")
+    if not text and not header:
+        return []
+
+    limit = max(1, int(limit or TELE_MSG_LIMIT))
+    body_limit = max(1, limit - len(header))
+    pages: list[str] = []
+    current = ""
+
+    blocks = re.split(r"(\n{2,})", text)
+    for block in blocks:
+        if not block:
+            continue
+        candidate = current + block
+        if len(candidate) <= body_limit:
+            current = candidate
+            continue
+        if current.strip():
+            pages.append(header + current.strip())
+            current = ""
+
+        block = block.lstrip()
+        while len(block) > body_limit:
+            cut = _html_safe_cut(block, body_limit)
+            piece = block[:cut].strip()
+            if piece:
+                pages.append(header + piece)
+            block = block[cut:].lstrip()
+        current = block
+
+    if current.strip():
+        pages.append(header + current.strip())
+    if not pages and header:
+        pages.append(header.rstrip())
     return [p for p in pages if p]
 
 
@@ -10044,12 +10296,15 @@ async def _convert_audio_files_to_telegram_voice(input_paths: list[str], speed: 
         timeout_s = max(FFMPEG_CONVERT_TIMEOUT_S, 20 * len(input_paths))
         _, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
     except FileNotFoundError as exc:
+        _cleanup(output_path)
         raise RuntimeError(f"FFmpeg executable not found: {_FFMPEG_EXE}") from exc
     except asyncio.TimeoutError:
+        _cleanup(output_path)
         await _terminate_subprocess(proc, "HF TTS FFmpeg")
         raise RuntimeError("FFmpeg timed out while converting HF TTS audio")
 
     if proc.returncode != 0:
+        _cleanup(output_path)
         snippet = (stderr_data or b"").decode(errors="replace")[-600:]
         raise RuntimeError(f"FFmpeg failed converting HF TTS audio (code {proc.returncode}): {snippet}")
 
@@ -10060,8 +10315,10 @@ async def _convert_audio_files_to_telegram_voice(input_paths: list[str], speed: 
             timeout=10,
         )
     except asyncio.TimeoutError:
+        _cleanup(output_path)
         raise RuntimeError("Timed out reading converted HF TTS output")
     except OSError as exc:
+        _cleanup(output_path)
         raise RuntimeError(f"Failed to read converted HF TTS output: {exc}") from exc
 
 
@@ -10174,12 +10431,15 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
         )
         _, stderr_data = await asyncio.wait_for(proc.communicate(input=mp3_data), timeout=FFMPEG_CONVERT_TIMEOUT_S)
     except FileNotFoundError as exc:
+        _cleanup(output_path)
         raise RuntimeError(f"FFmpeg executable not found: {_FFMPEG_EXE}") from exc
     except asyncio.TimeoutError:
+        _cleanup(output_path)
         await _terminate_subprocess(proc, "Edge TTS FFmpeg")
         raise RuntimeError(f"FFmpeg timed out after {FFMPEG_CONVERT_TIMEOUT_S:.0f}s")
 
     if proc.returncode != 0:
+        _cleanup(output_path)
         snippet = (stderr_data or b"").decode(errors="replace")[-400:]
         raise RuntimeError(f"FFmpeg failed (code {proc.returncode}): {snippet}")
 
@@ -10190,8 +10450,10 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
             timeout=10,
         )
     except asyncio.TimeoutError:
+        _cleanup(output_path)
         raise RuntimeError("Timed out reading output audio file")
     except OSError as e:
+        _cleanup(output_path)
         raise RuntimeError(f"Failed to read output audio file: {e}") from e
     return audio_bytes
 
@@ -11243,10 +11505,13 @@ async def _admin_open_settings_panel(query, force: bool = False, notice: str = "
 
 
 async def _admin_send_settings_sql(message) -> None:
-    for page in _paginate_plain(ADMIN_V2_TABLES_SQL, limit=3800):
+    for page in _paginate_pre_html(
+        ADMIN_V2_TABLES_SQL,
+        limit=3800,
+        header="🧩 <b>Admin Dashboard V2 SQL</b>\n\n",
+    ):
         await safe_send(lambda p=page: message.reply_text(
-            "🧩 <b>Admin Dashboard V2 SQL</b>\n\n"
-            f"<pre>{html.escape(p)}</pre>",
+            p,
             parse_mode="HTML",
             reply_markup=get_admin_dashboard_kb(),
         ))
@@ -12879,10 +13144,14 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loop = asyncio.get_running_loop()
 
     if action == "sql":
-        pages = _paginate_plain(AI_API_KEYS_TABLE_SQL, limit=3800)
+        pages = _paginate_pre_html(
+            AI_API_KEYS_TABLE_SQL,
+            limit=3800,
+            header="🧩 <b>Supabase SQL for API keys</b>\n\n",
+        )
         for page in pages:
             await safe_send(lambda p=page: msg.reply_text(
-                f"<pre>{html.escape(p)}</pre>",
+                p,
                 parse_mode="HTML",
                 reply_markup=get_api_admin_kb(),
             ))
@@ -12898,19 +13167,21 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"/api create failed: {e}", exc_info=True)
             err = str(e)
-            pages = _paginate_plain(err, limit=3500)
-            await safe_send(lambda: msg.reply_text(
-                "❌ Cannot create API key.\n"
-                "If this is first setup, press <b>🧩 Setup SQL</b> or run <code>/api sql</code> and execute it in Supabase.",
-                parse_mode="HTML",
-                reply_markup=get_api_admin_kb(),
-            ))
-            if pages:
-                await safe_send(lambda p=pages[0]: msg.reply_text(
-                f"<pre>{html.escape(p)}</pre>",
-                parse_mode="HTML",
-                reply_markup=get_api_admin_kb(),
-            ))
+            pages = _paginate_pre_html(
+                err,
+                limit=3500,
+                header=(
+                    "❌ Cannot create API key.\n"
+                    "If this is first setup, press <b>🧩 Setup SQL</b> or run <code>/api sql</code> "
+                    "and execute it in Supabase.\n\n"
+                ),
+            )
+            for page in pages:
+                await safe_send(lambda p=page: msg.reply_text(
+                    p,
+                    parse_mode="HTML",
+                    reply_markup=get_api_admin_kb(),
+                ))
             return
 
         warning = ""
@@ -12959,7 +13230,7 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         body = "\n\n".join(_format_api_key_row(r) for r in rows)
-        for page in _paginate_plain("🔑 <b>AI API Keys</b>\n\n" + body, limit=3900):
+        for page in _paginate_html(body, limit=3900, header="🔑 <b>AI API Keys</b>\n\n"):
             await safe_send(lambda p=page: msg.reply_text(
                 p,
                 parse_mode="HTML",
@@ -13057,11 +13328,14 @@ async def _api_status_async() -> dict:
 
 
 async def _api_send_sql_message(message) -> None:
-    pages = _paginate_plain(AI_API_KEYS_TABLE_SQL, limit=3800)
+    pages = _paginate_pre_html(
+        AI_API_KEYS_TABLE_SQL,
+        limit=3800,
+        header="🧩 <b>Supabase SQL for API keys</b>\n\n",
+    )
     for page in pages:
         await safe_send(lambda p=page: message.reply_text(
-            "🧩 <b>Supabase SQL for API keys</b>\n\n"
-            f"<pre>{html.escape(p)}</pre>",
+            p,
             parse_mode="HTML",
             reply_markup=get_api_admin_kb(),
         ))
