@@ -4698,6 +4698,7 @@ def get_runtime_admin_kb() -> Any:
         [InlineKeyboardButton(f"🔄 Switch to {target}", callback_data=f"rtadmin_switch:{target}")],
         [InlineKeyboardButton("⚡ Modify Rate Limit", callback_data="rtadmin_rate")],
         [InlineKeyboardButton("🔄 Rotate Webhook Secret", callback_data="rtadmin_rotate_secret")],
+        [InlineKeyboardButton("⬅️ Admin Dashboard", callback_data="admin_home")],
         [InlineKeyboardButton("❌ Close Menu", callback_data="rtadmin_close")],
     ])
 
@@ -9033,7 +9034,11 @@ def get_sched_detail_kb(row: dict) -> InlineKeyboardMarkup:
 
 
 def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
-    """Admin Dashboard V2 keyboard with direct panels and settings."""
+    """Admin Dashboard V2 keyboard with direct panels, settings, and runtime submenu.
+
+    Keep /admin as the original full bot admin dashboard. Runtime controls are
+    available as a submenu so older admin features are not hidden/replaced.
+    """
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🏠 Dashboard",   callback_data="admin_home"),
          InlineKeyboardButton("🩺 Health",      callback_data="admin_health")],
@@ -9044,7 +9049,8 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📢 Broadcast",   callback_data="admin_broadcast"),
          InlineKeyboardButton("⏰ Schedules",   callback_data="admin_schedules")],
         [InlineKeyboardButton("🔑 API Keys",    callback_data="admin_api"),
-         InlineKeyboardButton("🔄 Refresh",     callback_data="admin_home")],
+         InlineKeyboardButton("🛠️ Runtime",    callback_data="admin_runtime")],
+        [InlineKeyboardButton("🔄 Refresh",     callback_data="admin_home")],
         [InlineKeyboardButton("❌ Close",       callback_data="admin_close")],
     ])
 
@@ -11054,15 +11060,27 @@ async def _admin_start_schedule_from_button(query, context: ContextTypes.DEFAULT
 
 @admin_only
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Runtime Admin Panel: live operational controls without app restart.
+    # Preserve the original full Telegram Admin Dashboard V2 on /admin.
+    # Runtime controls are now reachable from the "🛠️ Runtime" submenu button.
+    user_id = update.effective_user.id if update.effective_user else 0
+    text = await _admin_home_text(user_id)
+    await safe_send(lambda: update.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=get_admin_dashboard_kb(),
+        disable_web_page_preview=True,
+    ))
+
+
+@admin_only
+async def cmd_runtime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Direct shortcut for runtime operations without replacing /admin.
     await safe_send(lambda: update.message.reply_text(
         _runtime_admin_text(),
         parse_mode="HTML",
         reply_markup=get_runtime_admin_kb(),
         disable_web_page_preview=True,
     ))
-
-
 
 
 @admin_only
@@ -11516,6 +11534,15 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
             text,
             parse_mode="HTML",
             reply_markup=get_admin_dashboard_kb(),
+        ))
+        return
+
+    if data == "admin_runtime":
+        await safe_send(lambda: query.message.edit_text(
+            _runtime_admin_text(),
+            parse_mode="HTML",
+            reply_markup=get_runtime_admin_kb(),
+            disable_web_page_preview=True,
         ))
         return
 
@@ -14216,6 +14243,7 @@ async def _run_bot():
     app.add_handler(CommandHandler("cancel",          cmd_cancel))
     app.add_handler(CommandHandler("stats",           admin_stats))
     app.add_handler(CommandHandler("admin",           cmd_admin))
+    app.add_handler(CommandHandler("runtime",         cmd_runtime))
     app.add_handler(CommandHandler("api",             cmd_api))
     app.add_handler(CommandHandler("botsettings",     cmd_botsettings))
     app.add_handler(CommandHandler("users",           cmd_users))
