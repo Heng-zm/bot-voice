@@ -4628,6 +4628,71 @@ webhook_logger = logging.getLogger("telegram_webhook")
 rate_limit_logger = logging.getLogger("rate_limit")
 broadcast_queue_logger = logging.getLogger("broadcast_queue")
 
+
+# ---------------------------------------------------------------------------
+# Admin Error Center — in-memory recent error ring for /admin
+# ---------------------------------------------------------------------------
+_ADMIN_ERROR_CENTER_MAX = _env_int("ADMIN_ERROR_CENTER_MAX", 200, minimum=20, maximum=2000)
+_ADMIN_ERROR_CENTER: deque[dict[str, Any]] = deque(maxlen=_ADMIN_ERROR_CENTER_MAX)
+_ADMIN_ERROR_CENTER_LOCK = threading.Lock()
+
+
+def _admin_error_fingerprint(source: str, message: str) -> str:
+    raw = f"{source}:{message}"[:2000]
+    return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+
+def _record_admin_error(source: str, message: str, *, level: str = "ERROR", context: str = "") -> None:
+    """Store a small, sanitized error entry for the Telegram Error Center."""
+    source = str(source or "unknown")[:80]
+    message = re.sub(r"\s+", " ", str(message or "").strip())[:900]
+    context = re.sub(r"\s+", " ", str(context or "").strip())[:300]
+    item = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "source": source,
+        "level": str(level or "ERROR")[:16],
+        "message": message or "(empty error)",
+        "context": context,
+        "fingerprint": _admin_error_fingerprint(source, message),
+    }
+    with _ADMIN_ERROR_CENTER_LOCK:
+        _ADMIN_ERROR_CENTER.appendleft(item)
+
+
+class _AdminErrorCenterHandler(logging.Handler):
+    """Capture ERROR+ log records without changing normal logging output."""
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if record.levelno < logging.ERROR:
+                return
+            _record_admin_error(
+                record.name,
+                self.format(record),
+                level=record.levelname,
+                context=f"{record.pathname}:{record.lineno}",
+            )
+        except Exception:
+            # Logging handlers must never crash the bot.
+            pass
+
+
+_admin_error_handler = _AdminErrorCenterHandler()
+_admin_error_handler.setLevel(logging.ERROR)
+_admin_error_handler.setFormatter(logging.Formatter("%(message)s"))
+logging.getLogger().addHandler(_admin_error_handler)
+
+
+def _admin_error_center_snapshot(limit: int = 10) -> list[dict[str, Any]]:
+    with _ADMIN_ERROR_CENTER_LOCK:
+        return list(_ADMIN_ERROR_CENTER)[: max(1, min(50, int(limit or 10)))]
+
+
+def _admin_error_center_clear() -> int:
+    with _ADMIN_ERROR_CENTER_LOCK:
+        count = len(_ADMIN_ERROR_CENTER)
+        _ADMIN_ERROR_CENTER.clear()
+    return count
+
 # ---------------------------------------------------------------------------
 # Config  (populated by _init_clients)
 # ---------------------------------------------------------------------------
@@ -5355,11 +5420,15 @@ async def _handle_runtime_admin_text(update: Any, context: Any) -> bool:
 
 
 def _runtime_admin_bootstrap_state() -> None:
+    with suppress(Exception):
+        _restore_tts_provider_runtime_overrides_sync()
     logger.info(
-        "Runtime admin state ready mode=%s user_rate_limit=%s http_max_connections=%s restored_from_redis=%s",
+        "Runtime admin state ready mode=%s user_rate_limit=%s http_max_connections=%s tts_provider=%s khmer_tts=%s restored_from_redis=%s",
         _run_state_bot_mode(),
         _run_state_user_rate_limit(),
         _run_state_http_max_connections(),
+        globals().get("TTS_PROVIDER", "auto"),
+        globals().get("KHMER_TTS_PROVIDER", "hf_space"),
         bool(globals().get("_RUNTIME_STATE_RESTORED_FROM_REDIS")),
     )
 
@@ -9518,11 +9587,14 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🕘 Recent History", callback_data="admin_history")],
         [InlineKeyboardButton("⚙️ Settings",    callback_data="admin_settings"),
          InlineKeyboardButton("📊 Stats",       callback_data="admin_stats")],
-        [InlineKeyboardButton("📢 Broadcast",   callback_data="admin_broadcast"),
-         InlineKeyboardButton("⏰ Schedules",   callback_data="admin_schedules")],
-        [InlineKeyboardButton("🔑 API Keys",    callback_data="admin_api"),
+        [InlineKeyboardButton("📢 Safer Broadcast V2", callback_data="admin_broadcast"),
+         InlineKeyboardButton("🗓 Schedule Calendar", callback_data="admin_calendar")],
+        [InlineKeyboardButton("⏰ Schedules",   callback_data="admin_schedules"),
+         InlineKeyboardButton("🎛 TTS Provider", callback_data="admin_tts")],
+        [InlineKeyboardButton("🚨 Error Center", callback_data="admin_errors"),
          InlineKeyboardButton("🛠️ Runtime",    callback_data="admin_runtime")],
-        [InlineKeyboardButton("🔄 Refresh",     callback_data="admin_home")],
+        [InlineKeyboardButton("🔑 API Keys",    callback_data="admin_api"),
+         InlineKeyboardButton("🔄 Refresh",     callback_data="admin_home")],
         [InlineKeyboardButton("❌ Close",       callback_data="admin_close")],
     ])
 
@@ -10814,10 +10886,38 @@ def get_ocr_confirm_kb(msg_id: int) -> InlineKeyboardMarkup:
 
 
 def get_broadcast_confirm_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ បញ្ជាក់ Broadcast", callback_data="bc_confirm"),
-        InlineKeyboardButton("❌ បោះបង់",           callback_data="bc_cancel"),
-    ]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Send to Active Users", callback_data="bc_confirm")],
+        [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+         InlineKeyboardButton("❌ Cancel", callback_data="bc_cancel")],
+    ])
+
+
+def _broadcast_recipient_estimate_sync() -> dict[str, int]:
+    """Return registered/active/blocked recipient counts for Safer Broadcast V2."""
+    raw_user_ids = get_all_user_ids()
+    registered = len(raw_user_ids)
+    blocked_ids = _web_blocked_ids_for_users(raw_user_ids) if raw_user_ids else set()
+    blocked = len(blocked_ids)
+    active = max(0, registered - blocked)
+    return {"registered": registered, "active": active, "blocked": blocked}
+
+
+def _broadcast_preview_summary(payload: dict, estimate: dict[str, int]) -> str:
+    kind = "Photo + caption" if payload.get("photo_file_id") else "Text"
+    content = payload.get("caption") if payload.get("photo_file_id") else payload.get("text")
+    content = str(content or "").strip()
+    chars = len(content)
+    return (
+        "🛡️ <b>Safer Broadcast V2 Preview</b>\n\n"
+        f"Type: <b>{html.escape(kind)}</b>\n"
+        f"Characters: <b>{chars}</b>\n"
+        f"Registered users: <b>{int(estimate.get('registered') or 0)}</b>\n"
+        f"Active target: <b>{int(estimate.get('active') or 0)}</b>\n"
+        f"Skipped blocked/unreachable: <b>{int(estimate.get('blocked') or 0)}</b>\n"
+        f"Batch size: <b>{BROADCAST_BATCH_SIZE}</b> · Delay: <b>{BROADCAST_INTER_BATCH_DELAY:g}s</b>\n\n"
+        "Confirm only after checking the preview. Blocked/unreachable users are skipped automatically."
+    )
 
 
 def _clamp_users_page(users: list[dict], page: int, page_size: int = 7) -> int:
@@ -11433,6 +11533,252 @@ async def _admin_stats_text(admin_id: int) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Admin panels: TTS Provider Control, Schedule Calendar, Error Center
+# ---------------------------------------------------------------------------
+def _admin_back_close_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+         InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+    ])
+
+
+def _tts_provider_control_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🤖 Auto", callback_data="admin_tts_set:auto"),
+         InlineKeyboardButton("🌐 Edge Only", callback_data="admin_tts_set:edge")],
+        [InlineKeyboardButton("🇰🇭 HF Khmer", callback_data="admin_tts_set:hf_space"),
+         InlineKeyboardButton("🇰🇭 Khmer → Edge", callback_data="admin_tts_set:khmer_edge")],
+        [InlineKeyboardButton("✅ Enable HF Now", callback_data="admin_tts_hf_enable"),
+         InlineKeyboardButton("⏸ Disable HF 5m", callback_data="admin_tts_hf_5m")],
+        [InlineKeyboardButton("🧹 Clear HF Client", callback_data="admin_tts_hf_clear"),
+         InlineKeyboardButton("🔄 Refresh", callback_data="admin_tts")],
+        [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+         InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+    ])
+
+
+def _admin_tts_provider_text(notice: str = "") -> str:
+    hf_remaining = _hf_tts_disabled_remaining_s() if "_hf_tts_disabled_remaining_s" in globals() else 0
+    hf_disabled = hf_remaining > 0
+    hf_client_ready = bool(globals().get("_HF_TTS_CLIENT"))
+    lines = []
+    if notice:
+        lines.append(f"{html.escape(notice)}\n")
+    lines.extend([
+        "🎛 <b>TTS Provider Control</b>",
+        "",
+        f"Main provider: <code>{html.escape(str(TTS_PROVIDER or 'auto'))}</code>",
+        f"Khmer provider: <code>{html.escape(str(KHMER_TTS_PROVIDER or 'hf_space'))}</code>",
+        f"Default user model: <code>{html.escape(_normalize_tts_model(DEFAULT_TTS_MODEL))}</code>",
+        f"HF Space: <code>{html.escape(str(HF_TTS_SPACE))}{html.escape(str(HF_TTS_API_NAME))}</code>",
+        f"Gradio client: <b>{'READY' if GradioClient is not None else 'MISSING'}</b>",
+        f"HF cached client: <b>{'YES' if hf_client_ready else 'NO'}</b>",
+        f"HF cooldown: <b>{hf_remaining}s</b> {'⚠️' if hf_disabled else '✅'}",
+        f"Edge fallback: <b>{'ON' if HF_TTS_EDGE_FALLBACK else 'OFF'}</b>",
+        f"HF retries: <b>{HF_TTS_RETRIES}</b> · timeout: <b>{HF_TTS_TIMEOUT_S:g}s</b>",
+        f"Edge retries: <b>{EDGE_TTS_RETRIES}</b> · stream timeout: <b>{EDGE_TTS_STREAM_TIMEOUT_S:g}s</b>",
+        "",
+        "Mode guide:",
+        "• Auto: Khmer tries HF, then Edge fallback.",
+        "• Edge Only: all TTS uses Microsoft Edge TTS.",
+        "• HF Khmer: Khmer strongly prefers the HF Khmer Space.",
+        "• Khmer → Edge: Khmer skips HF and uses Edge immediately.",
+    ])
+    return "\n".join(lines)
+
+
+async def _admin_open_tts_provider_panel(query, notice: str = "") -> None:
+    await safe_send(lambda: query.message.edit_text(
+        _admin_tts_provider_text(notice),
+        parse_mode="HTML",
+        reply_markup=_tts_provider_control_kb(),
+        disable_web_page_preview=True,
+    ))
+
+
+async def _admin_set_tts_provider(mode: str) -> str:
+    """Apply a live TTS provider mode. Redis persistence is best-effort."""
+    global TTS_PROVIDER, KHMER_TTS_PROVIDER
+    mode = str(mode or "auto").strip().lower()
+    if mode == "edge":
+        TTS_PROVIDER = "edge"
+        KHMER_TTS_PROVIDER = "edge"
+        label = "Edge Only"
+    elif mode == "hf_space":
+        TTS_PROVIDER = "hf_space"
+        KHMER_TTS_PROVIDER = "hf_space"
+        label = "HF Khmer"
+    elif mode == "khmer_edge":
+        TTS_PROVIDER = "auto"
+        KHMER_TTS_PROVIDER = "edge"
+        label = "Khmer → Edge"
+    else:
+        TTS_PROVIDER = "auto"
+        KHMER_TTS_PROVIDER = "hf_space"
+        label = "Auto"
+
+    if redis_client is not None:
+        def _persist():
+            pipe = redis_client.pipeline(transaction=False)
+            pipe.set("RUN_STATE:TTS_PROVIDER", TTS_PROVIDER)
+            pipe.set("RUN_STATE:KHMER_TTS_PROVIDER", KHMER_TTS_PROVIDER)
+            pipe.execute()
+            return True
+        with suppress(Exception):
+            await redis_call("tts_provider_runtime_persist", _persist, default=False, attempts=2, timeout=2.0, critical=False)
+    logger.info("Admin TTS provider changed: provider=%s khmer=%s", TTS_PROVIDER, KHMER_TTS_PROVIDER)
+    return label
+
+
+def _restore_tts_provider_runtime_overrides_sync() -> None:
+    """Restore live TTS provider choices from Redis if admin changed them before restart."""
+    global TTS_PROVIDER, KHMER_TTS_PROVIDER
+    if redis_client is None:
+        return
+    try:
+        provider = redis_client.get("RUN_STATE:TTS_PROVIDER")
+        khmer_provider = redis_client.get("RUN_STATE:KHMER_TTS_PROVIDER")
+        if isinstance(provider, bytes):
+            provider = provider.decode("utf-8", errors="ignore")
+        if isinstance(khmer_provider, bytes):
+            khmer_provider = khmer_provider.decode("utf-8", errors="ignore")
+        provider = str(provider or "").strip().lower()
+        khmer_provider = str(khmer_provider or "").strip().lower()
+        if provider in {"auto", "edge", "edge_tts", "hf", "hf_space", "khmer_hf_space", "khmer-tts"}:
+            TTS_PROVIDER = "edge" if provider == "edge_tts" else ("hf_space" if provider in {"hf", "khmer_hf_space", "khmer-tts"} else provider)
+        if khmer_provider in {"edge", "edge_tts", "hf", "hf_space", "khmer_hf_space", "khmer-tts"}:
+            KHMER_TTS_PROVIDER = "edge" if khmer_provider == "edge_tts" else ("hf_space" if khmer_provider in {"hf", "khmer_hf_space", "khmer-tts"} else khmer_provider)
+    except Exception as exc:
+        logger.warning("Could not restore TTS provider runtime override: %s", exc)
+
+
+def _schedule_calendar_fetch_sync(admin_id: int, offset_days: int = 0, span_days: int = 14) -> list[dict]:
+    start_local = (_local_now() + timedelta(days=int(offset_days or 0))).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = start_local + timedelta(days=max(1, min(31, int(span_days or 14))))
+    rows = _web_sched_fetch_range(_local_to_utc(start_local), _local_to_utc(end_local), limit=1000)
+    return [r for r in rows if int(r.get("admin_id") or 0) == int(admin_id)]
+
+
+def _schedule_calendar_text(rows: list[dict], offset_days: int = 0, span_days: int = 14) -> str:
+    start_local = (_local_now() + timedelta(days=int(offset_days or 0))).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = start_local + timedelta(days=max(1, min(31, int(span_days or 14))))
+    grouped: OrderedDict[str, list[dict]] = OrderedDict()
+    for i in range((end_local.date() - start_local.date()).days):
+        key = (start_local + timedelta(days=i)).date().isoformat()
+        grouped[key] = []
+    for row in rows:
+        dt = _sched_parse_iso(row.get("broadcast_at"))
+        if not dt:
+            continue
+        key = _to_local_time(dt).date().isoformat()
+        grouped.setdefault(key, []).append(row)
+
+    lines = [
+        "🗓 <b>Scheduled Broadcast Calendar</b>",
+        f"Window: <b>{html.escape(start_local.strftime('%Y-%m-%d'))}</b> → <b>{html.escape((end_local - timedelta(days=1)).strftime('%Y-%m-%d'))}</b>",
+        f"Timezone: <b>{APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})</b>",
+        "",
+    ]
+    shown = 0
+    for day, items in grouped.items():
+        if not items:
+            lines.append(f"<b>{html.escape(day)}</b> · 0")
+            continue
+        lines.append(f"<b>{html.escape(day)}</b> · {len(items)}")
+        for row in items[:5]:
+            dt = _sched_parse_iso(row.get("broadcast_at"))
+            local_time = _to_local_time(dt).strftime("%I:%M %p") if dt else "?"
+            status = _sched_status_label(row)
+            content = _sched_content_preview(row, limit=72)
+            lines.append(
+                f"  • <code>#{int(row.get('id') or 0)}</code> {html.escape(local_time)} "
+                f"<b>{html.escape(status)}</b> — {html.escape(content)}"
+            )
+            shown += 1
+        if len(items) > 5:
+            lines.append(f"  … +{len(items) - 5} more")
+    if shown == 0:
+        lines.append("\nNo scheduled broadcasts in this window.")
+    return "\n".join(lines)[:3900]
+
+
+def _schedule_calendar_kb(offset_days: int = 0) -> InlineKeyboardMarkup:
+    offset_days = int(offset_days or 0)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("← Previous 14d", callback_data=f"admin_calendar:{offset_days - 14}"),
+         InlineKeyboardButton("Today", callback_data="admin_calendar:0"),
+         InlineKeyboardButton("Next 14d →", callback_data=f"admin_calendar:{offset_days + 14}")],
+        [InlineKeyboardButton("📅 New Schedule", callback_data="admin_schedule_new"),
+         InlineKeyboardButton("📋 List", callback_data="admin_schedules")],
+        [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+         InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+    ])
+
+
+async def _admin_open_schedule_calendar_panel(query, admin_id: int, offset_days: int = 0) -> None:
+    rows = await asyncio.get_running_loop().run_in_executor(
+        _DB_EXECUTOR,
+        lambda: _schedule_calendar_fetch_sync(admin_id, offset_days, 14),
+    )
+    await safe_send(lambda: query.message.edit_text(
+        _schedule_calendar_text(rows, offset_days, 14),
+        parse_mode="HTML",
+        reply_markup=_schedule_calendar_kb(offset_days),
+        disable_web_page_preview=True,
+    ))
+
+
+def _error_center_text() -> str:
+    rows = _admin_error_center_snapshot(12)
+    if not rows:
+        return (
+            "🚨 <b>Error Center</b>\n\n"
+            "No captured runtime errors yet. New ERROR-level logs will appear here automatically.\n\n"
+            f"Storage: in-memory ring buffer, max <b>{_ADMIN_ERROR_CENTER_MAX}</b> items."
+        )
+    lines = [
+        "🚨 <b>Error Center</b>",
+        f"Showing latest <b>{len(rows)}</b> error(s).",
+        f"Total stored: <b>{len(_ADMIN_ERROR_CENTER)}</b> / {_ADMIN_ERROR_CENTER_MAX}",
+        "",
+    ]
+    for idx, item in enumerate(rows, 1):
+        dt = _sched_parse_iso(item.get("ts"))
+        local_ts = _fmt_dt(dt) if dt else str(item.get("ts") or "")[:19]
+        lines.append(
+            f"{idx}. <b>{html.escape(str(item.get('level') or 'ERROR'))}</b> "
+            f"<code>{html.escape(str(item.get('fingerprint') or ''))}</code>\n"
+            f"   🕒 {html.escape(local_ts)}\n"
+            f"   📍 {html.escape(str(item.get('source') or 'unknown'))}\n"
+            f"   {html.escape(str(item.get('message') or '')[:450])}"
+        )
+    return "\n\n".join(lines)[:3900]
+
+
+def _error_center_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh", callback_data="admin_errors"),
+         InlineKeyboardButton("🧹 Clear", callback_data="admin_errors_clear")],
+        [InlineKeyboardButton("🩺 Health", callback_data="admin_health"),
+         InlineKeyboardButton("🎛 TTS Provider", callback_data="admin_tts")],
+        [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+         InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+    ])
+
+
+async def _admin_open_error_center(query, notice: str = "") -> None:
+    text = _error_center_text()
+    if notice:
+        text = f"{html.escape(notice)}\n\n{text}"
+    await safe_send(lambda: query.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=_error_center_kb(),
+        disable_web_page_preview=True,
+    ))
+
+
 async def _admin_open_users_panel(query) -> None:
     users = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, get_all_users_with_names)
     if not users:
@@ -11520,11 +11866,16 @@ async def _admin_send_settings_sql(message) -> None:
 async def _admin_start_broadcast_from_button(query, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
     _pending_broadcast.pop(user_id, None)
     context.user_data["bc_state"] = BROADCAST_WAIT_MESSAGE
+    estimate = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, _broadcast_recipient_estimate_sync)
     await safe_send(lambda: query.message.edit_text(
-        "📢 <b>Admin Broadcast</b>\n\n"
-        "ផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + Caption</b> ដែលចង់ Broadcast ។\n"
-        "Bot នឹងបង្ហាញ preview មុនពេលផ្ញើ។\n\n"
-        "ចុច Cancel ឬវាយ /cancel ដើម្បីបោះបង់។",
+        "🛡️ <b>Safer Broadcast V2</b>\n\n"
+        "Send <b>text</b> or <b>photo + caption</b>. The bot will show a final preview before sending.\n\n"
+        f"Registered users: <b>{int(estimate.get('registered') or 0)}</b>\n"
+        f"Active target: <b>{int(estimate.get('active') or 0)}</b>\n"
+        f"Skipped blocked/unreachable: <b>{int(estimate.get('blocked') or 0)}</b>\n"
+        f"Batch size: <b>{BROADCAST_BATCH_SIZE}</b> · Delay: <b>{BROADCAST_INTER_BATCH_DELAY:g}s</b>\n\n"
+        "Protection: preview confirmation, blocked-user skip, bounded concurrency, RetryAfter handling, and auto-block for unreachable chats.\n\n"
+        "Press Cancel or type /cancel to stop.",
         parse_mode="HTML",
         reply_markup=get_admin_action_kb(),
     ))
@@ -11612,21 +11963,23 @@ async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "text":          plain_text,
     }
 
+    estimate = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, _broadcast_recipient_estimate_sync)
+    summary = _broadcast_preview_summary(_pending_broadcast[user_id], estimate)
+
     if photo_file_id:
-        preview_cap = html.escape(caption_text) if caption_text else "<i>(គ្មាន Caption)</i>"
+        preview_cap = html.escape(caption_text) if caption_text else "<i>(No caption)</i>"
         await safe_send(lambda: msg.reply_photo(
             photo=photo_file_id,
             caption=(
-                f"👁️ <b>Preview Broadcast</b>\n\n{preview_cap}\n\n"
-                "តើចង់ Broadcast ដល់អ្នកប្រើប្រាស់ទាំងអស់?"
-            ),
+                f"{summary}\n\n"
+                f"<b>Content preview</b>\n{preview_cap}"
+            )[:1024],
             parse_mode="HTML",
             reply_markup=get_broadcast_confirm_kb(),
         ))
     else:
         await safe_send(lambda: msg.reply_text(
-            f"👁️ <b>Preview Broadcast</b>\n\n{html.escape(plain_text)}\n\n"
-            "តើចង់ Broadcast ដល់អ្នកប្រើប្រាស់ទាំងអស់?",
+            f"{summary}\n\n<b>Content preview</b>\n{html.escape(plain_text)}",
             parse_mode="HTML",
             reply_markup=get_broadcast_confirm_kb(),
         ))
@@ -12051,6 +12404,53 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         )
         notice = f"✅ {BOT_SETTING_LABELS.get(key, key)} updated." if ok else f"⚠️ Could not persist setting: {info}"
         await _admin_open_settings_panel(query, force=True, notice=notice)
+        return
+
+    if data == "admin_tts":
+        await _admin_open_tts_provider_panel(query)
+        return
+
+    if data.startswith("admin_tts_set:"):
+        mode = data.split(":", 1)[1]
+        label = await _admin_set_tts_provider(mode)
+        await _admin_open_tts_provider_panel(query, notice=f"✅ TTS provider changed to {label}.")
+        return
+
+    if data == "admin_tts_hf_enable":
+        _reset_hf_tts_cooldown()
+        await _admin_open_tts_provider_panel(query, notice="✅ HF Khmer TTS cooldown cleared.")
+        return
+
+    if data == "admin_tts_hf_5m":
+        global _HF_TTS_DISABLED_UNTIL
+        with _HF_TTS_STATE_LOCK:
+            _HF_TTS_DISABLED_UNTIL = max(_HF_TTS_DISABLED_UNTIL, time.monotonic() + 300)
+        await _admin_open_tts_provider_panel(query, notice="⏸ HF Khmer TTS disabled for 5 minutes.")
+        return
+
+    if data == "admin_tts_hf_clear":
+        global _HF_TTS_CLIENT, _HF_TTS_CLIENT_KEY
+        with _HF_TTS_CLIENT_LOCK:
+            _HF_TTS_CLIENT = None
+            _HF_TTS_CLIENT_KEY = None
+        await _admin_open_tts_provider_panel(query, notice="🧹 HF cached client cleared.")
+        return
+
+    if data == "admin_calendar" or data.startswith("admin_calendar:"):
+        offset = 0
+        if ":" in data:
+            with suppress(Exception):
+                offset = int(data.split(":", 1)[1])
+        await _admin_open_schedule_calendar_panel(query, user_id, offset)
+        return
+
+    if data == "admin_errors":
+        await _admin_open_error_center(query)
+        return
+
+    if data == "admin_errors_clear":
+        cleared = _admin_error_center_clear()
+        await _admin_open_error_center(query, notice=f"🧹 Cleared {cleared} captured error(s).")
         return
 
     if data == "admin_api":
@@ -14656,6 +15056,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     _metric_inc("errors")
+    _record_admin_error("telegram_error_handler", str(context.error), level="ERROR", context=type(update).__name__)
     logger.error(f"Unhandled exception: {context.error}", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         with suppress(Exception):
