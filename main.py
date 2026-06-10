@@ -795,6 +795,11 @@ def generate_new_webhook_token() -> str:
 
 
 def _runtime_webhook_base_url() -> str:
+    run_state = globals().get("RUN_STATE")
+    if isinstance(run_state, dict):
+        value = run_state.get("TELEGRAM_WEBHOOK_URL")
+        if value:
+            return str(value).strip().rstrip("/")
     return str(
         globals().get("TELEGRAM_WEBHOOK_URL")
         or getattr(SETTINGS, "TELEGRAM_WEBHOOK_URL", "")
@@ -2181,6 +2186,7 @@ def _web_render(title: str, body: str, *, active: str = "dashboard", status_code
         ("broadcast", "Broadcast", "/admin/broadcast", "📣"),
         ("health", "Health", "/admin/health", "🩺"),
         ("control", "Control", "/admin/control", "🛡️"),
+        ("runtime", "Runtime", "/admin/runtime", "🛠️"),
         ("settings", "Settings", "/admin/settings", "⚙"),
         ("api", "API Keys", "/admin/api-keys", "🔑"),
         ("locks", "Locks", "/admin/locks", "🔒"),
@@ -4189,6 +4195,148 @@ def web_admin_performance_json():
     return resp
 
 
+
+
+def _run_admin_coro_sync(coro: Any, timeout: float = 20.0) -> Any:
+    """Run an async runtime admin mutation from a sync web-admin route."""
+    loop = _WEB_BROADCAST_QUEUE_LOOP
+    if loop is not None and loop.is_running():
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        return future.result(timeout=timeout)
+    return asyncio.run(coro)
+
+
+def _runtime_display_value(key: str) -> str:
+    value = RUN_STATE.get(key, globals().get(key, ""))
+    if key == "TELEGRAM_WEBHOOK_SECRET_TOKEN":
+        token = str(value or "")
+        if not token:
+            return ""
+        return token[:6] + "…" + token[-4:]
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value if value is not None else "")
+
+
+def _runtime_config_input_html(key: str) -> str:
+    spec = _RUNTIME_CONFIG_SPECS.get(key, {})
+    kind = spec.get("kind", "str")
+    value = _runtime_display_value(key)
+    if kind == "mode":
+        mode = _run_state_bot_mode()
+        return (
+            "<select name='cfg_" + _web_h(key) + "'>"
+            f"<option value='POLLING' {'selected' if mode == 'POLLING' else ''}>POLLING</option>"
+            f"<option value='WEBHOOK' {'selected' if mode == 'WEBHOOK' else ''}>WEBHOOK</option>"
+            "</select>"
+        )
+    if kind == "secret":
+        return (
+            f"<input type='text' value='{_web_h(value)}' disabled>"
+            "<div class='muted'>Use the Rotate Secret button. The full token is never displayed.</div>"
+        )
+    if kind == "int":
+        return f"<input type='number' name='cfg_{_web_h(key)}' value='{_web_h(value)}' min='{_web_h(spec.get('min', ''))}' max='{_web_h(spec.get('max', ''))}' step='1'>"
+    if kind == "float":
+        return f"<input type='number' name='cfg_{_web_h(key)}' value='{_web_h(value)}' min='{_web_h(spec.get('min', ''))}' max='{_web_h(spec.get('max', ''))}' step='0.05'>"
+    return f"<input type='text' name='cfg_{_web_h(key)}' value='{_web_h(value)}'>"
+
+
+def _runtime_config_rows_html() -> str:
+    rows = []
+    for key, spec in _RUNTIME_CONFIG_SPECS.items():
+        rows.append(
+            f"<tr><td><b>{_web_h(spec.get('label', key))}</b><br>"
+            f"<code>{_web_h(key)}</code><br><span class='muted'>{_web_h(spec.get('help', ''))}</span></td>"
+            f"<td>{_runtime_config_input_html(key)}</td></tr>"
+        )
+    return "".join(rows)
+
+
+@app_flask.route("/admin/runtime", methods=["GET", "POST"])
+@web_admin_required
+def web_admin_runtime_config():
+    """Dashboard-controlled runtime configuration persisted in Redis."""
+    csrf = _web_csrf_token()
+    admin_id = _web_current_admin_id()
+    if request.method == "POST":
+        _web_check_csrf()
+        action = str(request.form.get("action") or "save").strip().lower()
+        ok = True
+        messages: list[str] = []
+        try:
+            if action == "rotate_secret":
+                new_token = generate_new_webhook_token()
+                _run_admin_coro_sync(_update_run_state("TELEGRAM_WEBHOOK_SECRET_TOKEN", new_token), timeout=10)
+                if _run_state_bot_mode() == "WEBHOOK":
+                    _run_admin_coro_sync(set_telegram_webhook(), timeout=20)
+                messages.append(f"Webhook secret rotated. New path: /tg-webhook-{new_token}")
+                logger.info("Admin %s rotated Webhook Secret Token from web dashboard.", admin_id)
+            else:
+                target_mode = str(request.form.get("cfg_BOT_MODE") or _run_state_bot_mode()).strip().upper()
+                mode_changed = target_mode != _run_state_bot_mode()
+                webhook_url_changed = False
+                for key, spec in _RUNTIME_CONFIG_SPECS.items():
+                    if key in {"BOT_MODE", "TELEGRAM_WEBHOOK_SECRET_TOKEN"}:
+                        continue
+                    field = f"cfg_{key}"
+                    if field not in request.form:
+                        continue
+                    raw = request.form.get(field)
+                    current = RUN_STATE.get(key, globals().get(key))
+                    new_value = _coerce_run_state_value(key, raw)
+                    if str(new_value) != str(current):
+                        _run_admin_coro_sync(_update_run_state(key, new_value), timeout=10)
+                        messages.append(f"{key} updated")
+                        if key == "TELEGRAM_WEBHOOK_URL":
+                            webhook_url_changed = True
+                if mode_changed:
+                    _run_admin_coro_sync(_switch_telegram_runtime_mode(target_mode, admin_id), timeout=30)
+                    messages.append(f"BOT_MODE switched to {target_mode}")
+                elif webhook_url_changed and _run_state_bot_mode() == "WEBHOOK":
+                    _run_admin_coro_sync(set_telegram_webhook(), timeout=20)
+                    messages.append("Webhook re-registered with new URL")
+                if not messages:
+                    messages.append("No runtime changes detected.")
+        except Exception as exc:
+            ok = False
+            messages.append(str(exc)[:500])
+        _web_admin_audit("runtime_config", "; ".join(messages))
+        flask_flash(("OK: " if ok else "ERROR: ") + "; ".join(messages), "success" if ok else "error")
+        return redirect(url_for("web_admin_runtime_config"))
+
+    webhook_ready = bool(_runtime_webhook_base_url() and _runtime_webhook_secret_token())
+    minimal_env_text = 'PORT=8080\nRENDER=true\nRENDER_EXTERNAL_URL=https://your-service.onrender.com\nTELEGRAM_BOT_TOKEN=CHANGE_ME\nADMIN_IDS=1272791365\nADMIN_WEB_PASSWORD=CHANGE_ME\nWEB_SECRET_KEY=CHANGE_ME_RANDOM_SECRET\nSUPABASE_URL=https://your-project.supabase.co\nSUPABASE_SERVICE_ROLE_KEY=CHANGE_ME\nREDIS_URL=redis://default:password@host:6379\nHF_TOKEN=CHANGE_ME_OPTIONAL\nGEMINI_API_KEY=CHANGE_ME_OPTIONAL'
+    body = f"""
+    <div data-live-status></div>
+    <div class='card'>
+      <h2>Runtime Config Center</h2>
+      <p class='muted'>Use this page to move performance and runtime tuning out of your .env. Values save to Redis and restore after Render/Railway restarts. Keep only secrets and connection URLs in environment variables.</p>
+      <div class='grid'>
+        {_web_status_card('Current mode', _run_state_bot_mode(), 'runtime state', 'ok' if _run_state_bot_mode() == 'POLLING' else 'info')}
+        {_web_status_card('Webhook ready', 'YES' if webhook_ready else 'NO', 'base URL + secret', 'ok' if webhook_ready else 'warn')}
+        {_web_status_card('User rate limit', f"{_run_state_user_rate_limit()} req/{USER_RATE_LIMIT_WINDOW_S:g}s", 'live anti-flood', 'ok')}
+        {_web_status_card('HTTP pool', f"{_run_state_http_max_connections()}/{_run_state_http_keepalive_connections()}", 'max/keepalive', 'ok')}
+      </div>
+    </div>
+    <form method='post' data-confirm='Save runtime config changes?'>
+      <input type='hidden' name='csrf_token' value='{csrf}'>
+      <input type='hidden' name='action' value='save'>
+      <div class='card'><h2>Dashboard-controlled Settings</h2><div class='table-wrap'><table class='table'><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody>{_runtime_config_rows_html()}</tbody></table></div><p><button class='ok'>Save Runtime Config</button> <a class='btn secondary' href='/admin/control'>Control Center</a></p></div>
+    </form>
+    <div class='card'>
+      <h2>Webhook Secret</h2>
+      <p class='muted'>Rotate the webhook secret without editing env. If the bot is in WEBHOOK mode, Telegram is re-registered immediately.</p>
+      <form method='post' data-confirm='Rotate webhook secret now? Old webhook path will stop working.'>
+        <input type='hidden' name='csrf_token' value='{csrf}'>
+        <input type='hidden' name='action' value='rotate_secret'>
+        <button class='danger'>🔄 Rotate Webhook Secret</button>
+      </form>
+    </div>
+    <div class='card'><h2>Minimal env after using this page</h2><pre>{_web_h(minimal_env_text)}</pre></div>
+    """
+    return _web_render("Runtime Config", body, active="runtime")
+
 @app_flask.route("/admin/control")
 @web_admin_required
 def web_admin_control():
@@ -4447,9 +4595,25 @@ WEB_BROADCAST_QUEUE_MAXSIZE = _env_int("WEB_BROADCAST_QUEUE_MAXSIZE", 200, minim
 # selected values without restarting the process.
 RUN_STATE: dict[str, Any] = {
     "BOT_MODE": BOT_MODE,
-    "USER_RATE_LIMIT_PER_SECOND": USER_RATE_LIMIT_PER_SECOND,
-    "HTTP_MAX_CONNECTIONS": HTTP_MAX_CONNECTIONS,
+    "TELEGRAM_WEBHOOK_URL": TELEGRAM_WEBHOOK_URL,
     "TELEGRAM_WEBHOOK_SECRET_TOKEN": TELEGRAM_WEBHOOK_SECRET_TOKEN,
+    "HTTP_MAX_CONNECTIONS": HTTP_MAX_CONNECTIONS,
+    "HTTP_MAX_KEEPALIVE_CONNECTIONS": HTTP_MAX_KEEPALIVE_CONNECTIONS,
+    "USER_RATE_LIMIT_PER_SECOND": USER_RATE_LIMIT_PER_SECOND,
+    "USER_RATE_LIMIT_WINDOW_S": USER_RATE_LIMIT_WINDOW_S,
+    "API_RATE_LIMIT_PER_SECOND": API_RATE_LIMIT_PER_SECOND,
+    "API_RATE_LIMIT_WINDOW_S": API_RATE_LIMIT_WINDOW_S,
+    "RATE_LIMIT_REDIS_TTL_S": RATE_LIMIT_REDIS_TTL_S,
+    "CACHE_ASIDE_DEFAULT_TTL_S": CACHE_ASIDE_DEFAULT_TTL_S,
+    "WEB_BROADCAST_QUEUE_MAXSIZE": WEB_BROADCAST_QUEUE_MAXSIZE,
+    "BROADCAST_BATCH_SIZE": BROADCAST_BATCH_SIZE,
+    "BROADCAST_INTER_BATCH_DELAY": BROADCAST_INTER_BATCH_DELAY,
+    "MAX_CONCURRENT_TTS_USERS": MAX_CONCURRENT_TTS_USERS,
+    "MAX_CONCURRENT_AI": MAX_CONCURRENT_AI,
+    "MAX_CONCURRENT_BROADCAST": MAX_CONCURRENT_BROADCAST,
+    "WEB_COUNTS_CACHE_TTL_S": WEB_COUNTS_CACHE_TTL_S,
+    "WEB_STATUS_POLL_SECONDS": WEB_STATUS_POLL_SECONDS,
+    "WEB_LIVE_POLL_SECONDS": WEB_LIVE_POLL_SECONDS,
 }
 RUN_STATE_LOCK = asyncio.Lock()
 ACTIVE_ADMIN_CONVERSATIONS: dict[int, dict[str, Any]] = {}
@@ -4462,7 +4626,51 @@ _TELEGRAM_POLLING_LOCK: asyncio.Lock | None = None
 # conflicts.
 ACTIVE_POLLING_TASK: asyncio.Task | None = None
 _RUNTIME_STATE_RESTORED_FROM_REDIS = False
-_RUN_STATE_REDIS_KEYS = ("BOT_MODE", "USER_RATE_LIMIT_PER_SECOND", "HTTP_MAX_CONNECTIONS", "TELEGRAM_WEBHOOK_SECRET_TOKEN")
+_RUN_STATE_REDIS_KEYS = (
+    "BOT_MODE",
+    "TELEGRAM_WEBHOOK_URL",
+    "TELEGRAM_WEBHOOK_SECRET_TOKEN",
+    "HTTP_MAX_CONNECTIONS",
+    "HTTP_MAX_KEEPALIVE_CONNECTIONS",
+    "USER_RATE_LIMIT_PER_SECOND",
+    "USER_RATE_LIMIT_WINDOW_S",
+    "API_RATE_LIMIT_PER_SECOND",
+    "API_RATE_LIMIT_WINDOW_S",
+    "RATE_LIMIT_REDIS_TTL_S",
+    "CACHE_ASIDE_DEFAULT_TTL_S",
+    "WEB_BROADCAST_QUEUE_MAXSIZE",
+    "BROADCAST_BATCH_SIZE",
+    "BROADCAST_INTER_BATCH_DELAY",
+    "MAX_CONCURRENT_TTS_USERS",
+    "MAX_CONCURRENT_AI",
+    "MAX_CONCURRENT_BROADCAST",
+    "WEB_COUNTS_CACHE_TTL_S",
+    "WEB_STATUS_POLL_SECONDS",
+    "WEB_LIVE_POLL_SECONDS",
+)
+
+_RUNTIME_CONFIG_SPECS: OrderedDict[str, dict[str, Any]] = OrderedDict([
+    ("BOT_MODE", {"kind": "mode", "label": "Bot mode", "help": "POLLING for one node; WEBHOOK for scalable deployment."}),
+    ("TELEGRAM_WEBHOOK_URL", {"kind": "url", "label": "Webhook base URL", "help": "Public HTTPS base URL only. Do not include /tg-webhook-..."}),
+    ("TELEGRAM_WEBHOOK_SECRET_TOKEN", {"kind": "secret", "label": "Webhook secret", "help": "Rotatable secret used in the webhook path and Telegram secret header."}),
+    ("USER_RATE_LIMIT_PER_SECOND", {"kind": "int", "min": 1, "max": 100, "label": "User rate limit / second", "help": "Anti-flood limit per chat/user."}),
+    ("USER_RATE_LIMIT_WINDOW_S", {"kind": "float", "min": 0.25, "max": 60.0, "label": "User rate window seconds", "help": "Sliding window duration for user anti-flood."}),
+    ("API_RATE_LIMIT_PER_SECOND", {"kind": "int", "min": 1, "max": 1000, "label": "API rate limit / second", "help": "Anti-flood limit for hot web/API endpoints."}),
+    ("API_RATE_LIMIT_WINDOW_S", {"kind": "float", "min": 0.25, "max": 60.0, "label": "API rate window seconds", "help": "Sliding window duration for API limiter."}),
+    ("RATE_LIMIT_REDIS_TTL_S", {"kind": "int", "min": 2, "max": 3600, "label": "Rate limit Redis TTL", "help": "TTL for Redis-backed limiter keys."}),
+    ("HTTP_MAX_CONNECTIONS", {"kind": "int", "min": 10, "max": 1000, "label": "HTTP max connections", "help": "httpx pooled max connections for Telegram/API calls."}),
+    ("HTTP_MAX_KEEPALIVE_CONNECTIONS", {"kind": "int", "min": 2, "max": 500, "label": "HTTP keepalive connections", "help": "httpx keep-alive pool size."}),
+    ("CACHE_ASIDE_DEFAULT_TTL_S", {"kind": "int", "min": 30, "max": 86400, "label": "Cache-aside TTL seconds", "help": "Default Redis cache TTL for cache-aside data."}),
+    ("WEB_BROADCAST_QUEUE_MAXSIZE", {"kind": "int", "min": 10, "max": 10000, "label": "Broadcast queue size", "help": "Max queued admin broadcast jobs. Resize takes effect after restart for the active queue."}),
+    ("BROADCAST_BATCH_SIZE", {"kind": "int", "min": 1, "max": 500, "label": "Broadcast batch size", "help": "Users per broadcast batch."}),
+    ("BROADCAST_INTER_BATCH_DELAY", {"kind": "float", "min": 0.0, "max": 30.0, "label": "Broadcast batch delay", "help": "Delay between broadcast batches."}),
+    ("MAX_CONCURRENT_TTS_USERS", {"kind": "int", "min": 1, "max": 50, "label": "Max concurrent TTS", "help": "Concurrent TTS workload cap. New semaphore applies to future requests."}),
+    ("MAX_CONCURRENT_AI", {"kind": "int", "min": 1, "max": 50, "label": "Max concurrent AI", "help": "Concurrent AI workload cap. New semaphore applies to future requests."}),
+    ("MAX_CONCURRENT_BROADCAST", {"kind": "int", "min": 1, "max": 50, "label": "Max concurrent broadcast", "help": "Bot broadcast semaphore cap."}),
+    ("WEB_COUNTS_CACHE_TTL_S", {"kind": "float", "min": 5.0, "max": 600.0, "label": "Dashboard counts cache TTL", "help": "Admin dashboard count cache duration."}),
+    ("WEB_STATUS_POLL_SECONDS", {"kind": "int", "min": 10, "max": 300, "label": "Dashboard status poll seconds", "help": "Browser live status refresh interval."}),
+    ("WEB_LIVE_POLL_SECONDS", {"kind": "int", "min": 15, "max": 300, "label": "Dashboard live poll seconds", "help": "Live dashboard refresh interval."}),
+])
 
 
 def _run_state_get(key: str, default: Any = None) -> Any:
@@ -4488,17 +4696,52 @@ def _run_state_http_max_connections() -> int:
         return max(10, int(HTTP_MAX_CONNECTIONS or 100))
 
 
+def _run_state_http_keepalive_connections() -> int:
+    try:
+        max_conn = _run_state_http_max_connections()
+        keepalive = int(RUN_STATE.get("HTTP_MAX_KEEPALIVE_CONNECTIONS", HTTP_MAX_KEEPALIVE_CONNECTIONS))
+        return min(max(2, keepalive), max_conn)
+    except Exception:
+        return min(max(2, int(HTTP_MAX_KEEPALIVE_CONNECTIONS or 20)), _run_state_http_max_connections())
+
+
 def _make_httpx_limits_from_run_state() -> httpx.Limits:
     max_connections = _run_state_http_max_connections()
-    keepalive = min(max(2, int(HTTP_MAX_KEEPALIVE_CONNECTIONS or 20)), max_connections)
+    keepalive = _run_state_http_keepalive_connections()
     return httpx.Limits(max_connections=max_connections, max_keepalive_connections=keepalive)
 
 
+def _coerce_run_state_value(key: str, value: Any) -> Any:
+    spec = _RUNTIME_CONFIG_SPECS.get(key, {})
+    kind = spec.get("kind", "str")
+    if kind == "mode":
+        mode = str(value or "POLLING").strip().upper()
+        if mode not in {"POLLING", "WEBHOOK"}:
+            raise ValueError("BOT_MODE must be POLLING or WEBHOOK")
+        return mode
+    if kind == "int":
+        v = int(str(value).strip())
+        return max(int(spec.get("min", v)), min(int(spec.get("max", v)), v))
+    if kind == "float":
+        v = float(str(value).strip())
+        return max(float(spec.get("min", v)), min(float(spec.get("max", v)), v))
+    if kind == "url":
+        return str(value or "").strip().rstrip("/")
+    if kind == "secret":
+        token = str(value or "").strip()
+        if not token:
+            raise ValueError(f"{key} cannot be empty")
+        return token
+    return str(value if value is not None else "").strip()
+
+
 def _sync_run_state_from_globals() -> None:
-    RUN_STATE["BOT_MODE"] = BOT_MODE if BOT_MODE in {"POLLING", "WEBHOOK"} else "POLLING"
-    RUN_STATE["USER_RATE_LIMIT_PER_SECOND"] = max(1, int(USER_RATE_LIMIT_PER_SECOND or 3))
-    RUN_STATE["HTTP_MAX_CONNECTIONS"] = max(10, int(HTTP_MAX_CONNECTIONS or 100))
-    RUN_STATE["TELEGRAM_WEBHOOK_SECRET_TOKEN"] = str(TELEGRAM_WEBHOOK_SECRET_TOKEN or "").strip()
+    for key in _RUN_STATE_REDIS_KEYS:
+        if key in globals():
+            try:
+                RUN_STATE[key] = _coerce_run_state_value(key, globals().get(key))
+            except Exception:
+                RUN_STATE[key] = globals().get(key)
 
 
 async def _persist_run_state_key(key: str, value: Any) -> bool:
@@ -4545,19 +4788,19 @@ async def _persist_run_state_key(key: str, value: Any) -> bool:
 
 
 async def _restore_run_state_from_redis() -> bool:
-    """Load persisted runtime admin overrides after Redis is initialised.
+    """Load persisted runtime/admin dashboard overrides after Redis is initialised.
 
-    Redis is optional.  Startup verifies connectivity with ping before any key
-    lookup.  If Redis is down, slow, or unready, the app falls back to env values
-    already loaded into RUN_STATE and continues booting.
+    Redis is optional. Startup pings Redis before key reads. If Redis is down,
+    the app keeps .env/SETTINGS defaults and continues booting.
     """
     global _RUNTIME_STATE_RESTORED_FROM_REDIS
     if redis_client is None:
         webhook_logger.info("Runtime state restore skipped: Redis is not configured.")
         return False
 
-    primary_keys = [f"RUN_STATE:{key}" for key in _RUN_STATE_REDIS_KEYS]
-    compat_keys = [f"RUN_STATE_{key}" for key in _RUN_STATE_REDIS_KEYS]
+    keys = list(_RUN_STATE_REDIS_KEYS)
+    primary_keys = [f"RUN_STATE:{key}" for key in keys]
+    compat_keys = [f"RUN_STATE_{key}" for key in keys]
     extra_restore_keys = ["RUN_STATE_WEBHOOK_SECRET"]
 
     def _ping():
@@ -4587,12 +4830,12 @@ async def _restore_run_state_from_redis() -> bool:
         webhook_logger.info("Runtime state restore found no Redis overrides; using env defaults.")
         return False
 
-    n = len(_RUN_STATE_REDIS_KEYS)
+    n = len(keys)
     primary_values = list(values[:n])
     compat_values = list(values[n:n * 2])
     restored: dict[str, Any] = {}
 
-    for idx, key in enumerate(_RUN_STATE_REDIS_KEYS):
+    for idx, key in enumerate(keys):
         raw = primary_values[idx] if idx < len(primary_values) else None
         if raw in (None, "") and idx < len(compat_values):
             raw = compat_values[idx]
@@ -4605,26 +4848,9 @@ async def _restore_run_state_from_redis() -> bool:
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8", errors="ignore")
         try:
-            if key == "BOT_MODE":
-                mode = str(raw).strip().upper()
-                if mode not in {"POLLING", "WEBHOOK"}:
-                    webhook_logger.warning("Ignoring invalid persisted BOT_MODE=%r", raw)
-                    continue
-                await _update_run_state(key, mode, persist=False)
-                restored[key] = mode
-            elif key in {"USER_RATE_LIMIT_PER_SECOND", "HTTP_MAX_CONNECTIONS"}:
-                value = int(str(raw).strip())
-                await _update_run_state(key, value, persist=False)
-                restored[key] = value
-            elif key == "TELEGRAM_WEBHOOK_SECRET_TOKEN":
-                token = str(raw).strip()
-                if not token:
-                    continue
-                await _update_run_state(key, token, persist=False)
-                restored[key] = "<redacted>"
-            else:
-                await _update_run_state(key, raw, persist=False)
-                restored[key] = raw
+            coerced = _coerce_run_state_value(key, raw)
+            await _update_run_state(key, coerced, persist=False)
+            restored[key] = "<redacted>" if key == "TELEGRAM_WEBHOOK_SECRET_TOKEN" else coerced
         except Exception as exc:
             webhook_logger.warning("Ignoring invalid persisted runtime state %s=%r: %s", key, raw, exc)
 
@@ -4637,40 +4863,34 @@ async def _restore_run_state_from_redis() -> bool:
 
 
 async def _update_run_state(key: str, value: Any, *, persist: bool = True) -> None:
-    global BOT_MODE, USER_RATE_LIMIT_PER_SECOND, HTTP_MAX_CONNECTIONS, HTTPX_HIGH_CONCURRENCY_LIMITS
-    global TELEGRAM_WEBHOOK_SECRET_TOKEN
-    persisted_value: Any = value
-    async with RUN_STATE_LOCK:
-        if key == "BOT_MODE":
-            mode = str(value or "POLLING").strip().upper()
-            if mode not in {"POLLING", "WEBHOOK"}:
-                raise ValueError("BOT_MODE must be POLLING or WEBHOOK")
-            RUN_STATE["BOT_MODE"] = mode
-            BOT_MODE = mode
-            persisted_value = mode
-        elif key == "USER_RATE_LIMIT_PER_SECOND":
-            limit = max(1, min(100, int(value)))
-            RUN_STATE["USER_RATE_LIMIT_PER_SECOND"] = limit
-            USER_RATE_LIMIT_PER_SECOND = limit
-            persisted_value = limit
-        elif key == "HTTP_MAX_CONNECTIONS":
-            max_conn = max(10, min(1000, int(value)))
-            RUN_STATE["HTTP_MAX_CONNECTIONS"] = max_conn
-            HTTP_MAX_CONNECTIONS = max_conn
-            HTTPX_HIGH_CONCURRENCY_LIMITS = _make_httpx_limits_from_run_state()
-            persisted_value = max_conn
-        elif key == "TELEGRAM_WEBHOOK_SECRET_TOKEN":
-            token = str(value or "").strip()
-            if not token:
-                raise ValueError("TELEGRAM_WEBHOOK_SECRET_TOKEN cannot be empty")
-            RUN_STATE["TELEGRAM_WEBHOOK_SECRET_TOKEN"] = token
-            TELEGRAM_WEBHOOK_SECRET_TOKEN = token
-            persisted_value = token
-        else:
-            RUN_STATE[key] = value
-            persisted_value = value
+    """Update runtime config from Telegram admin or Web Admin Dashboard.
 
-    if persist and key in _RUN_STATE_REDIS_KEYS:
+    Values are persisted to Redis when available, mirrored into legacy globals,
+    and applied to hot runtime objects where safe. Secrets are never logged in
+    clear text.
+    """
+    global HTTPX_HIGH_CONCURRENCY_LIMITS
+    global _AI_SEMAPHORE, _BROADCAST_SEMAPHORE, _TTS_CHUNK_SEMAPHORE
+
+    if key not in _RUN_STATE_REDIS_KEYS:
+        raise ValueError(f"Unsupported runtime setting: {key}")
+
+    persisted_value = _coerce_run_state_value(key, value)
+    async with RUN_STATE_LOCK:
+        RUN_STATE[key] = persisted_value
+        globals()[key] = persisted_value
+        if key in {"HTTP_MAX_CONNECTIONS", "HTTP_MAX_KEEPALIVE_CONNECTIONS"}:
+            HTTPX_HIGH_CONCURRENCY_LIMITS = _make_httpx_limits_from_run_state()
+        elif key == "MAX_CONCURRENT_AI" and _AI_SEMAPHORE is not None:
+            _AI_SEMAPHORE = asyncio.Semaphore(int(persisted_value))
+        elif key == "MAX_CONCURRENT_BROADCAST" and _BROADCAST_SEMAPHORE is not None:
+            _BROADCAST_SEMAPHORE = asyncio.Semaphore(int(persisted_value))
+        elif key == "MAX_CONCURRENT_TTS_USERS" and _TTS_CHUNK_SEMAPHORE is not None:
+            _TTS_CHUNK_SEMAPHORE = asyncio.Semaphore(int(persisted_value))
+        elif key in {"WEB_COUNTS_CACHE_TTL_S", "WEB_STATUS_POLL_SECONDS", "WEB_LIVE_POLL_SECONDS"}:
+            _web_counts_invalidate()
+
+    if persist:
         await _persist_run_state_key(key, persisted_value)
 
 def _runtime_admin_text() -> str:
