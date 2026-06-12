@@ -16,3 +16,4 @@ huggingface_hub
 gradio_client
 orjson
 ujson
+sentry-sdk
