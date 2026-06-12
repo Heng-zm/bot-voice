@@ -16,21 +16,24 @@ import hashlib
 import hmac
 import secrets
 import socket
+import atexit
 import httpx
 import imageio_ffmpeg as _iio_ffmpeg
 from collections import OrderedDict, deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import suppress
 from datetime import datetime, timezone, timedelta
 try:
     from zoneinfo import ZoneInfo
-except Exception:
+except Exception as exc:
+    logging.getLogger(__name__).warning("zoneinfo import failed; timezone fallback will be used: %s", exc)
     ZoneInfo = None
 from urllib.parse import urlencode, quote
 try:
     from google import genai
     from google.genai import types as genai_types
-except Exception:
+except Exception as exc:
+    logging.getLogger(__name__).warning("Optional dependency google-genai is not available; Gemini features disabled: %s", exc)
     genai = None
     genai_types = None
 from fastapi import FastAPI, Request as FastAPIRequest, HTTPException
@@ -41,39 +44,113 @@ from starlette.concurrency import run_in_threadpool
 from jinja2 import Environment, Template, select_autoescape
 try:
     from pydantic_settings import BaseSettings, SettingsConfigDict
-except Exception:
+except Exception as exc:
+    logging.getLogger(__name__).warning("Optional dependency pydantic-settings is not available; env fallback settings will be used: %s", exc)
     BaseSettings = object
     SettingsConfigDict = dict
-from supabase import create_client, Client
+try:
+    from supabase import create_client, Client
+except Exception as exc:
+    logging.getLogger(__name__).warning("Dependency supabase is not available; Supabase-backed features disabled: %s", exc)
+    create_client = None
+    Client = object
 try:
     from supabase import acreate_client, AsyncClient
-except Exception:
+except Exception as exc:
+    logging.getLogger(__name__).warning("Async Supabase client import failed; async Supabase calls disabled: %s", exc)
     acreate_client = None
     AsyncClient = object
 from typing import Any, Callable
 
 
+_ASYNC_RESOLVER_LOOP: asyncio.AbstractEventLoop | None = None
+_ASYNC_RESOLVER_THREAD: threading.Thread | None = None
+_ASYNC_RESOLVER_LOCK = threading.Lock()
+
+
+def _async_resolver_loop_worker(loop: asyncio.AbstractEventLoop) -> None:
+    """Own exactly one background event loop for sync worker awaitables."""
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+
+def _get_async_resolver_loop() -> asyncio.AbstractEventLoop:
+    """Return a process-wide resolver loop instead of creating per-call loops.
+
+    This is used only from sync worker threads when a library unexpectedly
+    returns an awaitable.  It avoids asyncio.run(...) inside ThreadPoolExecutor
+    workers, which repeatedly creates/destroys event loops under load.
+    """
+    global _ASYNC_RESOLVER_LOOP, _ASYNC_RESOLVER_THREAD
+    loop = _ASYNC_RESOLVER_LOOP
+    if loop is not None and loop.is_running():
+        return loop
+
+    with _ASYNC_RESOLVER_LOCK:
+        loop = _ASYNC_RESOLVER_LOOP
+        if loop is not None and loop.is_running():
+            return loop
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(
+            target=_async_resolver_loop_worker,
+            args=(loop,),
+            name="async-awaitable-resolver",
+            daemon=True,
+        )
+        thread.start()
+        _ASYNC_RESOLVER_LOOP = loop
+        _ASYNC_RESOLVER_THREAD = thread
+        return loop
+
+
+def _shutdown_async_resolver_loop() -> None:
+    loop = _ASYNC_RESOLVER_LOOP
+    if loop is not None and loop.is_running():
+        loop.call_soon_threadsafe(loop.stop)
+
+
+atexit.register(_shutdown_async_resolver_loop)
+
+
+def _close_unawaited(value: Any) -> None:
+    """Best-effort coroutine cleanup when sync resolution cannot continue."""
+    close = getattr(value, "close", None)
+    if callable(close):
+        with suppress(Exception):
+            close()
+
+
+async def _await_sync_value(value: Any) -> Any:
+    return await value
+
+
 def _resolve_maybe_awaitable_sync(value: Any) -> Any:
     """Resolve sync or async SDK return values from worker/sync code paths.
 
-    supabase-py v2 exposes both synchronous and asynchronous clients. Most of
-    this bot intentionally runs database work in bounded worker threads. If an
-    async Supabase builder is accidentally used there, execute() returns an
-    awaitable; resolve it immediately in that worker thread instead of leaking
-    an un-awaited coroutine.
+    ThreadPoolExecutor workers must not call asyncio.run() for every Supabase
+    awaitable.  Instead, submit the awaitable to one dedicated resolver event
+    loop with asyncio.run_coroutine_threadsafe().  If this function is called
+    from an already-running event loop, fail loudly so the async caller awaits
+    the value directly instead of blocking its own loop.
     """
     if not inspect.isawaitable(value):
         return value
+
     try:
         running_loop = asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(value)
-    if running_loop.is_running():
+        running_loop = None
+
+    if running_loop is not None and running_loop.is_running():
+        _close_unawaited(value)
         raise RuntimeError(
-            "Async Supabase result returned inside the main event loop. "
-            "Run this database call through db_call/db_call_sync or await it explicitly."
+            "Async Supabase result returned inside a running event loop. "
+            "Await it explicitly or move the call to db_call/db_call_sync."
         )
-    return running_loop.run_until_complete(value)
+
+    resolver_loop = _get_async_resolver_loop()
+    future = asyncio.run_coroutine_threadsafe(_await_sync_value(value), resolver_loop)
+    return future.result()
 
 
 class _SyncExecuteProxy:
@@ -180,12 +257,13 @@ class _FastJSONResponse(StarletteResponse):
 try:
     from dotenv import load_dotenv as _early_load_dotenv
     _early_load_dotenv()
-except Exception:
-    pass
+except Exception as exc:
+    logging.getLogger(__name__).warning("Optional dependency python-dotenv is not available; .env file was not loaded: %s", exc)
 
 try:
     import redis as redis_lib
-except Exception:
+except Exception as exc:
+    logging.getLogger(__name__).warning("Optional dependency redis is not available; Redis cache/locks disabled: %s", exc)
     redis_lib = None
 
 
@@ -299,9 +377,21 @@ def _env_float(name: str, default: float, *, minimum: float | None = None, maxim
 
 
 def _default_cookie_secure() -> bool:
+    """Return a safe default for admin session cookies.
+
+    - Explicit WEB_COOKIE_SECURE always wins.
+    - SameSite=None requires Secure cookies in modern browsers.
+    - Render/proxy HTTPS deployments should default to Secure.
+    - Local development can stay non-secure unless configured otherwise.
+    """
     explicit = os.environ.get("WEB_COOKIE_SECURE")
     if explicit is not None:
         return _env_bool("WEB_COOKIE_SECURE", True)
+    same_site = str(os.environ.get("WEB_COOKIE_SAMESITE") or getattr(SETTINGS, "WEB_COOKIE_SAMESITE", "lax") or "lax").strip().lower()
+    if same_site == "none":
+        return True
+    if _env_bool("WEB_TRUST_PROXY", _env_bool("RENDER", False)):
+        return True
     return bool(getattr(SETTINGS, "WEB_COOKIE_SECURE", False))
 
 
@@ -532,7 +622,7 @@ class FastAPICompatApp:
             session_cookie=str(getattr(SETTINGS, "WEB_SESSION_COOKIE_NAME", "bot_admin_session") or "bot_admin_session"),
             https_only=_default_cookie_secure(),
             same_site=_cookie_samesite(),
-            max_age=max(3600, int(getattr(SETTINGS, "WEB_ADMIN_SESSION_DAYS", 14) or 14) * 86400),
+            max_age=max(3600, _env_int("WEB_ADMIN_SESSION_DAYS", 14, minimum=1, maximum=365) * 86400),
         )
 
     def after_request(self, fn: Callable[[Any], Any]):
@@ -1096,7 +1186,8 @@ import base64
 
 try:
     from huggingface_hub import InferenceClient
-except Exception:
+except Exception as exc:
+    logging.getLogger(__name__).warning("Optional dependency huggingface_hub is not available; Hugging Face inference disabled: %s", exc)
     InferenceClient = None
 
 _AI_API_MAX_IMAGE_BYTES   = 10 * 1024 * 1024   # 10 MB
@@ -1224,8 +1315,8 @@ def _fmt_local_time_hint() -> str:
 _AI_API_KEY_PREFIX = "sk-ai-"
 _AI_API_KEY_RANDOM_BYTES = 32
 _AI_API_KEY_DISPLAY_CHARS = 18
-_AI_API_KEY_VALIDATION_CACHE_TTL_S = float(os.environ.get("AI_API_KEY_CACHE_TTL_S", "60"))
-_AI_API_KEY_TOUCH_INTERVAL_S = float(os.environ.get("AI_API_KEY_TOUCH_INTERVAL_S", "60"))
+_AI_API_KEY_VALIDATION_CACHE_TTL_S = _env_float("AI_API_KEY_CACHE_TTL_S", 60.0, minimum=1.0, maximum=3600.0)
+_AI_API_KEY_TOUCH_INTERVAL_S = _env_float("AI_API_KEY_TOUCH_INTERVAL_S", 60.0, minimum=1.0, maximum=3600.0)
 _AI_API_KEY_CACHE_MAX = 10_000
 
 _api_key_validation_cache: OrderedDict[str, tuple[bool, int | None, float]] = OrderedDict()
@@ -2030,7 +2121,7 @@ def ai_info():
 # scheduled-broadcast functions, and distributed scheduler lock.
 _WEB_BROADCAST_JOBS: OrderedDict[str, dict] = OrderedDict()
 _WEB_BROADCAST_JOBS_LOCK = threading.Lock()
-_WEB_BROADCAST_JOBS_MAX = int(os.environ.get("WEB_BROADCAST_JOBS_MAX", "50"))
+_WEB_BROADCAST_JOBS_MAX = _env_int("WEB_BROADCAST_JOBS_MAX", 50, minimum=10, maximum=2000)
 WEB_BROADCAST_WORKERS = max(1, _env_int("WEB_BROADCAST_WORKERS", MAX_CONCURRENT_BROADCAST))
 WEB_BROADCAST_DELAY_S = max(0.0, _env_float("WEB_BROADCAST_DELAY_S", 0.05))
 WEB_BROADCAST_MAX_ACTIVE_JOBS = max(1, _env_int("WEB_BROADCAST_MAX_ACTIVE_JOBS", 2, minimum=1, maximum=10))
@@ -3951,8 +4042,15 @@ def _web_broadcast_worker(job_id: str, admin_id: int, text: str) -> None:
                         return
                     _web_broadcast_job_set(job_id, status="running")
                     batch = users[start:start + batch_size]
-                    results = list(pool.map(_send_one, batch))
-                    for result in results:
+                    futures = [pool.submit(_send_one, uid) for uid in batch]
+                    last_progress_update = 0.0
+                    for future in as_completed(futures):
+                        try:
+                            result = future.result()
+                        except Exception as exc:
+                            logger.warning("web broadcast future failed job=%s: %s", job_id, exc)
+                            result = "failed"
+
                         if result == "sent":
                             sent += 1
                         elif result == "blocked":
@@ -3961,6 +4059,11 @@ def _web_broadcast_worker(job_id: str, admin_id: int, text: str) -> None:
                             skipped += 1
                         else:
                             failed += 1
+
+                        now = time.monotonic()
+                        if now - last_progress_update >= 1.0:
+                            _web_broadcast_job_set(job_id, sent=sent, failed=failed, blocked=blocked, skipped=skipped)
+                            last_progress_update = now
 
                     _web_broadcast_job_set(job_id, sent=sent, failed=failed, blocked=blocked, skipped=skipped)
                     if _control_state() == "cancel":
@@ -4701,10 +4804,10 @@ SB_URL:             str = ""
 SB_KEY:             str = ""
 REDIS_URL:          str = ""
 REDIS_CACHE_PREFIX       = os.environ.get("REDIS_CACHE_PREFIX", "tgbot")
-REDIS_PREFS_TTL_S        = int(os.environ.get("REDIS_PREFS_TTL_S", "1800"))
-REDIS_TEXT_CACHE_TTL_S   = int(os.environ.get("REDIS_TEXT_CACHE_TTL_S", "86400"))
-REDIS_HISTORY_TTL_S      = int(os.environ.get("REDIS_HISTORY_TTL_S", "86400"))
-REDIS_SOCKET_TIMEOUT_S   = float(os.environ.get("REDIS_SOCKET_TIMEOUT_S", "3"))
+REDIS_PREFS_TTL_S        = _env_int("REDIS_PREFS_TTL_S", 1800, minimum=30, maximum=86400)
+REDIS_TEXT_CACHE_TTL_S   = _env_int("REDIS_TEXT_CACHE_TTL_S", 86400, minimum=60, maximum=604800)
+REDIS_HISTORY_TTL_S      = _env_int("REDIS_HISTORY_TTL_S", 86400, minimum=60, maximum=604800)
+REDIS_SOCKET_TIMEOUT_S   = _env_float("REDIS_SOCKET_TIMEOUT_S", 3.0, minimum=0.2, maximum=30.0)
 CACHE_ASIDE_DEFAULT_TTL_S = _env_int("CACHE_ASIDE_DEFAULT_TTL_S", 3600, minimum=30, maximum=86400)
 HTTP_MAX_CONNECTIONS = _env_int("HTTP_MAX_CONNECTIONS", 100, minimum=10, maximum=1000)
 HTTP_MAX_KEEPALIVE_CONNECTIONS = _env_int("HTTP_MAX_KEEPALIVE_CONNECTIONS", 20, minimum=2, maximum=500)
@@ -5479,8 +5582,8 @@ AI_PROVIDER             = "hf"
 OCR_PROVIDER            = "auto"   # auto | hf | gemini
 OCR_TIMEOUT_SECONDS     = 90
 HF_OCR_DNS_COOLDOWN_S   = 300.0
-OCR_PROVIDER_FAILURE_LIMIT = max(1, int(os.environ.get("OCR_PROVIDER_FAILURE_LIMIT", "3")))
-OCR_PROVIDER_COOLDOWN_S    = float(os.environ.get("OCR_PROVIDER_COOLDOWN_S", "300"))
+OCR_PROVIDER_FAILURE_LIMIT = _env_int("OCR_PROVIDER_FAILURE_LIMIT", 3, minimum=1, maximum=50)
+OCR_PROVIDER_COOLDOWN_S    = _env_float("OCR_PROVIDER_COOLDOWN_S", 300.0, minimum=1.0, maximum=86400.0)
 MAX_VOICE_BYTES         = 20 * 1024 * 1024
 MAX_AUDIO_FILE_BYTES    = 50 * 1024 * 1024
 MAX_INPUT_CHARS         = 5_000
@@ -5510,7 +5613,7 @@ HF_TTS_REP_PEN           = _env_float("HF_TTS_REP_PEN", 1.1, minimum=0.5, maximu
 HF_TTS_MAX_TOK           = _env_int("HF_TTS_MAX_TOK", 2048, minimum=128, maximum=4096)
 HF_TTS_MAX_CHARS         = _env_int("HF_TTS_MAX_CHARS", 300, minimum=50, maximum=1200)
 HF_TTS_TIMEOUT_S         = _env_float("HF_TTS_TIMEOUT_S", 90.0, minimum=15.0, maximum=240.0)
-HF_TTS_RETRIES           = _env_int("HF_TTS_RETRIES", 2, minimum=1, maximum=5)
+HF_TTS_RETRIES           = _env_int("HF_TTS_RETRIES", 3, minimum=1, maximum=5)
 HF_TTS_RETRY_DELAY_S     = _env_float("HF_TTS_RETRY_DELAY_S", 2.0, minimum=0.2, maximum=20.0)
 HF_TTS_EDGE_FALLBACK     = _env_bool("HF_TTS_EDGE_FALLBACK", True)
 HF_TTS_FAILURE_LIMIT     = _env_int("HF_TTS_FAILURE_LIMIT", 3, minimum=1, maximum=20)
@@ -5628,16 +5731,16 @@ class CircuitBreaker:
 
 supabase_breaker = CircuitBreaker(
     "Supabase",
-    max_failures=int(os.environ.get("SUPABASE_BREAKER_FAILURES", "5")),
-    reset_after=float(os.environ.get("SUPABASE_BREAKER_RESET_S", "30")),
+    max_failures=_env_int("SUPABASE_BREAKER_FAILURES", 5, minimum=1, maximum=100),
+    reset_after=_env_float("SUPABASE_BREAKER_RESET_S", 30.0, minimum=1.0, maximum=3600.0),
 )
 redis_breaker = CircuitBreaker(
     "Redis",
-    max_failures=int(os.environ.get("REDIS_BREAKER_FAILURES", "5")),
-    reset_after=float(os.environ.get("REDIS_BREAKER_RESET_S", "20")),
+    max_failures=_env_int("REDIS_BREAKER_FAILURES", 5, minimum=1, maximum=100),
+    reset_after=_env_float("REDIS_BREAKER_RESET_S", 20.0, minimum=1.0, maximum=3600.0),
 )
 
-_LOG_ONCE_TTL_S = float(os.environ.get("LOG_ONCE_TTL_S", "60"))
+_LOG_ONCE_TTL_S = _env_float("LOG_ONCE_TTL_S", 60.0, minimum=1.0, maximum=3600.0)
 _log_once_seen: dict[str, float] = {}
 
 
@@ -6088,18 +6191,18 @@ USER_SEARCH_WAIT_QUERY = 5
 SCHED_EDIT_WAIT_TIME   = 6
 SCHED_EDIT_WAIT_TEXT   = 7
 SCHED_EDIT_WAIT_PHOTO  = 8
-_SCHED_POLL_INTERVAL   = int(os.environ.get("SCHED_POLL_INTERVAL", "60"))
-_SCHED_SENDING_STALE_SECONDS = int(os.environ.get("SCHED_SENDING_STALE_SECONDS", "1800"))
-_SCHED_DUE_LIMIT      = max(1, int(os.environ.get("SCHED_DUE_LIMIT", "5")))
-_SCHED_SCAN_LIMIT     = max(25, int(os.environ.get("SCHED_SCAN_LIMIT", "250")))
+_SCHED_POLL_INTERVAL   = _env_int("SCHED_POLL_INTERVAL", 60, minimum=5, maximum=3600)
+_SCHED_SENDING_STALE_SECONDS = _env_int("SCHED_SENDING_STALE_SECONDS", 1800, minimum=60, maximum=86400)
+_SCHED_DUE_LIMIT      = _env_int("SCHED_DUE_LIMIT", 5, minimum=1, maximum=100)
+_SCHED_SCAN_LIMIT     = _env_int("SCHED_SCAN_LIMIT", 250, minimum=25, maximum=5000)
 _SCHED_LOCK_ENABLED   = os.environ.get("SCHED_LOCK_ENABLED", "1") == "1"
 _SCHED_LOCK_REQUIRED  = os.environ.get("SCHED_LOCK_REQUIRED", "0") == "1"
-_SCHED_ADMIN_PENDING_CACHE_TTL_S = max(1.0, float(os.environ.get("SCHED_ADMIN_PENDING_CACHE_TTL_S", "8")))
+_SCHED_ADMIN_PENDING_CACHE_TTL_S = _env_float("SCHED_ADMIN_PENDING_CACHE_TTL_S", 8.0, minimum=1.0, maximum=300.0)
 _sched_admin_pending_cache: dict[int, tuple[float, list[dict]]] = {}
 _sched_admin_pending_locks: dict[int, threading.Lock] = {}
 _sched_admin_pending_cache_lock = threading.Lock()
 _SCHED_LOCK_KEY       = os.environ.get("SCHED_LOCK_KEY", "scheduled_broadcast_runner").strip() or "scheduled_broadcast_runner"
-_SCHED_LOCK_TTL_S     = max(30, int(os.environ.get("SCHED_LOCK_TTL_S", str(max(90, _SCHED_POLL_INTERVAL * 3)))))
+_SCHED_LOCK_TTL_S     = _env_int("SCHED_LOCK_TTL_S", max(90, _SCHED_POLL_INTERVAL * 3), minimum=30, maximum=86400)
 _BOT_LOCK_OWNER       = os.environ.get("BOT_LOCK_OWNER", "").strip() or (
     f"{os.environ.get('RENDER_SERVICE_NAME', 'bot')}:{os.environ.get('RENDER_INSTANCE_ID', 'local')}:{socket.gethostname()}:{os.getpid()}:{secrets.token_hex(4)}"
 )
@@ -6254,8 +6357,8 @@ def ask_huggingface(prompt: str, history: list[dict] | None = None) -> str:
             response = _hf_client.chat_completion(
                 model=HF_MODEL,
                 messages=messages,
-                max_tokens=int(os.environ.get("HF_MAX_TOKENS", "1024")),
-                temperature=float(os.environ.get("HF_TEMPERATURE", "0.7")),
+                max_tokens=_env_int("HF_MAX_TOKENS", 1024, minimum=64, maximum=8192),
+                temperature=_env_float("HF_TEMPERATURE", 0.7, minimum=0.0, maximum=2.0),
             )
             content = response.choices[0].message.content
             if isinstance(content, list):
@@ -6731,7 +6834,7 @@ DEFAULT_USER_PREFS: dict = {"gender": "female", "speed": DEFAULT_SPEED, "tts_mod
 # Telegram callback failure.
 _USER_PREFS_TTS_MODEL_COLUMN_OK: bool | None = None
 _USER_PREFS_TTS_MODEL_LAST_CHECK = 0.0
-_USER_PREFS_TTS_MODEL_RECHECK_S = max(60.0, float(os.environ.get("TTS_MODEL_COLUMN_RECHECK_S", "300")))
+_USER_PREFS_TTS_MODEL_RECHECK_S = _env_float("TTS_MODEL_COLUMN_RECHECK_S", 300.0, minimum=60.0, maximum=86400.0)
 
 USER_PREFS_TTS_MODEL_SQL = """-- Run in Supabase SQL Editor if users cannot save TTS model choice
 alter table public.user_prefs
@@ -7371,7 +7474,7 @@ def _paginated_fetch(select_fields: str) -> list[dict]:
     return all_rows
 
 
-USER_SEARCH_CACHE_TTL_S = float(os.environ.get("USER_SEARCH_CACHE_TTL_S", "20"))
+USER_SEARCH_CACHE_TTL_S = _env_float("USER_SEARCH_CACHE_TTL_S", 20.0, minimum=0.0, maximum=600.0)
 _user_search_cache: dict[str, Any] = {"ts": 0.0, "rows": []}
 _user_search_cache_lock = threading.Lock()
 
@@ -7717,7 +7820,7 @@ def _text_cache_user_history_append_sync(
         "original_text": text,
         "created_at": created_at or datetime.now(timezone.utc).isoformat(),
     })
-    keep = max(50, int(os.environ.get("ADMIN_TEXT_CACHE_REDIS_TURNS", "120")))
+    keep = _env_int("ADMIN_TEXT_CACHE_REDIS_TURNS", 120, minimum=50, maximum=5000)
     _redis_set_json_sync(key, rows[-keep:], REDIS_HISTORY_TTL_S)
 
 
@@ -8002,7 +8105,7 @@ BOT_SETTING_DESCRIPTIONS: dict[str, str] = {
     "audio_transcribe_enabled": "Allow uploaded audio-file transcription.",
     "ai_resolver_enabled": "Allow AI to rewrite/resolve text before TTS when enabled by env.",
 }
-_SETTINGS_CACHE_TTL_S = float(os.environ.get("BOT_SETTINGS_CACHE_TTL_S", "30"))
+_SETTINGS_CACHE_TTL_S = _env_float("BOT_SETTINGS_CACHE_TTL_S", 30.0, minimum=0.0, maximum=3600.0)
 _bot_settings_memory: dict[str, str] = dict(BOT_SETTING_DEFAULTS)
 _bot_settings_cache: dict = {
     "data": dict(BOT_SETTING_DEFAULTS),
@@ -8345,9 +8448,9 @@ CONV_RESOLVE_TIMEOUT_S = 15
 # Admin history display/cache limits.
 # The old admin detail screen was hard-coded to show only 3 turns.
 # These env values let you increase/decrease history without editing code again.
-ADMIN_DETAIL_HISTORY_TURNS = max(3, min(20, int(os.environ.get("ADMIN_DETAIL_HISTORY_TURNS", "10"))))
-ADMIN_FULL_HISTORY_TURNS   = max(10, min(100, int(os.environ.get("ADMIN_FULL_HISTORY_TURNS", "50"))))
-ADMIN_HISTORY_PAGE_SIZE    = max(5, min(20, int(os.environ.get("ADMIN_HISTORY_PAGE_SIZE", "10"))))
+ADMIN_DETAIL_HISTORY_TURNS = _env_int("ADMIN_DETAIL_HISTORY_TURNS", 10, minimum=3, maximum=20)
+ADMIN_FULL_HISTORY_TURNS   = _env_int("ADMIN_FULL_HISTORY_TURNS", 50, minimum=10, maximum=100)
+ADMIN_HISTORY_PAGE_SIZE    = _env_int("ADMIN_HISTORY_PAGE_SIZE", 10, minimum=5, maximum=20)
 
 _HIST_CACHE_MAX_USERS = 5_000
 _HIST_CACHE_TURNS     = max(ADMIN_FULL_HISTORY_TURNS, 50)
@@ -10280,8 +10383,56 @@ def _hf_tts_get_client_sync():
         return _HF_TTS_CLIENT
 
 
+def _hf_tts_predict_should_retry(exc: Exception) -> bool:
+    """Return True for transient Gradio/ZeroGPU cold-start style failures."""
+    msg = str(exc).lower()
+    non_retryable = (
+        "invalid api",
+        "api_name",
+        "not found",
+        "401",
+        "403",
+        "unauthorized",
+        "forbidden",
+        "invalid token",
+    )
+    if any(token in msg for token in non_retryable):
+        return False
+    retryable = (
+        "cold",
+        "starting",
+        "loading",
+        "zerogpu",
+        "zero gpu",
+        "queue",
+        "queued",
+        "timeout",
+        "timed out",
+        "temporarily",
+        "connection",
+        "read error",
+        "503",
+        "504",
+        "502",
+        "too busy",
+        "no valid audio",
+        "empty audio",
+    )
+    return any(token in msg for token in retryable)
+
+
+def _hf_tts_sleep_before_retry(attempt: int) -> None:
+    delay = min(float(HF_TTS_RETRY_DELAY_S) * (2 ** max(0, attempt - 1)), 30.0)
+    time.sleep(delay)
+
+
 def _hf_tts_space_predict_sync(chunk_text: str) -> bytes:
-    """Blocking Gradio call for mrrtmob/khmer-tts. Run only in an executor."""
+    """Blocking Gradio call for mrrtmob/khmer-tts. Run only in an executor.
+
+    Public ZeroGPU Spaces often cold-start or sit in a queue.  Retry the
+    blocking predict call here with exponential backoff so one cold start does
+    not immediately fail the whole Telegram TTS request.
+    """
     client = _hf_tts_get_client_sync()
 
     def _predict():
@@ -10295,39 +10446,59 @@ def _hf_tts_space_predict_sync(chunk_text: str) -> bytes:
             api_name=HF_TTS_API_NAME,
         )
 
-    if HF_TTS_SERIALIZE_CALLS:
-        with _HF_TTS_CLIENT_CALL_LOCK:
+    def _predict_once() -> bytes:
+        if HF_TTS_SERIALIZE_CALLS:
+            with _HF_TTS_CLIENT_CALL_LOCK:
+                result = _predict()
+        else:
             result = _predict()
-    else:
-        result = _predict()
 
-    # The Space uses `gr.Audio(type="numpy")`, so successful responses may be
-    # `(24000, np.ndarray)` instead of a file path. Extract audio bytes first,
-    # then fall back to file/URL references. Ignore secondary UI strings such as
-    # `Characters: 238/300`.
-    data = _extract_hf_audio_bytes_from_result(result)
-    if data:
+        # The Space uses `gr.Audio(type="numpy")`, so successful responses may be
+        # `(24000, np.ndarray)` instead of a file path. Extract audio bytes first,
+        # then fall back to file/URL references. Ignore secondary UI strings such as
+        # `Characters: 238/300`.
+        data = _extract_hf_audio_bytes_from_result(result)
+        if data:
+            return data
+
+        path_or_url = _extract_hf_audio_path_or_url(result)
+        if not path_or_url:
+            result_preview = _web_short(result, 240) if "_web_short" in globals() else str(result)[:240]
+            raise RuntimeError(
+                f"HF TTS returned no valid audio data/file/url. result_type={type(result).__name__} result={result_preview!r}"
+            )
+
+        if re.match(r"^https?://", path_or_url, re.I):
+            resp = httpx.get(path_or_url, timeout=HF_TTS_TIMEOUT_S)
+            resp.raise_for_status()
+            data = resp.content or b""
+        else:
+            if not os.path.isfile(path_or_url):
+                raise RuntimeError(f"HF TTS returned missing audio file: {path_or_url!r}")
+            with open(path_or_url, "rb") as fh:
+                data = fh.read()
+        if not data:
+            raise RuntimeError("HF TTS returned empty audio.")
         return data
 
-    path_or_url = _extract_hf_audio_path_or_url(result)
-    if not path_or_url:
-        result_preview = _web_short(result, 240) if "_web_short" in globals() else str(result)[:240]
-        raise RuntimeError(
-            f"HF TTS returned no valid audio data/file/url. result_type={type(result).__name__} result={result_preview!r}"
-        )
+    last_exc: Exception | None = None
+    retries = max(1, int(HF_TTS_RETRIES or 3))
+    for attempt in range(1, retries + 1):
+        try:
+            return _predict_once()
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= retries or not _hf_tts_predict_should_retry(exc):
+                raise
+            logger.warning(
+                "HF Khmer TTS Gradio call failed attempt=%s/%s; retrying with exponential backoff: %s",
+                attempt,
+                retries,
+                exc,
+            )
+            _hf_tts_sleep_before_retry(attempt)
 
-    if re.match(r"^https?://", path_or_url, re.I):
-        resp = httpx.get(path_or_url, timeout=HF_TTS_TIMEOUT_S)
-        resp.raise_for_status()
-        data = resp.content or b""
-    else:
-        if not os.path.isfile(path_or_url):
-            raise RuntimeError(f"HF TTS returned missing audio file: {path_or_url!r}")
-        with open(path_or_url, "rb") as fh:
-            data = fh.read()
-    if not data:
-        raise RuntimeError("HF TTS returned empty audio.")
-    return data
+    raise RuntimeError(f"HF TTS failed after {retries} attempts: {last_exc}")
 
 
 async def _convert_audio_files_to_telegram_voice(input_paths: list[str], speed: float, output_path: str) -> bytes:
@@ -10407,23 +10578,29 @@ async def _generate_voice_hf_space(text: str, speed: float, output_path: str) ->
     with tempfile.TemporaryDirectory(prefix="hf_khmer_tts_") as tmpdir:
         input_paths: list[str] = []
         for idx, chunk_text in enumerate(chunks, 1):
-            last_error: Exception | None = None
-            audio_bytes = b""
-            for attempt in range(1, HF_TTS_RETRIES + 1):
-                try:
-                    audio_bytes = await asyncio.wait_for(
-                        loop.run_in_executor(_AI_EXECUTOR, _hf_tts_space_predict_sync, chunk_text),
-                        timeout=HF_TTS_TIMEOUT_S,
-                    )
-                    break
-                except Exception as exc:
-                    last_error = exc
-                    if attempt < HF_TTS_RETRIES:
-                        await asyncio.sleep(HF_TTS_RETRY_DELAY_S * attempt)
+            # _hf_tts_space_predict_sync owns the retry/backoff policy.  Keep a
+            # single executor submission per chunk so retries do not multiply
+            # and leave timed-out worker calls running in the background.
+            try:
+                retry_budget = max(1, int(HF_TTS_RETRIES or 3))
+                backoff_budget = sum(
+                    min(float(HF_TTS_RETRY_DELAY_S) * (2 ** max(0, attempt - 1)), 30.0)
+                    for attempt in range(1, retry_budget)
+                )
+                predict_timeout_s = (HF_TTS_TIMEOUT_S * retry_budget) + backoff_budget + 10.0
+                audio_bytes = await asyncio.wait_for(
+                    loop.run_in_executor(_AI_EXECUTOR, _hf_tts_space_predict_sync, chunk_text),
+                    timeout=predict_timeout_s,
+                )
+            except Exception as exc:
+                preview = chunk_text[:80].replace("\n", " ")
+                raise RuntimeError(
+                    f"HF Khmer TTS failed at chunk {idx}/{len(chunks)} ({preview!r}): {exc}"
+                ) from exc
             if not audio_bytes:
                 preview = chunk_text[:80].replace("\n", " ")
                 raise RuntimeError(
-                    f"HF Khmer TTS failed at chunk {idx}/{len(chunks)} ({preview!r}): {last_error}"
+                    f"HF Khmer TTS failed at chunk {idx}/{len(chunks)} ({preview!r}): empty audio"
                 )
             suffix = _audio_suffix_from_bytes(audio_bytes)
             in_path = os.path.join(tmpdir, f"chunk_{idx:03d}{suffix}")
@@ -12743,13 +12920,57 @@ def _clean_subtitle_text(raw: str) -> str:
     return cleaned
 
 
-async def _download_telegram_file_to_bytes(tg_file, max_bytes: int) -> bytes:
-    bio = io.BytesIO()
-    await tg_file.download_to_memory(out=bio)
-    data = bio.getvalue()
-    if len(data) > max_bytes:
+async def _download_telegram_file_to_temp_path(tg_file, max_bytes: int, suffix: str = ".bin") -> str:
+    """Download a Telegram file to disk with a hard size check.
+
+    This avoids io.BytesIO/download_to_memory, which can OOM the worker when
+    multiple users upload audio/documents at the same time.  Caller owns the
+    returned temp path and must delete it with _cleanup(path).
+    """
+    max_bytes = int(max_bytes or 0)
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+
+    file_size = getattr(tg_file, "file_size", None)
+    if file_size is not None and int(file_size) > max_bytes:
         raise ValueError(f"File too large. Max {max_bytes // 1024 // 1024} MB.")
-    return data
+
+    fd, path = tempfile.mkstemp(prefix="tg_download_", suffix=suffix or ".bin")
+    os.close(fd)
+    try:
+        await tg_file.download_to_drive(path)
+        actual_size = os.path.getsize(path)
+        if actual_size > max_bytes:
+            raise ValueError(f"File too large. Max {max_bytes // 1024 // 1024} MB.")
+        return path
+    except Exception:
+        _cleanup(path)
+        raise
+
+
+async def _download_telegram_file_to_bytes(tg_file, max_bytes: int) -> bytes:
+    """Compatibility wrapper that downloads via disk, then reads bounded bytes.
+
+    Keep this only for small text/subtitle files that genuinely need bytes.
+    Audio and larger media paths should use _download_telegram_file_to_temp_path()
+    and pass the temp path to FFmpeg/AI processing directly.
+    """
+    path = await _download_telegram_file_to_temp_path(tg_file, max_bytes)
+    try:
+        chunks: list[bytes] = []
+        total = 0
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError(f"File too large. Max {max_bytes // 1024 // 1024} MB.")
+                chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        _cleanup(path)
 
 
 # ---------------------------------------------------------------------------
