@@ -5982,7 +5982,7 @@ def get_runtime_admin_kb() -> Any:
         [InlineKeyboardButton(f"🔄 Switch to {target}", callback_data=f"rtadmin_switch:{target}")],
         [InlineKeyboardButton("⚡ Modify Rate Limit", callback_data="rtadmin_rate")],
         [InlineKeyboardButton("🔄 Rotate Webhook Secret", callback_data="rtadmin_rotate_secret")],
-        [InlineKeyboardButton("⬅️ Admin Dashboard", callback_data="admin_home")],
+        [InlineKeyboardButton("⬅️ Admin V7", callback_data="admin_home")],
         [InlineKeyboardButton("❌ Close Menu", callback_data="rtadmin_close")],
     ])
 
@@ -10568,15 +10568,17 @@ def get_sched_detail_kb(row: dict) -> InlineKeyboardMarkup:
 
 
 def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
-    """Admin Dashboard V2 keyboard with direct panels, settings, and runtime submenu.
+    """Telegram Admin System Center V7 keyboard.
 
-    Keep /admin as the original full bot admin dashboard. Runtime controls are
-    available as a submenu so older admin features are not hidden/replaced.
+    This menu now exposes the CRM and Optimize panels directly in Telegram,
+    not only in the web dashboard.
     """
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🏠 Dashboard",   callback_data="admin_home"),
          InlineKeyboardButton("🩺 Health",      callback_data="admin_health")],
         [InlineKeyboardButton("👥 Users",       callback_data="admin_users"),
+         InlineKeyboardButton("⭐ CRM",         callback_data="admin_crm")],
+        [InlineKeyboardButton("⚡ Optimize",    callback_data="admin_optimize"),
          InlineKeyboardButton("🕘 Recent History", callback_data="admin_history")],
         [InlineKeyboardButton("⚙️ Settings",    callback_data="admin_settings"),
          InlineKeyboardButton("📊 Stats",       callback_data="admin_stats")],
@@ -10592,9 +10594,134 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
     ])
 
 
+_CRM_TELEGRAM_SEGMENTS = {
+    "all": "All",
+    "power": "Power",
+    "active": "Active",
+    "warm": "Warm",
+    "risk": "At-risk",
+    "blocked": "Blocked",
+}
+
+
+def get_admin_crm_kb(active_segment: str = "all") -> InlineKeyboardMarkup:
+    """Compact Telegram CRM controls."""
+    active_segment = (active_segment or "all").strip().lower()
+    def _label(key: str, text: str) -> str:
+        return f"✅ {text}" if key == active_segment else text
+
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(_label("all", "All"), callback_data="admin_crm:all"),
+         InlineKeyboardButton(_label("power", "Power"), callback_data="admin_crm:power"),
+         InlineKeyboardButton(_label("active", "Active"), callback_data="admin_crm:active")],
+        [InlineKeyboardButton(_label("warm", "Warm"), callback_data="admin_crm:warm"),
+         InlineKeyboardButton(_label("risk", "At-risk"), callback_data="admin_crm:risk"),
+         InlineKeyboardButton(_label("blocked", "Blocked"), callback_data="admin_crm:blocked")],
+        [InlineKeyboardButton("👥 Users", callback_data="admin_users"),
+         InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("⬅️ Admin V7", callback_data="admin_home"),
+         InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+    ])
+
+
+def _format_crm_row_for_telegram(row: dict) -> str:
+    uid = int(row.get("user_id") or 0)
+    name = html.escape(str(row.get("username") or row.get("first_name") or uid))
+    score = int(row.get("quality_score") or 0)
+    segment = html.escape(str(row.get("crm_segment") or "unknown"))
+    age = row.get("age_days")
+    age_text = "unknown" if age is None else f"{int(age)}d"
+    messages = int(row.get("recent_messages") or 0)
+    blocked = " 🚫" if row.get("blocked") else ""
+    return f"• <b>{score}</b> · {name}{blocked} · <code>{uid}</code> · {segment} · {age_text} · {messages} msg"
+
+
+async def _admin_crm_text(segment: str = "all") -> str:
+    segment = (segment or "all").strip().lower() or "all"
+    if segment not in _CRM_TELEGRAM_SEGMENTS:
+        segment = "all"
+
+    rows, summary = await asyncio.get_running_loop().run_in_executor(
+        _DB_EXECUTOR,
+        lambda: db_crm_users_snapshot(segment=segment, limit=12, force=False),
+    )
+    lines = [_format_crm_row_for_telegram(row) for row in rows[:10]]
+    users_text = "\n".join(lines) if lines else "No users found for this CRM segment."
+    return (
+        f"⭐ <b>User Quality / CRM Panel</b>\n"
+        f"Segment: <b>{html.escape(_CRM_TELEGRAM_SEGMENTS.get(segment, segment))}</b>\n\n"
+        "<b>Summary</b>\n"
+        f"👥 Shown: <b>{int(summary.get('shown') or 0)}</b> / loaded <b>{int(summary.get('total_loaded') or 0)}</b>\n"
+        f"🔥 Power users: <b>{int(summary.get('power') or 0)}</b>\n"
+        f"✅ Active today: <b>{int(summary.get('active') or 0)}</b>\n"
+        f"⚠️ At-risk: <b>{int(summary.get('risk') or 0)}</b>\n"
+        f"🚫 Blocked: <b>{int(summary.get('blocked') or 0)}</b>\n"
+        f"🧠 Cache TTL: <b>{int(summary.get('cache_ttl_s') or CRM_CACHE_TTL_S)}s</b>\n\n"
+        "<b>Top users</b>\n"
+        f"{users_text}\n\n"
+        "Tip: open 👥 Users to view detail, block/unblock, reset prefs, or start admin chat."
+    )
+
+
+async def _admin_open_crm_panel(query, segment: str = "all") -> None:
+    segment = (segment or "all").strip().lower() or "all"
+    text = await _admin_crm_text(segment)
+    await safe_send(lambda: query.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=get_admin_crm_kb(segment),
+        disable_web_page_preview=True,
+    ))
+
+
+def get_admin_optimize_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛠 Runtime", callback_data="admin_runtime"),
+         InlineKeyboardButton("🩺 Health", callback_data="admin_health")],
+        [InlineKeyboardButton("🚨 Error Center", callback_data="admin_errors"),
+         InlineKeyboardButton("🔄 Refresh", callback_data="admin_optimize")],
+        [InlineKeyboardButton("⬅️ Admin V7", callback_data="admin_home"),
+         InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+    ])
+
+
+def _admin_optimize_text() -> str:
+    snap = _runtime_performance_snapshot(light=True)
+    score, warnings, tips = _optimization_score(snap)
+    runtime = snap.get("runtime", {}) if isinstance(snap, dict) else {}
+    web = snap.get("web", {}) if isinstance(snap, dict) else {}
+    memory = snap.get("memory", {}) if isinstance(snap, dict) else {}
+    broadcast = snap.get("broadcast", {}) if isinstance(snap, dict) else {}
+    warning_text = "\n".join(f"• {html.escape(w)}" for w in warnings[:5]) if warnings else "• No critical warnings."
+    tips_text = "\n".join(f"• {html.escape(t)}" for t in tips[:5]) if tips else "• Keep Balanced preset."
+    return (
+        "⚡ <b>Optimization Center</b>\n\n"
+        f"Score: <b>{score}/100</b>\n"
+        f"Mode: <b>{html.escape(str(runtime.get('BOT_MODE') or _run_state_bot_mode()))}</b>\n"
+        f"Active web requests: <b>{int(web.get('active_requests') or 0)}</b>\n"
+        f"Broadcast queue: <b>{html.escape(str(broadcast.get('queue_size', 0)))}</b>\n"
+        f"Rate-limit memory: <b>{int(memory.get('rate_limit_keys') or 0)}</b>\n"
+        f"Notice memory: <b>{int(memory.get('rate_limit_notice_keys') or 0)}</b>\n\n"
+        "<b>Warnings</b>\n"
+        f"{warning_text}\n\n"
+        "<b>Recommendations</b>\n"
+        f"{tips_text}\n\n"
+        "For one-click cleanup and presets, use the web page <code>/admin/optimize</code>."
+    )
+
+
+async def _admin_open_optimize_panel(query) -> None:
+    await safe_send(lambda: query.message.edit_text(
+        _admin_optimize_text(),
+        parse_mode="HTML",
+        reply_markup=get_admin_optimize_kb(),
+        disable_web_page_preview=True,
+    ))
+
+
 def get_admin_action_kb(cancel_callback: str = "admin_cancel_state") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Admin Dashboard", callback_data="admin_home"),
+        [InlineKeyboardButton("⬅️ Admin V7", callback_data="admin_home"),
          InlineKeyboardButton("❌ Cancel",          callback_data=cancel_callback)],
     ])
 
@@ -12491,7 +12618,7 @@ def _ok_bad(ok: bool, ok_text: str = "OK", bad_text: str = "OFF") -> str:
     return f"✅ {ok_text}" if ok else f"⚠️ {bad_text}"
 
 
-async def _admin_home_text(admin_id: int, title: str = "🛠️ Admin Dashboard V2") -> str:
+async def _admin_home_text(admin_id: int, title: str = "🛠️ Admin System Center V7") -> str:
     counts = await _admin_summary_counts(admin_id)
     settings, settings_status = await get_bot_settings_async()
     ffmpeg_ok = bool(_FFMPEG_EXE and os.path.exists(_FFMPEG_EXE))
@@ -12580,7 +12707,7 @@ async def _admin_stats_text(admin_id: int) -> str:
     counts = await _admin_summary_counts(admin_id)
     settings, status = await get_bot_settings_async()
     return (
-        "📊 <b>Admin Dashboard V2 Stats</b>\n\n"
+        "📊 <b>Admin System Center V7 Stats</b>\n\n"
         f"👥 Total users: <b>{int(counts.get('total_users') or 0)}</b>\n"
         f"🚫 Blocked users: <b>{int(counts.get('blocked_users') or 0)}</b>\n"
         f"⏰ Pending schedules: <b>{int(counts.get('pending_sched') or 0)}</b>\n"
@@ -12925,7 +13052,7 @@ async def _admin_send_settings_sql(message) -> None:
     for page in _paginate_pre_html(
         ADMIN_V2_TABLES_SQL,
         limit=3800,
-        header="🧩 <b>Admin Dashboard V2 SQL</b>\n\n",
+        header="🧩 <b>Admin System Center V7 SQL</b>\n\n",
     ):
         await safe_send(lambda p=page: message.reply_text(
             p,
@@ -12967,7 +13094,7 @@ async def _admin_start_schedule_from_button(query, context: ContextTypes.DEFAULT
 
 @admin_only
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Preserve the original full Telegram Admin Dashboard V2 on /admin.
+    # Preserve the full Telegram Admin System Center V7 on /admin.
     # Runtime controls are now reachable from the "🛠️ Runtime" submenu button.
     user_id = update.effective_user.id if update.effective_user else 0
     text = await _admin_home_text(user_id)
@@ -13526,6 +13653,15 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
 
     if data == "admin_api":
         await _cb_api_dashboard(query, user_id, context, "api_menu")
+        return
+
+    if data == "admin_crm" or data.startswith("admin_crm:"):
+        segment = data.split(":", 1)[1] if ":" in data else "all"
+        await _admin_open_crm_panel(query, segment)
+        return
+
+    if data == "admin_optimize":
+        await _admin_open_optimize_panel(query)
         return
 
     if data == "admin_users":
