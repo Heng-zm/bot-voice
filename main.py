@@ -2358,6 +2358,7 @@ def _web_render(title: str, body: str, *, active: str = "dashboard", status_code
         ("optimize", "Optimize", "/admin/optimize", "⚡"),
         ("analytics", "Analytics V2", "/admin/analytics", "📈"),
         ("users", "Users", "/admin/users", "👥"),
+        ("crm", "CRM", "/admin/crm", "⭐"),
         ("schedules", "Schedules", "/admin/schedules", "⏱"),
         ("calendar", "Calendar", "/admin/schedules/calendar", "🗓"),
         ("broadcast", "Broadcast", "/admin/broadcast", "📣"),
@@ -2369,7 +2370,7 @@ def _web_render(title: str, body: str, *, active: str = "dashboard", status_code
         ("locks", "Locks", "/admin/locks", "🔒"),
         ("sql", "SQL", "/admin/sql", "☷"),
     ]
-    bottom_nav = [item for item in nav if item[0] in {"dashboard", "optimize", "users", "schedules", "broadcast"}]
+    bottom_nav = [item for item in nav if item[0] in {"dashboard", "optimize", "users", "crm", "broadcast"}]
     template = """
 <!doctype html>
 <html lang="en">
@@ -3178,6 +3179,343 @@ def _web_fetch_users(q: str = "", page: int = 0, page_size: int = WEB_TABLE_PAGE
     return []
 
 
+
+
+# ── Admin CRM / User Quality Center ─────────────────────────────────────────
+CRM_CACHE_TTL_S = _env_float("CRM_CACHE_TTL_S", 45.0, minimum=5.0, maximum=600.0)
+CRM_DEFAULT_LIMIT = _env_int("CRM_DEFAULT_LIMIT", 80, minimum=20, maximum=500)
+_CRM_SNAPSHOT_CACHE: dict[str, Any] = {"ts": 0.0, "key": "", "rows": [], "summary": {}}
+_CRM_SNAPSHOT_LOCK = threading.Lock()
+
+
+def _crm_parse_dt(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        dt = _sched_parse_iso(str(value))
+    if dt and dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _crm_age_days(value: Any) -> int | None:
+    dt = _crm_parse_dt(value)
+    if not dt:
+        return None
+    return max(0, int((datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() // 86400))
+
+
+def _crm_segment_label(row: dict) -> tuple[str, str]:
+    """Return (segment, badge-kind) for CRM list rows."""
+    if row.get("blocked"):
+        return "blocked", "danger"
+    age = row.get("age_days")
+    messages = int(row.get("recent_messages") or 0)
+    if age is None:
+        return "unknown", "muted"
+    if age <= 1 and messages >= 20:
+        return "power", "ok"
+    if age <= 1:
+        return "active", "ok"
+    if age <= 7 and messages >= 8:
+        return "warm", "info"
+    if age <= 7:
+        return "new/warm", "info"
+    if age <= 30:
+        return "inactive 7d", "warn"
+    return "inactive 30d", "danger"
+
+
+def _crm_quality_score(row: dict) -> int:
+    """Score users 0-100 using cached profile + recent text_cache metrics."""
+    if row.get("blocked"):
+        return 0
+    score = 35
+    age = row.get("age_days")
+    messages = int(row.get("recent_messages") or 0)
+    chars = int(row.get("recent_chars") or 0)
+    if age is None:
+        score += 5
+    elif age <= 1:
+        score += 35
+    elif age <= 3:
+        score += 28
+    elif age <= 7:
+        score += 20
+    elif age <= 30:
+        score += 8
+    else:
+        score -= 10
+    score += min(20, messages * 2)
+    score += min(10, chars // 800)
+    if row.get("username"):
+        score += 3
+    if row.get("tts_model"):
+        score += 2
+    return max(0, min(100, int(score)))
+
+
+def _crm_score_badge(score: int) -> str:
+    if score >= 80:
+        return _web_badge(f"{score} excellent", "ok")
+    if score >= 55:
+        return _web_badge(f"{score} good", "info")
+    if score >= 30:
+        return _web_badge(f"{score} watch", "warn")
+    return _web_badge(f"{score} risk", "danger")
+
+
+def _crm_segment_matches(row: dict, segment: str) -> bool:
+    segment = (segment or "all").strip().lower()
+    if segment in ("", "all"):
+        return True
+    label = str(row.get("crm_segment") or "").lower()
+    age = row.get("age_days")
+    score = int(row.get("quality_score") or 0)
+    if segment == "blocked":
+        return bool(row.get("blocked"))
+    if segment == "active":
+        return not row.get("blocked") and age is not None and age <= 1
+    if segment == "warm":
+        return not row.get("blocked") and age is not None and 1 < age <= 7
+    if segment == "inactive7":
+        return not row.get("blocked") and age is not None and 7 < age <= 30
+    if segment == "inactive30":
+        return not row.get("blocked") and age is not None and age > 30
+    if segment == "power":
+        return label == "power" or score >= 80
+    if segment == "risk":
+        return score < 35 or label.startswith("inactive")
+    if segment == "unknown":
+        return age is None
+    return segment in label
+
+
+def _crm_fetch_base_users(q: str, limit: int) -> list[dict]:
+    q = (q or "").strip()
+    limit = max(1, min(500, int(limit or CRM_DEFAULT_LIMIT)))
+    if q:
+        return search_users_by_query(q, limit=limit)
+    if not supabase:
+        return []
+    fields_try = (
+        "user_id, username, first_name, gender, speed, tts_model, last_active",
+        "user_id, username, first_name, gender, speed, last_active",
+        "user_id, username, gender, speed, last_active",
+        "user_id, username",
+    )
+    for fields in fields_try:
+        def _query(f: str = fields):
+            builder = supabase.table("user_prefs").select(f).limit(limit)
+            if "last_active" in f:
+                builder = builder.order("last_active", desc=True)
+            return builder.execute()
+
+        res = db_call_sync(
+            f"crm_base_users:{fields}:{limit}",
+            _query,
+            default=None,
+            attempts=2,
+            critical=False,
+        )
+        rows = list(getattr(res, "data", None) or []) if res is not None else []
+        if rows:
+            return rows[:limit]
+    return []
+
+
+def _crm_text_cache_metrics(user_ids: list[int], scan_limit: int) -> dict[int, dict]:
+    """Batch recent text_cache metrics. Uses chunks to avoid URL/query limits."""
+    metrics: dict[int, dict] = {uid: {"recent_messages": 0, "recent_chars": 0, "last_text_at": None, "last_text": ""} for uid in user_ids}
+    if not supabase or not user_ids:
+        return metrics
+    scan_limit = max(len(user_ids), min(3000, int(scan_limit or 1000)))
+    chunk_size = 120
+    for start in range(0, len(user_ids), chunk_size):
+        chunk = user_ids[start:start + chunk_size]
+        res = db_call_sync(
+            f"crm_text_cache:{start}:{len(chunk)}",
+            lambda c=chunk: supabase.table("text_cache")
+                .select("user_id, original_text, content, created_at")
+                .in_("user_id", c)
+                .order("created_at", desc=True)
+                .limit(scan_limit)
+                .execute(),
+            default=None,
+            attempts=2,
+            critical=False,
+        )
+        for item in list(getattr(res, "data", None) or []):
+            try:
+                uid = int(item.get("user_id") or 0)
+            except Exception:
+                uid = 0
+            if uid not in metrics:
+                continue
+            text = str(item.get("original_text") or item.get("content") or "")
+            m = metrics[uid]
+            m["recent_messages"] = int(m.get("recent_messages") or 0) + 1
+            m["recent_chars"] = int(m.get("recent_chars") or 0) + len(text)
+            if not m.get("last_text_at"):
+                m["last_text_at"] = item.get("created_at")
+                m["last_text"] = _history_compact_text(text, 150)
+    return metrics
+
+
+def db_crm_users_snapshot(q: str = "", segment: str = "all", limit: int = CRM_DEFAULT_LIMIT, force: bool = False) -> tuple[list[dict], dict]:
+    """Return optimized CRM rows and summary.
+
+    No new table is required. It reads user_prefs for profile/last_active,
+    blocked_users in one batch, and text_cache in chunked batches for recent
+    activity. A short cache prevents admin auto-refresh from hammering Supabase.
+    """
+    q = (q or "").strip()
+    segment = (segment or "all").strip().lower() or "all"
+    limit = max(10, min(500, int(limit or CRM_DEFAULT_LIMIT)))
+    cache_key = f"{q}|{segment}|{limit}"
+    now = time.monotonic()
+    with _CRM_SNAPSHOT_LOCK:
+        if not force and _CRM_SNAPSHOT_CACHE.get("key") == cache_key and now - float(_CRM_SNAPSHOT_CACHE.get("ts") or 0.0) < CRM_CACHE_TTL_S:
+            return list(_CRM_SNAPSHOT_CACHE.get("rows") or []), dict(_CRM_SNAPSHOT_CACHE.get("summary") or {})
+
+    base_rows = _crm_fetch_base_users(q, limit=max(limit, CRM_DEFAULT_LIMIT))
+    user_ids: list[int] = []
+    clean_rows: list[dict] = []
+    seen: set[int] = set()
+    for row in base_rows:
+        try:
+            uid = int(row.get("user_id") or 0)
+        except Exception:
+            uid = 0
+        if not uid or uid in seen:
+            continue
+        seen.add(uid)
+        user_ids.append(uid)
+        clean_rows.append(dict(row))
+
+    blocked_ids = _web_blocked_ids_for_users(clean_rows)
+    tc_metrics = _crm_text_cache_metrics(user_ids, scan_limit=max(500, limit * 20))
+    out: list[dict] = []
+    scored_rows: list[dict] = []
+    for row in clean_rows:
+        uid = int(row.get("user_id") or 0)
+        row.update(tc_metrics.get(uid) or {})
+        row["blocked"] = uid in blocked_ids
+        row["age_days"] = _crm_age_days(row.get("last_active") or row.get("last_text_at"))
+        seg_label, seg_kind = _crm_segment_label(row)
+        row["crm_segment"] = seg_label
+        row["crm_segment_kind"] = seg_kind
+        row["quality_score"] = _crm_quality_score(row)
+        scored_rows.append(row)
+        if _crm_segment_matches(row, segment):
+            out.append(row)
+
+    out.sort(key=lambda r: (int(r.get("quality_score") or 0), str(r.get("last_active") or r.get("last_text_at") or "")), reverse=True)
+    out = out[:limit]
+
+    summary = {
+        "total_loaded": len(scored_rows),
+        "shown": len(out),
+        "active": sum(1 for r in scored_rows if _crm_segment_matches(r, "active")),
+        "blocked": len(blocked_ids),
+        "risk": sum(1 for r in scored_rows if int(r.get("quality_score") or 0) < 35 or str(r.get("crm_segment") or "").startswith("inactive")),
+        "power": sum(1 for r in scored_rows if int(r.get("quality_score") or 0) >= 80),
+        "cache_ttl_s": CRM_CACHE_TTL_S,
+    }
+    with _CRM_SNAPSHOT_LOCK:
+        _CRM_SNAPSHOT_CACHE.update({"ts": time.monotonic(), "key": cache_key, "rows": list(out), "summary": dict(summary)})
+    return out, summary
+
+
+def _crm_clear_cache() -> None:
+    with _CRM_SNAPSHOT_LOCK:
+        _CRM_SNAPSHOT_CACHE.update({"ts": 0.0, "key": "", "rows": [], "summary": {}})
+
+
+def _crm_segment_tabs(active_segment: str, q: str, limit: int) -> str:
+    segments = [
+        ("all", "All"),
+        ("power", "Power"),
+        ("active", "Active"),
+        ("warm", "Warm"),
+        ("inactive7", "Inactive 7d"),
+        ("inactive30", "Inactive 30d"),
+        ("risk", "Risk"),
+        ("blocked", "Blocked"),
+    ]
+    return "".join(
+        f"<a class='btn {'secondary' if key != active_segment else ''}' href='{_web_url('/admin/crm', segment=key, q=q, limit=limit)}'>{_web_h(label)}</a>"
+        for key, label in segments
+    )
+
+
+def _crm_rows_html(rows: list[dict], csrf: str, return_input: str) -> tuple[str, str]:
+    table_rows: list[str] = []
+    mobile_cards: list[str] = []
+    for row in rows:
+        uid = int(row.get("user_id") or 0)
+        username = row.get("username") or row.get("first_name") or "-"
+        detail_url = url_for("web_admin_user_detail", user_id=uid)
+        last_seen = row.get("last_active") or row.get("last_text_at") or ""
+        age = row.get("age_days")
+        age_txt = "unknown" if age is None else ("today" if age == 0 else f"{age}d ago")
+        score = int(row.get("quality_score") or 0)
+        seg = _web_badge(row.get("crm_segment") or "unknown", row.get("crm_segment_kind") or "muted")
+        block_action = "unblock" if row.get("blocked") else "block"
+        block_label = "Unblock" if row.get("blocked") else "Block"
+        block_cls = "ok" if row.get("blocked") else "danger"
+        action_forms = f"""
+          <a class='btn secondary' href='{detail_url}'>Detail</a>
+          <form class='inline-form' method='post' action='/admin/users/action' data-confirm='{_web_h(block_label)} this user?'>
+            <input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='user_id' value='{uid}'><input type='hidden' name='action' value='{block_action}'><button class='{block_cls}'>{block_label}</button>
+          </form>
+        """
+        table_rows.append(f"""
+        <tr>
+          <td><a href='{detail_url}'><code>{uid}</code></a><br><span class='muted'>{_web_h(username)}</span></td>
+          <td>{_crm_score_badge(score)}<br>{seg}</td>
+          <td><b>{_web_h(row.get('recent_messages') or 0)}</b><br><span class='muted'>{_web_h(row.get('recent_chars') or 0)} chars</span></td>
+          <td>{_web_h(_web_dt(last_seen))}<br><span class='muted'>{_web_h(age_txt)}</span></td>
+          <td>{_web_h(_web_short(row.get('last_text') or 'No cached text', 160))}</td>
+          <td><div class='actions'>{action_forms}</div></td>
+        </tr>
+        """)
+        mobile_cards.append(f"""
+        <div class='touch-item'>
+          <div class='actions' style='justify-content:space-between'><b><a href='{detail_url}'><code>{uid}</code></a></b>{_crm_score_badge(score)}</div>
+          <div class='muted'>{_web_h(username)} · {seg} · {age_txt}</div>
+          <div class='help'>{_web_h(_web_short(row.get('last_text') or 'No cached text', 150))}</div>
+          <div class='actions' style='margin-top:10px'>{action_forms}<button type='button' class='btn ghost' data-copy='{uid}'>Copy ID</button></div>
+        </div>
+        """)
+    empty = '<tr><td colspan=6><div class="empty">No CRM users found for this filter.</div></td></tr>'
+    return "".join(table_rows) or empty, "".join(mobile_cards) or '<div class="empty">No CRM users found for this filter.</div>'
+
+
+def _crm_csv(rows: list[dict]) -> str:
+    header = ["user_id", "username", "score", "segment", "blocked", "recent_messages", "recent_chars", "last_seen", "last_text"]
+    lines = [",".join(header)]
+    def esc(v: Any) -> str:
+        s = str(v if v is not None else "")
+        s = s.replace('"', '""')
+        return f'"{s}"' if any(ch in s for ch in [",", "\n", "\r", '"']) else s
+    for r in rows:
+        last_seen = r.get("last_active") or r.get("last_text_at") or ""
+        values = [
+            r.get("user_id"),
+            r.get("username") or r.get("first_name") or "",
+            r.get("quality_score"),
+            r.get("crm_segment"),
+            bool(r.get("blocked")),
+            r.get("recent_messages"),
+            r.get("recent_chars"),
+            _web_dt(last_seen),
+            r.get("last_text") or "",
+        ]
+        lines.append(",".join(esc(v) for v in values))
+    return "\n".join(lines) + "\n"
 def _web_send_telegram_message(
     chat_id: int,
     text: str,
@@ -3294,6 +3632,90 @@ def web_admin_users():
     return _web_render("Users", body, active="users")
 
 
+
+
+
+@app_flask.route("/admin/crm")
+@web_admin_required
+def web_admin_crm():
+    q = (request.args.get("q") or "").strip()
+    segment = (request.args.get("segment") or "all").strip().lower() or "all"
+    limit = max(20, min(500, _web_int(request.args.get("limit"), CRM_DEFAULT_LIMIT)))
+    force = str(request.args.get("refresh") or "").lower() in {"1", "true", "yes"}
+    rows, summary = db_crm_users_snapshot(q=q, segment=segment, limit=limit, force=force)
+    csrf = _web_csrf_token()
+    return_input = _web_return_input()
+    table_html, mobile_html = _crm_rows_html(rows, csrf, return_input)
+    tabs = _crm_segment_tabs(segment, q, limit)
+    export_url = _web_url("/admin/crm/export.csv", q=q, segment=segment, limit=limit)
+    refresh_url = _web_url("/admin/crm", q=q, segment=segment, limit=limit, refresh=1)
+    body = f"""
+    <div class='actions' style='justify-content:space-between;margin-bottom:12px'>
+      <div class='actions'><a class='btn secondary' href='/admin/users'>👥 Users</a><a class='btn secondary' href='/admin/broadcast'>📣 Broadcast</a><a class='btn secondary' href='{_web_h(export_url)}'>Export CSV</a></div>
+      <span class='muted'>CRM cache TTL {int(CRM_CACHE_TTL_S)}s · {_web_h(_fmt_local_time_hint())}</span>
+    </div>
+    <div class='grid'>
+      {_web_count_card('crm_shown', 'Shown', summary.get('shown', 0), f"loaded {summary.get('total_loaded', 0)} users", 'ok' if summary.get('shown') else '')}
+      {_web_count_card('crm_power', 'Power users', summary.get('power', 0), 'score 80+', 'ok' if summary.get('power') else '')}
+      {_web_count_card('crm_risk', 'At risk', summary.get('risk', 0), 'low score or inactive', 'warn' if summary.get('risk') else '')}
+      {_web_count_card('crm_blocked', 'Blocked', summary.get('blocked', 0), 'skipped during sends', 'danger' if summary.get('blocked') else '')}
+    </div>
+    <div class='card'>
+      <div class='actions' style='justify-content:space-between'><div><h2>User Quality / CRM Panel</h2><p class='muted'>Scores users from <code>user_prefs</code>, <code>text_cache</code>, and <code>blocked_users</code> with batched queries and short cache.</p></div><div class='actions'><a class='btn secondary' href='{_web_h(refresh_url)}'>Refresh</a><form class='inline-form' method='post' action='/admin/crm/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='return_to' value='/admin/crm'><input type='hidden' name='action' value='clear_cache'><button class='secondary'>Clear CRM Cache</button></form></div></div>
+      <form method='get' class='row3'>
+        <div class='field'><label>Search user ID or username</label><input name='q' value='{_web_h(q)}' placeholder='123456789 or @username'></div>
+        <div class='field'><label>Segment</label><select name='segment'>
+          {''.join(f"<option value='{k}' {'selected' if segment==k else ''}>{label}</option>" for k,label in [('all','All'),('power','Power users'),('active','Active today'),('warm','Warm 2-7d'),('inactive7','Inactive 7-30d'),('inactive30','Inactive 30d+'),('risk','At risk'),('blocked','Blocked')])}
+        </select></div>
+        <div class='field'><label>Limit</label><select name='limit'>{''.join(f"<option value='{n}' {'selected' if limit==n else ''}>{n}</option>" for n in (50,80,120,200,500))}</select></div>
+        <div class='field'><label>&nbsp;</label><div class='actions'><button>Apply Filter</button><a class='btn secondary' href='/admin/crm'>Reset</a></div></div>
+      </form>
+      <div class='actions' style='margin-top:12px'>{tabs}</div>
+    </div>
+    <div class='card'>
+      <div class='actions' style='justify-content:space-between'><h2>CRM Users</h2><span class='muted'>Sorted by quality score</span></div>
+      <div class='table-wrap desktop-table'><table class='table'><thead><tr><th>User</th><th>Quality</th><th>Recent Usage</th><th>Last Seen</th><th>Latest Text</th><th>Actions</th></tr></thead><tbody>{table_html}</tbody></table></div>
+      <div class='mobile-card'>{mobile_html}</div>
+    </div>
+    <div class='grid2'>
+      <div class='card'><h2>How score works</h2><div class='touch-list'>
+        <div class='touch-item'><b>Recency</b><div class='muted'>Recent last_active / last text_cache activity increases score.</div></div>
+        <div class='touch-item'><b>Engagement</b><div class='muted'>More recent text_cache messages and characters increase score.</div></div>
+        <div class='touch-item'><b>Risk</b><div class='muted'>Blocked users score 0; inactive users appear in risk segments.</div></div>
+      </div></div>
+      <div class='card'><h2>CRM Actions</h2><p class='muted'>Use this panel to find high-value users, inactive users, blocked users, and users who need follow-up. For mass sends, open Broadcast and use a test message first.</p><div class='actions'><a class='btn' href='/admin/broadcast'>Open Broadcast</a><a class='btn secondary' href='/admin/users'>Open Users</a></div></div>
+    </div>
+    """
+    return _web_render("User Quality CRM", body, active="crm")
+
+
+@app_flask.route("/admin/crm/export.csv")
+@web_admin_required
+def web_admin_crm_export_csv():
+    q = (request.args.get("q") or "").strip()
+    segment = (request.args.get("segment") or "all").strip().lower() or "all"
+    limit = max(20, min(500, _web_int(request.args.get("limit"), CRM_DEFAULT_LIMIT)))
+    rows, _summary = db_crm_users_snapshot(q=q, segment=segment, limit=limit)
+    filename = f"crm-users-{segment}-{datetime.now(APP_TIMEZONE).strftime('%Y%m%d-%H%M')}.csv"
+    return Response(
+        _crm_csv(rows),
+        status=200,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app_flask.route("/admin/crm/action", methods=["POST"])
+@web_admin_required
+def web_admin_crm_action():
+    _web_check_csrf()
+    action = str(request.form.get("action") or "").strip()
+    if action == "clear_cache":
+        _crm_clear_cache()
+        flask_flash("CRM cache cleared.", "success")
+    else:
+        flask_flash("Unknown CRM action.", "error")
+    return redirect(_web_safe_return("web_admin_crm"))
 
 
 @app_flask.route("/admin/users/<int:user_id>")
