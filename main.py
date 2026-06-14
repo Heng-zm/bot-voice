@@ -10,7 +10,6 @@ import html
 import json as _json
 import functools
 import tempfile
-import glob
 import gc
 import hashlib
 import hmac
@@ -37,7 +36,7 @@ except Exception as exc:
     genai = None
     genai_types = None
 from fastapi import FastAPI, Request as FastAPIRequest, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response as StarletteResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response as StarletteResponse
 from fastapi.encoders import jsonable_encoder
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.concurrency import run_in_threadpool
@@ -104,9 +103,14 @@ def _get_async_resolver_loop() -> asyncio.AbstractEventLoop:
 
 
 def _shutdown_async_resolver_loop() -> None:
+    """Stop the background resolver loop cleanly during process shutdown."""
     loop = _ASYNC_RESOLVER_LOOP
+    thread = _ASYNC_RESOLVER_THREAD
     if loop is not None and loop.is_running():
         loop.call_soon_threadsafe(loop.stop)
+    if thread is not None and thread.is_alive():
+        with suppress(Exception):
+            thread.join(timeout=2.0)
 
 
 atexit.register(_shutdown_async_resolver_loop)
@@ -1146,7 +1150,7 @@ async def keep_alive_async(stop_event: asyncio.Event | None = None):
     await asyncio.sleep(10)
     headers = {"User-Agent": "Mozilla/5.0 (AsyncKeepAlive/2.0)", "Accept": "text/plain,*/*"}
 
-    async with httpx.AsyncClient(timeout=10, follow_redirects=True, limits=HTTPX_HIGH_CONCURRENCY_LIMITS) as client:
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True, limits=_make_httpx_limits_from_run_state()) as client:
         while stop_event is None or not stop_event.is_set():
             urls = [render_url]
             if not render_url.endswith("/ping"):
@@ -1776,7 +1780,7 @@ def _parse_multipart_ai_request():
     raw_history = request.form.get("history", "")
     if raw_history:
         try:
-            history = _json.loads(raw_history)
+            history = _json_loads_fast(raw_history)
         except Exception:
             pass
 
@@ -2351,6 +2355,7 @@ def _web_render(title: str, body: str, *, active: str = "dashboard", status_code
     csrf = _web_csrf_token() if session.get("web_admin_ok") else ""
     nav = [
         ("dashboard", "Dashboard", "/admin", "▣"),
+        ("optimize", "Optimize", "/admin/optimize", "⚡"),
         ("analytics", "Analytics V2", "/admin/analytics", "📈"),
         ("users", "Users", "/admin/users", "👥"),
         ("schedules", "Schedules", "/admin/schedules", "⏱"),
@@ -2364,7 +2369,7 @@ def _web_render(title: str, body: str, *, active: str = "dashboard", status_code
         ("locks", "Locks", "/admin/locks", "🔒"),
         ("sql", "SQL", "/admin/sql", "☷"),
     ]
-    bottom_nav = [item for item in nav if item[0] in {"dashboard", "users", "schedules", "broadcast", "control"}]
+    bottom_nav = [item for item in nav if item[0] in {"dashboard", "optimize", "users", "schedules", "broadcast"}]
     template = """
 <!doctype html>
 <html lang="en">
@@ -2490,16 +2495,16 @@ tailwind.config = {
 </head>
 <body>
 <input id="menu-toggle" class="menu-toggle" type="checkbox">
-<div class="mobilebar"><label class="btn ghost" for="menu-toggle">☰ Menu</label><b>Bot Admin V4</b></div>
+<div class="mobilebar"><label class="btn ghost" for="menu-toggle">☰ Menu</label><b>Bot Admin V6</b></div>
 <div class="layout">
 <aside class="side">
   <div class="brand"><span class="brand-mark">🤖</span><span>Bot Admin</span></div>
-  <div class="sub">System V4 · Admin ID: <code>{{ admin_id }}</code></div>
+  <div class="sub">System V6 · Admin ID: <code>{{ admin_id }}</code></div>
   <nav class="nav">{% for key,label,url,ico in nav %}<a class="{{ 'active' if key==active else '' }}" href="{{ url }}"><span class="nav-ico">{{ ico }}</span><span>{{ label }}</span></a>{% endfor %}</nav>
   <div class="footer"><div>Supabase: <b>{{ 'ON' if supabase_on else 'OFF' }}</b></div><div>Redis: <b>{{ 'ON' if redis_on else 'OFF' }}</b></div><div><a href="/ping">Ping</a> · <a href="/admin/logout">Logout</a></div></div>
 </aside>
 <main class="main">
-  <div class="top"><div><div class="h1">{{ title }}</div><div class="muted">Clean Tailwind admin panel · mobile V4 · safe Telegram operations</div></div><div class="top-right"><div data-local-time>{{ now }}</div><div>{{ time_hint }}</div></div></div>
+  <div class="top"><div><div class="h1">{{ title }}</div><div class="muted">Clean admin panel · optimization center · safe Telegram operations</div></div><div class="top-right"><div data-local-time>{{ now }}</div><div>{{ time_hint }}</div></div></div>
   {% for cat,msg in messages %}<div class="flash {{ cat }}">{{ msg }}</div>{% endfor %}
   {{ body|safe }}
 </main>
@@ -2633,7 +2638,7 @@ def _web_counts(force: bool = False) -> dict:
     with _WEB_COUNTS_CACHE_LOCK:
         cached = dict(_WEB_COUNTS_CACHE.get("data") or {})
         age = now - float(_WEB_COUNTS_CACHE.get("ts") or 0.0)
-        if cached and not force and age < WEB_COUNTS_CACHE_TTL_S:
+        if cached and not force and age < _run_state_web_counts_cache_ttl():
             return cached
 
     acquired = _WEB_COUNTS_BUILD_LOCK.acquire(blocking=False)
@@ -2649,7 +2654,7 @@ def _web_counts(force: bool = False) -> dict:
         with _WEB_COUNTS_CACHE_LOCK:
             cached = dict(_WEB_COUNTS_CACHE.get("data") or {})
             age = now - float(_WEB_COUNTS_CACHE.get("ts") or 0.0)
-            if cached and not force and age < WEB_COUNTS_CACHE_TTL_S:
+            if cached and not force and age < _run_state_web_counts_cache_ttl():
                 return cached
 
         counts = {"users": 0, "blocked": 0, "schedules": 0, "pending": 0, "sending": 0, "failed": 0, "api_keys": 0}
@@ -2785,7 +2790,7 @@ def _start_web_broadcast_queue_workers() -> None:
     loop = asyncio.get_running_loop()
     if _WEB_BROADCAST_QUEUE is not None and _WEB_BROADCAST_QUEUE_LOOP is loop:
         return
-    _WEB_BROADCAST_QUEUE = asyncio.Queue(maxsize=WEB_BROADCAST_QUEUE_MAXSIZE)
+    _WEB_BROADCAST_QUEUE = asyncio.Queue(maxsize=_run_state_web_broadcast_queue_maxsize())
     _WEB_BROADCAST_QUEUE_LOOP = loop
     _WEB_BROADCAST_QUEUE_TASKS = [
         asyncio.create_task(_web_broadcast_queue_consumer(i + 1), name=f"web-broadcast-queue-{i + 1}")
@@ -3094,6 +3099,7 @@ def web_admin_home():
       {_web_count_card('pending', 'Pending schedules', counts['pending'], f"{counts['sending']} sending / {counts['failed']} failed", 'warn' if counts['pending'] else '')}
       {_web_count_card('api_keys', 'Active API keys', counts['api_keys'], 'generated admin access keys', 'ok' if counts['api_keys'] else '')}
     </div>
+    {_optimization_score_card_html(_runtime_performance_snapshot(light=True))}
     <div class='grid2'>
       <div class='card'><h2>System health</h2><div class='table-wrap'><table class='table'>
         <tr><td>Uptime</td><td><b data-uptime>{_web_h(_format_uptime())}</b></td></tr>
@@ -3112,7 +3118,7 @@ def web_admin_home():
     </div>
     <div class='grid2'>
       <div class='card'><h2>Feature settings</h2><div class='table-wrap'><table class='table'>{setting_rows}</table></div><p><a class='btn secondary' href='/admin/settings'>Open settings</a></p></div>
-      <div class='card'><h2>Quick actions</h2><p class='muted'>Common admin tasks. Dangerous actions still require confirmation on their pages.</p><div class='actions'><a class='btn' href='/admin/users'>Manage Users</a><a class='btn' href='/admin/analytics'>Analytics V2</a><a class='btn' href='/admin/schedules/calendar'>Calendar</a><a class='btn' href='/admin/schedules'>Schedules</a><a class='btn' href='/admin/broadcast'>Broadcast</a><a class='btn secondary' href='/admin/health'>Health Center</a><a class='btn secondary' href='/admin/control'>Control Center</a><a class='btn secondary' href='/admin/sql'>SQL Setup</a></div></div>
+      <div class='card'><h2>Quick actions</h2><p class='muted'>Common admin tasks. Dangerous actions still require confirmation on their pages.</p><div class='actions'><a class='btn' href='/admin/optimize'>Optimize</a><a class='btn' href='/admin/users'>Manage Users</a><a class='btn' href='/admin/analytics'>Analytics V2</a><a class='btn' href='/admin/schedules/calendar'>Calendar</a><a class='btn' href='/admin/schedules'>Schedules</a><a class='btn' href='/admin/broadcast'>Broadcast</a><a class='btn secondary' href='/admin/health'>Health Center</a><a class='btn secondary' href='/admin/control'>Control Center</a><a class='btn secondary' href='/admin/sql'>SQL Setup</a></div></div>
     </div>
     """
     return _web_render("Dashboard", body, active="dashboard")
@@ -4026,11 +4032,12 @@ def _web_broadcast_worker(job_id: str, admin_id: int, text: str) -> None:
             logger.warning("web broadcast exception uid=%s: %s", uid, exc)
             return "failed"
 
-    workers = max(1, min(WEB_BROADCAST_WORKERS, max(1, len(users))))
-    batch_size = max(1, max(BROADCAST_BATCH_SIZE, workers))
+    workers = max(1, min(WEB_BROADCAST_WORKERS, _run_state_max_concurrent_broadcast(), max(1, len(users))))
+    batch_size = max(1, max(_run_state_broadcast_batch_size(), workers))
+    delay_s = _run_state_broadcast_delay()
     limits = httpx.Limits(
-        max_keepalive_connections=max(HTTP_MAX_KEEPALIVE_CONNECTIONS, workers),
-        max_connections=max(HTTP_MAX_CONNECTIONS, workers * 2),
+        max_keepalive_connections=max(_run_state_http_keepalive_connections(), workers),
+        max_connections=max(_run_state_http_max_connections(), workers * 2),
     )
     try:
         with httpx.Client(timeout=20, limits=limits) as tg_client:
@@ -4070,8 +4077,8 @@ def _web_broadcast_worker(job_id: str, admin_id: int, text: str) -> None:
                         skipped += max(0, total - (start + len(batch)))
                         _web_broadcast_job_set(job_id, status="cancelled", skipped=skipped, sent=sent, failed=failed, blocked=blocked, finished_at=_sched_iso())
                         return
-                    if start + len(batch) < total and WEB_BROADCAST_DELAY_S:
-                        time.sleep(WEB_BROADCAST_DELAY_S)
+                    if start + len(batch) < total and delay_s:
+                        time.sleep(delay_s)
 
         _web_broadcast_job_set(job_id, status="done", control="done", sent=sent, failed=failed, blocked=blocked, skipped=skipped, finished_at=_sched_iso())
     except Exception as exc:
@@ -4301,12 +4308,19 @@ def _runtime_performance_snapshot(light: bool = False) -> dict:
             "active_requests": active_requests,
             "slow_request_threshold_ms": WEB_SLOW_REQUEST_MS,
             "recent_slow_requests": [] if light else list(_WEB_SLOW_REQUESTS)[:20],
-            "counts_cache_ttl_s": WEB_COUNTS_CACHE_TTL_S,
-            "live_poll_s": WEB_LIVE_POLL_SECONDS,
+            "counts_cache_ttl_s": _run_state_web_counts_cache_ttl(),
+            "status_poll_s": _run_state_int("WEB_STATUS_POLL_SECONDS", WEB_STATUS_POLL_SECONDS, minimum=10, maximum=300),
+            "live_poll_s": _run_state_int("WEB_LIVE_POLL_SECONDS", WEB_LIVE_POLL_SECONDS, minimum=15, maximum=300),
         },
         "telegram": {
             "concurrent_updates": TELEGRAM_CONCURRENT_UPDATES,
             "connection_pool_size": TELEGRAM_CONNECTION_POOL_SIZE,
+            "http_max_connections": _run_state_http_max_connections(),
+            "http_keepalive_connections": _run_state_http_keepalive_connections(),
+            "user_rate_limit": _run_state_user_rate_limit(),
+            "user_rate_window_s": _run_state_user_rate_window(),
+            "api_rate_limit": _run_state_api_rate_limit(),
+            "api_rate_window_s": _run_state_api_rate_window(),
             "allowed_updates": ["message", "callback_query"],
         },
         "semaphores": {
@@ -4317,8 +4331,11 @@ def _runtime_performance_snapshot(light: bool = False) -> dict:
         "broadcast": {
             "active_jobs": active_jobs,
             "max_active_jobs": WEB_BROADCAST_MAX_ACTIVE_JOBS,
-            "workers": WEB_BROADCAST_WORKERS,
-            "delay_s": WEB_BROADCAST_DELAY_S,
+            "workers": min(WEB_BROADCAST_WORKERS, _run_state_max_concurrent_broadcast()),
+            "batch_size": _run_state_broadcast_batch_size(),
+            "delay_s": _run_state_broadcast_delay(),
+            "queue_size": _WEB_BROADCAST_QUEUE.qsize() if _WEB_BROADCAST_QUEUE is not None else None,
+            "queue_maxsize": _WEB_BROADCAST_QUEUE.maxsize if _WEB_BROADCAST_QUEUE is not None else _run_state_web_broadcast_queue_maxsize(),
             "recent_jobs": [] if light else list(_WEB_BROADCAST_JOBS.values())[:20],
         },
         "scheduler": {
@@ -4331,6 +4348,20 @@ def _runtime_performance_snapshot(light: bool = False) -> dict:
             "redis": bool(redis_client),
             "supabase_breaker": _breaker_snapshot(globals().get("supabase_breaker")),
             "redis_breaker": _breaker_snapshot(globals().get("redis_breaker")),
+        },
+        "memory": {
+            "rate_limit_keys": len(_RATE_LIMIT_MEMORY),
+            "rate_limit_notice_keys": len(_RATE_LIMIT_NOTICE_MEMORY),
+            "user_locks": len(_user_locks),
+            "prefs_cache": len(_prefs_cache),
+            "history_cache": len(_hist_cache),
+            "text_cache_memory": len(_text_cache_memory),
+            "api_key_cache": len(_api_key_validation_cache),
+        },
+        "executors": {
+            "db": _executor_status("db", globals().get("_DB_EXECUTOR")),
+            "ai": _executor_status("ai", globals().get("_AI_EXECUTOR")),
+            "web_broadcast": _executor_status("web_broadcast", globals().get("_WEB_BROADCAST_EXECUTOR")),
         },
         "cooldowns": {
             "hf_tts_remaining_s": _hf_tts_disabled_remaining_s() if "_hf_tts_disabled_remaining_s" in globals() else 0,
@@ -4389,6 +4420,219 @@ def _run_admin_coro_sync(coro: Any, timeout: float = 20.0) -> Any:
         return future.result(timeout=timeout)
     return asyncio.run(coro)
 
+
+
+def _admin_runtime_update_many_sync(values: dict[str, Any], *, timeout: float = 20.0) -> list[str]:
+    """Persist multiple runtime knobs from sync admin routes."""
+    changed: list[str] = []
+    for key, value in values.items():
+        if key not in globals().get("_RUN_STATE_REDIS_KEYS", ()):  # safe guard for future edits
+            continue
+        current = RUN_STATE.get(key, globals().get(key))
+        coerced = _coerce_run_state_value(key, value)
+        if str(current) == str(coerced):
+            continue
+        _run_admin_coro_sync(_update_run_state(key, coerced), timeout=timeout)
+        changed.append(key)
+    return changed
+
+
+def _optimization_preset_values(name: str) -> dict[str, Any]:
+    """Runtime tuning presets for common Render/Railway sizes."""
+    name = (name or "balanced").strip().lower()
+    if name in {"small", "render_small", "safe"}:
+        return {
+            "HTTP_MAX_CONNECTIONS": 50,
+            "HTTP_MAX_KEEPALIVE_CONNECTIONS": 12,
+            "USER_RATE_LIMIT_PER_SECOND": 2,
+            "USER_RATE_LIMIT_WINDOW_S": 1.0,
+            "API_RATE_LIMIT_PER_SECOND": 12,
+            "API_RATE_LIMIT_WINDOW_S": 1.0,
+            "RATE_LIMIT_REDIS_TTL_S": 30,
+            "CACHE_ASIDE_DEFAULT_TTL_S": 3600,
+            "BROADCAST_BATCH_SIZE": 2,
+            "BROADCAST_INTER_BATCH_DELAY": 0.35,
+            "MAX_CONCURRENT_BROADCAST": 2,
+            "WEB_COUNTS_CACHE_TTL_S": 60.0,
+            "WEB_STATUS_POLL_SECONDS": 45,
+            "WEB_LIVE_POLL_SECONDS": 45,
+        }
+    if name in {"high", "high_throughput", "fast"}:
+        return {
+            "HTTP_MAX_CONNECTIONS": 180,
+            "HTTP_MAX_KEEPALIVE_CONNECTIONS": 50,
+            "USER_RATE_LIMIT_PER_SECOND": 5,
+            "USER_RATE_LIMIT_WINDOW_S": 1.0,
+            "API_RATE_LIMIT_PER_SECOND": 60,
+            "API_RATE_LIMIT_WINDOW_S": 1.0,
+            "RATE_LIMIT_REDIS_TTL_S": 45,
+            "CACHE_ASIDE_DEFAULT_TTL_S": 1800,
+            "BROADCAST_BATCH_SIZE": 8,
+            "BROADCAST_INTER_BATCH_DELAY": 0.08,
+            "MAX_CONCURRENT_BROADCAST": 6,
+            "WEB_COUNTS_CACHE_TTL_S": 20.0,
+            "WEB_STATUS_POLL_SECONDS": 20,
+            "WEB_LIVE_POLL_SECONDS": 20,
+        }
+    # balanced default
+    return {
+        "HTTP_MAX_CONNECTIONS": 100,
+        "HTTP_MAX_KEEPALIVE_CONNECTIONS": 24,
+        "USER_RATE_LIMIT_PER_SECOND": 3,
+        "USER_RATE_LIMIT_WINDOW_S": 1.0,
+        "API_RATE_LIMIT_PER_SECOND": 25,
+        "API_RATE_LIMIT_WINDOW_S": 1.0,
+        "RATE_LIMIT_REDIS_TTL_S": 30,
+        "CACHE_ASIDE_DEFAULT_TTL_S": 3600,
+        "BROADCAST_BATCH_SIZE": 4,
+        "BROADCAST_INTER_BATCH_DELAY": 0.18,
+        "MAX_CONCURRENT_BROADCAST": 3,
+        "WEB_COUNTS_CACHE_TTL_S": 30.0,
+        "WEB_STATUS_POLL_SECONDS": 30,
+        "WEB_LIVE_POLL_SECONDS": 30,
+    }
+
+
+def _optimization_score(snap: dict[str, Any] | None = None) -> tuple[int, list[str], list[str]]:
+    """Return a simple health score plus warnings/recommendations for /admin."""
+    snap = snap or _runtime_performance_snapshot(light=True)
+    score = 100
+    warnings: list[str] = []
+    tips: list[str] = []
+
+    web = snap.get("web", {}) if isinstance(snap, dict) else {}
+    memory = snap.get("memory", {}) if isinstance(snap, dict) else {}
+    broadcast = snap.get("broadcast", {}) if isinstance(snap, dict) else {}
+    stores = snap.get("stores", {}) if isinstance(snap, dict) else {}
+    semaphores = snap.get("semaphores", {}) if isinstance(snap, dict) else {}
+
+    if int(web.get("active_requests") or 0) >= 10:
+        score -= 15
+        warnings.append("High active web requests")
+        tips.append("Increase poll interval or use the Small Render preset during traffic spikes.")
+    if int(memory.get("rate_limit_keys") or 0) > 50_000:
+        score -= 10
+        warnings.append("Large in-memory rate-limit cache")
+        tips.append("Enable Redis or use Trim Runtime Memory from Optimize.")
+    if int(memory.get("rate_limit_notice_keys") or 0) > 20_000:
+        score -= 8
+        warnings.append("Large rate-limit notice cache")
+        tips.append("Trim notices after a flood event to reduce memory pressure.")
+    if not bool(stores.get("redis")):
+        score -= 8
+        warnings.append("Redis is OFF")
+        tips.append("Redis improves cache-aside, runtime config, and rate limiting stability.")
+    if not bool(stores.get("supabase")):
+        score -= 12
+        warnings.append("Supabase is OFF")
+        tips.append("Supabase is required for persistent admin data and user management.")
+    qsize = broadcast.get("queue_size")
+    qmax = broadcast.get("queue_maxsize")
+    try:
+        if qsize is not None and qmax and int(qsize) > int(qmax) * 0.7:
+            score -= 10
+            warnings.append("Broadcast queue is near capacity")
+            tips.append("Pause new broadcasts or increase queue size then restart.")
+    except Exception:
+        pass
+    for name, sem in (semaphores or {}).items():
+        try:
+            configured = int(sem.get("configured") or 0)
+            in_use = int(sem.get("in_use") or 0)
+            if configured and in_use >= configured:
+                score -= 8
+                warnings.append(f"{name.upper()} concurrency is saturated")
+                tips.append(f"Lower incoming load or increase MAX_CONCURRENT_{name.upper()} if CPU/RAM allows.")
+        except Exception:
+            pass
+    if not warnings:
+        tips.append("System looks stable. Keep Balanced preset unless you see queue growth or slow requests.")
+    return max(0, min(100, score)), warnings, tips[:6]
+
+
+def _optimization_score_card_html(snap: dict[str, Any] | None = None) -> str:
+    score, warnings, tips = _optimization_score(snap)
+    kind = "ok" if score >= 85 else ("warn" if score >= 65 else "danger")
+    warning_html = "".join(f"<li>{_web_h(w)}</li>" for w in warnings) or "<li>No critical warnings.</li>"
+    tip_html = "".join(f"<li>{_web_h(t)}</li>" for t in tips)
+    return f"""
+    <div class='card'>
+      <div class='actions' style='justify-content:space-between;align-items:center'>
+        <div><h2>Optimization Score</h2><p class='muted'>Live score from web load, queues, caches, stores, and concurrency.</p></div>
+        {_web_badge(str(score) + '/100', kind)}
+      </div>
+      <div style='height:10px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden;margin:10px 0 12px'>
+        <div style='height:10px;width:{score}%;border-radius:999px;background:linear-gradient(90deg,#38bdf8,#22c55e)'></div>
+      </div>
+      <div class='grid2'>
+        <div><b>Warnings</b><ul class='muted' style='margin:.5rem 0 0 1.1rem'>{warning_html}</ul></div>
+        <div><b>Recommendations</b><ul class='muted' style='margin:.5rem 0 0 1.1rem'>{tip_html}</ul></div>
+      </div>
+    </div>
+    """
+
+
+def _optimization_preset_cards_html(csrf: str) -> str:
+    cards = [
+        ("preset_small", "Small Render", "Lowest DB/HTTP pressure. Best for free/small instances.", "secondary"),
+        ("preset_balanced", "Balanced", "Safe default for normal traffic and admin usage.", "ok"),
+        ("preset_high", "High Throughput", "Faster broadcast/API throughput. Use only when CPU/RAM are healthy.", "warn"),
+    ]
+    out = []
+    for action, label, desc, kind in cards:
+        out.append(
+            f"<div class='card'><h3>{_web_h(label)}</h3><p class='muted'>{_web_h(desc)}</p>"
+            f"<form method='post' data-confirm='Apply {_web_h(label)} runtime preset?'>"
+            f"<input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='action' value='{action}'>"
+            f"<button class='{_web_h(kind)}'>Apply Preset</button></form></div>"
+        )
+    return "<div class='grid'>" + "".join(out) + "</div>"
+
+
+def _runtime_core_rows_html() -> str:
+    keys = [
+        "BOT_MODE", "HTTP_MAX_CONNECTIONS", "HTTP_MAX_KEEPALIVE_CONNECTIONS",
+        "USER_RATE_LIMIT_PER_SECOND", "API_RATE_LIMIT_PER_SECOND",
+        "BROADCAST_BATCH_SIZE", "BROADCAST_INTER_BATCH_DELAY", "MAX_CONCURRENT_BROADCAST",
+        "WEB_COUNTS_CACHE_TTL_S", "WEB_STATUS_POLL_SECONDS", "WEB_LIVE_POLL_SECONDS",
+    ]
+    rows = []
+    for key in keys:
+        rows.append(
+            f"<tr><td><code>{_web_h(key)}</code></td><td><b>{_web_h(_runtime_display_value(key))}</b></td>"
+            f"<td class='muted'>{_web_h(_RUNTIME_CONFIG_SPECS.get(key, {}).get('help', ''))}</td></tr>"
+        )
+    return "".join(rows)
+
+
+def _slow_request_rows_html(limit: int = 12) -> str:
+    rows = []
+    for item in list(_WEB_SLOW_REQUESTS)[:max(1, int(limit or 12))]:
+        rows.append(
+            f"<tr><td>{_web_h(item.get('ts'))}</td><td><code>{_web_h(item.get('method'))}</code></td>"
+            f"<td>{_web_h(item.get('path'))}</td><td>{_web_h(item.get('status'))}</td>"
+            f"<td><b>{_web_h(item.get('elapsed_ms'))} ms</b></td><td>{_web_h(item.get('active'))}</td></tr>"
+        )
+    return "".join(rows) or '<tr><td colspan="6"><div class="empty">No slow requests recorded.</div></td></tr>'
+
+
+def _admin_trim_runtime_memory_sync() -> str:
+    """Safe in-process cleanup for admin Optimize page."""
+    now = time.monotonic()
+    removed = 0
+    stale_notice_before = now - max(USER_RATE_LIMIT_NOTICE_COOLDOWN_S * 4, 300.0)
+    for key, old_ts in list(_RATE_LIMIT_NOTICE_MEMORY.items()):
+        if old_ts < stale_notice_before:
+            _RATE_LIMIT_NOTICE_MEMORY.pop(key, None)
+            removed += 1
+    # Do not clear active rate buckets blindly; keep recent buckets and remove empty/stale ones.
+    wall_now = time.time()
+    stale_bucket_before = wall_now - max(_run_state_user_rate_window() * 4, 120.0)
+    for key, dq in list(_RATE_LIMIT_MEMORY.items()):
+        if not dq or (dq and dq[-1] < stale_bucket_before):
+            _RATE_LIMIT_MEMORY.pop(key, None)
+            removed += 1
+    return f"Removed {removed} stale in-memory limiter entries."
 
 def _runtime_display_value(key: str) -> str:
     value = RUN_STATE.get(key, globals().get(key, ""))
@@ -4499,7 +4743,7 @@ def web_admin_runtime_config():
       <div class='grid'>
         {_web_status_card('Current mode', _run_state_bot_mode(), 'runtime state', 'ok' if _run_state_bot_mode() == 'POLLING' else 'info')}
         {_web_status_card('Webhook ready', 'YES' if webhook_ready else 'NO', 'base URL + secret', 'ok' if webhook_ready else 'warn')}
-        {_web_status_card('User rate limit', f"{_run_state_user_rate_limit()} req/{USER_RATE_LIMIT_WINDOW_S:g}s", 'live anti-flood', 'ok')}
+        {_web_status_card('User rate limit', f"{_run_state_user_rate_limit()} req/{_run_state_user_rate_window():g}s", 'live anti-flood', 'ok')}
         {_web_status_card('HTTP pool', f"{_run_state_http_max_connections()}/{_run_state_http_keepalive_connections()}", 'max/keepalive', 'ok')}
       </div>
     </div>
@@ -4520,6 +4764,89 @@ def web_admin_runtime_config():
     <div class='card'><h2>Minimal env after using this page</h2><pre>{_web_h(minimal_env_text)}</pre></div>
     """
     return _web_render("Runtime Config", body, active="runtime")
+
+
+@app_flask.route("/admin/optimize", methods=["GET", "POST"])
+@web_admin_required
+def web_admin_optimize():
+    """One-screen admin optimization center for performance presets and cleanup."""
+    csrf = _web_csrf_token()
+    admin_id = _web_current_admin_id()
+    if request.method == "POST":
+        _web_check_csrf()
+        action = str(request.form.get("action") or "").strip().lower()
+        ok = True
+        msg = "Done."
+        try:
+            if action in {"preset_small", "preset_balanced", "preset_high"}:
+                preset = action.replace("preset_", "")
+                changed = _admin_runtime_update_many_sync(_optimization_preset_values(preset), timeout=12.0)
+                _web_counts_invalidate()
+                msg = f"Applied {preset} optimization preset. Updated: {', '.join(changed) if changed else 'no changes needed'}."
+            elif action == "clear_dashboard_caches":
+                _web_counts_invalidate()
+                _api_key_cache_clear()
+                with _blocked_cache_lock:
+                    _blocked_user_cache.clear()
+                _bot_settings_cache["ts"] = 0.0
+                msg = "Dashboard, settings, API key, and blocked-user caches cleared."
+            elif action == "trim_runtime_memory":
+                msg = _admin_trim_runtime_memory_sync()
+                gc.collect()
+            elif action == "slow_admin_polling":
+                changed = _admin_runtime_update_many_sync({
+                    "WEB_STATUS_POLL_SECONDS": 60,
+                    "WEB_LIVE_POLL_SECONDS": 60,
+                    "WEB_COUNTS_CACHE_TTL_S": 90.0,
+                }, timeout=10.0)
+                msg = f"Admin polling slowed to reduce DB/API pressure. Updated: {', '.join(changed) if changed else 'no changes needed'}."
+            elif action == "normal_admin_polling":
+                changed = _admin_runtime_update_many_sync({
+                    "WEB_STATUS_POLL_SECONDS": 30,
+                    "WEB_LIVE_POLL_SECONDS": 30,
+                    "WEB_COUNTS_CACHE_TTL_S": 30.0,
+                }, timeout=10.0)
+                msg = f"Admin polling restored to balanced settings. Updated: {', '.join(changed) if changed else 'no changes needed'}."
+            elif action == "purge_temp":
+                with suppress(Exception):
+                    _sweep_stale_temps()
+                gc.collect()
+                msg = "Temp files swept and garbage collection completed."
+            else:
+                ok, msg = False, "Unknown optimization action."
+        except Exception as exc:
+            ok, msg = False, str(exc)[:500]
+        _web_admin_audit(f"optimize:{action}", msg)
+        flask_flash(("OK: " if ok else "ERROR: ") + msg, "success" if ok else "error")
+        return redirect(url_for("web_admin_optimize"))
+
+    snap = _runtime_performance_snapshot(light=False)
+    quick_actions = [
+        ("clear_dashboard_caches", "Clear dashboard caches", "Refresh counts, settings, API-key, and blocked-user caches.", "secondary"),
+        ("trim_runtime_memory", "Trim runtime memory", "Remove stale in-memory limiter/notice entries and run GC.", "secondary"),
+        ("slow_admin_polling", "Reduce admin polling", "Use 60s live polling and longer count cache TTL to reduce Supabase/API pressure.", "warn"),
+        ("normal_admin_polling", "Restore normal polling", "Return dashboard live refresh to balanced 30s settings.", "ok"),
+        ("purge_temp", "Purge temp files", "Run temp sweeper and garbage collector now.", "secondary"),
+    ]
+    quick_rows = "".join(
+        f"<tr><td><b>{_web_h(label)}</b><br><span class='muted'>{_web_h(desc)}</span></td>"
+        f"<td><form method='post' data-confirm='Run optimization action: {_web_h(label)}?'>"
+        f"<input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='action' value='{_web_h(action)}'>"
+        f"<button class='{_web_h(kind)}'>{_web_h(label)}</button></form></td></tr>"
+        for action, label, desc, kind in quick_actions
+    )
+    body = f"""
+    <div data-live-status></div>
+    {_optimization_score_card_html(snap)}
+    {_optimization_preset_cards_html(csrf)}
+    <div class='grid2'>
+      <div class='card'><h2>Optimization Actions</h2><p class='muted'>Safe cleanup and admin-poll tuning without restarting the bot.</p><div class='table-wrap'><table class='table'><thead><tr><th>Action</th><th>Run</th></tr></thead><tbody>{quick_rows}</tbody></table></div></div>
+      <div class='card'><h2>Current Runtime Core</h2><div class='table-wrap'><table class='table'><thead><tr><th>Key</th><th>Value</th><th>Note</th></tr></thead><tbody>{_runtime_core_rows_html()}</tbody></table></div><p><a class='btn secondary' href='/admin/runtime'>Advanced runtime config</a> <a class='btn secondary' href='/admin/performance.json'>JSON snapshot</a></p></div>
+    </div>
+    <div class='card'><h2>Recent Slow Requests</h2><p class='muted'>Useful for finding heavy admin pages or browser polling storms.</p><div class='table-wrap'><table class='table'><thead><tr><th>Time</th><th>Method</th><th>Path</th><th>Status</th><th>Latency</th><th>Active</th></tr></thead><tbody>{_slow_request_rows_html()}</tbody></table></div></div>
+    <div class='card'><h2>Full Performance Snapshot</h2><pre>{_web_h(_json.dumps(snap, ensure_ascii=False, indent=2, default=str))}</pre></div>
+    """
+    return _web_render("Optimize", body, active="optimize")
 
 @app_flask.route("/admin/control")
 @web_admin_required
@@ -4938,6 +5265,72 @@ def _run_state_user_rate_limit() -> int:
         return max(1, int(USER_RATE_LIMIT_PER_SECOND or 3))
 
 
+def _run_state_float(key: str, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
+    """Read a float from RUN_STATE with bounds for hot-path runtime tuning."""
+    try:
+        value = float(RUN_STATE.get(key, default))
+    except Exception:
+        value = float(default)
+    if minimum is not None:
+        value = max(float(minimum), value)
+    if maximum is not None:
+        value = min(float(maximum), value)
+    return value
+
+
+def _run_state_int(key: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
+    """Read an int from RUN_STATE with bounds for hot-path runtime tuning."""
+    try:
+        value = int(RUN_STATE.get(key, default))
+    except Exception:
+        value = int(default)
+    if minimum is not None:
+        value = max(int(minimum), value)
+    if maximum is not None:
+        value = min(int(maximum), value)
+    return value
+
+
+def _run_state_user_rate_window() -> float:
+    return _run_state_float("USER_RATE_LIMIT_WINDOW_S", USER_RATE_LIMIT_WINDOW_S, minimum=0.25, maximum=60.0)
+
+
+def _run_state_api_rate_limit() -> int:
+    return _run_state_int("API_RATE_LIMIT_PER_SECOND", API_RATE_LIMIT_PER_SECOND, minimum=1, maximum=1000)
+
+
+def _run_state_api_rate_window() -> float:
+    return _run_state_float("API_RATE_LIMIT_WINDOW_S", API_RATE_LIMIT_WINDOW_S, minimum=0.25, maximum=60.0)
+
+
+def _run_state_rate_limit_redis_ttl() -> int:
+    return _run_state_int("RATE_LIMIT_REDIS_TTL_S", RATE_LIMIT_REDIS_TTL_S, minimum=2, maximum=3600)
+
+
+def _run_state_cache_ttl() -> int:
+    return _run_state_int("CACHE_ASIDE_DEFAULT_TTL_S", CACHE_ASIDE_DEFAULT_TTL_S, minimum=30, maximum=86400)
+
+
+def _run_state_web_broadcast_queue_maxsize() -> int:
+    return _run_state_int("WEB_BROADCAST_QUEUE_MAXSIZE", WEB_BROADCAST_QUEUE_MAXSIZE, minimum=10, maximum=10000)
+
+
+def _run_state_broadcast_batch_size() -> int:
+    return _run_state_int("BROADCAST_BATCH_SIZE", BROADCAST_BATCH_SIZE, minimum=1, maximum=500)
+
+
+def _run_state_broadcast_delay() -> float:
+    return _run_state_float("BROADCAST_INTER_BATCH_DELAY", BROADCAST_INTER_BATCH_DELAY, minimum=0.0, maximum=30.0)
+
+
+def _run_state_max_concurrent_broadcast() -> int:
+    return _run_state_int("MAX_CONCURRENT_BROADCAST", MAX_CONCURRENT_BROADCAST, minimum=1, maximum=50)
+
+
+def _run_state_web_counts_cache_ttl() -> float:
+    return _run_state_float("WEB_COUNTS_CACHE_TTL_S", WEB_COUNTS_CACHE_TTL_S, minimum=5.0, maximum=600.0)
+
+
 def _run_state_http_max_connections() -> int:
     try:
         return max(10, int(RUN_STATE.get("HTTP_MAX_CONNECTIONS", HTTP_MAX_CONNECTIONS)))
@@ -5154,7 +5547,7 @@ def _runtime_admin_text() -> str:
         f"• Bot Mode: <b>{html.escape(mode)}</b>\n"
         f"• Polling Active: <b>{html.escape(polling_status)}</b>\n"
         f"• Webhook Config Ready: <b>{html.escape(webhook_ready)}</b>\n"
-        f"• User Rate Limit: <b>{rate_limit} req/{USER_RATE_LIMIT_WINDOW_S:g}s</b>\n"
+        f"• User Rate Limit: <b>{rate_limit} req/{_run_state_user_rate_window():g}s</b>\n"
         f"• HTTP Max Connections: <b>{http_conn}</b>\n\n"
         "ជ្រើសរើសសកម្មភាពខាងក្រោម ដើម្បីកែប្រែ Runtime ដោយមិនបាច់ Restart។"
     )
@@ -5383,7 +5776,7 @@ async def _runtime_admin_callback(update: Any, context: Any) -> None:
             await query.answer("Send a number", show_alert=False)
         await safe_send(lambda: query.message.edit_text(
             "⚡ <b>កែប្រែ Rate Limit</b>\n\n"
-            f"តម្លៃបច្ចុប្បន្ន: <b>{_run_state_user_rate_limit()} req/{USER_RATE_LIMIT_WINDOW_S:g}s</b>\n\n"
+            f"តម្លៃបច្ចុប្បន្ន: <b>{_run_state_user_rate_limit()} req/{_run_state_user_rate_window():g}s</b>\n\n"
             "សូមផ្ញើលេខគត់ថ្មី ឧទាហរណ៍ <code>3</code> ឬ <code>5</code>។\n"
             "បើចង់កែ HTTP pool សូមផ្ញើ <code>http 120</code>។",
             parse_mode="HTML",
@@ -5514,7 +5907,7 @@ async def _handle_runtime_admin_text(update: Any, context: Any) -> bool:
         ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
     _runtime_admin_log_state("update_rate_limit", user.id, extra=f"new_limit={value}")
     await safe_send(lambda: msg.reply_text(
-        _runtime_admin_text() + f"\n\n✅ Rate Limit ត្រូវបានកែទៅ <b>{value}</b> req/{USER_RATE_LIMIT_WINDOW_S:g}s។",
+        _runtime_admin_text() + f"\n\n✅ Rate Limit ត្រូវបានកែទៅ <b>{value}</b> req/{_run_state_user_rate_window():g}s។",
         parse_mode="HTML",
         reply_markup=_refresh_runtime_admin_markup(),
         disable_web_page_preview=True,
@@ -5688,6 +6081,44 @@ _DB_EXECUTOR = ThreadPoolExecutor(
 _AI_EXECUTOR = ThreadPoolExecutor(
     max_workers=max(2, MAX_CONCURRENT_AI), thread_name_prefix="ai"
 )
+
+
+def _shutdown_thread_executors() -> None:
+    """Stop long-lived thread pools cleanly on deploy restarts/shutdown."""
+    for name in ("_WEB_BROADCAST_EXECUTOR", "_DB_EXECUTOR", "_AI_EXECUTOR"):
+        executor = globals().get(name)
+        if executor is None:
+            continue
+        with suppress(Exception):
+            executor.shutdown(wait=False, cancel_futures=True)
+
+
+atexit.register(_shutdown_thread_executors)
+
+
+def _executor_status(name: str, executor: Any) -> dict[str, Any]:
+    """Return lightweight ThreadPoolExecutor status without touching private state unsafely."""
+    if executor is None:
+        return {"configured": False}
+    queue_size = None
+    try:
+        queue_size = executor._work_queue.qsize()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    threads = None
+    try:
+        threads = len(executor._threads)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    max_workers = getattr(executor, "_max_workers", None)
+    return {
+        "configured": True,
+        "name": name,
+        "max_workers": max_workers,
+        "threads": threads,
+        "queued": queue_size,
+    }
+
 
 _AI_SEMAPHORE:         asyncio.Semaphore | None = None
 _BROADCAST_SEMAPHORE:  asyncio.Semaphore | None = None
@@ -6076,7 +6507,7 @@ async def _redis_cache_get_many_json(keys: list[str]) -> dict[str, Any]:
 async def _redis_cache_set_many_json(items: dict[str, Any], ttl: int) -> bool:
     if redis_client is None or not items:
         return False
-    ttl_i = max(1, int(ttl or CACHE_ASIDE_DEFAULT_TTL_S))
+    ttl_i = max(1, int(ttl or _run_state_cache_ttl()))
     encoded = {str(k): _json_dumps_fast(v) for k, v in items.items()}
 
     def _run():
@@ -6109,7 +6540,7 @@ async def _rate_limit_check(key: str, limit: int, window_s: float) -> tuple[bool
             pipe.zremrangebyscore(redis_key, 0, cutoff)
             pipe.zcard(redis_key)
             pipe.zadd(redis_key, {member: now})
-            pipe.expire(redis_key, max(RATE_LIMIT_REDIS_TTL_S, int(window) + 2))
+            pipe.expire(redis_key, max(_run_state_rate_limit_redis_ttl(), int(window) + 2))
             results = pipe.execute()
             return int(results[1] or 0)
 
@@ -6153,7 +6584,7 @@ async def _telegram_rate_limit_guard(update: Any, context: Any) -> None:
     if not isinstance(update, Update):
         return
     key = _update_rate_limit_key(update)
-    allowed, _remaining = await _rate_limit_check(key, _run_state_user_rate_limit(), USER_RATE_LIMIT_WINDOW_S)
+    allowed, _remaining = await _rate_limit_check(key, _run_state_user_rate_limit(), _run_state_user_rate_window())
     if allowed:
         return
     _metric_inc("rate_limited")
@@ -6161,6 +6592,11 @@ async def _telegram_rate_limit_guard(update: Any, context: Any) -> None:
     last = _RATE_LIMIT_NOTICE_MEMORY.get(key, 0.0)
     if now - last >= USER_RATE_LIMIT_NOTICE_COOLDOWN_S:
         _RATE_LIMIT_NOTICE_MEMORY[key] = now
+        if len(_RATE_LIMIT_NOTICE_MEMORY) > 50_000:
+            stale_before = now - max(USER_RATE_LIMIT_NOTICE_COOLDOWN_S * 4, 300.0)
+            for old_key, old_ts in list(_RATE_LIMIT_NOTICE_MEMORY.items())[:5000]:
+                if old_ts < stale_before:
+                    _RATE_LIMIT_NOTICE_MEMORY.pop(old_key, None)
         msg = getattr(update, "effective_message", None)
         if msg is not None:
             with suppress(Exception):
@@ -6176,7 +6612,7 @@ async def _api_rate_limit_allowed(req: FastAPIRequest) -> bool:
     if auth.lower().startswith("bearer "):
         auth = auth[7:].strip()
     identity = hashlib.sha256(auth.encode("utf-8")).hexdigest()[:24] if auth else host
-    allowed, _remaining = await _rate_limit_check(f"api:{req.url.path}:{identity}", API_RATE_LIMIT_PER_SECOND, API_RATE_LIMIT_WINDOW_S)
+    allowed, _remaining = await _rate_limit_check(f"api:{req.url.path}:{identity}", _run_state_api_rate_limit(), _run_state_api_rate_window())
     return allowed
 
 
@@ -7331,12 +7767,27 @@ def _paginate_html(text: str, limit: int = TELE_MSG_LIMIT, header: str = "") -> 
 # Temp file helpers
 # ---------------------------------------------------------------------------
 _TMP_PREFIX = "tgbot_"
+_TEMP_DIR_CACHE: str | None = None
+_TEMP_DIR_CACHE_LOCK = threading.Lock()
 
 
 def _get_temp_dir() -> str:
-    temp_dir = os.environ.get("BOT_TMP_DIR") or tempfile.gettempdir()
-    os.makedirs(temp_dir, exist_ok=True)
-    return temp_dir
+    """Return the bot temp directory, creating it once per process.
+
+    The old implementation called os.makedirs on every temp-file creation.
+    That is safe, but it becomes noisy on high-volume TTS/media workloads.
+    """
+    global _TEMP_DIR_CACHE
+    configured = os.environ.get("BOT_TMP_DIR") or tempfile.gettempdir()
+    temp_dir = os.path.abspath(configured)
+    cached = _TEMP_DIR_CACHE
+    if cached == temp_dir:
+        return cached
+    with _TEMP_DIR_CACHE_LOCK:
+        if _TEMP_DIR_CACHE != temp_dir:
+            os.makedirs(temp_dir, exist_ok=True)
+            _TEMP_DIR_CACHE = temp_dir
+        return _TEMP_DIR_CACHE
 
 
 def _make_temp_file(suffix: str) -> str:
@@ -7364,23 +7815,40 @@ def _cleanup(*paths) -> None:
 
 
 _STALE_TEMP_AGE_S = 7200
+_STALE_TEMP_EXTENSIONS = frozenset({
+    ".ogg", ".jpg", ".jpeg", ".png", ".webp",
+    ".mp3", ".wav", ".mp4", ".m4a", ".flac", ".aac", ".opus", ".webm",
+})
 
 
 def _sweep_stale_temps() -> None:
+    """Delete old bot temp files using one directory scan.
+
+    This replaces one glob pass per extension with os.scandir(), reducing
+    filesystem work when the temp directory contains many files.
+    """
     temp_dir = _get_temp_dir()
-    extensions = [
-        ".ogg", ".jpg", ".jpeg", ".png", ".webp",
-        ".mp3", ".wav", ".mp4", ".m4a", ".flac", ".aac", ".opus", ".webm",
-    ]
     now = time.time()
-    for ext in extensions:
-        for file_path in glob.glob(os.path.join(temp_dir, f"{_TMP_PREFIX}*{ext}")):
-            try:
-                if now - os.path.getmtime(file_path) > _STALE_TEMP_AGE_S:
-                    os.remove(file_path)
-                    logger.info(f"Swept stale temp file: {file_path}")
-            except OSError:
-                pass
+    try:
+        entries = list(os.scandir(temp_dir))
+    except OSError as exc:
+        logger.warning("Temp sweep could not scan %s: %s", temp_dir, exc)
+        return
+
+    for entry in entries:
+        try:
+            if not entry.is_file():
+                continue
+            name = entry.name
+            if not name.startswith(_TMP_PREFIX):
+                continue
+            if os.path.splitext(name.lower())[1] not in _STALE_TEMP_EXTENSIONS:
+                continue
+            if now - entry.stat().st_mtime > _STALE_TEMP_AGE_S:
+                os.remove(entry.path)
+                logger.info("Swept stale temp file: %s", entry.path)
+        except OSError:
+            pass
 
 
 async def _periodic_temp_sweep(stop_event: asyncio.Event) -> None:
@@ -7392,7 +7860,7 @@ async def _periodic_temp_sweep(stop_event: asyncio.Event) -> None:
         except asyncio.TimeoutError:
             pass
         if not stop_event.is_set():
-            _sweep_stale_temps()
+            await asyncio.to_thread(_sweep_stale_temps)
 
 
 # ---------------------------------------------------------------------------
@@ -11092,7 +11560,7 @@ def _broadcast_preview_summary(payload: dict, estimate: dict[str, int]) -> str:
         f"Registered users: <b>{int(estimate.get('registered') or 0)}</b>\n"
         f"Active target: <b>{int(estimate.get('active') or 0)}</b>\n"
         f"Skipped blocked/unreachable: <b>{int(estimate.get('blocked') or 0)}</b>\n"
-        f"Batch size: <b>{BROADCAST_BATCH_SIZE}</b> · Delay: <b>{BROADCAST_INTER_BATCH_DELAY:g}s</b>\n\n"
+        f"Batch size: <b>{_run_state_broadcast_batch_size()}</b> · Delay: <b>{_run_state_broadcast_delay():g}s</b>\n\n"
         "Confirm only after checking the preview. Blocked/unreachable users are skipped automatically."
     )
 
@@ -11354,13 +11822,13 @@ async def _run_broadcast_to_all(
         return (0, 0, 0)
 
     loop = asyncio.get_running_loop()
-    raw_user_ids = await loop.run_in_executor(None, get_all_user_ids)
+    raw_user_ids = await loop.run_in_executor(_DB_EXECUTOR, get_all_user_ids)
 
     # Do not keep retrying users already known as unreachable/blocked.
     # This prevents scheduled broadcasts from repeatedly logging "Chat not found"
     # for the same invalid Telegram IDs.
     existing_blocked_ids = await loop.run_in_executor(
-        None, functools.partial(_web_blocked_ids_for_users, raw_user_ids)
+        _DB_EXECUTOR, functools.partial(_web_blocked_ids_for_users, raw_user_ids)
     )
     user_ids = [int(uid) for uid in raw_user_ids if int(uid) not in existing_blocked_ids]
     total_registered = len(raw_user_ids)
@@ -11463,7 +11931,7 @@ async def _run_broadcast_to_all(
                     await asyncio.sleep(0.5 * (attempt + 1))
         return "failed"
 
-    batch_size = max(1, BROADCAST_BATCH_SIZE)
+    batch_size = max(1, _run_state_broadcast_batch_size())
     for start in range(0, total, batch_size):
         batch = user_ids[start:start + batch_size]
         results = await asyncio.gather(
@@ -11492,7 +11960,7 @@ async def _run_broadcast_to_all(
                 )
 
         if completed < total:
-            await asyncio.sleep(max(0.0, BROADCAST_INTER_BATCH_DELAY))
+            await asyncio.sleep(max(0.0, _run_state_broadcast_delay()))
 
     report = (
         f"✅ <b>{html.escape(label)}</b> រួចរាល់!\n\n"
@@ -11610,8 +12078,12 @@ async def _admin_home_text(admin_id: int, title: str = "🛠️ Admin Dashboard 
     try:
         temp_dir = _get_temp_dir()
         temp_ok = os.path.isdir(temp_dir) and os.access(temp_dir, os.W_OK)
-        temp_files = glob.glob(os.path.join(temp_dir, f"{_TMP_PREFIX}*"))
-        temp_info = f"{len(temp_files)} files"
+        temp_count = sum(
+            1
+            for entry in os.scandir(temp_dir)
+            if entry.name.startswith(_TMP_PREFIX)
+        )
+        temp_info = f"{temp_count} files"
     except Exception:
         temp_info = "unknown"
 
@@ -12050,7 +12522,7 @@ async def _admin_start_broadcast_from_button(query, context: ContextTypes.DEFAUL
         f"Registered users: <b>{int(estimate.get('registered') or 0)}</b>\n"
         f"Active target: <b>{int(estimate.get('active') or 0)}</b>\n"
         f"Skipped blocked/unreachable: <b>{int(estimate.get('blocked') or 0)}</b>\n"
-        f"Batch size: <b>{BROADCAST_BATCH_SIZE}</b> · Delay: <b>{BROADCAST_INTER_BATCH_DELAY:g}s</b>\n\n"
+        f"Batch size: <b>{_run_state_broadcast_batch_size()}</b> · Delay: <b>{_run_state_broadcast_delay():g}s</b>\n\n"
         "Protection: preview confirmation, blocked-user skip, bounded concurrency, RetryAfter handling, and auto-block for unreachable chats.\n\n"
         "Press Cancel or type /cancel to stop.",
         parse_mode="HTML",
@@ -14156,8 +14628,8 @@ async def _cb_api_dashboard(query, user_id: int, context: ContextTypes.DEFAULT_T
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loop   = asyncio.get_running_loop()
     user_ids, pending_scheds = await asyncio.gather(
-        loop.run_in_executor(None, get_all_user_ids),
-        loop.run_in_executor(None, db_sched_fetch_admin_pending, update.effective_user.id),
+        loop.run_in_executor(_DB_EXECUTOR, get_all_user_ids),
+        loop.run_in_executor(_DB_EXECUTOR, db_sched_fetch_admin_pending, update.effective_user.id),
     )
     await safe_send(lambda: update.message.reply_text(
         f"📊 <b>Bot Statistics</b>\n\n"
