@@ -2773,8 +2773,12 @@ async def _web_broadcast_queue_consumer(worker_id: int) -> None:
         try:
             if item is _WEB_BROADCAST_QUEUE_STOP:
                 return
-            job_id, admin_id, text = item
-            await asyncio.to_thread(_web_broadcast_worker, job_id, admin_id, text)
+            if len(item) == 4:
+                job_id, admin_id, text, parse_mode = item
+            else:
+                job_id, admin_id, text = item
+                parse_mode = _BROADCAST_PARSE_MODE_AUTO
+            await asyncio.to_thread(_web_broadcast_worker, job_id, admin_id, text, parse_mode)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -2812,9 +2816,19 @@ async def _stop_web_broadcast_queue_workers() -> None:
     _WEB_BROADCAST_QUEUE_TASKS = []
 
 
-def _submit_web_broadcast_job(job_id: str, admin_id: int, text: str) -> None:
+def _submit_web_broadcast_job(
+    job_id: str,
+    admin_id: int,
+    text: str,
+    parse_mode: str | None = "auto",
+) -> None:
     """Submit a web broadcast without blocking the FastAPI/admin request path."""
-    item = (str(job_id), int(admin_id or 0), str(text or ""))
+    item = (
+        str(job_id),
+        int(admin_id or 0),
+        str(text or ""),
+        _broadcast_normalize_parse_mode(parse_mode),
+    )
     queue = _WEB_BROADCAST_QUEUE
     loop = _WEB_BROADCAST_QUEUE_LOOP
     if queue is not None and loop is not None and loop.is_running():
@@ -2827,7 +2841,13 @@ def _submit_web_broadcast_job(job_id: str, admin_id: int, text: str) -> None:
         return
 
     # Safe fallback for early startup/tests: keep old executor behavior.
-    future = _WEB_BROADCAST_EXECUTOR.submit(_web_broadcast_worker, job_id, admin_id, text)
+    future = _WEB_BROADCAST_EXECUTOR.submit(
+        _web_broadcast_worker,
+        job_id,
+        admin_id,
+        text,
+        _broadcast_normalize_parse_mode(parse_mode),
+    )
     future.add_done_callback(_log_future_exception)
 
 
@@ -2850,8 +2870,9 @@ def _web_broadcast_job_rows_html(csrf: str | None = None, *, include_actions: bo
             else:
                 controls += f"<form class='inline-form' method='post' action='/admin/broadcast/action'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='job_id' value='{_web_h(jid)}'><input type='hidden' name='action' value='pause'><button class='warn'>Pause</button></form>"
             controls += f"<form class='inline-form' method='post' action='/admin/broadcast/action' data-confirm='Cancel this running broadcast job?'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='job_id' value='{_web_h(jid)}'><input type='hidden' name='action' value='cancel'><button class='danger'>Cancel</button></form>"
+        mode_label = _broadcast_parse_mode_label(row.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO)
         rows.append(
-            f"<tr><td><code>{_web_h(jid)}</code><br><span class='muted'>{_web_h(row.get('error') or row.get('note') or '')}</span></td>"
+            f"<tr><td><code>{_web_h(jid)}</code><br><span class='muted'>{_web_h(row.get('error') or row.get('note') or '')}</span><br>{_web_badge(mode_label, 'info')}</td>"
             f"<td>{_web_status_badge(status)}</td>"
             f"<td><span class='nowrap'>{sent}/{total}</span><br>{_web_progress_bar(processed, total)}</td>"
             f"<td>{blocked}</td><td>{failed}</td>"
@@ -2867,6 +2888,9 @@ def _web_schedule_rows_html(rows: list[dict], csrf: str | None = None, return_in
     for row in rows:
         rid = _web_int(row.get("id"), 0)
         content = row.get("caption") or row.get("plain_text") or ""
+        preview_content, preview_mode = _broadcast_strip_format_directive(content, _BROADCAST_PARSE_MODE_AUTO)
+        preview_mode_label = _broadcast_parse_mode_label(preview_mode)
+        edit_parse_options = _broadcast_parse_mode_select_html("parse_mode", preview_mode)
         can_edit, edit_reason = _sched_can_edit(row, _web_current_admin_id())
         is_pending = str(row.get("status") or "").lower() == SCHED_STATUS_PENDING
         confirm_btn = ""
@@ -2882,8 +2906,8 @@ def _web_schedule_rows_html(rows: list[dict], csrf: str | None = None, return_in
             edit_block = f"""
             <details><summary>Edit schedule</summary>
               <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_time'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>Phnom Penh time</label><input type='datetime-local' name='broadcast_at' value='{_web_h(_web_dt_input_value(row.get('broadcast_at')))}' required><div class='help'>Local {APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL}); stored as UTC automatically.</div></div><button>Save Time</button></form>
-              <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_text'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>{'Caption' if row.get('photo_file_id') else 'Text message'}</label><textarea name='text' required>{_web_h(content)}</textarea></div><button>Save Text</button></form>
-              <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_photo'><input type='hidden' name='row_id' value='{rid}'><div class='row'><div class='field'><label>Photo file ID</label><input name='photo_file_id' value='{_web_h(row.get('photo_file_id') or '')}' required></div><div class='field'><label>Caption</label><input name='caption' value='{_web_h(row.get('caption') or '')}' maxlength='1024'></div></div><button class='secondary'>Save / Replace Photo</button></form>
+              <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_text'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>Format mode</label><select name='parse_mode'>{edit_parse_options}</select></div><div class='field'><label>{'Caption' if row.get('photo_file_id') else 'Text message'}</label><textarea name='text' required>{_web_h(preview_content)}</textarea></div><button>Save Text</button></form>
+              <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_photo'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>Format mode</label><select name='parse_mode'>{edit_parse_options}</select></div><div class='row'><div class='field'><label>Photo file ID</label><input name='photo_file_id' value='{_web_h(row.get('photo_file_id') or '')}' required></div><div class='field'><label>Caption</label><input name='caption' value='{_web_h(_broadcast_strip_format_directive(row.get('caption') or '', preview_mode)[0])}' maxlength='1024'></div></div><button class='secondary'>Save / Replace Photo</button></form>
               <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='duplicate'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>Duplicate to Phnom Penh time</label><input type='datetime-local' name='broadcast_at' value='{duplicate_at}' required><div class='help'>Creates a preview copy so you can confirm it after checking.</div></div><button class='secondary'>Duplicate Preview</button></form>
             </details>
             """
@@ -2893,7 +2917,7 @@ def _web_schedule_rows_html(rows: list[dict], csrf: str | None = None, return_in
             f"<tr><td><code>#{rid}</code><br><span class='muted'>admin {_web_h(row.get('admin_id'))}</span></td>"
             f"<td>{_web_status_badge(row.get('status'), row)}<br><span class='muted'>{_web_h(row.get('error_msg') or '')}</span></td>"
             f"<td>{_web_h(_web_dt(row.get('broadcast_at')))}</td>"
-            f"<td>{_web_h(_web_short(content, 180))}<br>{_web_badge('photo' if row.get('photo_file_id') else 'text', 'info' if row.get('photo_file_id') else 'muted')}</td>"
+            f"<td>{_web_h(_web_short(preview_content, 180))}<br>{_web_badge('photo' if row.get('photo_file_id') else 'text', 'info' if row.get('photo_file_id') else 'muted')} {_web_badge(preview_mode_label, 'info')}</td>"
             f"<td><div class='actions'>{confirm_btn}{cancel_btn}{duplicate_btn}</div>{edit_block}</td></tr>"
         )
     return "".join(table_rows) or '<tr><td colspan=5><div class="empty">No schedules found.</div></td></tr>'
@@ -3522,14 +3546,22 @@ def _web_send_telegram_message(
     *,
     admin_id: int | None = None,
     client: httpx.Client | None = None,
+    parse_mode: str | None = "plain",
 ) -> tuple[bool, str]:
     if not TELEGRAM_BOT_TOKEN:
         return False, "TELEGRAM_BOT_TOKEN missing."
-    text = (text or "").strip()
-    if not text:
+
+    try:
+        prepared_text, prepared_mode = _broadcast_prepare_text(
+            text,
+            parse_mode,
+            max_chars=TELE_MSG_LIMIT,
+        )
+    except ValueError as exc:
+        return False, str(exc)
+
+    if not prepared_text:
         return False, "Message is empty."
-    if len(text) > TELE_MSG_LIMIT:
-        return False, f"Message too long. Max {TELE_MSG_LIMIT}."
 
     created_client = False
     tg_client = client
@@ -3538,23 +3570,46 @@ def _web_send_telegram_message(
             tg_client = httpx.Client(timeout=20)
             created_client = True
 
-        resp = tg_client.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": int(chat_id), "text": text, "disable_web_page_preview": True},
-            timeout=20,
-        )
-        if resp.status_code == 403:
-            blocker_admin_id = int(admin_id or 0)
-            if not blocker_admin_id:
-                with suppress(Exception):
-                    blocker_admin_id = _web_current_admin_id()
-            db_user_set_blocked(int(chat_id), blocker_admin_id, True, "Telegram Forbidden from web send")
-        if not (200 <= resp.status_code < 300):
-            return False, f"Telegram HTTP {resp.status_code}: {resp.text[:300]}"
-        payload = resp.json()
-        if not payload.get("ok"):
-            return False, str(payload)[:300]
-        return True, "sent"
+        last_error = ""
+        for telegram_parse_mode in _broadcast_candidate_parse_modes(prepared_text, prepared_mode):
+            payload = {
+                "chat_id": int(chat_id),
+                "text": prepared_text,
+                "disable_web_page_preview": True,
+            }
+            if telegram_parse_mode:
+                payload["parse_mode"] = telegram_parse_mode
+
+            resp = tg_client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json=payload,
+                timeout=20,
+            )
+            if resp.status_code == 403:
+                blocker_admin_id = int(admin_id or 0)
+                if not blocker_admin_id:
+                    with suppress(Exception):
+                        blocker_admin_id = _web_current_admin_id()
+                db_user_set_blocked(int(chat_id), blocker_admin_id, True, "Telegram Forbidden from web send")
+            if not (200 <= resp.status_code < 300):
+                last_error = f"Telegram HTTP {resp.status_code}: {resp.text[:300]}"
+                if telegram_parse_mode and _is_telegram_parse_error(last_error):
+                    continue
+                return False, last_error
+
+            try:
+                response_payload = resp.json()
+            except Exception:
+                response_payload = {}
+            if response_payload.get("ok"):
+                return True, "sent"
+
+            last_error = str(response_payload)[:300]
+            if telegram_parse_mode and _is_telegram_parse_error(last_error):
+                continue
+            return False, last_error or "Telegram send failed."
+
+        return False, last_error or "Telegram parse mode rejected message."
     except Exception as exc:
         return False, str(exc)
     finally:
@@ -3893,14 +3948,27 @@ def _web_sched_cancel_any(row_id: int, admin_id: int) -> tuple[bool, str]:
     return True, "cancelled"
 
 
-def _web_sched_create(admin_id: int, broadcast_at: datetime, text: str, photo_file_id: str = "", caption: str = "", confirmed: bool = False) -> tuple[bool, str]:
+def _web_sched_create(
+    admin_id: int,
+    broadcast_at: datetime,
+    text: str,
+    photo_file_id: str = "",
+    caption: str = "",
+    confirmed: bool = False,
+    parse_mode: str | None = "auto",
+) -> tuple[bool, str]:
     if not supabase:
         return False, "Supabase is not configured."
     text = (text or "").strip()
     photo_file_id = (photo_file_id or "").strip()
     caption = (caption or "").strip()
+    parse_mode = _broadcast_normalize_parse_mode(parse_mode)
     if photo_file_id and not caption and text:
         caption = text
+    if photo_file_id and caption:
+        caption = _broadcast_apply_format_directive(caption, parse_mode)
+    elif not photo_file_id and text:
+        text = _broadcast_apply_format_directive(text, parse_mode)
     if not photo_file_id and not text:
         return False, "Broadcast text is required when no photo_file_id is provided."
     if photo_file_id and len(caption) > 1024:
@@ -4322,6 +4390,7 @@ def web_admin_schedules():
     options = "".join(f"<option value='{s}' {'selected' if status==s else ''}>{s.title()}</option>" for s in ["all", "preview", "pending", "sending", "done", "failed", "cancelled"])
     now_plus = (_local_now() + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M")
     table_rows = _web_schedule_rows_html(rows, csrf, return_input)
+    parse_options = _broadcast_parse_mode_select_html("parse_mode", _BROADCAST_PARSE_MODE_AUTO)
     body = f"""
     <div class='card'>
       <form method='get' class='row3'>
@@ -4330,7 +4399,7 @@ def web_admin_schedules():
         <div class='field'><label>&nbsp;</label><div class='actions'><button>Filter</button><a class='btn secondary' href='/admin/schedules'>Reset</a></div></div>
       </form>
     </div>
-    <div class='card'><h2>Create Schedule</h2><p class='muted'>Use Phnom Penh local time in AM/PM style ({APP_TIMEZONE_ALIAS}, {APP_TIMEZONE_UTC_LABEL}). The bot stores the final timestamp in UTC automatically. Use Preview first for safer broadcasts.</p><form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='create'><div class='row'><div class='field'><label>Broadcast Phnom Penh time</label><input type='datetime-local' name='broadcast_at' value='{now_plus}' required><div class='help'>Example: 2026-12-25 09:00 AM {APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})</div></div><div class='field'><label>Mode</label><select name='confirmed'><option value='0'>Preview first</option><option value='1'>Confirm immediately</option></select></div></div><div class='field'><label>Text message <span><span data-count-target='#schedule-text'>0</span>/{TELE_MSG_LIMIT}</span></label><textarea id='schedule-text' name='text' maxlength='{TELE_MSG_LIMIT}' placeholder='Required for text-only schedule; used as photo caption when caption is empty'></textarea></div><div class='row'><div class='field'><label>Telegram photo_file_id optional</label><input name='photo_file_id'></div><div class='field'><label>Photo caption optional</label><input name='caption' maxlength='1024'></div></div><button>Create Schedule</button></form></div>
+    <div class='card'><h2>Create Schedule</h2><p class='muted'>Use Phnom Penh local time in AM/PM style ({APP_TIMEZONE_ALIAS}, {APP_TIMEZONE_UTC_LABEL}). The bot stores the final timestamp in UTC automatically. Use Preview first for safer broadcasts.</p><form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='create'><div class='row'><div class='field'><label>Broadcast Phnom Penh time</label><input type='datetime-local' name='broadcast_at' value='{now_plus}' required><div class='help'>Example: 2026-12-25 09:00 AM {APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})</div></div><div class='field'><label>Mode</label><select name='confirmed'><option value='0'>Preview first</option><option value='1'>Confirm immediately</option></select></div></div><div class='field'><label>Format mode</label><select name='parse_mode'>{parse_options}</select><div class='help'>Supports Telegram HTML, MarkdownV2, Markdown, and plain text. First-line directives also work: <code>::html</code>, <code>::mdv2</code>, <code>::md</code>, <code>::plain</code>.</div></div><div class='field'><label>Text message <span><span data-count-target='#schedule-text'>0</span>/{TELE_MSG_LIMIT}</span></label><textarea id='schedule-text' name='text' maxlength='{TELE_MSG_LIMIT}' placeholder='Required for text-only schedule; used as photo caption when caption is empty'></textarea></div><div class='row'><div class='field'><label>Telegram photo_file_id optional</label><input name='photo_file_id'></div><div class='field'><label>Photo caption optional</label><input name='caption' maxlength='1024'></div></div><button>Create Schedule</button></form></div>
     <div class='card'><div class='actions' style='justify-content:space-between'><h2>Schedules</h2><span class='muted'>{len(rows)} shown</span></div><div class='table-wrap'><table class='table'><thead><tr><th>ID</th><th>Status</th><th>Time</th><th>Content</th><th>Actions</th></tr></thead><tbody>{table_rows}</tbody></table></div></div>
     """
     return _web_render("Schedules", body, active="schedules")
@@ -4349,7 +4418,15 @@ def web_admin_schedules_action():
             if not dt:
                 ok, msg = False, "Invalid time. Use Phnom Penh local time: YYYY-MM-DD HH:MM or YYYY-MM-DD HH:MM AM/PM."
             else:
-                ok, msg = _web_sched_create(_web_current_admin_id(), dt, request.form.get("text") or "", request.form.get("photo_file_id") or "", request.form.get("caption") or "", str(request.form.get("confirmed") or "0") == "1")
+                ok, msg = _web_sched_create(
+                    _web_current_admin_id(),
+                    dt,
+                    request.form.get("text") or "",
+                    request.form.get("photo_file_id") or "",
+                    request.form.get("caption") or "",
+                    str(request.form.get("confirmed") or "0") == "1",
+                    request.form.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO,
+                )
         elif not row_id:
             ok, msg = False, "Missing schedule ID."
         elif action == "confirm":
@@ -4370,10 +4447,18 @@ def web_admin_schedules_action():
                 ok, reason, _row = db_sched_update_time(row_id, _web_current_admin_id(), dt)
                 msg = "time updated" if ok else f"time not updated: {reason}"
         elif action == "edit_text":
-            ok, reason, _row = db_sched_update_text(row_id, _web_current_admin_id(), request.form.get("text") or "")
+            edit_text = _broadcast_apply_format_directive(
+                request.form.get("text") or "",
+                request.form.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO,
+            )
+            ok, reason, _row = db_sched_update_text(row_id, _web_current_admin_id(), edit_text)
             msg = "text updated" if ok else f"text not updated: {reason}"
         elif action == "edit_photo":
-            ok, reason, _row = db_sched_update_photo(row_id, _web_current_admin_id(), request.form.get("photo_file_id") or "", request.form.get("caption") or "")
+            edit_caption = _broadcast_apply_format_directive(
+                request.form.get("caption") or "",
+                request.form.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO,
+            )
+            ok, reason, _row = db_sched_update_photo(row_id, _web_current_admin_id(), request.form.get("photo_file_id") or "", edit_caption)
             msg = "photo updated" if ok else f"photo not updated: {reason}"
     except Exception as exc:
         ok, msg = False, str(exc)
@@ -4391,8 +4476,14 @@ def _web_broadcast_job_set(job_id: str, **updates) -> None:
             _WEB_BROADCAST_JOBS.popitem(last=False)
 
 
-def _web_broadcast_worker(job_id: str, admin_id: int, text: str) -> None:
+def _web_broadcast_worker(
+    job_id: str,
+    admin_id: int,
+    text: str,
+    parse_mode: str | None = "auto",
+) -> None:
     """Run web dashboard broadcast in bounded concurrent batches with pause/cancel."""
+    parse_mode = _broadcast_normalize_parse_mode(parse_mode)
     try:
         raw_users = get_all_user_ids()
     except Exception as exc:
@@ -4414,7 +4505,18 @@ def _web_broadcast_worker(job_id: str, admin_id: int, text: str) -> None:
 
     total = len(users)
     sent = failed = blocked = skipped = 0
-    _web_broadcast_job_set(job_id, status="running", control="run", total=total, sent=0, failed=0, blocked=0, skipped=0, started_at=_sched_iso())
+    _web_broadcast_job_set(
+        job_id,
+        status="running",
+        control="run",
+        total=total,
+        sent=0,
+        failed=0,
+        blocked=0,
+        skipped=0,
+        parse_mode=parse_mode,
+        started_at=_sched_iso(),
+    )
 
     if not users:
         _web_broadcast_job_set(job_id, status="done", finished_at=_sched_iso())
@@ -4441,7 +4543,13 @@ def _web_broadcast_worker(job_id: str, admin_id: int, text: str) -> None:
                 return "skipped"
             if uid in blocked_ids:
                 return "blocked"
-            ok, send_msg = _web_send_telegram_message(uid, text, admin_id=admin_id, client=tg_client)
+            ok, send_msg = _web_send_telegram_message(
+                uid,
+                text,
+                admin_id=admin_id,
+                client=tg_client,
+                parse_mode=parse_mode,
+            )
             if ok:
                 return "sent"
             low = str(send_msg or "").lower()
@@ -4514,6 +4622,7 @@ def web_admin_broadcast():
     if request.method == "POST":
         _web_check_csrf()
         text = (request.form.get("text") or "").strip()
+        parse_mode = _broadcast_normalize_parse_mode(request.form.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO)
         if not text:
             flask_flash("Broadcast text is empty.", "error")
         elif len(text) > TELE_MSG_LIMIT:
@@ -4527,14 +4636,26 @@ def web_admin_broadcast():
                 )
             else:
                 job_id = secrets.token_hex(6)
-                _web_broadcast_job_set(job_id, status="queued", control="run", total=0, sent=0, failed=0, blocked=0, skipped=0, created_at=_sched_iso())
-                _submit_web_broadcast_job(job_id, _web_current_admin_id(), text)
+                _web_broadcast_job_set(
+                    job_id,
+                    status="queued",
+                    control="run",
+                    total=0,
+                    sent=0,
+                    failed=0,
+                    blocked=0,
+                    skipped=0,
+                    parse_mode=parse_mode,
+                    created_at=_sched_iso(),
+                )
+                _submit_web_broadcast_job(job_id, _web_current_admin_id(), text, parse_mode)
                 flask_flash(f"Broadcast job {job_id} started.", "success")
                 return redirect(url_for("web_admin_broadcast"))
     csrf = _web_csrf_token()
     job_rows = _web_broadcast_job_rows_html(csrf, include_actions=True)
+    parse_options = _broadcast_parse_mode_select_html("parse_mode", _BROADCAST_PARSE_MODE_AUTO)
     body = f"""
-    <div class='card danger-zone'><h2>Immediate text broadcast</h2><p class='muted'>Safer broadcast system: bounded workers, blocked-user skip, live progress, pause, resume, cancel, and Telegram 403 auto-block.</p><form method='post' data-confirm='Start this broadcast now? This sends to all users.'><input type='hidden' name='csrf_token' value='{csrf}'><div class='field'><label>Message <span><span data-count-target='#broadcast-text'>0</span>/{TELE_MSG_LIMIT}</span></label><textarea id='broadcast-text' name='text' maxlength='{TELE_MSG_LIMIT}' required></textarea><div class='help'>For scheduled sending, use the Schedules page instead.</div></div><button class='danger'>Start Broadcast</button></form></div>
+    <div class='card danger-zone'><h2>Immediate text broadcast</h2><p class='muted'>Safer broadcast system: bounded workers, blocked-user skip, live progress, pause, resume, cancel, Telegram 403 auto-block, and Telegram formatting fallback.</p><form method='post' data-confirm='Start this broadcast now? This sends to all users.'><input type='hidden' name='csrf_token' value='{csrf}'><div class='field'><label>Format mode</label><select name='parse_mode'>{parse_options}</select><div class='help'>Supports Telegram HTML, MarkdownV2, Markdown, and plain text. You can also prefix the first line with <code>::html</code>, <code>::mdv2</code>, <code>::md</code>, or <code>::plain</code>.</div></div><div class='field'><label>Message <span><span data-count-target='#broadcast-text'>0</span>/{TELE_MSG_LIMIT}</span></label><textarea id='broadcast-text' name='text' maxlength='{TELE_MSG_LIMIT}' required></textarea><div class='help'>For scheduled sending, use the Schedules page instead. If formatting is malformed, the bot retries as plain text instead of failing the whole job.</div></div><button class='danger'>Start Broadcast</button></form></div>
     <div class='card'><div class='actions' style='justify-content:space-between'><h2>Recent web broadcast jobs</h2><span class='live-note'><span class='v3-live-dot'></span>Auto-refresh every 5 seconds</span></div><div class='table-wrap'><table class='table'><thead><tr><th>Job</th><th>Status</th><th>Progress</th><th>Blocked</th><th>Failed</th><th>Started</th><th>Action</th></tr></thead><tbody data-broadcast-jobs>{job_rows}</tbody></table></div></div>
     """
     return _web_render("Broadcast", body, active="broadcast")
@@ -10117,11 +10238,19 @@ def db_sched_insert(payload: dict, admin_id: int, broadcast_at: datetime) -> dic
     if not supabase:
         raise RuntimeError("Supabase not configured.")
 
+    parse_mode = _broadcast_normalize_parse_mode(payload.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO)
+    caption = payload.get("caption")
+    plain_text = payload.get("text")
+    if payload.get("photo_file_id"):
+        caption = _broadcast_apply_format_directive(caption, parse_mode) if caption else caption
+    elif plain_text:
+        plain_text = _broadcast_apply_format_directive(plain_text, parse_mode)
+
     row = {
         "admin_id":      int(admin_id),
         "photo_file_id": payload.get("photo_file_id"),
-        "caption":       payload.get("caption"),
-        "plain_text":    payload.get("text"),
+        "caption":       caption,
+        "plain_text":    plain_text,
         "broadcast_at":  _sched_iso(broadcast_at),
         "status":        SCHED_STATUS_PENDING,
         "error_msg":     SCHED_DRAFT_MARKER,
@@ -10807,9 +10936,12 @@ def _sched_content_preview(row: dict, limit: int = 500) -> str:
         base = row.get("caption") or "(photo, no caption)"
     else:
         base = row.get("plain_text") or "(empty)"
+    base, mode = _broadcast_strip_format_directive(str(base), _BROADCAST_PARSE_MODE_AUTO)
     base = str(base).strip()
     if len(base) > limit:
         base = base[:limit] + "…"
+    if mode != _BROADCAST_PARSE_MODE_AUTO:
+        return f"[{_broadcast_parse_mode_label(mode)}] {base}"
     return base
 
 
@@ -12100,11 +12232,16 @@ def _broadcast_recipient_estimate_sync() -> dict[str, int]:
 def _broadcast_preview_summary(payload: dict, estimate: dict[str, int]) -> str:
     kind = "Photo + caption" if payload.get("photo_file_id") else "Text"
     content = payload.get("caption") if payload.get("photo_file_id") else payload.get("text")
+    content, mode = _broadcast_strip_format_directive(
+        content,
+        payload.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO,
+    )
     content = str(content or "").strip()
     chars = len(content)
     return (
         "🛡️ <b>Safer Broadcast V2 Preview</b>\n\n"
         f"Type: <b>{html.escape(kind)}</b>\n"
+        f"Format: <b>{html.escape(_broadcast_parse_mode_label(mode))}</b>\n"
         f"Characters: <b>{chars}</b>\n"
         f"Registered users: <b>{int(estimate.get('registered') or 0)}</b>\n"
         f"Active target: <b>{int(estimate.get('active') or 0)}</b>\n"
@@ -12349,9 +12486,275 @@ def _get_admin_for_user(user_id: int) -> int | None:
 # ===========================================================================
 # Broadcast helper
 # ===========================================================================
+# ---------------------------------------------------------------------------
+# Telegram broadcast formatting helpers
+# ---------------------------------------------------------------------------
+# Telegram supports three parse modes for Bot API messages:
+#   HTML, MarkdownV2, and legacy Markdown.
+#
+# Older code escaped every broadcast as HTML, which made admin formatting show
+# as literal text.  These helpers keep broadcasts safe while allowing:
+#   - native Telegram formatting from admin messages (converted to HTML),
+#   - explicit web/admin formatting mode selection,
+#   - first-line format directives, e.g. ::html, ::mdv2, ::md, ::plain,
+#   - automatic parse-mode retry with a plain-text fallback.
+_BROADCAST_PARSE_MODE_AUTO = "auto"
+_BROADCAST_PARSE_MODE_PLAIN = "plain"
+_BROADCAST_PARSE_MODE_HTML = "html"
+_BROADCAST_PARSE_MODE_MARKDOWN = "markdown"
+_BROADCAST_PARSE_MODE_MARKDOWN_V2 = "markdownv2"
+
+_BROADCAST_PARSE_MODE_ALIASES = {
+    "": _BROADCAST_PARSE_MODE_AUTO,
+    "auto": _BROADCAST_PARSE_MODE_AUTO,
+    "detect": _BROADCAST_PARSE_MODE_AUTO,
+    "plain": _BROADCAST_PARSE_MODE_PLAIN,
+    "text": _BROADCAST_PARSE_MODE_PLAIN,
+    "none": _BROADCAST_PARSE_MODE_PLAIN,
+    "html": _BROADCAST_PARSE_MODE_HTML,
+    "htm": _BROADCAST_PARSE_MODE_HTML,
+    "md": _BROADCAST_PARSE_MODE_MARKDOWN,
+    "markdown": _BROADCAST_PARSE_MODE_MARKDOWN,
+    "markdown1": _BROADCAST_PARSE_MODE_MARKDOWN,
+    "legacy_markdown": _BROADCAST_PARSE_MODE_MARKDOWN,
+    "markdownv2": _BROADCAST_PARSE_MODE_MARKDOWN_V2,
+    "markdown_v2": _BROADCAST_PARSE_MODE_MARKDOWN_V2,
+    "mdv2": _BROADCAST_PARSE_MODE_MARKDOWN_V2,
+    "v2": _BROADCAST_PARSE_MODE_MARKDOWN_V2,
+}
+
+_BROADCAST_PARSE_MODE_TO_TELEGRAM = {
+    _BROADCAST_PARSE_MODE_HTML: "HTML",
+    _BROADCAST_PARSE_MODE_MARKDOWN: "Markdown",
+    _BROADCAST_PARSE_MODE_MARKDOWN_V2: "MarkdownV2",
+    _BROADCAST_PARSE_MODE_PLAIN: None,
+}
+
+_BROADCAST_FORMAT_DIRECTIVE_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:(?:::|//|#)\s*(?P<short>auto|plain|text|none|html|htm|markdownv2|markdown_v2|mdv2|v2|markdown|md))"
+    r"|(?:(?:parse[_ -]?mode|format|mode)\s*[:=]\s*(?P<long>auto|plain|text|none|html|htm|markdownv2|markdown_v2|mdv2|v2|markdown|md))"
+    r")\s*(?:-->)?\s*(?:\r?\n|$)",
+    re.IGNORECASE,
+)
+
+_BROADCAST_HTML_HINT_RE = re.compile(
+    r"</?(?:b|strong|i|em|u|ins|s|strike|del|a|code|pre|tg-spoiler|blockquote|tg-emoji)\b",
+    re.IGNORECASE,
+)
+_BROADCAST_MD_V2_HINT_RE = re.compile(r"(\|\|.+?\|\||__.+?__|~.+?~)", re.DOTALL)
+_BROADCAST_MD_HINT_RE = re.compile(r"(\*[^*\n]+\*|_[^_\n]+_|`[^`\n]+`|\[[^\]\n]+\]\([^)]+\))", re.DOTALL)
+
+
+def _broadcast_normalize_parse_mode(mode: str | None, default: str = _BROADCAST_PARSE_MODE_AUTO) -> str:
+    key = str(mode or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if key in _BROADCAST_PARSE_MODE_ALIASES:
+        return _BROADCAST_PARSE_MODE_ALIASES[key]
+    return _BROADCAST_PARSE_MODE_ALIASES.get(str(default or "").strip().lower(), _BROADCAST_PARSE_MODE_AUTO)
+
+
+def _broadcast_strip_format_directive(
+    text: str | None,
+    default_mode: str | None = _BROADCAST_PARSE_MODE_AUTO,
+) -> tuple[str, str]:
+    raw = str(text or "")
+    mode = _broadcast_normalize_parse_mode(default_mode)
+    match = _BROADCAST_FORMAT_DIRECTIVE_RE.match(raw)
+    if match:
+        mode = _broadcast_normalize_parse_mode(match.group("short") or match.group("long"), mode)
+        raw = raw[match.end():]
+    return raw, mode
+
+
+def _broadcast_apply_format_directive(text: str | None, parse_mode: str | None) -> str:
+    """Encode a web-selected parse mode in saved scheduled-broadcast text.
+
+    This avoids a DB migration for scheduled_broadcasts.  When the scheduler
+    fires later, _broadcast_strip_format_directive removes the first line and
+    uses it as the parse mode.
+    """
+    raw = str(text or "").strip()
+    mode = _broadcast_normalize_parse_mode(parse_mode)
+    if not raw or mode in {_BROADCAST_PARSE_MODE_AUTO, _BROADCAST_PARSE_MODE_PLAIN}:
+        return raw
+    existing_text, existing_mode = _broadcast_strip_format_directive(raw, _BROADCAST_PARSE_MODE_AUTO)
+    if existing_mode != _BROADCAST_PARSE_MODE_AUTO and existing_text != raw:
+        return raw
+    directive = {
+        _BROADCAST_PARSE_MODE_HTML: "::html",
+        _BROADCAST_PARSE_MODE_MARKDOWN: "::md",
+        _BROADCAST_PARSE_MODE_MARKDOWN_V2: "::mdv2",
+    }.get(mode)
+    return f"{directive}\n{raw}" if directive else raw
+
+
+def _broadcast_parse_mode_label(mode: str | None) -> str:
+    mode = _broadcast_normalize_parse_mode(mode)
+    return {
+        _BROADCAST_PARSE_MODE_AUTO: "Auto",
+        _BROADCAST_PARSE_MODE_PLAIN: "Plain",
+        _BROADCAST_PARSE_MODE_HTML: "HTML",
+        _BROADCAST_PARSE_MODE_MARKDOWN: "Markdown",
+        _BROADCAST_PARSE_MODE_MARKDOWN_V2: "MarkdownV2",
+    }.get(mode, "Auto")
+
+
+def _broadcast_parse_mode_select_html(name: str = "parse_mode", selected: str | None = "auto") -> str:
+    selected = _broadcast_normalize_parse_mode(selected)
+    options = [
+        (_BROADCAST_PARSE_MODE_AUTO, "Auto detect"),
+        (_BROADCAST_PARSE_MODE_HTML, "Telegram HTML"),
+        (_BROADCAST_PARSE_MODE_MARKDOWN_V2, "MarkdownV2"),
+        (_BROADCAST_PARSE_MODE_MARKDOWN, "Markdown"),
+        (_BROADCAST_PARSE_MODE_PLAIN, "Plain text"),
+    ]
+    return "".join(
+        f"<option value='{_web_h(value)}' {'selected' if value == selected else ''}>{_web_h(label)}</option>"
+        for value, label in options
+    )
+
+
+def _broadcast_candidate_parse_modes(text: str, requested_mode: str | None) -> list[str | None]:
+    """Return parse modes to try, ordered from richest to safest.
+
+    Plain text is always the final fallback.  This protects large broadcasts
+    from failing completely because one admin message contains malformed markup.
+    """
+    text = str(text or "")
+    requested = _broadcast_normalize_parse_mode(requested_mode)
+    candidates: list[str | None] = []
+
+    if requested == _BROADCAST_PARSE_MODE_PLAIN:
+        candidates = [None]
+    elif requested in _BROADCAST_PARSE_MODE_TO_TELEGRAM:
+        candidates = [_BROADCAST_PARSE_MODE_TO_TELEGRAM[requested], None]
+    else:
+        if _BROADCAST_HTML_HINT_RE.search(text):
+            candidates.extend(["HTML"])
+        if _BROADCAST_MD_V2_HINT_RE.search(text):
+            candidates.extend(["MarkdownV2", "Markdown"])
+        elif _BROADCAST_MD_HINT_RE.search(text):
+            candidates.extend(["Markdown", "MarkdownV2"])
+        candidates.append(None)
+
+    deduped: list[str | None] = []
+    for mode in candidates:
+        if mode not in deduped:
+            deduped.append(mode)
+    return deduped or [None]
+
+
+def _is_telegram_parse_error(exc_or_text: Any) -> bool:
+    low = str(exc_or_text or "").lower()
+    return (
+        "can't parse entities" in low
+        or "can't find end" in low
+        or ("entity" in low and "parse" in low)
+        or "unsupported start tag" in low
+        or ("tag" in low and "not found" in low)
+        or "can't parse" in low
+    )
+
+
+def _broadcast_visible_len(text: str, parse_mode: str | None) -> int:
+    raw = str(text or "")
+    mode = _broadcast_normalize_parse_mode(parse_mode)
+    if mode == _BROADCAST_PARSE_MODE_HTML:
+        without_tags = re.sub(r"<[^>]*>", "", raw)
+        return len(html.unescape(without_tags))
+    return len(raw)
+
+
+def _broadcast_prepare_text(
+    text: str | None,
+    default_parse_mode: str | None = "auto",
+    *,
+    max_chars: int,
+) -> tuple[str | None, str]:
+    raw, mode = _broadcast_strip_format_directive(text, default_parse_mode)
+    raw = raw.strip()
+    if not raw:
+        return None, mode
+    if _broadcast_visible_len(raw, mode) > max_chars:
+        raise ValueError(f"Broadcast content too long. Max {max_chars} Telegram-visible characters.")
+    return raw, mode
+
+
+def _broadcast_message_text_and_mode(msg: Any, *, caption: bool = False) -> tuple[str, str]:
+    """Read admin Telegram message content while preserving native formatting.
+
+    Telegram native formatting arrives as entities, not literal markdown.  PTB's
+    text_html/caption_html properties convert those entities to Telegram HTML,
+    so immediate and scheduled broadcasts keep bold/italic/code/links/etc.
+    """
+    raw = (getattr(msg, "caption", None) if caption else getattr(msg, "text", None)) or ""
+    entities = (getattr(msg, "caption_entities", None) if caption else getattr(msg, "entities", None)) or []
+    if entities:
+        prop_name = "caption_html" if caption else "text_html"
+        try:
+            html_text = getattr(msg, prop_name, None)
+            if html_text:
+                return str(html_text), _BROADCAST_PARSE_MODE_HTML
+        except Exception as exc:
+            logger.warning("Could not convert Telegram entities to HTML for broadcast: %s", exc)
+    clean, mode = _broadcast_strip_format_directive(raw, _BROADCAST_PARSE_MODE_AUTO)
+    return clean, mode
+
+
+async def _send_telegram_broadcast_message(
+    bot: Any,
+    *,
+    chat_id: int,
+    text: str,
+    parse_mode: str | None,
+    photo_file_id: str | None = None,
+) -> None:
+    """Send a text/photo broadcast with parse-mode fallback."""
+    parse_candidates = _broadcast_candidate_parse_modes(text, parse_mode)
+    last_parse_error: Exception | None = None
+
+    for telegram_parse_mode in parse_candidates:
+        try:
+            if photo_file_id:
+                kwargs = {
+                    "chat_id": int(chat_id),
+                    "photo": photo_file_id,
+                    "caption": text if text else None,
+                }
+                if telegram_parse_mode and text:
+                    kwargs["parse_mode"] = telegram_parse_mode
+                await bot.send_photo(**kwargs)
+            else:
+                kwargs = {
+                    "chat_id": int(chat_id),
+                    "text": text or " ",
+                    "disable_web_page_preview": True,
+                }
+                if telegram_parse_mode:
+                    kwargs["parse_mode"] = telegram_parse_mode
+                await bot.send_message(**kwargs)
+            return
+        except BadRequest as exc:
+            if telegram_parse_mode and _is_telegram_parse_error(exc):
+                last_parse_error = exc
+                logger.info(
+                    "Telegram parse mode %s rejected for chat_id=%s; retrying fallback: %s",
+                    telegram_parse_mode,
+                    chat_id,
+                    str(exc)[:180],
+                )
+                continue
+            raise
+
+    if last_parse_error:
+        raise last_parse_error
+    raise BadRequest("Broadcast send failed without a Telegram response.")
+
+
 def _safe_broadcast_html(text: str | None, max_chars: int) -> str | None:
-    """Escape admin/user broadcast content before using Telegram HTML mode."""
-    raw = (text or "").strip()
+    """Escape broadcast content for admin previews only."""
+    raw, _mode = _broadcast_strip_format_directive(text, _BROADCAST_PARSE_MODE_PLAIN)
+    raw = raw.strip()
     if not raw:
         return None
     if len(raw) > max_chars:
@@ -12400,10 +12803,30 @@ async def _run_broadcast_to_all(
         ))
         return (0, 0, blocked)
     photo_file_id = pending.get("photo_file_id")
-    safe_caption  = _safe_broadcast_html(pending.get("caption"), 1024)
-    safe_text     = _safe_broadcast_html(pending.get("text"), 4096)
+    default_parse_mode = pending.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO
+    try:
+        if photo_file_id:
+            send_text, send_parse_mode = _broadcast_prepare_text(
+                pending.get("caption"),
+                default_parse_mode,
+                max_chars=1024,
+            )
+            send_text = send_text or ""
+        else:
+            send_text, send_parse_mode = _broadcast_prepare_text(
+                pending.get("text"),
+                default_parse_mode,
+                max_chars=TELE_MSG_LIMIT,
+            )
+    except ValueError as exc:
+        await safe_send(lambda: bot.send_message(
+            chat_id=admin_id,
+            text=f"❌ {label}: {html.escape(str(exc))}",
+            parse_mode="HTML",
+        ))
+        return (0, 0, 0)
 
-    if not photo_file_id and not safe_text:
+    if not photo_file_id and not send_text:
         await safe_send(lambda: bot.send_message(
             chat_id=admin_id, text=f"❌ {label}: Broadcast text is empty."
         ))
@@ -12421,19 +12844,13 @@ async def _run_broadcast_to_all(
         async with broadcast_semaphore:
             for attempt in range(2):
                 try:
-                    if photo_file_id:
-                        await bot.send_photo(
-                            chat_id=uid,
-                            photo=photo_file_id,
-                            caption=safe_caption,
-                            parse_mode="HTML" if safe_caption else None,
-                        )
-                    else:
-                        await bot.send_message(
-                            chat_id=uid,
-                            text=safe_text or " ",
-                            parse_mode="HTML",
-                        )
+                    await _send_telegram_broadcast_message(
+                        bot,
+                        chat_id=uid,
+                        text=send_text or "",
+                        parse_mode=send_parse_mode,
+                        photo_file_id=photo_file_id,
+                    )
                     return "sent"
                 except Forbidden as e:
                     await loop.run_in_executor(
@@ -12539,7 +12956,9 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_send(lambda: update.message.reply_text(
         "📡 <b>Admin Broadcast</b>\n\n"
         "ផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + Caption</b> ដែលចង់ Broadcast ។\n"
-        "👉 អាចផ្ញើរូបភាព + Caption រួមគ្នា ឬ តែ text ។\n\n"
+        "👉 អាចផ្ញើរូបភាព + Caption រួមគ្នា ឬ តែ text ។\n"
+        "✅ Supports Telegram native formatting, HTML, MarkdownV2, Markdown, and plain text.\n"
+        "Prefix first line with <code>::html</code>, <code>::mdv2</code>, <code>::md</code>, or <code>::plain</code> to force a mode.\n\n"
         "វាយ /cancel ដើម្បីបោះបង់។",
         parse_mode="HTML",
     ))
@@ -13067,7 +13486,8 @@ async def _admin_start_broadcast_from_button(query, context: ContextTypes.DEFAUL
     estimate = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, _broadcast_recipient_estimate_sync)
     await safe_send(lambda: query.message.edit_text(
         "🛡️ <b>Safer Broadcast V2</b>\n\n"
-        "Send <b>text</b> or <b>photo + caption</b>. The bot will show a final preview before sending.\n\n"
+        "Send <b>text</b> or <b>photo + caption</b>. The bot will show a final preview before sending.\n"
+        "Formatting: Telegram native formatting, HTML, MarkdownV2, Markdown, or plain text. Use <code>::html</code>, <code>::mdv2</code>, <code>::md</code>, or <code>::plain</code> on the first line to force a mode.\n\n"
         f"Registered users: <b>{int(estimate.get('registered') or 0)}</b>\n"
         f"Active target: <b>{int(estimate.get('active') or 0)}</b>\n"
         f"Skipped blocked/unreachable: <b>{int(estimate.get('blocked') or 0)}</b>\n"
@@ -13085,7 +13505,8 @@ async def _admin_start_schedule_from_button(query, context: ContextTypes.DEFAULT
     await safe_send(lambda: query.message.edit_text(
         "📅 <b>Scheduled Broadcast</b>\n\n"
         "ផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + Caption</b> ដែលចង់ Schedule ។\n"
-        "បន្ទាប់មក Bot នឹងសួរពេលវេលា Phnom Penh local time (ICT, UTC+7)។\n\n"
+        "បន្ទាប់មក Bot នឹងសួរពេលវេលា Phnom Penh local time (ICT, UTC+7)។\n"
+        "Formatting: Telegram native formatting, HTML, MarkdownV2, Markdown, or plain text. First-line directives: <code>::html</code>, <code>::mdv2</code>, <code>::md</code>, <code>::plain</code>.\n\n"
         "ចុច Cancel ឬវាយ /cancel ដើម្បីបោះបង់។",
         parse_mode="HTML",
         reply_markup=get_admin_action_kb(),
@@ -13143,12 +13564,13 @@ async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption_text:  str | None = None
     plain_text:    str | None = None
 
+    parse_mode = _BROADCAST_PARSE_MODE_AUTO
     if msg.photo:
         photo_file_id = msg.photo[-1].file_id
-        caption_text  = msg.caption or ""
+        caption_text, parse_mode = _broadcast_message_text_and_mode(msg, caption=True)
     elif msg.text:
-        plain_text = msg.text.strip()
-        if not plain_text:
+        plain_text, parse_mode = _broadcast_message_text_and_mode(msg, caption=False)
+        if not plain_text.strip():
             await safe_send(lambda: msg.reply_text("⚠️ អត្ថបទមិនអាចទទេបាន។ សូមវាយសារ។"))
             return
     else:
@@ -13159,17 +13581,23 @@ async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "photo_file_id": photo_file_id,
         "caption":       caption_text,
         "text":          plain_text,
+        "parse_mode":    parse_mode,
     }
 
     estimate = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, _broadcast_recipient_estimate_sync)
     summary = _broadcast_preview_summary(_pending_broadcast[user_id], estimate)
 
+    preview_content, preview_mode = _broadcast_strip_format_directive(
+        caption_text if photo_file_id else plain_text,
+        parse_mode,
+    )
+    mode_note = ""
     if photo_file_id:
-        preview_cap = html.escape(caption_text) if caption_text else "<i>(No caption)</i>"
+        preview_cap = html.escape(preview_content) if preview_content else "<i>(No caption)</i>"
         await safe_send(lambda: msg.reply_photo(
             photo=photo_file_id,
             caption=(
-                f"{summary}\n\n"
+                f"{summary}{mode_note}\n\n"
                 f"<b>Content preview</b>\n{preview_cap}"
             )[:1024],
             parse_mode="HTML",
@@ -13177,7 +13605,7 @@ async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ))
     else:
         await safe_send(lambda: msg.reply_text(
-            f"{summary}\n\n<b>Content preview</b>\n{html.escape(plain_text)}",
+            f"{summary}{mode_note}\n\n<b>Content preview</b>\n{html.escape(preview_content)}",
             parse_mode="HTML",
             reply_markup=get_broadcast_confirm_kb(),
         ))
@@ -13226,7 +13654,9 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sched_state"] = SCHED_WAIT_MSG
     await safe_send(lambda: update.message.reply_text(
         "📅 <b>Scheduled Broadcast</b>\n\n"
-        "ផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + Caption</b> ដែលចង់ Schedule ។\n\n"
+        "ផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + Caption</b> ដែលចង់ Schedule ។\n"
+        "✅ Supports Telegram native formatting, HTML, MarkdownV2, Markdown, and plain text.\n"
+        "Prefix first line with <code>::html</code>, <code>::mdv2</code>, <code>::md</code>, or <code>::plain</code>.\n\n"
         "វាយ /cancel ដើម្បីបោះបង់។",
         parse_mode="HTML",
     ))
@@ -13292,19 +13722,25 @@ async def _handle_sched_content(update: Update, context: ContextTypes.DEFAULT_TY
     caption_text:  str | None = None
     plain_text:    str | None = None
 
+    parse_mode = _BROADCAST_PARSE_MODE_AUTO
     if msg.photo:
         photo_file_id = msg.photo[-1].file_id
-        caption_text  = msg.caption or ""
+        caption_text, parse_mode = _broadcast_message_text_and_mode(msg, caption=True)
     elif msg.text:
-        plain_text = msg.text.strip()
-        if not plain_text:
+        plain_text, parse_mode = _broadcast_message_text_and_mode(msg, caption=False)
+        if not plain_text.strip():
             await safe_send(lambda: msg.reply_text("⚠️ អត្ថបទមិនអាចទទេបាន។ សូមវាយសារ ឬ ផ្ញើរូបភាព។"))
             return True
     else:
         await safe_send(lambda: msg.reply_text("⚠️ ផ្ញើតែ Text ឬ រូបភាព + Caption ប៉ុណ្ណោះ។"))
         return True
 
-    _sched_payload[user_id] = {"photo_file_id": photo_file_id, "caption": caption_text, "text": plain_text}
+    _sched_payload[user_id] = {
+        "photo_file_id": photo_file_id,
+        "caption": caption_text,
+        "text": plain_text,
+        "parse_mode": parse_mode,
+    }
     context.user_data["sched_state"] = SCHED_WAIT_TIME
     await safe_send(lambda: msg.reply_text(
         "🕐 <b>ពេលវេលា Broadcast — Phnom Penh local time</b>\n\n"
@@ -13375,14 +13811,20 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
     row_id = row["id"]
     dt_str = _fmt_dt(broadcast_at)
 
+    preview_content, preview_mode = _broadcast_strip_format_directive(
+        payload.get("caption") if payload.get("photo_file_id") else payload.get("text"),
+        payload.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO,
+    )
+    mode_line = f"Format: <b>{html.escape(_broadcast_parse_mode_label(preview_mode))}</b>\n"
     if payload.get("photo_file_id"):
-        cap_preview = html.escape(payload["caption"]) if payload.get("caption") else "<i>(គ្មាន Caption)</i>"
+        cap_preview = html.escape(preview_content) if preview_content else "<i>(គ្មាន Caption)</i>"
         await safe_send(lambda: msg.reply_photo(
             photo=payload["photo_file_id"],
             caption=(
                 f"📅 <b>Preview Schedule #{row_id}</b>\n"
                 f"⏰ {dt_str}\n"
-                "ស្ថានភាព: <b>Preview — មិនទាន់បញ្ជាក់</b>\n\n"
+                "ស្ថានភាព: <b>Preview — មិនទាន់បញ្ជាក់</b>\n"
+                f"{mode_line}\n"
                 f"{cap_preview}"
             ),
             parse_mode="HTML",
@@ -13392,8 +13834,9 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
         await safe_send(lambda: msg.reply_text(
             f"📅 <b>Preview Schedule #{row_id}</b>\n"
             f"⏰ {dt_str}\n"
-            "ស្ថានភាព: <b>Preview — មិនទាន់បញ្ជាក់</b>\n\n"
-            f"{html.escape(payload.get('text') or '')}",
+            "ស្ថានភាព: <b>Preview — មិនទាន់បញ្ជាក់</b>\n"
+            f"{mode_line}\n"
+            f"{html.escape(preview_content)}",
             parse_mode="HTML",
             reply_markup=get_sched_confirm_kb(row_id),
         ))
