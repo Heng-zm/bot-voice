@@ -2608,7 +2608,12 @@ def web_admin_login():
     if not password_env:
         return _web_render("Setup required", "<div class='card'><h2>Set ADMIN_WEB_PASSWORD first</h2><p>The web admin dashboard is disabled until a password exists.</p></div>", status_code=503)
     if request.method == "POST":
-        password = str(request.form.get("password") or "")
+        # Starlette SessionMiddleware stores sessions as a signed-cookie dict.
+        # Flask's `session.permanent = True` is not supported here and raises
+        # AttributeError on successful login, making the dashboard look like it
+        # cannot log in. Cookie lifetime is already controlled by
+        # SessionMiddleware(max_age=WEB_ADMIN_SESSION_DAYS * 86400).
+        password = str(request.form.get("password") or "").strip()
         default_admin = int(sorted(ADMIN_IDS)[0]) if ADMIN_IDS else 0
         admin_id = _web_int(request.form.get("admin_id"), default_admin)
         if not hmac.compare_digest(password, password_env):
@@ -2617,9 +2622,9 @@ def web_admin_login():
             flask_flash("Admin ID is not in ADMIN_IDS.", "error")
         else:
             session.clear()
-            session.permanent = True
             session["web_admin_ok"] = True
             session["web_admin_id"] = int(admin_id)
+            session["web_login_at"] = datetime.now(timezone.utc).isoformat()
             _web_csrf_token()
             flask_flash("Logged in.", "success")
             return redirect(_web_safe_next_url(request.args.get("next"), "web_admin_home"))
