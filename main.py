@@ -12708,6 +12708,7 @@ async def _send_telegram_broadcast_message(
     text: str,
     parse_mode: str | None,
     photo_file_id: str | None = None,
+    reply_markup: Any | None = None,
 ) -> None:
     """Send a text/photo broadcast with parse-mode fallback."""
     parse_candidates = _broadcast_candidate_parse_modes(text, parse_mode)
@@ -12723,6 +12724,8 @@ async def _send_telegram_broadcast_message(
                 }
                 if telegram_parse_mode and text:
                     kwargs["parse_mode"] = telegram_parse_mode
+                if reply_markup is not None:
+                    kwargs["reply_markup"] = reply_markup
                 await bot.send_photo(**kwargs)
             else:
                 kwargs = {
@@ -12732,6 +12735,8 @@ async def _send_telegram_broadcast_message(
                 }
                 if telegram_parse_mode:
                     kwargs["parse_mode"] = telegram_parse_mode
+                if reply_markup is not None:
+                    kwargs["reply_markup"] = reply_markup
                 await bot.send_message(**kwargs)
             return
         except BadRequest as exc:
@@ -13591,23 +13596,34 @@ async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption_text if photo_file_id else plain_text,
         parse_mode,
     )
-    mode_note = ""
-    if photo_file_id:
-        preview_cap = html.escape(preview_content) if preview_content else "<i>(No caption)</i>"
-        await safe_send(lambda: msg.reply_photo(
-            photo=photo_file_id,
-            caption=(
-                f"{summary}{mode_note}\n\n"
-                f"<b>Content preview</b>\n{preview_cap}"
-            )[:1024],
-            parse_mode="HTML",
+
+    # Send the admin metadata as HTML, then send the real content preview as a
+    # separate Telegram message/photo using the content's own parse mode.
+    # This fixes the old preview bug where <b>...</b> or Markdown appeared as
+    # raw text because the content was escaped inside an HTML wrapper.
+    await safe_send(lambda: msg.reply_text(
+        f"{summary}\n\n"
+        "👁️ <b>Content preview is shown below.</b>\n"
+        "Use the buttons under the preview after checking the rendered message.",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    ))
+    try:
+        await safe_send(lambda: _send_telegram_broadcast_message(
+            context.bot,
+            chat_id=msg.chat_id,
+            text=preview_content or "",
+            parse_mode=preview_mode,
+            photo_file_id=photo_file_id,
             reply_markup=get_broadcast_confirm_kb(),
         ))
-    else:
+    except Exception as exc:
+        _pending_broadcast.pop(user_id, None)
+        context.user_data.pop("bc_state", None)
         await safe_send(lambda: msg.reply_text(
-            f"{summary}{mode_note}\n\n<b>Content preview</b>\n{html.escape(preview_content)}",
+            "❌ Preview failed, so this broadcast was not queued.\n"
+            f"Reason: <code>{html.escape(str(exc)[:300])}</code>",
             parse_mode="HTML",
-            reply_markup=get_broadcast_confirm_kb(),
         ))
 
 
@@ -13816,27 +13832,32 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
         payload.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO,
     )
     mode_line = f"Format: <b>{html.escape(_broadcast_parse_mode_label(preview_mode))}</b>\n"
-    if payload.get("photo_file_id"):
-        cap_preview = html.escape(preview_content) if preview_content else "<i>(គ្មាន Caption)</i>"
-        await safe_send(lambda: msg.reply_photo(
-            photo=payload["photo_file_id"],
-            caption=(
-                f"📅 <b>Preview Schedule #{row_id}</b>\n"
-                f"⏰ {dt_str}\n"
-                "ស្ថានភាព: <b>Preview — មិនទាន់បញ្ជាក់</b>\n"
-                f"{mode_line}\n"
-                f"{cap_preview}"
-            ),
-            parse_mode="HTML",
+
+    # Keep schedule details in a safe HTML message and render the actual
+    # broadcast content separately with its selected Telegram parse mode.
+    # This prevents HTML/Markdown from showing as raw tags in the preview.
+    await safe_send(lambda: msg.reply_text(
+        f"📅 <b>Preview Schedule #{row_id}</b>\n"
+        f"⏰ {dt_str}\n"
+        "ស្ថានភាព: <b>Preview — មិនទាន់បញ្ជាក់</b>\n"
+        f"{mode_line}\n"
+        "👁️ <b>Content preview is shown below.</b>",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    ))
+    try:
+        await safe_send(lambda: _send_telegram_broadcast_message(
+            context.bot,
+            chat_id=msg.chat_id,
+            text=preview_content or "",
+            parse_mode=preview_mode,
+            photo_file_id=payload.get("photo_file_id"),
             reply_markup=get_sched_confirm_kb(row_id),
         ))
-    else:
+    except Exception as exc:
         await safe_send(lambda: msg.reply_text(
-            f"📅 <b>Preview Schedule #{row_id}</b>\n"
-            f"⏰ {dt_str}\n"
-            "ស្ថានភាព: <b>Preview — មិនទាន់បញ្ជាក់</b>\n"
-            f"{mode_line}\n"
-            f"{html.escape(preview_content)}",
+            "❌ Schedule was saved, but the rendered preview failed. You can cancel it from /schedules.\n"
+            f"Reason: <code>{html.escape(str(exc)[:300])}</code>",
             parse_mode="HTML",
             reply_markup=get_sched_confirm_kb(row_id),
         ))
