@@ -323,6 +323,8 @@ class AppSettings(BaseSettings):
     BOT_MODE: str = "POLLING"
     TELEGRAM_WEBHOOK_URL: str | None = None
     TELEGRAM_WEBHOOK_SECRET_TOKEN: str | None = None
+    TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES: bool = False
+    TELEGRAM_ALLOWED_UPDATES: str = "message,callback_query"
     HTTP_MAX_CONNECTIONS: int = 100
     HTTP_MAX_KEEPALIVE_CONNECTIONS: int = 20
     REDIS_MAX_CONNECTIONS: int = 100
@@ -932,6 +934,11 @@ def ping():
     return "pong", 200
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(status_code=204)
+
+
 @app_flask.route("/readyz")
 def readyz():
     """Small deployment health endpoint for Render/UptimeRobot.
@@ -1028,6 +1035,26 @@ def _telegram_webhook_target_url() -> str:
     if not secret_token:
         raise RuntimeError("BOT_MODE=WEBHOOK requires TELEGRAM_WEBHOOK_SECRET_TOKEN.")
     return f"{base_url}/tg-webhook-{quote(secret_token, safe='')}"
+
+
+def _telegram_allowed_updates() -> list[str]:
+    """Return setWebhook allowed_updates from env/runtime safely.
+
+    Defaults to the update types this bot actually handles. Operators can add
+    edited_message, my_chat_member, etc. with TELEGRAM_ALLOWED_UPDATES without
+    touching code.
+    """
+    raw = str(
+        os.environ.get("TELEGRAM_ALLOWED_UPDATES")
+        or getattr(SETTINGS, "TELEGRAM_ALLOWED_UPDATES", "message,callback_query")
+        or "message,callback_query"
+    )
+    allowed = []
+    for item in raw.split(","):
+        item = item.strip()
+        if item and re.fullmatch(r"[a-z_]+", item) and item not in allowed:
+            allowed.append(item)
+    return allowed or ["message", "callback_query"]
 
 
 async def _read_limited_webhook_body(req: FastAPIRequest, max_body: int) -> bytes:
@@ -1130,8 +1157,11 @@ async def _configure_telegram_webhook_via_http() -> None:
     api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
     payload = {
         "url": target_url,
-        "allowed_updates": ["message", "callback_query"],
-        "drop_pending_updates": True,
+        "allowed_updates": _telegram_allowed_updates(),
+        # Keep pending updates by default so a Render restart/deploy does not
+        # silently lose user messages. Set TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES=true
+        # only when intentionally clearing a broken backlog.
+        "drop_pending_updates": _env_bool("TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES", False),
         "secret_token": secret_token,
     }
     timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
@@ -2323,13 +2353,15 @@ def _web_progress_bar(done: Any, total: Any) -> str:
 def _web_blocked_ids_for_users(users: list[Any]) -> set[int]:
     """Batch-load blocked status to avoid one Supabase query per table row/user."""
     ids: list[int] = []
+    seen_ids: set[int] = set()
     for item in users or []:
         raw = item.get("user_id") if isinstance(item, dict) else item
         try:
             uid = int(raw)
         except Exception:
             continue
-        if uid not in ids:
+        if uid not in seen_ids:
+            seen_ids.add(uid)
             ids.append(uid)
 
     if not ids:
@@ -5008,11 +5040,29 @@ def web_admin_performance_json():
 
 
 def _run_admin_coro_sync(coro: Any, timeout: float = 20.0) -> Any:
-    """Run an async runtime admin mutation from a sync web-admin route."""
+    """Run an async runtime admin mutation from a sync web-admin route.
+
+    FastAPI compatibility routes run sync handlers in a worker thread. This
+    helper safely schedules mutations onto the bot/background loop when present,
+    cancels timed-out work, and refuses to block a currently-running event loop.
+    """
     loop = _WEB_BROADCAST_QUEUE_LOOP
     if loop is not None and loop.is_running():
         future = asyncio.run_coroutine_threadsafe(coro, loop)
-        return future.result(timeout=timeout)
+        try:
+            return future.result(timeout=timeout)
+        except Exception:
+            if not future.done():
+                future.cancel()
+            raise
+
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+    if running_loop is not None and running_loop.is_running():
+        _close_unawaited(coro)
+        raise RuntimeError("Cannot run admin coroutine synchronously from an active event loop.")
     return asyncio.run(coro)
 
 
@@ -8276,7 +8326,11 @@ def _log_future_exception(future):
     with suppress(Exception):
         exc = future.exception()
         if exc:
-            logger.error(f"DB executor task raised: {exc}", exc_info=exc)
+            logger.error(
+                "DB executor task raised: %s",
+                exc,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
 
 
 def _submit_db(fn, *args, **kwargs):
@@ -17063,7 +17117,9 @@ async def _run_bot():
     sweep_task: asyncio.Task | None = None
 
     async with app:
-        await app.initialize()
+        # Application.__aenter__() already calls initialize(). Calling
+        # initialize() again can raise "Application is already initialized"
+        # on python-telegram-bot v20/v21 and break deploy restarts.
         await app.start()
         polling_started = False
         if _run_state_bot_mode() == "WEBHOOK":
@@ -17104,6 +17160,10 @@ async def _run_bot():
                 task.cancel()
                 with suppress(asyncio.CancelledError, Exception):
                     await task
+            # start() is not automatically paired by the async context manager;
+            # stop it explicitly before __aexit__ performs shutdown().
+            with suppress(Exception):
+                await app.stop()
 
 
 # ---------------------------------------------------------------------------
