@@ -2416,12 +2416,101 @@ def _web_status_card(label: str, value: Any, hint: str = "", kind: str = "") -> 
     )
 
 
+def _web_admin_feature_groups() -> list[tuple[str, list[tuple[str, str, str, str, str]]]]:
+    """Central feature map used by the Admin Center launcher.
+
+    Keeping this list in one place makes the dashboard feel consistent and
+    prevents feature links from drifting across pages as the admin system grows.
+    """
+    return [
+        ("Operate", [
+            ("Live Dashboard", "/admin", "⌘", "Realtime counts, schedules, jobs, and system status.", "dashboard"),
+            ("Broadcast", "/admin/broadcast", "📣", "Send, queue, pause, resume, and inspect broadcast jobs.", "broadcast"),
+            ("Schedules", "/admin/schedules", "⏱", "Create, preview, edit, cancel, and monitor scheduled sends.", "schedules"),
+            ("Calendar", "/admin/schedules/calendar", "🗓", "View upcoming scheduled messages in a calendar-style flow.", "calendar"),
+        ]),
+        ("Understand", [
+            ("Analytics", "/admin/analytics", "📈", "Usage trends, recent activity, and delivery performance.", "analytics"),
+            ("Users", "/admin/users", "👥", "Search users, inspect profile details, and manage access.", "users"),
+            ("CRM", "/admin/crm", "⭐", "Labels, notes, trust status, and CSV export for user care.", "crm"),
+            ("Health", "/admin/health", "🩺", "Deployment checks, runtime metrics, cache and database status.", "health"),
+        ]),
+        ("Control", [
+            ("Optimize", "/admin/optimize", "⚡", "Cleanup, cache refresh, and safe performance tuning actions.", "optimize"),
+            ("Control Center", "/admin/control", "🛡️", "Maintenance mode, polling/webhook mode, and protected controls.", "control"),
+            ("Runtime", "/admin/runtime", "🛠️", "Live runtime knobs for rate limits, pools, and bot mode.", "runtime"),
+            ("Settings", "/admin/settings", "⚙", "Feature toggles for TTS, OCR, AI resolver, and admin behavior.", "settings"),
+            ("API Keys", "/admin/api-keys", "🔑", "Create, view, and revoke AI assistant API access keys.", "api"),
+            ("Locks", "/admin/locks", "🔒", "Inspect or release distributed scheduler locks safely.", "locks"),
+            ("SQL Setup", "/admin/sql", "☷", "Copy required Supabase schema and setup instructions.", "sql"),
+        ]),
+    ]
+
+
+def _web_feature_launcher_html(active: str = "dashboard", compact: bool = False) -> str:
+    """Render a touch-friendly launcher for every admin feature."""
+    groups: list[str] = []
+    for title, items in _web_admin_feature_groups():
+        cards: list[str] = []
+        for label, url, icon, desc, key in items:
+            active_cls = " feature-card-active" if key == active else ""
+            cards.append(
+                "<a class='feature-card%s' href='%s'>"
+                "<span class='feature-icon'>%s</span>"
+                "<span><b>%s</b><small>%s</small></span>"
+                "<em>Open</em></a>"
+                % (
+                    active_cls,
+                    _web_h(url),
+                    _web_h(icon),
+                    _web_h(label),
+                    _web_h(desc),
+                )
+            )
+        groups.append(
+            "<section class='feature-section'><div class='section-title'><h2>%s</h2>"
+            "<span class='muted'>%s tools</span></div><div class='feature-grid%s'>%s</div></section>"
+            % (
+                _web_h(title),
+                len(items),
+                " feature-grid-compact" if compact else "",
+                "".join(cards),
+            )
+        )
+    return "<div class='feature-launcher'>" + "".join(groups) + "</div>"
+
+
+def _web_command_hero_html(counts: dict[str, Any]) -> str:
+    """Hero summary shown at the top of Admin Center."""
+    total_jobs = int(counts.get("pending") or 0) + int(counts.get("sending") or 0) + int(counts.get("failed") or 0)
+    return f"""
+    <div class='command-hero'>
+      <div>
+        <span class='hero-kicker'><span class='v3-live-dot'></span>Admin System Center</span>
+        <h2>Control every bot feature from one smooth dashboard.</h2>
+        <p>Fast access to broadcasts, schedules, users, CRM, settings, runtime controls, health checks, locks, and SQL setup.</p>
+        <div class='actions hero-actions'>
+          <a class='btn' href='/admin/broadcast'>New Broadcast</a>
+          <a class='btn secondary' href='/admin/users'>Search Users</a>
+          <a class='btn ghost' href='/admin/optimize'>Optimize Now</a>
+        </div>
+      </div>
+      <div class='hero-panel'>
+        <div><span class='muted'>Users</span><b data-count='users'>{_web_h(counts.get('users', 0))}</b></div>
+        <div><span class='muted'>Jobs</span><b>{_web_h(total_jobs)}</b></div>
+        <div><span class='muted'>Blocked</span><b data-count='blocked'>{_web_h(counts.get('blocked', 0))}</b></div>
+        <div><span class='muted'>API Keys</span><b data-count='api_keys'>{_web_h(counts.get('api_keys', 0))}</b></div>
+      </div>
+    </div>
+    """
+
+
 def _web_render(title: str, body: str, *, active: str = "dashboard", status_code: int = 200):
     csrf = _web_csrf_token() if session.get("web_admin_ok") else ""
     nav = [
-        ("dashboard", "Dashboard", "/admin", "▣"),
+        ("dashboard", "Admin Center", "/admin", "⌘"),
         ("optimize", "Optimize", "/admin/optimize", "⚡"),
-        ("analytics", "Analytics V2", "/admin/analytics", "📈"),
+        ("analytics", "Analytics", "/admin/analytics", "📈"),
         ("users", "Users", "/admin/users", "👥"),
         ("crm", "CRM", "/admin/crm", "⭐"),
         ("schedules", "Schedules", "/admin/schedules", "⏱"),
@@ -2433,7 +2522,7 @@ def _web_render(title: str, body: str, *, active: str = "dashboard", status_code
         ("settings", "Settings", "/admin/settings", "⚙"),
         ("api", "API Keys", "/admin/api-keys", "🔑"),
         ("locks", "Locks", "/admin/locks", "🔒"),
-        ("sql", "SQL", "/admin/sql", "☷"),
+        ("sql", "SQL Setup", "/admin/sql", "☷"),
     ]
     bottom_nav = [item for item in nav if item[0] in {"dashboard", "optimize", "users", "crm", "broadcast"}]
     template = """
@@ -2460,7 +2549,7 @@ tailwind.config = {
 @layer base{
   *{@apply box-border}
   html{@apply scroll-smooth bg-slate-950}
-  body{@apply min-h-screen m-0 bg-slate-950 text-slate-100 font-sans antialiased; background:radial-gradient(circle at top left,rgba(59,130,246,.22),transparent 30rem),radial-gradient(circle at bottom right,rgba(16,185,129,.12),transparent 28rem),linear-gradient(135deg,#020617,#0f172a 58%,#111827)}
+  body{@apply min-h-screen m-0 bg-slate-950 text-slate-100 font-sans antialiased; background:radial-gradient(circle at top left,rgba(59,130,246,.22),transparent 30rem),radial-gradient(circle at bottom right,rgba(16,185,129,.12),transparent 28rem),linear-gradient(135deg,#020617,#0f172a 58%,#111827); -webkit-tap-highlight-color:transparent}
   a{@apply text-blue-200 no-underline transition hover:text-white}
   code{@apply rounded-lg border border-white/10 bg-slate-950/80 px-1.5 py-0.5 text-xs text-slate-100}
   pre{@apply max-h-[65vh] overflow-auto whitespace-pre-wrap rounded-2xl border border-white/10 bg-slate-950/90 p-4 text-sm text-slate-100}
@@ -2474,23 +2563,24 @@ tailwind.config = {
 }
 @layer components{
   .layout{@apply grid min-h-screen grid-cols-[280px_minmax(0,1fr)]}
-  .side{@apply sticky top-0 h-screen overflow-y-auto border-r border-white/10 bg-slate-950/75 p-5 backdrop-blur-2xl}
+  .side{@apply sticky top-0 h-screen overflow-y-auto border-r border-white/10 bg-slate-950/80 p-5 backdrop-blur-2xl}
   .brand{@apply flex items-center gap-3 text-2xl font-black tracking-tight text-white}
   .brand-mark{@apply grid h-11 w-11 place-items-center rounded-2xl bg-gradient-to-br from-blue-500 to-violet-600 shadow-lg shadow-blue-500/20}
   .sub,.muted,.help{@apply text-slate-400}
   .sub{@apply my-4 text-xs}
   .help{@apply mt-1.5 text-xs}
   .nav{@apply grid gap-1.5}
+  .nav-search{@apply mb-3 w-full rounded-2xl border border-white/10 bg-slate-950/60 px-3 py-2.5 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-blue-400 focus:ring-4 focus:ring-blue-500/10}
   .nav a{@apply flex items-center gap-3 rounded-2xl border border-transparent px-3 py-3 text-sm font-bold text-slate-200 hover:border-blue-300/20 hover:bg-blue-400/10}
   .nav a.active{@apply border-blue-300/25 bg-blue-400/15 text-white shadow-sm}
   .nav-ico{@apply w-6 text-center}
-  .main{@apply w-full max-w-[1500px] px-6 py-6 pb-28 lg:pb-6}
+  .main{@apply mx-auto w-full max-w-[1560px] px-6 py-6 pb-28 lg:pb-6}
   .top{@apply mb-5 flex items-start justify-between gap-4}
   .h1{@apply text-3xl font-black tracking-tight text-white}
   .top-right{@apply text-right text-xs text-slate-400}
   .mobilebar{@apply sticky top-0 z-50 hidden items-center justify-between border-b border-white/10 bg-slate-950/90 px-4 py-3 backdrop-blur-2xl}
   .menu-toggle{@apply hidden}
-  .card{@apply mb-4 rounded-3xl border border-white/10 bg-slate-900/75 p-5 shadow-soft backdrop-blur-xl}
+  .card{@apply mb-4 rounded-3xl border border-white/10 bg-slate-900/75 p-5 shadow-soft backdrop-blur-xl transition duration-200 hover:border-white/15}
   .grid{@apply mb-4 grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4}
   .grid2{@apply grid grid-cols-1 gap-4 xl:grid-cols-2}
   .row{@apply grid grid-cols-1 gap-3 md:grid-cols-2}
@@ -2552,11 +2642,33 @@ tailwind.config = {
   .bottom-nav a{@apply flex flex-col items-center justify-center gap-1 rounded-2xl px-1 py-2 text-[11px] font-bold text-slate-400}
   .bottom-nav a.active{@apply bg-blue-500/15 text-white}
   .mobile-search-sticky{@apply sticky top-[60px] z-30 bg-slate-950/70 backdrop-blur-xl}
+  .command-hero{@apply mb-4 grid grid-cols-1 gap-4 overflow-hidden rounded-[2rem] border border-white/10 bg-gradient-to-br from-blue-500/20 via-slate-900/85 to-emerald-500/10 p-5 shadow-soft backdrop-blur-xl xl:grid-cols-[1.4fr_.6fr]}
+  .command-hero h2{@apply mt-3 text-3xl font-black leading-tight tracking-tight text-white md:text-4xl}
+  .command-hero p{@apply mt-2 max-w-3xl text-sm leading-6 text-slate-300}
+  .hero-kicker{@apply inline-flex items-center rounded-full border border-emerald-400/20 bg-emerald-500/10 px-3 py-1 text-xs font-black uppercase tracking-wider text-emerald-100}
+  .hero-actions{@apply mt-4}
+  .hero-panel{@apply grid grid-cols-2 gap-3}
+  .hero-panel div{@apply rounded-3xl border border-white/10 bg-slate-950/45 p-4}
+  .hero-panel b{@apply mt-1 block text-3xl font-black text-white}
+  .feature-launcher{@apply grid gap-4}
+  .feature-section{@apply rounded-3xl border border-white/10 bg-slate-900/55 p-4 shadow-sm backdrop-blur-xl}
+  .section-title{@apply mb-3 flex items-center justify-between gap-3}
+  .feature-grid{@apply grid grid-cols-1 gap-3 md:grid-cols-2 2xl:grid-cols-4}
+  .feature-grid-compact{@apply 2xl:grid-cols-3}
+  .feature-card{@apply group relative flex min-h-[112px] items-start gap-3 rounded-3xl border border-white/10 bg-slate-950/35 p-4 text-slate-100 transition duration-200 hover:-translate-y-0.5 hover:border-blue-300/35 hover:bg-blue-500/10 hover:text-white hover:shadow-lg hover:shadow-blue-950/20}
+  .feature-card-active{@apply border-blue-300/30 bg-blue-500/15}
+  .feature-icon{@apply grid h-11 w-11 shrink-0 place-items-center rounded-2xl bg-white/10 text-xl}
+  .feature-card b{@apply block text-sm font-black text-white}
+  .feature-card small{@apply mt-1 block text-xs leading-5 text-slate-400 group-hover:text-slate-300}
+  .feature-card em{@apply absolute bottom-3 right-4 text-[11px] font-black not-italic text-blue-200 opacity-0 transition group-hover:opacity-100}
+  .toast{@apply fixed bottom-24 left-1/2 z-[70] hidden -translate-x-1/2 rounded-2xl border border-white/10 bg-slate-950/95 px-4 py-3 text-sm font-bold text-white shadow-soft backdrop-blur-xl}
+  .toast.show{@apply block}
 }
+
 </style>
 <style>
 @media(max-width:860px){.mobilebar{display:flex}.layout{display:block}.side{display:none;position:fixed;z-index:60;inset:58px 0 auto 0;height:calc(100vh - 58px);border-right:0;border-bottom:1px solid rgba(255,255,255,.1)}.menu-toggle:checked~.layout .side{display:block}.main{padding:16px 16px calc(92px + env(safe-area-inset-bottom))}.top{display:block}.top-right{text-align:left;margin-top:.4rem}.h1{font-size:1.55rem}.desktop-table{display:none}.mobile-card{display:grid;gap:.75rem}.table{font-size:12px;min-width:720px}.card{padding:16px}.sticky-actions .actions{display:grid;grid-template-columns:1fr 1fr}.sticky-actions .actions>*{width:100%}input,select,textarea{font-size:16px}button,input[type=submit],.btn{min-height:44px}.actions .btn,.actions button{width:auto}}
-@media(max-width:520px){.grid{grid-template-columns:1fr}.actions .btn,.actions button{width:100%}.sticky-actions .actions{grid-template-columns:1fr}.pillbar{display:grid}.pillbar .btn{width:100%}.mini-stat b{font-size:18px}}
+@media(max-width:520px){.grid{grid-template-columns:1fr}.actions .btn,.actions button{width:100%}.sticky-actions .actions{grid-template-columns:1fr}.pillbar{display:grid}.pillbar .btn{width:100%}.mini-stat b{font-size:18px}.command-hero h2{font-size:1.75rem}.hero-panel b{font-size:1.35rem}.feature-card{min-height:auto}}
 </style>
 </head>
 <body>
@@ -2566,16 +2678,18 @@ tailwind.config = {
 <aside class="side">
   <div class="brand"><span class="brand-mark">🤖</span><span>Bot Admin</span></div>
   <div class="sub">System V6 · Admin ID: <code>{{ admin_id }}</code></div>
-  <nav class="nav">{% for key,label,url,ico in nav %}<a class="{{ 'active' if key==active else '' }}" href="{{ url }}"><span class="nav-ico">{{ ico }}</span><span>{{ label }}</span></a>{% endfor %}</nav>
-  <div class="footer"><div>Supabase: <b>{{ 'ON' if supabase_on else 'OFF' }}</b></div><div>Redis: <b>{{ 'ON' if redis_on else 'OFF' }}</b></div><div><a href="/ping">Ping</a> · <a href="/admin/logout">Logout</a></div></div>
+  <input class="nav-search" data-nav-filter placeholder="Search admin features…" aria-label="Search admin features">
+  <nav class="nav" data-nav-list>{% for key,label,url,ico in nav %}<a class="{{ 'active' if key==active else '' }}" href="{{ url }}" data-nav-item data-label="{{ label|lower }}"><span class="nav-ico">{{ ico }}</span><span>{{ label }}</span></a>{% endfor %}</nav>
+  <div class="footer"><div>Supabase: <b>{{ 'ON' if supabase_on else 'OFF' }}</b></div><div>Redis: <b>{{ 'ON' if redis_on else 'OFF' }}</b></div><div><a href="/ping">Ping</a> · <a href="/readyz">Ready</a> · <a href="/admin/logout">Logout</a></div><div class="muted">Tip: press <span class="kbd">Ctrl</span> + <span class="kbd">K</span> to search.</div></div>
 </aside>
 <main class="main">
-  <div class="top"><div><div class="h1">{{ title }}</div><div class="muted">Clean admin panel · optimization center · safe Telegram operations</div></div><div class="top-right"><div data-local-time>{{ now }}</div><div>{{ time_hint }}</div></div></div>
+  <div class="top"><div><div class="h1">{{ title }}</div><div class="muted">Unified Admin Center · smoother workflow · safe Telegram operations</div></div><div class="top-right"><div data-local-time>{{ now }}</div><div>{{ time_hint }}</div></div></div>
   {% for cat,msg in messages %}<div class="flash {{ cat }}">{{ msg }}</div>{% endfor %}
   {{ body|safe }}
 </main>
 </div>
 <nav class="bottom-nav">{% for key,label,url,ico in bottom_nav %}<a class="{{ 'active' if key==active else '' }}" href="{{ url }}"><span>{{ ico }}</span><span>{{ label }}</span></a>{% endfor %}</nav>
+<div class="toast" data-toast></div>
 <script>
 window.WEB_CSRF={{ csrf|tojson }};
 (function(){
@@ -2584,7 +2698,11 @@ window.WEB_CSRF={{ csrf|tojson }};
   qsa('form[data-confirm]').forEach(function(form){form.addEventListener('submit',function(e){var msg=form.getAttribute('data-confirm')||'Are you sure?';if(!confirm(msg)){e.preventDefault();return false;}})});
   qsa('form').forEach(function(form){form.addEventListener('submit',function(){var btn=form.querySelector('button[type="submit"],button:not([type]),input[type="submit"]');if(btn&&!form.dataset.noDisable){setTimeout(function(){btn.disabled=true;btn.dataset.oldText=btn.innerText;btn.innerText='Working…'},0)}})});
   qsa('[data-count-target]').forEach(function(el){var target=qs(el.getAttribute('data-count-target'));function update(){if(target){el.textContent=target.value.length}};if(target){target.addEventListener('input',update);update();}});
-  qsa('[data-copy]').forEach(function(btn){btn.addEventListener('click',function(){var text=btn.getAttribute('data-copy')||'';navigator.clipboard&&navigator.clipboard.writeText(text).then(function(){btn.innerText='Copied'}).catch(function(){})})});
+  function toast(msg){var el=qs('[data-toast]');if(!el)return;el.textContent=msg;el.classList.add('show');clearTimeout(el._t);el._t=setTimeout(function(){el.classList.remove('show')},1800)}
+  qsa('[data-copy]').forEach(function(btn){btn.addEventListener('click',function(){var text=btn.getAttribute('data-copy')||'';navigator.clipboard&&navigator.clipboard.writeText(text).then(function(){btn.innerText='Copied';toast('Copied to clipboard')}).catch(function(){toast('Copy failed')})})});
+  var navFilter=qs('[data-nav-filter]');
+  if(navFilter){navFilter.addEventListener('input',function(){var q=navFilter.value.trim().toLowerCase();qsa('[data-nav-item]').forEach(function(a){var hay=(a.getAttribute('data-label')||a.textContent||'').toLowerCase();a.style.display=!q||hay.indexOf(q)>=0?'flex':'none';});});document.addEventListener('keydown',function(e){if((e.ctrlKey||e.metaKey)&&String(e.key).toLowerCase()==='k'){e.preventDefault();navFilter.focus();navFilter.select();}})}
+  qsa('[data-nav-item],.bottom-nav a').forEach(function(a){a.addEventListener('click',function(){var t=qs('#menu-toggle');if(t)t.checked=false;})});
   var live=qs('[data-live-status]');
   function applyStatus(data){if(!data||!data.ok)return;qsa('[data-metric]').forEach(function(el){var k=el.getAttribute('data-metric');if(data.metrics&&Object.prototype.hasOwnProperty.call(data.metrics,k)){el.textContent=data.metrics[k]}});var up=qs('[data-uptime]');if(up)up.textContent=data.uptime||'';var lt=qs('[data-local-time]');if(lt&&data.local_time)lt.textContent=data.local_time;}
   function refreshStatus(){fetch('/admin/status.json?light=1',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null}).then(applyStatus).catch(function(){});}
@@ -3182,8 +3300,10 @@ def web_admin_home():
     live_schedule_rows = _web_schedule_rows_html(_web_live_schedules(), _web_csrf_token(), "")
     live_job_rows = _web_broadcast_job_rows_html(_web_csrf_token(), include_actions=False)
 
+    feature_launcher = _web_feature_launcher_html(active="dashboard")
     body = f"""
     <div data-live-status data-realtime-dashboard></div>
+    {_web_command_hero_html(counts)}
     <div class='actions' style='justify-content:space-between;margin-bottom:12px'>
       <span class='live-note'><span class='v3-live-dot'></span>Realtime dashboard refresh every {WEB_LIVE_POLL_SECONDS} seconds</span>
       <span class='muted' data-live-updated>Updated {_web_h(_fmt_local_dt())}</span>
@@ -3195,6 +3315,7 @@ def web_admin_home():
       {_web_count_card('api_keys', 'Active API keys', counts['api_keys'], 'generated admin access keys', 'ok' if counts['api_keys'] else '')}
     </div>
     {_optimization_score_card_html(_runtime_performance_snapshot(light=True))}
+    {feature_launcher}
     <div class='grid2'>
       <div class='card'><h2>System health</h2><div class='table-wrap'><table class='table'>
         <tr><td>Uptime</td><td><b data-uptime>{_web_h(_format_uptime())}</b></td></tr>
@@ -3216,7 +3337,13 @@ def web_admin_home():
       <div class='card'><h2>Quick actions</h2><p class='muted'>Common admin tasks. Dangerous actions still require confirmation on their pages.</p><div class='actions'><a class='btn' href='/admin/optimize'>Optimize</a><a class='btn' href='/admin/users'>Manage Users</a><a class='btn' href='/admin/analytics'>Analytics V2</a><a class='btn' href='/admin/schedules/calendar'>Calendar</a><a class='btn' href='/admin/schedules'>Schedules</a><a class='btn' href='/admin/broadcast'>Broadcast</a><a class='btn secondary' href='/admin/health'>Health Center</a><a class='btn secondary' href='/admin/control'>Control Center</a><a class='btn secondary' href='/admin/sql'>SQL Setup</a></div></div>
     </div>
     """
-    return _web_render("Dashboard", body, active="dashboard")
+    return _web_render("Admin Center", body, active="dashboard")
+
+
+@app_flask.route("/admin/center")
+@web_admin_required
+def web_admin_center_alias():
+    return redirect(url_for("web_admin_home"))
 
 
 @app_flask.route("/admin/health")
