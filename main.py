@@ -619,7 +619,13 @@ class FastAPICompatApp:
             or os.environ.get("WEB_SECRET_KEY", "")
             or secrets.token_hex(32)
         )
-        self.fastapi = FastAPI(title="Telegram Bot Admin", docs_url=None, redoc_url=None)
+        api_docs_enabled = _env_bool("API_DOCS_ENABLED", True)
+        self.fastapi = FastAPI(
+            title="Telegram Bot Admin",
+            docs_url="/docs" if api_docs_enabled else None,
+            redoc_url="/redoc" if api_docs_enabled else None,
+            openapi_url="/openapi.json" if api_docs_enabled else None,
+        )
         self.fastapi.add_middleware(
             SessionMiddleware,
             secret_key=secret_key,
@@ -802,7 +808,7 @@ class FastAPICompatApp:
                 endpoint,
                 methods=route_methods,
                 name=func.__name__,
-                include_in_schema=False,
+                include_in_schema=_env_bool("API_DOCS_INCLUDE_COMPAT_ROUTES", True),
             )
             return func
         return decorator
@@ -948,6 +954,26 @@ def readyz():
         with suppress(Exception):
             payload["uptime"] = fmt()
     return jsonify(payload)
+
+
+@app.get("/api-docs", include_in_schema=False)
+async def api_docs_redirect():
+    """Convenience alias for Swagger UI."""
+    if not _env_bool("API_DOCS_ENABLED", True):
+        return _FastJSONResponse({
+            "ok": False,
+            "error": "API docs are disabled. Set API_DOCS_ENABLED=true and restart.",
+            "docs": "/docs",
+            "redoc": "/redoc",
+            "openapi": "/openapi.json",
+        }, status_code=404)
+    return RedirectResponse(url="/docs", status_code=302)
+
+
+@app.get("/swagger", include_in_schema=False)
+async def swagger_redirect():
+    """Convenience alias for Swagger UI."""
+    return await api_docs_redirect()
 
 
 def _runtime_webhook_secret_token() -> str:
