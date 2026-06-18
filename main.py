@@ -869,7 +869,14 @@ async def _web_request_id_and_timing(req: FastAPIRequest, call_next):
     resp.headers.setdefault("X-Response-Time-ms", f"{elapsed_ms:.1f}")
     resp.headers.setdefault("X-Active-Requests", str(active_now))
 
-    if elapsed_ms >= WEB_SLOW_REQUEST_MS:
+    # Telegram webhook updates can legitimately wait for handler processing.
+    # Keep dashboard/API slow logs sensitive, but avoid noisy webhook warnings
+    # unless the request is truly stuck.
+    slow_threshold_ms = WEB_SLOW_REQUEST_MS
+    if req.url.path.startswith("/tg-webhook-") or req.url.path == "/telegram-webhook":
+        slow_threshold_ms = max(WEB_SLOW_REQUEST_MS, _env_float("WEBHOOK_SLOW_REQUEST_MS", 10_000.0, minimum=1000.0, maximum=120_000.0))
+
+    if elapsed_ms >= slow_threshold_ms:
         item = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "request_id": request_id,
@@ -3196,11 +3203,19 @@ def _web_fetch_users(q: str = "", page: int = 0, page_size: int = WEB_TABLE_PAGE
         return []
     start = max(0, int(page)) * page_size
     end = start + page_size - 1
-    for fields in ("user_id, username, gender, speed, last_active", "user_id, username, gender, speed", "user_id, username"):
-        res = db_call_sync(f"web_users:{fields}:{page}:{page_size}", lambda f=fields: supabase.table("user_prefs").select(f).range(start, end).execute(), default=None, attempts=2, critical=False)
-        if res is not None:
-            return list(getattr(res, "data", None) or [])
-    return []
+    fields_try = (
+        "user_id, username, first_name, gender, speed, tts_model, last_active",
+        "user_id, username, gender, speed, last_active",
+        "user_id, username",
+    )
+    res = _supabase_select_schema_safe_sync(
+        "user_prefs",
+        fields_try,
+        lambda builder, _fields: builder.range(start, end).execute(),
+        name=f"web_users:{page}:{page_size}",
+        default=None,
+    )
+    return list(getattr(res, "data", None) or []) if res is not None else []
 
 
 
@@ -3326,32 +3341,30 @@ def _crm_fetch_base_users(q: str, limit: int) -> list[dict]:
         return []
     fields_try = (
         "user_id, username, first_name, gender, speed, tts_model, last_active",
-        "user_id, username, first_name, gender, speed, last_active",
+        "user_id, username, gender, speed, tts_model, last_active",
         "user_id, username, gender, speed, last_active",
         "user_id, username",
     )
-    for fields in fields_try:
-        def _query(f: str = fields):
-            builder = supabase.table("user_prefs").select(f).limit(limit)
-            if "last_active" in f:
-                builder = builder.order("last_active", desc=True)
-            return builder.execute()
 
-        res = db_call_sync(
-            f"crm_base_users:{fields}:{limit}",
-            _query,
-            default=None,
-            attempts=2,
-            critical=False,
-        )
-        rows = list(getattr(res, "data", None) or []) if res is not None else []
-        if rows:
-            return rows[:limit]
-    return []
+    def _query(builder: Any, fields: str) -> Any:
+        builder = builder.limit(limit)
+        if _supabase_has_selected_field(fields, "last_active"):
+            builder = builder.order("last_active", desc=True)
+        return builder.execute()
+
+    res = _supabase_select_schema_safe_sync(
+        "user_prefs",
+        fields_try,
+        _query,
+        name=f"crm_base_users:{limit}",
+        default=None,
+    )
+    rows = list(getattr(res, "data", None) or []) if res is not None else []
+    return rows[:limit]
 
 
 def _crm_text_cache_metrics(user_ids: list[int], scan_limit: int) -> dict[int, dict]:
-    """Batch recent text_cache metrics. Uses chunks to avoid URL/query limits."""
+    """Batch recent text_cache metrics with schema-safe optional text columns."""
     metrics: dict[int, dict] = {uid: {"recent_messages": 0, "recent_chars": 0, "last_text_at": None, "last_text": ""} for uid in user_ids}
     if not supabase or not user_ids:
         return metrics
@@ -3359,17 +3372,25 @@ def _crm_text_cache_metrics(user_ids: list[int], scan_limit: int) -> dict[int, d
     chunk_size = 120
     for start in range(0, len(user_ids), chunk_size):
         chunk = user_ids[start:start + chunk_size]
-        res = db_call_sync(
-            f"crm_text_cache:{start}:{len(chunk)}",
-            lambda c=chunk: supabase.table("text_cache")
-                .select("user_id, original_text, content, created_at")
-                .in_("user_id", c)
-                .order("created_at", desc=True)
-                .limit(scan_limit)
-                .execute(),
+
+        def _query(builder: Any, fields: str, c: list[int] = chunk) -> Any:
+            builder = builder.in_("user_id", c)
+            if _supabase_has_selected_field(fields, "created_at"):
+                builder = builder.order("created_at", desc=True)
+            return builder.limit(scan_limit).execute()
+
+        res = _supabase_select_schema_safe_sync(
+            "text_cache",
+            (
+                "user_id, original_text, content, created_at",
+                "user_id, original_text, created_at",
+                "user_id, content, created_at",
+                "user_id, original_text",
+                "user_id, content",
+            ),
+            _query,
+            name=f"crm_text_cache:{start}:{len(chunk)}",
             default=None,
-            attempts=2,
-            critical=False,
         )
         for item in list(getattr(res, "data", None) or []):
             try:
@@ -3378,7 +3399,7 @@ def _crm_text_cache_metrics(user_ids: list[int], scan_limit: int) -> dict[int, d
                 uid = 0
             if uid not in metrics:
                 continue
-            text = str(item.get("original_text") or item.get("content") or "")
+            text = str(item.get("original_text") or item.get("content") or item.get("text") or "")
             m = metrics[uid]
             m["recent_messages"] = int(m.get("recent_messages") or 0) + 1
             m["recent_chars"] = int(m.get("recent_chars") or 0) + len(text)
@@ -6909,6 +6930,141 @@ async def db_call(name: str, factory: Callable[[], Any], *, default: Any = None,
     )
 
 
+# ── Supabase schema-safe optional column helpers ───────────────────────────
+# Older deployments may not have newer optional columns such as
+# user_prefs.first_name, user_prefs.tts_model, or text_cache.content.  The
+# normal retry wrapper logs those as non-retryable errors.  Dashboard/CRM reads
+# should instead omit missing optional columns, cache that decision, and keep the
+# UI fast/noiseless.  Required columns still surface real errors.
+_SUPABASE_SCHEMA_LOCK = threading.RLock()
+_SUPABASE_MISSING_COLUMNS: dict[str, set[str]] = {}
+
+
+def _supabase_field_column(field: str) -> str:
+    raw = str(field or "").strip()
+    if not raw:
+        return ""
+    # Handles simple PostgREST select fields used in this file:
+    #   "username", "username:display_name", "count".
+    raw = raw.split(":", 1)[0].strip()
+    raw = raw.split(".")[-1].strip()
+    raw = raw.split("(", 1)[0].strip()
+    return raw.strip('"')
+
+
+def _supabase_split_fields(select_fields: str) -> list[str]:
+    return [part.strip() for part in str(select_fields or "").split(",") if part.strip()]
+
+
+def _supabase_missing_column_name(exc: BaseException, table: str | None = None) -> str | None:
+    msg = str(exc or "")
+    table_l = str(table or "").strip().lower()
+    patterns = (
+        r"column\s+(?:(?P<table>[A-Za-z_][\w]*)\.)?(?P<col>[A-Za-z_][\w]*)\s+does\s+not\s+exist",
+        r"Could\s+not\s+find\s+the\s+'(?P<col>[^']+)'\s+column\s+of\s+'(?P<table>[^']+)'",
+    )
+    for pat in patterns:
+        m = re.search(pat, msg, re.IGNORECASE)
+        if not m:
+            continue
+        found_table = str(m.groupdict().get("table") or "").strip().lower()
+        found_col = str(m.groupdict().get("col") or "").strip().strip('"')
+        if not found_col:
+            continue
+        if table_l and found_table and found_table != table_l:
+            continue
+        return found_col
+    return None
+
+
+def _supabase_mark_missing_column(table: str, column: str, source: str = "") -> None:
+    table = str(table or "").strip()
+    column = str(column or "").strip()
+    if not table or not column:
+        return
+    with _SUPABASE_SCHEMA_LOCK:
+        bucket = _SUPABASE_MISSING_COLUMNS.setdefault(table, set())
+        first_seen = column not in bucket
+        bucket.add(column)
+    if first_seen:
+        _log_once(
+            logging.INFO,
+            f"supabase_schema_missing:{table}:{column}",
+            "Supabase optional column %s.%s is missing; %s will omit it from future schema-safe reads.",
+            table,
+            column,
+            source or "schema-safe query",
+        )
+
+
+def _supabase_filter_select_fields(table: str, select_fields: str) -> str:
+    fields = _supabase_split_fields(select_fields)
+    if not fields:
+        return ""
+    with _SUPABASE_SCHEMA_LOCK:
+        missing = set(_SUPABASE_MISSING_COLUMNS.get(str(table), set()))
+    kept = [field for field in fields if _supabase_field_column(field) not in missing]
+    return ", ".join(kept)
+
+
+def _supabase_has_selected_field(select_fields: str, column: str) -> bool:
+    wanted = str(column or "").strip()
+    return any(_supabase_field_column(field) == wanted for field in _supabase_split_fields(select_fields))
+
+
+def _supabase_select_schema_safe_sync(
+    table: str,
+    field_candidates: tuple[str, ...] | list[str],
+    build_query: Callable[[Any, str], Any],
+    *,
+    name: str,
+    default: Any = None,
+    max_schema_retries: int = 8,
+) -> Any:
+    """Execute a Supabase select while silently dropping missing optional columns.
+
+    The helper retries the same candidate after each discovered missing column.
+    This prevents noisy 42703 logs and keeps old Supabase schemas compatible
+    with newer dashboard/CRM code.
+    """
+    if not supabase:
+        return default
+
+    tried_effective_fields: set[str] = set()
+    for raw_fields in field_candidates:
+        for _ in range(max(1, int(max_schema_retries))):
+            fields = _supabase_filter_select_fields(table, raw_fields)
+            if not fields or fields in tried_effective_fields:
+                break
+            tried_effective_fields.add(fields)
+            try:
+                result = build_query(supabase.table(table).select(fields), fields)
+                if hasattr(result, "execute"):
+                    result = result.execute()
+                result = _resolve_maybe_awaitable_sync(result)
+                with suppress(Exception):
+                    supabase_breaker.record_success()
+                return result
+            except Exception as exc:
+                missing_col = _supabase_missing_column_name(exc, table)
+                if missing_col:
+                    _supabase_mark_missing_column(table, missing_col, name)
+                    continue
+
+                with suppress(Exception):
+                    supabase_breaker.record_failure(exc)
+                level = logging.WARNING if _is_retryable_store_error(exc) else logging.ERROR
+                _log_once(
+                    level,
+                    f"schema_safe_select:{name}:{type(exc).__name__}:{str(exc)[:120]}",
+                    "Supabase:%s failed: %s",
+                    name,
+                    exc,
+                )
+                return default
+    return default
+
+
 def redis_call_sync(name: str, factory: Callable[[], Any], *, default: Any = None, attempts: int = 2, critical: bool = False) -> Any:
     if redis_client is None:
         return default
@@ -8462,15 +8618,12 @@ def _paginated_fetch(select_fields: str) -> list[dict]:
 
     all_rows, page, page_size = [], 0, 1000
     while True:
-        res = db_call_sync(
-            f"paginated_fetch:{select_fields}:page{page}",
-            lambda p=page: supabase.table("user_prefs")
-                .select(select_fields)
-                .range(p * page_size, (p + 1) * page_size - 1)
-                .execute(),
+        res = _supabase_select_schema_safe_sync(
+            "user_prefs",
+            (select_fields,),
+            lambda builder, _fields, p=page: builder.range(p * page_size, (p + 1) * page_size - 1).execute(),
+            name=f"paginated_fetch:{select_fields}:page{page}",
             default=None,
-            attempts=3,
-            critical=False,
         )
         if res is None:
             return all_rows
@@ -8483,6 +8636,7 @@ def _paginated_fetch(select_fields: str) -> list[dict]:
             break
         page += 1
     return all_rows
+
 
 
 USER_SEARCH_CACHE_TTL_S = _env_float("USER_SEARCH_CACHE_TTL_S", 20.0, minimum=0.0, maximum=600.0)
@@ -8505,18 +8659,15 @@ def _get_user_search_rows_cached(force: bool = False) -> list[dict]:
     if not supabase:
         return []
 
-    for fields in (
-        "user_id, username, gender, speed, last_active",
-        "user_id, username, gender, speed",
-        "user_id, username",
-    ):
-        rows = _paginated_fetch(fields)
-        if rows:
-            with _user_search_cache_lock:
-                _user_search_cache["ts"] = now
-                _user_search_cache["rows"] = list(rows)
-            return rows
+    fields = "user_id, username, first_name, gender, speed, tts_model, last_active"
+    rows = _paginated_fetch(fields)
+    if rows:
+        with _user_search_cache_lock:
+            _user_search_cache["ts"] = now
+            _user_search_cache["rows"] = list(rows)
+        return rows
     return []
+
 
 
 def _dedupe_user_rows(rows: list[dict], limit: int) -> list[dict]:
@@ -8541,14 +8692,7 @@ def _normalize_user_search_query(query: str) -> str:
 
 
 def search_users_by_query(query: str, limit: int = 80) -> list[dict]:
-    """Search users by Telegram user ID or username with fast DB-first lookup.
-
-    Performance fix:
-    - Numeric searches try an exact indexed user_id lookup first.
-    - Username searches try Supabase ilike first.
-    - If the table/index/query shape is unavailable, it falls back to a short
-      in-memory cached scan so older deployments keep working.
-    """
+    """Search users by Telegram user ID or username with schema-safe selects."""
     q = _normalize_user_search_query(query)
     limit = max(1, min(200, int(limit or 80)))
     if not q:
@@ -8556,48 +8700,32 @@ def search_users_by_query(query: str, limit: int = 80) -> list[dict]:
 
     direct_rows: list[dict] = []
     fields_try = (
+        "user_id, username, first_name, gender, speed, tts_model, last_active",
         "user_id, username, gender, speed, last_active",
-        "user_id, username, gender, speed",
         "user_id, username",
     )
 
     if supabase:
         if q.isdigit():
-            for fields in fields_try:
-                res = db_call_sync(
-                    f"search_user_exact:{q}:{fields}",
-                    lambda f=fields: supabase.table("user_prefs")
-                        .select(f)
-                        .eq("user_id", int(q))
-                        .limit(limit)
-                        .execute(),
-                    default=None,
-                    attempts=2,
-                    critical=False,
-                )
-                rows = list(getattr(res, "data", None) or []) if res is not None else []
-                if rows:
-                    direct_rows.extend(rows)
-                    break
+            res = _supabase_select_schema_safe_sync(
+                "user_prefs",
+                fields_try,
+                lambda builder, _fields: builder.eq("user_id", int(q)).limit(limit).execute(),
+                name=f"search_user_exact:{q}",
+                default=None,
+            )
+            direct_rows.extend(list(getattr(res, "data", None) or []) if res is not None else [])
 
         username_q = q.lstrip("@")
         if username_q and not username_q.isdigit():
-            for fields in fields_try:
-                res = db_call_sync(
-                    f"search_username_ilike:{username_q}:{fields}",
-                    lambda f=fields: supabase.table("user_prefs")
-                        .select(f)
-                        .ilike("username", f"%{username_q}%")
-                        .limit(limit)
-                        .execute(),
-                    default=None,
-                    attempts=2,
-                    critical=False,
-                )
-                rows = list(getattr(res, "data", None) or []) if res is not None else []
-                if rows:
-                    direct_rows.extend(rows)
-                    break
+            res = _supabase_select_schema_safe_sync(
+                "user_prefs",
+                fields_try,
+                lambda builder, _fields: builder.ilike("username", f"%{username_q}%").limit(limit).execute(),
+                name=f"search_username_ilike:{username_q}",
+                default=None,
+            )
+            direct_rows.extend(list(getattr(res, "data", None) or []) if res is not None else [])
 
     users = _get_user_search_rows_cached()
     if direct_rows:
@@ -8619,14 +8747,13 @@ def search_users_by_query(query: str, limit: int = 80) -> list[dict]:
 
     for row in users:
         uid = str(row.get("user_id") or "").strip()
-        username = str(row.get("username") or "").strip()
+        username = str(row.get("username") or row.get("first_name") or "").strip()
         username_l = username.lower().lstrip("@")
-
-        if q == uid or q == username_l:
+        if uid == q or username_l == q:
             exact.append(row)
-        elif uid.startswith(q) or username_l.startswith(q):
+        elif username_l.startswith(q):
             prefix.append(row)
-        elif q in uid or q in username_l:
+        elif q in username_l or q in uid:
             contains.append(row)
 
     return _dedupe_user_rows(exact + prefix + contains, limit)
@@ -9664,12 +9791,7 @@ def _admin_history_rows_normalized(rows: list[dict] | None, limit: int | None = 
 
 
 def db_user_history_fetch(user_id: int, limit: int = 30) -> list[dict]:
-    """Admin full history view from text_cache: Redis first, then Supabase.
-
-    This function no longer reads conversation_history for the admin Recent
-    History/User Detail screens. The user asked for Recent History to fetch
-    data from text_cache.
-    """
+    """Admin full history view from text_cache: Redis first, then schema-safe Supabase."""
     user_id = int(user_id)
     limit = max(1, min(120, int(limit or 30)))
 
@@ -9682,17 +9804,23 @@ def db_user_history_fetch(user_id: int, limit: int = 30) -> list[dict]:
     if not supabase:
         return []
 
-    res = db_call_sync(
-        f"admin_text_cache_history_fetch:{user_id}",
-        lambda: supabase.table("text_cache")
-            .select("user_id, username, message_id, chat_id, original_text, created_at")
-            .eq("user_id", user_id)
-            .order("created_at", desc=True)
-            .limit(limit)
-            .execute(),
+    def _query(builder: Any, fields: str) -> Any:
+        builder = builder.eq("user_id", user_id)
+        if _supabase_has_selected_field(fields, "created_at"):
+            builder = builder.order("created_at", desc=True)
+        return builder.limit(limit).execute()
+
+    res = _supabase_select_schema_safe_sync(
+        "text_cache",
+        (
+            "user_id, username, message_id, chat_id, original_text, content, created_at",
+            "user_id, username, message_id, chat_id, original_text, created_at",
+            "user_id, message_id, chat_id, original_text, created_at",
+            "user_id, message_id, chat_id, content, created_at",
+        ),
+        _query,
+        name=f"admin_text_cache_history_fetch:{user_id}",
         default=None,
-        attempts=3,
-        critical=False,
     )
     rows = list(reversed(getattr(res, "data", None) or [])) if res else []
     clean = _admin_history_rows_normalized(rows, limit=limit)
@@ -9702,12 +9830,7 @@ def db_user_history_fetch(user_id: int, limit: int = 30) -> list[dict]:
 
 
 def db_recent_history_users(limit_users: int = 80, scan_limit: int = 500) -> list[dict]:
-    """Return users ordered by latest text_cache activity.
-
-    Source of truth: text_cache, not conversation_history.
-    It scans recent text_cache rows and groups by user_id in Python so this
-    works with normal Supabase REST queries and does not require SQL functions.
-    """
+    """Return users ordered by latest text_cache activity using schema-safe selects."""
     limit_users = max(1, min(200, int(limit_users or 80)))
     scan_limit = max(limit_users, min(1000, int(scan_limit or 500)))
 
@@ -9716,27 +9839,32 @@ def db_recent_history_users(limit_users: int = 80, scan_limit: int = 500) -> lis
         for u in get_all_users_with_names():
             uid = int(u.get("user_id") or 0)
             if uid:
-                name_map[uid] = str(u.get("username") or "").strip()
+                name_map[uid] = str(u.get("username") or u.get("first_name") or "").strip()
     except Exception as exc:
         _log_once(logging.WARNING, "recent_text_cache_names_failed", f"recent text_cache username lookup failed: {exc}")
 
     rows: list[dict] = []
     if supabase:
-        res = db_call_sync(
-            "admin_recent_text_cache_scan",
-            lambda: supabase.table("text_cache")
-                .select("user_id, username, message_id, chat_id, original_text, created_at")
-                .order("created_at", desc=True)
-                .limit(scan_limit)
-                .execute(),
+        def _query(builder: Any, fields: str) -> Any:
+            if _supabase_has_selected_field(fields, "created_at"):
+                builder = builder.order("created_at", desc=True)
+            return builder.limit(scan_limit).execute()
+
+        res = _supabase_select_schema_safe_sync(
+            "text_cache",
+            (
+                "user_id, username, message_id, chat_id, original_text, content, created_at",
+                "user_id, username, message_id, chat_id, original_text, created_at",
+                "user_id, message_id, chat_id, original_text, created_at",
+                "user_id, message_id, chat_id, content, created_at",
+            ),
+            _query,
+            name="admin_recent_text_cache_scan",
             default=None,
-            attempts=3,
-            critical=False,
         )
         rows = getattr(res, "data", None) or [] if res else []
 
     # Fallback only to Redis per-user text_cache history if Supabase is down.
-    # This is still text_cache-derived data, not conversation_history.
     if not rows and redis_client is not None:
         for key in list(_redis_scan_keys_sync(_redis_key("text_history", "*"), limit=limit_users * 2)):
             cached_rows = _redis_get_json_sync(key, default=[])
@@ -14679,11 +14807,16 @@ async def _scheduler_loop(bot, stop_event: asyncio.Event) -> None:
             )
             _scheduler_lock_last_status = "owned" if lock_acquired else "not_owner"
             if not lock_acquired:
+                lock_row = await loop.run_in_executor(None, db_lock_read, _SCHED_LOCK_KEY)
+                owner_hint = ""
+                if lock_row:
+                    owner_hint = f" owner={str(lock_row.get('owner') or '')[:96]} until={_web_dt(lock_row.get('locked_until') or '')}"
                 _log_once(
                     logging.INFO,
                     "sched_lock_not_owner",
-                    "Scheduler tick skipped because another bot instance owns lock %s",
+                    "Scheduler tick skipped because another bot instance owns lock %s.%s",
                     _SCHED_LOCK_KEY,
+                    owner_hint,
                 )
             else:
                 stale_count = await loop.run_in_executor(None, db_sched_mark_stale_sending_failed)
