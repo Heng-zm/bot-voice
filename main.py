@@ -2776,7 +2776,7 @@ tailwind.config = {
   <div class="sub">System V6 · Admin ID: <code>{{ admin_id }}</code></div>
   <input class="nav-search" data-nav-filter placeholder="Search admin features…" aria-label="Search admin features">
   <nav class="nav" data-nav-list>{% for key,label,url,ico in nav %}<a class="{{ 'active' if key==active else '' }}" href="{{ url }}" data-nav-item data-label="{{ label|lower }}"><span class="nav-ico">{{ ico }}</span><span>{{ label }}</span></a>{% endfor %}</nav>
-  <div class="footer"><div>Supabase: <b>{{ 'ON' if supabase_on else 'OFF' }}</b></div><div>Redis: <b>{{ 'ON' if redis_on else 'OFF' }}</b></div><div><a href="/ping">Ping</a> · <a href="/readyz">Ready</a> · <a href="/admin/logout">Logout</a></div><div class="muted">Tip: press <span class="kbd">Ctrl</span> + <span class="kbd">K</span> to search.</div></div>
+  <div class="footer"><div>Supabase: <b>{{ 'ON' if supabase_on else 'OFF' }}</b></div><div>Redis: <b>{{ 'ON' if redis_on else 'OFF' }}</b></div><div><a href="/ping">Ping</a> · <a href="/readyz">Ready</a></div><div class="muted">Tip: press <span class="kbd">Ctrl</span> + <span class="kbd">K</span> to search.</div></div>
 </aside>
 <main class="main">
   <div class="top"><div><div class="h1">{{ title }}</div><div class="muted">Unified Admin Center · smoother workflow · safe Telegram operations</div></div><div class="top-right"><div data-local-time>{{ now }}</div><div>{{ time_hint }}</div></div></div>
@@ -2832,67 +2832,61 @@ window.WEB_CSRF={{ csrf|tojson }};
     ), status_code
 
 
+def _web_admin_auto_open_session() -> None:
+    """Open the admin dashboard without the old /admin/login flow.
+
+    Change:
+    - No password page and no manual Telegram Admin ID input are required.
+    - The dashboard uses the first configured ADMIN_IDS value when available.
+    - A signed session is still populated so existing helpers, CSRF protection,
+      audit labels, and templates keep the same behavior.
+
+    Security note:
+    - This intentionally makes the web admin accessible when WEB_ADMIN_ENABLED=1.
+      Keep the Render URL private, or add network/proxy protection if deployed
+      publicly.
+    """
+    if session.get("web_admin_ok"):
+        if not _web_int(session.get("web_admin_id"), 0):
+            session["web_admin_id"] = _web_current_admin_id()
+        _web_csrf_token()
+        return
+
+    session["web_admin_ok"] = True
+    session["web_admin_id"] = _web_current_admin_id()
+    session["web_login_at"] = datetime.now(timezone.utc).isoformat()
+    _web_csrf_token()
+
+
 def web_admin_required(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        # Keep the global enable/disable kill switch, but remove the old
+        # ADMIN_WEB_PASSWORD / WEB_ADMIN_PASSWORD requirement and login redirect.
         if not _web_admin_enabled():
             return _web_render("Disabled", "<div class='card'>WEB_ADMIN_ENABLED=0</div>", status_code=403)
-        if not _web_admin_password():
-            body = "<div class='card'><h2>Setup required</h2><p>Set <code>ADMIN_WEB_PASSWORD</code> or <code>WEB_ADMIN_PASSWORD</code> in Render environment variables. This dashboard has full control and will not run without a password.</p></div>"
-            return _web_render("Setup required", body, status_code=503)
-        if not session.get("web_admin_ok"):
-            return redirect(url_for("web_admin_login", next=request.path))
+        _web_admin_auto_open_session()
         return fn(*args, **kwargs)
     return wrapper
 
 
 @app_flask.route("/admin/login", methods=["GET", "POST"])
 def web_admin_login():
+    """Backward-compatible route after removing login.
+
+    Old bookmarks or redirects to /admin/login now go straight to /admin.
+    """
     if not _web_admin_enabled():
         return _web_render("Disabled", "<div class='card'>WEB_ADMIN_ENABLED=0</div>", status_code=403)
-    password_env = _web_admin_password()
-    if not password_env:
-        return _web_render("Setup required", "<div class='card'><h2>Set ADMIN_WEB_PASSWORD first</h2><p>The web admin dashboard is disabled until a password exists.</p></div>", status_code=503)
-    if request.method == "POST":
-        # Starlette SessionMiddleware stores sessions as a signed-cookie dict.
-        # Flask's `session.permanent = True` is not supported here and raises
-        # AttributeError on successful login, making the dashboard look like it
-        # cannot log in. Cookie lifetime is already controlled by
-        # SessionMiddleware(max_age=WEB_ADMIN_SESSION_DAYS * 86400).
-        password = str(request.form.get("password") or "").strip()
-        default_admin = int(sorted(ADMIN_IDS)[0]) if ADMIN_IDS else 0
-        admin_id = _web_int(request.form.get("admin_id"), default_admin)
-        if not hmac.compare_digest(password, password_env):
-            flask_flash("Invalid password.", "error")
-        elif not _web_valid_admin_id(admin_id):
-            flask_flash("Admin ID is not in ADMIN_IDS.", "error")
-        else:
-            session.clear()
-            session["web_admin_ok"] = True
-            session["web_admin_id"] = int(admin_id)
-            session["web_login_at"] = datetime.now(timezone.utc).isoformat()
-            _web_csrf_token()
-            flask_flash("Logged in.", "success")
-            return redirect(_web_safe_next_url(request.args.get("next"), "web_admin_home"))
-    default_admin = int(sorted(ADMIN_IDS)[0]) if ADMIN_IDS else 0
-    body = f"""
-    <div class='card' style='max-width:520px'>
-      <h2>Login</h2>
-      <form method='post'>
-        <div class='field'><label>Password</label><input name='password' type='password' autofocus required></div>
-        <div class='field'><label>Telegram Admin ID</label><input name='admin_id' value='{_web_h(default_admin)}' required></div>
-        <button type='submit'>Login</button>
-      </form>
-    </div>
-    """
-    return _web_render("Admin Login", body, active="login")
+    _web_admin_auto_open_session()
+    return redirect(url_for("web_admin_home"))
 
 
 @app_flask.route("/admin/logout")
 def web_admin_logout():
+    """Logout is no-op now because the dashboard has no login screen."""
     session.clear()
-    return redirect(url_for("web_admin_login"))
-
+    return redirect(url_for("web_admin_home"))
 
 def _web_table_count(table: str, select_field: str = "id") -> int | None:
     if not supabase:
@@ -4376,121 +4370,328 @@ def _web_sched_fetch_range(start_utc: datetime, end_utc: datetime, limit: int = 
     return list(getattr(res, "data", None) or [])
 
 
-def _web_sched_fetch_analytics_window(since_utc: datetime, limit: int = 20000) -> list[dict]:
-    """Fetch analytics rows using DB-side date filtering and pagination.
+def _web_sched_fetch_analytics_window(
+    since_utc: datetime,
+    limit: int = 20000,
+    *,
+    until_utc: datetime | None = None,
+) -> list[dict]:
+    """Fetch analytics rows using broadcast_at window filtering and pagination.
 
-    Previous code downloaded the newest 5,000 schedules and filtered by date in
-    Python. This pushes the last-N-days boundary to Postgres via created_at and
-    pages results so analytics do not silently stop at the first broad payload.
+    Changes:
+    - Analytics must be based on the scheduled send time (`broadcast_at`), not
+      row creation time (`created_at`). This keeps charts, global stats, and
+      recent stats aligned with the real broadcast window.
+    - Supports an optional upper bound so the dashboard can count exactly the
+      selected local-day window and avoid leaking future rows into stats.
+    - Falls back to recent broadcast rows if the DB-side window query fails.
     """
     if not supabase:
         return []
+
+    since_utc = _sched_to_utc(since_utc)
+    until_utc = _sched_to_utc(until_utc) if until_utc else None
     since_iso = _sched_iso(since_utc)
-    max_rows = max(100, min(100000, _env_int("WEB_ANALYTICS_MAX_ROWS", int(limit or 20000), minimum=100, maximum=100000)))
-    page_size = max(100, min(1000, _env_int("WEB_ANALYTICS_PAGE_SIZE", 1000, minimum=100, maximum=1000)))
+    until_iso = _sched_iso(until_utc) if until_utc else None
+
+    max_rows = max(
+        100,
+        min(
+            100000,
+            _env_int(
+                "WEB_ANALYTICS_MAX_ROWS",
+                int(limit or 20000),
+                minimum=100,
+                maximum=100000,
+            ),
+        ),
+    )
+    page_size = max(
+        100,
+        min(
+            1000,
+            _env_int(
+                "WEB_ANALYTICS_PAGE_SIZE",
+                1000,
+                minimum=100,
+                maximum=1000,
+            ),
+        ),
+    )
+
+    def _row_in_window(row: dict) -> bool:
+        # Same rule as the DB query, used for fallback rows and defensive
+        # filtering. Missing/invalid broadcast_at rows are excluded from
+        # analytics because they cannot be placed on a broadcast timeline.
+        dt = _sched_parse_iso(row.get("broadcast_at"))
+        if not dt:
+            return False
+        if dt < since_utc:
+            return False
+        if until_utc and dt >= until_utc:
+            return False
+        return True
+
     rows: list[dict] = []
+    query_failed = False
     offset = 0
+
     while len(rows) < max_rows:
         upper = min(offset + page_size - 1, max_rows - 1)
-        res = db_call_sync(
-            f"web_sched_analytics_window:{offset}",
-            lambda lo=offset, hi=upper: (
+
+        def _query(lo: int = offset, hi: int = upper):
+            # IMPORTANT: filter/order by broadcast_at, not created_at.
+            builder = (
                 supabase.table("scheduled_broadcasts")
                 .select(_web_schedule_select_fields())
-                .gte("created_at", since_iso)
-                .order("created_at", desc=True)
-                .range(lo, hi)
-                .execute()
-            ),
-            default=None,
-            attempts=2,
-            critical=False,
-        )
+                .gte("broadcast_at", since_iso)
+            )
+            if until_iso:
+                builder = builder.lt("broadcast_at", until_iso)
+            return builder.order("broadcast_at", desc=True).range(lo, hi).execute()
+
+        try:
+            res = db_call_sync(
+                f"web_sched_analytics_window:{offset}",
+                _query,
+                default=None,
+                attempts=2,
+                critical=False,
+            )
+        except Exception as exc:
+            query_failed = True
+            logger.warning("analytics broadcast_at query failed offset=%s: %s", offset, exc)
+            break
+
+        if res is None:
+            query_failed = True
+            logger.warning("analytics broadcast_at query returned no response offset=%s", offset)
+            break
+
         batch = list(getattr(res, "data", None) or [])
         if not batch:
             break
+
         rows.extend(batch)
         if len(batch) < (upper - offset + 1):
             break
         offset += page_size
+
+    if query_failed:
+        # Keep the dashboard usable when Supabase/network has a temporary issue.
+        # _web_sched_fetch_recent already orders by broadcast_at, then we apply
+        # the exact same window in Python.
+        try:
+            fallback_rows = [row for row in _web_sched_fetch_recent(max_rows) if _row_in_window(row)]
+            if fallback_rows:
+                return fallback_rows[:max_rows]
+        except Exception as exc:
+            logger.warning("analytics fallback recent fetch failed: %s", exc)
+
+        if rows:
+            return [row for row in rows if _row_in_window(row)][:max_rows]
+
+        raise RuntimeError("analytics DB query failed and no fallback rows were available")
+
     if len(rows) >= max_rows:
         logger.warning(
-            "analytics row cap reached max_rows=%s since=%s; raise WEB_ANALYTICS_MAX_ROWS or add DB aggregates",
-            max_rows, since_iso,
+            "analytics row cap reached max_rows=%s since=%s until=%s; raise WEB_ANALYTICS_MAX_ROWS or add DB aggregates",
+            max_rows,
+            since_iso,
+            until_iso or "-",
         )
-    return rows
+
+    return [row for row in rows if _row_in_window(row)][:max_rows]
 
 
 def _web_analytics_v2(days: int = 30) -> dict:
-    days = max(1, min(365, int(days or 30)))
+    """Build scheduled-broadcast analytics for the selected local-day window.
+
+    Changes:
+    - Uses the same broadcast_at window for global stats, recent stats, and the
+      chart so the cards no longer disagree.
+    - Initializes day_counts from local dates, avoiding UTC/local date drift.
+    - Adds a small in-memory TTL cache to reduce dashboard DB pressure.
+    - On DB failure, returns stale cached analytics when available; otherwise
+      returns an empty safe payload instead of crashing the admin page.
+    """
+    try:
+        days = max(1, min(365, int(days or 30)))
+    except Exception:
+        days = 30
+
     now_utc = datetime.now(timezone.utc)
-    since_local = (_local_now() - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Count complete local calendar days including today. Example for 30 days:
+    # local midnight 29 days ago <= broadcast_at < tomorrow local midnight.
+    since_local = (_local_now() - timedelta(days=days - 1)).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    until_local = (since_local + timedelta(days=days)).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
     since_utc = _local_to_utc(since_local)
-    rows = _web_sched_fetch_analytics_window(since_utc)
+    until_utc = _local_to_utc(until_local)
+
+    cache_ttl = _env_float("WEB_ANALYTICS_CACHE_TTL_S", 45.0, minimum=30.0, maximum=60.0)
+    cache_key = (days, _sched_iso(since_utc), _sched_iso(until_utc), APP_TIMEZONE_NAME)
+    cache_lock = globals().setdefault("_WEB_ANALYTICS_CACHE_LOCK", threading.RLock())
+    cache = globals().setdefault("_WEB_ANALYTICS_CACHE", OrderedDict())
+    monotonic_now = time.monotonic()
+
+    with cache_lock:
+        cached = cache.get(cache_key)
+        if cached:
+            cached_at, cached_data = cached
+            if monotonic_now - float(cached_at or 0) <= cache_ttl:
+                cache.move_to_end(cache_key)
+                data = dict(cached_data)
+                data["cache_hit"] = True
+                data["cache_stale"] = False
+                return data
+
+    def _new_day_counts() -> OrderedDict[str, dict]:
+        # Initialize by local date directly. The old UTC + timedelta approach
+        # could skip/duplicate labels around timezone conversions.
+        buckets: OrderedDict[str, dict] = OrderedDict()
+        for i in range(days):
+            day_key = (since_local.date() + timedelta(days=i)).isoformat()
+            buckets[day_key] = {"schedules": 0, "sent": 0, "failed": 0, "blocked": 0}
+        return buckets
+
+    def _empty_result(error: str = "") -> dict:
+        return {
+            "days": days,
+            "rows": [],
+            "status_counts": {},
+            "total_schedules": 0,
+            "sent": 0,
+            "failed": 0,
+            "blocked": 0,
+            "delivery_total": 0,
+            "delivery_rate": 0,
+            "recent_sent": 0,
+            "recent_failed": 0,
+            "recent_blocked": 0,
+            "recent_delivery_total": 0,
+            "recent_delivery_rate": 0,
+            "upcoming": 0,
+            "overdue": 0,
+            "previews": 0,
+            "photo": 0,
+            "text": 0,
+            "day_counts": _new_day_counts(),
+            "recent_errors": [],
+            "cache_hit": False,
+            "cache_stale": False,
+            "analytics_error": error,
+        }
+
+    try:
+        rows = _web_sched_fetch_analytics_window(since_utc, until_utc=until_utc)
+    except Exception as exc:
+        logger.warning("analytics build failed; using cache/empty fallback: %s", exc)
+        with cache_lock:
+            cached = cache.get(cache_key)
+            if cached:
+                cached_at, cached_data = cached
+                cache.move_to_end(cache_key)
+                data = dict(cached_data)
+                data["cache_hit"] = True
+                data["cache_stale"] = True
+                data["analytics_error"] = str(exc)
+                return data
+
+        data = _empty_result(str(exc))
+        with cache_lock:
+            cache[cache_key] = (time.monotonic(), data)
+        return data
 
     status_counts: dict[str, int] = {}
-    day_counts: OrderedDict[str, dict] = OrderedDict()
-    for i in range(days):
-        d = _to_local_time(since_utc + timedelta(days=i)).date().isoformat()
-        day_counts[d] = {"schedules": 0, "sent": 0, "failed": 0, "blocked": 0}
+    day_counts = _new_day_counts()
+    counted_rows: list[dict] = []
 
     sent = failed = blocked = 0
-    recent_sent = recent_failed = recent_blocked = 0
     upcoming = overdue = previews = photo = text = 0
     recent_errors: list[dict] = []
 
     for row in rows:
+        dt = _sched_parse_iso(row.get("broadcast_at"))
+        if not dt:
+            continue
+
+        # Defensive window check keeps fallback rows and any DB edge cases honest.
+        if dt < since_utc or dt >= until_utc:
+            continue
+
+        local_key = _to_local_time(dt).date().isoformat()
+        bucket = day_counts.get(local_key)
+        if bucket is None:
+            continue
+
         status = _web_schedule_status_key(row)
-        status_counts[status] = status_counts.get(status, 0) + 1
         sent_i = _web_safe_int(row.get("sent_count"))
         failed_i = _web_safe_int(row.get("failed_count"))
         blocked_i = _web_safe_int(row.get("blocked_count"))
+
+        counted_rows.append(row)
+        status_counts[status] = status_counts.get(status, 0) + 1
+
         sent += sent_i
         failed += failed_i
         blocked += blocked_i
+
+        # Count schedules and delivery totals in the same local bucket.
+        bucket["schedules"] += 1
+        bucket["sent"] += sent_i
+        bucket["failed"] += failed_i
+        bucket["blocked"] += blocked_i
+
         if row.get("photo_file_id"):
             photo += 1
         else:
             text += 1
+
         if status == "preview":
             previews += 1
 
-        dt = _sched_parse_iso(row.get("broadcast_at"))
-        if dt:
-            local_key = _to_local_time(dt).date().isoformat()
-            if local_key in day_counts:
-                day_counts[local_key]["schedules"] += 1
-                day_counts[local_key]["sent"] += sent_i
-                day_counts[local_key]["failed"] += failed_i
-                day_counts[local_key]["blocked"] += blocked_i
-                recent_sent += sent_i
-                recent_failed += failed_i
-                recent_blocked += blocked_i
-            if status == SCHED_STATUS_PENDING:
-                if dt >= now_utc:
-                    upcoming += 1
-                else:
-                    overdue += 1
+        if status == SCHED_STATUS_PENDING:
+            if dt >= now_utc:
+                upcoming += 1
+            else:
+                overdue += 1
+
         if status == "failed" or row.get("error_msg"):
             recent_errors.append(row)
 
-    total_delivery = sent + failed + blocked
-    recent_delivery = recent_sent + recent_failed + recent_blocked
-    return {
+    delivery_total = sent + failed + blocked
+
+    data = {
         "days": days,
-        "rows": rows,
+        "rows": counted_rows,
         "status_counts": status_counts,
-        "total_schedules": len(rows),
+        "total_schedules": len(counted_rows),
         "sent": sent,
         "failed": failed,
         "blocked": blocked,
-        "delivery_total": total_delivery,
-        "delivery_rate": _web_pct(sent, total_delivery),
-        "recent_sent": recent_sent,
-        "recent_failed": recent_failed,
-        "recent_blocked": recent_blocked,
-        "recent_delivery_total": recent_delivery,
-        "recent_delivery_rate": _web_pct(recent_sent, recent_delivery),
+        "delivery_total": delivery_total,
+        "delivery_rate": _web_pct(sent, delivery_total),
+
+        # Recent stats are intentionally equal to global stats for this page,
+        # because both are now based on the selected last-N-days broadcast_at
+        # window. This removes the old mismatch caused by mixed counting logic.
+        "recent_sent": sent,
+        "recent_failed": failed,
+        "recent_blocked": blocked,
+        "recent_delivery_total": delivery_total,
+        "recent_delivery_rate": _web_pct(sent, delivery_total),
+
         "upcoming": upcoming,
         "overdue": overdue,
         "previews": previews,
@@ -4498,26 +4699,62 @@ def _web_analytics_v2(days: int = 30) -> dict:
         "text": text,
         "day_counts": day_counts,
         "recent_errors": recent_errors[:12],
+        "cache_hit": False,
+        "cache_stale": False,
+        "analytics_error": "",
     }
+
+    with cache_lock:
+        cache[cache_key] = (time.monotonic(), data)
+        cache.move_to_end(cache_key)
+
+        # Keep cache tiny and remove old entries for long-running Render workers.
+        expired_before = time.monotonic() - max(cache_ttl, 60.0) * 4
+        for key, (cached_at, _cached_data) in list(cache.items()):
+            if float(cached_at or 0) < expired_before:
+                cache.pop(key, None)
+        while len(cache) > 24:
+            cache.popitem(last=False)
+
+    return data
 
 
 def _web_analytics_chart_html(day_counts: OrderedDict[str, dict]) -> str:
+    """Render the local-day analytics chart.
+
+    Changes:
+    - Uses _web_safe_int for robust counting.
+    - Tooltip includes schedule, sent, failed, and blocked counts, matching the
+      improved day_counts structure.
+    """
     if not day_counts:
         return "<div class='empty'>No analytics data.</div>"
-    max_value = max((int(v.get("schedules") or 0) for v in day_counts.values()), default=0) or 1
+
+    max_value = max(
+        (_web_safe_int(v.get("schedules")) for v in day_counts.values()),
+        default=0,
+    ) or 1
+
     bars = []
     for day, vals in day_counts.items():
-        count = int(vals.get("schedules") or 0)
+        count = _web_safe_int(vals.get("schedules"))
+        sent = _web_safe_int(vals.get("sent"))
+        failed = _web_safe_int(vals.get("failed"))
+        blocked = _web_safe_int(vals.get("blocked"))
         height = max(8, int((count / max_value) * 120)) if count else 8
-        label = day[5:]
+        label = str(day)[5:] if len(str(day)) >= 10 else str(day)
+        title = f"{day}: {count} schedule(s) · {sent} sent · {failed} failed · {blocked} blocked"
+
         bars.append(
             "<div style='display:flex;flex-direction:column;align-items:center;gap:7px;min-width:34px'>"
-            f"<div title='{_web_h(day)}: {_web_h(count)} schedule(s)' style='height:130px;display:flex;align-items:end;width:100%'><div style='height:{height}px;width:100%;border-radius:12px 12px 4px 4px;background:linear-gradient(to top,rgba(59,130,246,.85),rgba(16,185,129,.85));border:1px solid rgba(255,255,255,.12)'></div></div>"
+            f"<div title='{_web_h(title)}' style='height:130px;display:flex;align-items:end;width:100%'>"
+            f"<div style='height:{height}px;width:100%;border-radius:12px 12px 4px 4px;background:linear-gradient(to top,rgba(59,130,246,.85),rgba(16,185,129,.85));border:1px solid rgba(255,255,255,.12)'></div>"
+            "</div>"
             f"<small class='muted'>{_web_h(label)}</small>"
             "</div>"
         )
-    return "<div style='display:flex;gap:10px;overflow-x:auto;padding:8px 2px 2px'>" + "".join(bars) + "</div>"
 
+    return "<div style='display:flex;gap:10px;overflow-x:auto;padding:8px 2px 2px'>" + "".join(bars) + "</div>"
 
 def _web_analytics_error_rows(rows: list[dict]) -> str:
     out = []
