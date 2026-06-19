@@ -1022,19 +1022,31 @@ def _runtime_webhook_base_url() -> str:
     ).strip().rstrip("/")
 
 
+def _telegram_webhook_target_url_for_secret(secret_token: str) -> str:
+    """Return the canonical webhook URL for an explicit secret token.
+
+    This helper is intentionally separate from _runtime_webhook_secret_token()
+    so secret rotation can safely call Telegram setWebhook with a new token
+    before persisting that token into Redis/runtime state.  That prevents a
+    failed setWebhook call from making the app reject Telegram's still-active
+    old webhook path with 403 Invalid path secret.
+    """
+    base_url = _runtime_webhook_base_url()
+    secret_token = str(secret_token or "").strip()
+    if not base_url:
+        raise RuntimeError("BOT_MODE=WEBHOOK requires TELEGRAM_WEBHOOK_URL.")
+    if not secret_token:
+        raise RuntimeError("BOT_MODE=WEBHOOK requires TELEGRAM_WEBHOOK_SECRET_TOKEN.")
+    return f"{base_url}/tg-webhook-{quote(secret_token, safe='')}"
+
+
 def _telegram_webhook_target_url() -> str:
     """Canonical public Telegram webhook URL registered with setWebhook.
 
     Telegram calls this exact route.  The token is URL-escaped for path safety
     while the Bot API secret header still carries the raw token value.
     """
-    base_url = _runtime_webhook_base_url()
-    secret_token = _runtime_webhook_secret_token()
-    if not base_url:
-        raise RuntimeError("BOT_MODE=WEBHOOK requires TELEGRAM_WEBHOOK_URL.")
-    if not secret_token:
-        raise RuntimeError("BOT_MODE=WEBHOOK requires TELEGRAM_WEBHOOK_SECRET_TOKEN.")
-    return f"{base_url}/tg-webhook-{quote(secret_token, safe='')}"
+    return _telegram_webhook_target_url_for_secret(_runtime_webhook_secret_token())
 
 
 def _telegram_allowed_updates() -> list[str]:
@@ -1143,16 +1155,17 @@ async def telegram_webhook(req: FastAPIRequest):
     return await _process_telegram_webhook_request(req, None)
 
 
-async def _configure_telegram_webhook_via_http() -> None:
-    """Configure Telegram webhook using the explicitly pooled HTTPX client.
+async def _configure_telegram_webhook_via_http_for_secret(secret_token: str) -> None:
+    """Configure Telegram webhook for an explicit secret token with 429 retry.
 
-    This keeps webhook setup independent from the polling updater and makes the
-    deployment mode safe for horizontally scaled FastAPI nodes.
+    Used by rotation so the remote Telegram webhook is updated first.  Only
+    after this function succeeds should the new token be saved to RUN_STATE.
     """
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
-    secret_token = _runtime_webhook_secret_token()
-    target_url = _telegram_webhook_target_url()
+
+    secret_token = str(secret_token or "").strip()
+    target_url = _telegram_webhook_target_url_for_secret(secret_token)
 
     api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
     payload = {
@@ -1165,25 +1178,108 @@ async def _configure_telegram_webhook_via_http() -> None:
         "secret_token": secret_token,
     }
     timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
-    async with httpx.AsyncClient(timeout=timeout, limits=_make_httpx_limits_from_run_state()) as client:
-        resp = await client.post(api_url, json=payload)
-    try:
-        data = _json_loads_fast(resp.content)
-    except Exception:
-        data = {"ok": False, "description": resp.text[:500]}
-    if resp.status_code >= 400 or not bool(data.get("ok")):
-        raise RuntimeError(f"Telegram setWebhook failed status={resp.status_code} response={str(data)[:500]}")
-    webhook_logger.info(
-        "Telegram webhook configured via HTTPX url=%s max_connections=%s keepalive=%s",
-        target_url,
-        _run_state_http_max_connections(),
-        min(max(2, int(HTTP_MAX_KEEPALIVE_CONNECTIONS or 20)), _run_state_http_max_connections()),
-    )
+    max_attempts = _env_int("TELEGRAM_SETWEBHOOK_MAX_RETRIES", 3, minimum=1, maximum=10)
+    last_error: str | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        async with httpx.AsyncClient(timeout=timeout, limits=_make_httpx_limits_from_run_state()) as client:
+            resp = await client.post(api_url, json=payload)
+        try:
+            data = _json_loads_fast(resp.content)
+        except Exception:
+            data = {"ok": False, "description": resp.text[:500]}
+
+        if resp.status_code == 429:
+            retry_after = 1
+            try:
+                retry_after = int((data.get("parameters") or {}).get("retry_after") or 1)
+            except Exception:
+                retry_after = 1
+            last_error = f"Telegram setWebhook rate-limited status=429 response={str(data)[:500]}"
+            if attempt < max_attempts:
+                webhook_logger.warning(
+                    "Telegram setWebhook rate-limited; retrying after %ss attempt=%s/%s",
+                    retry_after,
+                    attempt,
+                    max_attempts,
+                )
+                await asyncio.sleep(max(1, retry_after))
+                continue
+
+        if resp.status_code >= 400 or not bool(data.get("ok")):
+            raise RuntimeError(f"Telegram setWebhook failed status={resp.status_code} response={str(data)[:500]}")
+
+        webhook_logger.info(
+            "Telegram webhook configured via HTTPX url=%s max_connections=%s keepalive=%s",
+            target_url,
+            _run_state_http_max_connections(),
+            min(max(2, int(HTTP_MAX_KEEPALIVE_CONNECTIONS or 20)), _run_state_http_max_connections()),
+        )
+        return
+
+    raise RuntimeError(last_error or "Telegram setWebhook rate-limited after retries.")
+
+
+async def _configure_telegram_webhook_via_http() -> None:
+    """Configure Telegram webhook using the currently persisted runtime token."""
+    await _configure_telegram_webhook_via_http_for_secret(_runtime_webhook_secret_token())
 
 
 async def set_telegram_webhook() -> None:
     """Public compatibility wrapper used by runtime admin orchestration."""
     await _configure_telegram_webhook_via_http()
+
+
+# Webhook secret rotation guard.  Telegram rate-limits setWebhook calls, and
+# rapid repeated rotation can desynchronise Telegram's registered path from the
+# app's Redis RUN_STATE secret.  Keep rotation serialized and cooled down.
+_WEBHOOK_ROTATE_ASYNC_LOCK: asyncio.Lock | None = None
+_WEBHOOK_ROTATE_SYNC_LOCK = threading.Lock()
+_WEBHOOK_ROTATE_IN_PROGRESS = False
+_WEBHOOK_LAST_ROTATE_AT = 0.0
+
+
+def _webhook_rotate_cooldown_seconds() -> float:
+    return _env_float("WEBHOOK_ROTATE_COOLDOWN_S", 60.0, minimum=5.0, maximum=3600.0)
+
+
+def _webhook_rotate_lock() -> asyncio.Lock:
+    global _WEBHOOK_ROTATE_ASYNC_LOCK
+    if _WEBHOOK_ROTATE_ASYNC_LOCK is None:
+        _WEBHOOK_ROTATE_ASYNC_LOCK = asyncio.Lock()
+    return _WEBHOOK_ROTATE_ASYNC_LOCK
+
+
+def _webhook_rotate_cooldown_remaining() -> float:
+    elapsed = time.monotonic() - float(globals().get("_WEBHOOK_LAST_ROTATE_AT", 0.0) or 0.0)
+    return max(0.0, _webhook_rotate_cooldown_seconds() - elapsed)
+
+
+def _webhook_rotate_begin_or_remaining() -> float:
+    """Reserve one rotation attempt.
+
+    Returns:
+      0.0  -> reservation acquired
+      >0.0 -> cooldown seconds remaining
+      -1.0 -> another rotation is already running
+    """
+    global _WEBHOOK_ROTATE_IN_PROGRESS
+    with _WEBHOOK_ROTATE_SYNC_LOCK:
+        if _WEBHOOK_ROTATE_IN_PROGRESS:
+            return -1.0
+        remaining = _webhook_rotate_cooldown_remaining()
+        if remaining > 0:
+            return remaining
+        _WEBHOOK_ROTATE_IN_PROGRESS = True
+        return 0.0
+
+
+def _webhook_rotate_finish(success: bool) -> None:
+    global _WEBHOOK_ROTATE_IN_PROGRESS, _WEBHOOK_LAST_ROTATE_AT
+    with _WEBHOOK_ROTATE_SYNC_LOCK:
+        if success:
+            _WEBHOOK_LAST_ROTATE_AT = time.monotonic()
+        _WEBHOOK_ROTATE_IN_PROGRESS = False
 
 
 async def run_fastapi():
@@ -5466,10 +5562,30 @@ def web_admin_runtime_config():
         messages: list[str] = []
         try:
             if action == "rotate_secret":
+                remaining = _webhook_rotate_begin_or_remaining()
+                if remaining < 0:
+                    raise RuntimeError("Webhook secret rotation is already running. Please wait.")
+                if remaining > 0:
+                    raise RuntimeError(f"Please wait {int(remaining) + 1}s before rotating the webhook secret again.")
+
+                success = False
                 new_token = generate_new_webhook_token()
-                _run_admin_coro_sync(_update_run_state("TELEGRAM_WEBHOOK_SECRET_TOKEN", new_token), timeout=10)
-                if _run_state_bot_mode() == "WEBHOOK":
-                    _run_admin_coro_sync(set_telegram_webhook(), timeout=20)
+                try:
+                    # Important order: ask Telegram to accept the new webhook
+                    # first.  Only persist RUN_STATE after setWebhook succeeds.
+                    if _run_state_bot_mode() == "WEBHOOK":
+                        _run_admin_coro_sync(
+                            _configure_telegram_webhook_via_http_for_secret(new_token),
+                            timeout=45,
+                        )
+                    _run_admin_coro_sync(
+                        _update_run_state("TELEGRAM_WEBHOOK_SECRET_TOKEN", new_token),
+                        timeout=10,
+                    )
+                    success = True
+                finally:
+                    _webhook_rotate_finish(success)
+
                 messages.append(f"Webhook secret rotated. New path: /tg-webhook-{new_token}")
                 logger.info("Admin %s rotated Webhook Secret Token from web dashboard.", admin_id)
             else:
@@ -6571,30 +6687,61 @@ async def _runtime_admin_callback(update: Any, context: Any) -> None:
     if data == "rtadmin_rotate_secret":
         with suppress(Exception):
             await query.answer("Rotating secret…", show_alert=False)
-        new_token = generate_new_webhook_token()
-        try:
-            await _update_run_state("TELEGRAM_WEBHOOK_SECRET_TOKEN", new_token, persist=True)
-            logger.info(f"Admin {admin_id} rotated Webhook Secret Token.")
-            webhook_logger.info("Webhook secret rotated by admin_id=%s mode=%s", admin_id, _run_state_bot_mode())
-            if _run_state_bot_mode() == "WEBHOOK":
-                await set_telegram_webhook()
-            new_path = f"/tg-webhook-{new_token}"
-            await safe_send(lambda: query.message.edit_text(
-                _runtime_admin_text()
-                + "\n\n✅ Webhook secret updated!"
-                + f"\nNew URL path: <code>{html.escape(new_path)}</code>",
-                parse_mode="HTML",
-                reply_markup=_refresh_runtime_admin_markup(),
-                disable_web_page_preview=True,
-            ))
-        except Exception as exc:
-            webhook_logger.error("Webhook secret rotation failed admin_id=%s: %s", admin_id, exc, exc_info=True)
-            await safe_send(lambda: query.message.edit_text(
-                _runtime_admin_text() + f"\n\n❌ Rotate secret failed: <code>{html.escape(str(exc)[:800])}</code>",
-                parse_mode="HTML",
-                reply_markup=_refresh_runtime_admin_markup(),
-                disable_web_page_preview=True,
-            ))
+
+        async with _webhook_rotate_lock():
+            remaining = _webhook_rotate_begin_or_remaining()
+            if remaining < 0:
+                await safe_send(lambda: query.message.edit_text(
+                    _runtime_admin_text()
+                    + "\n\n⚠️ Webhook secret rotation is already running. Please wait.",
+                    parse_mode="HTML",
+                    reply_markup=_refresh_runtime_admin_markup(),
+                    disable_web_page_preview=True,
+                ))
+                return
+            if remaining > 0:
+                await safe_send(lambda: query.message.edit_text(
+                    _runtime_admin_text()
+                    + f"\n\n⚠️ Please wait {int(remaining) + 1}s before rotating the webhook secret again.",
+                    parse_mode="HTML",
+                    reply_markup=_refresh_runtime_admin_markup(),
+                    disable_web_page_preview=True,
+                ))
+                return
+
+            success = False
+            new_token = generate_new_webhook_token()
+            try:
+                # Important order: ask Telegram to accept the new webhook first.
+                # Only persist RUN_STATE after setWebhook succeeds.
+                if _run_state_bot_mode() == "WEBHOOK":
+                    await _configure_telegram_webhook_via_http_for_secret(new_token)
+
+                await _update_run_state("TELEGRAM_WEBHOOK_SECRET_TOKEN", new_token, persist=True)
+                success = True
+
+                logger.info("Admin %s rotated Webhook Secret Token.", admin_id)
+                webhook_logger.info("Webhook secret rotated by admin_id=%s mode=%s", admin_id, _run_state_bot_mode())
+
+                new_path = f"/tg-webhook-{new_token}"
+                await safe_send(lambda: query.message.edit_text(
+                    _runtime_admin_text()
+                    + "\n\n✅ Webhook secret updated!"
+                    + f"\nNew URL path: <code>{html.escape(new_path)}</code>",
+                    parse_mode="HTML",
+                    reply_markup=_refresh_runtime_admin_markup(),
+                    disable_web_page_preview=True,
+                ))
+            except Exception as exc:
+                webhook_logger.error("Webhook secret rotation failed admin_id=%s: %s", admin_id, exc, exc_info=True)
+                await safe_send(lambda: query.message.edit_text(
+                    _runtime_admin_text() + f"\n\n❌ Rotate secret failed: <code>{html.escape(str(exc)[:800])}</code>",
+                    parse_mode="HTML",
+                    reply_markup=_refresh_runtime_admin_markup(),
+                    disable_web_page_preview=True,
+                ))
+            finally:
+                _webhook_rotate_finish(success)
         return
 
     if data.startswith("rtadmin_switch:"):
