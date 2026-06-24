@@ -3781,7 +3781,7 @@ def _crm_rows_html(rows: list[dict], csrf: str, return_input: str) -> tuple[str,
     mobile_cards: list[str] = []
     for row in rows:
         uid = int(row.get("user_id") or 0)
-        username = row.get("username") or row.get("first_name") or "-"
+        username = _admin_username_display(row)
         detail_url = url_for("web_admin_user_detail", user_id=uid)
         last_seen = row.get("last_active") or row.get("last_text_at") or ""
         age = row.get("age_days")
@@ -4074,6 +4074,27 @@ def web_admin_crm_action():
     return redirect(_web_safe_return("web_admin_crm"))
 
 
+
+
+def _admin_username_display(row: dict | None) -> str:
+    """Return a clean Telegram username for admin screens.
+
+    Telegram gives `username` without @.  Store/display it as @username when
+    it looks like a real Telegram handle, but do not invent @ for a normal
+    first name fallback.
+    """
+    row = row or {}
+    raw_username = str(row.get("username") or "").strip()
+    first_name = str(row.get("first_name") or "").strip()
+
+    if raw_username and raw_username != "-":
+        clean = raw_username.lstrip("@").strip()
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", clean):
+            return f"@{clean}"
+        return raw_username
+
+    return first_name or "-"
+
 @app_flask.route("/admin/users/<int:user_id>")
 @web_admin_required
 def web_admin_user_detail(user_id: int):
@@ -4081,7 +4102,7 @@ def web_admin_user_detail(user_id: int):
     blocked = bool(row.get("blocked"))
     csrf = _web_csrf_token()
     return_input = _web_return_input()
-    username = row.get("username") or row.get("first_name") or "-"
+    username = _admin_username_display(row)
     history_rows = list(row.get("history") or [])
     metrics = _web_user_detail_metrics(row)
     tg_link = f"tg://user?id={int(user_id)}"
@@ -9209,11 +9230,31 @@ def sync_user_data(user) -> None:
         _user_sync_seen.popitem(last=False)
 
     def _run():
-        payload = {"user_id": user.id, "username": user.username or user.first_name}
-        primary_payload = {**payload, "last_active": datetime.now(timezone.utc).isoformat()}
+        # Telegram usernames are stored without @ by Telegram.  Keep the real
+        # username and first_name separate when the optional first_name column
+        # exists, then fall back safely for older schemas.
+        username = (user.username or "").strip()
+        first_name = (user.first_name or "").strip()
+        last_active = datetime.now(timezone.utc).isoformat()
+
+        primary_payload = {
+            "user_id": user.id,
+            "username": username,
+            "first_name": first_name,
+            "last_active": last_active,
+        }
+        legacy_payload = {
+            "user_id": user.id,
+            "username": username or first_name,
+            "last_active": last_active,
+        }
+        basic_payload = {
+            "user_id": user.id,
+            "username": username or first_name,
+        }
 
         res = db_call_sync(
-            f"sync_user_data:{user.id}:with_last_active",
+            f"sync_user_data:{user.id}:with_first_name",
             lambda: supabase.table("user_prefs").upsert(
                 primary_payload,
                 on_conflict="user_id",
@@ -9226,10 +9267,22 @@ def sync_user_data(user) -> None:
         if res is not None:
             return
 
+        # Fallback for older user_prefs tables without first_name.
+        res = db_call_sync(
+            f"sync_user_data:{user.id}:with_last_active",
+            lambda: supabase.table("user_prefs").upsert(legacy_payload, on_conflict="user_id").execute(),
+            default=None,
+            attempts=2,
+            critical=False,
+        )
+
+        if res is not None:
+            return
+
         # Fallback for older user_prefs tables without last_active.
         db_call_sync(
             f"sync_user_data:{user.id}:basic",
-            lambda: supabase.table("user_prefs").upsert(payload, on_conflict="user_id").execute(),
+            lambda: supabase.table("user_prefs").upsert(basic_payload, on_conflict="user_id").execute(),
             default=None,
             attempts=2,
             critical=False,
@@ -10144,7 +10197,7 @@ def db_user_detail(user_id: int) -> dict:
 
 def _format_user_detail_text(row: dict) -> str:
     user_id = int(row.get("user_id") or 0)
-    username = html.escape(str(row.get("username") or row.get("first_name") or "-"))
+    username = html.escape(_admin_username_display(row))
     gender = html.escape(str(row.get("gender") or "female"))
     speed = html.escape(str(row.get("speed") or DEFAULT_SPEED))
     tts_model = html.escape(_tts_model_label(row.get("tts_model") or DEFAULT_TTS_MODEL))
