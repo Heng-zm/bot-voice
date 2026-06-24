@@ -7136,6 +7136,10 @@ OCR_PROVIDER_COOLDOWN_S    = _env_float("OCR_PROVIDER_COOLDOWN_S", 300.0, minimu
 MAX_VOICE_BYTES         = 20 * 1024 * 1024
 MAX_AUDIO_FILE_BYTES    = 50 * 1024 * 1024
 MAX_INPUT_CHARS         = 5_000
+# Long text converted as one giant voice can make FFmpeg/libopus exceed Render's
+# small-instance CPU budget.  Above this length, send multiple smaller voice
+# messages instead of one huge OGG conversion.
+TTS_SINGLE_VOICE_MAX_CHARS = _env_int("TTS_SINGLE_VOICE_MAX_CHARS", 1200, minimum=300, maximum=MAX_INPUT_CHARS)
 TTS_CHUNK_CHARS         = 900
 # Edge TTS can intermittently return NoAudioReceived on Render when a voice
 # is busy, text is too long, or websocket audio chunks stop arriving.
@@ -7175,7 +7179,7 @@ HF_TTS_NO_AUDIO_COOLDOWN_S = _env_float("HF_TTS_NO_AUDIO_COOLDOWN_S", 600.0, min
 HF_TTS_CLIENT_CACHE      = _env_bool("HF_TTS_CLIENT_CACHE", True)
 HF_TTS_SERIALIZE_CALLS   = _env_bool("HF_TTS_SERIALIZE_CALLS", True)
 FFMPEG_START_TIMEOUT_S  = _env_float("FFMPEG_START_TIMEOUT_S", 5.0, minimum=1.0, maximum=30.0)
-FFMPEG_CONVERT_TIMEOUT_S = _env_float("FFMPEG_CONVERT_TIMEOUT_S", 75.0, minimum=15.0, maximum=300.0)
+FFMPEG_CONVERT_TIMEOUT_S = _env_float("FFMPEG_CONVERT_TIMEOUT_S", 120.0, minimum=15.0, maximum=600.0)
 DEFAULT_SPEED           = 1.0
 TELE_MSG_LIMIT          = 4000
 USER_COOLDOWN_S         = 3.0
@@ -8857,12 +8861,35 @@ def _is_message_not_modified_error(exc: Exception | str) -> bool:
     return "message is not modified" in str(exc).lower()
 
 
+def _is_stale_telegram_message_error(exc: Exception | str) -> bool:
+    """Return True for harmless Telegram edit/delete races on stale messages.
+
+    Inline keyboards can outlive the message Telegram is asked to edit/delete:
+    users may delete the message, the chat may auto-clean it, or Telegram may no
+    longer expose it for editing.  These should not become noisy unhandled
+    callback errors, especially for simple menu callbacks like `show_speed`.
+    """
+    msg = str(exc).lower()
+    return any(token in msg for token in (
+        "message to edit not found",
+        "message to delete not found",
+        "message can't be deleted",
+        "message can't be edited",
+        "message is not found",
+    ))
+
+
+def _is_nonfatal_telegram_edit_error(exc: Exception | str) -> bool:
+    return _is_message_not_modified_error(exc) or _is_stale_telegram_message_error(exc)
+
+
 async def safe_send(coro_factory, retries: int = 3, delay: float = 2.0):
     """Run Telegram send/edit calls with retry.
 
     Important fix: Telegram raises BadRequest when an inline button edits a
-    message to the same text + same markup. That is not a real failure, so this
-    helper now returns None instead of logging an unhandled callback error.
+    message to the same text/same markup, or when the original message is stale.
+    Those are not real failures, so this helper returns None instead of logging
+    an unhandled callback error.
     """
     if inspect.isawaitable(coro_factory):
         raise TypeError(
@@ -8880,8 +8907,8 @@ async def safe_send(coro_factory, retries: int = 3, delay: float = 2.0):
             if attempt == retries - 1:
                 raise
         except BadRequest as e:
-            if _is_message_not_modified_error(e):
-                logger.debug("Telegram edit skipped: message is not modified.")
+            if _is_nonfatal_telegram_edit_error(e):
+                logger.debug("Telegram edit/delete skipped because message is unchanged or stale: %s", e)
                 return None
             logger.warning(f"Telegram BadRequest (not retried): {e}")
             raise
@@ -8893,6 +8920,9 @@ async def safe_send(coro_factory, retries: int = 3, delay: float = 2.0):
             else:
                 raise
         except TelegramError as e:
+            if _is_nonfatal_telegram_edit_error(e):
+                logger.debug("Telegram edit/delete skipped because message is unchanged or stale: %s", e)
+                return None
             logger.error(f"Telegram error: {e}")
             raise
     if last_exc:
@@ -12226,6 +12256,19 @@ async def _terminate_subprocess(proc: asyncio.subprocess.Process | None, label: 
         logger.warning("Could not fully clean up %s subprocess: %s", label, exc)
 
 
+def _ffmpeg_tts_timeout_s(*, chunk_count: int = 1, input_bytes: int = 0) -> float:
+    """Compute a bounded FFmpeg timeout for TTS conversion.
+
+    The old fixed 75s timeout was too tight for long Khmer/Edge TTS jobs on
+    small Render instances.  Keep short jobs fast, but give longer/multi-chunk
+    conversions enough CPU time before killing FFmpeg.
+    """
+    chunks = max(1, int(chunk_count or 1))
+    size_mb = max(0.0, float(input_bytes or 0) / (1024 * 1024))
+    dynamic = 45.0 + (25.0 * chunks) + (12.0 * size_mb)
+    return min(600.0, max(float(FFMPEG_CONVERT_TIMEOUT_S), dynamic))
+
+
 def _hf_tts_make_client_sync():
     if GradioClient is None:
         raise RuntimeError("gradio_client is not installed. Add `gradio_client` to requirements.txt.")
@@ -12409,7 +12452,7 @@ async def _convert_audio_files_to_telegram_voice(input_paths: list[str], speed: 
             ),
             timeout=FFMPEG_START_TIMEOUT_S,
         )
-        timeout_s = max(FFMPEG_CONVERT_TIMEOUT_S, 20 * len(input_paths))
+        timeout_s = _ffmpeg_tts_timeout_s(chunk_count=len(input_paths))
         _, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
     except FileNotFoundError as exc:
         _cleanup(output_path)
@@ -12541,6 +12584,7 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
     cmd += ["-c:a", "libopus", "-b:a", "32k", output_path]
 
     proc: asyncio.subprocess.Process | None = None
+    timeout_s = float(FFMPEG_CONVERT_TIMEOUT_S)
     try:
         proc = await asyncio.wait_for(
             asyncio.create_subprocess_exec(
@@ -12551,14 +12595,15 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
             ),
             timeout=FFMPEG_START_TIMEOUT_S,
         )
-        _, stderr_data = await asyncio.wait_for(proc.communicate(input=mp3_data), timeout=FFMPEG_CONVERT_TIMEOUT_S)
+        timeout_s = _ffmpeg_tts_timeout_s(chunk_count=len(text_chunks), input_bytes=len(mp3_data))
+        _, stderr_data = await asyncio.wait_for(proc.communicate(input=mp3_data), timeout=timeout_s)
     except FileNotFoundError as exc:
         _cleanup(output_path)
         raise RuntimeError(f"FFmpeg executable not found: {_FFMPEG_EXE}") from exc
     except asyncio.TimeoutError:
         _cleanup(output_path)
         await _terminate_subprocess(proc, "Edge TTS FFmpeg")
-        raise RuntimeError(f"FFmpeg timed out after {FFMPEG_CONVERT_TIMEOUT_S:.0f}s")
+        raise RuntimeError(f"FFmpeg timed out after {timeout_s:.0f}s")
 
     if proc.returncode != 0:
         _cleanup(output_path)
@@ -16991,6 +17036,25 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with lock:
         try:
+            # Long text is safer as multiple smaller voice messages.  This avoids
+            # one large MP3 -> OGG/Opus FFmpeg conversion timing out on Render.
+            if len(tts_text) > TTS_SINGLE_VOICE_MAX_CHARS:
+                uname = user.username or user.first_name or str(user_id)
+                await _deliver_paged_tts(
+                    chat_id=msg.chat_id,
+                    bot=context.bot,
+                    text=tts_text,
+                    gender=gender,
+                    speed=speed,
+                    user_id=user_id,
+                    username=uname,
+                    tts_model=tts_model,
+                )
+                record_turn(user_id, "user", stripped)
+                record_turn(user_id, "assistant", tts_text[:CONV_CONTEXT_MAX_CHARS])
+                _set_last_tts(user_id)
+                return
+
             audio_bytes = await generate_voice_limited(tts_text, gender, speed, file_path, tts_model)
             sent_msg    = await safe_send(
                 lambda ab=audio_bytes: msg.reply_voice(
