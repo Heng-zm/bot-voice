@@ -2249,7 +2249,7 @@ def ai_info():
         "model": HF_MODEL,
         "ocr_model": HF_OCR_MODEL,
         "ocr_provider": OCR_PROVIDER,
-        "features": ["chat", "multi-turn-history", "image-ocr", "khmer-language", "english-language", "admin-generated-api-keys"],
+        "features": ["chat", "multi-turn-history", "image-ocr", "khmer-language", "english-language", "chinese-language", "admin-generated-api-keys"],
         "providers": {
             "active": AI_PROVIDER,
             "huggingface_available": _hf_client is not None,
@@ -7682,6 +7682,72 @@ def _supabase_select_schema_safe_sync(
     return default
 
 
+def _supabase_filter_payload_columns(table: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Drop optional columns already known to be missing for this table.
+
+    Required columns such as user_id are never marked missing by normal app
+    paths, so real schema mistakes still surface as failures.
+    """
+    with _SUPABASE_SCHEMA_LOCK:
+        missing = set(_SUPABASE_MISSING_COLUMNS.get(str(table), set()))
+    return {key: value for key, value in dict(payload or {}).items() if key not in missing}
+
+
+def _supabase_upsert_schema_safe_sync(
+    table: str,
+    payload: dict[str, Any],
+    *,
+    on_conflict: str | None = None,
+    name: str,
+    default: Any = None,
+    max_schema_retries: int = 8,
+) -> Any:
+    """Execute an upsert while silently retrying without missing optional columns.
+
+    This prevents expected migration drift such as missing user_prefs.first_name
+    from producing noisy PGRST204 non-retryable errors on every user sync.
+    """
+    if not supabase:
+        return default
+
+    tried_keys: set[tuple[str, ...]] = set()
+    for _ in range(max(1, int(max_schema_retries))):
+        filtered_payload = _supabase_filter_payload_columns(table, payload)
+        key_tuple = tuple(sorted(filtered_payload.keys()))
+        if not filtered_payload or key_tuple in tried_keys:
+            break
+        tried_keys.add(key_tuple)
+        try:
+            builder = (
+                supabase.table(table).upsert(filtered_payload, on_conflict=on_conflict)
+                if on_conflict
+                else supabase.table(table).upsert(filtered_payload)
+            )
+            result = builder.execute()
+            result = _resolve_maybe_awaitable_sync(result)
+            with suppress(Exception):
+                supabase_breaker.record_success()
+            return result
+        except Exception as exc:
+            missing_col = _supabase_missing_column_name(exc, table)
+            if missing_col:
+                _supabase_mark_missing_column(table, missing_col, name)
+                continue
+
+            with suppress(Exception):
+                supabase_breaker.record_failure(exc)
+            level = logging.WARNING if _is_retryable_store_error(exc) else logging.ERROR
+            _log_once(
+                level,
+                f"schema_safe_upsert:{name}:{type(exc).__name__}:{str(exc)[:120]}",
+                "Supabase:%s failed: %s",
+                name,
+                exc,
+            )
+            return default
+    return default
+
+
 def redis_call_sync(name: str, factory: Callable[[], Any], *, default: Any = None, attempts: int = 2, critical: bool = False) -> Any:
     if redis_client is None:
         return default
@@ -8517,8 +8583,17 @@ def _init_clients() -> None:
 # Constants
 # ---------------------------------------------------------------------------
 VOICE_MAP = {
+    # Khmer
     "km": {"female": "km-KH-SreymomNeural", "male": "km-KH-PisethNeural"},
-    "en": {"female": "en-US-AriaNeural",     "male": "en-US-GuyNeural"},
+    # English
+    "en": {"female": "en-US-AriaNeural", "male": "en-US-GuyNeural"},
+    # Chinese / Mandarin (Simplified + Traditional text detection routes here)
+    "zh": {"female": "zh-CN-XiaoxiaoNeural", "male": "zh-CN-YunxiNeural"},
+}
+TTS_LANGUAGE_LABELS = {
+    "km": "Khmer",
+    "en": "English",
+    "zh": "Chinese",
 }
 SPEED_OPTIONS = {
     "spd_0.5": ("x0.5", 0.5),
@@ -8530,7 +8605,7 @@ WELCOME_TEXT = (
     "🎵 សួស្តី! ខ្ញុំជា Bot បំលែងអក្សរទៅជាសំឡេង អេអាយ\n\n"
     "📌 វាយអក្សរភាសាណាមួយ ផ្ញើរមក Bot នឹងបំលែងដោយស្វ័យប្រវត្តិ!\n\n"
     "🌍 ភាសាដែល Support:\n"
-    "🇰🇭 ភាសាខ្មែរ | 🇺🇸 English\n\n"
+    "🇰🇭 ភាសាខ្មែរ | 🇺🇸 English | 🇨🇳 中文 Chinese\n\n"
     "⚙️ ប្រើ /myprefs ដើម្បីមើលការកំណត់របស់អ្នក\n"
     "📢 Join My Channel: https://t.me/m11mmm112"
 )
@@ -9220,72 +9295,39 @@ _user_sync_seen: OrderedDict[int, float] = OrderedDict()
 def sync_user_data(user) -> None:
     if not supabase or not user:
         return
-    now  = time.monotonic()
-    last = _user_sync_seen.get(user.id, 0.0)
+    now = time.monotonic()
+    user_id = int(getattr(user, "id", 0) or 0)
+    if not user_id:
+        return
+
+    last = _user_sync_seen.get(user_id, 0.0)
     if now - last < _USER_SYNC_TTL:
         return
-    _user_sync_seen.pop(user.id, None)
-    _user_sync_seen[user.id] = now
+    _user_sync_seen.pop(user_id, None)
+    _user_sync_seen[user_id] = now
     while len(_user_sync_seen) > _USER_SYNC_MAX:
         _user_sync_seen.popitem(last=False)
 
     def _run():
-        # Telegram usernames are stored without @ by Telegram.  Keep the real
-        # username and first_name separate when the optional first_name column
-        # exists, then fall back safely for older schemas.
-        username = (user.username or "").strip()
-        first_name = (user.first_name or "").strip()
-        last_active = datetime.now(timezone.utc).isoformat()
-
-        primary_payload = {
-            "user_id": user.id,
-            "username": username,
+        # Telegram usernames are stored without @ by Telegram. Store first_name
+        # only when the database has that optional column; older schemas are
+        # retried automatically without first_name/last_active and no noisy
+        # PGRST204 non-retryable error is logged.
+        username = (getattr(user, "username", None) or "").strip()
+        first_name = (getattr(user, "first_name", None) or "").strip()
+        payload = {
+            "user_id": user_id,
+            "username": username or first_name,
             "first_name": first_name,
-            "last_active": last_active,
+            "last_active": datetime.now(timezone.utc).isoformat(),
         }
-        legacy_payload = {
-            "user_id": user.id,
-            "username": username or first_name,
-            "last_active": last_active,
-        }
-        basic_payload = {
-            "user_id": user.id,
-            "username": username or first_name,
-        }
-
-        res = db_call_sync(
-            f"sync_user_data:{user.id}:with_first_name",
-            lambda: supabase.table("user_prefs").upsert(
-                primary_payload,
-                on_conflict="user_id",
-            ).execute(),
+        _supabase_upsert_schema_safe_sync(
+            "user_prefs",
+            payload,
+            on_conflict="user_id",
+            name=f"sync_user_data:{user_id}",
             default=None,
-            attempts=3,
-            critical=False,
-        )
-
-        if res is not None:
-            return
-
-        # Fallback for older user_prefs tables without first_name.
-        res = db_call_sync(
-            f"sync_user_data:{user.id}:with_last_active",
-            lambda: supabase.table("user_prefs").upsert(legacy_payload, on_conflict="user_id").execute(),
-            default=None,
-            attempts=2,
-            critical=False,
-        )
-
-        if res is not None:
-            return
-
-        # Fallback for older user_prefs tables without last_active.
-        db_call_sync(
-            f"sync_user_data:{user.id}:basic",
-            lambda: supabase.table("user_prefs").upsert(basic_payload, on_conflict="user_id").execute(),
-            default=None,
-            attempts=2,
-            critical=False,
+            max_schema_retries=4,
         )
 
     _submit_db(_run)
@@ -11854,11 +11896,33 @@ def _build_atempo_chain(speed: float) -> str:
     return ",".join(stages)
 
 
+_CHINESE_RE = re.compile(r"[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
+
+
 def _detect_tts_lang_key(text: str) -> str:
-    khmer_chars = len(_KHMER_RE.findall(text or ""))
-    total_alpha = sum(1 for c in (text or "") if c.isalpha())
-    is_khmer = khmer_chars > (total_alpha * 0.3) if total_alpha else khmer_chars > 0
-    return "km" if is_khmer else "en"
+    """Detect the best Edge/HF TTS language bucket for a text chunk.
+
+    Supports Khmer, English, and Chinese. Chinese detection is done before the
+    English fallback because CJK ideographs are also treated as alphabetic by
+    Python's str.isalpha().
+    """
+    text = text or ""
+    khmer_chars = len(_KHMER_RE.findall(text))
+    chinese_chars = len(_CHINESE_RE.findall(text))
+    latin_chars = len(_LATIN_RE.findall(text))
+    signal_total = khmer_chars + chinese_chars + latin_chars
+
+    if signal_total <= 0:
+        return "en"
+
+    # Prefer the strongest non-Latin script when it has meaningful presence.
+    # This keeps short Chinese phrases like "你好" or mixed captions readable.
+    if chinese_chars and chinese_chars >= khmer_chars and chinese_chars / signal_total >= 0.15:
+        return "zh"
+    if khmer_chars and khmer_chars / signal_total >= 0.15:
+        return "km"
+    return "en"
 
 
 def _detect_voice(text: str, gender: str) -> str:
@@ -11878,14 +11942,21 @@ def _clean_tts_text_for_edge(text: str) -> str:
 
 
 def _tts_voice_candidates(text: str, gender: str) -> list[str]:
-    """Primary voice first, then same-language fallback; optional cross-language fallback."""
+    """Primary voice first, same-language gender fallback, then optional cross-language fallback."""
     gender = gender if gender in ("female", "male") else "female"
     lang = _detect_tts_lang_key(text)
+    if lang not in VOICE_MAP:
+        lang = "en"
     other_gender = "male" if gender == "female" else "female"
     candidates = [VOICE_MAP[lang][gender], VOICE_MAP[lang][other_gender]]
+
     if EDGE_TTS_CROSS_LANG_FALLBACK:
-        other_lang = "en" if lang == "km" else "km"
-        candidates.extend([VOICE_MAP[other_lang][gender], VOICE_MAP[other_lang][other_gender]])
+        fallback_order = ("km", "zh", "en")
+        for other_lang in fallback_order:
+            if other_lang == lang or other_lang not in VOICE_MAP:
+                continue
+            candidates.extend([VOICE_MAP[other_lang][gender], VOICE_MAP[other_lang][other_gender]])
+
     seen: set[str] = set()
     unique: list[str] = []
     for voice in candidates:
