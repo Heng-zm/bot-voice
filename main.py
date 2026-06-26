@@ -271,6 +271,36 @@ except Exception as exc:
     redis_lib = None
 
 
+# ── Built-in smooth performance defaults ───────────────────────────────────
+# These values are now code defaults, so the bot runs smoothly without adding
+# performance knobs to Render/Railway env. Environment variables still override
+# them for emergency deployments, and /admin settings can change the hot-safe
+# values at runtime.
+PERFORMANCE_CODE_DEFAULTS: dict[str, Any] = {
+    "BOT_MODE": "WEBHOOK",
+    "TELEGRAM_CONCURRENT_UPDATES": 4,
+    "TELEGRAM_CONNECTION_POOL_SIZE": 24,
+    "HTTP_MAX_CONNECTIONS": 100,
+    "HTTP_MAX_KEEPALIVE_CONNECTIONS": 20,
+    "DB_EXECUTOR_MAX_WORKERS": 3,
+    "MAX_CONCURRENT_TTS_USERS": 2,
+    "USER_SYNC_TTL_S": 1800.0,
+    "PREFS_CACHE_TTL_S": 600.0,
+    "TTS_AUDIO_CACHE_ENABLED": True,
+    "TTS_AUDIO_CACHE_MAX_MB": 64,
+    "TTS_AUDIO_CACHE_ITEM_MAX_MB": 8,
+    "TTS_AUDIO_CACHE_TTL_S": 1200.0,
+    "EDGE_TTS_PARALLEL_CHUNKS": 1,
+    "PAGED_TTS_SEND_DELAY_S": 0.10,
+    "WEB_STATUS_POLL_SECONDS": 30,
+    "WEB_LIVE_POLL_SECONDS": 30,
+}
+
+
+def _perf_default(name: str, fallback: Any = None) -> Any:
+    return PERFORMANCE_CODE_DEFAULTS.get(name, fallback)
+
+
 # ── FastAPI Web Server + typed settings ─────────────────────────────────────
 class AppSettings(BaseSettings):
     """Centralised environment configuration.
@@ -294,7 +324,7 @@ class AppSettings(BaseSettings):
     WEB_COOKIE_SECURE: bool = False
     WEB_ADMIN_SESSION_DAYS: int = 14
     WEB_MAX_CONTENT_LENGTH: int = 64 * 1024 * 1024
-    MAX_CONCURRENT_TTS_USERS: int = 6
+    MAX_CONCURRENT_TTS_USERS: int = int(_perf_default("MAX_CONCURRENT_TTS_USERS", 2))
     MAX_CONCURRENT_AI: int = 3
     MAX_CONCURRENT_GEMINI: int = 3
     MAX_CONCURRENT_BROADCAST: int = 3
@@ -311,22 +341,31 @@ class AppSettings(BaseSettings):
     WEB_BROADCAST_DELAY_S: float = 0.05
     WEB_TABLE_PAGE_SIZE: int = 50
     WEB_COUNTS_CACHE_TTL_S: float = 30.0
-    WEB_STATUS_POLL_SECONDS: int = 30
-    WEB_LIVE_POLL_SECONDS: int = 30
+    WEB_STATUS_POLL_SECONDS: int = int(_perf_default("WEB_STATUS_POLL_SECONDS", 30))
+    WEB_LIVE_POLL_SECONDS: int = int(_perf_default("WEB_LIVE_POLL_SECONDS", 30))
     WEB_LIVE_SCHEDULES_CACHE_TTL_S: float = 30.0
     AI_API_KEY_CACHE_TTL_S: float = 60.0
     AI_API_KEY_TOUCH_INTERVAL_S: float = 60.0
     WEB_SLOW_REQUEST_MS: float = 1500.0
     WEB_ADMIN_AUDIT_MAX: int = 300
-    TELEGRAM_CONCURRENT_UPDATES: int = 8
-    TELEGRAM_CONNECTION_POOL_SIZE: int = 24
-    BOT_MODE: str = "POLLING"
+    TELEGRAM_CONCURRENT_UPDATES: int = int(_perf_default("TELEGRAM_CONCURRENT_UPDATES", 4))
+    TELEGRAM_CONNECTION_POOL_SIZE: int = int(_perf_default("TELEGRAM_CONNECTION_POOL_SIZE", 24))
+    DB_EXECUTOR_MAX_WORKERS: int = int(_perf_default("DB_EXECUTOR_MAX_WORKERS", 3))
+    USER_SYNC_TTL_S: float = float(_perf_default("USER_SYNC_TTL_S", 1800.0))
+    PREFS_CACHE_TTL_S: float = float(_perf_default("PREFS_CACHE_TTL_S", 600.0))
+    TTS_AUDIO_CACHE_ENABLED: bool = bool(_perf_default("TTS_AUDIO_CACHE_ENABLED", True))
+    TTS_AUDIO_CACHE_MAX_MB: int = int(_perf_default("TTS_AUDIO_CACHE_MAX_MB", 64))
+    TTS_AUDIO_CACHE_ITEM_MAX_MB: int = int(_perf_default("TTS_AUDIO_CACHE_ITEM_MAX_MB", 8))
+    TTS_AUDIO_CACHE_TTL_S: float = float(_perf_default("TTS_AUDIO_CACHE_TTL_S", 1200.0))
+    EDGE_TTS_PARALLEL_CHUNKS: int = int(_perf_default("EDGE_TTS_PARALLEL_CHUNKS", 1))
+    PAGED_TTS_SEND_DELAY_S: float = float(_perf_default("PAGED_TTS_SEND_DELAY_S", 0.10))
+    BOT_MODE: str = str(_perf_default("BOT_MODE", "WEBHOOK"))
     TELEGRAM_WEBHOOK_URL: str | None = None
     TELEGRAM_WEBHOOK_SECRET_TOKEN: str | None = None
     TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES: bool = False
     TELEGRAM_ALLOWED_UPDATES: str = "message,callback_query"
-    HTTP_MAX_CONNECTIONS: int = 100
-    HTTP_MAX_KEEPALIVE_CONNECTIONS: int = 20
+    HTTP_MAX_CONNECTIONS: int = int(_perf_default("HTTP_MAX_CONNECTIONS", 100))
+    HTTP_MAX_KEEPALIVE_CONNECTIONS: int = int(_perf_default("HTTP_MAX_KEEPALIVE_CONNECTIONS", 20))
     REDIS_MAX_CONNECTIONS: int = 100
     USER_RATE_LIMIT_PER_SECOND: int = 3
     USER_RATE_LIMIT_WINDOW_S: float = 1.0
@@ -835,8 +874,8 @@ app_flask.config["MAX_CONTENT_LENGTH"] = _web_max_content_length()
 # These are intentionally env-tunable so Render small instances can stay stable.
 WEB_SLOW_REQUEST_MS = _env_float("WEB_SLOW_REQUEST_MS", 1500.0, minimum=100.0, maximum=60_000.0)
 WEB_ADMIN_AUDIT_MAX = _env_int("WEB_ADMIN_AUDIT_MAX", 300, minimum=50, maximum=5_000)
-TELEGRAM_CONCURRENT_UPDATES = _env_int("TELEGRAM_CONCURRENT_UPDATES", 8, minimum=1, maximum=64)
-TELEGRAM_CONNECTION_POOL_SIZE = _env_int("TELEGRAM_CONNECTION_POOL_SIZE", 24, minimum=4, maximum=256)
+TELEGRAM_CONCURRENT_UPDATES = _env_int("TELEGRAM_CONCURRENT_UPDATES", int(_perf_default("TELEGRAM_CONCURRENT_UPDATES", 4)), minimum=1, maximum=64)
+TELEGRAM_CONNECTION_POOL_SIZE = _env_int("TELEGRAM_CONNECTION_POOL_SIZE", int(_perf_default("TELEGRAM_CONNECTION_POOL_SIZE", 24)), minimum=4, maximum=256)
 _WEB_ACTIVE_REQUESTS = 0
 _WEB_ACTIVE_REQUESTS_LOCK = threading.Lock()
 _WEB_SLOW_REQUESTS = deque(maxlen=200)
@@ -1378,7 +1417,7 @@ _AI_SYSTEM_PROMPT = (
 # ---------------------------------------------------------------------------
 # Concurrency limits
 # ---------------------------------------------------------------------------
-MAX_CONCURRENT_TTS_USERS   = _env_int("MAX_CONCURRENT_TTS_USERS", 6, minimum=1, maximum=50)
+MAX_CONCURRENT_TTS_USERS   = _env_int("MAX_CONCURRENT_TTS_USERS", int(_perf_default("MAX_CONCURRENT_TTS_USERS", 2)), minimum=1, maximum=50)
 MAX_CONCURRENT_AI          = _env_int("MAX_CONCURRENT_AI", _env_int("MAX_CONCURRENT_GEMINI", 3, minimum=1), minimum=1, maximum=50)
 MAX_CONCURRENT_BROADCAST   = _env_int("MAX_CONCURRENT_BROADCAST", 3, minimum=1, maximum=50)
 BROADCAST_BATCH_SIZE       = _env_int("BROADCAST_BATCH_SIZE", MAX_CONCURRENT_BROADCAST, minimum=1, maximum=500)
@@ -1571,7 +1610,23 @@ insert into public.bot_settings (key, value) values
   ('ocr_enabled', '1'),
   ('voice_transcribe_enabled', '1'),
   ('audio_transcribe_enabled', '1'),
-  ('ai_resolver_enabled', '1')
+  ('ai_resolver_enabled', '1'),
+  ('TELEGRAM_CONCURRENT_UPDATES', '4'),
+  ('TELEGRAM_CONNECTION_POOL_SIZE', '24'),
+  ('HTTP_MAX_CONNECTIONS', '100'),
+  ('HTTP_MAX_KEEPALIVE_CONNECTIONS', '20'),
+  ('DB_EXECUTOR_MAX_WORKERS', '3'),
+  ('MAX_CONCURRENT_TTS_USERS', '2'),
+  ('USER_SYNC_TTL_S', '1800.0'),
+  ('PREFS_CACHE_TTL_S', '600.0'),
+  ('TTS_AUDIO_CACHE_ENABLED', '1'),
+  ('TTS_AUDIO_CACHE_MAX_MB', '64'),
+  ('TTS_AUDIO_CACHE_ITEM_MAX_MB', '8'),
+  ('TTS_AUDIO_CACHE_TTL_S', '1200.0'),
+  ('EDGE_TTS_PARALLEL_CHUNKS', '1'),
+  ('PAGED_TTS_SEND_DELAY_S', '0.10'),
+  ('WEB_STATUS_POLL_SECONDS', '30'),
+  ('WEB_LIVE_POLL_SECONDS', '30')
 on conflict (key) do nothing;
 
 -- Distributed scheduler lock. Required for safe scheduled broadcasts when
@@ -2299,8 +2354,8 @@ _WEB_BROADCAST_QUEUE_STOP = object()
 WEB_TABLE_PAGE_SIZE = max(10, min(200, _env_int("WEB_TABLE_PAGE_SIZE", 50)))
 # V4.1: avoid hammering Supabase from mobile/live dashboard polling.
 WEB_COUNTS_CACHE_TTL_S = max(5.0, _env_float("WEB_COUNTS_CACHE_TTL_S", 30.0))
-WEB_STATUS_POLL_SECONDS = max(10, _env_int("WEB_STATUS_POLL_SECONDS", 30))
-WEB_LIVE_POLL_SECONDS = max(15, _env_int("WEB_LIVE_POLL_SECONDS", 30))
+WEB_STATUS_POLL_SECONDS = max(10, _env_int("WEB_STATUS_POLL_SECONDS", int(_perf_default("WEB_STATUS_POLL_SECONDS", 30))))
+WEB_LIVE_POLL_SECONDS = max(15, _env_int("WEB_LIVE_POLL_SECONDS", int(_perf_default("WEB_LIVE_POLL_SECONDS", 30))))
 WEB_LIVE_SCHEDULES_CACHE_TTL_S = max(5.0, _env_float("WEB_LIVE_SCHEDULES_CACHE_TTL_S", 30.0))
 _WEB_COUNTS_CACHE = {"ts": 0.0, "data": {}}
 _WEB_COUNTS_CACHE_LOCK = threading.Lock()
@@ -5261,14 +5316,21 @@ def web_admin_settings():
     settings, status = db_bot_settings_fetch_all()
     csrf = _web_csrf_token()
     rows = []
-    for key in BOT_SETTING_DEFAULTS:
+    for key in BOT_FEATURE_SETTING_KEYS:
         enabled = _setting_bool_from(settings, key)
         rows.append(
             f"<tr><td><b>{_web_h(BOT_SETTING_LABELS.get(key,key))}</b><br><span class='muted'>{_web_h(BOT_SETTING_DESCRIPTIONS.get(key,''))}</span></td>"
             f"<td>{_web_badge('ON' if enabled else 'OFF', 'ok' if enabled else 'muted')}</td>"
             f"<td><form method='post' data-confirm='Change this bot setting?'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='key' value='{_web_h(key)}'><input type='hidden' name='enabled' value='{'0' if enabled else '1'}'><button class='{'danger' if enabled else 'ok'}'>{'Turn OFF' if enabled else 'Turn ON'}</button></form></td></tr>"
         )
-    body = f"""<div class='card'><h2>Bot Settings</h2><p>DB status: {_web_badge('OK' if status.get('db_ok') else 'MEMORY', 'ok' if status.get('db_ok') else 'warn')} <span class='muted'>{_web_h(status.get('error') or '')}</span></p><div class='table-wrap'><table class='table'><thead><tr><th>Setting</th><th>Status</th><th>Action</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div></div>"""
+    perf_rows = []
+    for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items():
+        value = _setting_raw_from(settings, key, BOT_SETTING_DEFAULTS.get(key, ''))
+        perf_rows.append(
+            f"<tr><td><b>{_web_h(BOT_SETTING_LABELS.get(key,key))}</b><br><span class='muted'>{_web_h(BOT_SETTING_DESCRIPTIONS.get(key,''))}</span></td>"
+            f"<td><code>{_web_h(value)}</code></td><td><a class='btn secondary' href='/admin/runtime'>Advanced Runtime</a></td></tr>"
+        )
+    body = f"""<div class='card'><h2>Bot Settings</h2><p>DB status: {_web_badge('OK' if status.get('db_ok') else 'MEMORY', 'ok' if status.get('db_ok') else 'warn')} <span class='muted'>{_web_h(status.get('error') or '')}</span></p><div class='table-wrap'><table class='table'><thead><tr><th>Feature</th><th>Status</th><th>Action</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div></div><div class='card'><h2>Performance Settings</h2><p class='muted'>Use Telegram /admin → Settings → Performance Settings for quick mobile edits, or open Runtime for advanced web tuning.</p><div class='table-wrap'><table class='table'><thead><tr><th>Setting</th><th>Value</th><th>Action</th></tr></thead><tbody>{''.join(perf_rows)}</tbody></table></div></div>"""
     return _web_render("Settings", body, active="settings")
 
 
@@ -5464,6 +5526,9 @@ def _runtime_performance_snapshot(light: bool = False) -> dict:
             "prefs_cache": len(_prefs_cache),
             "history_cache": len(_hist_cache),
             "text_cache_memory": len(_text_cache_memory),
+            "tts_audio_cache_items": len(_TTS_AUDIO_CACHE) if "_TTS_AUDIO_CACHE" in globals() else 0,
+            "tts_audio_cache_mb": round((_TTS_AUDIO_CACHE_BYTES if "_TTS_AUDIO_CACHE_BYTES" in globals() else 0) / 1024 / 1024, 2),
+            "prefs_load_locks": len(_prefs_load_locks) if "_prefs_load_locks" in globals() else 0,
             "api_key_cache": len(_api_key_validation_cache),
         },
         "executors": {
@@ -6282,16 +6347,16 @@ REDIS_TEXT_CACHE_TTL_S   = _env_int("REDIS_TEXT_CACHE_TTL_S", 86400, minimum=60,
 REDIS_HISTORY_TTL_S      = _env_int("REDIS_HISTORY_TTL_S", 86400, minimum=60, maximum=604800)
 REDIS_SOCKET_TIMEOUT_S   = _env_float("REDIS_SOCKET_TIMEOUT_S", 3.0, minimum=0.2, maximum=30.0)
 CACHE_ASIDE_DEFAULT_TTL_S = _env_int("CACHE_ASIDE_DEFAULT_TTL_S", 3600, minimum=30, maximum=86400)
-HTTP_MAX_CONNECTIONS = _env_int("HTTP_MAX_CONNECTIONS", 100, minimum=10, maximum=1000)
-HTTP_MAX_KEEPALIVE_CONNECTIONS = _env_int("HTTP_MAX_KEEPALIVE_CONNECTIONS", 20, minimum=2, maximum=500)
+HTTP_MAX_CONNECTIONS = _env_int("HTTP_MAX_CONNECTIONS", int(_perf_default("HTTP_MAX_CONNECTIONS", 100)), minimum=10, maximum=1000)
+HTTP_MAX_KEEPALIVE_CONNECTIONS = _env_int("HTTP_MAX_KEEPALIVE_CONNECTIONS", int(_perf_default("HTTP_MAX_KEEPALIVE_CONNECTIONS", 20)), minimum=2, maximum=500)
 REDIS_MAX_CONNECTIONS = _env_int("REDIS_MAX_CONNECTIONS", 100, minimum=2, maximum=1000)
 HTTPX_HIGH_CONCURRENCY_LIMITS = httpx.Limits(
     max_connections=HTTP_MAX_CONNECTIONS,
     max_keepalive_connections=HTTP_MAX_KEEPALIVE_CONNECTIONS,
 )
-BOT_MODE = (os.environ.get("BOT_MODE") or getattr(SETTINGS, "BOT_MODE", "POLLING") or "POLLING").strip().upper()
+BOT_MODE = (os.environ.get("BOT_MODE") or getattr(SETTINGS, "BOT_MODE", _perf_default("BOT_MODE", "WEBHOOK")) or _perf_default("BOT_MODE", "WEBHOOK")).strip().upper()
 if BOT_MODE not in {"POLLING", "WEBHOOK"}:
-    BOT_MODE = "POLLING"
+    BOT_MODE = str(_perf_default("BOT_MODE", "WEBHOOK")).upper()
 TELEGRAM_WEBHOOK_URL = (os.environ.get("TELEGRAM_WEBHOOK_URL") or getattr(SETTINGS, "TELEGRAM_WEBHOOK_URL", None) or "").strip()
 TELEGRAM_WEBHOOK_SECRET_TOKEN = (os.environ.get("TELEGRAM_WEBHOOK_SECRET_TOKEN") or getattr(SETTINGS, "TELEGRAM_WEBHOOK_SECRET_TOKEN", None) or "").strip()
 SUPABASE_DB_POOLER_URL = (
@@ -6336,6 +6401,17 @@ RUN_STATE: dict[str, Any] = {
     "WEB_COUNTS_CACHE_TTL_S": WEB_COUNTS_CACHE_TTL_S,
     "WEB_STATUS_POLL_SECONDS": WEB_STATUS_POLL_SECONDS,
     "WEB_LIVE_POLL_SECONDS": WEB_LIVE_POLL_SECONDS,
+    "TELEGRAM_CONCURRENT_UPDATES": TELEGRAM_CONCURRENT_UPDATES,
+    "TELEGRAM_CONNECTION_POOL_SIZE": TELEGRAM_CONNECTION_POOL_SIZE,
+    "DB_EXECUTOR_MAX_WORKERS": int(_perf_default("DB_EXECUTOR_MAX_WORKERS", 3)),
+    "USER_SYNC_TTL_S": _USER_SYNC_TTL if "_USER_SYNC_TTL" in globals() else float(_perf_default("USER_SYNC_TTL_S", 1800.0)),
+    "PREFS_CACHE_TTL_S": _PREFS_TTL if "_PREFS_TTL" in globals() else float(_perf_default("PREFS_CACHE_TTL_S", 600.0)),
+    "TTS_AUDIO_CACHE_ENABLED": TTS_AUDIO_CACHE_ENABLED if "TTS_AUDIO_CACHE_ENABLED" in globals() else bool(_perf_default("TTS_AUDIO_CACHE_ENABLED", True)),
+    "TTS_AUDIO_CACHE_MAX_MB": TTS_AUDIO_CACHE_MAX_MB if "TTS_AUDIO_CACHE_MAX_MB" in globals() else int(_perf_default("TTS_AUDIO_CACHE_MAX_MB", 64)),
+    "TTS_AUDIO_CACHE_ITEM_MAX_MB": TTS_AUDIO_CACHE_ITEM_MAX_MB if "TTS_AUDIO_CACHE_ITEM_MAX_MB" in globals() else int(_perf_default("TTS_AUDIO_CACHE_ITEM_MAX_MB", 8)),
+    "TTS_AUDIO_CACHE_TTL_S": TTS_AUDIO_CACHE_TTL_S if "TTS_AUDIO_CACHE_TTL_S" in globals() else float(_perf_default("TTS_AUDIO_CACHE_TTL_S", 1200.0)),
+    "EDGE_TTS_PARALLEL_CHUNKS": EDGE_TTS_PARALLEL_CHUNKS if "EDGE_TTS_PARALLEL_CHUNKS" in globals() else int(_perf_default("EDGE_TTS_PARALLEL_CHUNKS", 1)),
+    "PAGED_TTS_SEND_DELAY_S": PAGED_TTS_SEND_DELAY_S if "PAGED_TTS_SEND_DELAY_S" in globals() else float(_perf_default("PAGED_TTS_SEND_DELAY_S", 0.10)),
 }
 RUN_STATE_LOCK = asyncio.Lock()
 ACTIVE_ADMIN_CONVERSATIONS: dict[int, dict[str, Any]] = {}
@@ -6369,6 +6445,17 @@ _RUN_STATE_REDIS_KEYS = (
     "WEB_COUNTS_CACHE_TTL_S",
     "WEB_STATUS_POLL_SECONDS",
     "WEB_LIVE_POLL_SECONDS",
+    "TELEGRAM_CONCURRENT_UPDATES",
+    "TELEGRAM_CONNECTION_POOL_SIZE",
+    "DB_EXECUTOR_MAX_WORKERS",
+    "USER_SYNC_TTL_S",
+    "PREFS_CACHE_TTL_S",
+    "TTS_AUDIO_CACHE_ENABLED",
+    "TTS_AUDIO_CACHE_MAX_MB",
+    "TTS_AUDIO_CACHE_ITEM_MAX_MB",
+    "TTS_AUDIO_CACHE_TTL_S",
+    "EDGE_TTS_PARALLEL_CHUNKS",
+    "PAGED_TTS_SEND_DELAY_S",
 )
 
 _RUNTIME_CONFIG_SPECS: OrderedDict[str, dict[str, Any]] = OrderedDict([
@@ -6392,6 +6479,17 @@ _RUNTIME_CONFIG_SPECS: OrderedDict[str, dict[str, Any]] = OrderedDict([
     ("WEB_COUNTS_CACHE_TTL_S", {"kind": "float", "min": 5.0, "max": 600.0, "label": "Dashboard counts cache TTL", "help": "Admin dashboard count cache duration."}),
     ("WEB_STATUS_POLL_SECONDS", {"kind": "int", "min": 10, "max": 300, "label": "Dashboard status poll seconds", "help": "Browser live status refresh interval."}),
     ("WEB_LIVE_POLL_SECONDS", {"kind": "int", "min": 15, "max": 300, "label": "Dashboard live poll seconds", "help": "Live dashboard refresh interval."}),
+    ("TELEGRAM_CONCURRENT_UPDATES", {"kind": "int", "min": 1, "max": 64, "label": "Telegram concurrent updates", "help": "Update processor concurrency. Restart required."}),
+    ("TELEGRAM_CONNECTION_POOL_SIZE", {"kind": "int", "min": 4, "max": 256, "label": "Telegram connection pool", "help": "Telegram HTTP pool size. Restart required."}),
+    ("DB_EXECUTOR_MAX_WORKERS", {"kind": "int", "min": 1, "max": 16, "label": "DB executor workers", "help": "Supabase background worker threads."}),
+    ("USER_SYNC_TTL_S", {"kind": "float", "min": 60.0, "max": 86400.0, "label": "User sync TTL", "help": "Minimum seconds between user sync writes."}),
+    ("PREFS_CACHE_TTL_S", {"kind": "float", "min": 30.0, "max": 86400.0, "label": "Prefs cache TTL", "help": "User prefs cache duration."}),
+    ("TTS_AUDIO_CACHE_ENABLED", {"kind": "bool", "label": "TTS audio cache", "help": "Reuse matching generated audio."}),
+    ("TTS_AUDIO_CACHE_MAX_MB", {"kind": "int", "min": 4, "max": 512, "label": "TTS cache max MB", "help": "Total in-memory TTS audio cache."}),
+    ("TTS_AUDIO_CACHE_ITEM_MAX_MB", {"kind": "int", "min": 1, "max": 64, "label": "TTS cache item max MB", "help": "Max single cached audio item."}),
+    ("TTS_AUDIO_CACHE_TTL_S", {"kind": "float", "min": 30.0, "max": 86400.0, "label": "TTS cache TTL", "help": "Seconds before cached audio expires."}),
+    ("EDGE_TTS_PARALLEL_CHUNKS", {"kind": "int", "min": 1, "max": 4, "label": "Edge TTS parallel chunks", "help": "Use 1 for stability; 2+ may trigger 403."}),
+    ("PAGED_TTS_SEND_DELAY_S", {"kind": "float", "min": 0.0, "max": 2.0, "label": "Paged TTS send delay", "help": "Delay between chunked voice messages."}),
 ])
 
 
@@ -6400,8 +6498,8 @@ def _run_state_get(key: str, default: Any = None) -> Any:
 
 
 def _run_state_bot_mode() -> str:
-    mode = str(RUN_STATE.get("BOT_MODE") or BOT_MODE or "POLLING").strip().upper()
-    return mode if mode in {"POLLING", "WEBHOOK"} else "POLLING"
+    mode = str(RUN_STATE.get("BOT_MODE") or BOT_MODE or _perf_default("BOT_MODE", "WEBHOOK")).strip().upper()
+    return mode if mode in {"POLLING", "WEBHOOK"} else str(_perf_default("BOT_MODE", "WEBHOOK")).upper()
 
 
 def _run_state_user_rate_limit() -> int:
@@ -6513,6 +6611,15 @@ def _coerce_run_state_value(key: str, value: Any) -> Any:
     if kind == "float":
         v = float(str(value).strip())
         return max(float(spec.get("min", v)), min(float(spec.get("max", v)), v))
+    if kind == "bool":
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "on", "enable", "enabled"}:
+            return True
+        if text in {"0", "false", "no", "off", "disable", "disabled"}:
+            return False
+        raise ValueError(f"{key} must be true/false or 1/0")
     if kind == "url":
         return str(value or "").strip().rstrip("/")
     if kind == "secret":
@@ -6658,7 +6765,8 @@ async def _update_run_state(key: str, value: Any, *, persist: bool = True) -> No
     clear text.
     """
     global HTTPX_HIGH_CONCURRENCY_LIMITS
-    global _AI_SEMAPHORE, _BROADCAST_SEMAPHORE, _TTS_CHUNK_SEMAPHORE
+    global _AI_SEMAPHORE, _BROADCAST_SEMAPHORE, _TTS_CHUNK_SEMAPHORE, _DB_EXECUTOR
+    global TTS_AUDIO_CACHE_MAX_BYTES, TTS_AUDIO_CACHE_ITEM_MAX_BYTES
 
     if key not in _RUN_STATE_REDIS_KEYS:
         raise ValueError(f"Unsupported runtime setting: {key}")
@@ -6675,6 +6783,25 @@ async def _update_run_state(key: str, value: Any, *, persist: bool = True) -> No
             _BROADCAST_SEMAPHORE = asyncio.Semaphore(int(persisted_value))
         elif key == "MAX_CONCURRENT_TTS_USERS" and _TTS_CHUNK_SEMAPHORE is not None:
             _TTS_CHUNK_SEMAPHORE = asyncio.Semaphore(int(persisted_value))
+        elif key == "DB_EXECUTOR_MAX_WORKERS":
+            old_executor = _DB_EXECUTOR
+            _DB_EXECUTOR = ThreadPoolExecutor(max_workers=int(persisted_value), thread_name_prefix="db_write")
+            with suppress(Exception):
+                old_executor.shutdown(wait=False, cancel_futures=False)
+        elif key == "PREFS_CACHE_TTL_S":
+            globals()["_PREFS_TTL"] = float(persisted_value)
+        elif key == "USER_SYNC_TTL_S":
+            globals()["_USER_SYNC_TTL"] = float(persisted_value)
+        elif key in {"TTS_AUDIO_CACHE_MAX_MB", "TTS_AUDIO_CACHE_ITEM_MAX_MB"}:
+            globals()[key] = int(persisted_value)
+            TTS_AUDIO_CACHE_MAX_BYTES = int(globals().get("TTS_AUDIO_CACHE_MAX_MB", 64)) * 1024 * 1024
+            TTS_AUDIO_CACHE_ITEM_MAX_BYTES = int(globals().get("TTS_AUDIO_CACHE_ITEM_MAX_MB", 8)) * 1024 * 1024
+        elif key in {"TTS_AUDIO_CACHE_TTL_S", "PAGED_TTS_SEND_DELAY_S"}:
+            globals()[key] = float(persisted_value)
+        elif key in {"TTS_AUDIO_CACHE_ENABLED"}:
+            globals()[key] = bool(persisted_value)
+        elif key in {"EDGE_TTS_PARALLEL_CHUNKS", "TELEGRAM_CONCURRENT_UPDATES", "TELEGRAM_CONNECTION_POOL_SIZE"}:
+            globals()[key] = int(persisted_value)
         elif key in {"WEB_COUNTS_CACHE_TTL_S", "WEB_STATUS_POLL_SECONDS", "WEB_LIVE_POLL_SECONDS"}:
             _web_counts_invalidate()
 
@@ -7035,6 +7162,32 @@ async def _handle_runtime_admin_text(update: Any, context: Any) -> bool:
         return False
     async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
         state = dict(ACTIVE_ADMIN_CONVERSATIONS.get(user.id) or {})
+    if state.get("state") == "awaiting_bot_perf_value":
+        raw = (msg.text or "").strip()
+        key = str(state.get("key") or "").strip()
+        if raw.lower() in {"/cancel", "cancel", "បោះបង់"}:
+            async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+                ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
+            await safe_send(lambda: msg.reply_text("Cancelled.", reply_markup=get_admin_dashboard_kb()))
+            return True
+        ok, info = await _apply_bot_performance_setting(key, raw, admin_id=user.id)
+        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+            ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
+        if ok:
+            await safe_send(lambda: msg.reply_text(
+                f"✅ <b>{html.escape(BOT_SETTING_LABELS.get(key, key))}</b> set to <code>{html.escape(str(raw))}</code>.\n"
+                "Open /admin → Settings → Performance Settings to review.",
+                parse_mode="HTML",
+                reply_markup=get_admin_dashboard_kb(),
+            ))
+        else:
+            await safe_send(lambda: msg.reply_text(
+                f"⚠️ Could not update <b>{html.escape(key)}</b>: <code>{html.escape(str(info)[:500])}</code>",
+                parse_mode="HTML",
+                reply_markup=get_admin_dashboard_kb(),
+            ))
+        return True
+
     if state.get("state") != "awaiting_rate_limit":
         return False
 
@@ -7170,6 +7323,16 @@ EDGE_TTS_RETRIES          = _env_int("EDGE_TTS_RETRIES", 3, minimum=1, maximum=8
 EDGE_TTS_RETRY_DELAY_S    = _env_float("EDGE_TTS_RETRY_DELAY_S", 0.8, minimum=0.2, maximum=10.0)
 EDGE_TTS_STREAM_TIMEOUT_S = _env_float("EDGE_TTS_STREAM_TIMEOUT_S", 45.0, minimum=15.0, maximum=180.0)
 EDGE_TTS_CROSS_LANG_FALLBACK = _env_bool("EDGE_TTS_CROSS_LANG_FALLBACK", False)
+# Smooth performance knobs. Keep Edge chunk parallelism conservative because
+# too many websocket calls can trigger throttling/403 on small Render services.
+EDGE_TTS_PARALLEL_CHUNKS   = _env_int("EDGE_TTS_PARALLEL_CHUNKS", int(_perf_default("EDGE_TTS_PARALLEL_CHUNKS", 1)), minimum=1, maximum=4)
+TTS_AUDIO_CACHE_ENABLED    = _env_bool("TTS_AUDIO_CACHE_ENABLED", bool(_perf_default("TTS_AUDIO_CACHE_ENABLED", True)))
+TTS_AUDIO_CACHE_TTL_S      = _env_float("TTS_AUDIO_CACHE_TTL_S", float(_perf_default("TTS_AUDIO_CACHE_TTL_S", 1200.0)), minimum=30.0, maximum=86400.0)
+TTS_AUDIO_CACHE_MAX_MB     = _env_int("TTS_AUDIO_CACHE_MAX_MB", int(_perf_default("TTS_AUDIO_CACHE_MAX_MB", 64)), minimum=4, maximum=512)
+TTS_AUDIO_CACHE_ITEM_MAX_MB = _env_int("TTS_AUDIO_CACHE_ITEM_MAX_MB", int(_perf_default("TTS_AUDIO_CACHE_ITEM_MAX_MB", 8)), minimum=1, maximum=64)
+TTS_AUDIO_CACHE_MAX_BYTES  = TTS_AUDIO_CACHE_MAX_MB * 1024 * 1024
+TTS_AUDIO_CACHE_ITEM_MAX_BYTES = TTS_AUDIO_CACHE_ITEM_MAX_MB * 1024 * 1024
+PAGED_TTS_SEND_DELAY_S     = _env_float("PAGED_TTS_SEND_DELAY_S", float(_perf_default("PAGED_TTS_SEND_DELAY_S", 0.10)), minimum=0.0, maximum=2.0)
 
 # Khmer TTS V2: optional Hugging Face Gradio Space provider.
 # Confirmed normal endpoint from `Client.view_api()` for mrrtmob/khmer-tts:
@@ -7253,7 +7416,7 @@ _DB_EXECUTOR = ThreadPoolExecutor(
     # [Errno 11] Resource temporarily unavailable on small Render instances.
     max_workers=_env_int(
         "DB_EXECUTOR_MAX_WORKERS",
-        min(4, max(2, MAX_CONCURRENT_TTS_USERS)),
+        int(_perf_default("DB_EXECUTOR_MAX_WORKERS", 3)),
         minimum=1,
         maximum=16,
     ),
@@ -8614,11 +8777,41 @@ BOT_TAG = "@voicekhaibot"
 # ---------------------------------------------------------------------------
 # Prefs cache — memory -> Redis -> Supabase -> safe defaults
 # ---------------------------------------------------------------------------
-_PREFS_TTL      = 300.0
-_PREFS_MAX_SIZE = 10_000
+_PREFS_TTL      = _env_float("PREFS_CACHE_TTL_S", float(_perf_default("PREFS_CACHE_TTL_S", 600.0)), minimum=30.0, maximum=86400.0)
+_PREFS_MAX_SIZE = _env_int("PREFS_CACHE_MAX_SIZE", 10_000, minimum=500, maximum=200_000)
 _prefs_cache: OrderedDict[int, tuple[dict, float]] = OrderedDict()
 _prefs_cache_lock: asyncio.Lock | None = None
 _prefs_cache_thread_lock = threading.RLock()
+_PREFS_LOAD_LOCKS_MAX = _env_int("PREFS_LOAD_LOCKS_MAX", 5000, minimum=100, maximum=50000)
+_prefs_load_locks: OrderedDict[int, asyncio.Lock] = OrderedDict()
+_prefs_load_locks_guard = threading.RLock()
+
+
+def _get_prefs_load_lock(user_id: int) -> asyncio.Lock:
+    """Per-user single-flight lock for cache misses.
+
+    Without this, several fast callbacks from the same user can all miss memory
+    cache and hit Redis/Supabase at the same time. This lock makes only one
+    coroutine load prefs while the others wait and reuse the refreshed cache.
+    """
+    user_id = int(user_id)
+    with _prefs_load_locks_guard:
+        lock = _prefs_load_locks.get(user_id)
+        if lock is not None:
+            _prefs_load_locks.move_to_end(user_id)
+            return lock
+        lock = asyncio.Lock()
+        _prefs_load_locks[user_id] = lock
+        while len(_prefs_load_locks) > _PREFS_LOAD_LOCKS_MAX:
+            victim = None
+            for uid, item in _prefs_load_locks.items():
+                if not item.locked():
+                    victim = uid
+                    break
+            if victim is None:
+                break
+            _prefs_load_locks.pop(victim, None)
+        return lock
 
 TTS_MODEL_OPTIONS = {
     "auto": ("Auto", "Kiri → Edge TTS"),
@@ -8801,22 +8994,7 @@ async def _async_get_cached_prefs(user_id: int) -> dict | None:
         return _get_cached_prefs_sync(user_id)
 
 
-async def get_user_prefs_async(user_id: int) -> dict:
-    """
-    Safe prefs flow:
-      1) try memory cache
-      2) if missing, try Redis
-      3) if Redis missing, try Supabase with retry
-      4) if Supabase works, refresh Redis
-      5) if Supabase fails, return safe defaults
-      6) never crash Telegram callbacks
-    """
-    defaults = dict(DEFAULT_USER_PREFS)
-
-    cached = await _async_get_cached_prefs(user_id)
-    if cached is not None:
-        return cached
-
+async def _load_user_prefs_uncached_async(user_id: int, defaults: dict) -> dict:
     redis_key = _prefs_redis_key(user_id)
     redis_map = await _redis_cache_get_many_json([redis_key])
     redis_prefs = redis_map.get(redis_key)
@@ -8827,7 +9005,7 @@ async def get_user_prefs_async(user_id: int) -> dict:
         return prefs
 
     if not supabase:
-        return defaults
+        return dict(defaults)
 
     try:
         rows = None
@@ -8840,7 +9018,7 @@ async def get_user_prefs_async(user_id: int) -> dict:
                         _DB_EXECUTOR,
                         functools.partial(_user_prefs_select_sync, user_id, True),
                     ),
-                    timeout=12,
+                    timeout=8,
                 )
                 _set_tts_model_column_status(True)
                 rows = getattr(res, "data", None) if res else None
@@ -8862,7 +9040,7 @@ async def get_user_prefs_async(user_id: int) -> dict:
                     _DB_EXECUTOR,
                     functools.partial(_user_prefs_select_sync, user_id, False),
                 ),
-                timeout=12,
+                timeout=8,
             )
             rows = getattr(res, "data", None) if res else None
 
@@ -8878,8 +9056,32 @@ async def get_user_prefs_async(user_id: int) -> dict:
             user_id,
             exc,
         )
-        return defaults
+        return dict(defaults)
 
+
+async def get_user_prefs_async(user_id: int) -> dict:
+    """
+    Smooth single-flight prefs flow:
+      1) memory cache
+      2) one coroutine per user loads Redis/Supabase on cache miss
+      3) Redis cache
+      4) Supabase with schema-safe tts_model fallback
+      5) safe defaults on any outage
+    """
+    user_id = int(user_id)
+    defaults = dict(DEFAULT_USER_PREFS)
+
+    cached = await _async_get_cached_prefs(user_id)
+    if cached is not None:
+        return cached
+
+    lock = _get_prefs_load_lock(user_id)
+    async with lock:
+        # Another callback may have refreshed the cache while we waited.
+        cached = await _async_get_cached_prefs(user_id)
+        if cached is not None:
+            return cached
+        return await _load_user_prefs_uncached_async(user_id, defaults)
 
 # ---------------------------------------------------------------------------
 # Per-user async locks (LRU-capped)
@@ -8944,7 +9146,32 @@ def _log_future_exception(future):
             )
 
 
-def _submit_db(fn, *args, **kwargs):
+def _db_executor_queue_size() -> int:
+    try:
+        return int(_DB_EXECUTOR._work_queue.qsize())  # type: ignore[attr-defined]
+    except Exception:
+        return 0
+
+
+def _submit_db(fn, *args, drop_if_backlog: bool = False, backlog_limit: int | None = None, **kwargs):
+    """Submit background DB/cache work with optional backpressure.
+
+    Low-priority telemetry writes such as last_active must not build an
+    unbounded queue during traffic spikes. Critical preference/history writes
+    still use the normal path by leaving drop_if_backlog=False.
+    """
+    if drop_if_backlog:
+        limit = backlog_limit if backlog_limit is not None else _env_int("DB_DROP_BACKLOG_LIMIT", 500, minimum=20, maximum=100_000)
+        queued = _db_executor_queue_size()
+        if queued >= limit:
+            _log_once(
+                logging.WARNING,
+                f"db_submit_backpressure:{getattr(fn, '__name__', 'task')}",
+                "Dropped low-priority DB task because db queue is backed up: queued=%s limit=%s",
+                queued,
+                limit,
+            )
+            return None
     future = _DB_EXECUTOR.submit(fn, *args, **kwargs)
     future.add_done_callback(_log_future_exception)
     return future
@@ -9287,9 +9514,10 @@ async def _periodic_temp_sweep(stop_event: asyncio.Event) -> None:
 # ---------------------------------------------------------------------------
 # Database helpers — user prefs
 # ---------------------------------------------------------------------------
-_USER_SYNC_TTL = 300.0
-_USER_SYNC_MAX = 20_000
+_USER_SYNC_TTL = _env_float("USER_SYNC_TTL_S", float(_perf_default("USER_SYNC_TTL_S", 1800.0)), minimum=60.0, maximum=86400.0)
+_USER_SYNC_MAX = _env_int("USER_SYNC_MAX", 20_000, minimum=1000, maximum=500_000)
 _user_sync_seen: OrderedDict[int, float] = OrderedDict()
+_user_sync_seen_lock = threading.RLock()
 
 
 def sync_user_data(user) -> None:
@@ -9300,13 +9528,14 @@ def sync_user_data(user) -> None:
     if not user_id:
         return
 
-    last = _user_sync_seen.get(user_id, 0.0)
-    if now - last < _USER_SYNC_TTL:
-        return
-    _user_sync_seen.pop(user_id, None)
-    _user_sync_seen[user_id] = now
-    while len(_user_sync_seen) > _USER_SYNC_MAX:
-        _user_sync_seen.popitem(last=False)
+    with _user_sync_seen_lock:
+        last = _user_sync_seen.get(user_id, 0.0)
+        if now - last < _USER_SYNC_TTL:
+            return
+        _user_sync_seen.pop(user_id, None)
+        _user_sync_seen[user_id] = now
+        while len(_user_sync_seen) > _USER_SYNC_MAX:
+            _user_sync_seen.popitem(last=False)
 
     def _run():
         # Telegram usernames are stored without @ by Telegram. Store first_name
@@ -9330,7 +9559,7 @@ def sync_user_data(user) -> None:
             max_schema_retries=4,
         )
 
-    _submit_db(_run)
+    _submit_db(_run, drop_if_backlog=True)
 
 
 def _paginated_fetch(select_fields: str) -> list[dict]:
@@ -9940,6 +10169,34 @@ def startup_self_check() -> None:
 # ---------------------------------------------------------------------------
 # Admin Dashboard V2 — settings, blocks, metrics, user tools
 # ---------------------------------------------------------------------------
+BOT_FEATURE_SETTING_KEYS: tuple[str, ...] = (
+    "maintenance_mode",
+    "tts_enabled",
+    "ocr_enabled",
+    "voice_transcribe_enabled",
+    "audio_transcribe_enabled",
+    "ai_resolver_enabled",
+)
+
+BOT_PERFORMANCE_SETTING_SPECS: OrderedDict[str, dict[str, Any]] = OrderedDict([
+    ("TELEGRAM_CONCURRENT_UPDATES", {"kind": "int", "min": 1, "max": 64, "label": "⚙️ Telegram Updates", "help": "Concurrent Telegram update processing. Restart recommended."}),
+    ("TELEGRAM_CONNECTION_POOL_SIZE", {"kind": "int", "min": 4, "max": 256, "label": "🌐 Telegram Pool", "help": "Telegram HTTP connection pool. Restart recommended."}),
+    ("HTTP_MAX_CONNECTIONS", {"kind": "int", "min": 10, "max": 1000, "label": "🌍 HTTP Max Connections", "help": "Shared HTTPX max connections. Hot reload."}),
+    ("HTTP_MAX_KEEPALIVE_CONNECTIONS", {"kind": "int", "min": 2, "max": 500, "label": "♻️ HTTP Keepalive", "help": "Shared HTTPX keepalive pool. Hot reload."}),
+    ("DB_EXECUTOR_MAX_WORKERS", {"kind": "int", "min": 1, "max": 16, "label": "🗄️ DB Workers", "help": "Background Supabase worker threads. Hot reload."}),
+    ("MAX_CONCURRENT_TTS_USERS", {"kind": "int", "min": 1, "max": 50, "label": "🗣️ Max TTS Users", "help": "Concurrent TTS cap. Hot reload."}),
+    ("USER_SYNC_TTL_S", {"kind": "float", "min": 60.0, "max": 86400.0, "label": "👤 User Sync TTL", "help": "Seconds between user activity DB writes. Hot reload."}),
+    ("PREFS_CACHE_TTL_S", {"kind": "float", "min": 30.0, "max": 86400.0, "label": "🧠 Prefs Cache TTL", "help": "User preferences cache lifetime. Hot reload."}),
+    ("TTS_AUDIO_CACHE_ENABLED", {"kind": "bool", "label": "💾 TTS Audio Cache", "help": "Reuse same generated audio. Hot reload."}),
+    ("TTS_AUDIO_CACHE_MAX_MB", {"kind": "int", "min": 4, "max": 512, "label": "💽 TTS Cache MB", "help": "Total audio cache memory. Hot reload."}),
+    ("TTS_AUDIO_CACHE_ITEM_MAX_MB", {"kind": "int", "min": 1, "max": 64, "label": "📦 TTS Item MB", "help": "Max size per cached audio. Hot reload."}),
+    ("TTS_AUDIO_CACHE_TTL_S", {"kind": "float", "min": 30.0, "max": 86400.0, "label": "⏱️ TTS Cache TTL", "help": "Audio cache expiry seconds. Hot reload."}),
+    ("EDGE_TTS_PARALLEL_CHUNKS", {"kind": "int", "min": 1, "max": 4, "label": "⚡ Edge Parallel", "help": "Keep 1 for stability; 2+ can trigger 403."}),
+    ("PAGED_TTS_SEND_DELAY_S", {"kind": "float", "min": 0.0, "max": 2.0, "label": "📨 Send Delay", "help": "Delay between paged TTS chunks. Hot reload."}),
+    ("WEB_STATUS_POLL_SECONDS", {"kind": "int", "min": 10, "max": 300, "label": "📊 Status Poll", "help": "Admin status refresh seconds. Hot reload."}),
+    ("WEB_LIVE_POLL_SECONDS", {"kind": "int", "min": 15, "max": 300, "label": "📡 Live Poll", "help": "Dashboard live refresh seconds. Hot reload."}),
+])
+
 BOT_SETTING_DEFAULTS: dict[str, str] = {
     "maintenance_mode": "0",
     "tts_enabled": "1",
@@ -9947,6 +10204,7 @@ BOT_SETTING_DEFAULTS: dict[str, str] = {
     "voice_transcribe_enabled": "1",
     "audio_transcribe_enabled": "1",
     "ai_resolver_enabled": "1",
+    **{key: str(_perf_default(key, spec.get("default", ""))) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 BOT_SETTING_LABELS: dict[str, str] = {
     "maintenance_mode": "🛠️ Maintenance Mode",
@@ -9955,6 +10213,7 @@ BOT_SETTING_LABELS: dict[str, str] = {
     "voice_transcribe_enabled": "🎙️ Voice Transcribe",
     "audio_transcribe_enabled": "🎵 Audio File Transcribe",
     "ai_resolver_enabled": "🧠 AI Text Resolver",
+    **{key: str(spec.get("label", key)) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 BOT_SETTING_DESCRIPTIONS: dict[str, str] = {
     "maintenance_mode": "When ON, normal users cannot use the bot.",
@@ -9963,6 +10222,7 @@ BOT_SETTING_DESCRIPTIONS: dict[str, str] = {
     "voice_transcribe_enabled": "Allow Telegram voice transcription.",
     "audio_transcribe_enabled": "Allow uploaded audio-file transcription.",
     "ai_resolver_enabled": "Allow AI to rewrite/resolve text before TTS when enabled by env.",
+    **{key: str(spec.get("help", "")) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 _SETTINGS_CACHE_TTL_S = _env_float("BOT_SETTINGS_CACHE_TTL_S", 30.0, minimum=0.0, maximum=3600.0)
 _bot_settings_memory: dict[str, str] = dict(BOT_SETTING_DEFAULTS)
@@ -10021,6 +10281,57 @@ def bot_setting_bool_cached(key: str, default: bool = True) -> bool:
     return _setting_bool_from(_bot_settings_cache.get("data") or BOT_SETTING_DEFAULTS, key, default)
 
 
+def _setting_raw_from(settings: dict | None, key: str, default: Any = None) -> str:
+    source = settings or _bot_settings_cache.get("data") or BOT_SETTING_DEFAULTS
+    if default is None:
+        default = BOT_SETTING_DEFAULTS.get(key, "")
+    return str(source.get(key, default)).strip()
+
+
+def _coerce_bot_perf_setting(key: str, raw: Any) -> Any:
+    spec = BOT_PERFORMANCE_SETTING_SPECS.get(key)
+    if not spec:
+        raise ValueError(f"Unknown performance setting: {key}")
+    kind = str(spec.get("kind", "str"))
+    if kind == "bool":
+        if isinstance(raw, bool):
+            return raw
+        text = str(raw).strip().lower()
+        if text in {"1", "true", "yes", "on", "enable", "enabled"}:
+            return True
+        if text in {"0", "false", "no", "off", "disable", "disabled"}:
+            return False
+        raise ValueError("Use on/off, true/false, or 1/0.")
+    if kind == "int":
+        try:
+            value = int(float(str(raw).strip()))
+        except Exception as exc:
+            raise ValueError("Use a whole number.") from exc
+        if "min" in spec and value < int(spec["min"]):
+            raise ValueError(f"Minimum is {spec['min']}.")
+        if "max" in spec and value > int(spec["max"]):
+            raise ValueError(f"Maximum is {spec['max']}.")
+        return value
+    if kind == "float":
+        try:
+            value = float(str(raw).strip())
+        except Exception as exc:
+            raise ValueError("Use a number.") from exc
+        if "min" in spec and value < float(spec["min"]):
+            raise ValueError(f"Minimum is {spec['min']}.")
+        if "max" in spec and value > float(spec["max"]):
+            raise ValueError(f"Maximum is {spec['max']}.")
+        return value
+    return str(raw).strip()
+
+
+def _format_bot_setting_value(key: str, value: Any) -> str:
+    spec = BOT_PERFORMANCE_SETTING_SPECS.get(key)
+    if spec and spec.get("kind") == "bool":
+        return "ON ✅" if _setting_bool_from({key: str(value)}, key, True) else "OFF ⚠️"
+    return str(value)
+
+
 def _bot_settings_redis_key() -> str:
     return _redis_key("settings", "bot", "v1")
 
@@ -10072,10 +10383,10 @@ async def get_bot_settings_async(force: bool = False) -> tuple[dict[str, str], d
     return data, status
 
 
-def db_bot_setting_set(key: str, enabled: bool, admin_id: int) -> tuple[bool, str]:
+def db_bot_setting_value_set(key: str, value: Any, admin_id: int) -> tuple[bool, str]:
     if key not in BOT_SETTING_DEFAULTS:
         return False, f"Unknown setting: {key}"
-    value = _bool_to_setting_value(enabled)
+    value = str(value).strip()
     _bot_settings_memory[key] = value
     if not supabase:
         _bot_settings_cache["ts"] = 0.0
@@ -10095,6 +10406,10 @@ def db_bot_setting_set(key: str, enabled: bool, admin_id: int) -> tuple[bool, st
         _bot_settings_cache["ts"] = 0.0
         _redis_delete_sync(_bot_settings_redis_key())
         return False, str(e)
+
+
+def db_bot_setting_set(key: str, enabled: bool, admin_id: int) -> tuple[bool, str]:
+    return db_bot_setting_value_set(key, _bool_to_setting_value(enabled), admin_id)
 
 
 def _blocked_cache_set(user_id: int, blocked: bool) -> None:
@@ -12670,6 +12985,79 @@ def _tts_user_error_message(exc: Exception | str) -> str:
     return "❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"
 
 
+# ---------------------------------------------------------------------------
+# In-memory TTS audio cache
+# ---------------------------------------------------------------------------
+_TTS_AUDIO_CACHE: OrderedDict[str, tuple[bytes, float, int]] = OrderedDict()
+_TTS_AUDIO_CACHE_LOCK = threading.RLock()
+_TTS_AUDIO_CACHE_BYTES = 0
+
+
+def _tts_audio_cache_key(text: str, gender: str, speed: float, tts_model: str) -> str:
+    cleaned = _clean_tts_text_for_edge(text)
+    lang = _detect_tts_lang_key(cleaned)
+    payload = {
+        "v": 2,
+        "lang": lang,
+        "gender": gender if gender in ("female", "male") else "female",
+        "speed": _rounded_speed(speed),
+        "model": _normalize_tts_model(tts_model),
+        "tts_provider": TTS_PROVIDER,
+        "khmer_provider": KHMER_TTS_PROVIDER,
+        "text_hash": hashlib.sha256(cleaned.encode("utf-8")).hexdigest(),
+    }
+    raw = _json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _tts_audio_cache_get(key: str) -> bytes | None:
+    if not TTS_AUDIO_CACHE_ENABLED:
+        return None
+    now = time.monotonic()
+    with _TTS_AUDIO_CACHE_LOCK:
+        item = _TTS_AUDIO_CACHE.get(key)
+        if not item:
+            return None
+        data, created, size = item
+        if now - created > TTS_AUDIO_CACHE_TTL_S:
+            global _TTS_AUDIO_CACHE_BYTES
+            _TTS_AUDIO_CACHE.pop(key, None)
+            _TTS_AUDIO_CACHE_BYTES = max(0, _TTS_AUDIO_CACHE_BYTES - size)
+            return None
+        _TTS_AUDIO_CACHE.move_to_end(key)
+        return bytes(data)
+
+
+def _tts_audio_cache_set(key: str, data: bytes) -> None:
+    if not TTS_AUDIO_CACHE_ENABLED or not data:
+        return
+    size = len(data)
+    if size > TTS_AUDIO_CACHE_ITEM_MAX_BYTES:
+        return
+    global _TTS_AUDIO_CACHE_BYTES
+    now = time.monotonic()
+    with _TTS_AUDIO_CACHE_LOCK:
+        old = _TTS_AUDIO_CACHE.pop(key, None)
+        if old:
+            _TTS_AUDIO_CACHE_BYTES = max(0, _TTS_AUDIO_CACHE_BYTES - old[2])
+        _TTS_AUDIO_CACHE[key] = (bytes(data), now, size)
+        _TTS_AUDIO_CACHE_BYTES += size
+        while _TTS_AUDIO_CACHE_BYTES > TTS_AUDIO_CACHE_MAX_BYTES and _TTS_AUDIO_CACHE:
+            _old_key, (_old_data, _old_created, old_size) = _TTS_AUDIO_CACHE.popitem(last=False)
+            _TTS_AUDIO_CACHE_BYTES = max(0, _TTS_AUDIO_CACHE_BYTES - old_size)
+
+
+def _write_cached_audio_to_path(path: str, data: bytes) -> None:
+    if not path or not data:
+        return
+    try:
+        with open(path, "wb") as fh:
+            fh.write(data)
+    except OSError:
+        # The caller primarily uses the returned bytes. Disk cache write-through
+        # is only for compatibility with cleanup/output_path expectations.
+        pass
+
 async def _generate_voice_edge(text: str, gender: str, speed: float, output_path: str) -> bytes:
     text = _clean_tts_text_for_edge(text)
     if not text:
@@ -12680,18 +13068,36 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
     if not text_chunks:
         raise ValueError("generate_voice: no speakable text chunks")
 
-    mp3_parts: list[bytes] = []
-    used_voices: list[str] = []
-    for idx, chunk_text in enumerate(text_chunks, 1):
+    async def _render_edge_chunk(idx: int, chunk_text: str) -> tuple[int, bytes, str]:
         try:
             chunk_mp3, used_voice = await _edge_tts_stream_with_retry(chunk_text, voices)
-            mp3_parts.append(chunk_mp3)
-            used_voices.append(used_voice)
+            return idx, chunk_mp3, used_voice
         except Exception as e:
             preview = chunk_text[:80].replace("\n", " ")
             raise RuntimeError(
                 f"edge-tts failed at chunk {idx}/{len(text_chunks)} ({preview!r}): {e}"
             ) from e
+
+    used_voices: list[str] = []
+    if len(text_chunks) > 1 and EDGE_TTS_PARALLEL_CHUNKS > 1:
+        chunk_sem = asyncio.Semaphore(min(EDGE_TTS_PARALLEL_CHUNKS, len(text_chunks)))
+
+        async def _guarded(idx: int, chunk_text: str) -> tuple[int, bytes, str]:
+            async with chunk_sem:
+                return await _render_edge_chunk(idx, chunk_text)
+
+        results = await asyncio.gather(*(
+            _guarded(idx, chunk_text) for idx, chunk_text in enumerate(text_chunks, 1)
+        ))
+        results.sort(key=lambda item: item[0])
+        mp3_parts = [item[1] for item in results]
+        used_voices = [item[2] for item in results]
+    else:
+        mp3_parts: list[bytes] = []
+        for idx, chunk_text in enumerate(text_chunks, 1):
+            _idx, chunk_mp3, used_voice = await _render_edge_chunk(idx, chunk_text)
+            mp3_parts.append(chunk_mp3)
+            used_voices.append(used_voice)
 
     mp3_data = b"".join(mp3_parts)
     if not mp3_data:
@@ -12791,11 +13197,28 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
 
 
 async def generate_voice_limited(text: str, gender: str, speed: float, output_path: str, tts_model: str = "auto") -> bytes:
+    cleaned = _clean_tts_text_for_edge(text)
+    cache_key = _tts_audio_cache_key(cleaned, gender, speed, tts_model)
+    cached = _tts_audio_cache_get(cache_key)
+    if cached is not None:
+        await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
+        logger.debug("TTS audio cache hit lang=%s bytes=%s", _detect_tts_lang_key(cleaned), len(cached))
+        return cached
+
     sem = _TTS_CHUNK_SEMAPHORE
     if sem is None:
-        return await generate_voice(text, gender, speed, output_path, tts_model)
-    async with sem:
-        return await generate_voice(text, gender, speed, output_path, tts_model)
+        audio = await generate_voice(cleaned, gender, speed, output_path, tts_model)
+    else:
+        async with sem:
+            # Re-check after waiting; another request may have generated the same audio.
+            cached = _tts_audio_cache_get(cache_key)
+            if cached is not None:
+                await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
+                logger.debug("TTS audio cache hit after wait lang=%s bytes=%s", _detect_tts_lang_key(cleaned), len(cached))
+                return cached
+            audio = await generate_voice(cleaned, gender, speed, output_path, tts_model)
+    _tts_audio_cache_set(cache_key, audio)
+    return audio
 
 
 # ---------------------------------------------------------------------------
@@ -12813,7 +13236,7 @@ async def transcribe_voice(ogg_path: str) -> str:
     prompt    = (
         "Transcribe this audio exactly as spoken. "
         "Output ONLY the transcribed text — no labels, no explanation. "
-        "Support both Khmer and English."
+        "Support Khmer, English, and Chinese."
     )
     semaphore = _AI_SEMAPHORE
     if semaphore is None:
@@ -12850,7 +13273,7 @@ async def transcribe_audio_file(file_path: str, mime_type: str) -> str:
     prompt    = (
         "Transcribe this audio exactly as spoken. "
         "Output ONLY the transcribed text — no labels, no explanation. "
-        "Support both Khmer and English."
+        "Support Khmer, English, and Chinese."
     )
     semaphore = _AI_SEMAPHORE
     if semaphore is None:
@@ -13038,7 +13461,7 @@ async def _deliver_paged_tts(
             _cleanup(file_path)
 
         if i < total:
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(float(PAGED_TTS_SEND_DELAY_S))
 
     _set_last_tts(user_id)
 
@@ -13319,17 +13742,35 @@ def get_user_detail_kb(user_id: int, blocked: bool, back_ref: str = "p0") -> Inl
 
 def get_bot_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    for key, label in BOT_SETTING_LABELS.items():
+    for key in BOT_FEATURE_SETTING_KEYS:
+        label = BOT_SETTING_LABELS.get(key, key)
         enabled = _setting_bool_from(settings, key, default=True)
         if key == "maintenance_mode":
             state = "ON 🛠️" if enabled else "OFF ✅"
         else:
             state = "ON ✅" if enabled else "OFF ⚠️"
         rows.append([InlineKeyboardButton(f"{label}: {state}", callback_data=f"admin_set:{key}")])
+
+    rows.append([InlineKeyboardButton("⚡ Performance Settings", callback_data="admin_perf")])
     rows.extend([
         [InlineKeyboardButton("🔄 Refresh", callback_data="admin_settings_refresh"),
          InlineKeyboardButton("🧩 Setup SQL", callback_data="admin_settings_sql")],
         [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+         InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def get_bot_perf_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items():
+        label = str(spec.get("label", key))
+        value = _setting_raw_from(settings, key, BOT_SETTING_DEFAULTS.get(key, ""))
+        rows.append([InlineKeyboardButton(f"{label}: {_format_bot_setting_value(key, value)}", callback_data=f"admin_perf_set:{key}")])
+    rows.extend([
+        [InlineKeyboardButton("✅ Apply saved values now", callback_data="admin_perf_apply")],
+        [InlineKeyboardButton("🔄 Reset to code defaults", callback_data="admin_perf_reset")],
+        [InlineKeyboardButton("⬅️ Settings", callback_data="admin_settings"),
          InlineKeyboardButton("❌ Close", callback_data="admin_close")],
     ])
     return InlineKeyboardMarkup(rows)
@@ -14335,6 +14776,69 @@ async def _admin_open_schedules_panel(query, admin_id: int) -> None:
     ))
 
 
+async def _apply_bot_performance_setting(key: str, raw_value: Any, *, admin_id: int = 0, persist_runtime: bool = True) -> tuple[bool, str]:
+    """Validate, save to bot_settings, and hot-apply supported performance knobs."""
+    try:
+        coerced = _coerce_bot_perf_setting(key, raw_value)
+    except Exception as exc:
+        return False, str(exc)
+
+    stored = _bool_to_setting_value(coerced) if isinstance(coerced, bool) else str(coerced)
+    ok, info = await asyncio.get_running_loop().run_in_executor(
+        _DB_EXECUTOR,
+        lambda: db_bot_setting_value_set(key, stored, admin_id),
+    )
+    if not ok:
+        return False, info
+
+    try:
+        await _update_run_state(key, coerced, persist=persist_runtime and key in _RUN_STATE_REDIS_KEYS)
+    except Exception:
+        # Some startup-only settings are still saved and will apply on restart.
+        globals()[key] = coerced
+    _bot_settings_cache["ts"] = 0.0
+    return True, "saved and applied"
+
+
+async def _apply_all_bot_performance_settings(admin_id: int = 0, *, force: bool = True) -> list[str]:
+    settings, _status = await get_bot_settings_async(force=force)
+    changed: list[str] = []
+    for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items():
+        raw = _setting_raw_from(settings, key, BOT_SETTING_DEFAULTS.get(key, ""))
+        ok, info = await _apply_bot_performance_setting(key, raw, admin_id=admin_id)
+        if ok:
+            changed.append(key)
+        else:
+            logger.warning("Could not apply bot performance setting %s=%r: %s", key, raw, info)
+    return changed
+
+
+async def _admin_open_perf_settings_panel(query, force: bool = False, notice: str = "") -> None:
+    settings, status = await get_bot_settings_async(force=force)
+    lines = []
+    if notice:
+        lines.append(f"{html.escape(notice)}\n")
+    lines.extend([
+        "⚡ <b>Performance Settings</b>",
+        "",
+        "តម្លៃទាំងនេះ save ក្នុង <code>bot_settings</code> ហើយភាគច្រើនអាច apply ភ្លាមៗ។",
+        f"Storage: <b>{_ok_bad(bool(status.get('db_ok')), 'Supabase', 'Memory / setup needed')}</b>",
+        "",
+    ])
+    for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items():
+        label = html.escape(str(spec.get("label", key)))
+        value = html.escape(_format_bot_setting_value(key, _setting_raw_from(settings, key, BOT_SETTING_DEFAULTS.get(key, ""))))
+        help_text = html.escape(str(spec.get("help", "")))
+        lines.append(f"{label}: <b>{value}</b> — {help_text}")
+    lines.extend(["", "ចុច setting មួយ រួចផ្ញើតម្លៃថ្មី។ ឧទាហរណ៍: <code>2</code>, <code>30</code>, <code>on</code>។"])
+    await safe_send(lambda: query.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=get_bot_perf_settings_kb(settings),
+        disable_web_page_preview=True,
+    ))
+
+
 async def _admin_open_settings_panel(query, force: bool = False, notice: str = "") -> None:
     settings, status = await get_bot_settings_async(force=force)
     lines = []
@@ -14348,7 +14852,8 @@ async def _admin_open_settings_panel(query, force: bool = False, notice: str = "
     if status.get("error"):
         lines.append(f"Setup note: <code>{html.escape(str(status.get('error'))[:500])}</code>")
     lines.append("")
-    for key, label in BOT_SETTING_LABELS.items():
+    for key in BOT_FEATURE_SETTING_KEYS:
+        label = BOT_SETTING_LABELS.get(key, key)
         enabled = _setting_bool_from(settings, key, True)
         if key == "maintenance_mode":
             state = "ON ⚠️" if enabled else "OFF ✅"
@@ -14356,7 +14861,7 @@ async def _admin_open_settings_panel(query, force: bool = False, notice: str = "
             state = "ON ✅" if enabled else "OFF ⚠️"
         desc = html.escape(BOT_SETTING_DESCRIPTIONS.get(key, ""))
         lines.append(f"{label}: <b>{state}</b> — {desc}")
-    lines.extend(["", "ចុច setting ណាមួយដើម្បី ON/OFF។"])
+    lines.extend(["", "ចុច setting ណាមួយដើម្បី ON/OFF ឬបើក ⚡ Performance Settings ដើម្បីកែ speed/cache/concurrency។"])
     await safe_send(lambda: query.message.edit_text(
         "\n".join(lines),
         parse_mode="HTML",
@@ -14949,8 +15454,48 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
             await _admin_open_settings_panel(query, force=True, notice="🧩 SQL sent. Run it in Supabase SQL editor.")
         return
 
+    if data in ("admin_perf", "admin_perf_refresh"):
+        await _admin_open_perf_settings_panel(query, force=True)
+        return
+
+    if data == "admin_perf_apply":
+        changed = await _apply_all_bot_performance_settings(user_id, force=True)
+        await _admin_open_perf_settings_panel(query, force=True, notice=f"✅ Applied {len(changed)} performance settings.")
+        return
+
+    if data == "admin_perf_reset":
+        for perf_key in BOT_PERFORMANCE_SETTING_SPECS:
+            await _apply_bot_performance_setting(perf_key, _perf_default(perf_key, BOT_SETTING_DEFAULTS.get(perf_key, "")), admin_id=user_id)
+        await _admin_open_perf_settings_panel(query, force=True, notice="✅ Reset to code defaults and applied.")
+        return
+
+    if data.startswith("admin_perf_set:"):
+        key = data.split(":", 1)[1].strip()
+        if key not in BOT_PERFORMANCE_SETTING_SPECS:
+            await query.answer("Unknown setting", show_alert=True)
+            return
+        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+            ACTIVE_ADMIN_CONVERSATIONS[user_id] = {"state": "awaiting_bot_perf_value", "key": key, "ts": time.monotonic()}
+        spec = BOT_PERFORMANCE_SETTING_SPECS[key]
+        settings, _status = await get_bot_settings_async(force=True)
+        await query.answer("Send new value", show_alert=False)
+        await safe_send(lambda: query.message.edit_text(
+            f"⚡ <b>{html.escape(str(spec.get('label', key)))}</b>\n\n"
+            f"Current: <code>{html.escape(_setting_raw_from(settings, key, BOT_SETTING_DEFAULTS.get(key, '')))}</code>\n"
+            f"Allowed: <code>{html.escape(str(spec.get('min', 'off/on')))} - {html.escape(str(spec.get('max', '')))}</code>\n"
+            f"Help: {html.escape(str(spec.get('help', '')))}\n\n"
+            "Send new value now. Use <code>/cancel</code> to cancel.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_perf")]]),
+            disable_web_page_preview=True,
+        ))
+        return
+
     if data.startswith("admin_set:"):
         key = data.split(":", 1)[1].strip()
+        if key not in BOT_FEATURE_SETTING_KEYS:
+            await query.answer("Use Performance Settings for this value.", show_alert=True)
+            return
         settings, _status = await get_bot_settings_async(force=True)
         current = _setting_bool_from(settings, key, True)
         ok, info = await asyncio.get_running_loop().run_in_executor(
@@ -17711,6 +18256,11 @@ async def _run_bot():
     # getUpdates worker itself is guarded separately by ACTIVE_POLLING_TASK;
     # if mode is WEBHOOK, no polling updater is started.
 
+    with suppress(Exception):
+        applied = await _apply_all_bot_performance_settings(admin_id=0, force=True)
+        if applied:
+            logger.info("Applied %s persisted /admin performance settings before bot startup.", len(applied))
+
     _AI_SEMAPHORE        = asyncio.Semaphore(MAX_CONCURRENT_AI)
     _BROADCAST_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_BROADCAST)
     _prefs_cache_lock    = asyncio.Lock()
@@ -17748,7 +18298,7 @@ async def _run_bot():
     if hasattr(builder, "concurrent_updates"):
         builder = builder.concurrent_updates(TELEGRAM_CONCURRENT_UPDATES)
     if hasattr(builder, "connection_pool_size"):
-        builder = builder.connection_pool_size(_run_state_http_max_connections())
+        builder = builder.connection_pool_size(int(TELEGRAM_CONNECTION_POOL_SIZE))
     app = builder.build()
     _TELEGRAM_APP = app
     telegram_application = app
