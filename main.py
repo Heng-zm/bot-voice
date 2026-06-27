@@ -9107,7 +9107,6 @@ WELCOME_TEXT = (
     "🌍 ភាសាដែល Support:\n"
     "🇰🇭 ភាសាខ្មែរ | 🇺🇸 English | 🇨🇳 中文 Chinese\n\n"
     "⚙️ ប្រើ /myprefs ដើម្បីមើលការកំណត់របស់អ្នក\n"
-    "🔐 ប្រើ /security ដើម្បីមើល Privacy/Security\n"
     "📢 Join My Channel: https://t.me/m11mmm112"
 )
 BOT_TAG = "@voicekhaibot"
