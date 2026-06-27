@@ -2502,9 +2502,13 @@ def _web_current_admin_id() -> int:
 
 
 def _web_valid_admin_id(admin_id: int) -> bool:
-    if not ADMIN_IDS:
-        return True
-    return int(admin_id or 0) in ADMIN_IDS
+    """Return True only for explicitly configured Telegram admin IDs.
+
+    Security fix: an empty ADMIN_IDS used to mean "allow any web login that
+    knows ADMIN_WEB_PASSWORD".  In production that is too permissive.  The
+    web dashboard is now locked until ADMIN_IDS is configured.
+    """
+    return bool(ADMIN_IDS) and int(admin_id or 0) in ADMIN_IDS
 
 
 def _web_csrf_token() -> str:
@@ -3014,8 +3018,9 @@ def _web_locked_admin_html(message: str) -> str:
         "<div class='card'>"
         "<h2>🔒 Admin dashboard locked</h2>"
         f"<p>{_web_h(message)}</p>"
-        "<p class='muted'>Set <code>ADMIN_WEB_PASSWORD</code> or "
-        "<code>WEB_ADMIN_PASSWORD</code> in your deployment environment, then restart.</p>"
+        "<p class='muted'>Required production env: <code>ADMIN_IDS</code> plus "
+        "<code>ADMIN_WEB_PASSWORD</code> or <code>WEB_ADMIN_PASSWORD</code>. "
+        "Restart after changing deployment environment variables.</p>"
         "</div>"
     )
 
@@ -3045,6 +3050,12 @@ def web_admin_required(fn):
     def wrapper(*args, **kwargs):
         if not _web_admin_enabled():
             return _web_render("Disabled", "<div class='card'>WEB_ADMIN_ENABLED=0</div>", status_code=403)
+        if not ADMIN_IDS:
+            return _web_render(
+                "Admin Locked",
+                _web_locked_admin_html("No ADMIN_IDS are configured. Web admin login is disabled until at least one Telegram admin ID is explicitly allowed."),
+                status_code=403,
+            )
         if not _web_admin_password():
             return _web_render(
                 "Admin Locked",
@@ -3062,6 +3073,13 @@ def web_admin_required(fn):
 def web_admin_login():
     if not _web_admin_enabled():
         return _web_render("Disabled", "<div class='card'>WEB_ADMIN_ENABLED=0</div>", status_code=403)
+    if not ADMIN_IDS:
+        return _web_render(
+            "Admin Locked",
+            _web_locked_admin_html("No ADMIN_IDS are configured. Web admin login is disabled until at least one Telegram admin ID is explicitly allowed."),
+            status_code=403,
+        )
+
     expected_password = _web_admin_password()
     if not expected_password:
         return _web_render(
@@ -11925,10 +11943,32 @@ async def _telegram_leader_refresh_once(app_obj: Any | None = None) -> bool:
     global _TELEGRAM_LEADER_LAST_WEBHOOK_SIGNATURE, _TELEGRAM_LEADER_LAST_WEBHOOK_SET_AT
 
     if not _telegram_leader_lock_enabled():
+        now = time.monotonic()
         if not _TELEGRAM_LEADER_OWNED:
-            _TELEGRAM_LEADER_LAST_CHANGE_AT = time.monotonic()
+            _TELEGRAM_LEADER_LAST_CHANGE_AT = now
         _TELEGRAM_LEADER_OWNED = True
-        _TELEGRAM_LEADER_LAST_RENEW_AT = time.monotonic()
+        _TELEGRAM_LEADER_LAST_RENEW_AT = now
+
+        # Single-server webhook mode has no Redis leader-election branch, but
+        # it still must register/refresh Telegram's webhook.  Without this, a
+        # normal one-instance WEBHOOK deployment can boot successfully while
+        # Telegram still points at an old URL/secret or has no webhook set.
+        if _run_state_bot_mode() == "WEBHOOK":
+            sig = _telegram_webhook_signature()
+            reconfigure_after = max(60, int(globals().get("TELEGRAM_WEBHOOK_RECONFIGURE_INTERVAL_S", 600) or 600))
+            needs_reconfigure = (
+                _TELEGRAM_LEADER_LAST_WEBHOOK_SIGNATURE != sig
+                or (now - float(_TELEGRAM_LEADER_LAST_WEBHOOK_SET_AT or 0.0)) >= reconfigure_after
+            )
+            if needs_reconfigure:
+                if app_obj is not None:
+                    with suppress(Exception):
+                        await _telegram_stop_polling_runtime(app_obj)
+                await _configure_telegram_webhook_via_http()
+                _TELEGRAM_LEADER_LAST_WEBHOOK_SIGNATURE = sig
+                _TELEGRAM_LEADER_LAST_WEBHOOK_SET_AT = now
+                webhook_logger.info("Telegram webhook confirmed with leader lock disabled.")
+
         return True
 
     loop = asyncio.get_running_loop()
@@ -18419,6 +18459,13 @@ async def _drop_stale_updates(update: Update, context: ContextTypes.DEFAULT_TYPE
     would break buttons on messages sent before the bot restarted. We only drop
     stale *message* updates.
     """
+    # Webhook mode must not drop old message timestamps. During cold starts,
+    # this app returns 503 until Telegram is ready, and Telegram may retry the
+    # same update later with the original message date.  Dropping it here would
+    # lose user messages after a slow Render restart/deploy.
+    if "_run_state_bot_mode" in globals() and _run_state_bot_mode() == "WEBHOOK":
+        return
+
     if _BOT_START_TIME == 0.0:
         return
 
