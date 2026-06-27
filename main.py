@@ -371,6 +371,11 @@ class AppSettings(BaseSettings):
     USER_RATE_LIMIT_WINDOW_S: float = 1.0
     API_RATE_LIMIT_PER_SECOND: int = 20
     API_RATE_LIMIT_WINDOW_S: float = 1.0
+    # Security defaults: keep public surfaces tight unless explicitly opened.
+    AI_API_ALLOWED_ORIGINS: str = ""
+    AI_API_QUERY_KEY_ENABLED: bool = False
+    WEBHOOK_REPLAY_TTL_S: int = 600
+    ADMIN_CALLBACK_GUARD_ENABLED: bool = True
     RATE_LIMIT_REDIS_TTL_S: int = 30
     CACHE_ASIDE_DEFAULT_TTL_S: int = 3600
     WEB_BROADCAST_QUEUE_MAXSIZE: int = 200
@@ -962,6 +967,20 @@ def _web_security_headers(resp):
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    )
+    if _default_cookie_secure():
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    try:
+        if str(getattr(request, "path", "")).startswith("/admin"):
+            resp.headers.setdefault("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            resp.headers.setdefault("Pragma", "no-cache")
+    except Exception:
+        pass
     return resp
 
 @app_flask.route("/")
@@ -1121,6 +1140,54 @@ def _telegram_allowed_updates() -> list[str]:
     return allowed or ["message", "callback_query"]
 
 
+_WEBHOOK_UPDATE_MEMORY: OrderedDict[int, float] = OrderedDict()
+_WEBHOOK_UPDATE_MEMORY_LOCK = asyncio.Lock()
+
+
+def _webhook_replay_ttl_seconds() -> int:
+    return _env_int("WEBHOOK_REPLAY_TTL_S", 600, minimum=60, maximum=86400)
+
+
+async def _telegram_webhook_update_seen_or_mark(update_id: Any) -> bool:
+    """Return True if Telegram update_id was already accepted recently.
+
+    Telegram may retry webhooks after network errors.  This guard prevents
+    duplicate processing/sending while keeping a bounded TTL. Redis gives
+    cross-instance protection; memory fallback protects single-instance runs.
+    """
+    try:
+        uid = int(update_id)
+    except Exception:
+        return False
+
+    ttl = _webhook_replay_ttl_seconds()
+    redis_obj = globals().get("redis_client")
+    if redis_obj is not None:
+        key = _redis_key("tg_update_seen", uid) if "_redis_key" in globals() else f"tg_update_seen:{uid}"
+        try:
+            ok = await asyncio.to_thread(lambda: redis_obj.set(key, "1", ex=ttl, nx=True))
+            return not bool(ok)
+        except Exception as exc:
+            _log_once(logging.WARNING, "webhook_replay_redis_fallback", "Webhook replay Redis fallback: %s", exc)
+
+    now = time.monotonic()
+    async with _WEBHOOK_UPDATE_MEMORY_LOCK:
+        # Trim old entries opportunistically.
+        stale_before = now - ttl
+        for old_uid, old_ts in list(_WEBHOOK_UPDATE_MEMORY.items())[:5000]:
+            if old_ts < stale_before:
+                _WEBHOOK_UPDATE_MEMORY.pop(old_uid, None)
+            else:
+                break
+        if uid in _WEBHOOK_UPDATE_MEMORY:
+            _WEBHOOK_UPDATE_MEMORY.move_to_end(uid)
+            return True
+        _WEBHOOK_UPDATE_MEMORY[uid] = now
+        while len(_WEBHOOK_UPDATE_MEMORY) > 50_000:
+            _WEBHOOK_UPDATE_MEMORY.popitem(last=False)
+        return False
+
+
 async def _read_limited_webhook_body(req: FastAPIRequest, max_body: int) -> bytes:
     """Read Telegram webhook payloads with a hard body cap.
 
@@ -1189,6 +1256,10 @@ async def _process_telegram_webhook_request(req: FastAPIRequest, path_secret_tok
         raw = await _read_limited_webhook_body(req, max_body)
         data = _json_loads_fast(raw)
         update = Update.de_json(data, app_obj.bot)
+        if await _telegram_webhook_update_seen_or_mark(getattr(update, "update_id", None)):
+            webhook_logger.info("Duplicate Telegram webhook update ignored update_id=%s", getattr(update, "update_id", None))
+            _metric_inc("replay_dropped")
+            return _FastJSONResponse({"status": "ok", "duplicate": True}, status_code=200)
         await app_obj.process_update(update)
     except HTTPException:
         raise
@@ -1456,13 +1527,43 @@ def _ai_error(msg: str, code: int = 400):
     return jsonify({"ok": False, "error": msg, "code": code}), code
 
 
+def _ai_allowed_origin() -> str:
+    """Return a safe CORS origin for public AI API responses.
+
+    Default is same-origin only (no wildcard).  Set AI_API_ALLOWED_ORIGINS to a
+    comma-separated allowlist, or to * only if you intentionally expose the API
+    to browser clients from any origin.
+    """
+    origin = (request.headers.get("Origin") or "").strip()
+    raw = str(os.environ.get("AI_API_ALLOWED_ORIGINS") or getattr(SETTINGS, "AI_API_ALLOWED_ORIGINS", "") or "").strip()
+    if not raw or not origin:
+        return ""
+    allowed = {item.strip() for item in raw.split(",") if item.strip()}
+    if "*" in allowed:
+        return "*"
+    return origin if origin in allowed else ""
+
+
+def _apply_ai_cors_headers(resp):
+    allowed_origin = _ai_allowed_origin()
+    if allowed_origin:
+        resp.headers["Access-Control-Allow-Origin"] = allowed_origin
+        resp.headers["Vary"] = "Origin"
+    resp.headers.setdefault("Access-Control-Allow-Methods", "POST, OPTIONS")
+    resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key")
+    resp.headers.setdefault("Access-Control-Max-Age", "600")
+    return resp
+
+
 def _ai_cors(response_or_tuple):
     if isinstance(response_or_tuple, tuple):
         resp, code = response_or_tuple
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        return resp, code
-    response_or_tuple.headers["Access-Control-Allow-Origin"] = "*"
-    return response_or_tuple
+        return _apply_ai_cors_headers(resp), code
+    return _apply_ai_cors_headers(response_or_tuple)
+
+
+def _ai_cors_preflight():
+    return _apply_ai_cors_headers(Response("", status=204))
 
 
 def _detect_lang(text: str) -> str:
@@ -1673,15 +1774,19 @@ with check (true);
 """
 
 def _extract_ai_request_key() -> str:
+    """Extract AI API key without leaking credentials through URLs by default."""
     auth_header = (request.headers.get("Authorization") or "").strip()
     bearer_key = ""
     if auth_header.lower().startswith("bearer "):
         bearer_key = auth_header[7:].strip()
-    return (
-        (request.headers.get("X-Api-Key") or "").strip()
-        or bearer_key
-        or (request.args.get("api_key") or "").strip()
-    )
+    key = (request.headers.get("X-Api-Key") or "").strip() or bearer_key
+    if key:
+        return key
+    # Query-string API keys leak into logs/history/referrers. Keep disabled
+    # unless explicitly enabled for old integrations during a temporary migration.
+    if _env_bool("AI_API_QUERY_KEY_ENABLED", False):
+        return (request.args.get("api_key") or "").strip()
+    return ""
 
 
 def _hash_ai_api_key(raw_key: str) -> str:
@@ -2093,13 +2198,7 @@ def _parse_json_ai_request():
 @app_flask.route("/ai-assistant", methods=["POST", "OPTIONS"])
 def ai_assistant():
     if request.method == "OPTIONS":
-        resp = Response("", status=204)
-        resp.headers.update({
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Api-Key",
-        })
-        return resp
+        return _ai_cors_preflight()
 
     if not _check_ai_api_key():
         return _ai_cors(_ai_error("Unauthorized — invalid or missing API key.", 401))
@@ -2197,13 +2296,7 @@ def ai_assistant():
 @app_flask.route("/ai-assistant/transcribe", methods=["POST", "OPTIONS"])
 def ai_transcribe():
     if request.method == "OPTIONS":
-        resp = Response("", status=204)
-        resp.headers.update({
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Api-Key",
-        })
-        return resp
+        return _ai_cors_preflight()
 
     if not _check_ai_api_key():
         return _ai_cors(_ai_error("Unauthorized.", 401))
@@ -2256,13 +2349,7 @@ def ai_transcribe():
 @app_flask.route("/ai-assistant/vision", methods=["POST", "OPTIONS"])
 def ai_vision():
     if request.method == "OPTIONS":
-        resp = Response("", status=204)
-        resp.headers.update({
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Api-Key",
-        })
-        return resp
+        return _ai_cors_preflight()
 
     if not _check_ai_api_key():
         return _ai_cors(_ai_error("Unauthorized.", 401))
@@ -8297,6 +8384,89 @@ async def _telegram_rate_limit_guard(update: Any, context: Any) -> None:
     raise ApplicationHandlerStop
 
 
+_ADMIN_ONLY_COMMANDS = {
+    "admin", "stats", "broadcast", "schedule", "schedules", "cancelschedule",
+    "runtime", "api", "botsettings", "users", "chat", "endchat",
+}
+_ADMIN_SECURITY_NOTICE_MEMORY: dict[str, float] = {}
+
+
+def _telegram_command_name(update: Update) -> str:
+    msg = update.effective_message
+    text = str(getattr(msg, "text", None) or getattr(msg, "caption", None) or "").strip()
+    if not text.startswith("/"):
+        return ""
+    return text[1:].split(maxsplit=1)[0].split("@", 1)[0].lower()
+
+
+async def _security_notice_once(update: Update, key: str, text: str, *, alert: bool = False) -> None:
+    now = time.monotonic()
+    last = _ADMIN_SECURITY_NOTICE_MEMORY.get(key, 0.0)
+    if now - last < USER_RATE_LIMIT_NOTICE_COOLDOWN_S:
+        return
+    _ADMIN_SECURITY_NOTICE_MEMORY[key] = now
+    if len(_ADMIN_SECURITY_NOTICE_MEMORY) > 50_000:
+        stale_before = now - max(USER_RATE_LIMIT_NOTICE_COOLDOWN_S * 4, 300.0)
+        for old_key, old_ts in list(_ADMIN_SECURITY_NOTICE_MEMORY.items())[:5000]:
+            if old_ts < stale_before:
+                _ADMIN_SECURITY_NOTICE_MEMORY.pop(old_key, None)
+    query = update.callback_query
+    if query is not None:
+        with suppress(Exception):
+            await query.answer(text, show_alert=alert)
+        return
+    msg = update.effective_message
+    if msg is not None:
+        with suppress(Exception):
+            await msg.reply_text(text)
+
+
+async def _telegram_user_security_guard(update: Any, context: Any) -> None:
+    """Cheap global user-safety gate before expensive handlers.
+
+    - Blocks non-admin access to admin commands/callbacks.
+    - Stops blocked users before OCR/TTS/AI work begins.
+    - Uses cached blocked lookups to avoid DB pressure under normal traffic.
+    """
+    if not isinstance(update, Update):
+        return
+    user = update.effective_user
+    if user is None:
+        return
+    user_id = int(user.id)
+    if _is_admin(user_id):
+        return
+
+    query = update.callback_query
+    data = str(getattr(query, "data", "") or "") if query is not None else ""
+    admin_callback_prefixes = ("admin_", "api_", "rtadmin_", "user_", "users_", "history_", "sched_", "bc_")
+    if _env_bool("ADMIN_CALLBACK_GUARD_ENABLED", True) and data.startswith(admin_callback_prefixes):
+        _metric_inc("admin_denied")
+        await _security_notice_once(update, f"admin_cb:{user_id}", "⛔ Admin only.", alert=True)
+        raise ApplicationHandlerStop
+
+    cmd = _telegram_command_name(update)
+    if cmd in _ADMIN_ONLY_COMMANDS:
+        _metric_inc("admin_denied")
+        await _security_notice_once(update, f"admin_cmd:{user_id}", "⛔ ពាក្យបញ្ជានេះសម្រាប់ Admin ប៉ុណ្ណោះ។")
+        raise ApplicationHandlerStop
+    if cmd in {"security", "privacy", "deleteme"}:
+        # Privacy/self-service commands stay available even if the user is blocked.
+        return
+
+    # Blocked-user guard.  db_user_is_blocked() has memory cache; executor keeps
+    # the event loop safe if Supabase fallback is needed.
+    try:
+        blocked = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_is_blocked(user_id))
+    except Exception as exc:
+        blocked = False
+        _log_once(logging.WARNING, f"blocked_guard_failed:{user_id}", "Blocked-user guard skipped user=%s: %s", user_id, exc)
+    if blocked:
+        _metric_inc("blocked_hits")
+        await _security_notice_once(update, f"blocked:{user_id}", "⛔ អ្នកត្រូវបាន Block មិនអាចប្រើ Bot នេះបានទេ។")
+        raise ApplicationHandlerStop
+
+
 async def _api_rate_limit_allowed(req: FastAPIRequest) -> bool:
     if not RATE_LIMIT_ENABLED:
         return True
@@ -8919,6 +9089,7 @@ WELCOME_TEXT = (
     "🌍 ភាសាដែល Support:\n"
     "🇰🇭 ភាសាខ្មែរ | 🇺🇸 English | 🇨🇳 中文 Chinese\n\n"
     "⚙️ ប្រើ /myprefs ដើម្បីមើលការកំណត់របស់អ្នក\n"
+    "🔐 ប្រើ /security ដើម្បីមើល Privacy/Security\n"
     "📢 Join My Channel: https://t.me/m11mmm112"
 )
 BOT_TAG = "@voicekhaibot"
@@ -10393,6 +10564,8 @@ _RUNTIME_METRICS: OrderedDict[str, int] = OrderedDict([
     ("audio", 0),
     ("blocked_hits", 0),
     ("disabled_hits", 0),
+    ("admin_denied", 0),
+    ("replay_dropped", 0),
     ("errors", 0),
 ])
 
@@ -18257,6 +18430,95 @@ async def _drop_stale_updates(update: Update, context: ContextTypes.DEFAULT_TYPE
             raise ApplicationHandlerStop
 
 
+async def cmd_security(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not update.effective_message:
+        return
+    blocked = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_is_blocked(int(user.id)))
+    status = "blocked" if blocked else "active"
+    await safe_send(lambda: update.effective_message.reply_text(
+        "🔐 <b>Security & Privacy</b>\n\n"
+        f"User ID: <code>{int(user.id)}</code>\n"
+        f"Status: <b>{html.escape(status)}</b>\n\n"
+        "✅ Admin commands are protected.\n"
+        "✅ Spam/flood protection is enabled.\n"
+        "✅ API keys are accepted from headers, not URL query strings by default.\n"
+        "✅ Use /clear to clear chat context.\n"
+        "🗑️ Use /deleteme to delete your saved bot history and preferences.",
+        parse_mode="HTML",
+    ))
+
+
+async def cmd_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_message:
+        return
+    await safe_send(lambda: update.effective_message.reply_text(
+        "🔒 <b>Privacy</b>\n\n"
+        "This bot stores only what it needs for preferences, cached text/audio workflow, "
+        "conversation context, admin safety, and delivery logs.\n\n"
+        "You can use /clear to remove current conversation context, or /deleteme to delete "
+        "your saved bot history and preferences from cache/database where configured.",
+        parse_mode="HTML",
+    ))
+
+
+async def _delete_user_personal_data(user_id: int) -> None:
+    user_id = int(user_id)
+    db_history_clear(user_id)
+    _invalidate_prefs(user_id)
+
+    def _run():
+        with suppress(Exception):
+            _hist_cache_clear(user_id)
+        with suppress(Exception):
+            if redis_client is not None:
+                _redis_delete_sync(_prefs_redis_key(user_id))
+                _redis_delete_sync(_hist_redis_key(user_id))
+                _redis_delete_sync(_text_cache_user_history_redis_key(user_id))
+        if supabase:
+            db_call_sync(
+                f"user_prefs_delete:{user_id}",
+                lambda: supabase.table("user_prefs").delete().eq("user_id", user_id).execute(),
+                default=None,
+                attempts=3,
+                critical=False,
+            )
+            db_call_sync(
+                f"text_cache_delete:{user_id}",
+                lambda: supabase.table("text_cache").delete().eq("user_id", user_id).execute(),
+                default=None,
+                attempts=3,
+                critical=False,
+            )
+            db_call_sync(
+                f"conversation_history_delete:{user_id}",
+                lambda: supabase.table("conversation_history").delete().eq("user_id", user_id).execute(),
+                default=None,
+                attempts=3,
+                critical=False,
+            )
+
+    await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, _run)
+
+
+async def cmd_delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not update.effective_message:
+        return
+    if _is_admin(int(user.id)) and "--confirm-admin" not in context.args:
+        await safe_send(lambda: update.effective_message.reply_text(
+            "⚠️ Admin account detected. To delete your own admin-user data, run:\n"
+            "<code>/deleteme --confirm-admin</code>",
+            parse_mode="HTML",
+        ))
+        return
+    await _delete_user_personal_data(int(user.id))
+    await safe_send(lambda: update.effective_message.reply_text(
+        "✅ Your saved bot history, text cache, and preferences were cleared.\n"
+        "Note: security block records and required delivery/audit logs may be retained by admins for abuse prevention."
+    ))
+
+
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         sync_user_data(update.effective_user)
@@ -19387,8 +19649,9 @@ async def _run_bot():
     _TELEGRAM_APP = app
     telegram_application = app
 
-    # Anti-flood guard must run before stale-drop and all expensive handlers.
-    app.add_handler(TypeHandler(Update, _telegram_rate_limit_guard), group=-2)
+    # Anti-flood/security guards must run before stale-drop and expensive handlers.
+    app.add_handler(TypeHandler(Update, _telegram_rate_limit_guard), group=-3)
+    app.add_handler(TypeHandler(Update, _telegram_user_security_guard), group=-2)
     app.add_handler(TypeHandler(Update, _drop_stale_updates), group=-1)
 
     # Commands
@@ -19397,6 +19660,9 @@ async def _run_bot():
     app.add_handler(CommandHandler("myprefs",         cmd_myprefs))
     app.add_handler(CommandHandler("ttsmodel",        cmd_ttsmodel))
     app.add_handler(CommandHandler("clear",           cmd_clear))
+    app.add_handler(CommandHandler("security",        cmd_security))
+    app.add_handler(CommandHandler("privacy",         cmd_privacy))
+    app.add_handler(CommandHandler("deleteme",        cmd_delete_my_data))
     app.add_handler(CommandHandler("broadcast",       broadcast_start))
     app.add_handler(CommandHandler("schedule",        cmd_schedule))
     app.add_handler(CommandHandler("schedules",       cmd_schedules))
