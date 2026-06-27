@@ -15038,39 +15038,391 @@ def _admin_report_lines(data: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _report_font_candidates() -> list[str]:
+    """Common Unicode font paths for Linux/Render, Windows, and macOS.
+
+    The bot does not bundle or expose font files.  If one of these fonts exists
+    on the server, the PDF can render Khmer/Unicode text more cleanly; otherwise
+    ReportLab safely falls back to built-in Helvetica.
+    """
+    return [
+        os.environ.get("REPORT_PDF_FONT", ""),
+        "/usr/share/fonts/truetype/noto/NotoSansKhmer-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansKhmer-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "C:/Windows/Fonts/NotoSansKhmer-Regular.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    ]
+
+
+def _register_report_pdf_fonts() -> tuple[str, str]:
+    """Return (regular_font, bold_font) registered for the admin PDF report."""
+    regular = "Helvetica"
+    bold = "Helvetica-Bold"
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+
+        for font_path in _report_font_candidates():
+            font_path = str(font_path or "").strip()
+            if not font_path or not os.path.exists(font_path):
+                continue
+            try:
+                pdfmetrics.registerFont(TTFont("AdminReportUnicode", font_path))
+                regular = "AdminReportUnicode"
+                break
+            except Exception:
+                continue
+
+        for font_path in [
+            os.environ.get("REPORT_PDF_BOLD_FONT", ""),
+            "/usr/share/fonts/truetype/noto/NotoSansKhmer-Bold.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansKhmer-Bold.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+            "C:/Windows/Fonts/arialbd.ttf",
+        ]:
+            font_path = str(font_path or "").strip()
+            if not font_path or not os.path.exists(font_path):
+                continue
+            try:
+                pdfmetrics.registerFont(TTFont("AdminReportUnicodeBold", font_path))
+                bold = "AdminReportUnicodeBold"
+                break
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return regular, bold
+
+
+def _report_pdf_text(value: Any, limit: int | None = None) -> str:
+    """Clean text for ReportLab paragraphs while preserving Unicode when possible."""
+    text = re.sub(r"\s+", " ", _strip_html_tags(value)).strip()
+    text = text.replace("\x00", "")
+    if limit and len(text) > limit:
+        return text[: max(0, limit - 1)] + "…"
+    return text
+
+
+def _report_bool_label(ok: bool, true_text: str = "OK", false_text: str = "Attention") -> str:
+    return true_text if bool(ok) else false_text
+
+
+def _report_status_style(ok: bool) -> str:
+    return "good" if bool(ok) else "bad"
+
+
 def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
+    """Write a clean, branded, multi-page admin report PDF.
+
+    The PDF uses ReportLab Platypus for proper wrapping, tables, page breaks,
+    footer/page numbers, status cards, and a modern dashboard-like layout.  A
+    tiny dependency-free PDF fallback remains available if ReportLab is missing.
+    """
     lines = _admin_report_lines(data)
     try:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_CENTER, TA_RIGHT
         from reportlab.lib.pagesizes import A4
-        from reportlab.pdfgen import canvas
-        c = canvas.Canvas(path, pagesize=A4)
-        width, height = A4
-        x = 42
-        y = height - 48
-        c.setTitle("Telegram Bot Admin Report")
-        c.setFont("Helvetica-Bold", 16)
-        c.drawString(x, y, _pdf_safe_line(lines[0], 80))
-        y -= 28
-        c.setFont("Helvetica", 10)
-        for line in lines[1:]:
-            if y < 48:
-                c.showPage()
-                c.setFont("Helvetica", 10)
-                y = height - 48
-            safe = _pdf_safe_line(line, 115)
-            if not safe:
-                y -= 9
-                continue
-            if safe in {"System Status", "Counts", "Runtime Metrics Since Restart", "Feature Settings", "Performance Runtime Settings", "Recent Errors"}:
-                c.setFont("Helvetica-Bold", 12)
-                c.drawString(x, y, safe)
-                c.setFont("Helvetica", 10)
-            else:
-                c.drawString(x, y, safe)
-            y -= 14
-        c.save()
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import mm
+        from reportlab.platypus import (
+            BaseDocTemplate,
+            Frame,
+            KeepTogether,
+            PageBreak,
+            PageTemplate,
+            Paragraph,
+            Spacer,
+            Table,
+            TableStyle,
+        )
+
+        regular_font, bold_font = _register_report_pdf_fonts()
+        page_width, page_height = A4
+        margin_x = 17 * mm
+        margin_top = 22 * mm
+        margin_bottom = 17 * mm
+        primary = colors.HexColor("#2563EB")
+        primary_dark = colors.HexColor("#1E3A8A")
+        ink = colors.HexColor("#0F172A")
+        muted = colors.HexColor("#64748B")
+        line = colors.HexColor("#E2E8F0")
+        soft = colors.HexColor("#F8FAFC")
+        good = colors.HexColor("#16A34A")
+        warn = colors.HexColor("#DC2626")
+        amber = colors.HexColor("#D97706")
+
+        doc = BaseDocTemplate(
+            path,
+            pagesize=A4,
+            leftMargin=margin_x,
+            rightMargin=margin_x,
+            topMargin=margin_top,
+            bottomMargin=margin_bottom,
+            title="Telegram Bot Admin Report",
+            author="Telegram Bot Admin",
+        )
+        frame = Frame(
+            doc.leftMargin,
+            doc.bottomMargin,
+            doc.width,
+            doc.height,
+            id="normal",
+            leftPadding=0,
+            rightPadding=0,
+            topPadding=0,
+            bottomPadding=0,
+        )
+
+        def _draw_page(canvas_obj, doc_obj):
+            canvas_obj.saveState()
+            canvas_obj.setFillColor(primary)
+            canvas_obj.rect(0, page_height - 13 * mm, page_width, 13 * mm, fill=1, stroke=0)
+            canvas_obj.setFillColor(colors.white)
+            canvas_obj.setFont(bold_font, 9)
+            canvas_obj.drawString(margin_x, page_height - 8.6 * mm, "Telegram Bot Admin Report")
+            canvas_obj.setFont(regular_font, 8)
+            canvas_obj.drawRightString(page_width - margin_x, page_height - 8.6 * mm, _report_pdf_text(data.get("generated_at"), 80))
+            canvas_obj.setStrokeColor(line)
+            canvas_obj.line(margin_x, 12 * mm, page_width - margin_x, 12 * mm)
+            canvas_obj.setFillColor(muted)
+            canvas_obj.setFont(regular_font, 8)
+            footer_left = f"Admin ID: {_report_pdf_text(data.get('admin_id'), 32)} | Uptime: {_report_pdf_text(data.get('uptime'), 60)}"
+            canvas_obj.drawString(margin_x, 7.5 * mm, footer_left)
+            canvas_obj.drawRightString(page_width - margin_x, 7.5 * mm, f"Page {doc_obj.page}")
+            canvas_obj.restoreState()
+
+        doc.addPageTemplates([PageTemplate(id="report", frames=[frame], onPage=_draw_page)])
+
+        styles = getSampleStyleSheet()
+        styles.add(ParagraphStyle(
+            name="ReportTitle",
+            parent=styles["Title"],
+            fontName=bold_font,
+            fontSize=24,
+            leading=29,
+            textColor=ink,
+            spaceAfter=5,
+        ))
+        styles.add(ParagraphStyle(
+            name="ReportSubtitle",
+            parent=styles["BodyText"],
+            fontName=regular_font,
+            fontSize=9.5,
+            leading=13,
+            textColor=muted,
+            spaceAfter=12,
+        ))
+        styles.add(ParagraphStyle(
+            name="SectionTitle",
+            parent=styles["Heading2"],
+            fontName=bold_font,
+            fontSize=13,
+            leading=16,
+            textColor=primary_dark,
+            spaceBefore=12,
+            spaceAfter=7,
+        ))
+        styles.add(ParagraphStyle(
+            name="SmallMuted",
+            parent=styles["BodyText"],
+            fontName=regular_font,
+            fontSize=8.2,
+            leading=11,
+            textColor=muted,
+        ))
+        styles.add(ParagraphStyle(
+            name="TableText",
+            parent=styles["BodyText"],
+            fontName=regular_font,
+            fontSize=8.5,
+            leading=11,
+            textColor=ink,
+        ))
+        styles.add(ParagraphStyle(
+            name="TableHead",
+            parent=styles["BodyText"],
+            fontName=bold_font,
+            fontSize=8.5,
+            leading=11,
+            textColor=colors.white,
+        ))
+        styles.add(ParagraphStyle(
+            name="CardLabel",
+            parent=styles["BodyText"],
+            fontName=regular_font,
+            fontSize=7.6,
+            leading=9.5,
+            textColor=muted,
+            alignment=TA_CENTER,
+        ))
+        styles.add(ParagraphStyle(
+            name="CardValue",
+            parent=styles["BodyText"],
+            fontName=bold_font,
+            fontSize=15,
+            leading=18,
+            textColor=ink,
+            alignment=TA_CENTER,
+        ))
+        styles.add(ParagraphStyle(
+            name="StatusGood",
+            parent=styles["BodyText"],
+            fontName=bold_font,
+            fontSize=8.5,
+            leading=11,
+            textColor=good,
+        ))
+        styles.add(ParagraphStyle(
+            name="StatusBad",
+            parent=styles["BodyText"],
+            fontName=bold_font,
+            fontSize=8.5,
+            leading=11,
+            textColor=warn,
+        ))
+        styles.add(ParagraphStyle(
+            name="RightMuted",
+            parent=styles["SmallMuted"],
+            alignment=TA_RIGHT,
+        ))
+
+        def P(value: Any, style_name: str = "TableText", limit: int | None = None) -> Paragraph:
+            return Paragraph(html.escape(_report_pdf_text(value, limit)), styles[style_name])
+
+        def section(title: str):
+            return Paragraph(html.escape(title), styles["SectionTitle"])
+
+        def table(rows, col_widths=None, header=True, extra_style=None):
+            tbl = Table(rows, colWidths=col_widths, hAlign="LEFT", repeatRows=1 if header else 0)
+            base = [
+                ("BOX", (0, 0), (-1, -1), 0.55, line),
+                ("INNERGRID", (0, 0), (-1, -1), 0.35, line),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 7),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("ROWBACKGROUNDS", (0, 1 if header else 0), (-1, -1), [colors.white, soft]),
+            ]
+            if header:
+                base.extend([
+                    ("BACKGROUND", (0, 0), (-1, 0), primary),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ])
+            if extra_style:
+                base.extend(extra_style)
+            tbl.setStyle(TableStyle(base))
+            return tbl
+
+        counts = data.get("counts") or {}
+        metrics = data.get("metrics") or {}
+        leader = data.get("leader") or {}
+        settings = data.get("settings") or {}
+        run_state = data.get("run_state") or {}
+        recent_errors = data.get("recent_errors") or []
+
+        story = []
+        story.append(Paragraph("Telegram Bot Admin Report", styles["ReportTitle"]))
+        story.append(Paragraph(
+            html.escape(
+                f"Generated {_report_pdf_text(data.get('generated_at'))} | "
+                f"Mode: {_report_pdf_text(data.get('bot_mode'))} | "
+                f"Admin ID: {_report_pdf_text(data.get('admin_id'))}"
+            ),
+            styles["ReportSubtitle"],
+        ))
+
+        card_data = [[
+            [P("Users", "CardLabel"), P(counts.get("users", 0), "CardValue")],
+            [P("Schedules", "CardLabel"), P(counts.get("schedules", 0), "CardValue")],
+            [P("Pending", "CardLabel"), P(counts.get("pending", 0), "CardValue")],
+            [P("Failed", "CardLabel"), P(counts.get("failed", 0), "CardValue")],
+            [P("API Keys", "CardLabel"), P(counts.get("api_keys", 0), "CardValue")],
+        ]]
+        card_table = Table(card_data, colWidths=[doc.width / 5.0] * 5, hAlign="LEFT")
+        card_table.setStyle(TableStyle([
+            ("BOX", (0, 0), (-1, -1), 0.6, line),
+            ("INNERGRID", (0, 0), (-1, -1), 0.6, line),
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F8FBFF")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 9),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
+        ]))
+        story.append(card_table)
+        story.append(Spacer(1, 8))
+
+        status_rows = [
+            [P("Service", "TableHead"), P("Status", "TableHead"), P("Details", "TableHead")],
+            [P("Supabase"), P(_report_bool_label(data.get("supabase_on"), "Connected", "Offline"), "StatusGood" if data.get("supabase_on") else "StatusBad"), P("Database-backed features and settings storage")],
+            [P("Redis"), P(_report_bool_label(data.get("redis_on"), "Connected", "Offline"), "StatusGood" if data.get("redis_on") else "StatusBad"), P("Runtime state, locks, cache, and queue helpers")],
+            [P("FFmpeg"), P(_report_bool_label(data.get("ffmpeg_ok"), "Available", "Missing"), "StatusGood" if data.get("ffmpeg_ok") else "StatusBad"), P("Video/audio processing dependency")],
+            [P("Temp folder"), P(_report_bool_label(data.get("temp_ok"), "Writable", "Problem"), "StatusGood" if data.get("temp_ok") else "StatusBad"), P(f"{data.get('temp_count')} temp files | {_report_pdf_text(data.get('temp_dir'), 85)}")],
+            [P("Webhook"), P(_report_bool_label(data.get("webhook_ready"), "Ready", "Not ready"), "StatusGood" if data.get("webhook_ready") else "StatusBad"), P(f"Bot mode: {_report_pdf_text(data.get('bot_mode'))} | Leader: {_report_pdf_text(leader.get('owner') or 'unknown', 70)}")],
+        ]
+        story.append(KeepTogether([section("System Health"), table(status_rows, [33 * mm, 31 * mm, doc.width - 64 * mm])]))
+
+        schedule_rows = [
+            [P("Metric", "TableHead"), P("Value", "TableHead"), P("Note", "TableHead")],
+            [P("Blocked users"), P(counts.get("blocked", 0)), P("Users currently blocked by admin tools")],
+            [P("Sending jobs"), P(counts.get("sending", 0)), P("Broadcasts or scheduled jobs currently marked sending")],
+            [P("Failed jobs"), P(counts.get("failed", 0)), P("Jobs that need admin review or retry")],
+            [P("Settings DB"), P("OK" if data.get("settings_db_ok") else "Fallback", "StatusGood" if data.get("settings_db_ok") else "StatusBad"), P("Whether bot settings loaded from Supabase")],
+        ]
+        story.append(KeepTogether([section("Operations Summary"), table(schedule_rows, [40 * mm, 28 * mm, doc.width - 68 * mm])]))
+
+        metric_rows = [[P("Metric", "TableHead"), P("Value", "TableHead")]]
+        for key in sorted(metrics):
+            metric_rows.append([P(key, limit=70), P(metrics.get(key), limit=90)])
+        if len(metric_rows) == 1:
+            metric_rows.append([P("No metrics captured"), P("-")])
+        story.append(section("Runtime Metrics Since Restart"))
+        story.append(table(metric_rows, [doc.width * 0.58, doc.width * 0.42]))
+
+        feature_rows = [[P("Feature", "TableHead"), P("Current Value", "TableHead")]]
+        for key in BOT_FEATURE_SETTING_KEYS:
+            feature_rows.append([P(key, limit=75), P(settings.get(key, BOT_SETTING_DEFAULTS.get(key, "")), limit=95)])
+        story.append(section("Feature Settings"))
+        story.append(table(feature_rows, [doc.width * 0.55, doc.width * 0.45]))
+
+        perf_rows = [[P("Setting", "TableHead"), P("Current Value", "TableHead")]]
+        for key in BOT_PERFORMANCE_SETTING_SPECS:
+            value = run_state.get(key, BOT_SETTING_DEFAULTS.get(key, _perf_default(key, "")))
+            perf_rows.append([P(key, limit=75), P(value, limit=95)])
+        story.append(section("Performance Runtime Settings"))
+        story.append(table(perf_rows, [doc.width * 0.62, doc.width * 0.38]))
+
+        error_rows = [[P("Time", "TableHead"), P("Level", "TableHead"), P("Source", "TableHead"), P("Message", "TableHead")]]
+        if not recent_errors:
+            error_rows.append([P("-"), P("OK", "StatusGood"), P("System"), P("No recent errors captured.")])
+        else:
+            for item in recent_errors[:12]:
+                level = _report_pdf_text(item.get("level", ""), 20)
+                style = "StatusBad" if level.upper() in {"ERROR", "CRITICAL"} else "TableText"
+                error_rows.append([
+                    P(item.get("ts", ""), limit=42),
+                    P(level, style),
+                    P(item.get("source", ""), limit=45),
+                    P(item.get("message", ""), limit=160),
+                ])
+        story.append(section("Recent Errors"))
+        story.append(table(error_rows, [32 * mm, 21 * mm, 31 * mm, doc.width - 84 * mm]))
+
+        story.append(Spacer(1, 10))
+        story.append(Paragraph(
+            html.escape("Generated automatically from the Telegram bot admin system. Keep this report private because it may include operational details."),
+            styles["SmallMuted"],
+        ))
+
+        doc.build(story)
     except Exception as exc:
-        logger.warning("reportlab PDF generation failed; using minimal PDF fallback: %s", exc)
+        logger.warning("reportlab styled PDF generation failed; using minimal PDF fallback: %s", exc)
         _write_minimal_pdf(path, lines)
 
 
