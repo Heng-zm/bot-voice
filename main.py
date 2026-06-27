@@ -994,6 +994,7 @@ def readyz():
         "ffmpeg_ok": bool(ffmpeg_path and os.path.exists(str(ffmpeg_path))),
         "bot_mode": _run_state_bot_mode() if "_run_state_bot_mode" in globals() else globals().get("BOT_MODE", "POLLING"),
         "webhook_ready": bool(globals().get("_TELEGRAM_APP")),
+        "telegram_leader": _telegram_leader_snapshot() if "_telegram_leader_snapshot" in globals() else {},
     }
     fmt = globals().get("_format_uptime")
     if callable(fmt):
@@ -1049,16 +1050,28 @@ def generate_new_webhook_token() -> str:
 
 
 def _runtime_webhook_base_url() -> str:
+    """Return this Render service's public webhook base URL.
+
+    In two-server mode, TELEGRAM_WEBHOOK_URL / RENDER_EXTERNAL_URL is
+    intentionally treated as service-local.  Redis RUN_STATE may contain the
+    other Render service's URL, so local env must win before persisted state.
+    """
+    env_value = str(
+        os.environ.get("TELEGRAM_WEBHOOK_URL")
+        or getattr(SETTINGS, "TELEGRAM_WEBHOOK_URL", "")
+        or os.environ.get("RENDER_EXTERNAL_URL")
+        or getattr(SETTINGS, "RENDER_EXTERNAL_URL", "")
+        or ""
+    ).strip().rstrip("/")
+    if bool(globals().get("TELEGRAM_MULTI_SERVER_ENABLED", False)) and env_value:
+        return env_value
+
     run_state = globals().get("RUN_STATE")
     if isinstance(run_state, dict):
         value = run_state.get("TELEGRAM_WEBHOOK_URL")
         if value:
             return str(value).strip().rstrip("/")
-    return str(
-        globals().get("TELEGRAM_WEBHOOK_URL")
-        or getattr(SETTINGS, "TELEGRAM_WEBHOOK_URL", "")
-        or ""
-    ).strip().rstrip("/")
+    return env_value or str(globals().get("TELEGRAM_WEBHOOK_URL") or "").strip().rstrip("/")
 
 
 def _telegram_webhook_target_url_for_secret(secret_token: str) -> str:
@@ -1163,6 +1176,10 @@ async def _process_telegram_webhook_request(req: FastAPIRequest, path_secret_tok
     if app_obj is None:
         webhook_logger.warning("Telegram webhook update acknowledged before application was ready.")
         return _FastJSONResponse({"status": "ok", "warning": "telegram_application_not_ready"}, status_code=200)
+
+    if not _telegram_should_process_webhook_update():
+        webhook_logger.info("Webhook update acknowledged by standby instance; active owner=%s", _telegram_leader_snapshot().get("owner"))
+        return _FastJSONResponse({"status": "ignored", "reason": "standby_instance"}, status_code=200)
 
     max_body = min(_web_max_content_length(), 2 * 1024 * 1024)
     try:
@@ -6357,8 +6374,46 @@ HTTPX_HIGH_CONCURRENCY_LIMITS = httpx.Limits(
 BOT_MODE = (os.environ.get("BOT_MODE") or getattr(SETTINGS, "BOT_MODE", _perf_default("BOT_MODE", "WEBHOOK")) or _perf_default("BOT_MODE", "WEBHOOK")).strip().upper()
 if BOT_MODE not in {"POLLING", "WEBHOOK"}:
     BOT_MODE = str(_perf_default("BOT_MODE", "WEBHOOK")).upper()
-TELEGRAM_WEBHOOK_URL = (os.environ.get("TELEGRAM_WEBHOOK_URL") or getattr(SETTINGS, "TELEGRAM_WEBHOOK_URL", None) or "").strip()
+TELEGRAM_WEBHOOK_URL = (
+    os.environ.get("TELEGRAM_WEBHOOK_URL")
+    or getattr(SETTINGS, "TELEGRAM_WEBHOOK_URL", None)
+    or os.environ.get("RENDER_EXTERNAL_URL")
+    or getattr(SETTINGS, "RENDER_EXTERNAL_URL", "")
+    or ""
+).strip().rstrip("/")
 TELEGRAM_WEBHOOK_SECRET_TOKEN = (os.environ.get("TELEGRAM_WEBHOOK_SECRET_TOKEN") or getattr(SETTINGS, "TELEGRAM_WEBHOOK_SECRET_TOKEN", None) or "").strip()
+
+# ── Render two-web-service safety ─────────────────────────────────────────
+# Telegram allows only one active webhook URL per bot token.  When the same
+# code is deployed as two Render Web Services, both processes must NOT call
+# setWebhook/process webhook updates at the same time.  This leader lease lets
+# both web dashboards stay online while only one service owns Telegram traffic.
+_IS_RENDER_ENV = (
+    _env_bool("RENDER", False)
+    or bool(os.environ.get("RENDER_SERVICE_ID"))
+    or bool(os.environ.get("RENDER_EXTERNAL_URL"))
+)
+TELEGRAM_MULTI_SERVER_ENABLED = _env_bool("TELEGRAM_MULTI_SERVER_ENABLED", _IS_RENDER_ENV)
+TELEGRAM_ACTIVE_LOCK_ENABLED = _env_bool("TELEGRAM_ACTIVE_LOCK_ENABLED", TELEGRAM_MULTI_SERVER_ENABLED)
+TELEGRAM_ACTIVE_LOCK_REQUIRED = _env_bool("TELEGRAM_ACTIVE_LOCK_REQUIRED", TELEGRAM_MULTI_SERVER_ENABLED)
+TELEGRAM_ACTIVE_LOCK_KEY = (os.environ.get("TELEGRAM_ACTIVE_LOCK_KEY") or "telegram_webhook_owner").strip() or "telegram_webhook_owner"
+TELEGRAM_ACTIVE_LOCK_TTL_S = _env_int("TELEGRAM_ACTIVE_LOCK_TTL_S", 90, minimum=30, maximum=3600)
+TELEGRAM_ACTIVE_LOCK_RENEW_S = _env_float(
+    "TELEGRAM_ACTIVE_LOCK_RENEW_S",
+    max(10.0, TELEGRAM_ACTIVE_LOCK_TTL_S / 3.0),
+    minimum=5.0,
+    maximum=max(5.0, TELEGRAM_ACTIVE_LOCK_TTL_S - 5.0),
+)
+TELEGRAM_WEBHOOK_RECONFIGURE_INTERVAL_S = _env_int("TELEGRAM_WEBHOOK_RECONFIGURE_INTERVAL_S", 600, minimum=60, maximum=86400)
+_PROCESS_BOOT_ID = secrets.token_hex(6)
+_TELEGRAM_LEADER_OWNED = False
+_TELEGRAM_LEADER_LAST_CHANGE_AT = 0.0
+_TELEGRAM_LEADER_LAST_RENEW_AT = 0.0
+_TELEGRAM_LEADER_LAST_WEBHOOK_SIGNATURE: tuple[Any, ...] | None = None
+_TELEGRAM_LEADER_LAST_WEBHOOK_SET_AT = 0.0
+_TELEGRAM_LEADER_LAST_ERROR = ""
+_TELEGRAM_LEADER_OWNER_ID_CACHE: str | None = None
+
 SUPABASE_DB_POOLER_URL = (
     os.environ.get("SUPABASE_DB_POOLER_URL")
     or os.environ.get("DATABASE_URL_POOLER")
@@ -6933,8 +6988,8 @@ async def _telegram_start_polling_runtime(app_obj: Any) -> bool:
                 ACTIVE_POLLING_TASK = asyncio.create_task(_telegram_polling_task_guard(app_obj), name="telegram-polling-guard")
             return True
         await updater.start_polling(
-            allowed_updates=["message", "callback_query"],
-            drop_pending_updates=True,
+            allowed_updates=_telegram_allowed_updates(),
+            drop_pending_updates=_env_bool("TELEGRAM_POLLING_DROP_PENDING_UPDATES", True),
         )
         _TELEGRAM_POLLING_ACTIVE = True
         ACTIVE_POLLING_TASK = asyncio.create_task(_telegram_polling_task_guard(app_obj), name="telegram-polling-guard")
@@ -6985,8 +7040,8 @@ async def _switch_telegram_runtime_mode(target_mode: str, admin_id: int = 0) -> 
         raise RuntimeError("Telegram application is not ready yet.")
 
     if target == "WEBHOOK":
-        if not TELEGRAM_WEBHOOK_URL or not _runtime_webhook_secret_token():
-            raise RuntimeError("TELEGRAM_WEBHOOK_URL and TELEGRAM_WEBHOOK_SECRET_TOKEN are required before switching to WEBHOOK.")
+        if not _runtime_webhook_base_url() or not _runtime_webhook_secret_token():
+            raise RuntimeError("TELEGRAM_WEBHOOK_URL/RENDER_EXTERNAL_URL and TELEGRAM_WEBHOOK_SECRET_TOKEN are required before switching to WEBHOOK.")
         webhook_logger.info("Runtime switch to WEBHOOK requested by admin_id=%s", admin_id)
         # Hard-stop any getUpdates worker before setWebhook to avoid Telegram 409.
         await _cancel_active_polling_task("switch_to_webhook")
@@ -7282,11 +7337,17 @@ def _refresh_arch_runtime_settings() -> None:
         max_connections=HTTP_MAX_CONNECTIONS,
         max_keepalive_connections=HTTP_MAX_KEEPALIVE_CONNECTIONS,
     )
-    BOT_MODE = (os.environ.get("BOT_MODE") or getattr(SETTINGS, "BOT_MODE", "POLLING") or "POLLING").strip().upper()
+    BOT_MODE = (os.environ.get("BOT_MODE") or getattr(SETTINGS, "BOT_MODE", _perf_default("BOT_MODE", "WEBHOOK")) or _perf_default("BOT_MODE", "WEBHOOK")).strip().upper()
     if BOT_MODE not in {"POLLING", "WEBHOOK"}:
-        webhook_logger.warning("Unsupported BOT_MODE=%r; falling back to POLLING.", BOT_MODE)
-        BOT_MODE = "POLLING"
-    TELEGRAM_WEBHOOK_URL = (os.environ.get("TELEGRAM_WEBHOOK_URL") or getattr(SETTINGS, "TELEGRAM_WEBHOOK_URL", None) or "").strip()
+        webhook_logger.warning("Unsupported BOT_MODE=%r; falling back to WEBHOOK.", BOT_MODE)
+        BOT_MODE = "WEBHOOK"
+    TELEGRAM_WEBHOOK_URL = (
+        os.environ.get("TELEGRAM_WEBHOOK_URL")
+        or getattr(SETTINGS, "TELEGRAM_WEBHOOK_URL", None)
+        or os.environ.get("RENDER_EXTERNAL_URL")
+        or getattr(SETTINGS, "RENDER_EXTERNAL_URL", "")
+        or ""
+    ).strip().rstrip("/")
     TELEGRAM_WEBHOOK_SECRET_TOKEN = (os.environ.get("TELEGRAM_WEBHOOK_SECRET_TOKEN") or getattr(SETTINGS, "TELEGRAM_WEBHOOK_SECRET_TOKEN", None) or "").strip()
     USER_RATE_LIMIT_PER_SECOND = _env_int("USER_RATE_LIMIT_PER_SECOND", 3, minimum=1, maximum=100)
     USER_RATE_LIMIT_WINDOW_S = _env_float("USER_RATE_LIMIT_WINDOW_S", 1.0, minimum=0.25, maximum=60.0)
@@ -11290,6 +11351,366 @@ def db_lock_read(lock_key: str = _SCHED_LOCK_KEY) -> dict | None:
         return rows[0] if rows else None
     except Exception:
         return None
+
+
+def db_named_lock_acquire(lock_key: str, owner: str, ttl_s: int | float) -> bool:
+    """Acquire/renew a named lock in Supabase without depending on scheduler flags."""
+    if not supabase:
+        return False
+    lock_key = str(lock_key or "lock")[:240]
+    owner = str(owner or "unknown")[:240]
+    now_iso = _sched_iso()
+    until_iso = _lock_until_iso(ttl_s)
+    update = {"owner": owner, "locked_until": until_iso, "updated_at": now_iso}
+    try:
+        res = (
+            supabase.table("bot_locks")
+            .update(update)
+            .eq("lock_key", lock_key)
+            .eq("owner", owner)
+            .execute()
+        )
+        if getattr(res, "data", None):
+            return True
+
+        res = (
+            supabase.table("bot_locks")
+            .update(update)
+            .eq("lock_key", lock_key)
+            .lt("locked_until", now_iso)
+            .execute()
+        )
+        if getattr(res, "data", None):
+            return True
+
+        try:
+            res = supabase.table("bot_locks").insert({"lock_key": lock_key, **update}).execute()
+            return bool(getattr(res, "data", None))
+        except Exception as insert_exc:
+            low = str(insert_exc).lower()
+            if "duplicate" in low or "23505" in low or "unique" in low:
+                return False
+            raise
+    except Exception as exc:
+        _log_once(
+            logging.WARNING,
+            f"named_lock_unavailable:{lock_key}:{type(exc).__name__}:{str(exc)[:120]}",
+            "Named distributed lock unavailable key=%s error=%s",
+            lock_key,
+            exc,
+        )
+        return False
+
+
+def db_named_lock_release(lock_key: str, owner: str) -> bool:
+    if not supabase:
+        return False
+    try:
+        res = (
+            supabase.table("bot_locks")
+            .delete()
+            .eq("lock_key", str(lock_key)[:240])
+            .eq("owner", str(owner)[:240])
+            .execute()
+        )
+        return bool(getattr(res, "data", None))
+    except Exception as exc:
+        _log_once(logging.WARNING, f"named_lock_release_failed:{lock_key}", "Named lock release failed key=%s: %s", lock_key, exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Telegram active-owner lease for two Render Web Services
+# ---------------------------------------------------------------------------
+def _telegram_leader_lock_enabled() -> bool:
+    return bool(globals().get("TELEGRAM_ACTIVE_LOCK_ENABLED", False))
+
+
+def _telegram_leader_require_store() -> bool:
+    return bool(globals().get("TELEGRAM_ACTIVE_LOCK_REQUIRED", False))
+
+
+def _telegram_leader_lock_key() -> str:
+    return str(globals().get("TELEGRAM_ACTIVE_LOCK_KEY", "telegram_webhook_owner") or "telegram_webhook_owner")
+
+
+def _telegram_leader_ttl_s() -> int:
+    return max(30, int(globals().get("TELEGRAM_ACTIVE_LOCK_TTL_S", 90) or 90))
+
+
+def _telegram_leader_renew_interval_s() -> float:
+    ttl = _telegram_leader_ttl_s()
+    return max(5.0, min(float(globals().get("TELEGRAM_ACTIVE_LOCK_RENEW_S", ttl / 3.0) or ttl / 3.0), ttl - 5.0))
+
+
+def _telegram_leader_owner_id() -> str:
+    global _TELEGRAM_LEADER_OWNER_ID_CACHE
+    cached = globals().get("_TELEGRAM_LEADER_OWNER_ID_CACHE")
+    if cached:
+        return str(cached)
+    service = (
+        os.environ.get("TELEGRAM_INSTANCE_ID")
+        or os.environ.get("RENDER_SERVICE_ID")
+        or os.environ.get("RENDER_SERVICE_NAME")
+        or os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+        or socket.gethostname()
+        or "render-service"
+    )
+    owner = f"{service}:{socket.gethostname()}:{os.getpid()}:{globals().get('_PROCESS_BOOT_ID', secrets.token_hex(6))}"
+    owner = re.sub(r"[^A-Za-z0-9_.:@/-]+", "_", owner)[:240]
+    _TELEGRAM_LEADER_OWNER_ID_CACHE = owner
+    return owner
+
+
+def _telegram_leader_meta() -> dict[str, Any]:
+    return {
+        "owner": _telegram_leader_owner_id(),
+        "mode": _run_state_bot_mode() if "_run_state_bot_mode" in globals() else str(globals().get("BOT_MODE", "WEBHOOK")),
+        "url": _runtime_webhook_base_url() if "_runtime_webhook_base_url" in globals() else str(globals().get("TELEGRAM_WEBHOOK_URL", "")),
+        "hostname": socket.gethostname(),
+        "pid": os.getpid(),
+        "boot_id": str(globals().get("_PROCESS_BOOT_ID", "")),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "ttl_s": _telegram_leader_ttl_s(),
+    }
+
+
+def _telegram_leader_redis_lock_key() -> str:
+    return _redis_key("locks", _telegram_leader_lock_key())
+
+
+def _telegram_leader_redis_meta_key() -> str:
+    return _redis_key("locks", _telegram_leader_lock_key(), "meta")
+
+
+def _telegram_leader_store_available() -> bool:
+    return bool(globals().get("redis_client") is not None or globals().get("supabase") is not None)
+
+
+def _telegram_leader_acquire_sync() -> bool:
+    """Acquire/renew active Telegram ownership. Redis is preferred; Supabase is fallback."""
+    global _TELEGRAM_LEADER_LAST_ERROR
+    if not _telegram_leader_lock_enabled():
+        return True
+
+    owner = _telegram_leader_owner_id()
+    ttl = _telegram_leader_ttl_s()
+
+    if redis_client is not None:
+        key = _telegram_leader_redis_lock_key()
+        meta_key = _telegram_leader_redis_meta_key()
+        try:
+            ok = redis_call_sync(
+                "telegram_leader_set_nx",
+                lambda: redis_client.set(key, owner, ex=ttl, nx=True),
+                default=False,
+                attempts=2,
+                critical=False,
+            )
+            current = None
+            if ok:
+                current = owner
+            else:
+                current = redis_call_sync(
+                    "telegram_leader_get",
+                    lambda: redis_client.get(key),
+                    default=None,
+                    attempts=2,
+                    critical=False,
+                )
+                if isinstance(current, bytes):
+                    current = current.decode("utf-8", errors="ignore")
+
+            if hmac.compare_digest(str(current or ""), owner):
+                # Renew only if the lock still belongs to this process.
+                redis_call_sync(
+                    "telegram_leader_expire",
+                    lambda: redis_client.expire(key, ttl),
+                    default=False,
+                    attempts=2,
+                    critical=False,
+                )
+                redis_call_sync(
+                    "telegram_leader_meta",
+                    lambda: redis_client.set(meta_key, _json_dumps_fast(_telegram_leader_meta()).decode("utf-8"), ex=ttl),
+                    default=False,
+                    attempts=1,
+                    critical=False,
+                )
+                _TELEGRAM_LEADER_LAST_ERROR = ""
+                return True
+            _TELEGRAM_LEADER_LAST_ERROR = f"owned_by:{str(current or '')[:120]}"
+            return False
+        except Exception as exc:
+            _TELEGRAM_LEADER_LAST_ERROR = f"redis:{type(exc).__name__}:{str(exc)[:160]}"
+            _log_once(logging.WARNING, "telegram_leader_redis_failed", "Telegram leader Redis lock failed: %s", exc)
+
+    if supabase is not None:
+        ok = db_named_lock_acquire(_telegram_leader_lock_key(), owner, ttl)
+        _TELEGRAM_LEADER_LAST_ERROR = "" if ok else "supabase:not_owner"
+        return bool(ok)
+
+    _TELEGRAM_LEADER_LAST_ERROR = "no_redis_or_supabase"
+    if _telegram_leader_require_store():
+        _log_once(
+            logging.ERROR,
+            "telegram_leader_no_store_required",
+            "Two-server Telegram mode requires REDIS_URL or Supabase bot_locks table. This instance stays standby.",
+        )
+        return False
+    _log_once(
+        logging.WARNING,
+        "telegram_leader_no_store_single",
+        "Telegram leader lock store unavailable; continuing as single active instance because TELEGRAM_ACTIVE_LOCK_REQUIRED=0.",
+    )
+    return True
+
+
+def _telegram_leader_release_sync() -> bool:
+    if not _telegram_leader_lock_enabled():
+        return True
+    owner = _telegram_leader_owner_id()
+    released = False
+    if redis_client is not None:
+        key = _telegram_leader_redis_lock_key()
+        meta_key = _telegram_leader_redis_meta_key()
+        script = """
+        if redis.call('get', KEYS[1]) == ARGV[1] then
+            redis.call('del', KEYS[1])
+            redis.call('del', KEYS[2])
+            return 1
+        end
+        return 0
+        """
+        try:
+            released = bool(redis_call_sync(
+                "telegram_leader_release",
+                lambda: redis_client.eval(script, 2, key, meta_key, owner),
+                default=False,
+                attempts=1,
+                critical=False,
+            ))
+        except Exception:
+            current = redis_call_sync("telegram_leader_release_get", lambda: redis_client.get(key), default=None, attempts=1, critical=False)
+            if isinstance(current, bytes):
+                current = current.decode("utf-8", errors="ignore")
+            if hmac.compare_digest(str(current or ""), owner):
+                redis_call_sync("telegram_leader_release_del", lambda: redis_client.delete(key, meta_key), default=None, attempts=1, critical=False)
+                released = True
+    elif supabase is not None:
+        released = db_named_lock_release(_telegram_leader_lock_key(), owner)
+    return bool(released)
+
+
+def _telegram_leader_snapshot() -> dict[str, Any]:
+    owned = bool(globals().get("_TELEGRAM_LEADER_OWNED", False))
+    snapshot = {
+        "enabled": _telegram_leader_lock_enabled(),
+        "required": _telegram_leader_require_store(),
+        "owned_by_this_instance": owned,
+        "owner": None,
+        "this_owner": _telegram_leader_owner_id(),
+        "backend": "none",
+        "error": str(globals().get("_TELEGRAM_LEADER_LAST_ERROR", "") or ""),
+        "url": _runtime_webhook_base_url() if "_runtime_webhook_base_url" in globals() else "",
+        "last_change_at": float(globals().get("_TELEGRAM_LEADER_LAST_CHANGE_AT", 0.0) or 0.0),
+        "last_renew_at": float(globals().get("_TELEGRAM_LEADER_LAST_RENEW_AT", 0.0) or 0.0),
+    }
+    if redis_client is not None:
+        snapshot["backend"] = "redis"
+        with suppress(Exception):
+            owner = redis_call_sync("telegram_leader_snapshot_get", lambda: redis_client.get(_telegram_leader_redis_lock_key()), default=None, attempts=1, critical=False)
+            if isinstance(owner, bytes):
+                owner = owner.decode("utf-8", errors="ignore")
+            snapshot["owner"] = owner
+            meta = _redis_get_json_sync(_telegram_leader_redis_meta_key(), default=None)
+            if isinstance(meta, dict):
+                snapshot["meta"] = meta
+        return snapshot
+    if supabase is not None:
+        snapshot["backend"] = "supabase"
+        row = db_lock_read(_telegram_leader_lock_key())
+        if row:
+            snapshot["owner"] = row.get("owner")
+            snapshot["meta"] = row
+        return snapshot
+    return snapshot
+
+
+def _telegram_should_process_webhook_update() -> bool:
+    if not _telegram_leader_lock_enabled():
+        return True
+    return bool(globals().get("_TELEGRAM_LEADER_OWNED", False))
+
+
+def _telegram_should_run_telegram_workers() -> bool:
+    if not _telegram_leader_lock_enabled():
+        return True
+    return bool(globals().get("_TELEGRAM_LEADER_OWNED", False))
+
+
+def _telegram_webhook_signature() -> tuple[Any, ...]:
+    return (
+        _run_state_bot_mode() if "_run_state_bot_mode" in globals() else str(globals().get("BOT_MODE", "WEBHOOK")),
+        _runtime_webhook_base_url() if "_runtime_webhook_base_url" in globals() else str(globals().get("TELEGRAM_WEBHOOK_URL", "")),
+        _runtime_webhook_secret_token() if "_runtime_webhook_secret_token" in globals() else str(globals().get("TELEGRAM_WEBHOOK_SECRET_TOKEN", "")),
+        tuple(_telegram_allowed_updates() if "_telegram_allowed_updates" in globals() else ["message", "callback_query"]),
+    )
+
+
+async def _telegram_leader_refresh_once(app_obj: Any | None = None) -> bool:
+    """Renew/acquire Telegram active ownership and configure webhook once per owner."""
+    global _TELEGRAM_LEADER_OWNED, _TELEGRAM_LEADER_LAST_CHANGE_AT, _TELEGRAM_LEADER_LAST_RENEW_AT
+    global _TELEGRAM_LEADER_LAST_WEBHOOK_SIGNATURE, _TELEGRAM_LEADER_LAST_WEBHOOK_SET_AT
+
+    if not _telegram_leader_lock_enabled():
+        if not _TELEGRAM_LEADER_OWNED:
+            _TELEGRAM_LEADER_LAST_CHANGE_AT = time.monotonic()
+        _TELEGRAM_LEADER_OWNED = True
+        _TELEGRAM_LEADER_LAST_RENEW_AT = time.monotonic()
+        return True
+
+    loop = asyncio.get_running_loop()
+    acquired = await loop.run_in_executor(None, _telegram_leader_acquire_sync)
+    now = time.monotonic()
+    if not acquired:
+        if _TELEGRAM_LEADER_OWNED:
+            webhook_logger.warning("This Render instance lost Telegram active ownership; switching to standby.")
+            if app_obj is not None:
+                with suppress(Exception):
+                    await _telegram_stop_polling_runtime(app_obj)
+        _TELEGRAM_LEADER_OWNED = False
+        _TELEGRAM_LEADER_LAST_CHANGE_AT = now
+        _TELEGRAM_LEADER_LAST_WEBHOOK_SIGNATURE = None
+        return False
+
+    if not _TELEGRAM_LEADER_OWNED:
+        webhook_logger.warning(
+            "This Render instance is now Telegram ACTIVE owner key=%s owner=%s url=%s",
+            _telegram_leader_lock_key(),
+            _telegram_leader_owner_id(),
+            _runtime_webhook_base_url(),
+        )
+        _TELEGRAM_LEADER_LAST_CHANGE_AT = now
+    _TELEGRAM_LEADER_OWNED = True
+    _TELEGRAM_LEADER_LAST_RENEW_AT = now
+
+    if _run_state_bot_mode() == "WEBHOOK":
+        sig = _telegram_webhook_signature()
+        reconfigure_after = max(60, int(globals().get("TELEGRAM_WEBHOOK_RECONFIGURE_INTERVAL_S", 600) or 600))
+        needs_reconfigure = (
+            _TELEGRAM_LEADER_LAST_WEBHOOK_SIGNATURE != sig
+            or (now - float(_TELEGRAM_LEADER_LAST_WEBHOOK_SET_AT or 0.0)) >= reconfigure_after
+        )
+        if needs_reconfigure:
+            if app_obj is not None:
+                with suppress(Exception):
+                    await _telegram_stop_polling_runtime(app_obj)
+            await _configure_telegram_webhook_via_http()
+            _TELEGRAM_LEADER_LAST_WEBHOOK_SIGNATURE = sig
+            _TELEGRAM_LEADER_LAST_WEBHOOK_SET_AT = now
+            webhook_logger.info("Telegram webhook confirmed by active owner.")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -18371,31 +18792,62 @@ async def _run_bot():
         # on python-telegram-bot v20/v21 and break deploy restarts.
         await app.start()
         polling_started = False
-        if _run_state_bot_mode() == "WEBHOOK":
+        leader_refresh_due = 0.0
+        active_owner = await _telegram_leader_refresh_once(app)
+        leader_refresh_due = time.monotonic() + _telegram_leader_renew_interval_s()
+
+        if not active_owner:
+            webhook_logger.warning(
+                "Telegram application is running in STANDBY mode. Web/Admin routes are online, but this Render service will not process Telegram updates until it owns the active lock."
+            )
+        elif _run_state_bot_mode() == "WEBHOOK":
             await _cancel_active_polling_task("startup_webhook_mode")
-            await _configure_telegram_webhook_via_http()
-            webhook_logger.info("Telegram polling updater is disabled because BOT_MODE=WEBHOOK.")
+            webhook_logger.info("Telegram polling updater is disabled because BOT_MODE=WEBHOOK and this instance owns the active lock.")
         else:
             # Startup may follow a previous webhook deployment; delete it before
-            # long polling to prevent Telegram 409 Conflict.
+            # long polling to prevent Telegram 409 Conflict. Only the active
+            # owner may do this in two-server mode.
             with suppress(Exception):
                 await _delete_telegram_webhook_via_http(drop_pending=True)
             polling_started = await _telegram_start_polling_runtime(app)
-            logger.info("Telegram polling started.")
+            logger.info("Telegram polling started by active owner.")
 
         # Start background jobs only after the Telegram application is fully ready.
+        # Scheduler itself has its own distributed lock, so both Render services
+        # may run this loop safely; only one will fire due scheduled broadcasts.
         sched_task = asyncio.create_task(_scheduler_loop(app.bot, sched_stop))
         sweep_task = asyncio.create_task(_periodic_temp_sweep(sweep_stop))
         try:
             while True:
+                now = time.monotonic()
+                if now >= leader_refresh_due:
+                    active_owner = await _telegram_leader_refresh_once(app)
+                    leader_refresh_due = now + _telegram_leader_renew_interval_s()
+                else:
+                    active_owner = _telegram_should_run_telegram_workers()
+
+                if not active_owner:
+                    if polling_started:
+                        webhook_logger.info("Stopping Telegram polling because this Render service is standby.")
+                        await _telegram_stop_polling_runtime(app)
+                        polling_started = False
+                    await asyncio.sleep(1.0)
+                    continue
+
                 # Early polling-loop exit guard requested for runtime mode switches.
                 # In webhook mode the Telegram application stays alive so the
                 # FastAPI /telegram-webhook route can continue processing updates;
                 # only the updater polling worker is stopped.
-                if polling_started and _run_state_bot_mode() != "POLLING":
-                    webhook_logger.info("_run_bot observed BOT_MODE=%s while polling_started; stopping polling worker.", _run_state_bot_mode())
+                mode = _run_state_bot_mode()
+                if polling_started and mode != "POLLING":
+                    webhook_logger.info("_run_bot observed BOT_MODE=%s while polling_started; stopping polling worker.", mode)
                     await _telegram_stop_polling_runtime(app)
                     polling_started = False
+                elif not polling_started and mode == "POLLING":
+                    with suppress(Exception):
+                        await _delete_telegram_webhook_via_http(drop_pending=True)
+                    polling_started = await _telegram_start_polling_runtime(app)
+
                 await asyncio.sleep(1.0)
         finally:
             sched_stop.set()
@@ -18403,6 +18855,8 @@ async def _run_bot():
             if polling_started and app.updater is not None:
                 with suppress(Exception):
                     await _telegram_stop_polling_runtime(app)
+            with suppress(Exception):
+                await asyncio.to_thread(_telegram_leader_release_sync)
             for task in (sched_task, sweep_task):
                 if task is None:
                     continue
@@ -18446,7 +18900,7 @@ async def _async_main_once():
         f"OCR: {OCR_PROVIDER} | HF OCR: {HF_OCR_MODEL} | "
         f"TTS: {TTS_PROVIDER}/{KHMER_TTS_PROVIDER} | user_model_default: {_normalize_tts_model(DEFAULT_TTS_MODEL)} | "
         f"Redis: {'on' if redis_client is not None else 'off'} | "
-        f"TG mode: {_run_state_bot_mode()} | TG updates: {TELEGRAM_CONCURRENT_UPDATES} | TG pool: {_run_state_http_max_connections()} | "
+        f"TG mode: {_run_state_bot_mode()} | TG leader-lock: {'on' if TELEGRAM_ACTIVE_LOCK_ENABLED else 'off'} | TG updates: {TELEGRAM_CONCURRENT_UPDATES} | TG pool: {_run_state_http_max_connections()} | "
         f"HTTP pool: {HTTP_MAX_CONNECTIONS}/{HTTP_MAX_KEEPALIVE_CONNECTIONS})"
     )
 
