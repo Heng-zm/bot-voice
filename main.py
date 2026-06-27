@@ -660,7 +660,7 @@ class FastAPICompatApp:
             or os.environ.get("WEB_SECRET_KEY", "")
             or secrets.token_hex(32)
         )
-        api_docs_enabled = _env_bool("API_DOCS_ENABLED", True)
+        api_docs_enabled = _env_bool("API_DOCS_ENABLED", False)
         self.fastapi = FastAPI(
             title="Telegram Bot Admin",
             docs_url="/docs" if api_docs_enabled else None,
@@ -1006,7 +1006,7 @@ def readyz():
 @app.get("/api-docs", include_in_schema=False)
 async def api_docs_redirect():
     """Convenience alias for Swagger UI."""
-    if not _env_bool("API_DOCS_ENABLED", True):
+    if not _env_bool("API_DOCS_ENABLED", False):
         return _FastJSONResponse({
             "ok": False,
             "error": "API docs are disabled. Set API_DOCS_ENABLED=true and restart.",
@@ -1173,9 +1173,12 @@ async def _process_telegram_webhook_request(req: FastAPIRequest, path_secret_tok
         raise HTTPException(status_code=403, detail="Invalid webhook secret.")
 
     app_obj = globals().get("telegram_application") or globals().get("_TELEGRAM_APP")
-    if app_obj is None:
-        webhook_logger.warning("Telegram webhook update acknowledged before application was ready.")
-        return _FastJSONResponse({"status": "ok", "warning": "telegram_application_not_ready"}, status_code=200)
+    if app_obj is None or not bool(globals().get("_TELEGRAM_APP_READY", False)):
+        # Do NOT acknowledge startup-time updates. Returning 503 tells Telegram
+        # to retry instead of losing user messages while the Render service,
+        # Supabase, Redis, or python-telegram-bot application is still starting.
+        webhook_logger.warning("Telegram webhook rejected with 503 because application is not ready yet.")
+        raise HTTPException(status_code=503, detail="Telegram application is starting. Please retry.")
 
     if not _telegram_should_process_webhook_update():
         webhook_logger.info("Webhook update acknowledged by standby instance; active owner=%s", _telegram_leader_snapshot().get("owner"))
@@ -2382,7 +2385,10 @@ _WEB_LIVE_SCHEDULES_LOCK = threading.Lock()
 
 
 def _web_admin_enabled() -> bool:
-    return os.environ.get("WEB_ADMIN_ENABLED", "1") != "0"
+    # Keep the dashboard available by default, but never public.  Without
+    # ADMIN_WEB_PASSWORD / WEB_ADMIN_PASSWORD, protected admin routes show a
+    # locked page instead of auto-opening an admin session.
+    return _env_bool("WEB_ADMIN_ENABLED", True)
 
 
 def _web_admin_password() -> str:
@@ -2599,6 +2605,7 @@ def _web_admin_feature_groups() -> list[tuple[str, list[tuple[str, str, str, str
         ]),
         ("Understand", [
             ("Analytics", "/admin/analytics", "📈", "Usage trends, recent activity, and delivery performance.", "analytics"),
+            ("Report", "/admin/report", "📄", "Generate and download an admin PDF system report.", "report"),
             ("Users", "/admin/users", "👥", "Search users, inspect profile details, and manage access.", "users"),
             ("CRM", "/admin/crm", "⭐", "Labels, notes, trust status, and CSV export for user care.", "crm"),
             ("Health", "/admin/health", "🩺", "Deployment checks, runtime metrics, cache and database status.", "health"),
@@ -2679,6 +2686,7 @@ def _web_render(title: str, body: str, *, active: str = "dashboard", status_code
         ("dashboard", "Admin Center", "/admin", "⌘"),
         ("optimize", "Optimize", "/admin/optimize", "⚡"),
         ("analytics", "Analytics", "/admin/analytics", "📈"),
+        ("report", "Report", "/admin/report", "📄"),
         ("users", "Users", "/admin/users", "👥"),
         ("crm", "CRM", "/admin/crm", "⭐"),
         ("schedules", "Schedules", "/admin/schedules", "⏱"),
@@ -2904,61 +2912,104 @@ window.WEB_CSRF={{ csrf|tojson }};
     ), status_code
 
 
-def _web_admin_auto_open_session() -> None:
-    """Open the admin dashboard without the old /admin/login flow.
+def _web_admin_session_valid() -> bool:
+    if not bool(session.get("web_admin_ok")):
+        return False
+    admin_id = _web_int(session.get("web_admin_id"), 0)
+    if not _web_valid_admin_id(admin_id):
+        session.clear()
+        return False
+    return True
 
-    Change:
-    - No password page and no manual Telegram Admin ID input are required.
-    - The dashboard uses the first configured ADMIN_IDS value when available.
-    - A signed session is still populated so existing helpers, CSRF protection,
-      audit labels, and templates keep the same behavior.
 
-    Security note:
-    - This intentionally makes the web admin accessible when WEB_ADMIN_ENABLED=1.
-      Keep the Render URL private, or add network/proxy protection if deployed
-      publicly.
-    """
-    if session.get("web_admin_ok"):
-        if not _web_int(session.get("web_admin_id"), 0):
-            session["web_admin_id"] = _web_current_admin_id()
-        _web_csrf_token()
-        return
+def _web_locked_admin_html(message: str) -> str:
+    return (
+        "<div class='card'>"
+        "<h2>🔒 Admin dashboard locked</h2>"
+        f"<p>{_web_h(message)}</p>"
+        "<p class='muted'>Set <code>ADMIN_WEB_PASSWORD</code> or "
+        "<code>WEB_ADMIN_PASSWORD</code> in your deployment environment, then restart.</p>"
+        "</div>"
+    )
 
-    session["web_admin_ok"] = True
-    session["web_admin_id"] = _web_current_admin_id()
-    session["web_login_at"] = datetime.now(timezone.utc).isoformat()
-    _web_csrf_token()
+
+def _web_login_page(error: str = ""):
+    if not session.get("web_login_csrf"):
+        session["web_login_csrf"] = secrets.token_urlsafe(32)
+    next_url = _web_safe_next_url(request.args.get("next") or request.form.get("next"), "web_admin_home")
+    admin_hint = str(sorted(ADMIN_IDS)[0]) if ADMIN_IDS else ""
+    error_html = f"<div class='flash danger'>{_web_h(error)}</div>" if error else ""
+    template = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin Login</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f172a;color:#e5e7eb;font-family:system-ui,-apple-system,Segoe UI,sans-serif}.card{width:min(440px,calc(100vw - 32px));background:#111827;border:1px solid #334155;border-radius:22px;padding:28px;box-shadow:0 24px 80px rgba(0,0,0,.35)}h1{margin:.2rem 0 1rem;font-size:1.6rem}.muted{color:#94a3b8;font-size:.94rem}label{display:block;margin-top:14px;color:#cbd5e1;font-weight:700}input{box-sizing:border-box;width:100%;margin-top:7px;border-radius:14px;border:1px solid #475569;background:#020617;color:#fff;padding:13px 14px;font-size:16px}button{width:100%;margin-top:20px;border:0;border-radius:14px;padding:13px 14px;background:#38bdf8;color:#082f49;font-weight:800;font-size:16px;cursor:pointer}.flash{margin:12px 0;padding:10px 12px;border-radius:12px}.danger{background:#7f1d1d;color:#fecaca}</style>
+</head><body><form class="card" method="post"><h1>🔐 Admin Login</h1><p class="muted">Protected dashboard. Enter your web admin password.</p>{{ error|safe }}<input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="next" value="{{ next_url }}"><label>Telegram Admin ID</label><input name="admin_id" value="{{ admin_hint }}" inputmode="numeric" autocomplete="username"><label>Password</label><input name="password" type="password" autocomplete="current-password" required autofocus><button>Login</button><p class="muted">Tip: set ADMIN_WEB_PASSWORD in Render/Railway environment.</p></form></body></html>"""
+    return HTMLResponse(render_template_string(
+        template,
+        csrf=session.get("web_login_csrf"),
+        next_url=next_url,
+        admin_hint=admin_hint,
+        error=error_html,
+    ), status_code=401 if error else 200)
 
 
 def web_admin_required(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        # Keep the global enable/disable kill switch, but remove the old
-        # ADMIN_WEB_PASSWORD / WEB_ADMIN_PASSWORD requirement and login redirect.
         if not _web_admin_enabled():
             return _web_render("Disabled", "<div class='card'>WEB_ADMIN_ENABLED=0</div>", status_code=403)
-        _web_admin_auto_open_session()
+        if not _web_admin_password():
+            return _web_render(
+                "Admin Locked",
+                _web_locked_admin_html("No web admin password is configured."),
+                status_code=403,
+            )
+        if not _web_admin_session_valid():
+            return redirect(_web_url("web_admin_login", next=request.full_path))
+        _web_csrf_token()
         return fn(*args, **kwargs)
     return wrapper
 
 
 @app_flask.route("/admin/login", methods=["GET", "POST"])
 def web_admin_login():
-    """Backward-compatible route after removing login.
-
-    Old bookmarks or redirects to /admin/login now go straight to /admin.
-    """
     if not _web_admin_enabled():
         return _web_render("Disabled", "<div class='card'>WEB_ADMIN_ENABLED=0</div>", status_code=403)
-    _web_admin_auto_open_session()
-    return redirect(url_for("web_admin_home"))
+    expected_password = _web_admin_password()
+    if not expected_password:
+        return _web_render(
+            "Admin Locked",
+            _web_locked_admin_html("No web admin password is configured."),
+            status_code=403,
+        )
+
+    if request.method == "POST":
+        expected_csrf = str(session.get("web_login_csrf") or "")
+        got_csrf = str(request.form.get("csrf_token") or "")
+        if not expected_csrf or not hmac.compare_digest(expected_csrf, got_csrf):
+            return _web_login_page("Session expired. Please try again.")
+
+        got_password = str(request.form.get("password") or "")
+        admin_id = _web_int(request.form.get("admin_id"), _web_current_admin_id())
+        if not hmac.compare_digest(got_password, expected_password):
+            return _web_login_page("Invalid password.")
+        if not _web_valid_admin_id(admin_id):
+            return _web_login_page("This Telegram Admin ID is not in ADMIN_IDS.")
+
+        session.clear()
+        session["web_admin_ok"] = True
+        session["web_admin_id"] = int(admin_id or _web_current_admin_id())
+        session["web_login_at"] = datetime.now(timezone.utc).isoformat()
+        _web_csrf_token()
+        return redirect(_web_safe_next_url(request.form.get("next"), "web_admin_home"))
+
+    return _web_login_page()
 
 
 @app_flask.route("/admin/logout")
 def web_admin_logout():
-    """Logout is no-op now because the dashboard has no login screen."""
     session.clear()
-    return redirect(url_for("web_admin_home"))
+    return redirect(url_for("web_admin_login"))
 
 def _web_table_count(table: str, select_field: str = "id") -> int | None:
     if not supabase:
@@ -3432,6 +3483,42 @@ def _web_user_detail_metrics(row: dict) -> dict:
         "last_seen": last_dt,
         "last_text": last_text,
     }
+
+@app_flask.route("/admin/report")
+@web_admin_required
+def web_admin_report():
+    body = f"""
+    <div class='card'>
+      <h2>📄 Admin PDF Report</h2>
+      <p class='muted'>Generate a PDF with system status, counts, runtime settings, feature toggles, and recent errors.</p>
+      <div class='actions'>
+        <a class='btn ok' href='/admin/report.pdf'>Download PDF Report</a>
+        <a class='btn secondary' href='/admin'>Back to Dashboard</a>
+      </div>
+    </div>
+    """
+    return _web_render("Admin Report", body, active="report")
+
+
+@app_flask.route("/admin/report.pdf")
+@web_admin_required
+def web_admin_report_pdf():
+    path = ""
+    try:
+        path = build_admin_report_pdf_sync(_web_current_admin_id())
+        with open(path, "rb") as f:
+            data = f.read()
+        filename = os.path.basename(path)
+        return Response(
+            data,
+            mimetype="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+    finally:
+        if path:
+            with suppress(Exception):
+                os.remove(path)
+
 
 @app_flask.route("/admin")
 @web_admin_required
@@ -8312,6 +8399,7 @@ redis_client = None
 _gemini    = None
 _hf_client = None
 _TELEGRAM_APP: Any = None
+_TELEGRAM_APP_READY = False
 # Public alias used by the FastAPI webhook dispatcher. Keep both names for
 # compatibility with older helper code and current Telegram ingestion logic.
 telegram_application: Any = None
@@ -10198,7 +10286,7 @@ def startup_self_check() -> None:
     if not ADMIN_IDS:
         checks.append("ADMIN_IDS is empty; admin-only commands will reject everyone")
     if not _web_admin_password() and _web_admin_enabled():
-        checks.append("ADMIN_WEB_PASSWORD / WEB_ADMIN_PASSWORD is missing; /admin web dashboard will stay locked")
+        checks.append("ADMIN_WEB_PASSWORD / WEB_ADMIN_PASSWORD is missing; /admin web dashboard is locked")
     if not os.environ.get("FLASK_SECRET_KEY") and not os.environ.get("WEB_SECRET_KEY"):
         checks.append("FLASK_SECRET_KEY is not set; web admin sessions reset on every deploy/restart")
     if supabase and not os.environ.get("SUPABASE_SERVICE_ROLE_KEY"):
@@ -12303,7 +12391,8 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🚨 Error Center", callback_data="admin_errors"),
          InlineKeyboardButton("🛠️ Runtime",    callback_data="admin_runtime")],
         [InlineKeyboardButton("🔑 API Keys",    callback_data="admin_api"),
-         InlineKeyboardButton("🔄 Refresh",     callback_data="admin_home")],
+         InlineKeyboardButton("📄 Report PDF",  callback_data="admin_report")],
+        [InlineKeyboardButton("🔄 Refresh",     callback_data="admin_home")],
         [InlineKeyboardButton("❌ Close",       callback_data="admin_close")],
     ])
 
@@ -14797,6 +14886,206 @@ def _ok_bad(ok: bool, ok_text: str = "OK", bad_text: str = "OFF") -> str:
     return f"✅ {ok_text}" if ok else f"⚠️ {bad_text}"
 
 
+def _strip_html_tags(value: Any) -> str:
+    text = re.sub(r"<[^>]+>", "", str(value or ""))
+    return html.unescape(text)
+
+
+def _pdf_safe_line(value: Any, limit: int = 110) -> str:
+    text = re.sub(r"\s+", " ", _strip_html_tags(value)).strip()
+    text = text.encode("latin-1", "replace").decode("latin-1")
+    return text[:limit]
+
+
+def _minimal_pdf_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def _write_minimal_pdf(path: str, lines: list[str]) -> None:
+    """Dependency-free fallback PDF writer used when reportlab is unavailable."""
+    y = 800
+    content_parts = ["BT", "/F1 11 Tf", "50 820 Td"]
+    first = True
+    for raw in lines:
+        line = _pdf_safe_line(raw, 100)
+        if not first:
+            content_parts.append("0 -15 Td")
+        first = False
+        content_parts.append(f"({_minimal_pdf_escape(line)}) Tj")
+        y -= 15
+        if y < 60:
+            break
+    content_parts.append("ET")
+    stream = "\n".join(content_parts).encode("latin-1", "replace")
+    objects = [
+        b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
+        b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n",
+        b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n",
+        b"4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n",
+        b"5 0 obj << /Length " + str(len(stream)).encode() + b" >> stream\n" + stream + b"\nendstream endobj\n",
+    ]
+    with open(path, "wb") as f:
+        f.write(b"%PDF-1.4\n")
+        offsets = [0]
+        for obj in objects:
+            offsets.append(f.tell())
+            f.write(obj)
+        xref_at = f.tell()
+        f.write(f"xref\n0 {len(objects)+1}\n".encode())
+        f.write(b"0000000000 65535 f \n")
+        for off in offsets[1:]:
+            f.write(f"{off:010d} 00000 n \n".encode())
+        f.write(f"trailer << /Root 1 0 R /Size {len(objects)+1} >>\nstartxref\n{xref_at}\n%%EOF\n".encode())
+
+
+def _collect_admin_report_data_sync(admin_id: int) -> dict[str, Any]:
+    counts = {
+        "users": 0,
+        "blocked": 0,
+        "schedules": 0,
+        "pending": 0,
+        "sending": 0,
+        "failed": 0,
+        "api_keys": 0,
+    }
+    with suppress(Exception):
+        counts.update(_web_counts(force=True))
+
+    settings: dict[str, str] = {}
+    settings_status: dict[str, Any] = {"db_ok": False}
+    with suppress(Exception):
+        settings, settings_status = db_bot_settings_fetch_all()
+
+    temp_dir = ""
+    temp_ok = False
+    temp_count = 0
+    with suppress(Exception):
+        temp_dir = _get_temp_dir()
+        temp_ok = os.path.isdir(temp_dir) and os.access(temp_dir, os.W_OK)
+        temp_count = sum(1 for entry in os.scandir(temp_dir) if entry.name.startswith(_TMP_PREFIX))
+
+    ffmpeg_ok = bool(_FFMPEG_EXE and os.path.exists(_FFMPEG_EXE))
+    leader = _telegram_leader_snapshot() if "_telegram_leader_snapshot" in globals() else {}
+    run_state = globals().get("RUN_STATE") if isinstance(globals().get("RUN_STATE"), dict) else {}
+    recent_errors = _admin_error_center_snapshot(8) if "_admin_error_center_snapshot" in globals() else []
+
+    return {
+        "admin_id": int(admin_id or 0),
+        "generated_at": _fmt_local_dt(),
+        "uptime": _format_uptime() if "_format_uptime" in globals() else "unknown",
+        "counts": counts,
+        "settings": settings,
+        "settings_db_ok": bool(settings_status.get("db_ok")),
+        "supabase_on": bool(supabase),
+        "redis_on": bool(redis_client),
+        "ffmpeg_ok": ffmpeg_ok,
+        "temp_dir": temp_dir,
+        "temp_ok": temp_ok,
+        "temp_count": temp_count,
+        "bot_mode": _run_state_bot_mode() if "_run_state_bot_mode" in globals() else globals().get("BOT_MODE", "unknown"),
+        "webhook_ready": bool(globals().get("_TELEGRAM_APP_READY", False)),
+        "leader": leader,
+        "run_state": dict(run_state or {}),
+        "metrics": dict(_RUNTIME_METRICS),
+        "recent_errors": recent_errors,
+    }
+
+
+def _admin_report_lines(data: dict[str, Any]) -> list[str]:
+    counts = data.get("counts") or {}
+    metrics = data.get("metrics") or {}
+    leader = data.get("leader") or {}
+    settings = data.get("settings") or {}
+    run_state = data.get("run_state") or {}
+    lines = [
+        "Telegram Bot Admin PDF Report",
+        f"Generated: {data.get('generated_at')}",
+        f"Admin ID: {data.get('admin_id')}",
+        "",
+        "System Status",
+        f"Supabase: {'ON' if data.get('supabase_on') else 'OFF'}",
+        f"Redis: {'ON' if data.get('redis_on') else 'OFF'}",
+        f"FFmpeg: {'OK' if data.get('ffmpeg_ok') else 'ERROR'}",
+        f"Temp: {'OK' if data.get('temp_ok') else 'ERROR'} ({data.get('temp_count')} files) {data.get('temp_dir')}",
+        f"Bot mode: {data.get('bot_mode')}",
+        f"Webhook ready: {'YES' if data.get('webhook_ready') else 'NO'}",
+        f"Uptime: {data.get('uptime')}",
+        f"Telegram leader owner: {leader.get('owner') or 'unknown'}",
+        "",
+        "Counts",
+        f"Users: {counts.get('users', 0)}",
+        f"Blocked users: {counts.get('blocked', 0)}",
+        f"Schedules: {counts.get('schedules', 0)} | Pending: {counts.get('pending', 0)} | Sending: {counts.get('sending', 0)} | Failed: {counts.get('failed', 0)}",
+        f"Active API keys: {counts.get('api_keys', 0)}",
+        "",
+        "Runtime Metrics Since Restart",
+    ]
+    for key in sorted(metrics):
+        lines.append(f"{key}: {metrics.get(key)}")
+    lines.extend(["", "Feature Settings"])
+    for key in BOT_FEATURE_SETTING_KEYS:
+        lines.append(f"{key}: {settings.get(key, BOT_SETTING_DEFAULTS.get(key, ''))}")
+    lines.extend(["", "Performance Runtime Settings"])
+    for key in BOT_PERFORMANCE_SETTING_SPECS:
+        value = run_state.get(key, BOT_SETTING_DEFAULTS.get(key, _perf_default(key, "")))
+        lines.append(f"{key}: {value}")
+    lines.extend(["", "Recent Errors"])
+    errors = data.get("recent_errors") or []
+    if not errors:
+        lines.append("No recent errors captured.")
+    for item in errors[:8]:
+        lines.append(f"{item.get('ts', '')} {item.get('level', '')} {item.get('source', '')}: {item.get('message', '')}")
+    return lines
+
+
+def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
+    lines = _admin_report_lines(data)
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen import canvas
+        c = canvas.Canvas(path, pagesize=A4)
+        width, height = A4
+        x = 42
+        y = height - 48
+        c.setTitle("Telegram Bot Admin Report")
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(x, y, _pdf_safe_line(lines[0], 80))
+        y -= 28
+        c.setFont("Helvetica", 10)
+        for line in lines[1:]:
+            if y < 48:
+                c.showPage()
+                c.setFont("Helvetica", 10)
+                y = height - 48
+            safe = _pdf_safe_line(line, 115)
+            if not safe:
+                y -= 9
+                continue
+            if safe in {"System Status", "Counts", "Runtime Metrics Since Restart", "Feature Settings", "Performance Runtime Settings", "Recent Errors"}:
+                c.setFont("Helvetica-Bold", 12)
+                c.drawString(x, y, safe)
+                c.setFont("Helvetica", 10)
+            else:
+                c.drawString(x, y, safe)
+            y -= 14
+        c.save()
+    except Exception as exc:
+        logger.warning("reportlab PDF generation failed; using minimal PDF fallback: %s", exc)
+        _write_minimal_pdf(path, lines)
+
+
+def build_admin_report_pdf_sync(admin_id: int) -> str:
+    data = _collect_admin_report_data_sync(admin_id)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(tempfile.gettempdir(), f"bot-admin-report-{int(admin_id or 0)}-{stamp}.pdf")
+    _write_admin_report_pdf_sync(path, data)
+    return path
+
+
+async def build_admin_report_pdf(admin_id: int) -> str:
+    return await asyncio.to_thread(build_admin_report_pdf_sync, int(admin_id or 0))
+
+
 async def _admin_home_text(admin_id: int, title: str = "🛠️ Admin System Center V7") -> str:
     counts = await _admin_summary_counts(admin_id)
     settings, settings_status = await get_bot_settings_async()
@@ -15854,6 +16143,27 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
             parse_mode="HTML",
             reply_markup=get_admin_dashboard_kb(),
         ))
+        return
+
+    if data == "admin_report":
+        # on_callback already answered this callback once; do not answer again.
+        path = ""
+        try:
+            path = await build_admin_report_pdf(user_id)
+            with open(path, "rb") as report_file:
+                await context.bot.send_document(
+                    chat_id=user_id,
+                    document=report_file,
+                    filename=os.path.basename(path),
+                    caption="📄 Admin PDF report generated.",
+                )
+        except Exception as exc:
+            logger.error("admin_report_pdf failed: %s", exc, exc_info=True)
+            await safe_send(lambda: query.message.reply_text(f"⚠️ Report generation failed: {html.escape(str(exc)[:300])}"))
+        finally:
+            if path:
+                with suppress(Exception):
+                    os.remove(path)
         return
 
     if data == "admin_runtime":
@@ -18668,7 +18978,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 async def _run_bot():
     global _BOT_START_TIME, _AI_SEMAPHORE, _BROADCAST_SEMAPHORE
-    global _prefs_cache_lock, _TTS_CHUNK_SEMAPHORE, _TELEGRAM_APP, telegram_application
+    global _prefs_cache_lock, _TTS_CHUNK_SEMAPHORE, _TELEGRAM_APP, _TELEGRAM_APP_READY, telegram_application
 
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
@@ -18721,6 +19031,7 @@ async def _run_bot():
     if hasattr(builder, "connection_pool_size"):
         builder = builder.connection_pool_size(int(TELEGRAM_CONNECTION_POOL_SIZE))
     app = builder.build()
+    _TELEGRAM_APP_READY = False
     _TELEGRAM_APP = app
     telegram_application = app
 
@@ -18791,6 +19102,7 @@ async def _run_bot():
         # initialize() again can raise "Application is already initialized"
         # on python-telegram-bot v20/v21 and break deploy restarts.
         await app.start()
+        _TELEGRAM_APP_READY = True
         polling_started = False
         leader_refresh_due = 0.0
         active_owner = await _telegram_leader_refresh_once(app)
@@ -18863,10 +19175,38 @@ async def _run_bot():
                 task.cancel()
                 with suppress(asyncio.CancelledError, Exception):
                     await task
+            _TELEGRAM_APP_READY = False
             # start() is not automatically paired by the async context manager;
             # stop it explicitly before __aexit__ performs shutdown().
             with suppress(Exception):
                 await app.stop()
+
+
+# ---------------------------------------------------------------------------
+# Startup background maintenance
+# ---------------------------------------------------------------------------
+async def _run_startup_background_checks() -> None:
+    """Run slow/non-critical startup checks after web + bot tasks are launched.
+
+    Keeping these checks in the background makes Render/Railway boot faster and
+    lets /readyz respond while Supabase column probes and temp cleanup continue.
+    """
+    async def _run_one(label: str, fn: Callable[[], Any], timeout_s: float = 20.0) -> None:
+        try:
+            await asyncio.wait_for(asyncio.to_thread(fn), timeout=timeout_s)
+            logger.info("Startup background check finished: %s", label)
+        except asyncio.TimeoutError:
+            logger.warning("Startup background check timed out: %s", label)
+        except Exception as exc:
+            logger.warning("Startup background check failed: %s: %s", label, exc)
+
+    await asyncio.gather(
+        _run_one("sweep stale temp files", _sweep_stale_temps, 30.0),
+        _run_one("ensure user_prefs.speed column", ensure_speed_column, 25.0),
+        _run_one("ensure user_prefs.tts_model column", ensure_tts_model_column, 25.0),
+        _run_one("startup self check", startup_self_check, 10.0),
+        return_exceptions=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -18883,11 +19223,6 @@ async def _async_main_once():
     except Exception as rexc:
         webhook_logger.warning("Redis fallback triggered. Runtime state restore failed during boot: %s", rexc)
     _runtime_admin_bootstrap_state()
-
-    _sweep_stale_temps()
-    ensure_speed_column()
-    ensure_tts_model_column()
-    startup_self_check()
 
     if not ADMIN_IDS:
         logger.warning(
@@ -18907,9 +19242,11 @@ async def _async_main_once():
     _start_web_broadcast_queue_workers()
     keepalive_stop = asyncio.Event()
     telegram_app_task = asyncio.create_task(_run_bot(), name="telegram-bot")
+    startup_checks_task = asyncio.create_task(_run_startup_background_checks(), name="startup-background-checks")
     tasks = [
         asyncio.create_task(run_fastapi(), name="fastapi-web"),
         telegram_app_task,
+        startup_checks_task,
     ]
     if (os.environ.get("RENDER_EXTERNAL_URL") or getattr(SETTINGS, "RENDER_EXTERNAL_URL", "") or "").strip():
         tasks.append(asyncio.create_task(keep_alive_async(keepalive_stop), name="async-keep-alive"))
