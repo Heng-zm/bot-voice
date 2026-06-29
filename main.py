@@ -302,6 +302,13 @@ def _perf_default(name: str, fallback: Any = None) -> Any:
     return PERFORMANCE_CODE_DEFAULTS.get(name, fallback)
 
 
+# ── Admin cookie defaults ──────────────────────────────────────────────────
+# Default cookie mode for separated frontend/backend deployments.
+# SameSite=None requires Secure=True in modern browsers.
+DEFAULT_WEB_COOKIE_SAMESITE = "none"
+DEFAULT_WEB_COOKIE_SECURE = True
+
+
 # ── FastAPI Web Server + typed settings ─────────────────────────────────────
 class AppSettings(BaseSettings):
     """Centralised environment configuration.
@@ -321,8 +328,8 @@ class AppSettings(BaseSettings):
     FLASK_SECRET_KEY: str = ""
     WEB_SECRET_KEY: str = ""
     WEB_SESSION_COOKIE_NAME: str = "bot_admin_session"
-    WEB_COOKIE_SAMESITE: str = "none"
-    WEB_COOKIE_SECURE: bool = True
+    WEB_COOKIE_SAMESITE: str = DEFAULT_WEB_COOKIE_SAMESITE
+    WEB_COOKIE_SECURE: bool = DEFAULT_WEB_COOKIE_SECURE
     WEB_ADMIN_SESSION_DAYS: int = 14
     WEB_MAX_CONTENT_LENGTH: int = 64 * 1024 * 1024
     # Backend/API-only mode: HTML admin dashboard pages are disabled by default.
@@ -452,22 +459,22 @@ def _default_cookie_secure() -> bool:
     """
     explicit = os.environ.get("WEB_COOKIE_SECURE")
     if explicit is not None:
-        return _env_bool("WEB_COOKIE_SECURE", True)
-    same_site = str(os.environ.get("WEB_COOKIE_SAMESITE") or getattr(SETTINGS, "WEB_COOKIE_SAMESITE", "none") or "none").strip().lower()
+        return _env_bool("WEB_COOKIE_SECURE", DEFAULT_WEB_COOKIE_SECURE)
+    same_site = str(os.environ.get("WEB_COOKIE_SAMESITE") or getattr(SETTINGS, "WEB_COOKIE_SAMESITE", DEFAULT_WEB_COOKIE_SAMESITE) or DEFAULT_WEB_COOKIE_SAMESITE).strip().lower()
     if same_site == "none":
         return True
     if _env_bool("WEB_TRUST_PROXY", _env_bool("RENDER", False)):
         return True
-    return bool(getattr(SETTINGS, "WEB_COOKIE_SECURE", True))
+    return bool(getattr(SETTINGS, "WEB_COOKIE_SECURE", DEFAULT_WEB_COOKIE_SECURE))
 
 
 def _cookie_samesite() -> str:
     """Return a Starlette-safe SameSite value.
 
     A mistyped WEB_COOKIE_SAMESITE used to make the dashboard fail during
-    startup. Keep bad env values safe by falling back to lax, while the normal default is none.
+    startup. Keep bad env values safe by falling back to lax, while the normal code default is SameSite=None.
     """
-    value = str(getattr(SETTINGS, "WEB_COOKIE_SAMESITE", "none") or "none").strip().lower()
+    value = str(getattr(SETTINGS, "WEB_COOKIE_SAMESITE", DEFAULT_WEB_COOKIE_SAMESITE) or DEFAULT_WEB_COOKIE_SAMESITE).strip().lower()
     return value if value in {"lax", "strict", "none"} else "lax"
 
 
@@ -3386,6 +3393,37 @@ def _admin_login_clear_failures(admin_id: int | None) -> None:
         _ADMIN_LOGIN_ATTEMPTS.pop(key, None)
 
 
+def _admin_auth_profile_payload(admin_id: int | None = None, *, authenticated: bool = True) -> dict[str, Any]:
+    """Return a stable admin profile shape for separated frontends.
+
+    Some frontend builds hydrate auth state from login response directly while
+    others call /api/admin/auth/me after login. Keep both endpoints returning
+    the same profile/admin/user objects so the UI never treats a successful
+    login as incomplete just because profile data was missing.
+    """
+    resolved_admin_id = int(admin_id or _web_current_admin_id() or 0) if authenticated else None
+    profile = {
+        "id": resolved_admin_id,
+        "admin_id": resolved_admin_id,
+        "telegram_id": resolved_admin_id,
+        "role": "admin",
+        "name": f"Admin {resolved_admin_id}" if resolved_admin_id else "Admin",
+        "display_name": f"Admin {resolved_admin_id}" if resolved_admin_id else "Admin",
+        "username": "",
+    } if authenticated else None
+    return {
+        "authenticated": bool(authenticated),
+        "admin_id": resolved_admin_id,
+        "csrf_token": _web_csrf_token() if authenticated else None,
+        "profile": profile,
+        "admin": profile,
+        "user": profile,
+        "admin_ids_configured": bool(ADMIN_IDS),
+        "admin_password_configured": bool(_web_admin_password()),
+        "frontend_allowed_origins": _frontend_allowed_origins(),
+    }
+
+
 def web_admin_required(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
@@ -3457,25 +3495,19 @@ def api_admin_auth_login():
     session["web_admin_id"] = int(admin_id or _web_current_admin_id())
     session["web_login_at"] = datetime.now(timezone.utc).isoformat()
     csrf = _web_csrf_token()
-    return _admin_api_success({
-        "admin_id": int(session["web_admin_id"]),
+    auth_payload = _admin_auth_profile_payload(int(session["web_admin_id"]), authenticated=True)
+    auth_payload.update({
         "csrf_token": csrf,
         "session": "cookie",
         "message": "Login successful.",
     })
+    return _admin_api_success(auth_payload)
 
 
 @app_flask.route("/api/admin/auth/me", methods=["GET"])
 def api_admin_auth_me():
     authenticated = _web_admin_session_valid()
-    payload = {
-        "authenticated": authenticated,
-        "admin_id": _web_current_admin_id() if authenticated else None,
-        "csrf_token": _web_csrf_token() if authenticated else None,
-        "admin_ids_configured": bool(ADMIN_IDS),
-        "admin_password_configured": bool(_web_admin_password()),
-        "frontend_allowed_origins": _frontend_allowed_origins(),
-    }
+    payload = _admin_auth_profile_payload(_web_current_admin_id() if authenticated else None, authenticated=authenticated)
     return _admin_api_success(payload) if authenticated else _admin_api_error("Not authenticated.", 401, code="admin_auth_required", **payload)
 
 
