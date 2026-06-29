@@ -308,7 +308,7 @@ def _perf_default(name: str, fallback: Any = None) -> Any:
 # SameSite=None requires Secure=True in modern browsers.
 DEFAULT_WEB_COOKIE_SAMESITE = "none"
 DEFAULT_WEB_COOKIE_SECURE = True
-ADMIN_BACKEND_RELEASE = "v19-production-hardening"
+ADMIN_BACKEND_RELEASE = "v20-pdf-report-graph-day-picker"
 
 
 # ── FastAPI Web Server + typed settings ─────────────────────────────────────
@@ -4829,11 +4829,15 @@ def web_admin_report():
     body = f"""
     <div class='card'>
       <h2>📄 Admin PDF Report</h2>
-      <p class='muted'>Generate a PDF with system status, counts, runtime settings, feature toggles, Smart Error Inbox summary, and recent errors.</p>
+      <p class='muted'>Generate a PDF with graphs, selected-day/range analytics, system status, runtime settings, feature toggles, Smart Error Inbox summary, and recent errors.</p>
       <div class='actions'>
-        <a class='btn ok' href='/admin/report.pdf'>Download PDF Report</a>
+        <a class='btn ok' href='/admin/report.pdf?range=today'>Today</a>
+        <a class='btn secondary' href='/admin/report.pdf?range=yesterday'>Yesterday</a>
+        <a class='btn secondary' href='/admin/report.pdf?range=last7'>Last 7 Days</a>
+        <a class='btn secondary' href='/admin/report.pdf?range=last30'>Last 30 Days</a>
         <a class='btn secondary' href='/admin'>Back to Dashboard</a>
       </div>
+      <p class='muted'>Custom day URL example: <code>/admin/report.pdf?date=2026-06-29</code></p>
     </div>
     """
     return _web_render("Admin Report", body, active="report")
@@ -4844,7 +4848,10 @@ def web_admin_report():
 def web_admin_report_pdf():
     path = ""
     try:
-        path = build_admin_report_pdf_sync(_web_current_admin_id())
+        requested_date = request.args.get("date", "")
+        requested_range = request.args.get("range", "today")
+        report_range = _admin_report_parse_day_text(requested_date) if requested_date else _admin_report_range_from_key(requested_range)
+        path = build_admin_report_pdf_sync(_web_current_admin_id(), report_range)
         with open(path, "rb") as f:
             data = f.read()
         filename = os.path.basename(path)
@@ -10068,6 +10075,7 @@ USER_SEARCH_WAIT_QUERY = 5
 SCHED_EDIT_WAIT_TIME   = 6
 SCHED_EDIT_WAIT_TEXT   = 7
 SCHED_EDIT_WAIT_PHOTO  = 8
+ADMIN_REPORT_WAIT_DAY = 9
 _SCHED_POLL_INTERVAL   = _env_int("SCHED_POLL_INTERVAL", 60, minimum=5, maximum=3600)
 _SCHED_SENDING_STALE_SECONDS = _env_int("SCHED_SENDING_STALE_SECONDS", 1800, minimum=60, maximum=86400)
 _SCHED_DUE_LIMIT      = _env_int("SCHED_DUE_LIMIT", 5, minimum=1, maximum=100)
@@ -14172,6 +14180,19 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def get_admin_report_day_kb() -> InlineKeyboardMarkup:
+    """Date/range picker shown when admin taps PDF Report in Telegram."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 Today", callback_data="admin_report_range:today"),
+         InlineKeyboardButton("◀️ Yesterday", callback_data="admin_report_range:yesterday")],
+        [InlineKeyboardButton("7 Days", callback_data="admin_report_range:last7"),
+         InlineKeyboardButton("30 Days", callback_data="admin_report_range:last30")],
+        [InlineKeyboardButton("✍️ Type Date", callback_data="admin_report_range:custom")],
+        [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+         InlineKeyboardButton("❌ Cancel", callback_data="admin_cancel_state")],
+    ])
+
+
 def generate_web_secret_key() -> str:
     """Return a strong WEB_SECRET_KEY value for Redis-backed web sessions."""
     return _generate_web_secret_value()
@@ -16838,7 +16859,201 @@ def _write_minimal_pdf(path: str, lines: list[str]) -> None:
         f.write(f"trailer << /Root 1 0 R /Size {len(objects)+1} >>\nstartxref\n{xref_at}\n%%EOF\n".encode())
 
 
-def _collect_admin_report_data_sync(admin_id: int) -> dict[str, Any]:
+def _admin_report_local_midnight(day_value: Any) -> datetime:
+    """Return a timezone-aware Phnom Penh local midnight for a date-like value."""
+    if isinstance(day_value, datetime):
+        day_value = _to_local_time(day_value).date()
+    return datetime(day_value.year, day_value.month, day_value.day, tzinfo=APP_TIMEZONE)
+
+
+def _admin_report_range_from_key(range_key: str) -> dict[str, Any]:
+    """Resolve Telegram/web report range keys to exact local and UTC bounds."""
+    key = str(range_key or "today").strip().lower()
+    today = _local_now().date()
+    if key in {"yesterday", "prev", "previous"}:
+        start_day = today - timedelta(days=1)
+        end_day = today
+        title = "Yesterday"
+    elif key in {"last7", "7", "7d", "week"}:
+        start_day = today - timedelta(days=6)
+        end_day = today + timedelta(days=1)
+        title = "Last 7 days"
+    elif key in {"last30", "30", "30d", "month"}:
+        start_day = today - timedelta(days=29)
+        end_day = today + timedelta(days=1)
+        title = "Last 30 days"
+    else:
+        start_day = today
+        end_day = today + timedelta(days=1)
+        title = "Today"
+
+    start_local = _admin_report_local_midnight(start_day)
+    end_local = _admin_report_local_midnight(end_day)
+    return _admin_report_range_payload(title, start_local, end_local, key)
+
+
+def _admin_report_range_payload(title: str, start_local: datetime, end_local: datetime, range_key: str = "custom") -> dict[str, Any]:
+    start_local = _to_local_time(start_local)
+    end_local = _to_local_time(end_local)
+    if end_local <= start_local:
+        end_local = start_local + timedelta(days=1)
+    day_count = max(1, (end_local.date() - start_local.date()).days)
+    if day_count == 1:
+        range_label = f"{title} - {start_local.strftime('%Y-%m-%d')} {APP_TIMEZONE_ALIAS}"
+    else:
+        inclusive_end = (end_local - timedelta(seconds=1)).date()
+        range_label = f"{title} - {start_local.date().isoformat()} to {inclusive_end.isoformat()} {APP_TIMEZONE_ALIAS}"
+    return {
+        "key": str(range_key or "custom"),
+        "title": str(title or "Custom day"),
+        "label": range_label,
+        "days": day_count,
+        "start_local": start_local,
+        "end_local": end_local,
+        "start_utc": _local_to_utc(start_local),
+        "end_utc": _local_to_utc(end_local),
+    }
+
+
+def _admin_report_parse_day_text(text_value: Any) -> dict[str, Any] | None:
+    """Parse admin typed report day/range text.
+
+    Supported examples: today, yesterday, 7, 30, last 7, 2026-06-29,
+    29/06/2026, and 29-06-2026.  Custom typed dates intentionally generate a
+    one-day report so admins cannot accidentally request a huge DB scan.
+    """
+    raw = re.sub(r"\s+", " ", str(text_value or "").strip().lower())
+    if not raw:
+        return None
+    normalized = raw.replace("days", "day").replace(" ", "")
+    if normalized in {"today", "td"}:
+        return _admin_report_range_from_key("today")
+    if normalized in {"yesterday", "ys", "yday"}:
+        return _admin_report_range_from_key("yesterday")
+    if normalized in {"7", "7d", "last7", "last7day", "week"}:
+        return _admin_report_range_from_key("last7")
+    if normalized in {"30", "30d", "last30", "last30day", "month"}:
+        return _admin_report_range_from_key("last30")
+
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+        try:
+            parsed = datetime.strptime(raw, fmt).date()
+            start_local = _admin_report_local_midnight(parsed)
+            return _admin_report_range_payload("Custom day", start_local, start_local + timedelta(days=1), "custom")
+        except ValueError:
+            continue
+    return None
+
+
+def _admin_report_day_counts_template(start_local: datetime, end_local: datetime) -> OrderedDict[str, dict]:
+    start_day = _to_local_time(start_local).date()
+    end_day = _to_local_time(end_local).date()
+    days = max(1, min(366, (end_day - start_day).days))
+    buckets: OrderedDict[str, dict] = OrderedDict()
+    for idx in range(days):
+        day_key = (start_day + timedelta(days=idx)).isoformat()
+        buckets[day_key] = {"schedules": 0, "sent": 0, "failed": 0, "blocked": 0}
+    return buckets
+
+
+def _collect_admin_report_analytics_sync(report_range: dict[str, Any]) -> dict[str, Any]:
+    """Collect date-bounded scheduled-broadcast analytics for the PDF report."""
+    start_local = report_range.get("start_local") or _admin_report_range_from_key("today")["start_local"]
+    end_local = report_range.get("end_local") or (start_local + timedelta(days=1))
+    start_utc = report_range.get("start_utc") or _local_to_utc(start_local)
+    end_utc = report_range.get("end_utc") or _local_to_utc(end_local)
+    day_counts = _admin_report_day_counts_template(start_local, end_local)
+
+    empty = {
+        "rows": [],
+        "status_counts": {},
+        "day_counts": day_counts,
+        "total_schedules": 0,
+        "sent": 0,
+        "failed": 0,
+        "blocked": 0,
+        "delivery_total": 0,
+        "delivery_rate": 0,
+        "upcoming": 0,
+        "overdue": 0,
+        "previews": 0,
+        "photo": 0,
+        "text": 0,
+        "error": "",
+    }
+    if not supabase:
+        empty["error"] = "Supabase is not configured."
+        return empty
+
+    try:
+        rows = _web_sched_fetch_analytics_window(start_utc, until_utc=end_utc, limit=50000)
+    except Exception as exc:
+        logger.warning("PDF report analytics fetch failed: %s", exc)
+        empty["error"] = str(exc)[:240]
+        return empty
+
+    now_utc = datetime.now(timezone.utc)
+    status_counts: dict[str, int] = {}
+    counted_rows: list[dict] = []
+    sent = failed = blocked = upcoming = overdue = previews = photo = text_count = 0
+
+    for row in rows:
+        dt = _sched_parse_iso(row.get("broadcast_at"))
+        if not dt or dt < start_utc or dt >= end_utc:
+            continue
+        local_key = _to_local_time(dt).date().isoformat()
+        bucket = day_counts.get(local_key)
+        if bucket is None:
+            continue
+
+        status = _web_schedule_status_key(row)
+        sent_i = _web_safe_int(row.get("sent_count"))
+        failed_i = _web_safe_int(row.get("failed_count"))
+        blocked_i = _web_safe_int(row.get("blocked_count"))
+
+        counted_rows.append(row)
+        status_counts[status] = status_counts.get(status, 0) + 1
+        sent += sent_i
+        failed += failed_i
+        blocked += blocked_i
+        bucket["schedules"] += 1
+        bucket["sent"] += sent_i
+        bucket["failed"] += failed_i
+        bucket["blocked"] += blocked_i
+
+        if row.get("photo_file_id"):
+            photo += 1
+        else:
+            text_count += 1
+        if status == "preview":
+            previews += 1
+        if status == SCHED_STATUS_PENDING:
+            if dt >= now_utc:
+                upcoming += 1
+            else:
+                overdue += 1
+
+    delivery_total = sent + failed + blocked
+    return {
+        "rows": counted_rows,
+        "status_counts": status_counts,
+        "day_counts": day_counts,
+        "total_schedules": len(counted_rows),
+        "sent": sent,
+        "failed": failed,
+        "blocked": blocked,
+        "delivery_total": delivery_total,
+        "delivery_rate": _web_pct(sent, delivery_total),
+        "upcoming": upcoming,
+        "overdue": overdue,
+        "previews": previews,
+        "photo": photo,
+        "text": text_count,
+        "error": "",
+    }
+
+
+def _collect_admin_report_data_sync(admin_id: int, report_range: dict[str, Any] | None = None) -> dict[str, Any]:
     counts = {
         "users": 0,
         "blocked": 0,
@@ -16868,10 +17083,15 @@ def _collect_admin_report_data_sync(admin_id: int) -> dict[str, Any]:
     leader = _telegram_leader_snapshot() if "_telegram_leader_snapshot" in globals() else {}
     run_state = globals().get("RUN_STATE") if isinstance(globals().get("RUN_STATE"), dict) else {}
     recent_errors = _admin_error_center_snapshot(8) if "_admin_error_center_snapshot" in globals() else []
+    report_range = report_range or _admin_report_range_from_key("today")
+    analytics = _collect_admin_report_analytics_sync(report_range)
 
     return {
         "admin_id": int(admin_id or 0),
         "generated_at": _fmt_local_dt(),
+        "report_range": report_range,
+        "report_range_label": report_range.get("label", "Today"),
+        "analytics": analytics,
         "uptime": _format_uptime() if "_format_uptime" in globals() else "unknown",
         "counts": counts,
         "settings": settings,
@@ -16901,6 +17121,7 @@ def _admin_report_lines(data: dict[str, Any]) -> list[str]:
         "Telegram Bot Admin PDF Report",
         f"Generated: {data.get('generated_at')}",
         f"Admin ID: {data.get('admin_id')}",
+        f"Report Range: {data.get('report_range_label')}",
         "",
         "System Status",
         f"Supabase: {'ON' if data.get('supabase_on') else 'OFF'}",
@@ -16917,6 +17138,11 @@ def _admin_report_lines(data: dict[str, Any]) -> list[str]:
         f"Blocked users: {counts.get('blocked', 0)}",
         f"Schedules: {counts.get('schedules', 0)} | Pending: {counts.get('pending', 0)} | Sending: {counts.get('sending', 0)} | Failed: {counts.get('failed', 0)}",
         f"Active API keys: {counts.get('api_keys', 0)}",
+        "",
+        "Report Analytics",
+        f"Schedules in range: {(data.get('analytics') or {}).get('total_schedules', 0)}",
+        f"Sent: {(data.get('analytics') or {}).get('sent', 0)} | Failed: {(data.get('analytics') or {}).get('failed', 0)} | Blocked: {(data.get('analytics') or {}).get('blocked', 0)}",
+        f"Delivery rate: {(data.get('analytics') or {}).get('delivery_rate', 0)}%",
         "",
         "Runtime Metrics Since Restart",
     ]
@@ -17031,6 +17257,9 @@ def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
         from reportlab.lib.units import mm
+        from reportlab.graphics.charts.barcharts import VerticalBarChart
+        from reportlab.graphics.charts.legends import Legend
+        from reportlab.graphics.shapes import Drawing, String
         from reportlab.platypus import (
             BaseDocTemplate,
             Frame,
@@ -17221,12 +17450,76 @@ def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
             tbl.setStyle(TableStyle(base))
             return tbl
 
+        def activity_graph(analytics: dict[str, Any]):
+            day_counts = analytics.get("day_counts") if isinstance(analytics, dict) else None
+            if not day_counts:
+                return None
+            labels: list[str] = []
+            schedules: list[int] = []
+            sent_values: list[int] = []
+            issue_values: list[int] = []
+            for day_key, bucket in list(day_counts.items())[:31]:
+                try:
+                    label_dt = datetime.strptime(str(day_key), "%Y-%m-%d")
+                    label = label_dt.strftime("%b %d")
+                except Exception:
+                    label = str(day_key)[5:] or str(day_key)
+                labels.append(label)
+                schedules.append(max(0, _web_safe_int((bucket or {}).get("schedules"))))
+                sent_values.append(max(0, _web_safe_int((bucket or {}).get("sent"))))
+                issue_values.append(max(0, _web_safe_int((bucket or {}).get("failed")) + _web_safe_int((bucket or {}).get("blocked"))))
+
+            if not labels:
+                return None
+
+            max_value = max([1] + schedules + sent_values + issue_values)
+            width = max(420, min(520, int(doc.width)))
+            drawing = Drawing(width, 182)
+            drawing.add(String(0, 166, "Activity by day", fontName=bold_font, fontSize=10, fillColor=ink))
+            drawing.add(String(0, 153, "Schedules, successful sends, and failed/blocked deliveries for the selected report range.", fontName=regular_font, fontSize=7.6, fillColor=muted))
+
+            chart = VerticalBarChart()
+            chart.x = 28
+            chart.y = 36
+            chart.width = width - 58
+            chart.height = 105
+            chart.data = [schedules, sent_values, issue_values]
+            chart.categoryAxis.categoryNames = labels
+            chart.categoryAxis.labels.fontName = regular_font
+            chart.categoryAxis.labels.fontSize = 6.2 if len(labels) > 14 else 7
+            chart.categoryAxis.labels.angle = 30 if len(labels) > 10 else 0
+            chart.categoryAxis.labels.dy = -2
+            chart.valueAxis.labels.fontName = regular_font
+            chart.valueAxis.labels.fontSize = 7
+            chart.valueAxis.valueMin = 0
+            chart.valueAxis.valueMax = max(1, int(max_value * 1.25) + 1)
+            chart.valueAxis.valueStep = max(1, int(chart.valueAxis.valueMax / 4) or 1)
+            chart.bars[0].fillColor = primary
+            chart.bars[1].fillColor = good
+            chart.bars[2].fillColor = warn
+            chart.groupSpacing = 8
+            chart.barSpacing = 1.5
+            drawing.add(chart)
+
+            legend = Legend()
+            legend.x = 30
+            legend.y = 11
+            legend.fontName = regular_font
+            legend.fontSize = 7.4
+            legend.boxAnchor = "sw"
+            legend.columnMaximum = 1
+            legend.colorNamePairs = [(primary, "Schedules"), (good, "Sent"), (warn, "Failed/blocked")]
+            drawing.add(legend)
+            return drawing
+
         counts = data.get("counts") or {}
         metrics = data.get("metrics") or {}
         leader = data.get("leader") or {}
         settings = data.get("settings") or {}
         run_state = data.get("run_state") or {}
         recent_errors = data.get("recent_errors") or []
+        analytics = data.get("analytics") or {}
+        report_range_label = data.get("report_range_label") or "Today"
 
         story = []
         story.append(Paragraph("Telegram Bot Admin Report", styles["ReportTitle"]))
@@ -17234,7 +17527,8 @@ def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
             html.escape(
                 f"Generated {_report_pdf_text(data.get('generated_at'))} | "
                 f"Mode: {_report_pdf_text(data.get('bot_mode'))} | "
-                f"Admin ID: {_report_pdf_text(data.get('admin_id'))}"
+                f"Admin ID: {_report_pdf_text(data.get('admin_id'))} | "
+                f"Range: {_report_pdf_text(report_range_label, 120)}"
             ),
             styles["ReportSubtitle"],
         ))
@@ -17257,6 +17551,25 @@ def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
         ]))
         story.append(card_table)
         story.append(Spacer(1, 8))
+
+        graph = activity_graph(analytics)
+        if graph is not None:
+            story.append(KeepTogether([section("Report Activity Graph"), graph]))
+
+        analytics_rows = [
+            [P("Report Window", "TableHead"), P("Schedules", "TableHead"), P("Sent", "TableHead"), P("Failed", "TableHead"), P("Blocked", "TableHead"), P("Delivery Rate", "TableHead")],
+            [
+                P(report_range_label, limit=95),
+                P(analytics.get("total_schedules", 0)),
+                P(analytics.get("sent", 0)),
+                P(analytics.get("failed", 0)),
+                P(analytics.get("blocked", 0)),
+                P(f"{analytics.get('delivery_rate', 0)}%"),
+            ],
+        ]
+        if analytics.get("error"):
+            analytics_rows.append([P("Data warning", "StatusBad"), P("-"), P("-"), P("-"), P("-"), P(analytics.get("error"), "StatusBad", limit=80)])
+        story.append(table(analytics_rows, [doc.width * 0.34, doc.width * 0.13, doc.width * 0.13, doc.width * 0.12, doc.width * 0.12, doc.width * 0.16]))
 
         status_rows = [
             [P("Service", "TableHead"), P("Status", "TableHead"), P("Details", "TableHead")],
@@ -17326,16 +17639,118 @@ def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
         _write_minimal_pdf(path, lines)
 
 
-def build_admin_report_pdf_sync(admin_id: int) -> str:
-    data = _collect_admin_report_data_sync(admin_id)
+def build_admin_report_pdf_sync(admin_id: int, report_range: dict[str, Any] | None = None) -> str:
+    report_range = report_range or _admin_report_range_from_key("today")
+    data = _collect_admin_report_data_sync(admin_id, report_range)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    path = os.path.join(tempfile.gettempdir(), f"bot-admin-report-{int(admin_id or 0)}-{stamp}.pdf")
+    range_key = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(report_range.get("key") or "report")).strip("-") or "report"
+    path = os.path.join(tempfile.gettempdir(), f"bot-admin-report-{int(admin_id or 0)}-{range_key}-{stamp}.pdf")
     _write_admin_report_pdf_sync(path, data)
     return path
 
 
-async def build_admin_report_pdf(admin_id: int) -> str:
-    return await asyncio.to_thread(build_admin_report_pdf_sync, int(admin_id or 0))
+async def build_admin_report_pdf(admin_id: int, report_range: dict[str, Any] | None = None) -> str:
+    return await asyncio.to_thread(build_admin_report_pdf_sync, int(admin_id or 0), report_range)
+
+
+async def _admin_open_report_day_picker(query, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    context.user_data.pop("admin_report_state", None)
+    await safe_send(lambda: query.message.edit_text(
+        "📄 <b>PDF Report</b>\n\n"
+        "ជ្រើសរើសថ្ងៃ ឬ Range ដែលអ្នកចង់ទាញយក Report។\n"
+        "PDF នឹងមាន graph សម្រាប់ schedules/sent/failed/blocked នៅក្នុងថ្ងៃដែលបានជ្រើស។\n\n"
+        "Custom: ចុច <b>Type Date</b> ហើយវាយជា <code>YYYY-MM-DD</code> ឧ. <code>2026-06-29</code>។",
+        parse_mode="HTML",
+        reply_markup=get_admin_report_day_kb(),
+        disable_web_page_preview=True,
+    ))
+
+
+async def _admin_send_report_pdf_for_range(query, context: ContextTypes.DEFAULT_TYPE, user_id: int, report_range: dict[str, Any]) -> None:
+    context.user_data.pop("admin_report_state", None)
+    label = str((report_range or {}).get("label") or "Selected range")
+    path = ""
+    progress = None
+    try:
+        progress = await safe_send(lambda: query.message.reply_text(
+            f"⏳ Generating PDF report...\nRange: <b>{html.escape(label)}</b>",
+            parse_mode="HTML",
+        ))
+        path = await build_admin_report_pdf(user_id, report_range)
+        with open(path, "rb") as report_file:
+            await context.bot.send_document(
+                chat_id=user_id,
+                document=report_file,
+                filename=os.path.basename(path),
+                caption=f"📄 Admin PDF report with graph\nRange: {label}",
+            )
+        if progress:
+            with suppress(Exception):
+                await progress.edit_text("✅ PDF report generated and sent.")
+    except Exception as exc:
+        logger.error("admin_report_pdf failed: %s", exc, exc_info=True)
+        if progress:
+            with suppress(Exception):
+                await progress.edit_text(f"⚠️ Report generation failed: {html.escape(str(exc)[:300])}")
+        else:
+            await safe_send(lambda: query.message.reply_text(f"⚠️ Report generation failed: {html.escape(str(exc)[:300])}"))
+    finally:
+        if path:
+            with suppress(Exception):
+                os.remove(path)
+
+
+async def _handle_admin_report_day_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    msg = update.message
+    if not user or not msg or context.user_data.get("admin_report_state") != ADMIN_REPORT_WAIT_DAY:
+        return False
+    user_id = int(user.id)
+    if not _is_admin(user_id):
+        return False
+
+    report_range = _admin_report_parse_day_text(msg.text)
+    if not report_range:
+        await safe_send(lambda: msg.reply_text(
+            "⚠️ Date មិនត្រឹមត្រូវ។ សូមវាយជា <code>YYYY-MM-DD</code> ឧ. <code>2026-06-29</code>\n"
+            "ឬវាយ <code>today</code>, <code>yesterday</code>, <code>7</code>, <code>30</code>។",
+            parse_mode="HTML",
+            reply_markup=get_admin_action_kb(),
+        ))
+        return True
+
+    context.user_data.pop("admin_report_state", None)
+    label = str(report_range.get("label") or "Selected day")
+    path = ""
+    progress = None
+    try:
+        progress = await safe_send(lambda: msg.reply_text(
+            f"⏳ Generating PDF report...\nRange: <b>{html.escape(label)}</b>",
+            parse_mode="HTML",
+        ))
+        path = await build_admin_report_pdf(user_id, report_range)
+        with open(path, "rb") as report_file:
+            await context.bot.send_document(
+                chat_id=user_id,
+                document=report_file,
+                filename=os.path.basename(path),
+                caption=f"📄 Admin PDF report with graph\nRange: {label}",
+            )
+        if progress:
+            with suppress(Exception):
+                await progress.edit_text("✅ PDF report generated and sent.")
+    except Exception as exc:
+        logger.error("admin_report_pdf_text_date failed: %s", exc, exc_info=True)
+        if progress:
+            with suppress(Exception):
+                await progress.edit_text(f"⚠️ Report generation failed: {html.escape(str(exc)[:300])}")
+        else:
+            await safe_send(lambda: msg.reply_text(f"⚠️ Report generation failed: {html.escape(str(exc)[:300])}"))
+    finally:
+        if path:
+            with suppress(Exception):
+                os.remove(path)
+    return True
 
 
 async def _admin_home_text(admin_id: int, title: str = "🛠️ Admin System Center V7") -> str:
@@ -18346,6 +18761,7 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         context.user_data.pop("bc_state", None)
         context.user_data.pop("sched_state", None)
         context.user_data.pop("sched_edit_row_id", None)
+        context.user_data.pop("admin_report_state", None)
         _pending_broadcast.pop(user_id, None)
         _sched_payload.pop(user_id, None)
         with suppress(Exception):
@@ -18356,6 +18772,7 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         context.user_data.pop("bc_state", None)
         context.user_data.pop("sched_state", None)
         context.user_data.pop("sched_edit_row_id", None)
+        context.user_data.pop("admin_report_state", None)
         text = await _admin_home_text(user_id)
         await safe_send(lambda: query.message.edit_text(
             text,
@@ -18368,6 +18785,7 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         context.user_data.pop("bc_state", None)
         context.user_data.pop("sched_state", None)
         context.user_data.pop("sched_edit_row_id", None)
+        context.user_data.pop("admin_report_state", None)
         _pending_broadcast.pop(user_id, None)
         _sched_payload.pop(user_id, None)
         text = await _admin_home_text(user_id, title="✅ Admin action cancelled")
@@ -18402,24 +18820,26 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         return
 
     if data == "admin_report":
-        # on_callback already answered this callback once; do not answer again.
-        path = ""
-        try:
-            path = await build_admin_report_pdf(user_id)
-            with open(path, "rb") as report_file:
-                await context.bot.send_document(
-                    chat_id=user_id,
-                    document=report_file,
-                    filename=os.path.basename(path),
-                    caption="📄 Admin PDF report generated.",
-                )
-        except Exception as exc:
-            logger.error("admin_report_pdf failed: %s", exc, exc_info=True)
-            await safe_send(lambda: query.message.reply_text(f"⚠️ Report generation failed: {html.escape(str(exc)[:300])}"))
-        finally:
-            if path:
-                with suppress(Exception):
-                    os.remove(path)
+        # Ask which day/range the admin wants before generating the PDF.
+        await _admin_open_report_day_picker(query, context, user_id)
+        return
+
+    if data.startswith("admin_report_range:"):
+        range_key = data.split(":", 1)[1].strip().lower()
+        if range_key == "custom":
+            context.user_data["admin_report_state"] = ADMIN_REPORT_WAIT_DAY
+            await safe_send(lambda: query.message.edit_text(
+                "✍️ <b>Custom PDF Report Date</b>\n\n"
+                "វាយថ្ងៃដែលចង់បានជា <code>YYYY-MM-DD</code>។\n"
+                "Example: <code>2026-06-29</code>\n\n"
+                "You can also type: <code>today</code>, <code>yesterday</code>, <code>7</code>, or <code>30</code>.",
+                parse_mode="HTML",
+                reply_markup=get_admin_action_kb(),
+                disable_web_page_preview=True,
+            ))
+            return
+        report_range = _admin_report_range_from_key(range_key)
+        await _admin_send_report_pdf_for_range(query, context, user_id, report_range)
         return
 
     if data == "admin_runtime":
@@ -20126,9 +20546,9 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: update.message.reply_text("❌ Schedule/Edit flow បានបោះបង់។"))
         cleared = True
 
-    if context.user_data.get("user_search_state") == USER_SEARCH_WAIT_QUERY:
-        context.user_data.pop("user_search_state", None)
-        await safe_send(lambda: update.message.reply_text("❌ User search cancelled."))
+    if context.user_data.get("admin_report_state") == ADMIN_REPORT_WAIT_DAY:
+        context.user_data.pop("admin_report_state", None)
+        await safe_send(lambda: update.message.reply_text("❌ PDF report date selection cancelled."))
         cleared = True
 
     if not cleared:
@@ -20700,6 +21120,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if await _handle_runtime_admin_text(update, context):
             return
         if await _handle_user_search_text(update, context):
+            return
+        if await _handle_admin_report_day_text(update, context):
             return
 
         sched_state = context.user_data.get("sched_state")
