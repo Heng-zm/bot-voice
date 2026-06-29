@@ -308,7 +308,7 @@ def _perf_default(name: str, fallback: Any = None) -> Any:
 # SameSite=None requires Secure=True in modern browsers.
 DEFAULT_WEB_COOKIE_SAMESITE = "none"
 DEFAULT_WEB_COOKIE_SECURE = True
-ADMIN_BACKEND_RELEASE = "v20-pdf-report-graph-day-picker"
+ADMIN_BACKEND_RELEASE = "v21-pdf-activity-graph-style"
 
 
 # ── FastAPI Web Server + typed settings ─────────────────────────────────────
@@ -16956,6 +16956,49 @@ def _admin_report_day_counts_template(start_local: datetime, end_local: datetime
     return buckets
 
 
+def _admin_report_activity_timeline_template(start_local: datetime, end_local: datetime) -> tuple[OrderedDict[str, dict], str]:
+    """Return a chart-friendly report activity timeline.
+
+    One-day reports use hourly buckets so the PDF graph looks like a real
+    activity chart instead of a single bar/point. Multi-day reports use daily
+    buckets. Values are kept simple dictionaries so the PDF renderer can draw
+    a custom analytics card without adding another runtime dependency.
+    """
+    start_local = _to_local_time(start_local)
+    end_local = _to_local_time(end_local)
+    day_count = max(1, (end_local.date() - start_local.date()).days)
+    buckets: OrderedDict[str, dict] = OrderedDict()
+
+    if day_count <= 1:
+        base = _admin_report_local_midnight(start_local.date())
+        for hour in range(24):
+            key = (base + timedelta(hours=hour)).strftime("%Y-%m-%dT%H")
+            buckets[key] = {
+                "label": f"{hour:02d}:00",
+                "schedules": 0,
+                "sent": 0,
+                "failed": 0,
+                "blocked": 0,
+                "issues": 0,
+            }
+        return buckets, "hour"
+
+    days = max(1, min(366, day_count))
+    start_day = start_local.date()
+    for idx in range(days):
+        day = start_day + timedelta(days=idx)
+        key = day.isoformat()
+        buckets[key] = {
+            "label": day.strftime("%b %d"),
+            "schedules": 0,
+            "sent": 0,
+            "failed": 0,
+            "blocked": 0,
+            "issues": 0,
+        }
+    return buckets, "day"
+
+
 def _collect_admin_report_analytics_sync(report_range: dict[str, Any]) -> dict[str, Any]:
     """Collect date-bounded scheduled-broadcast analytics for the PDF report."""
     start_local = report_range.get("start_local") or _admin_report_range_from_key("today")["start_local"]
@@ -16963,11 +17006,14 @@ def _collect_admin_report_analytics_sync(report_range: dict[str, Any]) -> dict[s
     start_utc = report_range.get("start_utc") or _local_to_utc(start_local)
     end_utc = report_range.get("end_utc") or _local_to_utc(end_local)
     day_counts = _admin_report_day_counts_template(start_local, end_local)
+    activity_timeline, activity_timeline_mode = _admin_report_activity_timeline_template(start_local, end_local)
 
     empty = {
         "rows": [],
         "status_counts": {},
         "day_counts": day_counts,
+        "activity_timeline": list(activity_timeline.values()),
+        "activity_timeline_mode": activity_timeline_mode,
         "total_schedules": 0,
         "sent": 0,
         "failed": 0,
@@ -17010,6 +17056,9 @@ def _collect_admin_report_analytics_sync(report_range: dict[str, Any]) -> dict[s
         sent_i = _web_safe_int(row.get("sent_count"))
         failed_i = _web_safe_int(row.get("failed_count"))
         blocked_i = _web_safe_int(row.get("blocked_count"))
+        local_dt = _to_local_time(dt)
+        timeline_key = local_dt.strftime("%Y-%m-%dT%H") if activity_timeline_mode == "hour" else local_dt.date().isoformat()
+        timeline_bucket = activity_timeline.get(timeline_key)
 
         counted_rows.append(row)
         status_counts[status] = status_counts.get(status, 0) + 1
@@ -17020,6 +17069,12 @@ def _collect_admin_report_analytics_sync(report_range: dict[str, Any]) -> dict[s
         bucket["sent"] += sent_i
         bucket["failed"] += failed_i
         bucket["blocked"] += blocked_i
+        if timeline_bucket is not None:
+            timeline_bucket["schedules"] += 1
+            timeline_bucket["sent"] += sent_i
+            timeline_bucket["failed"] += failed_i
+            timeline_bucket["blocked"] += blocked_i
+            timeline_bucket["issues"] += failed_i + blocked_i
 
         if row.get("photo_file_id"):
             photo += 1
@@ -17038,6 +17093,8 @@ def _collect_admin_report_analytics_sync(report_range: dict[str, Any]) -> dict[s
         "rows": counted_rows,
         "status_counts": status_counts,
         "day_counts": day_counts,
+        "activity_timeline": list(activity_timeline.values()),
+        "activity_timeline_mode": activity_timeline_mode,
         "total_schedules": len(counted_rows),
         "sent": sent,
         "failed": failed,
@@ -17257,9 +17314,7 @@ def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
         from reportlab.lib.units import mm
-        from reportlab.graphics.charts.barcharts import VerticalBarChart
-        from reportlab.graphics.charts.legends import Legend
-        from reportlab.graphics.shapes import Drawing, String
+        from reportlab.graphics.shapes import Circle, Drawing, Line, Path, Rect, String
         from reportlab.platypus import (
             BaseDocTemplate,
             Frame,
@@ -17450,66 +17505,208 @@ def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
             tbl.setStyle(TableStyle(base))
             return tbl
 
-        def activity_graph(analytics: dict[str, Any]):
-            day_counts = analytics.get("day_counts") if isinstance(analytics, dict) else None
-            if not day_counts:
-                return None
-            labels: list[str] = []
-            schedules: list[int] = []
-            sent_values: list[int] = []
-            issue_values: list[int] = []
-            for day_key, bucket in list(day_counts.items())[:31]:
-                try:
-                    label_dt = datetime.strptime(str(day_key), "%Y-%m-%d")
-                    label = label_dt.strftime("%b %d")
-                except Exception:
-                    label = str(day_key)[5:] or str(day_key)
-                labels.append(label)
-                schedules.append(max(0, _web_safe_int((bucket or {}).get("schedules"))))
-                sent_values.append(max(0, _web_safe_int((bucket or {}).get("sent"))))
-                issue_values.append(max(0, _web_safe_int((bucket or {}).get("failed")) + _web_safe_int((bucket or {}).get("blocked"))))
+        def activity_graph(analytics: dict[str, Any], report_label: str = ""):
+            """Draw a modern line-chart activity card directly in the PDF.
 
-            if not labels:
+            Style goal: similar to a clean analytics dashboard card with KPI
+            values, legend dots, subtle grid lines, smooth blue/cyan lines, and
+            compact range pills. This avoids image/network dependencies and is
+            safe on Render because it uses only ReportLab vector shapes.
+            """
+            if not isinstance(analytics, dict):
                 return None
 
-            max_value = max([1] + schedules + sent_values + issue_values)
-            width = max(420, min(520, int(doc.width)))
-            drawing = Drawing(width, 182)
-            drawing.add(String(0, 166, "Activity by day", fontName=bold_font, fontSize=10, fillColor=ink))
-            drawing.add(String(0, 153, "Schedules, successful sends, and failed/blocked deliveries for the selected report range.", fontName=regular_font, fontSize=7.6, fillColor=muted))
+            timeline = analytics.get("activity_timeline") or []
+            if not timeline:
+                day_counts = analytics.get("day_counts") or {}
+                for day_key, bucket in list(day_counts.items())[:31]:
+                    try:
+                        label = datetime.strptime(str(day_key), "%Y-%m-%d").strftime("%b %d")
+                    except Exception:
+                        label = str(day_key)[5:] or str(day_key)
+                    bucket = bucket or {}
+                    timeline.append({
+                        "label": label,
+                        "schedules": max(0, _web_safe_int(bucket.get("schedules"))),
+                        "sent": max(0, _web_safe_int(bucket.get("sent"))),
+                        "failed": max(0, _web_safe_int(bucket.get("failed"))),
+                        "blocked": max(0, _web_safe_int(bucket.get("blocked"))),
+                        "issues": max(0, _web_safe_int(bucket.get("failed")) + _web_safe_int(bucket.get("blocked"))),
+                    })
+            if not timeline:
+                return None
 
-            chart = VerticalBarChart()
-            chart.x = 28
-            chart.y = 36
-            chart.width = width - 58
-            chart.height = 105
-            chart.data = [schedules, sent_values, issue_values]
-            chart.categoryAxis.categoryNames = labels
-            chart.categoryAxis.labels.fontName = regular_font
-            chart.categoryAxis.labels.fontSize = 6.2 if len(labels) > 14 else 7
-            chart.categoryAxis.labels.angle = 30 if len(labels) > 10 else 0
-            chart.categoryAxis.labels.dy = -2
-            chart.valueAxis.labels.fontName = regular_font
-            chart.valueAxis.labels.fontSize = 7
-            chart.valueAxis.valueMin = 0
-            chart.valueAxis.valueMax = max(1, int(max_value * 1.25) + 1)
-            chart.valueAxis.valueStep = max(1, int(chart.valueAxis.valueMax / 4) or 1)
-            chart.bars[0].fillColor = primary
-            chart.bars[1].fillColor = good
-            chart.bars[2].fillColor = warn
-            chart.groupSpacing = 8
-            chart.barSpacing = 1.5
-            drawing.add(chart)
+            timeline = list(timeline)[:60]
+            series_a = [max(0, _web_safe_int(item.get("sent"))) for item in timeline]
+            series_b = [max(0, _web_safe_int(item.get("schedules"))) for item in timeline]
+            labels = [str(item.get("label") or "") for item in timeline]
+            total_sent = max(0, _web_safe_int(analytics.get("sent")))
+            total_schedules = max(0, _web_safe_int(analytics.get("total_schedules")))
+            total_issues = max(0, _web_safe_int(analytics.get("failed")) + _web_safe_int(analytics.get("blocked")))
+            if max(series_a + series_b + [total_sent, total_schedules, 1]) <= 0:
+                # Keep the card visible even on quiet days, but draw flat zero lines.
+                series_a = [0 for _ in timeline]
+                series_b = [0 for _ in timeline]
 
-            legend = Legend()
-            legend.x = 30
-            legend.y = 11
-            legend.fontName = regular_font
-            legend.fontSize = 7.4
-            legend.boxAnchor = "sw"
-            legend.columnMaximum = 1
-            legend.colorNamePairs = [(primary, "Schedules"), (good, "Sent"), (warn, "Failed/blocked")]
-            drawing.add(legend)
+            def compact_number(value: Any) -> str:
+                n = max(0, _web_safe_int(value))
+                if n >= 1_000_000:
+                    return f"{n / 1_000_000:.2f}m".rstrip("0").rstrip(".")
+                if n >= 1_000:
+                    return f"{n / 1_000:.2f}k".rstrip("0").rstrip(".")
+                return str(n)
+
+            def nice_max(value: int) -> int:
+                value = max(1, int(value or 1))
+                if value <= 5:
+                    return 5
+                magnitude = 10 ** max(0, len(str(value)) - 1)
+                for mult in (1, 2, 5, 10):
+                    candidate = mult * magnitude
+                    if candidate >= value:
+                        return candidate
+                return value
+
+            def smooth_path(points: list[tuple[float, float]]) -> Path:
+                path = Path()
+                if not points:
+                    return path
+                path.moveTo(points[0][0], points[0][1])
+                if len(points) == 1:
+                    return path
+                if len(points) == 2:
+                    path.lineTo(points[1][0], points[1][1])
+                    return path
+                for i in range(len(points) - 1):
+                    p0 = points[max(i - 1, 0)]
+                    p1 = points[i]
+                    p2 = points[i + 1]
+                    p3 = points[min(i + 2, len(points) - 1)]
+                    c1x = p1[0] + (p2[0] - p0[0]) / 6.0
+                    c1y = p1[1] + (p2[1] - p0[1]) / 6.0
+                    c2x = p2[0] - (p3[0] - p1[0]) / 6.0
+                    c2y = p2[1] - (p3[1] - p1[1]) / 6.0
+                    path.curveTo(c1x, c1y, c2x, c2y, p2[0], p2[1])
+                return path
+
+            width = max(440, min(540, int(doc.width)))
+            height = 238
+            drawing = Drawing(width, height)
+            blue = colors.HexColor("#2563EB")
+            cyan = colors.HexColor("#7DD3E0")
+            card_bg = colors.HexColor("#FFFFFF")
+            shadow = colors.HexColor("#E5EAF3")
+            grid = colors.HexColor("#E5E7EB")
+            axis = colors.HexColor("#D1D5DB")
+            text_dark = colors.HexColor("#111827")
+            text_muted = colors.HexColor("#6B7280")
+            pill_border = colors.HexColor("#D7DBE2")
+            pill_active_bg = colors.HexColor("#EFF6FF")
+            issue_color = colors.HexColor("#F59E0B")
+
+            # Soft dashboard card shell.
+            drawing.add(Rect(3, 0, width - 6, height - 3, rx=13, ry=13, fillColor=shadow, strokeColor=None))
+            drawing.add(Rect(0, 4, width - 6, height - 7, rx=13, ry=13, fillColor=card_bg, strokeColor=colors.HexColor("#EEF2F7"), strokeWidth=0.7))
+
+            # KPI legend and numbers.
+            top_y = height - 27
+            drawing.add(Circle(26, top_y + 1, 3.6, fillColor=blue, strokeColor=blue))
+            drawing.add(String(36, top_y - 2, "Sent", fontName=regular_font, fontSize=8.5, fillColor=text_muted))
+            drawing.add(String(22, top_y - 31, compact_number(total_sent), fontName=bold_font, fontSize=25, fillColor=text_dark))
+
+            drawing.add(Circle(144, top_y + 1, 3.6, fillColor=cyan, strokeColor=cyan))
+            drawing.add(String(154, top_y - 2, "Schedules", fontName=regular_font, fontSize=8.5, fillColor=text_muted))
+            drawing.add(String(140, top_y - 31, compact_number(total_schedules), fontName=bold_font, fontSize=25, fillColor=text_dark))
+
+            # Compact range pills at top right, with selected range highlighted.
+            pill_labels = ["Today", "7D", "30D"]
+            label_lower = str(report_label or "").lower()
+            active_idx = 0
+            if "30" in label_lower:
+                active_idx = 2
+            elif "7" in label_lower:
+                active_idx = 1
+            pill_w = 35
+            pill_h = 17
+            start_x = width - 22 - (pill_w * len(pill_labels))
+            for idx, label in enumerate(pill_labels):
+                x = start_x + idx * pill_w
+                active = idx == active_idx
+                drawing.add(Rect(
+                    x, height - 31, pill_w, pill_h,
+                    rx=3.5, ry=3.5,
+                    fillColor=pill_active_bg if active else colors.white,
+                    strokeColor=blue if active else pill_border,
+                    strokeWidth=0.8,
+                ))
+                drawing.add(String(x + 9, height - 25.2, label, fontName=regular_font, fontSize=7.3, fillColor=blue if active else text_muted))
+
+            if total_issues:
+                issue_text = f"Issues {compact_number(total_issues)}"
+                drawing.add(Circle(width - 91, height - 49, 2.8, fillColor=issue_color, strokeColor=issue_color))
+                drawing.add(String(width - 83, height - 52, issue_text, fontName=regular_font, fontSize=7.3, fillColor=text_muted))
+
+            # Chart area.
+            chart_x0 = 40
+            chart_y0 = 42
+            chart_w = width - 70
+            chart_h = 122
+            max_value = nice_max(max(series_a + series_b + [1]))
+            steps = 4
+            for i in range(steps + 1):
+                y = chart_y0 + (chart_h / steps) * i
+                drawing.add(Line(chart_x0, y, chart_x0 + chart_w, y, strokeColor=grid, strokeWidth=0.55))
+                value = int(round((max_value / steps) * i))
+                label = compact_number(value)
+                drawing.add(String(12, y - 3, label, fontName=regular_font, fontSize=7.2, fillColor=text_muted))
+            drawing.add(Line(chart_x0, chart_y0, chart_x0 + chart_w, chart_y0, strokeColor=axis, strokeWidth=0.75))
+
+            def scale_points(values: list[int]) -> list[tuple[float, float]]:
+                n = max(1, len(values) - 1)
+                return [
+                    (
+                        chart_x0 + (chart_w * idx / n if len(values) > 1 else chart_w / 2),
+                        chart_y0 + (chart_h * (max(0, float(value)) / max_value if max_value else 0)),
+                    )
+                    for idx, value in enumerate(values)
+                ]
+
+            blue_points = scale_points(series_a)
+            cyan_points = scale_points(series_b)
+            blue_path = smooth_path(blue_points)
+            cyan_path = smooth_path(cyan_points)
+            cyan_path.strokeColor = cyan
+            cyan_path.strokeWidth = 2.15
+            cyan_path.fillColor = None
+            blue_path.strokeColor = blue
+            blue_path.strokeWidth = 2.25
+            blue_path.fillColor = None
+            drawing.add(cyan_path)
+            drawing.add(blue_path)
+
+            # Minimal x-axis labels, kept readable for hourly/day timelines.
+            count = len(labels)
+            if count <= 1:
+                tick_indexes = [0]
+            elif count <= 8:
+                tick_indexes = list(range(count))
+            else:
+                tick_indexes = sorted(set([0, count // 4, count // 2, (count * 3) // 4, count - 1]))
+            n = max(1, count - 1)
+            for idx in tick_indexes:
+                x = chart_x0 + (chart_w * idx / n if count > 1 else chart_w / 2)
+                label = labels[idx]
+                if len(label) > 7:
+                    label = label[:7]
+                drawing.add(String(x - 10, chart_y0 - 16, label, fontName=regular_font, fontSize=7.2, fillColor=text_muted))
+
+            # Small visual baseline ticks, like analytics dashboard activity cards.
+            mini_y = 18
+            tick_count = min(12, max(4, count))
+            for idx in range(tick_count):
+                x = chart_x0 + (chart_w * idx / max(1, tick_count - 1))
+                drawing.add(Line(x - 3, mini_y, x + 3, mini_y, strokeColor=colors.HexColor("#D6D8DC"), strokeWidth=3, strokeLineCap=1))
+
             return drawing
 
         counts = data.get("counts") or {}
@@ -17552,9 +17749,9 @@ def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
         story.append(card_table)
         story.append(Spacer(1, 8))
 
-        graph = activity_graph(analytics)
+        graph = activity_graph(analytics, report_range_label)
         if graph is not None:
-            story.append(KeepTogether([section("Report Activity Graph"), graph]))
+            story.append(KeepTogether([section("Activity Graph"), graph]))
 
         analytics_rows = [
             [P("Report Window", "TableHead"), P("Schedules", "TableHead"), P("Sent", "TableHead"), P("Failed", "TableHead"), P("Blocked", "TableHead"), P("Delivery Rate", "TableHead")],
@@ -17658,7 +17855,7 @@ async def _admin_open_report_day_picker(query, context: ContextTypes.DEFAULT_TYP
     await safe_send(lambda: query.message.edit_text(
         "📄 <b>PDF Report</b>\n\n"
         "ជ្រើសរើសថ្ងៃ ឬ Range ដែលអ្នកចង់ទាញយក Report។\n"
-        "PDF នឹងមាន graph សម្រាប់ schedules/sent/failed/blocked នៅក្នុងថ្ងៃដែលបានជ្រើស។\n\n"
+        "PDF នឹងមាន activity graph style ស្អាត សម្រាប់ schedules/sent/failed/blocked នៅក្នុងថ្ងៃដែលបានជ្រើស។\n\n"
         "Custom: ចុច <b>Type Date</b> ហើយវាយជា <code>YYYY-MM-DD</code> ឧ. <code>2026-06-29</code>។",
         parse_mode="HTML",
         reply_markup=get_admin_report_day_kb(),
@@ -17682,7 +17879,7 @@ async def _admin_send_report_pdf_for_range(query, context: ContextTypes.DEFAULT_
                 chat_id=user_id,
                 document=report_file,
                 filename=os.path.basename(path),
-                caption=f"📄 Admin PDF report with graph\nRange: {label}",
+                caption=f"📄 Admin PDF report with activity graph\nRange: {label}",
             )
         if progress:
             with suppress(Exception):
@@ -17734,7 +17931,7 @@ async def _handle_admin_report_day_text(update: Update, context: ContextTypes.DE
                 chat_id=user_id,
                 document=report_file,
                 filename=os.path.basename(path),
-                caption=f"📄 Admin PDF report with graph\nRange: {label}",
+                caption=f"📄 Admin PDF report with activity graph\nRange: {label}",
             )
         if progress:
             with suppress(Exception):
