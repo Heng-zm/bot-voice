@@ -307,6 +307,7 @@ def _perf_default(name: str, fallback: Any = None) -> Any:
 # SameSite=None requires Secure=True in modern browsers.
 DEFAULT_WEB_COOKIE_SAMESITE = "none"
 DEFAULT_WEB_COOKIE_SECURE = True
+ADMIN_BACKEND_RELEASE = "v16-web-key-generator"
 
 
 # ── FastAPI Web Server + typed settings ─────────────────────────────────────
@@ -346,6 +347,8 @@ class AppSettings(BaseSettings):
     FRONTEND_ALLOW_ALL_ORIGINS: bool = False
     ADMIN_LOGIN_RATE_LIMIT_ATTEMPTS: int = 5
     ADMIN_LOGIN_RATE_LIMIT_WINDOW_S: float = 300.0
+    ADMIN_LOGIN_RATE_LIMIT_REDIS_ENABLED: bool = True
+    ADMIN_ORIGIN_GUARD_ENABLED: bool = True
     WEB_REQUIRE_STABLE_SECRET_IN_PRODUCTION: bool = True
     MAX_CONCURRENT_TTS_USERS: int = int(_perf_default("MAX_CONCURRENT_TTS_USERS", 2))
     MAX_CONCURRENT_AI: int = 3
@@ -990,6 +993,36 @@ def _frontend_allowed_origins() -> list[str]:
     return origins
 
 
+def _normalise_origin(value: str) -> str:
+    return str(value or "").strip().rstrip("/")
+
+
+def _admin_origin_guard_enabled() -> bool:
+    return _env_bool("ADMIN_ORIGIN_GUARD_ENABLED", True)
+
+
+def _admin_origin_allowed(origin: str) -> bool:
+    origin = _normalise_origin(origin)
+    if not origin:
+        return True
+    allowed = [_normalise_origin(item) for item in _frontend_allowed_origins()]
+    if "*" in allowed and _frontend_allow_all_origins_enabled():
+        return True
+    return origin in allowed
+
+
+def _admin_origin_guard_payload(origin: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "code": "admin_origin_forbidden",
+        "error": "This admin API origin is not allowed. Set ADMIN_FRONTEND_URL and FRONTEND_ALLOWED_ORIGINS to your frontend URL.",
+        "origin": _normalise_origin(origin),
+        "frontend_url": _admin_frontend_url(),
+        "frontend_allowed_origins": _frontend_allowed_origins(),
+        "backend_only": _backend_only_mode(),
+    }
+
+
 def _request_wants_json() -> bool:
     try:
         accept = str(request.headers.get("accept") or "").lower()
@@ -1082,6 +1115,35 @@ if _allowed_frontend_origins:
     else:
         cors_kwargs.update({"allow_origins": _allowed_frontend_origins})
     app.add_middleware(CORSMiddleware, **cors_kwargs)
+
+
+@app.middleware("http")
+async def _admin_origin_guard_middleware(req: FastAPIRequest, call_next):
+    """Reject browser state-changing admin API calls from unknown origins.
+
+    CORS controls what browsers can read, but this guard also prevents
+    credentialed writes from untrusted sites when cookies are enabled.  Requests
+    with no Origin header (curl/server-to-server/same-origin form posts) are
+    allowed. Configure ADMIN_FRONTEND_URL / FRONTEND_ALLOWED_ORIGINS for a
+    separated frontend.
+    """
+    method = str(req.method or "GET").upper()
+    path = str(req.url.path or "")
+    if (
+        _admin_origin_guard_enabled()
+        and method in {"POST", "PUT", "PATCH", "DELETE"}
+        and (path.startswith("/api/admin") or path.startswith("/admin/"))
+    ):
+        origin = _normalise_origin(req.headers.get("origin") or "")
+        if origin and not _admin_origin_allowed(origin):
+            logging.getLogger(__name__).warning(
+                "Blocked admin API request from disallowed origin origin=%s method=%s path=%s",
+                origin,
+                method,
+                path,
+            )
+            return _FastJSONResponse(_admin_origin_guard_payload(origin), status_code=403)
+    return await call_next(req)
 
 
 def _is_legacy_admin_frontend_request(path: str, method: str) -> bool:
@@ -1275,6 +1337,9 @@ def readyz():
         "ffmpeg_ok": bool(ffmpeg_path and os.path.exists(str(ffmpeg_path))),
         "web_secret_configured": _web_stable_secret_configured(),
         "frontend_allowed_origins": _frontend_allowed_origins(),
+        "origin_guard_enabled": _admin_origin_guard_enabled(),
+        "cookie_policy": _admin_cookie_policy_payload(),
+        "release": ADMIN_BACKEND_RELEASE,
         "bot_mode": _run_state_bot_mode() if "_run_state_bot_mode" in globals() else globals().get("BOT_MODE", "POLLING"),
         "webhook_ready": bool(globals().get("_TELEGRAM_APP")),
         "telegram_leader": _telegram_leader_snapshot() if "_telegram_leader_snapshot" in globals() else {},
@@ -3330,15 +3395,19 @@ _ADMIN_LOGIN_ATTEMPTS_LOCK = threading.RLock()
 
 
 def _web_client_ip() -> str:
-    # Respect common proxy headers on Render/proxy deployments. Only the first
-    # X-Forwarded-For value is used because it represents the original client.
+    # Respect common proxy headers only when WEB_TRUST_PROXY/RENDER is enabled.
+    # Otherwise use the ASGI client host so spoofed X-Forwarded-For headers do
+    # not bypass login throttling on direct/local deployments.
     try:
         if _env_bool("WEB_TRUST_PROXY", _env_bool("RENDER", False)):
             for header in ("cf-connecting-ip", "x-real-ip", "x-forwarded-for"):
                 value = str(request.headers.get(header) or "").strip()
                 if value:
                     return value.split(",", 1)[0].strip()[:80]
-        return str(request.headers.get("x-real-ip") or request.headers.get("x-forwarded-for") or "unknown").split(",", 1)[0].strip()[:80] or "unknown"
+        req_obj = getattr(request, "_req", None)
+        client = getattr(req_obj, "client", None)
+        host = str(getattr(client, "host", "") or "").strip()
+        return host[:80] or "unknown"
     except Exception:
         return "unknown"
 
@@ -3354,8 +3423,43 @@ def _admin_login_rate_limit_config() -> tuple[int, float]:
     return attempts, window_s
 
 
+def _admin_login_redis_enabled() -> bool:
+    return _env_bool("ADMIN_LOGIN_RATE_LIMIT_REDIS_ENABLED", True) and globals().get("redis_client") is not None
+
+
+def _admin_login_redis_key(admin_id: int | None) -> str:
+    key_hash = _admin_login_rate_limit_key(admin_id)
+    key_builder = globals().get("_redis_key")
+    if callable(key_builder):
+        with suppress(Exception):
+            return str(key_builder("admin_login_fail", key_hash))
+    return f"admin_login_fail:{key_hash}"
+
+
+def _admin_login_redis_count(admin_id: int | None) -> tuple[int | None, int | None]:
+    if not _admin_login_redis_enabled():
+        return None, None
+    redis_obj = globals().get("redis_client")
+    key = _admin_login_redis_key(admin_id)
+    try:
+        raw = redis_obj.get(key)
+        count = int(raw or 0)
+        ttl = redis_obj.ttl(key)
+        ttl_i = int(ttl) if ttl is not None and int(ttl) > 0 else None
+        return count, ttl_i
+    except Exception as exc:
+        _log_once(logging.WARNING, "admin_login_redis_limit_fallback", "Admin login Redis rate-limit fallback: %s", exc)
+        return None, None
+
+
 def _admin_login_is_limited(admin_id: int | None) -> tuple[bool, int]:
     limit, window_s = _admin_login_rate_limit_config()
+    redis_count, redis_ttl = _admin_login_redis_count(admin_id)
+    if redis_count is not None:
+        if redis_count >= limit:
+            return True, max(1, int(redis_ttl or window_s))
+        return False, 0
+
     key = _admin_login_rate_limit_key(admin_id)
     now = time.monotonic()
     with _ADMIN_LOGIN_ATTEMPTS_LOCK:
@@ -3371,6 +3475,17 @@ def _admin_login_is_limited(admin_id: int | None) -> tuple[bool, int]:
 
 def _admin_login_record_failure(admin_id: int | None) -> None:
     _limit, window_s = _admin_login_rate_limit_config()
+    if _admin_login_redis_enabled():
+        redis_obj = globals().get("redis_client")
+        key = _admin_login_redis_key(admin_id)
+        try:
+            count = int(redis_obj.incr(key) or 1)
+            if count == 1 or int(redis_obj.ttl(key) or -1) < 0:
+                redis_obj.expire(key, int(window_s))
+            return
+        except Exception as exc:
+            _log_once(logging.WARNING, "admin_login_redis_record_fallback", "Admin login Redis failure-record fallback: %s", exc)
+
     key = _admin_login_rate_limit_key(admin_id)
     now = time.monotonic()
     with _ADMIN_LOGIN_ATTEMPTS_LOCK:
@@ -3388,9 +3503,23 @@ def _admin_login_record_failure(admin_id: int | None) -> None:
 
 
 def _admin_login_clear_failures(admin_id: int | None) -> None:
+    if _admin_login_redis_enabled():
+        redis_obj = globals().get("redis_client")
+        try:
+            redis_obj.delete(_admin_login_redis_key(admin_id))
+        except Exception:
+            pass
     key = _admin_login_rate_limit_key(admin_id)
     with _ADMIN_LOGIN_ATTEMPTS_LOCK:
         _ADMIN_LOGIN_ATTEMPTS.pop(key, None)
+
+
+def _admin_cookie_policy_payload() -> dict[str, Any]:
+    return {
+        "same_site": _cookie_samesite(),
+        "secure": bool(_default_cookie_secure()),
+        "session_cookie_name": str(getattr(SETTINGS, "WEB_SESSION_COOKIE_NAME", "bot_admin_session") or "bot_admin_session"),
+    }
 
 
 def _admin_auth_profile_payload(admin_id: int | None = None, *, authenticated: bool = True) -> dict[str, Any]:
@@ -3421,6 +3550,9 @@ def _admin_auth_profile_payload(admin_id: int | None = None, *, authenticated: b
         "admin_ids_configured": bool(ADMIN_IDS),
         "admin_password_configured": bool(_web_admin_password()),
         "frontend_allowed_origins": _frontend_allowed_origins(),
+        "origin_guard_enabled": _admin_origin_guard_enabled(),
+        "cookie_policy": _admin_cookie_policy_payload(),
+        "release": ADMIN_BACKEND_RELEASE,
     }
 
 
@@ -3529,6 +3661,10 @@ def api_admin_bootstrap():
         "timezone_label": f"{APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})",
         "health_endpoint": "/readyz",
         "status_endpoint": "/admin/status.json",
+        "release": ADMIN_BACKEND_RELEASE,
+        "cookie_policy": _admin_cookie_policy_payload(),
+        "origin_guard_enabled": _admin_origin_guard_enabled(),
+        "frontend_allowed_origins": _frontend_allowed_origins(),
         "live_endpoint": "/admin/live.json",
         "performance_endpoint": "/admin/performance.json",
         "errors_endpoint": "/admin/errors.json",
@@ -13627,9 +13763,122 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🛠️ Runtime",    callback_data="admin_runtime")],
         [InlineKeyboardButton("🔑 API Keys",    callback_data="admin_api"),
          InlineKeyboardButton("📄 Report PDF",  callback_data="admin_report")],
+        [InlineKeyboardButton("🔐 WEB_KEY",     callback_data="admin_web_key")],
         [InlineKeyboardButton("🔄 Refresh",     callback_data="admin_home")],
         [InlineKeyboardButton("❌ Close",       callback_data="admin_close")],
     ])
+
+
+def generate_web_secret_key() -> str:
+    """Return a strong WEB_SECRET_KEY value for Starlette/FastAPI sessions.
+
+    The key must be copied into the deployment environment and applied on
+    restart.  Runtime replacement is intentionally avoided because the session
+    middleware signs/verifies cookies with the startup key.
+    """
+    return secrets.token_urlsafe(48)
+
+
+def _web_secret_key_fingerprint(secret_value: str) -> str:
+    value = str(secret_value or "")
+    if not value:
+        return "not-set"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def _configured_web_secret_source() -> tuple[str, str]:
+    """Return (source, value) for the active configured web session secret.
+
+    This never exposes the secret to logs or public API responses.
+    """
+    web_key = os.environ.get("WEB_SECRET_KEY", "").strip()
+    if web_key:
+        return "WEB_SECRET_KEY", web_key
+    flask_key = os.environ.get("FLASK_SECRET_KEY", "").strip()
+    if flask_key:
+        return "FLASK_SECRET_KEY", flask_key
+    settings_key = str(getattr(SETTINGS, "WEB_SECRET_KEY", "") or "").strip()
+    if settings_key:
+        return "SETTINGS.WEB_SECRET_KEY", settings_key
+    settings_flask_key = str(getattr(SETTINGS, "FLASK_SECRET_KEY", "") or "").strip()
+    if settings_flask_key:
+        return "SETTINGS.FLASK_SECRET_KEY", settings_flask_key
+    return "random-startup-fallback", ""
+
+
+def _web_key_private_message(new_key: str) -> str:
+    source, current_value = _configured_web_secret_source()
+    current_status = "configured" if current_value else "missing / random fallback"
+    current_fp = _web_secret_key_fingerprint(current_value)
+    new_fp = _web_secret_key_fingerprint(new_key)
+    generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return (
+        "🔐 <b>New WEB_SECRET_KEY generated</b>\n\n"
+        "Copy this exact value to your hosting environment, then restart/deploy "
+        "<b>all</b> backend instances.\n\n"
+        f"<pre>WEB_SECRET_KEY={html.escape(new_key)}</pre>\n"
+        "Recommended cookie env for separated frontend:\n"
+        "<pre>WEB_COOKIE_SAMESITE=none\nWEB_COOKIE_SECURE=true</pre>\n"
+        "Important:\n"
+        "• This is <b>not</b> the admin login password. It signs web admin session cookies.\n"
+        "• The running server cannot safely use this new value until restart.\n"
+        "• Existing admin browser sessions will be logged out after rotation.\n"
+        "• Do not share this key or paste it in public logs.\n\n"
+        f"Current source: <code>{html.escape(source)}</code>\n"
+        f"Current status: <code>{html.escape(current_status)}</code>\n"
+        f"Current fingerprint: <code>{html.escape(current_fp)}</code>\n"
+        f"New fingerprint: <code>{html.escape(new_fp)}</code>\n"
+        f"Generated UTC: <code>{html.escape(generated_at)}</code>"
+    )
+
+
+async def _admin_generate_web_key(query, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate WEB_SECRET_KEY from Telegram /admin without leaking in groups.
+
+    The secret is sent only to the requesting admin's private Telegram chat.
+    The admin panel message only shows a non-sensitive confirmation.
+    """
+    new_key = generate_web_secret_key()
+    fingerprint = _web_secret_key_fingerprint(new_key)
+    try:
+        await context.bot.send_message(
+            chat_id=int(user_id),
+            text=_web_key_private_message(new_key),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Forbidden:
+        await safe_send(lambda: query.message.edit_text(
+            "⚠️ <b>Cannot send WEB_KEY privately.</b>\n\n"
+            "Please open a private chat with this bot, press /start, then return to /admin and tap <b>WEB_KEY</b> again.\n\n"
+            "For safety, the secret was not shown in this chat.",
+            parse_mode="HTML",
+            reply_markup=get_admin_dashboard_kb(),
+            disable_web_page_preview=True,
+        ))
+        return
+    except Exception as exc:
+        logger.error("WEB_SECRET_KEY private delivery failed admin_id=%s fingerprint=%s: %s", user_id, fingerprint, exc, exc_info=True)
+        await safe_send(lambda: query.message.edit_text(
+            "⚠️ <b>WEB_KEY generation failed to deliver.</b>\n\n"
+            f"Reason: <code>{html.escape(str(exc)[:300])}</code>\n\n"
+            "For safety, the secret was not shown here.",
+            parse_mode="HTML",
+            reply_markup=get_admin_dashboard_kb(),
+            disable_web_page_preview=True,
+        ))
+        return
+
+    logger.info("WEB_SECRET_KEY generated for admin_id=%s fingerprint=%s", user_id, fingerprint)
+    await safe_send(lambda: query.message.edit_text(
+        "✅ <b>WEB_KEY generated.</b>\n\n"
+        "I sent the new <code>WEB_SECRET_KEY</code> to your private Telegram chat.\n"
+        "Copy it into Render/Railway/VPS env and restart all backend instances.\n\n"
+        f"Fingerprint: <code>{html.escape(fingerprint)}</code>",
+        parse_mode="HTML",
+        reply_markup=get_admin_dashboard_kb(),
+        disable_web_page_preview=True,
+    ))
 
 
 _CRM_TELEGRAM_SEGMENTS = {
@@ -17735,6 +17984,10 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         ))
         return
 
+    if data == "admin_web_key":
+        await _admin_generate_web_key(query, user_id, context)
+        return
+
     if data == "admin_report":
         # on_callback already answered this callback once; do not answer again.
         path = ""
@@ -20724,7 +20977,10 @@ async def _run_bot():
     # Anti-flood/security guards must run before stale-drop and expensive handlers.
     app.add_handler(TypeHandler(Update, _telegram_rate_limit_guard), group=-3)
     app.add_handler(TypeHandler(Update, _telegram_user_security_guard), group=-2)
-    app.add_handler(TypeHandler(Update, _drop_stale_updates), group=-1)
+    if _run_state_bot_mode() != "WEBHOOK":
+        app.add_handler(TypeHandler(Update, _drop_stale_updates), group=-1)
+    else:
+        webhook_logger.info("Stale update drop handler skipped in WEBHOOK mode to preserve Telegram retries after cold starts.")
 
     # Commands
     app.add_handler(CommandHandler("start",           on_start))
