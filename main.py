@@ -16,6 +16,7 @@ import hmac
 import secrets
 import socket
 import atexit
+import base64
 import httpx
 import imageio_ffmpeg as _iio_ffmpeg
 from collections import OrderedDict, deque
@@ -307,7 +308,7 @@ def _perf_default(name: str, fallback: Any = None) -> Any:
 # SameSite=None requires Secure=True in modern browsers.
 DEFAULT_WEB_COOKIE_SAMESITE = "none"
 DEFAULT_WEB_COOKIE_SECURE = True
-ADMIN_BACKEND_RELEASE = "v16-web-key-generator"
+ADMIN_BACKEND_RELEASE = "v18-redis-web-secret"
 
 
 # ── FastAPI Web Server + typed settings ─────────────────────────────────────
@@ -328,6 +329,9 @@ class AppSettings(BaseSettings):
     WEB_TRUST_PROXY: bool = False
     FLASK_SECRET_KEY: str = ""
     WEB_SECRET_KEY: str = ""
+    # Redis-backed web session secret. The app reads this before normal Redis
+    # startup so WEB_SECRET_KEY no longer needs to live in Render/Railway env.
+    WEB_SECRET_REDIS_KEY: str = ""
     WEB_SESSION_COOKIE_NAME: str = "bot_admin_session"
     WEB_COOKIE_SAMESITE: str = DEFAULT_WEB_COOKIE_SAMESITE
     WEB_COOKIE_SECURE: bool = DEFAULT_WEB_COOKIE_SECURE
@@ -349,6 +353,12 @@ class AppSettings(BaseSettings):
     ADMIN_LOGIN_RATE_LIMIT_WINDOW_S: float = 300.0
     ADMIN_LOGIN_RATE_LIMIT_REDIS_ENABLED: bool = True
     ADMIN_ORIGIN_GUARD_ENABLED: bool = True
+    # Optional bearer fallback for separated frontends when browser cookies are
+    # blocked by local dev, preview domains, or missing credentials: include.
+    # The token is short-lived, HMAC-signed with WEB_SECRET_KEY, and accepted
+    # only for explicitly configured ADMIN_IDS.
+    ADMIN_API_TOKEN_FALLBACK_ENABLED: bool = True
+    ADMIN_API_TOKEN_TTL_SECONDS: int = 0
     WEB_REQUIRE_STABLE_SECRET_IN_PRODUCTION: bool = True
     MAX_CONCURRENT_TTS_USERS: int = int(_perf_default("MAX_CONCURRENT_TTS_USERS", 2))
     MAX_CONCURRENT_AI: int = 3
@@ -496,9 +506,188 @@ def _is_production_runtime() -> bool:
 
 
 _WEB_SESSION_SECRET_CACHE: str | None = None
+_WEB_SESSION_SECRET_SOURCE_CACHE: str = ""
+_WEB_SESSION_SECRET_REDIS_CLIENT: Any | None = None
+_WEB_SESSION_SECRET_REDIS_LOCK = threading.RLock()
+_WEB_SESSION_SECRET_REDIS_LAST_ERROR: str = ""
+
+
+def _generate_web_secret_value() -> str:
+    """Generate a strong Starlette/FastAPI session signing secret."""
+    return secrets.token_urlsafe(48)
+
+
+def _web_secret_fingerprint(secret_value: str) -> str:
+    value = str(secret_value or "")
+    if not value:
+        return "not-set"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def _web_secret_redis_key() -> str:
+    """Redis key that stores the stable WEB_SECRET_KEY replacement."""
+    configured = str(
+        os.environ.get("WEB_SECRET_REDIS_KEY")
+        or getattr(SETTINGS, "WEB_SECRET_REDIS_KEY", "")
+        or ""
+    ).strip()
+    if configured:
+        return configured
+    prefix = str(os.environ.get("REDIS_CACHE_PREFIX") or "tgbot").strip() or "tgbot"
+    return f"{prefix}:web_secret_key:v1"
+
+
+def _web_secret_redis_url() -> str:
+    return str(os.environ.get("REDIS_URL") or "").strip()
+
+
+def _web_secret_redis_client() -> Any | None:
+    """Return a Redis client usable before the normal app Redis init runs.
+
+    FastAPI SessionMiddleware is created during module import, before load_env()
+    initializes the shared redis_client.  This small early client exists only so
+    the web session secret can be read/generated from Redis at startup.  After
+    the normal redis_client exists, this helper reuses it.
+    """
+    global _WEB_SESSION_SECRET_REDIS_CLIENT, _WEB_SESSION_SECRET_REDIS_LAST_ERROR
+
+    shared_client = globals().get("redis_client")
+    if shared_client is not None:
+        return shared_client
+
+    if redis_lib is None:
+        _WEB_SESSION_SECRET_REDIS_LAST_ERROR = "redis package is not installed"
+        return None
+
+    redis_url = _web_secret_redis_url()
+    if not redis_url:
+        _WEB_SESSION_SECRET_REDIS_LAST_ERROR = "REDIS_URL is not configured"
+        return None
+
+    with _WEB_SESSION_SECRET_REDIS_LOCK:
+        if _WEB_SESSION_SECRET_REDIS_CLIENT is not None:
+            return _WEB_SESSION_SECRET_REDIS_CLIENT
+        try:
+            timeout = _env_float("WEB_SECRET_REDIS_SOCKET_TIMEOUT_S", 3.0, minimum=0.2, maximum=30.0)
+            max_connections = _env_int("WEB_SECRET_REDIS_MAX_CONNECTIONS", 3, minimum=1, maximum=20)
+            client = redis_lib.from_url(
+                redis_url,
+                decode_responses=True,
+                socket_timeout=timeout,
+                socket_connect_timeout=timeout,
+                health_check_interval=30,
+                retry_on_timeout=True,
+                max_connections=max_connections,
+            )
+            client.ping()
+            _WEB_SESSION_SECRET_REDIS_CLIENT = client
+            _WEB_SESSION_SECRET_REDIS_LAST_ERROR = ""
+            logging.getLogger(__name__).info(
+                "Redis web session secret client initialised key=%s max_connections=%s.",
+                _web_secret_redis_key(),
+                max_connections,
+            )
+            return client
+        except Exception as exc:
+            _WEB_SESSION_SECRET_REDIS_LAST_ERROR = str(exc)[:300]
+            logging.getLogger(__name__).warning(
+                "Redis web session secret client failed; falling back if possible: %s",
+                _WEB_SESSION_SECRET_REDIS_LAST_ERROR,
+            )
+            return None
+
+
+def _web_secret_get_from_redis() -> tuple[str, str]:
+    client = _web_secret_redis_client()
+    if client is None:
+        return "", "redis-unavailable"
+    key = _web_secret_redis_key()
+    try:
+        raw = client.get(key)
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="ignore")
+        value = str(raw or "").strip()
+        if len(value) >= 32:
+            return value, f"redis:{key}"
+        if value:
+            logging.getLogger(__name__).warning(
+                "Ignoring too-short Redis WEB_SECRET_KEY value key=%s fingerprint=%s.",
+                key,
+                _web_secret_fingerprint(value),
+            )
+        return "", f"redis:{key}:missing"
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Redis WEB_SECRET_KEY read failed key=%s: %s", key, exc)
+        return "", f"redis:{key}:error"
+
+
+def _web_secret_set_in_redis_sync(secret_value: str, *, overwrite: bool = True) -> tuple[bool, str]:
+    secret_value = str(secret_value or "").strip()
+    if len(secret_value) < 32:
+        return False, "Generated secret is too short; refusing to store it."
+    client = _web_secret_redis_client()
+    if client is None:
+        detail = _WEB_SESSION_SECRET_REDIS_LAST_ERROR or "Redis is not available"
+        return False, f"Cannot store WEB_SECRET_KEY in Redis: {detail}"
+    key = _web_secret_redis_key()
+    try:
+        if overwrite:
+            ok = client.set(key, secret_value)
+        else:
+            ok = client.set(key, secret_value, nx=True)
+        if not ok and not overwrite:
+            return False, f"Redis key already exists: {key}"
+        return True, f"Stored in Redis key {key}"
+    except Exception as exc:
+        logging.getLogger(__name__).error("Redis WEB_SECRET_KEY write failed key=%s: %s", key, exc, exc_info=True)
+        return False, f"Redis WEB_SECRET_KEY write failed: {str(exc)[:300]}"
+
+
+def _web_secret_get_or_create_from_redis() -> tuple[str, str]:
+    existing, source = _web_secret_get_from_redis()
+    if existing:
+        return existing, source
+
+    client = _web_secret_redis_client()
+    if client is None:
+        return "", source
+
+    key = _web_secret_redis_key()
+    generated = _generate_web_secret_value()
+    try:
+        # NX makes first boot safe in two-server mode: one instance creates the
+        # shared secret, the other reads the winning value immediately after.
+        created = bool(client.set(key, generated, nx=True))
+        if created:
+            logging.getLogger(__name__).warning(
+                "Generated and stored new Redis WEB_SECRET_KEY replacement key=%s fingerprint=%s. Restart all backend instances after manual rotations only.",
+                key,
+                _web_secret_fingerprint(generated),
+            )
+            return generated, f"redis:{key}:generated"
+        winner, winner_source = _web_secret_get_from_redis()
+        if winner:
+            return winner, winner_source
+        return "", f"redis:{key}:race-empty"
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Redis WEB_SECRET_KEY auto-create failed key=%s: %s", key, exc)
+        return "", f"redis:{key}:create-error"
+
+
+def _web_session_secret_source() -> str:
+    return _WEB_SESSION_SECRET_SOURCE_CACHE or "unknown"
+
+
+def _web_session_secret_fingerprint() -> str:
+    return _web_secret_fingerprint(_WEB_SESSION_SECRET_CACHE or "")
 
 
 def _web_stable_secret_configured() -> bool:
+    if _WEB_SESSION_SECRET_CACHE and not (_WEB_SESSION_SECRET_SOURCE_CACHE or "").startswith("random-startup"):
+        return True
+    redis_value, _redis_source = _web_secret_get_from_redis()
+    if redis_value:
+        return True
     return bool(
         os.environ.get("WEB_SECRET_KEY")
         or os.environ.get("FLASK_SECRET_KEY")
@@ -508,7 +697,20 @@ def _web_stable_secret_configured() -> bool:
 
 
 def _web_session_secret_key() -> str:
-    global _WEB_SESSION_SECRET_CACHE
+    global _WEB_SESSION_SECRET_CACHE, _WEB_SESSION_SECRET_SOURCE_CACHE
+
+    if _WEB_SESSION_SECRET_CACHE:
+        return _WEB_SESSION_SECRET_CACHE
+
+    # Primary path: Redis.  This removes the need to put WEB_SECRET_KEY in the
+    # deployment environment and keeps multiple backend instances in sync.
+    redis_secret, redis_source = _web_secret_get_or_create_from_redis()
+    if redis_secret:
+        _WEB_SESSION_SECRET_CACHE = redis_secret
+        _WEB_SESSION_SECRET_SOURCE_CACHE = redis_source
+        return redis_secret
+
+    # Compatibility fallback only.  Redis remains the preferred source.
     secret = (
         os.environ.get("WEB_SECRET_KEY")
         or os.environ.get("FLASK_SECRET_KEY")
@@ -519,21 +721,25 @@ def _web_session_secret_key() -> str:
     secret = str(secret or "").strip()
     if secret:
         _WEB_SESSION_SECRET_CACHE = secret
+        _WEB_SESSION_SECRET_SOURCE_CACHE = "env:web_secret_key"
+        logging.getLogger(__name__).warning(
+            "Using env WEB_SECRET_KEY fallback. Recommended: remove WEB_SECRET_KEY from env and store the key in Redis key=%s.",
+            _web_secret_redis_key(),
+        )
         return secret
 
-    if _WEB_SESSION_SECRET_CACHE:
-        return _WEB_SESSION_SECRET_CACHE
-
     msg = (
-        "WEB_SECRET_KEY / FLASK_SECRET_KEY is not configured. "
+        "Redis-backed WEB_SECRET_KEY is not available. "
         "A temporary in-memory session secret will be used; admin sessions "
-        "will reset after restart and may not work across multiple servers."
+        "will reset after restart and may not work across multiple servers. "
+        "Set REDIS_URL so the app can store the web session secret in Redis."
     )
     if _is_production_runtime() and _env_bool("WEB_REQUIRE_STABLE_SECRET_IN_PRODUCTION", True):
-        logging.getLogger(__name__).critical(msg + " Set WEB_SECRET_KEY in production.")
+        logging.getLogger(__name__).critical(msg)
     else:
         logging.getLogger(__name__).warning(msg)
     _WEB_SESSION_SECRET_CACHE = secrets.token_hex(32)
+    _WEB_SESSION_SECRET_SOURCE_CACHE = "random-startup-fallback"
     return _WEB_SESSION_SECRET_CACHE
 
 
@@ -1336,6 +1542,9 @@ def readyz():
         "redis_configured": bool(globals().get("redis_client")),
         "ffmpeg_ok": bool(ffmpeg_path and os.path.exists(str(ffmpeg_path))),
         "web_secret_configured": _web_stable_secret_configured(),
+        "web_secret_source": _web_session_secret_source(),
+        "web_secret_fingerprint": _web_session_secret_fingerprint(),
+        "web_secret_redis_key": _web_secret_redis_key(),
         "frontend_allowed_origins": _frontend_allowed_origins(),
         "origin_guard_enabled": _admin_origin_guard_enabled(),
         "cookie_policy": _admin_cookie_policy_payload(),
@@ -2822,9 +3031,18 @@ def _web_int(value: Any, default: int = 0) -> int:
 
 
 def _web_current_admin_id() -> int:
-    saved = _web_int(session.get("web_admin_id"), 0)
+    # Prefer the signed cookie session, but support the API-only bearer
+    # fallback below so separated frontends can still hydrate /auth/me when a
+    # browser refuses third-party/cross-site cookies.
+    try:
+        saved = _web_int(session.get("web_admin_id"), 0)
+    except Exception:
+        saved = 0
     if saved:
         return saved
+    bearer_admin_id = _web_bearer_admin_id() if "_web_bearer_admin_id" in globals() else 0
+    if bearer_admin_id:
+        return int(bearer_admin_id)
     if ADMIN_IDS:
         return int(sorted(ADMIN_IDS)[0])
     return 0
@@ -2848,7 +3066,111 @@ def _web_csrf_token() -> str:
     return str(token)
 
 
+def _admin_api_token_fallback_enabled() -> bool:
+    return _env_bool("ADMIN_API_TOKEN_FALLBACK_ENABLED", True)
+
+
+def _admin_api_token_ttl_seconds() -> int:
+    configured = _env_int("ADMIN_API_TOKEN_TTL_SECONDS", 0, minimum=0, maximum=31 * 86400)
+    if configured > 0:
+        return configured
+    days = _env_int("WEB_ADMIN_SESSION_DAYS", 14, minimum=1, maximum=365)
+    return min(days * 86400, 14 * 86400)
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(data: str) -> bytes:
+    data = str(data or "")
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode((data + padding).encode("ascii"))
+
+
+def _admin_api_token_secret() -> bytes:
+    # Derive a dedicated signing key from the web session secret instead of
+    # reusing it directly.  Token verification automatically fails after
+    # WEB_SECRET_KEY rotation/restart, matching admin session behavior.
+    secret = _web_session_secret_key().encode("utf-8")
+    return hmac.new(secret, b"bot-admin-api-token-v1", hashlib.sha256).digest()
+
+
+def _admin_issue_api_token(admin_id: int) -> tuple[str | None, int]:
+    if not _admin_api_token_fallback_enabled():
+        return None, 0
+    admin_id = int(admin_id or 0)
+    if not _web_valid_admin_id(admin_id):
+        return None, 0
+    now = int(time.time())
+    ttl = _admin_api_token_ttl_seconds()
+    payload = {
+        "v": 1,
+        "admin_id": admin_id,
+        "iat": now,
+        "exp": now + ttl,
+        "nonce": secrets.token_urlsafe(16),
+    }
+    body = _b64url_encode(_json_dumps_fast(payload))
+    sig = _b64url_encode(hmac.new(_admin_api_token_secret(), body.encode("ascii"), hashlib.sha256).digest())
+    return f"v1.{body}.{sig}", ttl
+
+
+def _admin_verify_api_token(token: str) -> int | None:
+    if not _admin_api_token_fallback_enabled():
+        return None
+    token = str(token or "").strip()
+    parts = token.split(".")
+    if len(parts) != 3 or parts[0] != "v1":
+        return None
+    _version, body, got_sig = parts
+    expected_sig = _b64url_encode(hmac.new(_admin_api_token_secret(), body.encode("ascii"), hashlib.sha256).digest())
+    if not hmac.compare_digest(got_sig, expected_sig):
+        return None
+    try:
+        payload = _json_loads_fast(_b64url_decode(body))
+        admin_id = int(payload.get("admin_id") or 0)
+        exp = int(payload.get("exp") or 0)
+    except Exception:
+        return None
+    if exp < int(time.time()):
+        return None
+    if not _web_valid_admin_id(admin_id):
+        return None
+    return admin_id
+
+
+def _web_bearer_token_from_request() -> str:
+    try:
+        auth = str(request.headers.get("authorization") or "").strip()
+        if auth.lower().startswith("bearer "):
+            return auth.split(None, 1)[1].strip()
+        # Convenience for fetch clients that cannot set Authorization during an
+        # early migration.  Prefer Authorization: Bearer in new frontends.
+        header_token = str(request.headers.get("x-admin-session-token") or "").strip()
+        return header_token
+    except Exception:
+        return ""
+
+
+def _web_bearer_admin_id() -> int:
+    token = _web_bearer_token_from_request()
+    if not token:
+        return 0
+    admin_id = _admin_verify_api_token(token)
+    return int(admin_id or 0)
+
+
+def _web_using_bearer_auth() -> bool:
+    return bool(_web_bearer_admin_id())
+
+
 def _web_check_csrf() -> None:
+    # Cookie-authenticated browser writes require CSRF.  Bearer fallback writes
+    # are allowed without CSRF because browsers do not attach Authorization
+    # headers automatically across origins.
+    if _web_using_bearer_auth():
+        return
     expected = str(session.get("web_csrf_token") or "")
     got = str(request.form.get("csrf_token") or request.headers.get("X-CSRF-Token") or "")
     if not expected or not got or not hmac.compare_digest(expected, got):
@@ -3342,13 +3664,21 @@ window.WEB_CSRF={{ csrf|tojson }};
 
 
 def _web_admin_session_valid() -> bool:
-    if not bool(session.get("web_admin_ok")):
-        return False
-    admin_id = _web_int(session.get("web_admin_id"), 0)
-    if not _web_valid_admin_id(admin_id):
-        session.clear()
-        return False
-    return True
+    # Primary auth path: signed Starlette session cookie.
+    try:
+        if bool(session.get("web_admin_ok")):
+            admin_id = _web_int(session.get("web_admin_id"), 0)
+            if _web_valid_admin_id(admin_id):
+                return True
+            session.clear()
+            return False
+    except Exception:
+        pass
+
+    # API-only fallback: short-lived HMAC bearer token returned by login.
+    # This fixes separated frontends that can log in but cannot hydrate
+    # /api/admin/auth/me because the browser did not persist the cookie.
+    return bool(_web_bearer_admin_id())
 
 
 def _web_locked_admin_html(message: str) -> str:
@@ -3515,10 +3845,16 @@ def _admin_login_clear_failures(admin_id: int | None) -> None:
 
 
 def _admin_cookie_policy_payload() -> dict[str, Any]:
+    same_site = _cookie_samesite()
+    secure = bool(_default_cookie_secure())
     return {
-        "same_site": _cookie_samesite(),
-        "secure": bool(_default_cookie_secure()),
+        "same_site": same_site,
+        "secure": secure,
         "session_cookie_name": str(getattr(SETTINGS, "WEB_SESSION_COOKIE_NAME", "bot_admin_session") or "bot_admin_session"),
+        "requires_fetch_credentials_include": True,
+        "same_site_none_requires_secure": same_site == "none",
+        "bearer_fallback_enabled": _admin_api_token_fallback_enabled(),
+        "note": "For separated frontend calls, use fetch/axios credentials include for cookies, or Authorization: Bearer <access_token> fallback.",
     }
 
 
@@ -3552,6 +3888,8 @@ def _admin_auth_profile_payload(admin_id: int | None = None, *, authenticated: b
         "frontend_allowed_origins": _frontend_allowed_origins(),
         "origin_guard_enabled": _admin_origin_guard_enabled(),
         "cookie_policy": _admin_cookie_policy_payload(),
+        "auth_methods": ["cookie", "bearer"] if _admin_api_token_fallback_enabled() else ["cookie"],
+        "bearer_fallback_enabled": _admin_api_token_fallback_enabled(),
         "release": ADMIN_BACKEND_RELEASE,
     }
 
@@ -3628,11 +3966,19 @@ def api_admin_auth_login():
     session["web_login_at"] = datetime.now(timezone.utc).isoformat()
     csrf = _web_csrf_token()
     auth_payload = _admin_auth_profile_payload(int(session["web_admin_id"]), authenticated=True)
+    api_token, token_ttl = _admin_issue_api_token(int(session["web_admin_id"]))
     auth_payload.update({
         "csrf_token": csrf,
         "session": "cookie",
         "message": "Login successful.",
     })
+    if api_token:
+        auth_payload.update({
+            "access_token": api_token,
+            "token_type": "Bearer",
+            "expires_in": token_ttl,
+            "authorization_header": "Bearer <access_token>",
+        })
     return _admin_api_success(auth_payload)
 
 
@@ -3648,7 +3994,10 @@ def api_admin_auth_logout():
     if request.method == "OPTIONS":
         return _admin_api_success({"preflight": True}, status_code=204)
     session.clear()
-    return _admin_api_success({"message": "Logged out."})
+    return _admin_api_success({
+        "message": "Logged out.",
+        "bearer_token_note": "Stateless bearer fallback tokens expire automatically; discard the token in the frontend on logout.",
+    })
 
 
 @app_flask.route("/api/admin/bootstrap", methods=["GET"])
@@ -3670,6 +4019,8 @@ def api_admin_bootstrap():
         "errors_endpoint": "/admin/errors.json",
         "broadcast_jobs_endpoint": "/admin/broadcast/jobs.json",
         "report_pdf_endpoint": "/admin/report.pdf",
+        "auth_methods": ["cookie", "bearer"] if _admin_api_token_fallback_enabled() else ["cookie"],
+        "bearer_fallback_enabled": _admin_api_token_fallback_enabled(),
     })
 
 
@@ -4162,7 +4513,7 @@ def _web_env_check_rows() -> str:
         ("TELEGRAM_BOT_TOKEN", bool(TELEGRAM_BOT_TOKEN), "Required"),
         ("ADMIN_IDS", bool(ADMIN_IDS), "Recommended"),
         ("ADMIN_WEB_PASSWORD / WEB_ADMIN_PASSWORD", bool(_web_admin_password()), "Required for dashboard"),
-        ("FLASK_SECRET_KEY / WEB_SECRET_KEY", bool(os.environ.get("FLASK_SECRET_KEY") or os.environ.get("WEB_SECRET_KEY")), "Recommended persistent sessions"),
+        ("Redis WEB_SECRET_KEY", _web_stable_secret_configured(), f"Stored at {_web_secret_redis_key()}"),
         ("SUPABASE_URL", bool(os.environ.get("SUPABASE_URL") or globals().get("SB_URL")), "Recommended"),
         ("SUPABASE_SERVICE_ROLE_KEY / SUPABASE_KEY", bool(os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY") or globals().get("SB_KEY")), "Recommended"),
         ("REDIS_URL", bool(os.environ.get("REDIS_URL") or globals().get("REDIS_URL")), "Optional cache"),
@@ -6987,7 +7338,7 @@ def web_admin_runtime_config():
         return redirect(url_for("web_admin_runtime_config"))
 
     webhook_ready = bool(_runtime_webhook_base_url() and _runtime_webhook_secret_token())
-    minimal_env_text = 'PORT=8080\nRENDER=true\nRENDER_EXTERNAL_URL=https://your-service.onrender.com\nTELEGRAM_BOT_TOKEN=CHANGE_ME\nADMIN_IDS=1272791365\nADMIN_WEB_PASSWORD=CHANGE_ME\nWEB_SECRET_KEY=CHANGE_ME_RANDOM_SECRET\nSUPABASE_URL=https://your-project.supabase.co\nSUPABASE_SERVICE_ROLE_KEY=CHANGE_ME\nREDIS_URL=redis://default:password@host:6379\nHF_TOKEN=CHANGE_ME_OPTIONAL\nGEMINI_API_KEY=CHANGE_ME_OPTIONAL'
+    minimal_env_text = 'PORT=8080\nRENDER=true\nRENDER_EXTERNAL_URL=https://your-service.onrender.com\nTELEGRAM_BOT_TOKEN=CHANGE_ME\nADMIN_IDS=1272791365\nADMIN_WEB_PASSWORD=CHANGE_ME\nSUPABASE_URL=https://your-project.supabase.co\nSUPABASE_SERVICE_ROLE_KEY=CHANGE_ME\nREDIS_URL=redis://default:password@host:6379\nHF_TOKEN=CHANGE_ME_OPTIONAL\nGEMINI_API_KEY=CHANGE_ME_OPTIONAL'
     body = f"""
     <div data-live-status></div>
     <div class='card'>
@@ -11633,7 +11984,7 @@ def startup_self_check() -> None:
     if not _web_admin_password() and _web_admin_enabled():
         checks.append("ADMIN_WEB_PASSWORD / WEB_ADMIN_PASSWORD is missing; /admin web dashboard is locked")
     if not _web_stable_secret_configured():
-        checks.append("WEB_SECRET_KEY / FLASK_SECRET_KEY is not set; web admin sessions reset on every deploy/restart and may not work across two servers")
+        checks.append("Redis WEB_SECRET_KEY is not available; set REDIS_URL so web admin sessions persist across restarts/two servers")
     if supabase and not os.environ.get("SUPABASE_SERVICE_ROLE_KEY"):
         checks.append("SUPABASE_SERVICE_ROLE_KEY is not set; admin tables may fail under RLS/publishable key")
     if supabase and not SUPABASE_DB_POOLER_URL:
@@ -13770,76 +14121,85 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
 
 
 def generate_web_secret_key() -> str:
-    """Return a strong WEB_SECRET_KEY value for Starlette/FastAPI sessions.
-
-    The key must be copied into the deployment environment and applied on
-    restart.  Runtime replacement is intentionally avoided because the session
-    middleware signs/verifies cookies with the startup key.
-    """
-    return secrets.token_urlsafe(48)
+    """Return a strong WEB_SECRET_KEY value for Redis-backed web sessions."""
+    return _generate_web_secret_value()
 
 
 def _web_secret_key_fingerprint(secret_value: str) -> str:
-    value = str(secret_value or "")
-    if not value:
-        return "not-set"
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    return _web_secret_fingerprint(secret_value)
 
 
 def _configured_web_secret_source() -> tuple[str, str]:
-    """Return (source, value) for the active configured web session secret.
+    """Return (source, value) for the configured web session secret.
 
+    Redis is primary.  Env values are kept only as compatibility fallback.
     This never exposes the secret to logs or public API responses.
     """
+    redis_value, redis_source = _web_secret_get_from_redis()
+    if redis_value:
+        return redis_source, redis_value
     web_key = os.environ.get("WEB_SECRET_KEY", "").strip()
     if web_key:
-        return "WEB_SECRET_KEY", web_key
+        return "env:WEB_SECRET_KEY:fallback", web_key
     flask_key = os.environ.get("FLASK_SECRET_KEY", "").strip()
     if flask_key:
-        return "FLASK_SECRET_KEY", flask_key
+        return "env:FLASK_SECRET_KEY:fallback", flask_key
     settings_key = str(getattr(SETTINGS, "WEB_SECRET_KEY", "") or "").strip()
     if settings_key:
-        return "SETTINGS.WEB_SECRET_KEY", settings_key
+        return "settings:WEB_SECRET_KEY:fallback", settings_key
     settings_flask_key = str(getattr(SETTINGS, "FLASK_SECRET_KEY", "") or "").strip()
     if settings_flask_key:
-        return "SETTINGS.FLASK_SECRET_KEY", settings_flask_key
-    return "random-startup-fallback", ""
+        return "settings:FLASK_SECRET_KEY:fallback", settings_flask_key
+    if _WEB_SESSION_SECRET_CACHE:
+        return _web_session_secret_source(), _WEB_SESSION_SECRET_CACHE
+    return "missing", ""
 
 
 def _web_key_private_message(new_key: str) -> str:
-    source, current_value = _configured_web_secret_source()
-    current_status = "configured" if current_value else "missing / random fallback"
-    current_fp = _web_secret_key_fingerprint(current_value)
-    new_fp = _web_secret_key_fingerprint(new_key)
+    stored_source, stored_value = _configured_web_secret_source()
+    stored_status = "stored in Redis" if stored_value else "missing"
+    active_source = _web_session_secret_source()
+    active_fp = _web_session_secret_fingerprint()
+    stored_fp = _web_secret_key_fingerprint(stored_value or new_key)
     generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     return (
-        "🔐 <b>New WEB_SECRET_KEY generated</b>\n\n"
-        "Copy this exact value to your hosting environment, then restart/deploy "
-        "<b>all</b> backend instances.\n\n"
-        f"<pre>WEB_SECRET_KEY={html.escape(new_key)}</pre>\n"
-        "Recommended cookie env for separated frontend:\n"
-        "<pre>WEB_COOKIE_SAMESITE=none\nWEB_COOKIE_SECURE=true</pre>\n"
+        "🔐 <b>New WEB_SECRET_KEY stored in Redis</b>\n\n"
+        "You do <b>not</b> need to put <code>WEB_SECRET_KEY</code> in Render/Railway env anymore. "
+        "Keep <code>REDIS_URL</code> configured so every backend server reads the same session secret.\n\n"
+        f"Redis key: <code>{html.escape(_web_secret_redis_key())}</code>\n"
+        f"Stored source: <code>{html.escape(stored_source)}</code>\n"
+        f"Stored status: <code>{html.escape(stored_status)}</code>\n"
+        f"Stored fingerprint: <code>{html.escape(stored_fp)}</code>\n"
+        f"Active running source: <code>{html.escape(active_source)}</code>\n"
+        f"Active running fingerprint: <code>{html.escape(active_fp)}</code>\n\n"
         "Important:\n"
-        "• This is <b>not</b> the admin login password. It signs web admin session cookies.\n"
-        "• The running server cannot safely use this new value until restart.\n"
+        "• Restart/deploy <b>all</b> backend instances after rotation so SessionMiddleware uses the Redis key.\n"
         "• Existing admin browser sessions will be logged out after rotation.\n"
-        "• Do not share this key or paste it in public logs.\n\n"
-        f"Current source: <code>{html.escape(source)}</code>\n"
-        f"Current status: <code>{html.escape(current_status)}</code>\n"
-        f"Current fingerprint: <code>{html.escape(current_fp)}</code>\n"
-        f"New fingerprint: <code>{html.escape(new_fp)}</code>\n"
+        "• The raw secret is not shown because it is already persisted in Redis.\n"
+        "• Recommended cookie defaults are already in code: <code>WEB_COOKIE_SAMESITE=none</code>, <code>WEB_COOKIE_SECURE=true</code>.\n\n"
         f"Generated UTC: <code>{html.escape(generated_at)}</code>"
     )
 
 
 async def _admin_generate_web_key(query, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Generate WEB_SECRET_KEY from Telegram /admin without leaking in groups.
+    """Generate and store the web session secret in Redis from Telegram /admin.
 
-    The secret is sent only to the requesting admin's private Telegram chat.
-    The admin panel message only shows a non-sensitive confirmation.
+    The raw secret is not displayed.  The admin receives only fingerprints and
+    restart guidance, because Redis is now the source of truth.
     """
     new_key = generate_web_secret_key()
     fingerprint = _web_secret_key_fingerprint(new_key)
+    ok, store_message = await asyncio.to_thread(_web_secret_set_in_redis_sync, new_key, overwrite=True)
+    if not ok:
+        await safe_send(lambda: query.message.edit_text(
+            "⚠️ <b>WEB_KEY Redis save failed.</b>\n\n"
+            f"Reason: <code>{html.escape(str(store_message)[:500])}</code>\n\n"
+            "Set <code>REDIS_URL</code> first, restart the backend, then tap <b>WEB_KEY</b> again.",
+            parse_mode="HTML",
+            reply_markup=get_admin_dashboard_kb(),
+            disable_web_page_preview=True,
+        ))
+        return
     try:
         await context.bot.send_message(
             chat_id=int(user_id),
@@ -13851,7 +14211,7 @@ async def _admin_generate_web_key(query, user_id: int, context: ContextTypes.DEF
         await safe_send(lambda: query.message.edit_text(
             "⚠️ <b>Cannot send WEB_KEY privately.</b>\n\n"
             "Please open a private chat with this bot, press /start, then return to /admin and tap <b>WEB_KEY</b> again.\n\n"
-            "For safety, the secret was not shown in this chat.",
+            "The key was already stored in Redis; restart all backend instances to apply it.",
             parse_mode="HTML",
             reply_markup=get_admin_dashboard_kb(),
             disable_web_page_preview=True,
@@ -13862,18 +14222,19 @@ async def _admin_generate_web_key(query, user_id: int, context: ContextTypes.DEF
         await safe_send(lambda: query.message.edit_text(
             "⚠️ <b>WEB_KEY generation failed to deliver.</b>\n\n"
             f"Reason: <code>{html.escape(str(exc)[:300])}</code>\n\n"
-            "For safety, the secret was not shown here.",
+            "The key was already stored in Redis; restart all backend instances to apply it.",
             parse_mode="HTML",
             reply_markup=get_admin_dashboard_kb(),
             disable_web_page_preview=True,
         ))
         return
 
-    logger.info("WEB_SECRET_KEY generated for admin_id=%s fingerprint=%s", user_id, fingerprint)
+    logger.info("WEB_SECRET_KEY stored in Redis for admin_id=%s fingerprint=%s", user_id, fingerprint)
     await safe_send(lambda: query.message.edit_text(
-        "✅ <b>WEB_KEY generated.</b>\n\n"
-        "I sent the new <code>WEB_SECRET_KEY</code> to your private Telegram chat.\n"
-        "Copy it into Render/Railway/VPS env and restart all backend instances.\n\n"
+        "✅ <b>WEB_KEY stored in Redis.</b>\n\n"
+        "I sent the Redis status and restart guidance to your private Telegram chat.\n"
+        "No <code>WEB_SECRET_KEY</code> env value is needed now. Restart/deploy all backend instances to use the rotated Redis key.\n\n"
+        f"Redis key: <code>{html.escape(_web_secret_redis_key())}</code>\n"
         f"Fingerprint: <code>{html.escape(fingerprint)}</code>",
         parse_mode="HTML",
         reply_markup=get_admin_dashboard_kb(),
