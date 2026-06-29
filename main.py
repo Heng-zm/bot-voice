@@ -321,16 +321,25 @@ class AppSettings(BaseSettings):
     FLASK_SECRET_KEY: str = ""
     WEB_SECRET_KEY: str = ""
     WEB_SESSION_COOKIE_NAME: str = "bot_admin_session"
-    WEB_COOKIE_SAMESITE: str = "lax"
-    WEB_COOKIE_SECURE: bool = False
+    WEB_COOKIE_SAMESITE: str = "none"
+    WEB_COOKIE_SECURE: bool = True
     WEB_ADMIN_SESSION_DAYS: int = 14
     WEB_MAX_CONTENT_LENGTH: int = 64 * 1024 * 1024
     # Backend/API-only mode: HTML admin dashboard pages are disabled by default.
     # Build/deploy the frontend separately and point it to this backend API.
     BACKEND_ONLY: bool = True
     WEB_ADMIN_FRONTEND_ENABLED: bool = False
+    # Keep the backend API-only by default. Do not use "*" as a frontend URL.
+    # Set ADMIN_FRONTEND_URL to the deployed frontend URL, and set
+    # FRONTEND_ALLOWED_ORIGINS to a comma-separated allowlist.
     ADMIN_FRONTEND_URL: str = ""
-    FRONTEND_ALLOWED_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000"
+    FRONTEND_ALLOWED_ORIGINS: str = ""
+    # Emergency/dev-only escape hatch. Keep false in production because wildcard
+    # credentialed CORS lets any website call cookie-authenticated admin APIs.
+    FRONTEND_ALLOW_ALL_ORIGINS: bool = False
+    ADMIN_LOGIN_RATE_LIMIT_ATTEMPTS: int = 5
+    ADMIN_LOGIN_RATE_LIMIT_WINDOW_S: float = 300.0
+    WEB_REQUIRE_STABLE_SECRET_IN_PRODUCTION: bool = True
     MAX_CONCURRENT_TTS_USERS: int = int(_perf_default("MAX_CONCURRENT_TTS_USERS", 2))
     MAX_CONCURRENT_AI: int = 3
     MAX_CONCURRENT_GEMINI: int = 3
@@ -444,21 +453,21 @@ def _default_cookie_secure() -> bool:
     explicit = os.environ.get("WEB_COOKIE_SECURE")
     if explicit is not None:
         return _env_bool("WEB_COOKIE_SECURE", True)
-    same_site = str(os.environ.get("WEB_COOKIE_SAMESITE") or getattr(SETTINGS, "WEB_COOKIE_SAMESITE", "lax") or "lax").strip().lower()
+    same_site = str(os.environ.get("WEB_COOKIE_SAMESITE") or getattr(SETTINGS, "WEB_COOKIE_SAMESITE", "none") or "none").strip().lower()
     if same_site == "none":
         return True
     if _env_bool("WEB_TRUST_PROXY", _env_bool("RENDER", False)):
         return True
-    return bool(getattr(SETTINGS, "WEB_COOKIE_SECURE", False))
+    return bool(getattr(SETTINGS, "WEB_COOKIE_SECURE", True))
 
 
 def _cookie_samesite() -> str:
     """Return a Starlette-safe SameSite value.
 
     A mistyped WEB_COOKIE_SAMESITE used to make the dashboard fail during
-    startup. Keep bad env values safe by falling back to lax.
+    startup. Keep bad env values safe by falling back to lax, while the normal default is none.
     """
-    value = str(getattr(SETTINGS, "WEB_COOKIE_SAMESITE", "lax") or "lax").strip().lower()
+    value = str(getattr(SETTINGS, "WEB_COOKIE_SAMESITE", "none") or "none").strip().lower()
     return value if value in {"lax", "strict", "none"} else "lax"
 
 
@@ -469,6 +478,53 @@ def _web_max_content_length() -> int:
         minimum=1 * 1024 * 1024,
         maximum=256 * 1024 * 1024,
     )
+
+
+def _is_production_runtime() -> bool:
+    env_name = str(os.environ.get("ENV") or os.environ.get("APP_ENV") or os.environ.get("PYTHON_ENV") or "").strip().lower()
+    return _env_bool("RENDER", False) or env_name in {"prod", "production"}
+
+
+_WEB_SESSION_SECRET_CACHE: str | None = None
+
+
+def _web_stable_secret_configured() -> bool:
+    return bool(
+        os.environ.get("WEB_SECRET_KEY")
+        or os.environ.get("FLASK_SECRET_KEY")
+        or getattr(SETTINGS, "WEB_SECRET_KEY", "")
+        or getattr(SETTINGS, "FLASK_SECRET_KEY", "")
+    )
+
+
+def _web_session_secret_key() -> str:
+    global _WEB_SESSION_SECRET_CACHE
+    secret = (
+        os.environ.get("WEB_SECRET_KEY")
+        or os.environ.get("FLASK_SECRET_KEY")
+        or getattr(SETTINGS, "WEB_SECRET_KEY", "")
+        or getattr(SETTINGS, "FLASK_SECRET_KEY", "")
+        or ""
+    )
+    secret = str(secret or "").strip()
+    if secret:
+        _WEB_SESSION_SECRET_CACHE = secret
+        return secret
+
+    if _WEB_SESSION_SECRET_CACHE:
+        return _WEB_SESSION_SECRET_CACHE
+
+    msg = (
+        "WEB_SECRET_KEY / FLASK_SECRET_KEY is not configured. "
+        "A temporary in-memory session secret will be used; admin sessions "
+        "will reset after restart and may not work across multiple servers."
+    )
+    if _is_production_runtime() and _env_bool("WEB_REQUIRE_STABLE_SECRET_IN_PRODUCTION", True):
+        logging.getLogger(__name__).critical(msg + " Set WEB_SECRET_KEY in production.")
+    else:
+        logging.getLogger(__name__).warning(msg)
+    _WEB_SESSION_SECRET_CACHE = secrets.token_hex(32)
+    return _WEB_SESSION_SECRET_CACHE
 
 
 _request_ctx: contextvars.ContextVar[Any] = contextvars.ContextVar("fastapi_request_ctx")
@@ -672,13 +728,7 @@ class FastAPICompatApp:
     def __init__(self):
         self.config: dict[str, Any] = {}
         self.after_request_funcs: list[Callable[[Any], Any]] = []
-        secret_key = (
-            getattr(SETTINGS, "FLASK_SECRET_KEY", "")
-            or getattr(SETTINGS, "WEB_SECRET_KEY", "")
-            or os.environ.get("FLASK_SECRET_KEY", "")
-            or os.environ.get("WEB_SECRET_KEY", "")
-            or secrets.token_hex(32)
-        )
+        secret_key = _web_session_secret_key()
         api_docs_enabled = _env_bool("API_DOCS_ENABLED", False)
         self.fastapi = FastAPI(
             title="Telegram Bot Admin",
@@ -888,7 +938,9 @@ def _env_str(name: str, default: str = "") -> str:
 
 
 def _admin_frontend_url() -> str:
-    return _env_str("ADMIN_FRONTEND_URL", "").rstrip("/")
+    value = _env_str("ADMIN_FRONTEND_URL", "").rstrip("/")
+    # "*" is valid for an origin allowlist, but never for a concrete frontend URL.
+    return "" if value == "*" else value
 
 
 def _backend_only_mode() -> bool:
@@ -899,16 +951,35 @@ def _backend_only_mode() -> bool:
     return _env_bool("BACKEND_ONLY", True) or not _env_bool("WEB_ADMIN_FRONTEND_ENABLED", False)
 
 
+def _frontend_allow_all_origins_enabled() -> bool:
+    # Dev/emergency only. In production, prefer FRONTEND_ALLOWED_ORIGINS with exact URLs.
+    return _env_bool("FRONTEND_ALLOW_ALL_ORIGINS", False)
+
+
 def _frontend_allowed_origins() -> list[str]:
     raw = _env_str("FRONTEND_ALLOWED_ORIGINS", "")
     admin_url = _admin_frontend_url()
     origins: list[str] = []
+    allow_all_requested = False
     for item in (raw.split(",") if raw else []):
         item = item.strip().rstrip("/")
-        if item and item not in origins:
+        if not item:
+            continue
+        if item == "*":
+            allow_all_requested = True
+            continue
+        if item not in origins:
             origins.append(item)
     if admin_url and admin_url not in origins:
         origins.append(admin_url)
+    if allow_all_requested:
+        if _frontend_allow_all_origins_enabled():
+            origins.append("*")
+        else:
+            logging.getLogger(__name__).warning(
+                "Ignoring FRONTEND_ALLOWED_ORIGINS='*' because FRONTEND_ALLOW_ALL_ORIGINS is false. "
+                "Set exact frontend origins in production."
+            )
     return origins
 
 
@@ -987,14 +1058,23 @@ def _should_return_backend_json_redirect(location: str) -> bool:
 _allowed_frontend_origins = _frontend_allowed_origins()
 if _allowed_frontend_origins:
     _allow_all_frontends = "*" in _allowed_frontend_origins
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"] if _allow_all_frontends else _allowed_frontend_origins,
-        allow_credentials=not _allow_all_frontends,
-        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "X-CSRF-Token", "X-Requested-With", "X-Api-Key"],
-        expose_headers=["X-Request-ID", "X-Response-Time-ms"],
-    )
+    # Exact origin allowlist is the production-safe path for cookie sessions.
+    # Wildcard origin matching is enabled only when FRONTEND_ALLOW_ALL_ORIGINS=true.
+    cors_kwargs = {
+        "allow_credentials": True,
+        "allow_methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        "allow_headers": ["Authorization", "Content-Type", "X-CSRF-Token", "X-Requested-With", "X-Api-Key"],
+        "expose_headers": ["X-Request-ID", "X-Response-Time-ms"],
+    }
+    if _allow_all_frontends:
+        logging.getLogger(__name__).warning(
+            "FRONTEND_ALLOW_ALL_ORIGINS=true enables wildcard credentialed CORS. "
+            "Use only for development or trusted isolated deployments."
+        )
+        cors_kwargs.update({"allow_origins": [], "allow_origin_regex": r"https?://.*"})
+    else:
+        cors_kwargs.update({"allow_origins": _allowed_frontend_origins})
+    app.add_middleware(CORSMiddleware, **cors_kwargs)
 
 
 def _is_legacy_admin_frontend_request(path: str, method: str) -> bool:
@@ -1041,7 +1121,7 @@ async def _backend_only_legacy_dashboard_guard(req: FastAPIRequest, call_next):
             },
         }, status_code=410)
     return await call_next(req)
-app_flask.config["SECRET_KEY"] = getattr(SETTINGS, "FLASK_SECRET_KEY", "") or getattr(SETTINGS, "WEB_SECRET_KEY", "") or secrets.token_hex(32)
+app_flask.config["SECRET_KEY"] = _web_session_secret_key()
 app_flask.config["SESSION_COOKIE_NAME"] = getattr(SETTINGS, "WEB_SESSION_COOKIE_NAME", "bot_admin_session")
 app_flask.config["SESSION_COOKIE_HTTPONLY"] = True
 app_flask.config["SESSION_COOKIE_SAMESITE"] = _cookie_samesite().capitalize()
@@ -1186,6 +1266,8 @@ def readyz():
         "supabase_configured": bool(globals().get("supabase")),
         "redis_configured": bool(globals().get("redis_client")),
         "ffmpeg_ok": bool(ffmpeg_path and os.path.exists(str(ffmpeg_path))),
+        "web_secret_configured": _web_stable_secret_configured(),
+        "frontend_allowed_origins": _frontend_allowed_origins(),
         "bot_mode": _run_state_bot_mode() if "_run_state_bot_mode" in globals() else globals().get("BOT_MODE", "POLLING"),
         "webhook_ready": bool(globals().get("_TELEGRAM_APP")),
         "telegram_leader": _telegram_leader_snapshot() if "_telegram_leader_snapshot" in globals() else {},
@@ -3236,6 +3318,74 @@ def _web_login_page(error: str = ""):
     ), status_code=401 if error else 200)
 
 
+_ADMIN_LOGIN_ATTEMPTS: dict[str, deque[float]] = {}
+_ADMIN_LOGIN_ATTEMPTS_LOCK = threading.RLock()
+
+
+def _web_client_ip() -> str:
+    # Respect common proxy headers on Render/proxy deployments. Only the first
+    # X-Forwarded-For value is used because it represents the original client.
+    try:
+        if _env_bool("WEB_TRUST_PROXY", _env_bool("RENDER", False)):
+            for header in ("cf-connecting-ip", "x-real-ip", "x-forwarded-for"):
+                value = str(request.headers.get(header) or "").strip()
+                if value:
+                    return value.split(",", 1)[0].strip()[:80]
+        return str(request.headers.get("x-real-ip") or request.headers.get("x-forwarded-for") or "unknown").split(",", 1)[0].strip()[:80] or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _admin_login_rate_limit_key(admin_id: int | None) -> str:
+    raw = f"{_web_client_ip()}:{admin_id or 0}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _admin_login_rate_limit_config() -> tuple[int, float]:
+    attempts = _env_int("ADMIN_LOGIN_RATE_LIMIT_ATTEMPTS", 5, minimum=1, maximum=100)
+    window_s = _env_float("ADMIN_LOGIN_RATE_LIMIT_WINDOW_S", 300.0, minimum=10.0, maximum=86400.0)
+    return attempts, window_s
+
+
+def _admin_login_is_limited(admin_id: int | None) -> tuple[bool, int]:
+    limit, window_s = _admin_login_rate_limit_config()
+    key = _admin_login_rate_limit_key(admin_id)
+    now = time.monotonic()
+    with _ADMIN_LOGIN_ATTEMPTS_LOCK:
+        dq = _ADMIN_LOGIN_ATTEMPTS.setdefault(key, deque())
+        stale_before = now - window_s
+        while dq and dq[0] < stale_before:
+            dq.popleft()
+        if len(dq) >= limit:
+            retry_after = max(1, int(window_s - (now - dq[0])))
+            return True, retry_after
+        return False, 0
+
+
+def _admin_login_record_failure(admin_id: int | None) -> None:
+    _limit, window_s = _admin_login_rate_limit_config()
+    key = _admin_login_rate_limit_key(admin_id)
+    now = time.monotonic()
+    with _ADMIN_LOGIN_ATTEMPTS_LOCK:
+        dq = _ADMIN_LOGIN_ATTEMPTS.setdefault(key, deque())
+        stale_before = now - window_s
+        while dq and dq[0] < stale_before:
+            dq.popleft()
+        dq.append(now)
+        # Opportunistic cleanup to avoid unbounded memory growth under scans.
+        if len(_ADMIN_LOGIN_ATTEMPTS) > 20_000:
+            for old_key in list(_ADMIN_LOGIN_ATTEMPTS.keys())[:1000]:
+                old_dq = _ADMIN_LOGIN_ATTEMPTS.get(old_key)
+                if not old_dq or old_dq[-1] < stale_before:
+                    _ADMIN_LOGIN_ATTEMPTS.pop(old_key, None)
+
+
+def _admin_login_clear_failures(admin_id: int | None) -> None:
+    key = _admin_login_rate_limit_key(admin_id)
+    with _ADMIN_LOGIN_ATTEMPTS_LOCK:
+        _ADMIN_LOGIN_ATTEMPTS.pop(key, None)
+
+
 def web_admin_required(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
@@ -3283,11 +3433,25 @@ def api_admin_auth_login():
     data = request.get_json(silent=True) or {}
     got_password = str(data.get("password") or request.form.get("password") or "")
     admin_id = _web_int(data.get("admin_id") or request.form.get("admin_id"), _web_current_admin_id())
-    if not hmac.compare_digest(got_password, expected_password):
-        return _admin_api_error("Invalid password.", 401, code="invalid_admin_password")
-    if not _web_valid_admin_id(admin_id):
-        return _admin_api_error("This Telegram Admin ID is not in ADMIN_IDS.", 403, code="admin_id_not_allowed")
 
+    limited, retry_after = _admin_login_is_limited(admin_id)
+    if limited:
+        resp = _admin_api_error(
+            "Too many failed login attempts. Please wait and try again.",
+            429,
+            code="admin_login_rate_limited",
+            retry_after_seconds=retry_after,
+        )
+        resp.headers["Retry-After"] = str(retry_after)
+        return resp
+
+    valid_admin = _web_valid_admin_id(admin_id)
+    valid_password = hmac.compare_digest(got_password, expected_password)
+    if not (valid_admin and valid_password):
+        _admin_login_record_failure(admin_id)
+        return _admin_api_error("Invalid admin credentials.", 401, code="invalid_admin_credentials")
+
+    _admin_login_clear_failures(admin_id)
     session.clear()
     session["web_admin_ok"] = True
     session["web_admin_id"] = int(admin_id or _web_current_admin_id())
@@ -3315,7 +3479,7 @@ def api_admin_auth_me():
     return _admin_api_success(payload) if authenticated else _admin_api_error("Not authenticated.", 401, code="admin_auth_required", **payload)
 
 
-@app_flask.route("/api/admin/auth/logout", methods=["POST", "GET", "OPTIONS"])
+@app_flask.route("/api/admin/auth/logout", methods=["POST", "OPTIONS"])
 def api_admin_auth_logout():
     if request.method == "OPTIONS":
         return _admin_api_success({"preflight": True}, status_code=204)
@@ -6928,7 +7092,11 @@ def web_admin_dashboard_alias():
 # ── FFmpeg ─────────────────────────────────────────────────────────────────
 _FFMPEG_EXE = _iio_ffmpeg.get_ffmpeg_exe()
 
-import edge_tts
+try:
+    import edge_tts
+except Exception as exc:
+    edge_tts = None
+    logging.getLogger(__name__).warning("Optional dependency edge_tts is not available; Edge TTS is disabled: %s", exc)
 try:
     from gradio_client import Client as GradioClient
 except Exception:
@@ -11296,8 +11464,8 @@ def startup_self_check() -> None:
         checks.append("ADMIN_IDS is empty; admin-only commands will reject everyone")
     if not _web_admin_password() and _web_admin_enabled():
         checks.append("ADMIN_WEB_PASSWORD / WEB_ADMIN_PASSWORD is missing; /admin web dashboard is locked")
-    if not os.environ.get("FLASK_SECRET_KEY") and not os.environ.get("WEB_SECRET_KEY"):
-        checks.append("FLASK_SECRET_KEY is not set; web admin sessions reset on every deploy/restart")
+    if not _web_stable_secret_configured():
+        checks.append("WEB_SECRET_KEY / FLASK_SECRET_KEY is not set; web admin sessions reset on every deploy/restart and may not work across two servers")
     if supabase and not os.environ.get("SUPABASE_SERVICE_ROLE_KEY"):
         checks.append("SUPABASE_SERVICE_ROLE_KEY is not set; admin tables may fail under RLS/publishable key")
     if supabase and not SUPABASE_DB_POOLER_URL:
@@ -11310,6 +11478,8 @@ def startup_self_check() -> None:
         checks.append("HF_TOKEN is missing; Hugging Face OCR will be unavailable")
     if OCR_PROVIDER in ("auto", "gemini") and not GEMINI_API_KEY:
         checks.append("GEMINI_API_KEY is missing; Gemini OCR/audio fallback will be unavailable")
+    if (TTS_PROVIDER in {"auto", "edge", "edge_tts"} or KHMER_TTS_PROVIDER in {"auto", "edge", "edge_tts"}) and edge_tts is None:
+        checks.append("edge-tts is missing; Edge TTS will be unavailable. Add `edge-tts` to requirements.txt or choose another TTS provider")
     if (TTS_PROVIDER in {"auto", "hf", "hf_space", "khmer_hf_space", "khmer-tts"} or KHMER_TTS_PROVIDER in {"hf", "hf_space", "khmer_hf_space", "khmer-tts"}) and GradioClient is None:
         checks.append("gradio_client is missing; Khmer HF Space TTS will fall back to Edge. Add `gradio_client` to requirements.txt")
     if _should_try_hf_khmer_tts("សាកល្បង", "hf_space") and not HF_TTS_SPACE:
@@ -13825,6 +13995,9 @@ def _tts_voice_candidates(text: str, gender: str) -> list[str]:
 
 
 async def _edge_tts_stream_once(chunk_text: str, voice: str) -> bytes:
+    if edge_tts is None:
+        raise RuntimeError("edge-tts is not installed. Add `edge-tts` to requirements.txt or choose another TTS provider.")
+
     async def _collect() -> bytes:
         audio_chunks: list[bytes] = []
         # Do not pass rate here; speed is applied by FFmpeg atempo. This avoids
