@@ -2696,6 +2696,8 @@ def _web_admin_feature_groups() -> list[tuple[str, list[tuple[str, str, str, str
         ]),
         ("Understand", [
             ("Analytics", "/admin/analytics", "📈", "Usage trends, recent activity, and delivery performance.", "analytics"),
+            ("Insights", "/admin/insights", "💡", "Smart warnings, roadmap ideas, and next-feature recommendations.", "insights"),
+            ("Error Inbox", "/admin/errors", "🚨", "Group repeated errors, mute noise, copy logs, and see recommended fixes.", "errors"),
             ("Report", "/admin/report", "📄", "Generate and download an admin PDF system report.", "report"),
             ("Users", "/admin/users", "👥", "Search users, inspect profile details, and manage access.", "users"),
             ("CRM", "/admin/crm", "⭐", "Labels, notes, trust status, and CSV export for user care.", "crm"),
@@ -2758,6 +2760,8 @@ def _web_command_hero_html(counts: dict[str, Any]) -> str:
         <div class='actions hero-actions'>
           <a class='btn' href='/admin/broadcast'>New Broadcast</a>
           <a class='btn secondary' href='/admin/users'>Search Users</a>
+          <a class='btn ghost' href='/admin/insights'>Insights</a>
+          <a class='btn ghost' href='/admin/errors'>Error Inbox</a>
           <a class='btn ghost' href='/admin/optimize'>Optimize Now</a>
         </div>
       </div>
@@ -2777,6 +2781,8 @@ def _web_render(title: str, body: str, *, active: str = "dashboard", status_code
         ("dashboard", "Admin Center", "/admin", "⌘"),
         ("optimize", "Optimize", "/admin/optimize", "⚡"),
         ("analytics", "Analytics", "/admin/analytics", "📈"),
+        ("insights", "Insights", "/admin/insights", "💡"),
+        ("errors", "Errors", "/admin/errors", "🚨"),
         ("report", "Report", "/admin/report", "📄"),
         ("users", "Users", "/admin/users", "👥"),
         ("crm", "CRM", "/admin/crm", "⭐"),
@@ -2791,7 +2797,7 @@ def _web_render(title: str, body: str, *, active: str = "dashboard", status_code
         ("locks", "Locks", "/admin/locks", "🔒"),
         ("sql", "SQL Setup", "/admin/sql", "☷"),
     ]
-    bottom_nav = [item for item in nav if item[0] in {"dashboard", "optimize", "users", "crm", "broadcast"}]
+    bottom_nav = [item for item in nav if item[0] in {"dashboard", "insights", "errors", "broadcast", "optimize"}]
     template = """
 <!doctype html>
 <html lang="en">
@@ -2890,6 +2896,7 @@ tailwind.config = {
   .pillbar{@apply flex flex-wrap gap-2}
   .empty{@apply p-6 text-center text-slate-400}
   .copybox{@apply break-all select-all}
+  .error-message{@apply max-w-[520px] whitespace-pre-wrap break-words text-slate-200}
   .danger-zone{@apply border-red-400/25 bg-red-500/10}
   .v3-live-dot{@apply mr-2 inline-block h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_0_6px_rgba(52,211,153,.12)]}
   .mini-grid{@apply grid grid-cols-1 gap-3 md:grid-cols-3}
@@ -2940,17 +2947,17 @@ tailwind.config = {
 </head>
 <body>
 <input id="menu-toggle" class="menu-toggle" type="checkbox">
-<div class="mobilebar"><label class="btn ghost" for="menu-toggle">☰ Menu</label><b>Bot Admin V6</b></div>
+<div class="mobilebar"><label class="btn ghost" for="menu-toggle">☰ Menu</label><b>Bot Admin V8</b></div>
 <div class="layout">
 <aside class="side">
   <div class="brand"><span class="brand-mark">🤖</span><span>Bot Admin</span></div>
-  <div class="sub">System V6 · Admin ID: <code>{{ admin_id }}</code></div>
+  <div class="sub">System V8 · Admin ID: <code>{{ admin_id }}</code></div>
   <input class="nav-search" data-nav-filter placeholder="Search admin features…" aria-label="Search admin features">
   <nav class="nav" data-nav-list>{% for key,label,url,ico in nav %}<a class="{{ 'active' if key==active else '' }}" href="{{ url }}" data-nav-item data-label="{{ label|lower }}"><span class="nav-ico">{{ ico }}</span><span>{{ label }}</span></a>{% endfor %}</nav>
   <div class="footer"><div>Supabase: <b>{{ 'ON' if supabase_on else 'OFF' }}</b></div><div>Redis: <b>{{ 'ON' if redis_on else 'OFF' }}</b></div><div><a href="/ping">Ping</a> · <a href="/readyz">Ready</a></div><div class="muted">Tip: press <span class="kbd">Ctrl</span> + <span class="kbd">K</span> to search.</div></div>
 </aside>
 <main class="main">
-  <div class="top"><div><div class="h1">{{ title }}</div><div class="muted">Unified Admin Center · smoother workflow · safe Telegram operations</div></div><div class="top-right"><div data-local-time>{{ now }}</div><div>{{ time_hint }}</div></div></div>
+  <div class="top"><div><div class="h1">{{ title }}</div><div class="muted">Unified Admin Center V8 · error inbox · safer Telegram operations</div></div><div class="top-right"><div data-local-time>{{ now }}</div><div>{{ time_hint }}</div></div></div>
   {% for cat,msg in messages %}<div class="flash {{ cat }}">{{ msg }}</div>{% endfor %}
   {{ body|safe }}
 </main>
@@ -3589,13 +3596,236 @@ def _web_user_detail_metrics(row: dict) -> dict:
         "last_text": last_text,
     }
 
+
+# ── Admin Insights / Feature Recommendation Center ─────────────────────────
+def _web_admin_recommendation_items(counts: dict | None = None, perf: dict | None = None, settings_status: dict | None = None) -> list[dict[str, str]]:
+    """Return prioritized feature ideas tailored to this running dashboard.
+
+    The list is intentionally static + lightweight so /admin/insights never
+    creates heavy DB pressure.  Runtime warnings are prepended when the current
+    process shows a clear operational risk.
+    """
+    counts = counts or {}
+    perf = perf or {}
+    settings_status = settings_status or {}
+    items: list[dict[str, str]] = []
+
+    try:
+        failed_count = int(counts.get("failed") or 0)
+    except Exception:
+        failed_count = 0
+    try:
+        active_requests = int(((perf.get("web") or {}).get("active_requests")) or 0)
+    except Exception:
+        active_requests = 0
+
+    if not bool(settings_status.get("db_ok", True)):
+        items.append({
+            "priority": "High",
+            "feature": "Settings DB Repair Wizard",
+            "status": "Recommended now",
+            "why": "Bot settings are using memory fallback, so changes may not survive restart.",
+            "action": "Add one-click SQL check + copy missing table SQL + re-test button.",
+        })
+    if failed_count > 0:
+        items.append({
+            "priority": "High",
+            "feature": "Failed Job Auto-Recovery",
+            "status": "Recommended now",
+            "why": f"There are {failed_count} failed schedule/broadcast item(s) visible in admin counts.",
+            "action": "Add Retry Failed, Retry Selected, and failure reason grouping.",
+        })
+    if active_requests >= 10:
+        items.append({
+            "priority": "Medium",
+            "feature": "Traffic Pressure Guard",
+            "status": "Recommended now",
+            "why": "The dashboard is seeing high active web requests.",
+            "action": "Auto-switch live polling to slow mode and show a pressure banner.",
+        })
+    if not bool(globals().get("redis_client")):
+        items.append({
+            "priority": "Medium",
+            "feature": "Redis Setup Assistant",
+            "status": "Recommended",
+            "why": "Redis is offline, so locks/cache/replay protection use local fallback only.",
+            "action": "Add setup checklist, connection tester, and safe fallback explanation.",
+        })
+
+    items.extend([
+        {
+            "priority": "High",
+            "feature": "Smart Error Inbox Pro",
+            "status": "Added in V8",
+            "why": "Group repeated errors by fingerprint, affected feature, first seen, last seen, and count.",
+            "action": "Open /admin/errors to review, mute, clear, copy logs, and see recommended fixes.",
+        },
+        {
+            "priority": "High",
+            "feature": "Broadcast Quality Checker",
+            "status": "Next update",
+            "why": "Admins need to preview Telegram formatting, link safety, length, and blocked-user impact before sending.",
+            "action": "Add pre-send validation score and a test-send-to-admin button.",
+        },
+        {
+            "priority": "Medium",
+            "feature": "User Segmentation Auto Labels",
+            "status": "Good for CRM",
+            "why": "CRM can automatically tag active, warm, inactive, blocked, and power users.",
+            "action": "Add scheduled segment refresh plus filter chips in /admin/crm.",
+        },
+        {
+            "priority": "Medium",
+            "feature": "Admin Activity Timeline",
+            "status": "Good for teams",
+            "why": "Important actions like pause, resume, key creation, lock release, and broadcast changes should be searchable.",
+            "action": "Persist audit logs to Supabase instead of memory-only deque.",
+        },
+        {
+            "priority": "Medium",
+            "feature": "Backup & Restore Center",
+            "status": "Safety feature",
+            "why": "Settings, schedules, API key metadata, and CRM notes should be exportable before big updates.",
+            "action": "Add JSON export/import with admin confirmation and dry-run validation.",
+        },
+        {
+            "priority": "Low",
+            "feature": "Theme & Compact Mode",
+            "status": "UI polish",
+            "why": "Small laptop screens and mobile admins benefit from dense tables and collapsible cards.",
+            "action": "Add localStorage theme, compact density toggle, and sticky filter toolbar.",
+        },
+    ])
+
+    seen: set[str] = set()
+    unique: list[dict[str, str]] = []
+    for item in items:
+        key = item.get("feature", "")
+        if key and key not in seen:
+            unique.append(item)
+            seen.add(key)
+    return unique[:12]
+
+
+def _web_admin_alert_items(counts: dict | None = None, perf: dict | None = None, settings_status: dict | None = None) -> list[tuple[str, str, str]]:
+    counts = counts or {}
+    perf = perf or {}
+    settings_status = settings_status or {}
+    alerts: list[tuple[str, str, str]] = []
+
+    if not bool(globals().get("supabase")):
+        alerts.append(("Supabase offline", "Database features are disabled or using fallback memory.", "danger"))
+    if not bool(settings_status.get("db_ok", True)):
+        alerts.append(("Settings DB fallback", settings_status.get("error") or "bot_settings table may be missing.", "warn"))
+    if not bool(globals().get("redis_client")):
+        alerts.append(("Redis offline", "Replay guard, locks, and cache use process-local fallback only.", "warn"))
+    try:
+        failed_count = int(counts.get("failed") or 0)
+        if failed_count:
+            alerts.append(("Failed jobs", f"{failed_count} failed job(s) need review.", "danger"))
+    except Exception:
+        pass
+    try:
+        error_count_fn = globals().get("_admin_error_center_total_count")
+        error_count = int(error_count_fn() if callable(error_count_fn) else len(list(globals().get("_ADMIN_ERROR_CENTER") or [])))
+        if error_count:
+            alerts.append(("Admin error inbox", f"{error_count} recent error event(s) captured. Open Error Inbox.", "danger"))
+    except Exception:
+        pass
+    try:
+        slow_count = len(list(globals().get("_WEB_SLOW_REQUESTS") or []))
+        if slow_count:
+            alerts.append(("Slow web requests", f"{slow_count} slow request(s) recorded in memory.", "warn"))
+    except Exception:
+        pass
+    try:
+        web_active = int(((perf.get("web") or {}).get("active_requests")) or 0)
+        if web_active >= 10:
+            alerts.append(("High web pressure", f"{web_active} active web request(s) right now.", "warn"))
+    except Exception:
+        pass
+
+    if not alerts:
+        alerts.append(("System looks stable", "No urgent admin warning detected from lightweight checks.", "ok"))
+    return alerts[:8]
+
+
+def _web_admin_recommendations_rows_html(items: list[dict[str, str]]) -> str:
+    rows = []
+    for item in items:
+        priority = str(item.get("priority") or "Medium")
+        kind = "danger" if priority.lower() == "high" else "warn" if priority.lower() == "medium" else "muted"
+        rows.append(
+            "<tr>"
+            f"<td>{_web_badge(priority, kind)}</td>"
+            f"<td><b>{_web_h(item.get('feature'))}</b><br><span class='muted'>{_web_h(item.get('why'))}</span></td>"
+            f"<td>{_web_badge(item.get('status') or 'Idea', 'info')}</td>"
+            f"<td>{_web_h(item.get('action'))}</td>"
+            "</tr>"
+        )
+    return "".join(rows) or '<tr><td colspan="4"><div class="empty">No recommendations.</div></td></tr>'
+
+
+def _web_admin_alerts_html(alerts: list[tuple[str, str, str]]) -> str:
+    return "".join(
+        f"<div class='mini-stat'><b>{_web_badge(title, kind)}</b><span class='muted'>{_web_h(detail)}</span></div>"
+        for title, detail, kind in alerts
+    )
+
+
+@app_flask.route("/admin/insights")
+@web_admin_required
+def web_admin_insights():
+    counts = _web_counts(force=False)
+    _settings, settings_status = db_bot_settings_fetch_all()
+    perf = _runtime_performance_snapshot(light=True)
+    recommendations = _web_admin_recommendation_items(counts, perf, settings_status)
+    alerts = _web_admin_alert_items(counts, perf, settings_status)
+    body = f"""
+    <div data-live-status></div>
+    <div class='card'>
+      <div class='actions' style='justify-content:space-between'>
+        <div><h2>💡 Admin Insights & Roadmap</h2><p class='muted'>Smart warnings plus recommended next features for this bot admin panel.</p></div>
+        <div class='actions'><a class='btn secondary' href='/admin/errors'>Error Inbox</a><a class='btn secondary' href='/admin/health'>Health</a><a class='btn secondary' href='/admin/optimize'>Optimize</a><a class='btn secondary' href='/admin/report.pdf'>PDF Report</a></div>
+      </div>
+    </div>
+    <div class='grid'>
+      {_web_status_card('Users', counts.get('users', 0), 'total user_prefs', 'ok' if counts.get('users') else '')}
+      {_web_status_card('Pending', counts.get('pending', 0), 'scheduled broadcasts', 'warn' if counts.get('pending') else '')}
+      {_web_status_card('Failed', counts.get('failed', 0), 'needs review', 'danger' if counts.get('failed') else 'ok')}
+      {_web_status_card('Active requests', (perf.get('web') or {}).get('active_requests', 0), 'dashboard/API pressure', 'warn' if int((perf.get('web') or {}).get('active_requests') or 0) >= 10 else 'ok')}
+    </div>
+    <div class='card'><h2>Current warnings</h2><div class='mini-grid'>{_web_admin_alerts_html(alerts)}</div></div>
+    <div class='card'>
+      <h2>Recommended new features</h2>
+      <p class='muted'>Prioritized for your current bot system: admin safety, broadcast reliability, CRM, and smoother mobile control.</p>
+      <div class='table-wrap'><table class='table'><thead><tr><th>Priority</th><th>Feature</th><th>Status</th><th>Recommended implementation</th></tr></thead><tbody>{_web_admin_recommendations_rows_html(recommendations)}</tbody></table></div>
+    </div>
+    <div class='grid2'>
+      <div class='card'><h2>Best next update package</h2><div class='mini-grid'>
+        <div class='mini-stat'><b>Admin V8 Pro</b><span class='muted'>Insights, Smart Error Inbox Pro, broadcast checker, backup center.</span></div>
+        <div class='mini-stat'><b>Safe Operations</b><span class='muted'>Group errors, retry failed, pause pressure, audit timeline, lock safety.</span></div>
+        <div class='mini-stat'><b>Mobile Friendly</b><span class='muted'>Error Inbox in bottom nav, compact pages, sticky filters.</span></div>
+      </div></div>
+      <div class='card'><h2>Implementation order</h2><ol class='muted' style='padding-left:20px;line-height:1.9'>
+        <li>Smart Error Inbox Pro is added. Open <a href='/admin/errors'>/admin/errors</a>.</li>
+        <li>Add Broadcast Quality Checker before every send.</li>
+        <li>Persist admin audit timeline to Supabase.</li>
+        <li>Add Backup & Restore Center for settings/schedules.</li>
+        <li>Add compact mode for small screens.</li>
+      </ol></div>
+    </div>
+    """
+    return _web_render("Insights", body, active="insights")
+
+
 @app_flask.route("/admin/report")
 @web_admin_required
 def web_admin_report():
     body = f"""
     <div class='card'>
       <h2>📄 Admin PDF Report</h2>
-      <p class='muted'>Generate a PDF with system status, counts, runtime settings, feature toggles, and recent errors.</p>
+      <p class='muted'>Generate a PDF with system status, counts, runtime settings, feature toggles, Smart Error Inbox summary, and recent errors.</p>
       <div class='actions'>
         <a class='btn ok' href='/admin/report.pdf'>Download PDF Report</a>
         <a class='btn secondary' href='/admin'>Back to Dashboard</a>
@@ -3688,7 +3918,7 @@ def web_admin_home():
     </div>
     <div class='grid2'>
       <div class='card'><h2>Feature settings</h2><div class='table-wrap'><table class='table'>{setting_rows}</table></div><p><a class='btn secondary' href='/admin/settings'>Open settings</a></p></div>
-      <div class='card'><h2>Quick actions</h2><p class='muted'>Common admin tasks. Dangerous actions still require confirmation on their pages.</p><div class='actions'><a class='btn' href='/admin/optimize'>Optimize</a><a class='btn' href='/admin/users'>Manage Users</a><a class='btn' href='/admin/analytics'>Analytics V2</a><a class='btn' href='/admin/schedules/calendar'>Calendar</a><a class='btn' href='/admin/schedules'>Schedules</a><a class='btn' href='/admin/broadcast'>Broadcast</a><a class='btn secondary' href='/admin/health'>Health Center</a><a class='btn secondary' href='/admin/control'>Control Center</a><a class='btn secondary' href='/admin/sql'>SQL Setup</a></div></div>
+      <div class='card'><h2>Quick actions</h2><p class='muted'>Common admin tasks. Dangerous actions still require confirmation on their pages.</p><div class='actions'><a class='btn' href='/admin/optimize'>Optimize</a><a class='btn' href='/admin/users'>Manage Users</a><a class='btn' href='/admin/analytics'>Analytics V2</a><a class='btn' href='/admin/insights'>Insights</a><a class='btn' href='/admin/errors'>Error Inbox</a><a class='btn' href='/admin/schedules/calendar'>Calendar</a><a class='btn' href='/admin/schedules'>Schedules</a><a class='btn' href='/admin/broadcast'>Broadcast</a><a class='btn secondary' href='/admin/health'>Health Center</a><a class='btn secondary' href='/admin/control'>Control Center</a><a class='btn secondary' href='/admin/sql'>SQL Setup</a></div></div>
     </div>
     """
     return _web_render("Admin Center", body, active="dashboard")
@@ -5687,6 +5917,8 @@ def _runtime_performance_snapshot(light: bool = False) -> dict:
             "active_requests": active_requests,
             "slow_request_threshold_ms": WEB_SLOW_REQUEST_MS,
             "recent_slow_requests": [] if light else list(_WEB_SLOW_REQUESTS)[:20],
+            "admin_error_events": (globals().get("_admin_error_center_total_count")() if callable(globals().get("_admin_error_center_total_count")) else len(list(globals().get("_ADMIN_ERROR_CENTER") or []))),
+            "admin_error_groups": len(globals().get("_admin_error_center_grouped", lambda *a, **k: [])(limit=200, include_muted=True)) if callable(globals().get("_admin_error_center_grouped")) else 0,
             "counts_cache_ttl_s": _run_state_web_counts_cache_ttl(),
             "status_poll_s": _run_state_int("WEB_STATUS_POLL_SECONDS", WEB_STATUS_POLL_SECONDS, minimum=10, maximum=300),
             "live_poll_s": _run_state_int("WEB_LIVE_POLL_SECONDS", WEB_LIVE_POLL_SECONDS, minimum=15, maximum=300),
@@ -6480,30 +6712,98 @@ broadcast_queue_logger = logging.getLogger("broadcast_queue")
 
 
 # ---------------------------------------------------------------------------
-# Admin Error Center — in-memory recent error ring for /admin
+# Admin Error Inbox Pro V8 — grouped in-memory recent error center for /admin
 # ---------------------------------------------------------------------------
-_ADMIN_ERROR_CENTER_MAX = _env_int("ADMIN_ERROR_CENTER_MAX", 200, minimum=20, maximum=2000)
-_ADMIN_ERROR_CENTER: deque[dict[str, Any]] = deque(maxlen=_ADMIN_ERROR_CENTER_MAX)
-_ADMIN_ERROR_CENTER_LOCK = threading.Lock()
+ADMIN_ERROR_CENTER_MAX = _env_int("ADMIN_ERROR_CENTER_MAX", 300, minimum=20, maximum=5000)
+# Backward-compatible alias used by the Telegram /admin Error Center text.
+_ADMIN_ERROR_CENTER_MAX = ADMIN_ERROR_CENTER_MAX
+ADMIN_ERROR_MESSAGE_MAX = _env_int("ADMIN_ERROR_MESSAGE_MAX", 900, minimum=120, maximum=3000)
+_ADMIN_ERROR_CENTER: deque[dict[str, Any]] = deque(maxlen=ADMIN_ERROR_CENTER_MAX)
+_ADMIN_ERROR_CENTER_LOCK = threading.RLock()
+_ADMIN_ERROR_CENTER_MUTED: set[str] = set()
+_ADMIN_ERROR_HANDLER_INSTALLED = False
+
+
+_SECRET_PATTERNS = [
+    (re.compile(r"(bot\d{5,}:[A-Za-z0-9_-]{20,})"), "<telegram-token>"),
+    (re.compile(r"(sk-[A-Za-z0-9_-]{16,})"), "<api-key>"),
+    (re.compile(r"(eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})"), "<jwt>"),
+    (re.compile(r"(?i)(password|secret|token|key)=([^\s&]+)"), r"\1=<hidden>"),
+]
+
+
+def _admin_error_sanitize(value: Any, limit: int | None = None) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    for pattern, repl in _SECRET_PATTERNS:
+        text = pattern.sub(repl, text)
+    return text[: int(limit or ADMIN_ERROR_MESSAGE_MAX)]
 
 
 def _admin_error_fingerprint(source: str, message: str) -> str:
-    raw = f"{source}:{message}"[:2000]
+    normalized = _admin_error_sanitize(message, 700).lower()
+    normalized = re.sub(r"\b\d{4,}\b", "#", normalized)
+    normalized = re.sub(r"[0-9a-f]{12,}", "#hex", normalized)
+    normalized = re.sub(r"https?://\S+", "<url>", normalized)
+    raw = f"{_admin_error_sanitize(source, 80).lower()}:{normalized}"[:2000]
     return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:12]
 
 
+def _admin_error_feature(source: str, message: str) -> str:
+    hay = f"{source} {message}".lower()
+    if "webhook" in hay or "setwebhook" in hay or "tg-webhook" in hay:
+        return "Telegram Webhook"
+    if "broadcast" in hay or "scheduled_broadcast" in hay:
+        return "Broadcast / Schedule"
+    if "supabase" in hay or "postgrest" in hay or "pgrst" in hay or "database" in hay:
+        return "Supabase / DB"
+    if "redis" in hay or "lock" in hay:
+        return "Redis / Locks"
+    if "edge-tts" in hay or "speech.platform.bing" in hay or "tts" in hay:
+        return "TTS Engine"
+    if "gemini" in hay or "huggingface" in hay or "hf_" in hay or "ai-assistant" in hay:
+        return "AI / OCR"
+    if "telegram" in hay or "bot api" in hay or "bad request" in hay:
+        return "Telegram API"
+    if "rate" in hay or "429" in hay:
+        return "Rate Limit"
+    return "Runtime"
+
+
+def _admin_error_recommended_fix(feature: str, message: str) -> str:
+    hay = message.lower()
+    if "429" in hay or "rate" in hay:
+        return "Slow down retries, increase delay settings, and check Telegram/API rate limits."
+    if "message to edit not found" in hay:
+        return "Use safe edit fallback: send a new message when edit/delete target no longer exists."
+    if "forbidden" in hay or "bot was blocked" in hay:
+        return "Mark user as blocked/inactive and skip future broadcast sends to that user."
+    if "supabase" in feature.lower() or "column" in hay or "pgrst" in hay:
+        return "Open SQL Setup, run missing table/column migration, then retest Health Center."
+    if "redis" in feature.lower() or "lock" in feature.lower():
+        return "Check REDIS_URL, Redis connection limits, and release stale locks only when no worker is active."
+    if "webhook" in feature.lower():
+        return "Open Control Center, verify WEBHOOK mode, TELEGRAM_WEBHOOK_URL, secret token, and active leader."
+    if "tts" in feature.lower() or "403" in hay:
+        return "Reset TTS cooldown, reduce parallel chunks, check proxy/VPN/network, or switch fallback provider."
+    if "broadcast" in feature.lower():
+        return "Open failed jobs, inspect Telegram parse/blocked errors, fix content, then retry selected users."
+    return "Open the related admin page, copy this grouped log, and fix the repeated root cause first."
+
+
 def _record_admin_error(source: str, message: str, *, level: str = "ERROR", context: str = "") -> None:
-    """Store a small, sanitized error entry for the Telegram Error Center."""
-    source = str(source or "unknown")[:80]
-    message = re.sub(r"\s+", " ", str(message or "").strip())[:900]
-    context = re.sub(r"\s+", " ", str(context or "").strip())[:300]
+    """Store a small, sanitized error entry for Admin Error Inbox Pro."""
+    source_s = _admin_error_sanitize(source or "unknown", 80)
+    message_s = _admin_error_sanitize(message or "(empty error)", ADMIN_ERROR_MESSAGE_MAX)
+    context_s = _admin_error_sanitize(context or "", 300)
+    fingerprint = _admin_error_fingerprint(source_s, message_s)
     item = {
         "ts": datetime.now(timezone.utc).isoformat(),
-        "source": source,
-        "level": str(level or "ERROR")[:16],
-        "message": message or "(empty error)",
-        "context": context,
-        "fingerprint": _admin_error_fingerprint(source, message),
+        "source": source_s,
+        "level": _admin_error_sanitize(level or "ERROR", 16),
+        "message": message_s,
+        "context": context_s,
+        "feature": _admin_error_feature(source_s, message_s),
+        "fingerprint": fingerprint,
     }
     with _ADMIN_ERROR_CENTER_LOCK:
         _ADMIN_ERROR_CENTER.appendleft(item)
@@ -6526,15 +6826,34 @@ class _AdminErrorCenterHandler(logging.Handler):
             pass
 
 
-_admin_error_handler = _AdminErrorCenterHandler()
-_admin_error_handler.setLevel(logging.ERROR)
-_admin_error_handler.setFormatter(logging.Formatter("%(message)s"))
-logging.getLogger().addHandler(_admin_error_handler)
+def _install_admin_error_handler() -> None:
+    global _ADMIN_ERROR_HANDLER_INSTALLED
+    if _ADMIN_ERROR_HANDLER_INSTALLED:
+        return
+    root = logging.getLogger()
+    for handler in root.handlers:
+        if getattr(handler, "_admin_error_inbox_pro", False):
+            _ADMIN_ERROR_HANDLER_INSTALLED = True
+            return
+    handler = _AdminErrorCenterHandler()
+    handler.setLevel(logging.ERROR)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler._admin_error_inbox_pro = True  # type: ignore[attr-defined]
+    root.addHandler(handler)
+    _ADMIN_ERROR_HANDLER_INSTALLED = True
+
+
+_install_admin_error_handler()
+
+
+def _admin_error_center_total_count() -> int:
+    with _ADMIN_ERROR_CENTER_LOCK:
+        return len(_ADMIN_ERROR_CENTER)
 
 
 def _admin_error_center_snapshot(limit: int = 10) -> list[dict[str, Any]]:
     with _ADMIN_ERROR_CENTER_LOCK:
-        return list(_ADMIN_ERROR_CENTER)[: max(1, min(50, int(limit or 10)))]
+        return list(_ADMIN_ERROR_CENTER)[: max(1, min(100, int(limit or 10)))]
 
 
 def _admin_error_center_clear() -> int:
@@ -6542,6 +6861,239 @@ def _admin_error_center_clear() -> int:
         count = len(_ADMIN_ERROR_CENTER)
         _ADMIN_ERROR_CENTER.clear()
     return count
+
+
+def _admin_error_center_remove_fingerprint(fingerprint: str) -> int:
+    fingerprint = str(fingerprint or "").strip()
+    with _ADMIN_ERROR_CENTER_LOCK:
+        old = list(_ADMIN_ERROR_CENTER)
+        kept = [item for item in old if str(item.get("fingerprint")) != fingerprint]
+        removed = len(old) - len(kept)
+        _ADMIN_ERROR_CENTER.clear()
+        _ADMIN_ERROR_CENTER.extend(kept)
+    return removed
+
+
+def _admin_error_center_grouped(limit: int = 50, include_muted: bool = False) -> list[dict[str, Any]]:
+    grouped: OrderedDict[str, dict[str, Any]] = OrderedDict()
+    with _ADMIN_ERROR_CENTER_LOCK:
+        items = list(_ADMIN_ERROR_CENTER)
+        muted = set(_ADMIN_ERROR_CENTER_MUTED)
+    for item in items:
+        fp = str(item.get("fingerprint") or "")
+        if not fp:
+            continue
+        is_muted = fp in muted
+        if is_muted and not include_muted:
+            continue
+        current = grouped.get(fp)
+        ts = str(item.get("ts") or "")
+        if current is None:
+            grouped[fp] = {
+                "fingerprint": fp,
+                "count": 1,
+                "first_seen": ts,
+                "last_seen": ts,
+                "level": item.get("level") or "ERROR",
+                "source": item.get("source") or "unknown",
+                "feature": item.get("feature") or _admin_error_feature(item.get("source"), item.get("message")),
+                "message": item.get("message") or "",
+                "context": item.get("context") or "",
+                "muted": is_muted,
+            }
+            continue
+        current["count"] += 1
+        current["first_seen"] = min(str(current.get("first_seen") or ts), ts)
+        current["last_seen"] = max(str(current.get("last_seen") or ts), ts)
+    rows = list(grouped.values())
+    rows.sort(key=lambda x: (bool(x.get("muted")), str(x.get("last_seen") or "")), reverse=False)
+    rows.sort(key=lambda x: str(x.get("last_seen") or ""), reverse=True)
+    return rows[: max(1, min(200, int(limit or 50)))]
+
+
+def _admin_error_details(fingerprint: str, limit: int = 30) -> list[dict[str, Any]]:
+    fingerprint = str(fingerprint or "").strip()
+    with _ADMIN_ERROR_CENTER_LOCK:
+        rows = [item for item in list(_ADMIN_ERROR_CENTER) if str(item.get("fingerprint")) == fingerprint]
+    return rows[: max(1, min(100, int(limit or 30)))]
+
+
+def _admin_error_rows_html(rows: list[dict[str, Any]]) -> str:
+    out: list[str] = []
+    for row in rows:
+        fp = str(row.get("fingerprint") or "")
+        priority_kind = "danger" if str(row.get("level", "")).upper() in {"ERROR", "CRITICAL"} else "warn"
+        muted_badge = _web_badge("Muted", "muted") if row.get("muted") else ""
+        fix = _admin_error_recommended_fix(str(row.get("feature") or ""), str(row.get("message") or ""))
+        copy_text = f"[{row.get('level')}] {row.get('feature')} {row.get('source')} {row.get('message')} fp={fp} fix={fix}"
+        out.append(
+            "<tr>"
+            f"<td>{_web_badge(row.get('level') or 'ERROR', priority_kind)}<br>{muted_badge}<br><code>{_web_h(fp)}</code></td>"
+            f"<td><b>{_web_h(row.get('feature'))}</b><br><span class='muted'>{_web_h(row.get('source'))}</span></td>"
+            f"<td><b>{_web_h(row.get('count'))}x</b><br><span class='muted'>First: {_web_h(_web_dt(row.get('first_seen')))}</span><br><span class='muted'>Last: {_web_h(_web_dt(row.get('last_seen')))}</span></td>"
+            f"<td><div class='error-message'>{_web_h(row.get('message'))}</div><details><summary>Recommended fix</summary><p class='muted'>{_web_h(fix)}</p></details></td>"
+            f"<td class='nowrap'><div class='actions'>"
+            f"<a class='btn secondary' href='/admin/errors/group/{_web_h(fp)}'>Open</a>"
+            f"<button type='button' class='secondary' data-copy='{_web_h(copy_text)}'>Copy</button>"
+            f"<form method='post' action='/admin/errors/action' class='inline-form' data-confirm='Mute this error group?'><input type='hidden' name='csrf_token' value='{_web_h(_web_csrf_token())}'><input type='hidden' name='fingerprint' value='{_web_h(fp)}'><input type='hidden' name='action' value='mute'><button class='ghost'>Mute</button></form>"
+            f"<form method='post' action='/admin/errors/action' class='inline-form' data-confirm='Clear this error group from memory?'><input type='hidden' name='csrf_token' value='{_web_h(_web_csrf_token())}'><input type='hidden' name='fingerprint' value='{_web_h(fp)}'><input type='hidden' name='action' value='clear_fingerprint'><button class='danger'>Clear</button></form>"
+            f"</div></td></tr>"
+        )
+    return "".join(out) or '<tr><td colspan="5"><div class="empty">No unmuted errors captured yet.</div></td></tr>'
+
+
+def _admin_error_detail_rows_html(rows: list[dict[str, Any]]) -> str:
+    out: list[str] = []
+    for row in rows:
+        out.append(
+            "<tr>"
+            f"<td>{_web_h(_web_dt(row.get('ts')))}</td>"
+            f"<td>{_web_badge(row.get('level') or 'ERROR', 'danger')}</td>"
+            f"<td>{_web_h(row.get('source'))}<br><span class='muted'>{_web_h(row.get('context'))}</span></td>"
+            f"<td><div class='error-message'>{_web_h(row.get('message'))}</div></td>"
+            "</tr>"
+        )
+    return "".join(out) or '<tr><td colspan="4"><div class="empty">This error group is empty.</div></td></tr>'
+
+
+@app_flask.route("/admin/errors")
+@web_admin_required
+def web_admin_errors():
+    include_muted = str(request.args.get("muted") or "").lower() in {"1", "true", "yes", "on"}
+    groups = _admin_error_center_grouped(limit=80, include_muted=include_muted)
+    total_events = _admin_error_center_total_count()
+    muted_count = len(_ADMIN_ERROR_CENTER_MUTED)
+    visible_groups = len(groups)
+    slow_count = len(list(globals().get("_WEB_SLOW_REQUESTS") or []))
+    rows_html = _admin_error_rows_html(groups)
+    csrf = _web_csrf_token()
+    muted_link = "/admin/errors" if include_muted else "/admin/errors?muted=1"
+    muted_label = "Hide muted" if include_muted else "Show muted"
+    body = f"""
+    <div data-live-status></div>
+    <div class='card'>
+      <div class='actions' style='justify-content:space-between'>
+        <div><h2>🚨 Smart Error Inbox Pro</h2><p class='muted'>Grouped recent ERROR/CRITICAL logs by fingerprint. Memory-based, safe, no database migration required.</p></div>
+        <div class='actions'>
+          <a class='btn secondary' href='{_web_h(muted_link)}'>{_web_h(muted_label)}</a>
+          <a class='btn secondary' href='/admin/health'>Health</a>
+          <a class='btn secondary' href='/admin/optimize'>Optimize</a>
+        </div>
+      </div>
+    </div>
+    <div class='grid'>
+      {_web_status_card('Error events', total_events, 'recent captured logs', 'danger' if total_events else 'ok')}
+      {_web_status_card('Error groups', visible_groups, 'fingerprint groups visible', 'warn' if visible_groups else 'ok')}
+      {_web_status_card('Muted groups', muted_count, 'hidden noisy fingerprints', 'muted' if muted_count else 'ok')}
+      {_web_status_card('Slow requests', slow_count, 'from web telemetry', 'warn' if slow_count else 'ok')}
+    </div>
+    <div class='card'>
+      <div class='actions' style='justify-content:space-between'>
+        <div><h2>Error groups</h2><p class='muted'>Use Open for details, Copy for Claude/AI debugging, Mute for noisy known issues, Clear after fixing.</p></div>
+        <div class='actions'>
+          <form method='post' action='/admin/errors/action' data-confirm='Create a sample test error?'><input type='hidden' name='csrf_token' value='{_web_h(csrf)}'><input type='hidden' name='action' value='test_error'><button class='secondary'>Test Capture</button></form>
+          <form method='post' action='/admin/errors/action' data-confirm='Unmute all groups?'><input type='hidden' name='csrf_token' value='{_web_h(csrf)}'><input type='hidden' name='action' value='unmute_all'><button class='ghost'>Unmute All</button></form>
+          <form method='post' action='/admin/errors/action' data-confirm='Clear all captured errors from memory?'><input type='hidden' name='csrf_token' value='{_web_h(csrf)}'><input type='hidden' name='action' value='clear_all'><button class='danger'>Clear All</button></form>
+        </div>
+      </div>
+      <div class='table-wrap'><table class='table'><thead><tr><th>Level / ID</th><th>Feature</th><th>Count / Time</th><th>Message</th><th>Actions</th></tr></thead><tbody>{rows_html}</tbody></table></div>
+    </div>
+    <div class='grid2'>
+      <div class='card'><h2>What this fixes</h2><div class='mini-grid'>
+        <div class='mini-stat'><b>Less noise</b><span class='muted'>Repeated errors are grouped instead of flooding the admin.</span></div>
+        <div class='mini-stat'><b>Faster debug</b><span class='muted'>Copy one grouped log with feature, source, message, and suggested fix.</span></div>
+        <div class='mini-stat'><b>Safe ops</b><span class='muted'>Mute known issues without deleting real logs.</span></div>
+      </div></div>
+      <div class='card'><h2>Recommended next step</h2><p class='muted'>After this, add Broadcast Quality Checker to validate parse mode, length, links, and target count before sending.</p><p><a class='btn secondary' href='/admin/insights'>Open Insights</a></p></div>
+    </div>
+    """
+    return _web_render("Smart Error Inbox", body, active="errors")
+
+
+@app_flask.route("/admin/errors/group/<fingerprint>")
+@web_admin_required
+def web_admin_error_detail(fingerprint: str):
+    fingerprint = str(fingerprint or "").strip()
+    rows = _admin_error_details(fingerprint, limit=80)
+    first = rows[0] if rows else {}
+    feature = first.get("feature") or "Error Group"
+    message = first.get("message") or ""
+    fix = _admin_error_recommended_fix(str(feature), str(message))
+    copy_all = "\n".join(
+        f"[{row.get('ts')}] [{row.get('level')}] {row.get('source')} {row.get('context')} {row.get('message')}"
+        for row in rows[:50]
+    )
+    csrf = _web_csrf_token()
+    body = f"""
+    <div class='card'>
+      <div class='actions' style='justify-content:space-between'>
+        <div><h2>🚨 Error Group: <code>{_web_h(fingerprint)}</code></h2><p class='muted'>{_web_h(feature)} · {len(rows)} recent event(s)</p></div>
+        <div class='actions'><a class='btn secondary' href='/admin/errors'>Back</a><button type='button' class='secondary' data-copy='{_web_h(copy_all)}'>Copy All</button></div>
+      </div>
+    </div>
+    <div class='grid2'>
+      <div class='card'><h2>Recommended fix</h2><p class='muted'>{_web_h(fix)}</p><div class='actions'>
+        <form method='post' action='/admin/errors/action' data-confirm='Mute this error group?'><input type='hidden' name='csrf_token' value='{_web_h(csrf)}'><input type='hidden' name='fingerprint' value='{_web_h(fingerprint)}'><input type='hidden' name='action' value='mute'><button class='ghost'>Mute</button></form>
+        <form method='post' action='/admin/errors/action' data-confirm='Clear this error group from memory?'><input type='hidden' name='csrf_token' value='{_web_h(csrf)}'><input type='hidden' name='fingerprint' value='{_web_h(fingerprint)}'><input type='hidden' name='action' value='clear_fingerprint'><button class='danger'>Clear Group</button></form>
+      </div></div>
+      <div class='card'><h2>Message sample</h2><pre>{_web_h(message or 'No message')}</pre></div>
+    </div>
+    <div class='card'><h2>Recent events</h2><div class='table-wrap'><table class='table'><thead><tr><th>Time</th><th>Level</th><th>Source</th><th>Message</th></tr></thead><tbody>{_admin_error_detail_rows_html(rows)}</tbody></table></div></div>
+    """
+    return _web_render("Error Detail", body, active="errors")
+
+
+@app_flask.route("/admin/errors/action", methods=["POST"])
+@web_admin_required
+def web_admin_errors_action():
+    _web_check_csrf()
+    action = str(request.form.get("action") or "").strip()
+    fp = str(request.form.get("fingerprint") or "").strip()
+    ok = True
+    msg = "No action."
+    if action == "clear_all":
+        count = _admin_error_center_clear()
+        msg = f"Cleared {count} captured error event(s)."
+    elif action == "clear_fingerprint" and fp:
+        count = _admin_error_center_remove_fingerprint(fp)
+        with _ADMIN_ERROR_CENTER_LOCK:
+            _ADMIN_ERROR_CENTER_MUTED.discard(fp)
+        msg = f"Cleared {count} event(s) for {fp}."
+    elif action == "mute" and fp:
+        with _ADMIN_ERROR_CENTER_LOCK:
+            _ADMIN_ERROR_CENTER_MUTED.add(fp)
+        msg = f"Muted error group {fp}."
+    elif action == "unmute" and fp:
+        with _ADMIN_ERROR_CENTER_LOCK:
+            _ADMIN_ERROR_CENTER_MUTED.discard(fp)
+        msg = f"Unmuted error group {fp}."
+    elif action == "unmute_all":
+        with _ADMIN_ERROR_CENTER_LOCK:
+            count = len(_ADMIN_ERROR_CENTER_MUTED)
+            _ADMIN_ERROR_CENTER_MUTED.clear()
+        msg = f"Unmuted {count} group(s)."
+    elif action == "test_error":
+        _record_admin_error("admin.error_inbox.test", "Sample captured error from Smart Error Inbox Pro test button.", level="ERROR", context="manual-test")
+        msg = "Sample error captured."
+    else:
+        ok = False
+        msg = "Unknown or incomplete error inbox action."
+    _web_admin_audit(f"errors:{action}", msg)
+    flask_flash(("OK: " if ok else "ERROR: ") + msg, "success" if ok else "error")
+    return redirect(_web_safe_next_url(request.form.get("return_to"), "web_admin_errors"))
+
+
+@app_flask.route("/admin/errors.json")
+@web_admin_required
+def web_admin_errors_json():
+    return jsonify({
+        "ok": True,
+        "events": _admin_error_center_total_count(),
+        "groups": _admin_error_center_grouped(limit=80, include_muted=True),
+        "muted": list(_ADMIN_ERROR_CENTER_MUTED)[:200],
+        "local_time": _fmt_local_dt(),
+    })
+
 
 # ---------------------------------------------------------------------------
 # Config  (populated by _init_clients)
@@ -7080,7 +7632,7 @@ def get_runtime_admin_kb() -> Any:
         [InlineKeyboardButton(f"🔄 Switch to {target}", callback_data=f"rtadmin_switch:{target}")],
         [InlineKeyboardButton("⚡ Modify Rate Limit", callback_data="rtadmin_rate")],
         [InlineKeyboardButton("🔄 Rotate Webhook Secret", callback_data="rtadmin_rotate_secret")],
-        [InlineKeyboardButton("⬅️ Admin V7", callback_data="admin_home")],
+        [InlineKeyboardButton("⬅️ Admin V8", callback_data="admin_home")],
         [InlineKeyboardButton("❌ Close Menu", callback_data="rtadmin_close")],
     ])
 
@@ -12634,7 +13186,7 @@ def get_admin_crm_kb(active_segment: str = "all") -> InlineKeyboardMarkup:
          InlineKeyboardButton(_label("blocked", "Blocked"), callback_data="admin_crm:blocked")],
         [InlineKeyboardButton("👥 Users", callback_data="admin_users"),
          InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("⬅️ Admin V7", callback_data="admin_home"),
+        [InlineKeyboardButton("⬅️ Admin V8", callback_data="admin_home"),
          InlineKeyboardButton("❌ Close", callback_data="admin_close")],
     ])
 
@@ -12695,7 +13247,7 @@ def get_admin_optimize_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🩺 Health", callback_data="admin_health")],
         [InlineKeyboardButton("🚨 Error Center", callback_data="admin_errors"),
          InlineKeyboardButton("🔄 Refresh", callback_data="admin_optimize")],
-        [InlineKeyboardButton("⬅️ Admin V7", callback_data="admin_home"),
+        [InlineKeyboardButton("⬅️ Admin V8", callback_data="admin_home"),
          InlineKeyboardButton("❌ Close", callback_data="admin_close")],
     ])
 
@@ -12736,7 +13288,7 @@ async def _admin_open_optimize_panel(query) -> None:
 
 def get_admin_action_kb(cancel_callback: str = "admin_cancel_state") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Admin V7", callback_data="admin_home"),
+        [InlineKeyboardButton("⬅️ Admin V8", callback_data="admin_home"),
          InlineKeyboardButton("❌ Cancel",          callback_data=cancel_callback)],
     ])
 
