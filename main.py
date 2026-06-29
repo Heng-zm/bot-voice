@@ -37,6 +37,7 @@ except Exception as exc:
     genai_types = None
 from fastapi import FastAPI, Request as FastAPIRequest, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, Response as StarletteResponse
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.encoders import jsonable_encoder
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.concurrency import run_in_threadpool
@@ -324,6 +325,12 @@ class AppSettings(BaseSettings):
     WEB_COOKIE_SECURE: bool = False
     WEB_ADMIN_SESSION_DAYS: int = 14
     WEB_MAX_CONTENT_LENGTH: int = 64 * 1024 * 1024
+    # Backend/API-only mode: HTML admin dashboard pages are disabled by default.
+    # Build/deploy the frontend separately and point it to this backend API.
+    BACKEND_ONLY: bool = True
+    WEB_ADMIN_FRONTEND_ENABLED: bool = False
+    ADMIN_FRONTEND_URL: str = ""
+    FRONTEND_ALLOWED_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000"
     MAX_CONCURRENT_TTS_USERS: int = int(_perf_default("MAX_CONCURRENT_TTS_USERS", 2))
     MAX_CONCURRENT_AI: int = 3
     MAX_CONCURRENT_GEMINI: int = 3
@@ -583,6 +590,13 @@ def Response(content: Any = "", status: int = 200, status_code: int | None = Non
 
 
 def redirect(location: str, code: int = 302):
+    checker = globals().get("_should_return_backend_json_redirect")
+    if callable(checker):
+        try:
+            if checker(location):
+                return _admin_api_success({"redirect": location}, status_code=200)
+        except Exception:
+            pass
     return RedirectResponse(url=location, status_code=code)
 
 
@@ -866,6 +880,167 @@ class FastAPICompatApp:
 
 app_flask = FastAPICompatApp()
 app = app_flask.fastapi
+
+
+# ── Backend/API-only mode + separated frontend CORS ────────────────────────
+def _env_str(name: str, default: str = "") -> str:
+    return str(os.environ.get(name, getattr(SETTINGS, name, default)) or default).strip()
+
+
+def _admin_frontend_url() -> str:
+    return _env_str("ADMIN_FRONTEND_URL", "").rstrip("/")
+
+
+def _backend_only_mode() -> bool:
+    # Default is API-only so the Python service no longer serves dashboard UI.
+    # To temporarily restore old inline dashboard pages, set:
+    #   BACKEND_ONLY=false
+    #   WEB_ADMIN_FRONTEND_ENABLED=true
+    return _env_bool("BACKEND_ONLY", True) or not _env_bool("WEB_ADMIN_FRONTEND_ENABLED", False)
+
+
+def _frontend_allowed_origins() -> list[str]:
+    raw = _env_str("FRONTEND_ALLOWED_ORIGINS", "")
+    admin_url = _admin_frontend_url()
+    origins: list[str] = []
+    for item in (raw.split(",") if raw else []):
+        item = item.strip().rstrip("/")
+        if item and item not in origins:
+            origins.append(item)
+    if admin_url and admin_url not in origins:
+        origins.append(admin_url)
+    return origins
+
+
+def _request_wants_json() -> bool:
+    try:
+        accept = str(request.headers.get("accept") or "").lower()
+        content_type = str(request.headers.get("content-type") or "").lower()
+        requested_with = str(request.headers.get("x-requested-with") or "").lower()
+        return (
+            "application/json" in accept
+            or "application/json" in content_type
+            or requested_with in {"fetch", "xmlhttprequest"}
+            or str(getattr(request, "path", "")).startswith("/api/")
+            or str(getattr(request, "path", "")).endswith(".json")
+        )
+    except Exception:
+        return False
+
+
+def _admin_api_error(message: str, status_code: int = 400, *, code: str = "admin_error", **extra: Any):
+    payload = {
+        "ok": False,
+        "error": str(message),
+        "code": code,
+        "backend_only": _backend_only_mode(),
+        "frontend_url": _admin_frontend_url(),
+    }
+    payload.update(extra)
+    resp = jsonify(payload)
+    resp.status_code = int(status_code)
+    resp.headers.setdefault("Cache-Control", "no-store")
+    return resp
+
+
+def _admin_api_success(payload: dict | None = None, *, status_code: int = 200):
+    data = {"ok": True, "backend_only": _backend_only_mode(), "frontend_url": _admin_frontend_url()}
+    if payload:
+        data.update(payload)
+    resp = jsonify(data)
+    resp.status_code = int(status_code)
+    resp.headers.setdefault("Cache-Control", "no-store")
+    return resp
+
+
+def _legacy_dashboard_disabled_payload(title: str = "Admin dashboard disabled", *, status_code: int = 410):
+    return _admin_api_error(
+        "HTML admin dashboard pages are disabled. Deploy the frontend as a separate app and call this backend API.",
+        status_code,
+        code="admin_frontend_disabled",
+        title=title,
+        auth={
+            "login": "/api/admin/auth/login",
+            "me": "/api/admin/auth/me",
+            "logout": "/api/admin/auth/logout",
+        },
+        endpoints={
+            "health": "/readyz",
+            "status": "/admin/status.json",
+            "live": "/admin/live.json",
+            "performance": "/admin/performance.json",
+            "errors": "/admin/errors.json",
+            "broadcast_jobs": "/admin/broadcast/jobs.json",
+            "report_pdf": "/admin/report.pdf",
+        },
+    )
+
+
+def _should_return_backend_json_redirect(location: str) -> bool:
+    try:
+        path = str(getattr(request, "path", "") or "")
+    except Exception:
+        path = ""
+    return _backend_only_mode() and (path == "/dashboard" or path.startswith("/admin"))
+
+
+_allowed_frontend_origins = _frontend_allowed_origins()
+if _allowed_frontend_origins:
+    _allow_all_frontends = "*" in _allowed_frontend_origins
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"] if _allow_all_frontends else _allowed_frontend_origins,
+        allow_credentials=not _allow_all_frontends,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-CSRF-Token", "X-Requested-With", "X-Api-Key"],
+        expose_headers=["X-Request-ID", "X-Response-Time-ms"],
+    )
+
+
+def _is_legacy_admin_frontend_request(path: str, method: str) -> bool:
+    path = str(path or "")
+    method = str(method or "GET").upper()
+    if path == "/dashboard":
+        return True
+    if path in {"/admin", "/admin/", "/admin/login"}:
+        return True
+    if not path.startswith("/admin/"):
+        return False
+    # Backend resources remain available to the separated frontend.
+    if path.endswith((".json", ".pdf", ".csv")):
+        return False
+    # Keep write/action endpoints callable; they return JSON redirects in API-only mode.
+    if method != "GET" or path.endswith("/action"):
+        return False
+    return True
+
+
+@app.middleware("http")
+async def _backend_only_legacy_dashboard_guard(req: FastAPIRequest, call_next):
+    if _backend_only_mode() and _is_legacy_admin_frontend_request(req.url.path, req.method):
+        return _FastJSONResponse({
+            "ok": False,
+            "code": "admin_frontend_disabled",
+            "error": "HTML admin dashboard pages are disabled. Deploy the frontend separately and call this backend API.",
+            "backend_only": True,
+            "frontend_url": _admin_frontend_url(),
+            "auth": {
+                "login": "/api/admin/auth/login",
+                "me": "/api/admin/auth/me",
+                "logout": "/api/admin/auth/logout",
+            },
+            "endpoints": {
+                "health": "/readyz",
+                "bootstrap": "/api/admin/bootstrap",
+                "status": "/admin/status.json",
+                "live": "/admin/live.json",
+                "performance": "/admin/performance.json",
+                "errors": "/admin/errors.json",
+                "broadcast_jobs": "/admin/broadcast/jobs.json",
+                "report_pdf": "/admin/report.pdf",
+            },
+        }, status_code=410)
+    return await call_next(req)
 app_flask.config["SECRET_KEY"] = getattr(SETTINGS, "FLASK_SECRET_KEY", "") or getattr(SETTINGS, "WEB_SECRET_KEY", "") or secrets.token_hex(32)
 app_flask.config["SESSION_COOKIE_NAME"] = getattr(SETTINGS, "WEB_SESSION_COOKIE_NAME", "bot_admin_session")
 app_flask.config["SESSION_COOKIE_HTTPONLY"] = True
@@ -2776,6 +2951,8 @@ def _web_command_hero_html(counts: dict[str, Any]) -> str:
 
 
 def _web_render(title: str, body: str, *, active: str = "dashboard", status_code: int = 200):
+    if _backend_only_mode():
+        return _legacy_dashboard_disabled_payload(title, status_code=status_code if status_code >= 400 else 410)
     csrf = _web_csrf_token() if session.get("web_admin_ok") else ""
     nav = [
         ("dashboard", "Admin Center", "/admin", "⌘"),
@@ -3033,6 +3210,13 @@ def _web_locked_admin_html(message: str) -> str:
 
 
 def _web_login_page(error: str = ""):
+    if _backend_only_mode():
+        return _admin_api_error(
+            error or "HTML login page is disabled. Use POST /api/admin/auth/login from the separate frontend.",
+            401,
+            code="admin_login_page_disabled",
+            login_endpoint="/api/admin/auth/login",
+        )
     if not session.get("web_login_csrf"):
         session["web_login_csrf"] = secrets.token_urlsafe(32)
     next_url = _web_safe_next_url(request.args.get("next") or request.form.get("next"), "web_admin_home")
@@ -3056,28 +3240,111 @@ def web_admin_required(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         if not _web_admin_enabled():
-            return _web_render("Disabled", "<div class='card'>WEB_ADMIN_ENABLED=0</div>", status_code=403)
+            return _admin_api_error("Admin backend is disabled by WEB_ADMIN_ENABLED=0.", 403, code="admin_disabled")
         if not ADMIN_IDS:
-            return _web_render(
-                "Admin Locked",
-                _web_locked_admin_html("No ADMIN_IDS are configured. Web admin login is disabled until at least one Telegram admin ID is explicitly allowed."),
-                status_code=403,
+            return _admin_api_error(
+                "No ADMIN_IDS are configured. Configure at least one Telegram admin ID before using admin APIs.",
+                403,
+                code="admin_ids_missing",
             )
         if not _web_admin_password():
-            return _web_render(
-                "Admin Locked",
-                _web_locked_admin_html("No web admin password is configured."),
-                status_code=403,
+            return _admin_api_error(
+                "No web admin password is configured. Set ADMIN_WEB_PASSWORD or WEB_ADMIN_PASSWORD.",
+                403,
+                code="admin_password_missing",
             )
         if not _web_admin_session_valid():
+            if _backend_only_mode() or _request_wants_json():
+                return _admin_api_error(
+                    "Authentication required. Login with POST /api/admin/auth/login.",
+                    401,
+                    code="admin_auth_required",
+                    login_endpoint="/api/admin/auth/login",
+                )
             return redirect(_web_url("web_admin_login", next=request.full_path))
         _web_csrf_token()
         return fn(*args, **kwargs)
     return wrapper
 
 
+
+@app_flask.route("/api/admin/auth/login", methods=["POST", "OPTIONS"])
+def api_admin_auth_login():
+    if request.method == "OPTIONS":
+        return _admin_api_success({"preflight": True}, status_code=204)
+    if not _web_admin_enabled():
+        return _admin_api_error("Admin backend is disabled by WEB_ADMIN_ENABLED=0.", 403, code="admin_disabled")
+    if not ADMIN_IDS:
+        return _admin_api_error("No ADMIN_IDS are configured.", 403, code="admin_ids_missing")
+    expected_password = _web_admin_password()
+    if not expected_password:
+        return _admin_api_error("No web admin password is configured. Set ADMIN_WEB_PASSWORD or WEB_ADMIN_PASSWORD.", 403, code="admin_password_missing")
+
+    data = request.get_json(silent=True) or {}
+    got_password = str(data.get("password") or request.form.get("password") or "")
+    admin_id = _web_int(data.get("admin_id") or request.form.get("admin_id"), _web_current_admin_id())
+    if not hmac.compare_digest(got_password, expected_password):
+        return _admin_api_error("Invalid password.", 401, code="invalid_admin_password")
+    if not _web_valid_admin_id(admin_id):
+        return _admin_api_error("This Telegram Admin ID is not in ADMIN_IDS.", 403, code="admin_id_not_allowed")
+
+    session.clear()
+    session["web_admin_ok"] = True
+    session["web_admin_id"] = int(admin_id or _web_current_admin_id())
+    session["web_login_at"] = datetime.now(timezone.utc).isoformat()
+    csrf = _web_csrf_token()
+    return _admin_api_success({
+        "admin_id": int(session["web_admin_id"]),
+        "csrf_token": csrf,
+        "session": "cookie",
+        "message": "Login successful.",
+    })
+
+
+@app_flask.route("/api/admin/auth/me", methods=["GET"])
+def api_admin_auth_me():
+    authenticated = _web_admin_session_valid()
+    payload = {
+        "authenticated": authenticated,
+        "admin_id": _web_current_admin_id() if authenticated else None,
+        "csrf_token": _web_csrf_token() if authenticated else None,
+        "admin_ids_configured": bool(ADMIN_IDS),
+        "admin_password_configured": bool(_web_admin_password()),
+        "frontend_allowed_origins": _frontend_allowed_origins(),
+    }
+    return _admin_api_success(payload) if authenticated else _admin_api_error("Not authenticated.", 401, code="admin_auth_required", **payload)
+
+
+@app_flask.route("/api/admin/auth/logout", methods=["POST", "GET", "OPTIONS"])
+def api_admin_auth_logout():
+    if request.method == "OPTIONS":
+        return _admin_api_success({"preflight": True}, status_code=204)
+    session.clear()
+    return _admin_api_success({"message": "Logged out."})
+
+
+@app_flask.route("/api/admin/bootstrap", methods=["GET"])
+@web_admin_required
+def api_admin_bootstrap():
+    return _admin_api_success({
+        "admin_id": _web_current_admin_id(),
+        "csrf_token": _web_csrf_token(),
+        "timezone": APP_TIMEZONE_NAME,
+        "timezone_label": f"{APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})",
+        "health_endpoint": "/readyz",
+        "status_endpoint": "/admin/status.json",
+        "live_endpoint": "/admin/live.json",
+        "performance_endpoint": "/admin/performance.json",
+        "errors_endpoint": "/admin/errors.json",
+        "broadcast_jobs_endpoint": "/admin/broadcast/jobs.json",
+        "report_pdf_endpoint": "/admin/report.pdf",
+    })
+
+
 @app_flask.route("/admin/login", methods=["GET", "POST"])
 def web_admin_login():
+    if _backend_only_mode():
+        return _legacy_dashboard_disabled_payload("Admin Login", status_code=410)
     if not _web_admin_enabled():
         return _web_render("Disabled", "<div class='card'>WEB_ADMIN_ENABLED=0</div>", status_code=403)
     if not ADMIN_IDS:
@@ -3121,6 +3388,8 @@ def web_admin_login():
 @app_flask.route("/admin/logout")
 def web_admin_logout():
     session.clear()
+    if _backend_only_mode():
+        return _admin_api_success({"message": "Logged out."})
     return redirect(url_for("web_admin_login"))
 
 def _web_table_count(table: str, select_field: str = "id") -> int | None:
