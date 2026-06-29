@@ -308,7 +308,7 @@ def _perf_default(name: str, fallback: Any = None) -> Any:
 # SameSite=None requires Secure=True in modern browsers.
 DEFAULT_WEB_COOKIE_SAMESITE = "none"
 DEFAULT_WEB_COOKIE_SECURE = True
-ADMIN_BACKEND_RELEASE = "v18-redis-web-secret"
+ADMIN_BACKEND_RELEASE = "v19-production-hardening"
 
 
 # ── FastAPI Web Server + typed settings ─────────────────────────────────────
@@ -346,9 +346,12 @@ class AppSettings(BaseSettings):
     # FRONTEND_ALLOWED_ORIGINS to a comma-separated allowlist.
     ADMIN_FRONTEND_URL: str = ""
     FRONTEND_ALLOWED_ORIGINS: str = ""
-    # Emergency/dev-only escape hatch. Keep false in production because wildcard
-    # credentialed CORS lets any website call cookie-authenticated admin APIs.
+    # Emergency/dev-only escape hatch. This is now forcibly ignored in
+    # production/runtime Render environments. Use exact frontend origins there.
     FRONTEND_ALLOW_ALL_ORIGINS: bool = False
+    # Local Vite convenience only. When not in production and no frontend origins
+    # are configured, allow http://localhost:5173 and http://127.0.0.1:5173.
+    FRONTEND_LOCAL_DEV_ORIGINS_ENABLED: bool = True
     ADMIN_LOGIN_RATE_LIMIT_ATTEMPTS: int = 5
     ADMIN_LOGIN_RATE_LIMIT_WINDOW_S: float = 300.0
     ADMIN_LOGIN_RATE_LIMIT_REDIS_ENABLED: bool = True
@@ -358,7 +361,9 @@ class AppSettings(BaseSettings):
     # The token is short-lived, HMAC-signed with WEB_SECRET_KEY, and accepted
     # only for explicitly configured ADMIN_IDS.
     ADMIN_API_TOKEN_FALLBACK_ENABLED: bool = True
-    ADMIN_API_TOKEN_TTL_SECONDS: int = 0
+    # Keep the separated-frontend bearer fallback short-lived by default.
+    # Set ADMIN_API_TOKEN_FALLBACK_ENABLED=false after cookie auth is verified.
+    ADMIN_API_TOKEN_TTL_SECONDS: int = 3600
     WEB_REQUIRE_STABLE_SECRET_IN_PRODUCTION: bool = True
     MAX_CONCURRENT_TTS_USERS: int = int(_perf_default("MAX_CONCURRENT_TTS_USERS", 2))
     MAX_CONCURRENT_AI: int = 3
@@ -730,14 +735,20 @@ def _web_session_secret_key() -> str:
 
     msg = (
         "Redis-backed WEB_SECRET_KEY is not available. "
-        "A temporary in-memory session secret will be used; admin sessions "
-        "will reset after restart and may not work across multiple servers. "
-        "Set REDIS_URL so the app can store the web session secret in Redis."
+        "Production requires a stable web session secret so admin sessions do "
+        "not reset after restart and do not break across multiple servers. "
+        "Set REDIS_URL, or explicitly set WEB_SECRET_KEY only as a temporary "
+        "compatibility fallback."
     )
     if _is_production_runtime() and _env_bool("WEB_REQUIRE_STABLE_SECRET_IN_PRODUCTION", True):
         logging.getLogger(__name__).critical(msg)
-    else:
-        logging.getLogger(__name__).warning(msg)
+        raise RuntimeError(msg)
+
+    logging.getLogger(__name__).warning(
+        "%s Using a temporary in-memory secret because this is not production "
+        "or WEB_REQUIRE_STABLE_SECRET_IN_PRODUCTION=false.",
+        msg,
+    )
     _WEB_SESSION_SECRET_CACHE = secrets.token_hex(32)
     _WEB_SESSION_SECRET_SOURCE_CACHE = "random-startup-fallback"
     return _WEB_SESSION_SECRET_CACHE
@@ -1167,9 +1178,27 @@ def _backend_only_mode() -> bool:
     return _env_bool("BACKEND_ONLY", True) or not _env_bool("WEB_ADMIN_FRONTEND_ENABLED", False)
 
 
+DEFAULT_LOCAL_FRONTEND_ORIGINS = ("http://localhost:5173", "http://127.0.0.1:5173")
+
+
 def _frontend_allow_all_origins_enabled() -> bool:
-    # Dev/emergency only. In production, prefer FRONTEND_ALLOWED_ORIGINS with exact URLs.
-    return _env_bool("FRONTEND_ALLOW_ALL_ORIGINS", False)
+    # Dev/emergency only. Production must use FRONTEND_ALLOWED_ORIGINS with
+    # exact URLs because wildcard credentialed CORS is unsafe with admin cookies.
+    requested = _env_bool("FRONTEND_ALLOW_ALL_ORIGINS", False)
+    if requested and _is_production_runtime():
+        logging.getLogger(__name__).warning(
+            "Ignoring FRONTEND_ALLOW_ALL_ORIGINS=true in production. "
+            "Set ADMIN_FRONTEND_URL and FRONTEND_ALLOWED_ORIGINS to exact frontend origins."
+        )
+        return False
+    return requested
+
+
+def _frontend_local_dev_origins_enabled() -> bool:
+    explicit = os.environ.get("FRONTEND_LOCAL_DEV_ORIGINS_ENABLED")
+    if explicit is not None:
+        return _env_bool("FRONTEND_LOCAL_DEV_ORIGINS_ENABLED", True)
+    return not _is_production_runtime() and _env_bool("FRONTEND_LOCAL_DEV_ORIGINS_ENABLED", True)
 
 
 def _frontend_allowed_origins() -> list[str]:
@@ -1188,12 +1217,17 @@ def _frontend_allowed_origins() -> list[str]:
             origins.append(item)
     if admin_url and admin_url not in origins:
         origins.append(admin_url)
+    if _frontend_local_dev_origins_enabled():
+        for item in DEFAULT_LOCAL_FRONTEND_ORIGINS:
+            if item not in origins:
+                origins.append(item)
     if allow_all_requested:
         if _frontend_allow_all_origins_enabled():
             origins.append("*")
         else:
             logging.getLogger(__name__).warning(
-                "Ignoring FRONTEND_ALLOWED_ORIGINS='*' because FRONTEND_ALLOW_ALL_ORIGINS is false. "
+                "Ignoring FRONTEND_ALLOWED_ORIGINS='*'. Wildcard admin CORS is allowed only "
+                "outside production and only when FRONTEND_ALLOW_ALL_ORIGINS=true. "
                 "Set exact frontend origins in production."
             )
     return origins
@@ -1529,13 +1563,24 @@ async def favicon():
 
 @app_flask.route("/readyz")
 def readyz():
-    """Small deployment health endpoint for Render/UptimeRobot.
+    """Public deployment health endpoint.
 
-    It intentionally exposes only boolean readiness, never tokens or secrets.
+    Keep this intentionally minimal for Render/UptimeRobot. Detailed runtime,
+    secret-source, CORS, cookie, Redis, webhook, and leader data is available
+    only to authenticated admins at /api/admin/diagnostics.
     """
+    return jsonify({
+        "ok": True,
+        "web": True,
+        "status": "ready",
+        "ts": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+def _admin_diagnostics_payload() -> dict[str, Any]:
+    """Authenticated admin diagnostics; never expose this data on /readyz."""
     ffmpeg_path = globals().get("_FFMPEG_EXE", "")
     payload = {
-        "ok": True,
         "web": True,
         "telegram_token_configured": bool(globals().get("TELEGRAM_BOT_TOKEN")),
         "supabase_configured": bool(globals().get("supabase")),
@@ -1543,21 +1588,23 @@ def readyz():
         "ffmpeg_ok": bool(ffmpeg_path and os.path.exists(str(ffmpeg_path))),
         "web_secret_configured": _web_stable_secret_configured(),
         "web_secret_source": _web_session_secret_source(),
-        "web_secret_fingerprint": _web_session_secret_fingerprint(),
         "web_secret_redis_key": _web_secret_redis_key(),
         "frontend_allowed_origins": _frontend_allowed_origins(),
         "origin_guard_enabled": _admin_origin_guard_enabled(),
-        "cookie_policy": _admin_cookie_policy_payload(),
         "release": ADMIN_BACKEND_RELEASE,
         "bot_mode": _run_state_bot_mode() if "_run_state_bot_mode" in globals() else globals().get("BOT_MODE", "POLLING"),
         "webhook_ready": bool(globals().get("_TELEGRAM_APP")),
         "telegram_leader": _telegram_leader_snapshot() if "_telegram_leader_snapshot" in globals() else {},
     }
+    cookie_policy = globals().get("_admin_cookie_policy_payload")
+    if callable(cookie_policy):
+        with suppress(Exception):
+            payload["cookie_policy"] = cookie_policy()
     fmt = globals().get("_format_uptime")
     if callable(fmt):
         with suppress(Exception):
             payload["uptime"] = fmt()
-    return jsonify(payload)
+    return payload
 
 
 @app.get("/api-docs", include_in_schema=False)
@@ -3071,11 +3118,10 @@ def _admin_api_token_fallback_enabled() -> bool:
 
 
 def _admin_api_token_ttl_seconds() -> int:
-    configured = _env_int("ADMIN_API_TOKEN_TTL_SECONDS", 0, minimum=0, maximum=31 * 86400)
-    if configured > 0:
-        return configured
-    days = _env_int("WEB_ADMIN_SESSION_DAYS", 14, minimum=1, maximum=365)
-    return min(days * 86400, 14 * 86400)
+    # Production hardening: never silently stretch bearer fallback tokens to the
+    # full cookie/session lifetime.  Cookie auth remains the primary path; the
+    # bearer is only a short-lived bridge for separated frontends and local dev.
+    return _env_int("ADMIN_API_TOKEN_TTL_SECONDS", 3600, minimum=60, maximum=24 * 86400)
 
 
 def _b64url_encode(data: bytes) -> str:
@@ -3925,6 +3971,11 @@ def web_admin_required(fn):
     return wrapper
 
 
+@app_flask.route("/api/admin/diagnostics", methods=["GET"])
+@web_admin_required
+def api_admin_diagnostics():
+    return _admin_api_success(_admin_diagnostics_payload())
+
 
 @app_flask.route("/api/admin/auth/login", methods=["POST", "OPTIONS"])
 def api_admin_auth_login():
@@ -4009,6 +4060,7 @@ def api_admin_bootstrap():
         "timezone": APP_TIMEZONE_NAME,
         "timezone_label": f"{APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})",
         "health_endpoint": "/readyz",
+        "diagnostics_endpoint": "/api/admin/diagnostics",
         "status_endpoint": "/admin/status.json",
         "release": ADMIN_BACKEND_RELEASE,
         "cookie_policy": _admin_cookie_policy_payload(),
