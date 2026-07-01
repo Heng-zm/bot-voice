@@ -10024,7 +10024,7 @@ async def _telegram_user_security_guard(update: Any, context: Any) -> None:
 
     query = update.callback_query
     data = str(getattr(query, "data", "") or "") if query is not None else ""
-    admin_callback_prefixes = ("admin_", "api_", "rtadmin_", "user_", "users_", "history_", "sched_", "bc_")
+    admin_callback_prefixes = ("admin_", "api_", "rtadmin_", "user_", "users_", "history_", "sched_", "bc_", "admin_report_")
     if _env_bool("ADMIN_CALLBACK_GUARD_ENABLED", True) and data.startswith(admin_callback_prefixes):
         _metric_inc("admin_denied")
         await _security_notice_once(update, f"admin_cb:{user_id}", "⛔ Admin only.", alert=True)
@@ -10082,6 +10082,18 @@ BROADCAST_TEMPLATES_SETTING_KEY = "broadcast_templates_json"
 BROADCAST_TEMPLATE_LIBRARY_MAX = 20
 BROADCAST_TEMPLATE_TITLE_MAX = 48
 BROADCAST_TEMPLATE_PREVIEW_MAX = 700
+BROADCAST_TEMPLATE_BUTTON_TITLE_MAX = 34
+_BROADCAST_TEMPLATES_LOCK = threading.RLock()
+
+# Broadcast Sent Delete Center. Telegram normally allows deleting bot-sent
+# messages only for a limited time, so keep delete jobs short-lived and
+# in-memory to avoid a DB migration for this safe rollback action.
+BROADCAST_SENT_DELETE_TTL_S = 47 * 3600
+BROADCAST_SENT_DELETE_MAX_JOBS = 25
+BROADCAST_SENT_DELETE_BATCH_SIZE = 20
+BROADCAST_SENT_DELETE_DELAY_S = 0.08
+_BROADCAST_SENT_DELETE_LOCK = threading.RLock()
+_BROADCAST_SENT_DELETE_JOBS: OrderedDict[str, dict] = OrderedDict()
 
 _SCHED_POLL_INTERVAL   = _env_int("SCHED_POLL_INTERVAL", 60, minimum=5, maximum=3600)
 _SCHED_SENDING_STALE_SECONDS = _env_int("SCHED_SENDING_STALE_SECONDS", 1800, minimum=60, maximum=86400)
@@ -11118,50 +11130,75 @@ def _is_nonfatal_telegram_edit_error(exc: Exception | str) -> bool:
     return _is_message_not_modified_error(exc) or _is_stale_telegram_message_error(exc)
 
 
-async def safe_send(coro_factory, retries: int = 3, delay: float = 2.0):
-    """Run Telegram send/edit calls with retry.
+def _retry_after_seconds(exc: Any, default: float = 3.0) -> float:
+    """Return a safe sleep duration for Telegram RetryAfter variants."""
+    value = getattr(exc, "retry_after", default)
+    if isinstance(value, timedelta):
+        value = value.total_seconds()
+    try:
+        return max(0.5, min(float(value) + 1.0, 60.0))
+    except Exception:
+        return float(default)
 
-    Important fix: Telegram raises BadRequest when an inline button edits a
-    message to the same text/same markup, or when the original message is stale.
-    Those are not real failures, so this helper returns None instead of logging
-    an unhandled callback error.
+
+async def safe_send(coro_factory, retries: int = 3, delay: float = 2.0):
+    """Run Telegram send/edit/delete calls with safe retry behavior.
+
+    The helper keeps callback/menu flows stable by treating unchanged or stale
+    Telegram messages as non-fatal, honoring RetryAfter sleeps, and returning
+    None when a user blocked the bot instead of crashing the whole handler.
     """
     if inspect.isawaitable(coro_factory):
         raise TypeError(
             "safe_send requires a zero-arg callable (lambda), not a raw coroutine."
         )
+    if not callable(coro_factory):
+        raise TypeError("safe_send requires a zero-arg callable.")
+
+    retries = max(1, int(retries or 1))
+    delay = max(0.1, float(delay or 0.1))
     last_exc = None
     for attempt in range(retries):
         try:
-            return await coro_factory()
+            result = coro_factory()
+            if inspect.isawaitable(result):
+                return await result
+            return result
         except RetryAfter as e:
-            wait = e.retry_after + 1
-            logger.warning(f"Rate-limited — sleeping {wait}s (attempt {attempt + 1})")
-            await asyncio.sleep(wait)
+            wait = _retry_after_seconds(e)
+            logger.warning("Telegram RetryAfter — sleeping %.1fs (attempt %s/%s)", wait, attempt + 1, retries)
             last_exc = e
-            if attempt == retries - 1:
+            if attempt >= retries - 1:
                 raise
+            await asyncio.sleep(wait)
+        except Forbidden as e:
+            # User/group blocked the bot or bot lost access.  Broadcast-specific
+            # code still marks recipients blocked; generic UI sends should not
+            # take down the handler.
+            logger.info("Telegram Forbidden ignored by safe_send: %s", str(e)[:300])
+            return None
         except BadRequest as e:
             if _is_nonfatal_telegram_edit_error(e):
                 logger.debug("Telegram edit/delete skipped because message is unchanged or stale: %s", e)
                 return None
-            logger.warning(f"Telegram BadRequest (not retried): {e}")
+            logger.warning("Telegram BadRequest (not retried): %s", e)
             raise
         except (TimedOut, NetworkError) as e:
             last_exc = e
             if attempt < retries - 1:
-                logger.warning(f"Network error (attempt {attempt + 1}): {e}")
-                await asyncio.sleep(delay)
+                wait = min(delay * (attempt + 1), 15.0)
+                logger.warning("Telegram network error (attempt %s/%s), retrying in %.1fs: %s", attempt + 1, retries, wait, e)
+                await asyncio.sleep(wait)
             else:
                 raise
         except TelegramError as e:
             if _is_nonfatal_telegram_edit_error(e):
                 logger.debug("Telegram edit/delete skipped because message is unchanged or stale: %s", e)
                 return None
-            logger.error(f"Telegram error: {e}")
+            logger.error("Telegram error: %s", e)
             raise
     if last_exc:
-        logger.warning(f"safe_send giving up after {retries} attempts: {last_exc}")
+        logger.warning("safe_send giving up after %s attempts: %s", retries, last_exc)
     return None
 
 
@@ -15991,22 +16028,57 @@ def get_broadcast_templates_kb(templates: list[dict]) -> InlineKeyboardMarkup:
             continue
         title = _broadcast_template_button_title(tpl)
         rows.append([
-            InlineKeyboardButton(title, callback_data=f"bc_tpl_use:{tpl_id}"),
-            InlineKeyboardButton("🗑", callback_data=f"bc_tpl_del:{tpl_id}"),
+            InlineKeyboardButton(f"▶️ {title}", callback_data=f"bc_tpl_use:{tpl_id}"),
+            InlineKeyboardButton("🗑", callback_data=f"bc_tpl_delask:{tpl_id}"),
         ])
-    rows.append([InlineKeyboardButton("➕ Broadcast ថ្មី", callback_data="admin_broadcast")])
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="bc_templates"),
+                 InlineKeyboardButton("➕ Broadcast ថ្មី", callback_data="admin_broadcast")])
     rows.append([InlineKeyboardButton("⬅️ Admin V8", callback_data="admin_home"),
                  InlineKeyboardButton("❌ បិទ", callback_data="admin_close")])
     return InlineKeyboardMarkup(rows)
 
 
+def get_broadcast_template_delete_confirm_kb(template_id: str) -> InlineKeyboardMarkup:
+    tpl_id = _broadcast_template_safe_id(template_id)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ លុប Template នេះ", callback_data=f"bc_tpl_del:{tpl_id}")],
+        [InlineKeyboardButton("↩️ មិនលុប / ត្រឡប់ក្រោយ", callback_data="bc_templates")],
+    ])
+
+
+def get_broadcast_sent_delete_kb(delete_job_id: str) -> InlineKeyboardMarkup:
+    job_id = _broadcast_sent_delete_safe_id(delete_job_id)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑️ លុបសារដែលបានផ្ញើ", callback_data=f"bc_del_sent_ask:{job_id}")],
+        [InlineKeyboardButton("⬅️ Admin V8", callback_data="admin_home")],
+    ])
+
+
+def get_broadcast_sent_delete_confirm_kb(delete_job_id: str) -> InlineKeyboardMarkup:
+    job_id = _broadcast_sent_delete_safe_id(delete_job_id)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ បញ្ជាក់លុបសារដែលបានផ្ញើ", callback_data=f"bc_del_sent_run:{job_id}")],
+        [InlineKeyboardButton("↩️ ទុកសារនៅដដែល", callback_data="bc_del_sent_keep")],
+    ])
+
+
 def _broadcast_template_safe_id(value: Any) -> str:
-    text = str(value or "").strip()
+    text = str(value or "").strip().lower()
     return text if re.fullmatch(r"[a-f0-9]{8,16}", text) else ""
 
 
+def _broadcast_template_safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
 def _broadcast_template_content(payload: dict) -> str:
-    return str(payload.get("caption") if payload.get("photo_file_id") else payload.get("text") or "")
+    if not isinstance(payload, dict):
+        return ""
+    content = payload.get("caption") if payload.get("photo_file_id") else payload.get("text")
+    return str(content or "")
 
 
 def _broadcast_template_clean_preview(text: Any, *, max_len: int = BROADCAST_TEMPLATE_TITLE_MAX) -> str:
@@ -16031,7 +16103,7 @@ def _broadcast_template_button_title(tpl: dict) -> str:
     title = str(tpl.get("title") or "").strip()
     if not title:
         title = _broadcast_template_title_from_payload(tpl)
-    return _broadcast_template_clean_preview(title, max_len=36)
+    return _broadcast_template_clean_preview(title, max_len=BROADCAST_TEMPLATE_BUTTON_TITLE_MAX)
 
 
 def _broadcast_template_payload_from_template(tpl: dict) -> dict:
@@ -16067,6 +16139,7 @@ def _broadcast_template_normalize(tpl: dict, *, fallback_id: str | None = None) 
         text = ""
     else:
         caption = ""
+    now_iso = _sched_iso()
     tpl_id = _broadcast_template_safe_id(tpl.get("id")) or _broadcast_template_safe_id(fallback_id) or secrets.token_hex(4)
     payload = {
         "id": tpl_id,
@@ -16075,13 +16148,13 @@ def _broadcast_template_normalize(tpl: dict, *, fallback_id: str | None = None) 
         "caption": caption if photo_file_id else None,
         "text": None if photo_file_id else text,
         "parse_mode": parse_mode,
-        "created_at": str(tpl.get("created_at") or _sched_iso()),
-        "updated_at": str(tpl.get("updated_at") or _sched_iso()),
-        "created_by": int(tpl.get("created_by") or 0),
+        "created_at": str(tpl.get("created_at") or now_iso),
+        "updated_at": str(tpl.get("updated_at") or now_iso),
+        "created_by": _broadcast_template_safe_int(tpl.get("created_by"), 0),
     }
     if not payload["title"]:
         payload["title"] = _broadcast_template_title_from_payload(payload)
-    payload["fingerprint"] = str(tpl.get("fingerprint") or _broadcast_template_fingerprint(payload))
+    payload["fingerprint"] = _broadcast_template_fingerprint(payload)
     return payload
 
 
@@ -16114,7 +16187,8 @@ _BROADCAST_TEMPLATES_MEMORY_JSON = "[]"
 
 
 def db_broadcast_templates_fetch() -> list[dict]:
-    raw = _BROADCAST_TEMPLATES_MEMORY_JSON
+    with _BROADCAST_TEMPLATES_LOCK:
+        raw = _BROADCAST_TEMPLATES_MEMORY_JSON
     if supabase:
         try:
             res = (
@@ -16127,6 +16201,9 @@ def db_broadcast_templates_fetch() -> list[dict]:
             rows = getattr(res, "data", None) or []
             if rows:
                 raw = str(rows[0].get("value") or "[]")
+                # Keep memory fallback warm after a successful DB read.
+                with _BROADCAST_TEMPLATES_LOCK:
+                    globals()["_BROADCAST_TEMPLATES_MEMORY_JSON"] = raw
         except Exception as exc:
             logger.warning("broadcast template fetch fallback: %s", exc)
     return _broadcast_templates_parse(raw)
@@ -16135,14 +16212,21 @@ def db_broadcast_templates_fetch() -> list[dict]:
 def db_broadcast_templates_save_all(templates: list[dict], admin_id: int) -> tuple[bool, str]:
     global _BROADCAST_TEMPLATES_MEMORY_JSON
     normalised = []
+    seen_fingerprints: set[str] = set()
     for item in templates:
         tpl = _broadcast_template_normalize(item)
-        if tpl:
-            normalised.append(tpl)
+        if not tpl:
+            continue
+        fingerprint = str(tpl.get("fingerprint") or "")
+        if fingerprint and fingerprint in seen_fingerprints:
+            continue
+        seen_fingerprints.add(fingerprint)
+        normalised.append(tpl)
         if len(normalised) >= BROADCAST_TEMPLATE_LIBRARY_MAX:
             break
     raw = _json.dumps(normalised, ensure_ascii=False, separators=(",", ":"))
-    _BROADCAST_TEMPLATES_MEMORY_JSON = raw
+    with _BROADCAST_TEMPLATES_LOCK:
+        _BROADCAST_TEMPLATES_MEMORY_JSON = raw
     if not supabase:
         return True, "saved in memory only"
     try:
@@ -16159,22 +16243,40 @@ def db_broadcast_templates_save_all(templates: list[dict], admin_id: int) -> tup
 
 
 def db_broadcast_template_save(payload: dict, admin_id: int, title: str | None = None) -> tuple[bool, str, dict | None]:
-    tpl = _broadcast_template_normalize({
+    now_iso = _sched_iso()
+    incoming = _broadcast_template_normalize({
         **dict(payload or {}),
         "id": secrets.token_hex(4),
         "title": str(title or "").strip(),
         "created_by": int(admin_id),
-        "created_at": _sched_iso(),
-        "updated_at": _sched_iso(),
+        "created_at": now_iso,
+        "updated_at": now_iso,
     })
-    if not tpl:
+    if not incoming:
         return False, "Template content is empty.", None
 
-    fingerprint = str(tpl.get("fingerprint") or "")
-    templates = [t for t in db_broadcast_templates_fetch() if str(t.get("fingerprint") or "") != fingerprint]
-    templates.insert(0, tpl)
+    fingerprint = str(incoming.get("fingerprint") or "")
+    existing_templates = db_broadcast_templates_fetch()
+    updated_existing = False
+    templates: list[dict] = []
+    for existing in existing_templates:
+        if str(existing.get("fingerprint") or "") == fingerprint:
+            incoming["id"] = existing.get("id") or incoming["id"]
+            incoming["created_at"] = existing.get("created_at") or incoming["created_at"]
+            incoming["created_by"] = existing.get("created_by") or incoming["created_by"]
+            # Keep a custom old title when the admin saves the same content again
+            # without providing a new title.
+            if not str(title or "").strip() and existing.get("title"):
+                incoming["title"] = existing.get("title")
+            incoming["updated_at"] = now_iso
+            updated_existing = True
+            continue
+        templates.append(existing)
+    templates.insert(0, incoming)
     ok, info = db_broadcast_templates_save_all(templates, admin_id)
-    return ok, info, tpl if ok else None
+    if not ok:
+        return False, info, None
+    return True, "updated existing template" if updated_existing else info, incoming
 
 
 def db_broadcast_template_get(template_id: str) -> dict | None:
@@ -16199,6 +16301,170 @@ def db_broadcast_template_delete(template_id: str, admin_id: int) -> tuple[bool,
     return ok, info
 
 
+def _broadcast_sent_delete_safe_id(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return text if re.fullmatch(r"[a-f0-9]{8,16}", text) else ""
+
+
+def _broadcast_sent_delete_cleanup_locked(now: float | None = None) -> None:
+    now = time.monotonic() if now is None else float(now)
+    for job_id, item in list(_BROADCAST_SENT_DELETE_JOBS.items()):
+        if float(item.get("expires_at") or 0.0) <= now:
+            _BROADCAST_SENT_DELETE_JOBS.pop(job_id, None)
+    while len(_BROADCAST_SENT_DELETE_JOBS) > BROADCAST_SENT_DELETE_MAX_JOBS:
+        _BROADCAST_SENT_DELETE_JOBS.popitem(last=False)
+
+
+def _broadcast_sent_delete_register(admin_id: int, label: str, sent_records: list[dict]) -> str:
+    clean_records: list[dict] = []
+    seen: set[tuple[int, int]] = set()
+    for item in sent_records or []:
+        try:
+            chat_id = int(item.get("chat_id"))
+            message_id = int(item.get("message_id"))
+        except Exception:
+            continue
+        if not chat_id or not message_id:
+            continue
+        key = (chat_id, message_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        clean_records.append({"chat_id": chat_id, "message_id": message_id})
+    if not clean_records:
+        return ""
+    job_id = secrets.token_hex(4)
+    now = time.monotonic()
+    with _BROADCAST_SENT_DELETE_LOCK:
+        _broadcast_sent_delete_cleanup_locked(now)
+        _BROADCAST_SENT_DELETE_JOBS[job_id] = {
+            "id": job_id,
+            "admin_id": int(admin_id),
+            "label": str(label or "Broadcast")[:80],
+            "records": clean_records,
+            "created_at": _sched_iso(),
+            "expires_at": now + BROADCAST_SENT_DELETE_TTL_S,
+        }
+        _broadcast_sent_delete_cleanup_locked(now)
+    return job_id
+
+
+def _broadcast_sent_delete_get(job_id: str, admin_id: int, *, pop: bool = False) -> dict | None:
+    job_id = _broadcast_sent_delete_safe_id(job_id)
+    if not job_id:
+        return None
+    with _BROADCAST_SENT_DELETE_LOCK:
+        _broadcast_sent_delete_cleanup_locked()
+        item = _BROADCAST_SENT_DELETE_JOBS.get(job_id)
+        if not item or int(item.get("admin_id") or 0) != int(admin_id):
+            return None
+        if pop:
+            _BROADCAST_SENT_DELETE_JOBS.pop(job_id, None)
+        else:
+            _BROADCAST_SENT_DELETE_JOBS.move_to_end(job_id)
+        copied = dict(item)
+        copied["records"] = [dict(r) for r in item.get("records") or []]
+        return copied
+
+
+def _broadcast_sent_delete_confirm_text(job: dict | None) -> str:
+    if not job:
+        return (
+            "⚠️ <b>Delete job មិនមានទៀតទេ</b>\n\n"
+            "វាអាចផុតកំណត់ ឬ Server បាន restart។"
+        )
+    records = job.get("records") or []
+    label = html.escape(str(job.get("label") or "Broadcast"))
+    return (
+        "🗑️ <b>លុបសារដែល Broadcast បានផ្ញើ</b>\n\n"
+        f"Broadcast: <b>{label}</b>\n"
+        f"ចំនួនសារដែលអាចលុប: <b>{len(records)}</b>\n\n"
+        "⚠️ Bot នឹងព្យាយាមលុបសារដែល bot បានផ្ញើទៅអ្នកប្រើ។ "
+        "សារចាស់ពេក ឬ chat ខ្លះៗអាចលុបមិនបានតាមច្បាប់ Telegram។"
+    )
+
+
+async def _delete_broadcast_sent_messages(bot: Any, admin_id: int, delete_job: dict) -> tuple[int, int]:
+    records = list(delete_job.get("records") or [])
+    total = len(records)
+    label = str(delete_job.get("label") or "Broadcast")[:80]
+    if not records:
+        await safe_send(lambda: bot.send_message(
+            chat_id=admin_id,
+            text="⚠️ មិនមានសារសម្រាប់លុបទេ។",
+        ))
+        return (0, 0)
+
+    progress_msg = await safe_send(lambda: bot.send_message(
+        chat_id=admin_id,
+        text=f"🗑️ កំពុងលុបសារ {total} ពី {html.escape(label)}...",
+        parse_mode="HTML",
+    ))
+
+    deleted = failed = 0
+    for idx, item in enumerate(records, start=1):
+        try:
+            await bot.delete_message(
+                chat_id=int(item.get("chat_id")),
+                message_id=int(item.get("message_id")),
+            )
+            deleted += 1
+        except RetryAfter as exc:
+            await asyncio.sleep(float(getattr(exc, "retry_after", 1) or 1) + 1)
+            try:
+                await bot.delete_message(
+                    chat_id=int(item.get("chat_id")),
+                    message_id=int(item.get("message_id")),
+                )
+                deleted += 1
+            except Exception as retry_exc:
+                failed += 1
+                logger.info("broadcast sent-delete retry failed chat=%s msg=%s: %s", item.get("chat_id"), item.get("message_id"), retry_exc)
+        except Exception as exc:
+            failed += 1
+            logger.info("broadcast sent-delete failed chat=%s msg=%s: %s", item.get("chat_id"), item.get("message_id"), exc)
+
+        if progress_msg and (idx == total or idx % max(10, BROADCAST_SENT_DELETE_BATCH_SIZE) == 0):
+            with suppress(Exception):
+                pct = int(idx / total * 100) if total else 100
+                await progress_msg.edit_text(
+                    f"🗑️ កំពុងលុប: {pct}% ({idx}/{total})\n"
+                    f"✅ លុបបាន: {deleted}  ❌ មិនបាន: {failed}"
+                )
+        if idx < total and BROADCAST_SENT_DELETE_DELAY_S:
+            await asyncio.sleep(BROADCAST_SENT_DELETE_DELAY_S)
+
+    report = (
+        "✅ <b>លុបសារ Broadcast រួចរាល់</b>\n\n"
+        f"Broadcast: <b>{html.escape(label)}</b>\n"
+        f"សរុប: <b>{total}</b>\n"
+        f"🗑️ លុបបាន: <b>{deleted}</b>\n"
+        f"❌ លុបមិនបាន: <b>{failed}</b>"
+    )
+    try:
+        if progress_msg:
+            await progress_msg.edit_text(report, parse_mode="HTML")
+        else:
+            await safe_send(lambda: bot.send_message(chat_id=admin_id, text=report, parse_mode="HTML"))
+    except Exception as exc:
+        logger.warning("broadcast sent-delete final report failed: %s", exc)
+    return (deleted, failed)
+
+
+def _broadcast_template_delete_confirm_text(tpl: dict) -> str:
+    title = html.escape(_broadcast_template_button_title(tpl))
+    kind = "🖼️ Photo" if tpl.get("photo_file_id") else "📝 Text"
+    mode = html.escape(_broadcast_parse_mode_label(tpl.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO))
+    preview = html.escape(_broadcast_template_clean_preview(_broadcast_template_content(tpl), max_len=180))
+    return (
+        "⚠️ <b>បញ្ជាក់ការលុប Template</b>\n\n"
+        f"ឈ្មោះ: <b>{title}</b>\n"
+        f"ប្រភេទ: <b>{kind}</b> · Format: <b>{mode}</b>\n"
+        f"Preview: <code>{preview}</code>\n\n"
+        "ការលុបនេះមិនអាច Undo បានទេ។"
+    )
+
+
 def _broadcast_templates_panel_text(templates: list[dict], notice: str = "") -> str:
     lines: list[str] = []
     if notice:
@@ -16212,19 +16478,23 @@ def _broadcast_templates_panel_text(templates: list[dict], notice: str = "") -> 
     ])
     if not templates:
         lines.append("📭 មិនទាន់មាន Template ទេ។")
-        lines.append("បង្កើត Broadcast Preview រួចចុច <b>Save Template</b>។")
+        lines.append("បង្កើត Broadcast Preview រួចចុច <b>📝 រក្សាទុក Template</b>។")
     else:
         for idx, tpl in enumerate(templates, start=1):
             kind = "🖼️ Photo" if tpl.get("photo_file_id") else "📝 Text"
             title = html.escape(_broadcast_template_button_title(tpl))
             mode = html.escape(_broadcast_parse_mode_label(tpl.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO))
-            preview = html.escape(_broadcast_template_clean_preview(_broadcast_template_content(tpl), max_len=84))
+            preview = html.escape(_broadcast_template_clean_preview(
+                _broadcast_template_content(tpl),
+                max_len=min(120, BROADCAST_TEMPLATE_PREVIEW_MAX),
+            ))
             lines.append(f"{idx}. <b>{title}</b> — {kind} · {mode}")
             lines.append(f"   <code>{preview}</code>")
     lines.extend([
         "",
-        "ចុច Template ដើម្បីបង្ហាញ Preview ហើយអាច Confirm ផ្ញើបាន។",
-        "ចុច 🗑 ដើម្បីលុប Template។",
+        "▶️ ចុច Template ដើម្បី Preview មុនផ្ញើ។",
+        "🗑 ចុចលុប នឹងមាន Confirm មុនលុបពិត។",
+        "🔄 Refresh ប្រើពេលមាន Admin ច្រើនកំពុងកែ Template។",
     ])
     return "\n".join(lines)
 
@@ -16740,8 +17010,8 @@ async def _send_telegram_broadcast_message(
     parse_mode: str | None,
     photo_file_id: str | None = None,
     reply_markup: Any | None = None,
-) -> None:
-    """Send a text/photo broadcast with parse-mode fallback."""
+) -> Any:
+    """Send a text/photo broadcast with parse-mode fallback and return Telegram Message."""
     parse_candidates = _broadcast_candidate_parse_modes(text, parse_mode)
     last_parse_error: Exception | None = None
 
@@ -16757,7 +17027,7 @@ async def _send_telegram_broadcast_message(
                     kwargs["parse_mode"] = telegram_parse_mode
                 if reply_markup is not None:
                     kwargs["reply_markup"] = reply_markup
-                await bot.send_photo(**kwargs)
+                return await bot.send_photo(**kwargs)
             else:
                 kwargs = {
                     "chat_id": int(chat_id),
@@ -16768,8 +17038,7 @@ async def _send_telegram_broadcast_message(
                     kwargs["parse_mode"] = telegram_parse_mode
                 if reply_markup is not None:
                     kwargs["reply_markup"] = reply_markup
-                await bot.send_message(**kwargs)
-            return
+                return await bot.send_message(**kwargs)
         except BadRequest as exc:
             if telegram_parse_mode and _is_telegram_parse_error(exc):
                 last_parse_error = exc
@@ -16830,6 +17099,7 @@ async def _run_broadcast_to_all(
         return (0, 0, 0)
 
     sent = failed = 0
+    sent_records: list[dict] = []
     blocked = max(0, total_registered - total)
 
     if total == 0:
@@ -16876,18 +17146,20 @@ async def _run_broadcast_to_all(
         )
     ))
 
-    async def _send_one(uid: int) -> str:
+    async def _send_one(uid: int) -> tuple[str, dict | None]:
         async with broadcast_semaphore:
             for attempt in range(2):
                 try:
-                    await _send_telegram_broadcast_message(
+                    sent_message = await _send_telegram_broadcast_message(
                         bot,
                         chat_id=uid,
                         text=send_text or "",
                         parse_mode=send_parse_mode,
                         photo_file_id=photo_file_id,
                     )
-                    return "sent"
+                    message_id = int(getattr(sent_message, "message_id", 0) or 0)
+                    record = {"chat_id": int(uid), "message_id": message_id} if message_id else None
+                    return "sent", record
                 except Forbidden as e:
                     await loop.run_in_executor(
                         None,
@@ -16899,11 +17171,11 @@ async def _run_broadcast_to_all(
                             f"Telegram Forbidden during broadcast: {str(e)[:180]}",
                         ),
                     )
-                    return "blocked"
+                    return "blocked", None
                 except RetryAfter as e:
                     await asyncio.sleep(e.retry_after + 1)
                     if attempt == 1:
-                        return "failed"
+                        return "failed", None
                 except BadRequest as e:
                     low = str(e).lower()
                     if (
@@ -16923,15 +17195,15 @@ async def _run_broadcast_to_all(
                                 f"Telegram unreachable during broadcast: {str(e)[:180]}",
                             ),
                         )
-                        return "blocked"
+                        return "blocked", None
                     logger.error(f"{label} Telegram BadRequest uid={uid}: {e}")
-                    return "failed"
+                    return "failed", None
                 except Exception as e:
                     logger.error(f"{label} error uid={uid} attempt={attempt}: {e}")
                     if attempt == 1:
-                        return "failed"
+                        return "failed", None
                     await asyncio.sleep(0.5 * (attempt + 1))
-        return "failed"
+        return "failed", None
 
     batch_size = max(1, _run_state_broadcast_batch_size())
     for start in range(0, total, batch_size):
@@ -16945,9 +17217,19 @@ async def _run_broadcast_to_all(
             if isinstance(result, Exception):
                 logger.error(f"{label} batch task error: {result}")
                 failed += 1
-            elif result == "sent":
+                continue
+
+            status = result
+            record = None
+            if isinstance(result, tuple):
+                status = result[0]
+                record = result[1] if len(result) > 1 else None
+
+            if status == "sent":
                 sent += 1
-            elif result == "blocked":
+                if isinstance(record, dict):
+                    sent_records.append(record)
+            elif status == "blocked":
                 blocked += 1
             else:
                 failed += 1
@@ -16964,6 +17246,11 @@ async def _run_broadcast_to_all(
         if completed < total:
             await asyncio.sleep(max(0.0, _run_state_broadcast_delay()))
 
+    delete_job_id = _broadcast_sent_delete_register(admin_id, label, sent_records)
+    delete_note = (
+        "\n\n🗑️ ចង់លុបសារដែលបានផ្ញើទៅអ្នកប្រើវិញ សូមចុចប៊ូតុងខាងក្រោម។"
+        if delete_job_id else ""
+    )
     report = (
         f"✅ <b>{html.escape(label)}</b> រួចរាល់!\n\n"
         f"👥 Registered: {total_registered}\n"
@@ -16971,12 +17258,14 @@ async def _run_broadcast_to_all(
         f"📨 បានផ្ញើ: {sent}\n"
         f"🚫 Blocked/unreachable: {blocked}\n"
         f"❌ Failed: {failed}"
+        f"{delete_note}"
     )
+    reply_markup = get_broadcast_sent_delete_kb(delete_job_id) if delete_job_id else None
     try:
         if progress_msg:
-            await safe_send(lambda: progress_msg.edit_text(report, parse_mode="HTML"))
+            await safe_send(lambda: progress_msg.edit_text(report, parse_mode="HTML", reply_markup=reply_markup))
         else:
-            await safe_send(lambda: bot.send_message(chat_id=admin_id, text=report, parse_mode="HTML"))
+            await safe_send(lambda: bot.send_message(chat_id=admin_id, text=report, parse_mode="HTML", reply_markup=reply_markup))
     except Exception as e:
         logger.error(f"{label} report error: {e}")
 
@@ -18279,6 +18568,12 @@ async def _admin_home_text(admin_id: int, title: str = "🛠️ Admin System Cen
 
 
 async def _admin_health_text() -> str:
+    """Admin-facing whole-bot health snapshot.
+
+    Keep this command read-only and safe to call often.  It intentionally uses
+    existing runtime/cache state and short executor calls instead of changing
+    external API contracts.
+    """
     ffmpeg_ok = bool(_FFMPEG_EXE and os.path.exists(_FFMPEG_EXE))
     temp_dir = ""
     temp_ok = False
@@ -18288,23 +18583,73 @@ async def _admin_health_text() -> str:
     except Exception:
         temp_dir = "ERROR"
 
+    loop = asyncio.get_running_loop()
+    try:
+        counts = await _admin_summary_counts(0)
+    except Exception:
+        counts = {}
+
+    try:
+        template_count = await loop.run_in_executor(_DB_EXECUTOR, lambda: len(_broadcast_template_load_sync()))
+    except Exception:
+        template_count = 0
+
+    with _BROADCAST_SENT_DELETE_LOCK:
+        delete_jobs = len(_BROADCAST_SENT_DELETE_JOBS)
+
+    try:
+        db_queue = _db_executor_queue_size()
+    except Exception:
+        db_queue = 0
+
+    try:
+        active_requests = int(globals().get("_WEB_ACTIVE_REQUESTS", 0) or 0)
+    except Exception:
+        active_requests = 0
+
+    mode = _run_state_bot_mode() if "_run_state_bot_mode" in globals() else str(globals().get("BOT_MODE", "POLLING"))
+    webhook_ready = bool(globals().get("_TELEGRAM_APP_READY"))
+    redis_ok = bool(globals().get("redis_client"))
+    db_ok = bool(globals().get("supabase"))
     ocr_ready = _ocr_configured()
-    return (
-        "🩺 <b>Bot Health</b>\n\n"
-        f"🤖 Telegram bot: <b>✅ OK</b>\n"
-        f"🗄️ Supabase: <b>{_ok_bad(bool(supabase))}</b>\n"
-        f"🧠 Hugging Face: <b>{_ok_bad(bool(_hf_client))}</b>\n"
-        f"🔍 OCR: <b>{_ok_bad(bool(ocr_ready), 'READY', 'OFF')}</b>\n"
-        f"🎧 FFmpeg: <b>{_ok_bad(ffmpeg_ok, 'OK', 'ERROR')}</b>\n"
-        f"📁 Temp folder: <b>{_ok_bad(temp_ok, 'OK', 'ERROR')}</b>\n"
-        f"<code>{html.escape(str(temp_dir))}</code>\n\n"
-        f"⏰ Scheduler poll: <b>{int(_SCHED_POLL_INTERVAL)}s</b>\n"
-        f"🔐 Scheduler lock: <b>{'ON' if _SCHED_LOCK_ENABLED else 'OFF'}</b> / required <b>{'YES' if _SCHED_LOCK_REQUIRED else 'NO'}</b>\n"
-        f"📌 Lock status: <b>{html.escape(str(_scheduler_lock_last_status))}</b>\n"
-        f"🔑 Lock owner: <code>{html.escape(_BOT_LOCK_OWNER[:80])}</code>\n"
-        f"📦 Due batch: <b>{int(_SCHED_DUE_LIMIT)}</b> / scan <b>{int(_SCHED_SCAN_LIMIT)}</b>\n"
-        f"🏃 Active schedule jobs: <b>{len(_scheduler_active_ids)}</b>"
-    )
+    tts_provider = str(globals().get("TTS_PROVIDER", "auto") or "auto")
+
+    return "\n".join([
+        "🩺 <b>Whole Bot Health</b>",
+        "",
+        "<b>Core Services</b>",
+        f"🤖 Telegram app: <b>{_ok_bad(webhook_ready, 'READY', 'BOOTING')}</b>",
+        f"🌐 Runtime mode: <code>{html.escape(str(mode))}</code>",
+        f"🗄️ Supabase: <b>{_ok_bad(db_ok)}</b>",
+        f"🧰 Redis: <b>{_ok_bad(redis_ok)}</b>",
+        f"🎧 FFmpeg: <b>{_ok_bad(ffmpeg_ok, 'OK', 'ERROR')}</b>",
+        f"📁 Temp folder: <b>{_ok_bad(temp_ok, 'OK', 'ERROR')}</b> <code>{html.escape(str(temp_dir))}</code>",
+        "",
+        "<b>AI / TTS</b>",
+        f"🗣️ TTS provider: <code>{html.escape(tts_provider)}</code>",
+        f"🧠 Hugging Face: <b>{_ok_bad(bool(_hf_client))}</b>",
+        f"🔍 OCR: <b>{_ok_bad(bool(ocr_ready), 'READY', 'OFF')}</b>",
+        f"🔒 TTS concurrency: <b>{_run_state_max_concurrent_tts_users() if '_run_state_max_concurrent_tts_users' in globals() else MAX_CONCURRENT_TTS_USERS}</b>",
+        "",
+        "<b>Broadcast / Schedule</b>",
+        f"👥 Users: <b>{int(counts.get('total_users') or 0)}</b> | 🚫 Blocked: <b>{int(counts.get('blocked_users') or 0)}</b>",
+        f"⏰ Pending schedules: <b>{int(counts.get('pending_sched') or 0)}</b>",
+        f"📚 Templates: <b>{int(template_count)}/{BROADCAST_TEMPLATE_LIBRARY_MAX}</b>",
+        f"🗑️ Sent-delete jobs: <b>{int(delete_jobs)}</b>",
+        f"📦 Batch: <b>{_run_state_broadcast_batch_size()}</b> · Delay: <b>{_run_state_broadcast_delay():g}s</b>",
+        "",
+        "<b>Runtime Pressure</b>",
+        f"🌍 Active web requests: <b>{active_requests}</b>",
+        f"🧵 DB executor queue: <b>{db_queue}</b>",
+        f"🔐 Rate limit: <b>{_run_state_user_rate_limit()}</b> req/{_run_state_user_rate_window():g}s",
+        f"📌 Scheduler lock: <b>{html.escape(str(_scheduler_lock_last_status))}</b>",
+        f"🏃 Active schedule jobs: <b>{len(_scheduler_active_ids)}</b>",
+        "",
+        "<b>Since Restart</b>",
+        f"🗣️ TTS: <b>{_RUNTIME_METRICS.get('tts', 0)}</b> | 🔍 OCR: <b>{_RUNTIME_METRICS.get('ocr', 0)}</b> | 🎙️ Voice: <b>{_RUNTIME_METRICS.get('voice', 0)}</b>",
+        f"❌ Errors: <b>{_RUNTIME_METRICS.get('errors', 0)}</b> | ⛔ Blocked hits: <b>{_RUNTIME_METRICS.get('blocked_hits', 0)}</b>",
+        f"⏱️ Uptime: <b>{html.escape(_format_uptime())}</b>",
+    ])
 
 
 async def _admin_stats_text(admin_id: int) -> str:
@@ -18923,7 +19268,10 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             _DB_EXECUTOR,
             lambda: db_broadcast_template_save(pending, user_id),
         )
-        notice = "✅ បាន Save Template។" if ok else f"⚠️ Save Template មិនជោគជ័យ: {info}"
+        if ok and str(info).startswith("updated existing"):
+            notice = "♻️ Template មានរួចហើយ — បាន Update និងដាក់ឡើងលើ។"
+        else:
+            notice = "✅ បាន Save Template។" if ok else f"⚠️ Save Template មិនជោគជ័យ: {info}"
         await _admin_open_broadcast_templates(query, context, user_id, notice=notice)
         return
 
@@ -18948,6 +19296,20 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             context.user_data.pop("bc_state", None)
         return
 
+    if data.startswith("bc_tpl_delask:"):
+        tpl_id = data.split(":", 1)[1]
+        tpl = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_broadcast_template_get(tpl_id))
+        if not tpl:
+            await _admin_open_broadcast_templates(query, context, user_id, notice="⚠️ រក Template មិនឃើញ។")
+            return
+        await safe_send(lambda: query.message.edit_text(
+            _broadcast_template_delete_confirm_text(tpl),
+            parse_mode="HTML",
+            reply_markup=get_broadcast_template_delete_confirm_kb(tpl_id),
+            disable_web_page_preview=True,
+        ))
+        return
+
     if data.startswith("bc_tpl_del:"):
         tpl_id = data.split(":", 1)[1]
         ok, info = await asyncio.get_running_loop().run_in_executor(
@@ -18956,6 +19318,37 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         notice = "🗑️ បានលុប Template។" if ok else f"⚠️ លុបមិនជោគជ័យ: {info}"
         await _admin_open_broadcast_templates(query, context, user_id, notice=notice)
+        return
+
+    if data.startswith("bc_del_sent_ask:"):
+        job_id = data.split(":", 1)[1]
+        job = _broadcast_sent_delete_get(job_id, user_id)
+        await safe_send(lambda: query.message.reply_text(
+            _broadcast_sent_delete_confirm_text(job),
+            parse_mode="HTML",
+            reply_markup=get_broadcast_sent_delete_confirm_kb(job_id) if job else None,
+            disable_web_page_preview=True,
+        ))
+        return
+
+    if data.startswith("bc_del_sent_run:"):
+        job_id = data.split(":", 1)[1]
+        job = _broadcast_sent_delete_get(job_id, user_id, pop=True)
+        if not job:
+            await safe_send(lambda: query.message.reply_text(
+                "⚠️ Delete job មិនមានទៀតទេ។ វាអាចផុតកំណត់ ឬ server restart។"
+            ))
+            return
+        with suppress(Exception):
+            await query.message.edit_reply_markup(reply_markup=None)
+        context.application.create_task(_delete_broadcast_sent_messages(context.bot, user_id, job))
+        await safe_send(lambda: query.message.reply_text("🗑️ បានចាប់ផ្ដើមលុបសារ Broadcast ដែលបានផ្ញើ..."))
+        return
+
+    if data == "bc_del_sent_keep":
+        with suppress(Exception):
+            await query.message.edit_reply_markup(reply_markup=None)
+        await safe_send(lambda: query.message.reply_text("✅ ទុកសារ Broadcast នៅដដែល។"))
         return
 
     if data == "bc_cancel":
@@ -19302,21 +19695,13 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         return
 
     if data == "admin_close":
-        context.user_data.pop("bc_state", None)
-        context.user_data.pop("sched_state", None)
-        context.user_data.pop("sched_edit_row_id", None)
-        context.user_data.pop("admin_report_state", None)
-        _pending_broadcast.pop(user_id, None)
-        _sched_payload.pop(user_id, None)
+        await _clear_admin_transient_state(context, user_id)
         with suppress(Exception):
             await query.message.delete()
         return
 
     if data in ("admin_home", "admin_refresh"):
-        context.user_data.pop("bc_state", None)
-        context.user_data.pop("sched_state", None)
-        context.user_data.pop("sched_edit_row_id", None)
-        context.user_data.pop("admin_report_state", None)
+        await _clear_admin_transient_state(context, user_id)
         text = await _admin_home_text(user_id)
         await safe_send(lambda: query.message.edit_text(
             text,
@@ -19326,13 +19711,9 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         return
 
     if data == "admin_cancel_state":
-        context.user_data.pop("bc_state", None)
-        context.user_data.pop("sched_state", None)
-        context.user_data.pop("sched_edit_row_id", None)
-        context.user_data.pop("admin_report_state", None)
-        _pending_broadcast.pop(user_id, None)
-        _sched_payload.pop(user_id, None)
-        text = await _admin_home_text(user_id, title="✅ Admin action cancelled")
+        cleared = await _clear_admin_transient_state(context, user_id)
+        suffix = f" ({', '.join(cleared[:5])})" if cleared else ""
+        text = await _admin_home_text(user_id, title=f"✅ Admin action cancelled{suffix}")
         await safe_send(lambda: query.message.edit_text(
             text,
             parse_mode="HTML",
@@ -21060,43 +21441,91 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ))
 
 
+@admin_only
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Telegram admin shortcut for the full bot health panel."""
+    text = await _admin_health_text()
+    await safe_send(lambda: update.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=get_admin_dashboard_kb(),
+        disable_web_page_preview=True,
+    ))
+
+
+async def _clear_admin_transient_state(context: Any, admin_id: int) -> list[str]:
+    """Clear every short-lived admin conversation state safely.
+
+    Admin flows are spread across broadcast, schedule editing, user search,
+    report generation, chat bridge, and runtime/performance setting inputs.
+    A single clear helper prevents stale states from hijacking the next admin
+    text message after /cancel or Admin → Cancel.
+    """
+    cleared: list[str] = []
+    user_data = getattr(context, "user_data", {}) or {}
+
+    def _pop_state(key: str, label: str) -> None:
+        if user_data.pop(key, None) is not None:
+            cleared.append(label)
+
+    if int(user_data.get("bc_state") or 0) == BROADCAST_WAIT_MESSAGE:
+        cleared.append("broadcast")
+    _pop_state("bc_state", "broadcast")
+    if _pending_broadcast.pop(int(admin_id), None) is not None and "broadcast" not in cleared:
+        cleared.append("broadcast")
+
+    if int(user_data.get("sched_state") or 0) in (SCHED_WAIT_MSG, SCHED_WAIT_TIME, SCHED_EDIT_WAIT_TIME, SCHED_EDIT_WAIT_TEXT, SCHED_EDIT_WAIT_PHOTO):
+        cleared.append("schedule")
+    _pop_state("sched_state", "schedule")
+    _pop_state("sched_edit_row_id", "schedule-edit")
+    if _sched_payload.pop(int(admin_id), None) is not None and "schedule" not in cleared:
+        cleared.append("schedule")
+
+    _pop_state("admin_report_state", "report")
+    _pop_state("user_search_state", "user-search")
+    _pop_state("users_search_query", "user-search")
+    _pop_state("users_search_results", "user-search")
+
+    if int(user_data.get("chat_state") or 0) == CHAT_WAIT_MESSAGE:
+        _pop_state("chat_state", "admin-chat")
+        _close_session(int(admin_id))
+
+    async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+        if ACTIVE_ADMIN_CONVERSATIONS.pop(int(admin_id), None) is not None:
+            cleared.append("runtime-input")
+
+    # De-duplicate while preserving the first useful order.
+    return list(dict.fromkeys(cleared))
+
+
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid     = update.effective_user.id
+    uid = update.effective_user.id
     if not _is_admin(uid):
         return
-    cleared = False
 
-    if context.user_data.get("bc_state") == BROADCAST_WAIT_MESSAGE:
-        _pending_broadcast.pop(uid, None)
-        context.user_data.pop("bc_state", None)
-        await safe_send(lambda: update.message.reply_text("❌ Broadcast បានបោះបង់។"))
-        cleared = True
+    # Preserve the old admin-chat notification behavior while still using the
+    # unified cleanup helper for every other transient state.
+    target_id = None
+    with suppress(Exception):
+        if context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
+            target_id = _admin_chat_target.get(uid)
 
-    if context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
-        target_id = _close_session(uid)
-        context.user_data.pop("chat_state", None)
-        if target_id:
-            await safe_send(lambda: update.message.reply_text(
-                f"✅ Chat ជាមួយ User <code>{target_id}</code> បានបញ្ចប់។", parse_mode="HTML"
-            ))
-            with suppress(Exception):
-                await context.bot.send_message(chat_id=target_id, text="ℹ️ Admin បានបញ្ចប់ Session Chat ។")
-        cleared = True
+    cleared = await _clear_admin_transient_state(context, uid)
 
-    if context.user_data.get("sched_state") in (SCHED_WAIT_MSG, SCHED_WAIT_TIME, SCHED_EDIT_WAIT_TIME, SCHED_EDIT_WAIT_TEXT, SCHED_EDIT_WAIT_PHOTO):
-        _sched_payload.pop(uid, None)
-        context.user_data.pop("sched_state", None)
-        context.user_data.pop("sched_edit_row_id", None)
-        await safe_send(lambda: update.message.reply_text("❌ Schedule/Edit flow បានបោះបង់។"))
-        cleared = True
+    if target_id:
+        with suppress(Exception):
+            await context.bot.send_message(chat_id=target_id, text="ℹ️ Admin បានបញ្ចប់ Session Chat ។")
 
-    if context.user_data.get("admin_report_state") == ADMIN_REPORT_WAIT_DAY:
-        context.user_data.pop("admin_report_state", None)
-        await safe_send(lambda: update.message.reply_text("❌ PDF report date selection cancelled."))
-        cleared = True
+    if cleared:
+        labels = ", ".join(cleared[:8])
+        await safe_send(lambda: update.message.reply_text(
+            f"✅ បានបោះបង់/សម្អាត state រួច: <code>{html.escape(labels)}</code>",
+            parse_mode="HTML",
+            reply_markup=get_admin_dashboard_kb(),
+        ))
+        return
 
-    if not cleared:
-        await safe_send(lambda: update.message.reply_text("ℹ️ មិនមាន operation ត្រូវ cancel ទេ។"))
+    await safe_send(lambda: update.message.reply_text("ℹ️ មិនមាន operation ត្រូវ cancel ទេ។"))
 
 
 # ===========================================================================
@@ -22281,9 +22710,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Global error handler
 # ---------------------------------------------------------------------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = getattr(context, "error", None)
+    if err is None:
+        return
+
+    if isinstance(err, ApplicationHandlerStop) or _is_nonfatal_telegram_edit_error(err):
+        logger.debug("Ignored non-fatal Telegram handler condition: %s", err)
+        return
+
     _metric_inc("errors")
-    _record_admin_error("telegram_error_handler", str(context.error), level="ERROR", context=type(update).__name__)
-    logger.error(f"Unhandled exception: {context.error}", exc_info=context.error)
+    _record_admin_error("telegram_error_handler", str(err), level="ERROR", context=type(update).__name__)
+    logger.error(
+        "Unhandled exception: %s",
+        err,
+        exc_info=(type(err), err, getattr(err, "__traceback__", None)),
+    )
+
     if isinstance(update, Update) and update.effective_message:
         with suppress(Exception):
             await safe_send(lambda: update.effective_message.reply_text(
@@ -22376,6 +22818,7 @@ async def _run_bot():
     app.add_handler(CommandHandler("cancelschedule",  cmd_cancelschedule))
     app.add_handler(CommandHandler("cancel",          cmd_cancel))
     app.add_handler(CommandHandler("stats",           admin_stats))
+    app.add_handler(CommandHandler("health",          cmd_health))
     app.add_handler(CommandHandler("admin",           cmd_admin))
     app.add_handler(CommandHandler("runtime",         cmd_runtime))
     app.add_handler(CommandHandler("api",             cmd_api))
