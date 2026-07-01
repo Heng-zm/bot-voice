@@ -10076,6 +10076,13 @@ SCHED_EDIT_WAIT_TIME   = 6
 SCHED_EDIT_WAIT_TEXT   = 7
 SCHED_EDIT_WAIT_PHOTO  = 8
 ADMIN_REPORT_WAIT_DAY = 9
+
+# Broadcast Template Library (stored in bot_settings as JSON; no new DB table).
+BROADCAST_TEMPLATES_SETTING_KEY = "broadcast_templates_json"
+BROADCAST_TEMPLATE_LIBRARY_MAX = 20
+BROADCAST_TEMPLATE_TITLE_MAX = 48
+BROADCAST_TEMPLATE_PREVIEW_MAX = 700
+
 _SCHED_POLL_INTERVAL   = _env_int("SCHED_POLL_INTERVAL", 60, minimum=5, maximum=3600)
 _SCHED_SENDING_STALE_SECONDS = _env_int("SCHED_SENDING_STALE_SECONDS", 1800, minimum=60, maximum=86400)
 _SCHED_DUE_LIMIT      = _env_int("SCHED_DUE_LIMIT", 5, minimum=1, maximum=100)
@@ -14147,7 +14154,7 @@ def get_sched_detail_kb(row: dict) -> InlineKeyboardMarkup:
              InlineKeyboardButton("🗑️ Cancel Schedule", callback_data=f"sched_cancel_confirm:{row_id}")],
         ])
     rows.append([InlineKeyboardButton("⬅️ Schedules", callback_data="admin_schedules"),
-                 InlineKeyboardButton("❌ Close", callback_data="sched_close")])
+                 InlineKeyboardButton("❌ បិទ", callback_data="sched_close")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -14166,7 +14173,7 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🕘 Recent History", callback_data="admin_history")],
         [InlineKeyboardButton("⚙️ Settings",    callback_data="admin_settings"),
          InlineKeyboardButton("📊 Stats",       callback_data="admin_stats")],
-        [InlineKeyboardButton("📢 Safer Broadcast V2", callback_data="admin_broadcast"),
+        [InlineKeyboardButton("📢 Broadcast សុវត្ថិភាព", callback_data="admin_broadcast"),
          InlineKeyboardButton("🗓 Schedule Calendar", callback_data="admin_calendar")],
         [InlineKeyboardButton("⏰ Schedules",   callback_data="admin_schedules"),
          InlineKeyboardButton("🎛 TTS Provider", callback_data="admin_tts")],
@@ -14176,7 +14183,7 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("📄 Report PDF",  callback_data="admin_report")],
         [InlineKeyboardButton("🔐 WEB_KEY",     callback_data="admin_web_key")],
         [InlineKeyboardButton("🔄 Refresh",     callback_data="admin_home")],
-        [InlineKeyboardButton("❌ Close",       callback_data="admin_close")],
+        [InlineKeyboardButton("❌ បិទ",       callback_data="admin_close")],
     ])
 
 
@@ -14341,7 +14348,7 @@ def get_admin_crm_kb(active_segment: str = "all") -> InlineKeyboardMarkup:
         [InlineKeyboardButton("👥 Users", callback_data="admin_users"),
          InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
         [InlineKeyboardButton("⬅️ Admin V8", callback_data="admin_home"),
-         InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
 
 
@@ -14402,7 +14409,7 @@ def get_admin_optimize_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🚨 Error Center", callback_data="admin_errors"),
          InlineKeyboardButton("🔄 Refresh", callback_data="admin_optimize")],
         [InlineKeyboardButton("⬅️ Admin V8", callback_data="admin_home"),
-         InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
 
 
@@ -14443,7 +14450,7 @@ async def _admin_open_optimize_panel(query) -> None:
 def get_admin_action_kb(cancel_callback: str = "admin_cancel_state") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⬅️ Admin V8", callback_data="admin_home"),
-         InlineKeyboardButton("❌ Cancel",          callback_data=cancel_callback)],
+         InlineKeyboardButton("❌ បោះបង់",          callback_data=cancel_callback)],
     ])
 
 
@@ -14460,7 +14467,7 @@ def get_api_admin_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🩺 API Status",     callback_data="api_status")],
         [InlineKeyboardButton("❔ Help",           callback_data="api_help"),
          InlineKeyboardButton("⬅️ Admin",         callback_data="api_back")],
-        [InlineKeyboardButton("❌ Close",          callback_data="api_close")],
+        [InlineKeyboardButton("❌ បិទ",          callback_data="api_close")],
     ])
 
 
@@ -14479,7 +14486,7 @@ def get_api_list_kb(rows: list[dict]) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔄 Refresh List", callback_data="api_list"),
          InlineKeyboardButton("➕ Create New",   callback_data="api_create")],
         [InlineKeyboardButton("⬅️ API Menu",    callback_data="api_menu"),
-         InlineKeyboardButton("❌ Close",        callback_data="api_close")],
+         InlineKeyboardButton("❌ បិទ",        callback_data="api_close")],
     ])
     return InlineKeyboardMarkup(kbd_rows)
 
@@ -14489,7 +14496,7 @@ def get_api_revoke_confirm_kb(identifier: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Confirm Revoke", callback_data=f"api_revoke_confirm:{safe_ident}")],
         [InlineKeyboardButton("⬅️ Back to List", callback_data="api_list"),
-         InlineKeyboardButton("❌ Close",        callback_data="api_close")],
+         InlineKeyboardButton("❌ បិទ",        callback_data="api_close")],
     ])
 
 
@@ -15960,10 +15967,266 @@ def get_ocr_confirm_kb(msg_id: int) -> InlineKeyboardMarkup:
 
 def get_broadcast_confirm_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Send to Active Users", callback_data="bc_confirm")],
-        [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
-         InlineKeyboardButton("❌ Cancel", callback_data="bc_cancel")],
+        [InlineKeyboardButton("✅ បញ្ជាក់ផ្ញើទៅអ្នកប្រើសកម្ម", callback_data="bc_confirm")],
+        [InlineKeyboardButton("📝 រក្សាទុក Template", callback_data="bc_save_template"),
+         InlineKeyboardButton("📚 បណ្ណាល័យ Template", callback_data="bc_templates")],
+        [InlineKeyboardButton("⬅️ Admin V8", callback_data="admin_home"),
+         InlineKeyboardButton("❌ បោះបង់", callback_data="bc_cancel")],
     ])
+
+
+def get_broadcast_entry_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📚 បណ្ណាល័យ Template", callback_data="bc_templates")],
+        [InlineKeyboardButton("⬅️ Admin V8", callback_data="admin_home"),
+         InlineKeyboardButton("❌ បោះបង់", callback_data="bc_cancel")],
+    ])
+
+
+def get_broadcast_templates_kb(templates: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for tpl in templates[:BROADCAST_TEMPLATE_LIBRARY_MAX]:
+        tpl_id = _broadcast_template_safe_id(tpl.get("id"))
+        if not tpl_id:
+            continue
+        title = _broadcast_template_button_title(tpl)
+        rows.append([
+            InlineKeyboardButton(title, callback_data=f"bc_tpl_use:{tpl_id}"),
+            InlineKeyboardButton("🗑", callback_data=f"bc_tpl_del:{tpl_id}"),
+        ])
+    rows.append([InlineKeyboardButton("➕ Broadcast ថ្មី", callback_data="admin_broadcast")])
+    rows.append([InlineKeyboardButton("⬅️ Admin V8", callback_data="admin_home"),
+                 InlineKeyboardButton("❌ បិទ", callback_data="admin_close")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _broadcast_template_safe_id(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if re.fullmatch(r"[a-f0-9]{8,16}", text) else ""
+
+
+def _broadcast_template_content(payload: dict) -> str:
+    return str(payload.get("caption") if payload.get("photo_file_id") else payload.get("text") or "")
+
+
+def _broadcast_template_clean_preview(text: Any, *, max_len: int = BROADCAST_TEMPLATE_TITLE_MAX) -> str:
+    clean = str(text or "").strip()
+    clean = re.sub(r"^::(?:html|mdv2|md|plain)\s*\n", "", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"<[^>]+>", " ", clean)
+    clean = html.unescape(clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    if not clean:
+        clean = "គ្មាន Caption"
+    if len(clean) > max_len:
+        clean = clean[: max(1, max_len - 1)].rstrip() + "…"
+    return clean
+
+
+def _broadcast_template_title_from_payload(payload: dict) -> str:
+    prefix = "🖼️ " if payload.get("photo_file_id") else "📝 "
+    return (prefix + _broadcast_template_clean_preview(_broadcast_template_content(payload))).strip()[:BROADCAST_TEMPLATE_TITLE_MAX + 3]
+
+
+def _broadcast_template_button_title(tpl: dict) -> str:
+    title = str(tpl.get("title") or "").strip()
+    if not title:
+        title = _broadcast_template_title_from_payload(tpl)
+    return _broadcast_template_clean_preview(title, max_len=36)
+
+
+def _broadcast_template_payload_from_template(tpl: dict) -> dict:
+    return {
+        "photo_file_id": str(tpl.get("photo_file_id") or "").strip() or None,
+        "caption": str(tpl.get("caption") or "") if tpl.get("photo_file_id") else None,
+        "text": None if tpl.get("photo_file_id") else str(tpl.get("text") or ""),
+        "parse_mode": _broadcast_normalize_parse_mode(tpl.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO),
+    }
+
+
+def _broadcast_template_fingerprint(payload: dict) -> str:
+    clean = {
+        "photo_file_id": str(payload.get("photo_file_id") or ""),
+        "caption": str(payload.get("caption") or ""),
+        "text": str(payload.get("text") or ""),
+        "parse_mode": _broadcast_normalize_parse_mode(payload.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO),
+    }
+    raw = _json.dumps(clean, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _broadcast_template_normalize(tpl: dict, *, fallback_id: str | None = None) -> dict | None:
+    if not isinstance(tpl, dict):
+        return None
+    photo_file_id = str(tpl.get("photo_file_id") or "").strip()
+    caption = str(tpl.get("caption") or "")[:1024]
+    text = str(tpl.get("text") or "")[:TELE_MSG_LIMIT]
+    parse_mode = _broadcast_normalize_parse_mode(tpl.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO)
+    if not photo_file_id and not text.strip():
+        return None
+    if photo_file_id:
+        text = ""
+    else:
+        caption = ""
+    tpl_id = _broadcast_template_safe_id(tpl.get("id")) or _broadcast_template_safe_id(fallback_id) or secrets.token_hex(4)
+    payload = {
+        "id": tpl_id,
+        "title": str(tpl.get("title") or "").strip()[:BROADCAST_TEMPLATE_TITLE_MAX],
+        "photo_file_id": photo_file_id or None,
+        "caption": caption if photo_file_id else None,
+        "text": None if photo_file_id else text,
+        "parse_mode": parse_mode,
+        "created_at": str(tpl.get("created_at") or _sched_iso()),
+        "updated_at": str(tpl.get("updated_at") or _sched_iso()),
+        "created_by": int(tpl.get("created_by") or 0),
+    }
+    if not payload["title"]:
+        payload["title"] = _broadcast_template_title_from_payload(payload)
+    payload["fingerprint"] = str(tpl.get("fingerprint") or _broadcast_template_fingerprint(payload))
+    return payload
+
+
+def _broadcast_templates_parse(raw: Any) -> list[dict]:
+    try:
+        parsed = _json.loads(str(raw or "[]"))
+    except Exception:
+        parsed = []
+    if isinstance(parsed, dict):
+        parsed = parsed.get("templates") or []
+    if not isinstance(parsed, list):
+        return []
+    templates: list[dict] = []
+    seen: set[str] = set()
+    for item in parsed:
+        tpl = _broadcast_template_normalize(item)
+        if not tpl:
+            continue
+        tpl_id = str(tpl.get("id"))
+        if tpl_id in seen:
+            continue
+        seen.add(tpl_id)
+        templates.append(tpl)
+        if len(templates) >= BROADCAST_TEMPLATE_LIBRARY_MAX:
+            break
+    return templates
+
+
+_BROADCAST_TEMPLATES_MEMORY_JSON = "[]"
+
+
+def db_broadcast_templates_fetch() -> list[dict]:
+    raw = _BROADCAST_TEMPLATES_MEMORY_JSON
+    if supabase:
+        try:
+            res = (
+                supabase.table("bot_settings")
+                .select("value")
+                .eq("key", BROADCAST_TEMPLATES_SETTING_KEY)
+                .limit(1)
+                .execute()
+            )
+            rows = getattr(res, "data", None) or []
+            if rows:
+                raw = str(rows[0].get("value") or "[]")
+        except Exception as exc:
+            logger.warning("broadcast template fetch fallback: %s", exc)
+    return _broadcast_templates_parse(raw)
+
+
+def db_broadcast_templates_save_all(templates: list[dict], admin_id: int) -> tuple[bool, str]:
+    global _BROADCAST_TEMPLATES_MEMORY_JSON
+    normalised = []
+    for item in templates:
+        tpl = _broadcast_template_normalize(item)
+        if tpl:
+            normalised.append(tpl)
+        if len(normalised) >= BROADCAST_TEMPLATE_LIBRARY_MAX:
+            break
+    raw = _json.dumps(normalised, ensure_ascii=False, separators=(",", ":"))
+    _BROADCAST_TEMPLATES_MEMORY_JSON = raw
+    if not supabase:
+        return True, "saved in memory only"
+    try:
+        supabase.table("bot_settings").upsert({
+            "key": BROADCAST_TEMPLATES_SETTING_KEY,
+            "value": raw,
+            "updated_by": int(admin_id),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="key").execute()
+        return True, "saved"
+    except Exception as exc:
+        logger.warning("broadcast template save failed: %s", exc)
+        return False, str(exc)
+
+
+def db_broadcast_template_save(payload: dict, admin_id: int, title: str | None = None) -> tuple[bool, str, dict | None]:
+    tpl = _broadcast_template_normalize({
+        **dict(payload or {}),
+        "id": secrets.token_hex(4),
+        "title": str(title or "").strip(),
+        "created_by": int(admin_id),
+        "created_at": _sched_iso(),
+        "updated_at": _sched_iso(),
+    })
+    if not tpl:
+        return False, "Template content is empty.", None
+
+    fingerprint = str(tpl.get("fingerprint") or "")
+    templates = [t for t in db_broadcast_templates_fetch() if str(t.get("fingerprint") or "") != fingerprint]
+    templates.insert(0, tpl)
+    ok, info = db_broadcast_templates_save_all(templates, admin_id)
+    return ok, info, tpl if ok else None
+
+
+def db_broadcast_template_get(template_id: str) -> dict | None:
+    template_id = _broadcast_template_safe_id(template_id)
+    if not template_id:
+        return None
+    for tpl in db_broadcast_templates_fetch():
+        if str(tpl.get("id")) == template_id:
+            return tpl
+    return None
+
+
+def db_broadcast_template_delete(template_id: str, admin_id: int) -> tuple[bool, str]:
+    template_id = _broadcast_template_safe_id(template_id)
+    if not template_id:
+        return False, "Invalid template id."
+    templates = db_broadcast_templates_fetch()
+    kept = [t for t in templates if str(t.get("id")) != template_id]
+    if len(kept) == len(templates):
+        return False, "Template not found."
+    ok, info = db_broadcast_templates_save_all(kept, admin_id)
+    return ok, info
+
+
+def _broadcast_templates_panel_text(templates: list[dict], notice: str = "") -> str:
+    lines: list[str] = []
+    if notice:
+        lines.append(f"{html.escape(notice)}\n")
+    lines.extend([
+        "📚 <b>បណ្ណាល័យ Broadcast Template</b>",
+        "",
+        "រក្សាទុកសារ Broadcast ដែលប្រើញឹកញាប់ ដើម្បីយកមកប្រើម្ដងទៀតបានលឿន។",
+        f"ចំនួន Template: <b>{len(templates)}/{BROADCAST_TEMPLATE_LIBRARY_MAX}</b>",
+        "",
+    ])
+    if not templates:
+        lines.append("📭 មិនទាន់មាន Template ទេ។")
+        lines.append("បង្កើត Broadcast Preview រួចចុច <b>Save Template</b>។")
+    else:
+        for idx, tpl in enumerate(templates, start=1):
+            kind = "🖼️ Photo" if tpl.get("photo_file_id") else "📝 Text"
+            title = html.escape(_broadcast_template_button_title(tpl))
+            mode = html.escape(_broadcast_parse_mode_label(tpl.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO))
+            preview = html.escape(_broadcast_template_clean_preview(_broadcast_template_content(tpl), max_len=84))
+            lines.append(f"{idx}. <b>{title}</b> — {kind} · {mode}")
+            lines.append(f"   <code>{preview}</code>")
+    lines.extend([
+        "",
+        "ចុច Template ដើម្បីបង្ហាញ Preview ហើយអាច Confirm ផ្ញើបាន។",
+        "ចុច 🗑 ដើម្បីលុប Template។",
+    ])
+    return "\n".join(lines)
 
 
 def _broadcast_recipient_estimate_sync() -> dict[str, int]:
@@ -15977,7 +16240,7 @@ def _broadcast_recipient_estimate_sync() -> dict[str, int]:
 
 
 def _broadcast_preview_summary(payload: dict, estimate: dict[str, int]) -> str:
-    kind = "Photo + caption" if payload.get("photo_file_id") else "Text"
+    kind = "រូបភាព + Caption" if payload.get("photo_file_id") else "អត្ថបទ"
     content = payload.get("caption") if payload.get("photo_file_id") else payload.get("text")
     content, mode = _broadcast_strip_format_directive(
         content,
@@ -15986,15 +16249,18 @@ def _broadcast_preview_summary(payload: dict, estimate: dict[str, int]) -> str:
     content = str(content or "").strip()
     chars = len(content)
     return (
-        "🛡️ <b>Safer Broadcast V2 Preview</b>\n\n"
-        f"Type: <b>{html.escape(kind)}</b>\n"
+        "🛡️ <b>Preview Broadcast សុវត្ថិភាព V2</b>\n\n"
+        "📦 <b>មាតិកា</b>\n"
+        f"ប្រភេទ: <b>{html.escape(kind)}</b>\n"
         f"Format: <b>{html.escape(_broadcast_parse_mode_label(mode))}</b>\n"
-        f"Characters: <b>{chars}</b>\n"
-        f"Registered users: <b>{int(estimate.get('registered') or 0)}</b>\n"
-        f"Active target: <b>{int(estimate.get('active') or 0)}</b>\n"
-        f"Skipped blocked/unreachable: <b>{int(estimate.get('blocked') or 0)}</b>\n"
-        f"Batch size: <b>{_run_state_broadcast_batch_size()}</b> · Delay: <b>{_run_state_broadcast_delay():g}s</b>\n\n"
-        "Confirm only after checking the preview. Blocked/unreachable users are skipped automatically."
+        f"ចំនួនតួអក្សរ: <b>{chars}</b>\n\n"
+        "📊 <b>អ្នកទទួល</b>\n"
+        f"👥 អ្នកប្រើបានចុះឈ្មោះ: <b>{int(estimate.get('registered') or 0)}</b>\n"
+        f"🎯 គោលដៅសកម្ម: <b>{int(estimate.get('active') or 0)}</b>\n"
+        f"🚫 រំលង Blocked/Unreachable: <b>{int(estimate.get('blocked') or 0)}</b>\n"
+        f"⚙️ Batch: <b>{_run_state_broadcast_batch_size()}</b> · ពន្យារ: <b>{_run_state_broadcast_delay():g}s</b>\n\n"
+        "✅ សូមពិនិត្យ Preview ខាងក្រោមជាមុនសិន មុនចុចបញ្ជាក់។ "
+        "អ្នកដែល Block/Unreachable នឹងត្រូវរំលងដោយស្វ័យប្រវត្តិ។"
     )
 
 
@@ -16045,7 +16311,7 @@ def get_users_page_kb(users: list[dict], page: int, page_size: int = 7) -> Inlin
     rows.append([InlineKeyboardButton("🔎 Search User", callback_data="users_search"),
                  InlineKeyboardButton("🔄 Refresh", callback_data=f"users_page:{page}")])
     rows.append([InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
-                 InlineKeyboardButton("❌ Close", callback_data="users_close")])
+                 InlineKeyboardButton("❌ បិទ", callback_data="users_close")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -16073,7 +16339,7 @@ def get_user_search_page_kb(users: list[dict], page: int, page_size: int = 7) ->
     rows.append([InlineKeyboardButton("🔎 New Search", callback_data="users_search"),
                  InlineKeyboardButton("👥 All Users", callback_data="users_page:0")])
     rows.append([InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
-                 InlineKeyboardButton("❌ Close", callback_data="users_close")])
+                 InlineKeyboardButton("❌ បិទ", callback_data="users_close")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -16081,7 +16347,7 @@ def get_user_search_prompt_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👥 All Users", callback_data="users_page:0")],
         [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
-         InlineKeyboardButton("❌ Close", callback_data="users_close")],
+         InlineKeyboardButton("❌ បិទ", callback_data="users_close")],
     ])
 
 
@@ -16121,7 +16387,7 @@ def get_recent_history_kb(rows: list[dict], page: int, page_size: int = 7) -> In
     kbd_rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="history_refresh"),
                      InlineKeyboardButton("👥 Users", callback_data="users_page:0")])
     kbd_rows.append([InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
-                     InlineKeyboardButton("❌ Close", callback_data="history_close")])
+                     InlineKeyboardButton("❌ បិទ", callback_data="history_close")])
     return InlineKeyboardMarkup(kbd_rows)
 
 
@@ -16149,7 +16415,7 @@ def get_user_history_kb(user_id: int, back_ref: str = "p0", page: int = 0, total
         [InlineKeyboardButton("👤 User Detail", callback_data=f"user_view:{user_id}:{back_ref}"),
          InlineKeyboardButton(back_label, callback_data=back_callback)],
         [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
-         InlineKeyboardButton("❌ Close", callback_data="users_close")],
+         InlineKeyboardButton("❌ បិទ", callback_data="users_close")],
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -16187,7 +16453,7 @@ def get_bot_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔄 Refresh", callback_data="admin_settings_refresh"),
          InlineKeyboardButton("🧩 Setup SQL", callback_data="admin_settings_sql")],
         [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
-         InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -16202,7 +16468,7 @@ def get_bot_perf_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✅ Apply saved values now", callback_data="admin_perf_apply")],
         [InlineKeyboardButton("🔄 Reset to code defaults", callback_data="admin_perf_reset")],
         [InlineKeyboardButton("⬅️ Settings", callback_data="admin_settings"),
-         InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -16724,13 +16990,19 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _pending_broadcast.pop(update.effective_user.id, None)
     context.user_data["bc_state"] = BROADCAST_WAIT_MESSAGE
     await safe_send(lambda: update.message.reply_text(
-        "📡 <b>Admin Broadcast</b>\n\n"
-        "ផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + Caption</b> ដែលចង់ Broadcast ។\n"
-        "👉 អាចផ្ញើរូបភាព + Caption រួមគ្នា ឬ តែ text ។\n"
-        "✅ Supports Telegram native formatting, HTML, MarkdownV2, Markdown, and plain text.\n"
-        "Prefix first line with <code>::html</code>, <code>::mdv2</code>, <code>::md</code>, or <code>::plain</code> to force a mode.\n\n"
+        "🛡️ <b>Broadcast សុវត្ថិភាព V2</b>\n\n"
+        "📨 <b>របៀបប្រើ</b>\n"
+        "• ផ្ញើ <b>អត្ថបទ</b> ឬ <b>រូបភាព + Caption</b> ដែលចង់ Broadcast\n"
+        "• Bot នឹងបង្ហាញ Preview ចុងក្រោយ មុនពេលផ្ញើពិត\n"
+        "• គាំទ្រ Telegram formatting, HTML, MarkdownV2, Markdown និង Plain text\n"
+        "• បើចង់បង្ខំ Format សូមដាក់ <code>::html</code>, <code>::mdv2</code>, <code>::md</code>, ឬ <code>::plain</code> នៅជួរទី១\n\n"
+        "🔐 <b>ការពារ</b>\n"
+        "✅ Preview confirmation មុនផ្ញើ\n"
+        "✅ រំលងអ្នកដែល Block/Unreachable\n"
+        "✅ គ្រប់គ្រងល្បឿនផ្ញើ និង RetryAfter\n\n"
         "វាយ /cancel ដើម្បីបោះបង់។",
         parse_mode="HTML",
+        reply_markup=get_broadcast_entry_kb(),
     ))
 
 
@@ -18069,7 +18341,7 @@ async def _admin_stats_text(admin_id: int) -> str:
 def _admin_back_close_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
-         InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
 
 
@@ -18084,7 +18356,7 @@ def _tts_provider_control_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🧹 Clear HF Client", callback_data="admin_tts_hf_clear"),
          InlineKeyboardButton("🔄 Refresh", callback_data="admin_tts")],
         [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
-         InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
 
 
@@ -18242,7 +18514,7 @@ def _schedule_calendar_kb(offset_days: int = 0) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📅 New Schedule", callback_data="admin_schedule_new"),
          InlineKeyboardButton("📋 List", callback_data="admin_schedules")],
         [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
-         InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
 
 
@@ -18293,7 +18565,7 @@ def _error_center_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🩺 Health", callback_data="admin_health"),
          InlineKeyboardButton("🎛 TTS Provider", callback_data="admin_tts")],
         [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
-         InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
 
 
@@ -18337,7 +18609,7 @@ async def _admin_open_schedules_panel(query, admin_id: int) -> None:
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📅 New Schedule", callback_data="admin_schedule_new")],
                 [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
-                 InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+                 InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
             ]),
         ))
         return
@@ -18462,18 +18734,75 @@ async def _admin_start_broadcast_from_button(query, context: ContextTypes.DEFAUL
     context.user_data["bc_state"] = BROADCAST_WAIT_MESSAGE
     estimate = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, _broadcast_recipient_estimate_sync)
     await safe_send(lambda: query.message.edit_text(
-        "🛡️ <b>Safer Broadcast V2</b>\n\n"
-        "Send <b>text</b> or <b>photo + caption</b>. The bot will show a final preview before sending.\n"
-        "Formatting: Telegram native formatting, HTML, MarkdownV2, Markdown, or plain text. Use <code>::html</code>, <code>::mdv2</code>, <code>::md</code>, or <code>::plain</code> on the first line to force a mode.\n\n"
-        f"Registered users: <b>{int(estimate.get('registered') or 0)}</b>\n"
-        f"Active target: <b>{int(estimate.get('active') or 0)}</b>\n"
-        f"Skipped blocked/unreachable: <b>{int(estimate.get('blocked') or 0)}</b>\n"
-        f"Batch size: <b>{_run_state_broadcast_batch_size()}</b> · Delay: <b>{_run_state_broadcast_delay():g}s</b>\n\n"
-        "Protection: preview confirmation, blocked-user skip, bounded concurrency, RetryAfter handling, and auto-block for unreachable chats.\n\n"
-        "Press Cancel or type /cancel to stop.",
+        "🛡️ <b>Broadcast សុវត្ថិភាព V2</b>\n\n"
+        "📨 <b>របៀបប្រើ</b>\n"
+        "• ផ្ញើ <b>អត្ថបទ</b> ឬ <b>រូបភាព + Caption</b>\n"
+        "• Bot នឹងបង្ហាញ Preview ចុងក្រោយ មុនពេលផ្ញើពិត\n"
+        "• គាំទ្រ Telegram formatting, HTML, MarkdownV2, Markdown និង Plain text\n"
+        "• បើចង់បង្ខំ Format សូមដាក់ <code>::html</code>, <code>::mdv2</code>, <code>::md</code>, ឬ <code>::plain</code> នៅជួរទី១\n\n"
+        "📊 <b>អ្នកទទួល</b>\n"
+        f"👥 អ្នកប្រើបានចុះឈ្មោះ: <b>{int(estimate.get('registered') or 0)}</b>\n"
+        f"🎯 គោលដៅសកម្ម: <b>{int(estimate.get('active') or 0)}</b>\n"
+        f"🚫 រំលង Blocked/Unreachable: <b>{int(estimate.get('blocked') or 0)}</b>\n"
+        f"⚙️ Batch: <b>{_run_state_broadcast_batch_size()}</b> · ពន្យារ: <b>{_run_state_broadcast_delay():g}s</b>\n\n"
+        "🔐 <b>ការពារ</b>\n"
+        "✅ Preview confirmation មុនផ្ញើ\n"
+        "✅ រំលងអ្នកដែល Block/Unreachable\n"
+        "✅ គ្រប់គ្រងល្បឿនផ្ញើ និង RetryAfter\n"
+        "✅ Auto-block chat ដែលមិនអាចផ្ញើបាន\n\n"
+        "ចុច <b>បោះបង់</b> ឬវាយ /cancel ដើម្បីបញ្ឈប់។",
         parse_mode="HTML",
-        reply_markup=get_admin_action_kb(),
+        reply_markup=get_broadcast_entry_kb(),
     ))
+
+
+async def _admin_open_broadcast_templates(query, context: ContextTypes.DEFAULT_TYPE, user_id: int, notice: str = "") -> None:
+    templates = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, db_broadcast_templates_fetch)
+    await safe_send(lambda: query.message.edit_text(
+        _broadcast_templates_panel_text(templates, notice=notice),
+        parse_mode="HTML",
+        reply_markup=get_broadcast_templates_kb(templates),
+        disable_web_page_preview=True,
+    ))
+
+
+async def _admin_show_broadcast_preview_message(message, bot, user_id: int, payload: dict) -> bool:
+    estimate = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, _broadcast_recipient_estimate_sync)
+    summary = _broadcast_preview_summary(payload, estimate)
+    photo_file_id = payload.get("photo_file_id")
+    caption_text = payload.get("caption")
+    plain_text = payload.get("text")
+    parse_mode = payload.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO
+
+    preview_content, preview_mode = _broadcast_strip_format_directive(
+        caption_text if photo_file_id else plain_text,
+        parse_mode,
+    )
+
+    await safe_send(lambda: message.reply_text(
+        f"{summary}\n\n"
+        "👁️ <b>Preview មាតិកានឹងបង្ហាញខាងក្រោម</b>\n"
+        "សូមពិនិត្យទម្រង់សារឲ្យបានច្បាស់ បន្ទាប់មកចុចប៊ូតុងខាងក្រោម Preview ដើម្បីផ្ញើ បញ្ចូល Template ឬបោះបង់។",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    ))
+    try:
+        await safe_send(lambda: _send_telegram_broadcast_message(
+            bot,
+            chat_id=message.chat_id,
+            text=preview_content or "",
+            parse_mode=preview_mode,
+            photo_file_id=photo_file_id,
+            reply_markup=get_broadcast_confirm_kb(),
+        ))
+        return True
+    except Exception as exc:
+        await safe_send(lambda: message.reply_text(
+            "❌ Preview មិនជោគជ័យ ដូច្នេះ Broadcast មិនត្រូវបានដាក់ Queue ទេ។\n"
+            f"មូលហេតុ: <code>{html.escape(str(exc)[:300])}</code>",
+            parse_mode="HTML",
+        ))
+        return False
 
 
 async def _admin_start_schedule_from_button(query, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
@@ -18561,48 +18890,16 @@ async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "parse_mode":    parse_mode,
     }
 
-    estimate = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, _broadcast_recipient_estimate_sync)
-    summary = _broadcast_preview_summary(_pending_broadcast[user_id], estimate)
-
-    preview_content, preview_mode = _broadcast_strip_format_directive(
-        caption_text if photo_file_id else plain_text,
-        parse_mode,
-    )
-
-    # Send the admin metadata as HTML, then send the real content preview as a
-    # separate Telegram message/photo using the content's own parse mode.
-    # This fixes the old preview bug where <b>...</b> or Markdown appeared as
-    # raw text because the content was escaped inside an HTML wrapper.
-    await safe_send(lambda: msg.reply_text(
-        f"{summary}\n\n"
-        "👁️ <b>Content preview is shown below.</b>\n"
-        "Use the buttons under the preview after checking the rendered message.",
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    ))
-    try:
-        await safe_send(lambda: _send_telegram_broadcast_message(
-            context.bot,
-            chat_id=msg.chat_id,
-            text=preview_content or "",
-            parse_mode=preview_mode,
-            photo_file_id=photo_file_id,
-            reply_markup=get_broadcast_confirm_kb(),
-        ))
-    except Exception as exc:
+    ok = await _admin_show_broadcast_preview_message(msg, context.bot, user_id, _pending_broadcast[user_id])
+    if not ok:
         _pending_broadcast.pop(user_id, None)
         context.user_data.pop("bc_state", None)
-        await safe_send(lambda: msg.reply_text(
-            "❌ Preview failed, so this broadcast was not queued.\n"
-            f"Reason: <code>{html.escape(str(exc)[:300])}</code>",
-            parse_mode="HTML",
-        ))
 
 
 async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     user_id = query.from_user.id
-    data    = query.data
+    data    = query.data or ""
 
     if not _is_admin(user_id):
         with suppress(Exception):
@@ -18611,12 +18908,62 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     with suppress(Exception):
         await query.answer()
 
+    if data == "bc_templates":
+        await _admin_open_broadcast_templates(query, context, user_id)
+        return
+
+    if data == "bc_save_template":
+        pending = _pending_broadcast.get(user_id)
+        if not pending:
+            await safe_send(lambda: query.message.reply_text(
+                "⚠️ មិនមាន Preview សម្រាប់ Save ទេ។ សូមផ្ញើ Broadcast មុនសិន។"
+            ))
+            return
+        ok, info, tpl = await asyncio.get_running_loop().run_in_executor(
+            _DB_EXECUTOR,
+            lambda: db_broadcast_template_save(pending, user_id),
+        )
+        notice = "✅ បាន Save Template។" if ok else f"⚠️ Save Template មិនជោគជ័យ: {info}"
+        await _admin_open_broadcast_templates(query, context, user_id, notice=notice)
+        return
+
+    if data.startswith("bc_tpl_use:"):
+        tpl_id = data.split(":", 1)[1]
+        tpl = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_broadcast_template_get(tpl_id))
+        if not tpl:
+            await _admin_open_broadcast_templates(query, context, user_id, notice="⚠️ រក Template មិនឃើញ។")
+            return
+        pending = _broadcast_template_payload_from_template(tpl)
+        _pending_broadcast[user_id] = pending
+        context.user_data["bc_state"] = BROADCAST_WAIT_MESSAGE
+        with suppress(Exception):
+            await query.message.edit_reply_markup(reply_markup=None)
+        await safe_send(lambda: query.message.reply_text(
+            f"📚 បានជ្រើស Template: <b>{html.escape(_broadcast_template_button_title(tpl))}</b>",
+            parse_mode="HTML",
+        ))
+        ok = await _admin_show_broadcast_preview_message(query.message, context.bot, user_id, pending)
+        if not ok:
+            _pending_broadcast.pop(user_id, None)
+            context.user_data.pop("bc_state", None)
+        return
+
+    if data.startswith("bc_tpl_del:"):
+        tpl_id = data.split(":", 1)[1]
+        ok, info = await asyncio.get_running_loop().run_in_executor(
+            _DB_EXECUTOR,
+            lambda: db_broadcast_template_delete(tpl_id, user_id),
+        )
+        notice = "🗑️ បានលុប Template។" if ok else f"⚠️ លុបមិនជោគជ័យ: {info}"
+        await _admin_open_broadcast_templates(query, context, user_id, notice=notice)
+        return
+
     if data == "bc_cancel":
         _pending_broadcast.pop(user_id, None)
         context.user_data.pop("bc_state", None)
         with suppress(Exception):
             await query.message.edit_reply_markup(reply_markup=None)
-        await safe_send(lambda: query.message.reply_text("❌ Broadcast បានបោះបង់។"))
+        await safe_send(lambda: query.message.reply_text("❌ Broadcast ត្រូវបានបោះបង់។"))
         return
 
     if data == "bc_confirm":
@@ -21887,8 +22234,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # FIX: These patterns are handled by dedicated CallbackQueryHandlers that
     # already call query.answer(). Do NOT answer here — it would cause a
     # "query is too old" double-answer error on Telegram's side.
-    _HANDLED_EXACT = {"bc_confirm", "bc_cancel", "users_close", "noop"}
-    _HANDLED_PREFIX = ("sched_", "users_page:", "users_search", "user_", "history_", "rtadmin_")
+    _HANDLED_EXACT = {"users_close", "noop"}
+    _HANDLED_PREFIX = ("bc_", "sched_", "users_page:", "users_search", "user_", "history_", "rtadmin_")
     if data in _HANDLED_EXACT or any(data.startswith(p) for p in _HANDLED_PREFIX):
         return
 
@@ -22038,7 +22385,7 @@ async def _run_bot():
     app.add_handler(CommandHandler("endchat",         cmd_endchat))
 
     # Callback handlers (priority order matters)
-    app.add_handler(CallbackQueryHandler(broadcast_callback,  pattern=r"^bc_(confirm|cancel)$"))
+    app.add_handler(CallbackQueryHandler(broadcast_callback,  pattern=r"^bc_"))
     app.add_handler(CallbackQueryHandler(
         users_page_callback,
         # Route every admin user/history button here, including paged callbacks like
