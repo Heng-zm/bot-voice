@@ -308,7 +308,7 @@ def _perf_default(name: str, fallback: Any = None) -> Any:
 # SameSite=None requires Secure=True in modern browsers.
 DEFAULT_WEB_COOKIE_SAMESITE = "none"
 DEFAULT_WEB_COOKIE_SECURE = True
-ADMIN_BACKEND_RELEASE = "v22-tts-ko-ja-optimized"
+ADMIN_BACKEND_RELEASE = "v23-tts-ko-ja-bugfix"
 
 
 # ── FastAPI Web Server + typed settings ─────────────────────────────────────
@@ -2081,7 +2081,7 @@ _AI_ALLOWED_AUDIO_MIME = {
 }
 
 _AI_SYSTEM_PROMPT = (
-    "You are a helpful AI assistant that supports both Khmer (ភាសាខ្មែរ) and English. "
+    "You are a helpful AI assistant that supports Khmer, English, Chinese, Korean, and Japanese. "
     "Always reply in the same language the user uses. "
     "If the user sends an image, describe and analyse it fully. "
     "If the user sends audio, provide an accurate transcription then answer any follow-up. "
@@ -2151,14 +2151,66 @@ def _ai_cors_preflight():
     return _apply_ai_cors_headers(Response("", status=204))
 
 
-def _detect_lang(text: str) -> str:
-    """Best-effort language hint for API responses and logs.
+_LANG_HINT_ALIASES = {
+    "km": "km", "kh": "km", "khmer": "km", "ភាសាខ្មែរ": "km",
+    "en": "en", "eng": "en", "english": "en",
+    "zh": "zh", "cn": "zh", "chinese": "zh", "中文": "zh",
+    "ko": "ko", "kr": "ko", "korean": "ko", "한국어": "ko",
+    "ja": "ja", "jp": "ja", "japanese": "ja", "日本語": "ja",
+}
+_LANG_HINT_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"\[(?P<bracket>km|kh|khmer|en|eng|english|zh|cn|chinese|ko|kr|korean|ja|jp|japanese|中文|한국어|日本語)\]"
+    r"|/(?P<slash>km|kh|khmer|en|eng|english|zh|cn|chinese|ko|kr|korean|ja|jp|japanese)\b"
+    r"|(?:tts|lang|language)\s*[:=]\s*(?P<named>km|kh|khmer|en|eng|english|zh|cn|chinese|ko|kr|korean|ja|jp|japanese|中文|한국어|日本語)\b"
+    r"|(?P<prefix>km|kh|khmer|en|eng|english|zh|cn|chinese|ko|kr|korean|ja|jp|japanese|中文|한국어|日本語)\s*[:：]"
+    r")\s*",
+    re.IGNORECASE,
+)
 
-    Keep this dependency-free because it runs before the full TTS constants are
-    declared.  It now recognises Khmer, Korean, Japanese, Chinese, and English
-    so API metadata does not mislabel CJK/Korean text as English.
+
+def _normalise_lang_hint(value: Any) -> str:
+    return _LANG_HINT_ALIASES.get(str(value or "").strip().lower(), "")
+
+
+def _extract_leading_lang_hint(text: str) -> tuple[str, str]:
+    """Return (language_key, text_without_hint) for explicit TTS language hints.
+
+    This fixes ambiguous CJK text.  For example, Kanji-only Japanese such as
+    `日本語` can look Chinese to a script detector, so users may send
+    `ja: 日本語` or `[ja] 日本語` to force the Japanese Edge voice.
     """
-    text = text or ""
+    text = str(text or "")
+    match = _LANG_HINT_PATTERN.match(text)
+    if not match:
+        return "", text
+    for group_name in ("bracket", "slash", "named", "prefix"):
+        lang = _normalise_lang_hint(match.group(group_name))
+        if lang:
+            return lang, text[match.end():].lstrip()
+    return "", text
+
+
+def _looks_like_japanese_han_phrase(text: str) -> bool:
+    """Small dependency-free hint for common Japanese-only Han phrases.
+
+    Han/Kanji-only CJK is inherently ambiguous, so this function is deliberately
+    conservative.  Explicit language hints still win for words like 東京 that
+    can be valid Chinese or Japanese.
+    """
+    compact = re.sub(r"\s+", "", str(text or ""))
+    if not compact:
+        return False
+    japanese_han_hints = ("日本語", "仮名", "片仮名", "平仮名")
+    return any(item in compact for item in japanese_han_hints)
+
+
+def _detect_lang(text: str) -> str:
+    """Best-effort language hint for API responses and logs."""
+    hint, text = _extract_leading_lang_hint(text or "")
+    if hint:
+        return hint
+
     khmer = sum(1 for c in text if "\u1780" <= c <= "\u17FF")
     korean = sum(1 for c in text if "\u1100" <= c <= "\u11FF" or "\u3130" <= c <= "\u318F" or "\uAC00" <= c <= "\uD7AF")
     japanese = sum(1 for c in text if "\u3040" <= c <= "\u30FF" or "\u31F0" <= c <= "\u31FF")
@@ -2172,6 +2224,8 @@ def _detect_lang(text: str) -> str:
     if korean and korean / signal_total >= 0.15:
         return "ko"
     if japanese and japanese / signal_total >= 0.08:
+        return "ja"
+    if _looks_like_japanese_han_phrase(text):
         return "ja"
     if chinese and chinese / signal_total >= 0.15:
         return "zh"
@@ -10709,7 +10763,7 @@ TTS_LANGUAGE_LABELS = {
     "ko": "Korean",
     "ja": "Japanese",
 }
-TTS_SUPPORTED_LANG_ORDER = ("km", "zh", "ja", "ko", "en")
+TTS_SUPPORTED_LANG_ORDER = ("en", "km", "zh", "ja", "ko")
 SPEED_OPTIONS = {
     "spd_0.5": ("x0.5", 0.5),
     "spd_1.0": ("Normal", 1.0),
@@ -10720,7 +10774,8 @@ WELCOME_TEXT = (
     "🎵 សួស្តី! ខ្ញុំជា Bot បំលែងអក្សរទៅជាសំឡេង អេអាយ\n\n"
     "📌 វាយអក្សរភាសាណាមួយ ផ្ញើរមក Bot នឹងបំលែងដោយស្វ័យប្រវត្តិ!\n\n"
     "🌍 ភាសាដែល Support:\n"
-    "🇰🇭 ភាសាខ្មែរ | 🇺🇸 English | 🇨🇳 中文 | 🇰🇷 한국어 | 🇯🇵 日本語\n\n"
+    "🇰🇭 ភាសាខ្មែរ | 🇺🇸 English | 🇨🇳 中文 | 🇰🇷 한국어 | 🇯🇵 日本語\n"
+    "💡 Japanese/Chinese Kanji ambiguous? use: ja: 日本語 or zh: 中文\n\n"
     "⚙️ ប្រើ /myprefs ដើម្បីមើលការកំណត់របស់អ្នក\n"
     "📢 Join My Channel: https://t.me/m11mmm112"
 )
@@ -13125,7 +13180,7 @@ async def resolve_tts_text(
         return raw_text
 
     system_prompt = (
-        "You are a text pre-processor for a Khmer/English TTS bot. "
+        "You are a text pre-processor for a multilingual TTS bot that supports Khmer, English, Chinese, Korean, and Japanese. "
         "Output ONLY the exact text to be spoken — no labels, no explanation, no markdown.\n\n"
         "Rules:\n"
         "1. Normal sentence → output verbatim.\n"
@@ -14722,10 +14777,13 @@ def _detect_tts_lang_key(text: str) -> str:
 
     Supports Khmer, English, Chinese, Korean, and Japanese.  Korean Hangul and
     Japanese Kana are detected before the Chinese Han fallback so CJK text does
-    not get routed to the wrong Edge voice.  Han-only text is ambiguous, so it
-    intentionally remains Chinese unless Japanese Kana are present.
+    not get routed to the wrong Edge voice.  For ambiguous Han/Kanji-only text,
+    users can force a voice with a leading hint such as `ja: 日本語`.
     """
-    text = text or ""
+    hint, text = _extract_leading_lang_hint(text or "")
+    if hint:
+        return hint
+
     khmer_chars = len(_KHMER_RE.findall(text))
     korean_chars = len(_KOREAN_RE.findall(text))
     japanese_kana_chars = len(_JAPANESE_KANA_RE.findall(text))
@@ -14743,6 +14801,8 @@ def _detect_tts_lang_key(text: str) -> str:
         return "ko"
     if japanese_kana_chars and japanese_kana_chars / signal_total >= 0.08:
         return "ja"
+    if _looks_like_japanese_han_phrase(text):
+        return "ja"
     if chinese_chars and chinese_chars / signal_total >= 0.15:
         return "zh"
     return "en"
@@ -14755,10 +14815,11 @@ def _detect_voice(text: str, gender: str) -> str:
 
 
 def _clean_tts_text_for_edge(text: str) -> str:
-    """Remove hidden/control chars that can make Edge TTS return no audio."""
+    """Remove hidden/control chars and optional leading language hints."""
     text = (text or "")
     for ch in ("\ufeff", "\u200b", "\u200c", "\u200d"):
         text = text.replace(ch, "")
+    _hint, text = _extract_leading_lang_hint(text)
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text)
     text = re.sub(r"[ \t\r\f\v]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -15509,7 +15570,7 @@ def _tts_audio_cache_key(text: str, gender: str, speed: float, tts_model: str) -
     cleaned = _clean_tts_text_for_edge(text)
     lang = _detect_tts_lang_key(cleaned)
     payload = {
-        "v": 2,
+        "v": 3,
         "lang": lang,
         "gender": gender if gender in ("female", "male") else "female",
         "speed": _rounded_speed(speed),
@@ -15621,7 +15682,7 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
         raise RuntimeError("edge-tts returned empty audio after retries")
 
     if len(set(used_voices)) > 1:
-        logger.info("edge-tts used fallback voices: %s", sorted(set(used_voices)))
+        logger.info("edge-tts used multiple voices/languages: %s", sorted(set(used_voices)))
 
     speed_key = _rounded_speed(speed)
     af        = _build_atempo_chain(speed_key) if abs(speed_key - DEFAULT_SPEED) > 1e-4 else None
