@@ -308,7 +308,7 @@ def _perf_default(name: str, fallback: Any = None) -> Any:
 # SameSite=None requires Secure=True in modern browsers.
 DEFAULT_WEB_COOKIE_SAMESITE = "none"
 DEFAULT_WEB_COOKIE_SECURE = True
-ADMIN_BACKEND_RELEASE = "v21-pdf-activity-graph-style"
+ADMIN_BACKEND_RELEASE = "v22-tts-ko-ja-optimized"
 
 
 # ── FastAPI Web Server + typed settings ─────────────────────────────────────
@@ -2152,9 +2152,30 @@ def _ai_cors_preflight():
 
 
 def _detect_lang(text: str) -> str:
+    """Best-effort language hint for API responses and logs.
+
+    Keep this dependency-free because it runs before the full TTS constants are
+    declared.  It now recognises Khmer, Korean, Japanese, Chinese, and English
+    so API metadata does not mislabel CJK/Korean text as English.
+    """
+    text = text or ""
     khmer = sum(1 for c in text if "\u1780" <= c <= "\u17FF")
-    alpha = sum(1 for c in text if c.isalpha())
-    return "km" if alpha and khmer / alpha > 0.25 else "en"
+    korean = sum(1 for c in text if "\u1100" <= c <= "\u11FF" or "\u3130" <= c <= "\u318F" or "\uAC00" <= c <= "\uD7AF")
+    japanese = sum(1 for c in text if "\u3040" <= c <= "\u30FF" or "\u31F0" <= c <= "\u31FF")
+    chinese = sum(1 for c in text if "\u3400" <= c <= "\u4DBF" or "\u4E00" <= c <= "\u9FFF" or "\uF900" <= c <= "\uFAFF")
+    latin = sum(1 for c in text if ("A" <= c <= "Z") or ("a" <= c <= "z"))
+    signal_total = khmer + korean + japanese + chinese + latin
+    if signal_total <= 0:
+        return "en"
+    if khmer and khmer / signal_total >= 0.15:
+        return "km"
+    if korean and korean / signal_total >= 0.15:
+        return "ko"
+    if japanese and japanese / signal_total >= 0.08:
+        return "ja"
+    if chinese and chinese / signal_total >= 0.15:
+        return "zh"
+    return "en"
 
 
 # ---------------------------------------------------------------------------
@@ -2996,7 +3017,7 @@ def ai_info():
         "model": HF_MODEL,
         "ocr_model": HF_OCR_MODEL,
         "ocr_provider": OCR_PROVIDER,
-        "features": ["chat", "multi-turn-history", "image-ocr", "khmer-language", "english-language", "chinese-language", "admin-generated-api-keys"],
+        "features": ["chat", "multi-turn-history", "image-ocr", "khmer-language", "english-language", "chinese-language", "korean-language", "japanese-language", "admin-generated-api-keys"],
         "providers": {
             "active": AI_PROVIDER,
             "huggingface_available": _hf_client is not None,
@@ -9191,7 +9212,7 @@ _STALE_GRACE_S          = 30.0
 _KHMER_RE               = re.compile(r"[\u1780-\u17FF]")
 _SPEED_MIN              = 0.25
 _SPEED_MAX              = 4.0
-_SENTENCE_RE            = re.compile(r"(?<=[។!\?\.。])\s*")
+_SENTENCE_RE            = re.compile(r"(?<=[។!\?\.。！？｡．])\s*")
 
 # ---------------------------------------------------------------------------
 # Supported audio file extensions
@@ -10676,12 +10697,19 @@ VOICE_MAP = {
     "en": {"female": "en-US-AriaNeural", "male": "en-US-GuyNeural"},
     # Chinese / Mandarin (Simplified + Traditional text detection routes here)
     "zh": {"female": "zh-CN-XiaoxiaoNeural", "male": "zh-CN-YunxiNeural"},
+    # Korean
+    "ko": {"female": "ko-KR-SunHiNeural", "male": "ko-KR-InJoonNeural"},
+    # Japanese
+    "ja": {"female": "ja-JP-NanamiNeural", "male": "ja-JP-KeitaNeural"},
 }
 TTS_LANGUAGE_LABELS = {
     "km": "Khmer",
     "en": "English",
     "zh": "Chinese",
+    "ko": "Korean",
+    "ja": "Japanese",
 }
+TTS_SUPPORTED_LANG_ORDER = ("km", "zh", "ja", "ko", "en")
 SPEED_OPTIONS = {
     "spd_0.5": ("x0.5", 0.5),
     "spd_1.0": ("Normal", 1.0),
@@ -10692,7 +10720,7 @@ WELCOME_TEXT = (
     "🎵 សួស្តី! ខ្ញុំជា Bot បំលែងអក្សរទៅជាសំឡេង អេអាយ\n\n"
     "📌 វាយអក្សរភាសាណាមួយ ផ្ញើរមក Bot នឹងបំលែងដោយស្វ័យប្រវត្តិ!\n\n"
     "🌍 ភាសាដែល Support:\n"
-    "🇰🇭 ភាសាខ្មែរ | 🇺🇸 English | 🇨🇳 中文 Chinese\n\n"
+    "🇰🇭 ភាសាខ្មែរ | 🇺🇸 English | 🇨🇳 中文 | 🇰🇷 한국어 | 🇯🇵 日本語\n\n"
     "⚙️ ប្រើ /myprefs ដើម្បីមើលការកំណត់របស់អ្នក\n"
     "📢 Join My Channel: https://t.me/m11mmm112"
 )
@@ -14684,37 +14712,46 @@ def _build_atempo_chain(speed: float) -> str:
 
 
 _CHINESE_RE = re.compile(r"[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]")
+_JAPANESE_KANA_RE = re.compile(r"[\u3040-\u30FF\u31F0-\u31FF]")
+_KOREAN_RE = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
 
 
 def _detect_tts_lang_key(text: str) -> str:
     """Detect the best Edge/HF TTS language bucket for a text chunk.
 
-    Supports Khmer, English, and Chinese. Chinese detection is done before the
-    English fallback because CJK ideographs are also treated as alphabetic by
-    Python's str.isalpha().
+    Supports Khmer, English, Chinese, Korean, and Japanese.  Korean Hangul and
+    Japanese Kana are detected before the Chinese Han fallback so CJK text does
+    not get routed to the wrong Edge voice.  Han-only text is ambiguous, so it
+    intentionally remains Chinese unless Japanese Kana are present.
     """
     text = text or ""
     khmer_chars = len(_KHMER_RE.findall(text))
+    korean_chars = len(_KOREAN_RE.findall(text))
+    japanese_kana_chars = len(_JAPANESE_KANA_RE.findall(text))
     chinese_chars = len(_CHINESE_RE.findall(text))
     latin_chars = len(_LATIN_RE.findall(text))
-    signal_total = khmer_chars + chinese_chars + latin_chars
+    signal_total = khmer_chars + korean_chars + japanese_kana_chars + chinese_chars + latin_chars
 
     if signal_total <= 0:
         return "en"
 
-    # Prefer the strongest non-Latin script when it has meaningful presence.
-    # This keeps short Chinese phrases like "你好" or mixed captions readable.
-    if chinese_chars and chinese_chars >= khmer_chars and chinese_chars / signal_total >= 0.15:
-        return "zh"
+    # Prefer unambiguous non-Latin scripts when they have meaningful presence.
     if khmer_chars and khmer_chars / signal_total >= 0.15:
         return "km"
+    if korean_chars and korean_chars / signal_total >= 0.15:
+        return "ko"
+    if japanese_kana_chars and japanese_kana_chars / signal_total >= 0.08:
+        return "ja"
+    if chinese_chars and chinese_chars / signal_total >= 0.15:
+        return "zh"
     return "en"
 
 
 def _detect_voice(text: str, gender: str) -> str:
     gender = gender if gender in ("female", "male") else "female"
-    return VOICE_MAP[_detect_tts_lang_key(text)][gender]
+    voices = VOICE_MAP.get(_detect_tts_lang_key(text)) or VOICE_MAP["en"]
+    return voices.get(gender) or voices.get("female") or VOICE_MAP["en"]["female"]
 
 
 def _clean_tts_text_for_edge(text: str) -> str:
@@ -14738,7 +14775,7 @@ def _tts_voice_candidates(text: str, gender: str) -> list[str]:
     candidates = [VOICE_MAP[lang][gender], VOICE_MAP[lang][other_gender]]
 
     if EDGE_TTS_CROSS_LANG_FALLBACK:
-        fallback_order = ("km", "zh", "en")
+        fallback_order = globals().get("TTS_SUPPORTED_LANG_ORDER", tuple(VOICE_MAP.keys()))
         for other_lang in fallback_order:
             if other_lang == lang or other_lang not in VOICE_MAP:
                 continue
@@ -15538,19 +15575,24 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
     if not text:
         raise ValueError("generate_voice: text must not be empty")
 
-    voices = _tts_voice_candidates(text, gender)
     text_chunks = _split_text_chunks(text, max_chars=EDGE_TTS_CHUNK_CHARS)
     if not text_chunks:
         raise ValueError("generate_voice: no speakable text chunks")
 
     async def _render_edge_chunk(idx: int, chunk_text: str) -> tuple[int, bytes, str]:
+        # Detect voice per chunk, not only for the whole message.  This keeps
+        # mixed English/Korean/Japanese/Chinese/Khmer text readable after
+        # chunking and prevents one dominant script from forcing every chunk to
+        # the same voice.
+        chunk_voices = _tts_voice_candidates(chunk_text, gender)
         try:
-            chunk_mp3, used_voice = await _edge_tts_stream_with_retry(chunk_text, voices)
+            chunk_mp3, used_voice = await _edge_tts_stream_with_retry(chunk_text, chunk_voices)
             return idx, chunk_mp3, used_voice
         except Exception as e:
             preview = chunk_text[:80].replace("\n", " ")
+            lang = _detect_tts_lang_key(chunk_text)
             raise RuntimeError(
-                f"edge-tts failed at chunk {idx}/{len(text_chunks)} ({preview!r}): {e}"
+                f"edge-tts failed at chunk {idx}/{len(text_chunks)} lang={lang} ({preview!r}): {e}"
             ) from e
 
     used_voices: list[str] = []
@@ -15711,7 +15753,7 @@ async def transcribe_voice(ogg_path: str) -> str:
     prompt    = (
         "Transcribe this audio exactly as spoken. "
         "Output ONLY the transcribed text — no labels, no explanation. "
-        "Support Khmer, English, and Chinese."
+        "Support Khmer, English, Chinese, Korean, and Japanese."
     )
     semaphore = _AI_SEMAPHORE
     if semaphore is None:
@@ -15748,7 +15790,7 @@ async def transcribe_audio_file(file_path: str, mime_type: str) -> str:
     prompt    = (
         "Transcribe this audio exactly as spoken. "
         "Output ONLY the transcribed text — no labels, no explanation. "
-        "Support Khmer, English, and Chinese."
+        "Support Khmer, English, Chinese, Korean, and Japanese."
     )
     semaphore = _AI_SEMAPHORE
     if semaphore is None:
@@ -18723,6 +18765,7 @@ def _admin_tts_provider_text(notice: str = "") -> str:
         f"HF cached client: <b>{'YES' if hf_client_ready else 'NO'}</b>",
         f"HF cooldown: <b>{hf_remaining}s</b> {'⚠️' if hf_disabled else '✅'}",
         f"Edge fallback: <b>{'ON' if HF_TTS_EDGE_FALLBACK else 'OFF'}</b>",
+        f"Supported Edge languages: <code>{html.escape(', '.join(TTS_LANGUAGE_LABELS.values()))}</code>",
         f"HF retries: <b>{HF_TTS_RETRIES}</b> · timeout: <b>{HF_TTS_TIMEOUT_S:g}s</b>",
         f"Edge retries: <b>{EDGE_TTS_RETRIES}</b> · stream timeout: <b>{EDGE_TTS_STREAM_TIMEOUT_S:g}s</b>",
         "",
