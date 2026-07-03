@@ -308,7 +308,7 @@ def _perf_default(name: str, fallback: Any = None) -> Any:
 # SameSite=None requires Secure=True in modern browsers.
 DEFAULT_WEB_COOKIE_SAMESITE = "none"
 DEFAULT_WEB_COOKIE_SECURE = True
-ADMIN_BACKEND_RELEASE = "v23-tts-ko-ja-bugfix"
+ADMIN_BACKEND_RELEASE = "v25-gemini-ocr-defaults"
 
 
 # ── FastAPI Web Server + typed settings ─────────────────────────────────────
@@ -2915,7 +2915,7 @@ def ai_assistant():
         if audio_data is not None:
             if _gemini is None:
                 return _ai_cors(_ai_error(
-                    "Audio transcription requires Gemini. Set GEMINI_API_KEY and GEMINI_MODEL.", 503
+                    "Audio transcription requires Gemini. Set GEMINI_API_KEY; GEMINI_MODEL optional.", 503
                 ))
             contents = _build_gemini_contents(
                 message, history, image_data, audio_data, image_mime, audio_mime
@@ -4613,7 +4613,7 @@ def _web_system_v4_rows() -> str:
         rows.append(_web_health_item("AI API auth", False, str(exc)[:220]))
     rows.append(_web_health_item("AI provider", bool(_hf_client or _gemini), f"provider={AI_PROVIDER} model={HF_MODEL if AI_PROVIDER == 'hf' else GEMINI_MODEL}", warn=not bool(_hf_client or _gemini)))
     ocr_disabled = _hf_ocr_is_temporarily_disabled() or _ocr_provider_is_temporarily_disabled("hf") or _ocr_provider_is_temporarily_disabled("gemini")
-    rows.append(_web_health_item("OCR provider", _ocr_configured(), f"provider={OCR_PROVIDER} model={HF_OCR_MODEL}; temporary_disabled={ocr_disabled}", warn=ocr_disabled or not _ocr_configured()))
+    rows.append(_web_health_item("OCR provider", _ocr_configured(), f"provider={OCR_PROVIDER} prefer={_ocr_auto_provider_order()[0] if OCR_PROVIDER == 'auto' else OCR_PROVIDER} hf_model={HF_OCR_MODEL} gemini_model={GEMINI_MODEL or 'not-set'}; temporary_disabled={ocr_disabled}", warn=ocr_disabled or not _ocr_configured()))
     hf_tts_configured = bool(GradioClient is not None and HF_TTS_SPACE and HF_TTS_API_NAME)
     hf_tts_disabled = _hf_tts_is_temporarily_disabled()
     rows.append(_web_health_item("Khmer HF Space TTS", hf_tts_configured, _tts_provider_summary() + f"; cooldown_remaining={_hf_tts_disabled_remaining_s()}s", warn=hf_tts_disabled or not hf_tts_configured))
@@ -9192,12 +9192,17 @@ def _refresh_arch_runtime_settings() -> None:
     _sync_run_state_from_globals()
 GEMINI_API_KEY:     str = ""
 ADMIN_IDS:  set[int]    = set()
-GEMINI_MODEL            = ""
+DEFAULT_GEMINI_MODEL    = "gemini-2.0-flash"
+GEMINI_MODEL            = DEFAULT_GEMINI_MODEL
 HF_TOKEN                = ""
 HF_MODEL                = "Qwen/Qwen2.5-7B-Instruct"
 HF_OCR_MODEL            = "microsoft/trocr-base-printed"
 AI_PROVIDER             = "hf"
-OCR_PROVIDER            = "auto"   # auto | hf | gemini
+OCR_PROVIDER            = "gemini"   # gemini | auto | hf
+# Gemini is the safe default for OCR because Hugging Face hosted OCR can be
+# unavailable or DNS-blocked on small PaaS networks. Set OCR_PROVIDER=auto/hf
+# only when you intentionally want Hugging Face OCR.
+OCR_AUTO_PREFER_PROVIDER = "gemini"  # gemini | hf
 OCR_TIMEOUT_SECONDS     = 90
 HF_OCR_DNS_COOLDOWN_S   = 300.0
 OCR_PROVIDER_FAILURE_LIMIT = _env_int("OCR_PROVIDER_FAILURE_LIMIT", 3, minimum=1, maximum=50)
@@ -10385,31 +10390,45 @@ def _is_dns_or_network_error(exc: Exception | str) -> bool:
     return any(needle in msg for needle in (
         "getaddrinfo failed", "failed to resolve", "nameresolutionerror",
         "temporary failure in name resolution", "nodename nor servname",
-        "connectionerror", "maxretryerror", "name or service not known",
-        "no address associated with hostname", "dns",
+        "connectionerror", "connecterror", "readtimeout", "connecttimeout",
+        "maxretryerror", "name or service not known",
+        "no address associated with hostname", "network is unreachable",
+        "connection reset", "connection refused", "tls", "ssl", "dns",
     ))
 
 
 def _friendly_ocr_error(errors: list[str]) -> RuntimeError:
-    joined = " | ".join(errors)
+    joined = " | ".join(str(e) for e in (errors or []) if str(e).strip())
     low    = joined.lower()
 
+    gemini_missing = "gemini=not configured" in low or "gemini api key" in low or "gemini_model" in low
+    hf_problem = "hf=" in low or "hugging face" in low or "api-inference.huggingface.co" in low
+
     if _is_dns_or_network_error(joined):
+        if hf_problem and gemini_missing:
+            return RuntimeError(
+                "OCR network/DNS failed for Hugging Face and Gemini fallback is not configured. "
+                "Fix Render DNS/firewall for api-inference.huggingface.co, or set "
+                "OCR_PROVIDER=gemini plus GEMINI_API_KEY; GEMINI_MODEL is optional. "
+                f"Details: {joined[:900]}"
+            )
         return RuntimeError(
-            "OCR network/DNS failed. Cannot reach api-inference.huggingface.co. "
-            "Set OCR_PROVIDER=gemini with GEMINI_API_KEY/GEMINI_MODEL for fallback, "
-            f"or fix DNS/firewall. Details: {joined[:900]}"
+            "OCR network/DNS failed. The server cannot reach the selected OCR provider. "
+            "If Hugging Face is blocked, set OCR_PROVIDER=gemini with GEMINI_API_KEY; GEMINI_MODEL is optional; "
+            f"otherwise fix DNS/firewall. Details: {joined[:900]}"
         )
     if "stopiteration" in low:
         return RuntimeError(
             "Hugging Face OCR model is not available for hosted inference. "
-            "Try HF_OCR_MODEL=microsoft/trocr-base-printed, or set OCR_PROVIDER=gemini. "
+            "Use OCR_PROVIDER=gemini with GEMINI_API_KEY; GEMINI_MODEL is optional, or change HF_OCR_MODEL. "
             f"Details: {joined[:900]}"
         )
     if "401" in low or "unauthorized" in low:
-        return RuntimeError("HF_TOKEN is invalid or expired. Create a new token and update env.")
+        return RuntimeError("OCR token/API key is invalid or expired. Update HF_TOKEN or GEMINI_API_KEY.")
     if "403" in low or "forbidden" in low:
-        return RuntimeError("HF_TOKEN lacks permission for this Hugging Face model.")
+        return RuntimeError("OCR provider denied access. Check HF_TOKEN/GEMINI_API_KEY permissions and model access.")
+    if "temporarily disabled" in low:
+        return RuntimeError("OCR provider is temporarily disabled after repeated failures. Try again after cooldown or switch OCR_PROVIDER.")
     return RuntimeError("OCR failed. " + joined[:1200])
 
 
@@ -10435,30 +10454,66 @@ def _mark_hf_ocr_failure(exc: Exception | str) -> None:
             _hf_ocr_disabled_until = time.monotonic() + 60.0
 
 
+def _gemini_ocr_available() -> bool:
+    return _gemini is not None and bool(GEMINI_MODEL) and not _ocr_provider_is_temporarily_disabled("gemini")
+
+
+def _hf_ocr_available() -> bool:
+    return _hf_client is not None and not _hf_ocr_is_temporarily_disabled() and not _ocr_provider_is_temporarily_disabled("hf")
+
+
+def _ocr_auto_provider_order() -> list[str]:
+    prefer = str(
+        os.environ.get("OCR_AUTO_PREFER_PROVIDER")
+        or os.environ.get("OCR_AUTO_PREFER")
+        or OCR_AUTO_PREFER_PROVIDER
+        or "gemini"
+    ).lower().strip()
+    if prefer in {"hf", "huggingface", "hugging_face"}:
+        return ["hf", "gemini"]
+    return ["gemini", "hf"]
+
+
+def _ocr_provider_order(provider: str) -> list[str]:
+    provider = (provider or "auto").lower().strip()
+    if provider == "hf":
+        return ["hf"]
+    if provider == "gemini":
+        return ["gemini"]
+    return _ocr_auto_provider_order()
+
+
 def _ocr_configured() -> bool:
-    p  = (OCR_PROVIDER or "auto").lower().strip()
-    hf = _hf_client is not None and not _hf_ocr_is_temporarily_disabled() and not _ocr_provider_is_temporarily_disabled("hf")
-    gm = _gemini is not None and not _ocr_provider_is_temporarily_disabled("gemini")
+    p = (OCR_PROVIDER or "auto").lower().strip()
     if p == "hf":
-        return hf
+        return _hf_ocr_available()
     if p == "gemini":
-        return gm
-    return hf or gm
+        return _gemini_ocr_available()
+    return _hf_ocr_available() or _gemini_ocr_available()
 
 
 def _ocr_status_for_user() -> str:
     p = (OCR_PROVIDER or "auto").lower().strip()
+    hf_enabled = _hf_ocr_available()
+    gm_enabled = _gemini_ocr_available()
+
     if p == "hf" and _hf_client is None:
         return "❌ OCR មិនទាន់ Activate ទេ។ សូម Set HF_TOKEN ឬប្ដូរ OCR_PROVIDER=gemini។"
     if p == "gemini" and _gemini is None:
-        return "❌ OCR Gemini មិនទាន់ Activate ទេ។ សូម Set GEMINI_API_KEY និង GEMINI_MODEL។"
+        return "❌ OCR Gemini មិនទាន់ Activate ទេ។ សូម Set GEMINI_API_KEY; GEMINI_MODEL optional។"
     if _hf_client is None and _gemini is None:
-        return "❌ OCR មិនទាន់ Activate ទេ។ សូម Set HF_TOKEN ឬ GEMINI_API_KEY/GEMINI_MODEL។"
-    if p == "hf" and (_hf_ocr_is_temporarily_disabled() or _ocr_provider_is_temporarily_disabled("hf")):
+        return "❌ OCR មិនទាន់ Activate ទេ។ សូម Set HF_TOKEN ឬ GEMINI_API_KEY; GEMINI_MODEL optional។"
+    if p == "auto" and not gm_enabled and (_hf_ocr_is_temporarily_disabled() or _ocr_provider_is_temporarily_disabled("hf")):
+        return (
+            "❌ OCR Hugging Face មានបញ្ហា network/DNS ហើយ Gemini fallback មិនទាន់រួចរាល់។\n"
+            "✅ ដំណោះស្រាយល្អបំផុត: Set OCR_PROVIDER=gemini + GEMINI_API_KEY; GEMINI_MODEL optional, "
+            "ឬជួសជុល DNS/firewall របស់ server។"
+        )
+    if p == "hf" and not hf_enabled:
         return "❌ Hugging Face OCR ត្រូវបានបិទបណ្តោះអាសន្ន ព្រោះមាន network/API errors ជាប់គ្នា។"
-    if p == "gemini" and _ocr_provider_is_temporarily_disabled("gemini"):
-        return "❌ Gemini OCR ត្រូវបានបិទបណ្តោះអាសន្ន ព្រោះមាន network/API errors ជាប់គ្នា។"
-    return "❌ OCR មិនអាចប្រើបាននៅពេលនេះ។ សូមពិនិត្យ API key និង network។"
+    if p == "gemini" and not gm_enabled:
+        return "❌ Gemini OCR ត្រូវបានបិទបណ្តោះអាសន្ន ឬ model/API key មិនត្រឹមត្រូវ។"
+    return "❌ OCR មិនអាចប្រើបាននៅពេលនេះ។ សូមពិនិត្យ API key, provider, model និង network។"
 
 
 def _hf_ocr_via_rest(image_data: bytes) -> str:
@@ -10554,14 +10609,14 @@ def ask_huggingface_ocr(image_data: bytes) -> str:
 
 def ask_gemini_ocr(image_data: bytes, mime_type: str = "image/jpeg") -> str:
     if _gemini is None:
-        raise RuntimeError("Gemini OCR is not configured. Set GEMINI_API_KEY and GEMINI_MODEL.")
+        raise RuntimeError("Gemini OCR is not configured. Set GEMINI_API_KEY; GEMINI_MODEL optional.")
     if not image_data:
         raise RuntimeError("Empty image data.")
     from google.genai import types as _gtypes
     prompt = (
-        "Extract all readable text from this image. Preserve Khmer and English exactly. "
-        "Keep useful line breaks. If there is no readable text, output only NOTEXT. "
-        "Do not describe the image and do not add explanations."
+        "Extract all readable text from this image. Preserve Khmer, English, Chinese, Korean, "
+        "and Japanese exactly. Keep useful line breaks. If there is no readable text, "
+        "output only NOTEXT. Do not describe the image and do not add explanations."
     )
     response = _gemini.models.generate_content(
         model=GEMINI_MODEL,
@@ -10575,7 +10630,14 @@ def ask_gemini_ocr(image_data: bytes, mime_type: str = "image/jpeg") -> str:
 
 
 def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tuple[str, str, str]:
-    """Unified OCR with provider fallback. Returns (text, provider, model)."""
+    """Unified OCR with provider fallback. Returns (text, provider, model).
+
+    v25 fixes:
+    - auto mode can prefer Gemini first to avoid Render/HF DNS failures.
+    - unavailable providers are recorded clearly instead of producing confusing
+      "HF failed; trying Gemini" logs when Gemini is not configured.
+    - temporarily disabled providers are skipped quickly until cooldown ends.
+    """
     if not image_data:
         raise RuntimeError("Empty image data.")
 
@@ -10584,31 +10646,16 @@ def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tuple[str
         provider = "auto"
 
     errors: list[str] = []
+    order = _ocr_provider_order(provider)
 
-    if provider in ("auto", "hf") and _hf_client is not None:
-        hf_disabled = _hf_ocr_is_temporarily_disabled() or _ocr_provider_is_temporarily_disabled("hf")
-        if hf_disabled:
-            errors.append("hf=temporarily disabled after recent OCR failures")
-            if provider == "hf":
-                raise _friendly_ocr_error(errors)
-        else:
-            try:
-                text = ask_huggingface_ocr(image_data)
-                _mark_ocr_provider_success("hf")
-                return text, "hf", HF_OCR_MODEL
-            except Exception as e:
-                errors.append(f"hf={type(e).__name__}: {e!r}")
-                _mark_ocr_provider_failure("hf", e)
-                if provider == "hf":
-                    raise _friendly_ocr_error(errors)
-                logger.warning(f"HF OCR failed; trying Gemini fallback: {e}")
-
-    if provider in ("auto", "gemini") and _gemini is not None:
-        if _ocr_provider_is_temporarily_disabled("gemini"):
-            errors.append("gemini=temporarily disabled after recent OCR failures")
-            if provider == "gemini":
-                raise _friendly_ocr_error(errors)
-        else:
+    for item in order:
+        if item == "gemini":
+            if _gemini is None or not GEMINI_MODEL:
+                errors.append("gemini=not configured: set GEMINI_API_KEY; GEMINI_MODEL optional")
+                continue
+            if _ocr_provider_is_temporarily_disabled("gemini"):
+                errors.append("gemini=temporarily disabled after recent OCR failures")
+                continue
             try:
                 text = ask_gemini_ocr(image_data, mime_type)
                 _mark_ocr_provider_success("gemini")
@@ -10618,7 +10665,31 @@ def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tuple[str
                 _mark_ocr_provider_failure("gemini", e)
                 if provider == "gemini":
                     raise _friendly_ocr_error(errors)
-                logger.warning(f"Gemini OCR fallback failed: {e}")
+                logger.warning("Gemini OCR failed; fallback provider will be tried if available: %s", str(e)[:300])
+                continue
+
+        if item == "hf":
+            if _hf_client is None:
+                errors.append("hf=not configured: set HF_TOKEN")
+                continue
+            hf_disabled = _hf_ocr_is_temporarily_disabled() or _ocr_provider_is_temporarily_disabled("hf")
+            if hf_disabled:
+                errors.append("hf=temporarily disabled after recent OCR failures")
+                continue
+            try:
+                text = ask_huggingface_ocr(image_data)
+                _mark_ocr_provider_success("hf")
+                return text, "hf", HF_OCR_MODEL
+            except Exception as e:
+                errors.append(f"hf={type(e).__name__}: {e!r}")
+                _mark_ocr_provider_failure("hf", e)
+                if provider == "hf":
+                    raise _friendly_ocr_error(errors)
+                if _gemini is not None and not _ocr_provider_is_temporarily_disabled("gemini"):
+                    logger.warning("HF OCR failed; Gemini fallback will be tried: %s", str(e)[:300])
+                else:
+                    logger.warning("HF OCR failed and Gemini fallback is not configured/available: %s", str(e)[:300])
+                continue
 
     if not errors:
         errors.append(
@@ -10658,14 +10729,14 @@ def ai_text_reply(prompt: str, history: list[dict] | None = None) -> tuple[str, 
 def _init_clients() -> None:
     global supabase, redis_client, _gemini, TELEGRAM_BOT_TOKEN, SB_URL, SB_KEY, REDIS_URL
     global GEMINI_API_KEY, ADMIN_IDS, GEMINI_MODEL
-    global HF_TOKEN, HF_MODEL, HF_OCR_MODEL, AI_PROVIDER, OCR_PROVIDER
+    global HF_TOKEN, HF_MODEL, HF_OCR_MODEL, AI_PROVIDER, OCR_PROVIDER, OCR_AUTO_PREFER_PROVIDER
 
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     SB_URL             = os.getenv("SUPABASE_URL", "")
     SB_KEY             = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY", "")
     REDIS_URL          = os.getenv("REDIS_URL", "").strip()
     GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL       = os.getenv("GEMINI_MODEL", "").strip()
+    GEMINI_MODEL       = (os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_GENAI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
     HF_TOKEN           = os.getenv("HF_TOKEN", "")
     HF_MODEL           = os.getenv("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
     HF_OCR_MODEL       = os.getenv("HF_OCR_MODEL", "microsoft/trocr-base-printed")
@@ -10675,10 +10746,19 @@ def _init_clients() -> None:
         logger.warning(f"Unknown AI_PROVIDER={AI_PROVIDER!r}; falling back to hf.")
         AI_PROVIDER = "hf"
 
-    OCR_PROVIDER = os.getenv("OCR_PROVIDER", "auto").lower().strip()
+    OCR_PROVIDER = os.getenv("OCR_PROVIDER", "gemini").lower().strip()
     if OCR_PROVIDER not in ("auto", "hf", "gemini"):
-        logger.warning(f"Unknown OCR_PROVIDER={OCR_PROVIDER!r}; falling back to auto.")
-        OCR_PROVIDER = "auto"
+        logger.warning(f"Unknown OCR_PROVIDER={OCR_PROVIDER!r}; falling back to gemini.")
+        OCR_PROVIDER = "gemini"
+
+    OCR_AUTO_PREFER_PROVIDER = (
+        os.getenv("OCR_AUTO_PREFER_PROVIDER")
+        or os.getenv("OCR_AUTO_PREFER")
+        or "gemini"
+    ).lower().strip()
+    if OCR_AUTO_PREFER_PROVIDER not in ("gemini", "hf"):
+        logger.warning("Unknown OCR_AUTO_PREFER_PROVIDER=%r; falling back to gemini.", OCR_AUTO_PREFER_PROVIDER)
+        OCR_AUTO_PREFER_PROVIDER = "gemini"
 
     ADMIN_IDS.clear()
     for _aid in os.getenv("ADMIN_IDS", "").split(","):
@@ -10736,7 +10816,14 @@ def _init_clients() -> None:
             _gemini = None
     else:
         _gemini = None
-        logger.info("Gemini disabled. Using Hugging Face for chat/OCR.")
+        missing = []
+        if not GEMINI_API_KEY:
+            missing.append("GEMINI_API_KEY")
+        if not GEMINI_MODEL:
+            GEMINI_MODEL = DEFAULT_GEMINI_MODEL
+        if genai is None:
+            missing.append("google-genai package")
+        logger.info("Gemini disabled (%s). Using Hugging Face for chat/OCR when available.", ", ".join(missing) or "not configured")
 
     _init_hf_client()
 
@@ -21912,16 +21999,32 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         err_msg  = str(e) or repr(e)
-        logger.error(f"on_photo OCR error: {type(e).__name__}: {e!r}", exc_info=True)
+        expected_ocr_outage = (
+            _is_dns_or_network_error(err_msg)
+            or "temporarily disabled" in err_msg.lower()
+            or "not configured" in err_msg.lower()
+            or "not available for hosted inference" in err_msg.lower()
+        )
+        if expected_ocr_outage:
+            logger.warning("on_photo OCR unavailable: %s: %s", type(e).__name__, err_msg[:700])
+        else:
+            logger.error(f"on_photo OCR error: {type(e).__name__}: {e!r}", exc_info=True)
+
         if _is_dns_or_network_error(err_msg):
             user_msg = (
                 "❌ OCR network/DNS មានបញ្ហា។ Server មិនអាចភ្ជាប់ទៅ Provider OCR បាន។\n"
-                "✅ Code នេះនឹងសាក fallback provider ដោយស្វ័យប្រវត្តិ បើបាន Set OCR_PROVIDER=auto និង GEMINI_API_KEY/GEMINI_MODEL។"
+                "✅ បើ Hugging Face ខូច DNS លើ Render សូម Set OCR_PROVIDER=gemini + GEMINI_API_KEY; GEMINI_MODEL optional។\n"
+                "ℹ️ បើ Gemini មិនទាន់ set ទេ fallback មិនអាចដំណើរការ។"
             )
-        elif "model/provider is not available" in err_msg:
+        elif "not available for hosted inference" in err_msg or "model/provider is not available" in err_msg:
             user_msg = (
-                "❌ Hugging Face OCR model មិន support hosted inference ទេ។\n"
-                "សូមសាក HF_OCR_MODEL=microsoft/trocr-base-printed ជាមុនសិន។"
+                "❌ Hugging Face OCR model មិន support hosted inference ឬ provider មិនទាន់រួចរាល់។\n"
+                "✅ សូមប្រើ OCR_PROVIDER=gemini ជាមួយ GEMINI_API_KEY; GEMINI_MODEL optional ឬប្ដូរ HF_OCR_MODEL។"
+            )
+        elif "temporarily disabled" in err_msg.lower():
+            user_msg = (
+                "❌ OCR provider ត្រូវបានបិទបណ្តោះអាសន្ន ព្រោះមាន error ជាប់គ្នា។\n"
+                "✅ សូមសាកម្ដងទៀតបន្ទាប់ពី cooldown ឬប្ដូរ OCR_PROVIDER=gemini។"
             )
         else:
             user_msg = f"❌ មានបញ្ហាក្នុងការ OCR រូបភាព។\n{html.escape(err_msg[:1000])}"
