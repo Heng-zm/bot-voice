@@ -308,7 +308,7 @@ def _perf_default(name: str, fallback: Any = None) -> Any:
 # SameSite=None requires Secure=True in modern browsers.
 DEFAULT_WEB_COOKIE_SAMESITE = "none"
 DEFAULT_WEB_COOKIE_SECURE = True
-ADMIN_BACKEND_RELEASE = "v27-ocr-tts-feature-improvements"
+ADMIN_BACKEND_RELEASE = "v28-admin-bot-experience-v9"
 
 
 # ── FastAPI Web Server + typed settings ─────────────────────────────────────
@@ -1455,7 +1455,7 @@ _WEB_ADMIN_AUDIT = deque(maxlen=WEB_ADMIN_AUDIT_MAX)
 async def _web_request_id_and_timing(req: FastAPIRequest, call_next):
     """Attach request id, latency, active-request count, and slow-request logs.
 
-    Admin V5 adds lightweight performance telemetry without exposing secrets.
+    Admin V9 adds lightweight performance telemetry without exposing secrets.
     It helps identify slow dashboard endpoints, Supabase pressure, and browser
     polling storms while keeping the response body unchanged.
     """
@@ -3752,17 +3752,17 @@ tailwind.config = {
 </head>
 <body>
 <input id="menu-toggle" class="menu-toggle" type="checkbox">
-<div class="mobilebar"><label class="btn ghost" for="menu-toggle">☰ Menu</label><b>Bot Admin V8</b></div>
+<div class="mobilebar"><label class="btn ghost" for="menu-toggle">☰ Menu</label><b>Bot Admin V9</b></div>
 <div class="layout">
 <aside class="side">
   <div class="brand"><span class="brand-mark">🤖</span><span>Bot Admin</span></div>
-  <div class="sub">System V8 · Admin ID: <code>{{ admin_id }}</code></div>
+  <div class="sub">System V9 · Admin ID: <code>{{ admin_id }}</code></div>
   <input class="nav-search" data-nav-filter placeholder="Search admin features…" aria-label="Search admin features">
   <nav class="nav" data-nav-list>{% for key,label,url,ico in nav %}<a class="{{ 'active' if key==active else '' }}" href="{{ url }}" data-nav-item data-label="{{ label|lower }}"><span class="nav-ico">{{ ico }}</span><span>{{ label }}</span></a>{% endfor %}</nav>
   <div class="footer"><div>Supabase: <b>{{ 'ON' if supabase_on else 'OFF' }}</b></div><div>Redis: <b>{{ 'ON' if redis_on else 'OFF' }}</b></div><div><a href="/ping">Ping</a> · <a href="/readyz">Ready</a></div><div class="muted">Tip: press <span class="kbd">Ctrl</span> + <span class="kbd">K</span> to search.</div></div>
 </aside>
 <main class="main">
-  <div class="top"><div><div class="h1">{{ title }}</div><div class="muted">Unified Admin Center V8 · error inbox · safer Telegram operations</div></div><div class="top-right"><div data-local-time>{{ now }}</div><div>{{ time_hint }}</div></div></div>
+  <div class="top"><div><div class="h1">{{ title }}</div><div class="muted">Unified Admin Center V9 · error inbox · safer Telegram operations</div></div><div class="top-right"><div data-local-time>{{ now }}</div><div>{{ time_hint }}</div></div></div>
   {% for cat,msg in messages %}<div class="flash {{ cat }}">{{ msg }}</div>{% endfor %}
   {{ body|safe }}
 </main>
@@ -4919,7 +4919,7 @@ def web_admin_insights():
     </div>
     <div class='grid2'>
       <div class='card'><h2>Best next update package</h2><div class='mini-grid'>
-        <div class='mini-stat'><b>Admin V8 Pro</b><span class='muted'>Insights, Smart Error Inbox Pro, broadcast checker, backup center.</span></div>
+        <div class='mini-stat'><b>Admin V9 Pro</b><span class='muted'>Insights, Smart Error Inbox Pro, broadcast checker, backup center.</span></div>
         <div class='mini-stat'><b>Safe Operations</b><span class='muted'>Group errors, retry failed, pause pressure, audit timeline, lock safety.</span></div>
         <div class='mini-stat'><b>Mobile Friendly</b><span class='muted'>Error Inbox in bottom nav, compact pages, sticky filters.</span></div>
       </div></div>
@@ -6977,7 +6977,7 @@ where status = 'pending';
 -- Recommended for Admin Dashboard V5 Analytics + Calendar month range queries
 create index if not exists scheduled_broadcasts_calendar_idx
 on public.scheduled_broadcasts (broadcast_at, status);"""
-    body = f"<div class='card'><h2>Required / Recommended SQL</h2><p>Run in Supabase SQL Editor.</p></div><div class='card'><h3>bot_locks</h3><pre>{_web_h(locks_sql)}</pre></div><div class='card'><h3>Admin V2 tables</h3><pre>{_web_h(ADMIN_V2_TABLES_SQL)}</pre></div><div class='card'><h3>Schedule indexes</h3><pre>{_web_h(schedule_indexes)}</pre></div>"
+    body = f"<div class='card'><h2>Required / Recommended SQL</h2><p>Run in Supabase SQL Editor.</p></div><div class='card'><h3>bot_locks</h3><pre>{_web_h(locks_sql)}</pre></div><div class='card'><h3>Admin V9 tables</h3><pre>{_web_h(ADMIN_V2_TABLES_SQL)}</pre></div><div class='card'><h3>Schedule indexes</h3><pre>{_web_h(schedule_indexes)}</pre></div>"
     return _web_render("SQL", body, active="sql")
 
 
@@ -7856,7 +7856,7 @@ broadcast_queue_logger = logging.getLogger("broadcast_queue")
 
 
 # ---------------------------------------------------------------------------
-# Admin Error Inbox Pro V8 — grouped in-memory recent error center for /admin
+# Admin Error Inbox Pro V9 — grouped in-memory recent error center for /admin
 # ---------------------------------------------------------------------------
 ADMIN_ERROR_CENTER_MAX = _env_int("ADMIN_ERROR_CENTER_MAX", 300, minimum=20, maximum=5000)
 # Backward-compatible alias used by the Telegram /admin Error Center text.
@@ -8776,7 +8776,7 @@ def get_runtime_admin_kb() -> Any:
         [InlineKeyboardButton(f"🔄 Switch to {target}", callback_data=f"rtadmin_switch:{target}")],
         [InlineKeyboardButton("⚡ Modify Rate Limit", callback_data="rtadmin_rate")],
         [InlineKeyboardButton("🔄 Rotate Webhook Secret", callback_data="rtadmin_rotate_secret")],
-        [InlineKeyboardButton("⬅️ Admin V8", callback_data="admin_home")],
+        [InlineKeyboardButton("⬅️ Admin V9", callback_data="admin_home")],
         [InlineKeyboardButton("❌ Close Menu", callback_data="rtadmin_close")],
     ])
 
@@ -14513,6 +14513,9 @@ def _fmt_dt(dt: datetime) -> str:
 # ---------------------------------------------------------------------------
 # Keyboard helpers
 # ---------------------------------------------------------------------------
+ADMIN_UI_VERSION = "V9"
+ADMIN_UI_TITLE = f"🛡️ Admin System Center {ADMIN_UI_VERSION}"
+
 def get_sched_confirm_kb(row_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ បញ្ជាក់ Schedule", callback_data=f"sched_ok:{row_id}"),
@@ -14545,31 +14548,55 @@ def get_sched_detail_kb(row: dict) -> InlineKeyboardMarkup:
 
 
 def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
-    """Telegram Admin System Center V7 keyboard.
+    """Mobile-first Telegram admin home keyboard for Admin V9.
 
-    This menu now exposes the CRM and Optimize panels directly in Telegram,
-    not only in the web dashboard.
+    Keep the first screen small enough for phones while preserving every
+    existing admin feature through grouped shortcuts.
     """
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏠 Dashboard",   callback_data="admin_home"),
-         InlineKeyboardButton("🩺 Health",      callback_data="admin_health")],
-        [InlineKeyboardButton("👥 Users",       callback_data="admin_users"),
-         InlineKeyboardButton("⭐ CRM",         callback_data="admin_crm")],
-        [InlineKeyboardButton("⚡ Optimize",    callback_data="admin_optimize"),
-         InlineKeyboardButton("🕘 Recent History", callback_data="admin_history")],
-        [InlineKeyboardButton("⚙️ Settings",    callback_data="admin_settings"),
-         InlineKeyboardButton("📊 Stats",       callback_data="admin_stats")],
-        [InlineKeyboardButton("📢 Broadcast សុវត្ថិភាព", callback_data="admin_broadcast"),
-         InlineKeyboardButton("🗓 Schedule Calendar", callback_data="admin_calendar")],
-        [InlineKeyboardButton("⏰ Schedules",   callback_data="admin_schedules"),
-         InlineKeyboardButton("🎛 TTS Provider", callback_data="admin_tts")],
-        [InlineKeyboardButton("🚨 Error Center", callback_data="admin_errors"),
-         InlineKeyboardButton("🛠️ Runtime",    callback_data="admin_runtime")],
-        [InlineKeyboardButton("🔑 API Keys",    callback_data="admin_api"),
-         InlineKeyboardButton("📄 Report PDF",  callback_data="admin_report")],
-        [InlineKeyboardButton("🔐 WEB_KEY",     callback_data="admin_web_key")],
-        [InlineKeyboardButton("🔄 Refresh",     callback_data="admin_home")],
-        [InlineKeyboardButton("❌ បិទ",       callback_data="admin_close")],
+        [InlineKeyboardButton("🏠 Overview", callback_data="admin_home"),
+         InlineKeyboardButton("🩺 Health", callback_data="admin_health")],
+        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
+         InlineKeyboardButton("🗓 Schedules", callback_data="admin_schedules")],
+        [InlineKeyboardButton("👥 Users", callback_data="admin_users"),
+         InlineKeyboardButton("⭐ CRM", callback_data="admin_crm")],
+        [InlineKeyboardButton("🚨 Errors", callback_data="admin_errors"),
+         InlineKeyboardButton("⚡ Optimize", callback_data="admin_optimize")],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings"),
+         InlineKeyboardButton("🛠 Runtime", callback_data="admin_runtime")],
+        [InlineKeyboardButton("📄 Report", callback_data="admin_report"),
+         InlineKeyboardButton("🔐 WEB_KEY", callback_data="admin_web_key")],
+        [InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
+         InlineKeyboardButton("📅 Calendar", callback_data="admin_calendar")],
+        [InlineKeyboardButton("🔑 API Keys", callback_data="admin_api"),
+         InlineKeyboardButton("🕘 History", callback_data="admin_history")],
+        [InlineKeyboardButton("📱 Compact", callback_data="admin_compact"),
+         InlineKeyboardButton("🔄 Refresh", callback_data="admin_home")],
+        [InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
+    ])
+
+
+def get_admin_compact_kb() -> InlineKeyboardMarkup:
+    """Very small /admin menu for Telegram mobile."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
+         InlineKeyboardButton("🚨 Errors", callback_data="admin_errors")],
+        [InlineKeyboardButton("👥 Users", callback_data="admin_users"),
+         InlineKeyboardButton("⚡ Optimize", callback_data="admin_optimize")],
+        [InlineKeyboardButton("📄 Report", callback_data="admin_report"),
+         InlineKeyboardButton("🩺 Health", callback_data="admin_health")],
+        [InlineKeyboardButton("🏠 Full Admin", callback_data="admin_home"),
+         InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+    ])
+
+
+def get_admin_confirm_kb(action: str, *, back: str = "admin_home") -> InlineKeyboardMarkup:
+    """Shared confirmation keyboard for risky Telegram admin actions."""
+    safe_action = re.sub(r"[^a-zA-Z0-9_:-]", "", str(action or ""))[:48]
+    safe_back = re.sub(r"[^a-zA-Z0-9_:-]", "", str(back or "admin_home"))[:48] or "admin_home"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Confirm", callback_data=f"admin_confirm:{safe_action}"),
+         InlineKeyboardButton("❌ Cancel", callback_data=safe_back)],
     ])
 
 
@@ -14733,7 +14760,7 @@ def get_admin_crm_kb(active_segment: str = "all") -> InlineKeyboardMarkup:
          InlineKeyboardButton(_label("blocked", "Blocked"), callback_data="admin_crm:blocked")],
         [InlineKeyboardButton("👥 Users", callback_data="admin_users"),
          InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("⬅️ Admin V8", callback_data="admin_home"),
+        [InlineKeyboardButton("⬅️ Admin V9", callback_data="admin_home"),
          InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
 
@@ -14794,7 +14821,7 @@ def get_admin_optimize_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🩺 Health", callback_data="admin_health")],
         [InlineKeyboardButton("🚨 Error Center", callback_data="admin_errors"),
          InlineKeyboardButton("🔄 Refresh", callback_data="admin_optimize")],
-        [InlineKeyboardButton("⬅️ Admin V8", callback_data="admin_home"),
+        [InlineKeyboardButton("⬅️ Admin V9", callback_data="admin_home"),
          InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
 
@@ -14835,7 +14862,7 @@ async def _admin_open_optimize_panel(query) -> None:
 
 def get_admin_action_kb(cancel_callback: str = "admin_cancel_state") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Admin V8", callback_data="admin_home"),
+        [InlineKeyboardButton("⬅️ Admin V9", callback_data="admin_home"),
          InlineKeyboardButton("❌ បោះបង់",          callback_data=cancel_callback)],
     ])
 
@@ -16376,7 +16403,7 @@ def get_broadcast_confirm_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✅ បញ្ជាក់ផ្ញើទៅអ្នកប្រើសកម្ម", callback_data="bc_confirm")],
         [InlineKeyboardButton("📝 រក្សាទុក Template", callback_data="bc_save_template"),
          InlineKeyboardButton("📚 បណ្ណាល័យ Template", callback_data="bc_templates")],
-        [InlineKeyboardButton("⬅️ Admin V8", callback_data="admin_home"),
+        [InlineKeyboardButton("⬅️ Admin V9", callback_data="admin_home"),
          InlineKeyboardButton("❌ បោះបង់", callback_data="bc_cancel")],
     ])
 
@@ -16384,7 +16411,7 @@ def get_broadcast_confirm_kb() -> InlineKeyboardMarkup:
 def get_broadcast_entry_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📚 បណ្ណាល័យ Template", callback_data="bc_templates")],
-        [InlineKeyboardButton("⬅️ Admin V8", callback_data="admin_home"),
+        [InlineKeyboardButton("⬅️ Admin V9", callback_data="admin_home"),
          InlineKeyboardButton("❌ បោះបង់", callback_data="bc_cancel")],
     ])
 
@@ -16402,7 +16429,7 @@ def get_broadcast_templates_kb(templates: list[dict]) -> InlineKeyboardMarkup:
         ])
     rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="bc_templates"),
                  InlineKeyboardButton("➕ Broadcast ថ្មី", callback_data="admin_broadcast")])
-    rows.append([InlineKeyboardButton("⬅️ Admin V8", callback_data="admin_home"),
+    rows.append([InlineKeyboardButton("⬅️ Admin V9", callback_data="admin_home"),
                  InlineKeyboardButton("❌ បិទ", callback_data="admin_close")])
     return InlineKeyboardMarkup(rows)
 
@@ -16419,7 +16446,7 @@ def get_broadcast_sent_delete_kb(delete_job_id: str) -> InlineKeyboardMarkup:
     job_id = _broadcast_sent_delete_safe_id(delete_job_id)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🗑️ លុបសារដែលបានផ្ញើ", callback_data=f"bc_del_sent_ask:{job_id}")],
-        [InlineKeyboardButton("⬅️ Admin V8", callback_data="admin_home")],
+        [InlineKeyboardButton("⬅️ Admin V9", callback_data="admin_home")],
     ])
 
 
@@ -18880,58 +18907,120 @@ async def _handle_admin_report_day_text(update: Update, context: ContextTypes.DE
     return True
 
 
-async def _admin_home_text(admin_id: int, title: str = "🛠️ Admin System Center V7") -> str:
+
+async def _admin_smart_alert_lines(counts: dict | None = None) -> list[str]:
+    """Build short, actionable alerts for the Telegram /admin home screen."""
+    alerts: list[str] = []
+    counts = counts or {}
+    try:
+        pending = int(counts.get("pending_sched") or 0)
+        if pending:
+            alerts.append(f"🗓 {pending} pending schedule(s)")
+    except Exception:
+        pass
+
+    try:
+        stored_errors = int(_admin_error_center_total_count())
+        if stored_errors:
+            alerts.append(f"🚨 {stored_errors} captured error(s)")
+    except Exception:
+        pass
+
+    try:
+        snap = _runtime_performance_snapshot(light=True)
+        score, warnings, _tips = _optimization_score(snap)
+        if int(score) < 80:
+            alerts.append(f"⚡ Optimize score {score}/100")
+        for warning in list(warnings or [])[:2]:
+            clean_warning = html.escape(str(warning))[:90]
+            alerts.append(f"⚠️ {clean_warning}")
+    except Exception:
+        pass
+
+    try:
+        db_queue = int(_db_executor_queue_size())
+        if db_queue >= 10:
+            alerts.append(f"🧵 DB queue high: {db_queue}")
+    except Exception:
+        pass
+
+    try:
+        if not bool(globals().get("redis_client")):
+            alerts.append("🧰 Redis not connected")
+    except Exception:
+        pass
+
+    return list(dict.fromkeys(alerts))[:5]
+
+
+async def _admin_compact_text(admin_id: int) -> str:
+    counts = await _admin_summary_counts(admin_id)
+    mode = _run_state_bot_mode() if "_run_state_bot_mode" in globals() else str(globals().get("BOT_MODE", "POLLING"))
+    error_count = 0
+    with suppress(Exception):
+        error_count = int(_admin_error_center_total_count())
+    optimize_score = "?"
+    with suppress(Exception):
+        optimize_score = str(_optimization_score(_runtime_performance_snapshot(light=True))[0])
+    alerts = await _admin_smart_alert_lines(counts)
+    alert_text = "\n".join(f"• {line}" for line in alerts) if alerts else "✅ No critical alerts"
+    return (
+        f"📱 <b>Admin Compact {ADMIN_UI_VERSION}</b>\n\n"
+        f"✅ Online · <code>{html.escape(str(mode))}</code>\n"
+        f"👥 Users: <b>{int(counts.get('total_users') or 0)}</b>\n"
+        f"🗓 Pending: <b>{int(counts.get('pending_sched') or 0)}</b>\n"
+        f"🚨 Errors: <b>{error_count}</b>\n"
+        f"⚡ Score: <b>{html.escape(optimize_score)}/100</b>\n"
+        f"⏱ Uptime: <b>{html.escape(_format_uptime())}</b>\n\n"
+        f"<b>Smart Alerts</b>\n{alert_text}\n\n"
+        "Choose an action below."
+    )
+
+
+async def _admin_home_text(admin_id: int, title: str = ADMIN_UI_TITLE) -> str:
+    """Fast, mobile-readable Admin V9 home screen."""
     counts = await _admin_summary_counts(admin_id)
     settings, settings_status = await get_bot_settings_async()
     ffmpeg_ok = bool(_FFMPEG_EXE and os.path.exists(_FFMPEG_EXE))
-    temp_ok = False
-    temp_info = ""
-    try:
-        temp_dir = _get_temp_dir()
-        temp_ok = os.path.isdir(temp_dir) and os.access(temp_dir, os.W_OK)
-        temp_count = sum(
-            1
-            for entry in os.scandir(temp_dir)
-            if entry.name.startswith(_TMP_PREFIX)
-        )
-        temp_info = f"{temp_count} files"
-    except Exception:
-        temp_info = "unknown"
-
-    api_ready = bool(os.environ.get("AI_API_KEY", "").strip()) or bool(counts.get("active_api_keys"))
+    mode = _run_state_bot_mode() if "_run_state_bot_mode" in globals() else str(globals().get("BOT_MODE", "POLLING"))
     maintenance = _setting_bool_from(settings, "maintenance_mode", False)
     tts_on = _setting_bool_from(settings, "tts_enabled", True)
     ocr_on = _setting_bool_from(settings, "ocr_enabled", True)
     voice_on = _setting_bool_from(settings, "voice_transcribe_enabled", True)
+    api_ready = bool(os.environ.get("AI_API_KEY", "").strip()) or bool(counts.get("active_api_keys"))
+
+    error_count = 0
+    with suppress(Exception):
+        error_count = int(_admin_error_center_total_count())
+    optimize_score = "?"
+    with suppress(Exception):
+        optimize_score = str(_optimization_score(_runtime_performance_snapshot(light=True))[0])
+
+    alerts = await _admin_smart_alert_lines(counts)
+    alert_text = "\n".join(f"• {line}" for line in alerts) if alerts else "✅ No critical alerts"
+
     return (
-        f"{title}\n\n"
-        "<b>System Status</b>\n"
-        f"🤖 Telegram: <b>✅ OK</b>\n"
-        f"🗄️ Supabase: <b>{_ok_bad(bool(supabase))}</b>\n"
-        f"⚙️ Settings DB: <b>{_ok_bad(bool(settings_status.get('db_ok')), 'READY', 'MEMORY/SETUP')}</b>\n"
-        f"🧠 Hugging Face: <b>{_ok_bad(bool(_hf_client))}</b>\n"
-        f"🔍 OCR provider: <b>{_ok_bad(_ocr_configured(), 'READY', 'OFF')}</b>\n"
-        f"🎧 FFmpeg: <b>{_ok_bad(ffmpeg_ok, 'OK', 'ERROR')}</b>\n"
-        f"⏱️ Uptime: <b>{html.escape(_format_uptime())}</b>\n"
-        f"📁 Temp: <b>{_ok_bad(temp_ok, 'OK', 'ERROR')}</b> <code>{html.escape(temp_info)}</code>\n\n"
-        "<b>Live Controls</b>\n"
-        f"🛠️ Maintenance: <b>{'ON ⚠️' if maintenance else 'OFF ✅'}</b>\n"
-        f"🗣️ TTS: <b>{'ON ✅' if tts_on else 'OFF ⚠️'}</b>\n"
-        f"🔍 OCR: <b>{'ON ✅' if ocr_on else 'OFF ⚠️'}</b>\n"
-        f"🎙️ Voice: <b>{'ON ✅' if voice_on else 'OFF ⚠️'}</b>\n\n"
+        f"{title}\n"
+        f"<code>/admin › overview</code>\n\n"
+        f"Status: <b>✅ Online</b> · Mode: <code>{html.escape(str(mode))}</code>\n"
+        f"Uptime: <b>{html.escape(_format_uptime())}</b>\n"
+        f"Optimize: <b>{html.escape(optimize_score)}/100</b> · Errors: <b>{error_count}</b>\n\n"
+        "<b>Smart Alerts</b>\n"
+        f"{alert_text}\n\n"
         "<b>Quick Stats</b>\n"
-        f"👥 Users: <b>{int(counts.get('total_users') or 0)}</b>\n"
+        f"👥 Users: <b>{int(counts.get('total_users') or 0)}</b> · "
         f"🚫 Blocked: <b>{int(counts.get('blocked_users') or 0)}</b>\n"
-        f"⏰ Pending schedules: <b>{int(counts.get('pending_sched') or 0)}</b>\n"
-        f"🔑 API access: <b>{_ok_bad(api_ready, 'READY', 'SETUP')}</b>\n"
-        f"💬 Admin chats: <b>{len(_admin_chat_target)}</b>\n\n"
-        "<b>Runtime Since Restart</b>\n"
-        f"🗣️ TTS: <b>{_RUNTIME_METRICS.get('tts', 0)}</b> | "
-        f"🔍 OCR: <b>{_RUNTIME_METRICS.get('ocr', 0)}</b> | "
-        f"🎙️ Voice: <b>{_RUNTIME_METRICS.get('voice', 0)}</b>\n"
-        f"🎵 Audio: <b>{_RUNTIME_METRICS.get('audio', 0)}</b> | "
-        f"⛔ Blocked hits: <b>{_RUNTIME_METRICS.get('blocked_hits', 0)}</b> | "
-        f"⚠️ Disabled hits: <b>{_RUNTIME_METRICS.get('disabled_hits', 0)}</b>\n\n"
+        f"🗓 Pending schedules: <b>{int(counts.get('pending_sched') or 0)}</b> · "
+        f"🔑 API: <b>{_ok_bad(api_ready, 'READY', 'SETUP')}</b>\n"
+        f"🗣 TTS: <b>{'ON ✅' if tts_on else 'OFF ⚠️'}</b> · "
+        f"🔍 OCR: <b>{'ON ✅' if ocr_on else 'OFF ⚠️'}</b> · "
+        f"🎙 Voice: <b>{'ON ✅' if voice_on else 'OFF ⚠️'}</b>\n"
+        f"🛠 Maintenance: <b>{'ON ⚠️' if maintenance else 'OFF ✅'}</b>\n\n"
+        "<b>Core</b>\n"
+        f"🗄 Supabase: <b>{_ok_bad(bool(supabase))}</b> · "
+        f"⚙️ Settings: <b>{_ok_bad(bool(settings_status.get('db_ok')), 'READY', 'MEMORY')}</b>\n"
+        f"🎧 FFmpeg: <b>{_ok_bad(ffmpeg_ok, 'OK', 'ERROR')}</b> · "
+        f"🧰 Redis: <b>{_ok_bad(bool(globals().get('redis_client')))}</b>\n\n"
         "ចុចប៊ូតុងខាងក្រោម ដើម្បីគ្រប់គ្រង Bot។"
     )
 
@@ -19025,7 +19114,7 @@ async def _admin_stats_text(admin_id: int) -> str:
     counts = await _admin_summary_counts(admin_id)
     settings, status = await get_bot_settings_async()
     return (
-        "📊 <b>Admin System Center V7 Stats</b>\n\n"
+        "📊 <b>Admin System Center V9 Stats</b>\n\n"
         f"👥 Total users: <b>{int(counts.get('total_users') or 0)}</b>\n"
         f"🚫 Blocked users: <b>{int(counts.get('blocked_users') or 0)}</b>\n"
         f"⏰ Pending schedules: <b>{int(counts.get('pending_sched') or 0)}</b>\n"
@@ -19246,52 +19335,93 @@ async def _admin_open_schedule_calendar_panel(query, admin_id: int, offset_days:
     ))
 
 
-def _error_center_text() -> str:
-    rows = _admin_error_center_snapshot(12)
-    if not rows:
+def _error_center_text(grouped: bool = True, fingerprint: str | None = None) -> str:
+    """Telegram Error Center Pro: grouped first, details on demand."""
+    if fingerprint:
+        fp = str(fingerprint or "").strip()
+        rows = [row for row in _admin_error_center_snapshot(80) if str(row.get("fingerprint") or "") == fp]
+        if not rows:
+            return "🚨 <b>Error Detail</b>\n\nThis error group is empty or already cleared."
+        item = rows[0]
+        feature = html.escape(str(item.get("feature") or "Runtime"))
+        message = html.escape(str(item.get("message") or "")[:1100])
+        source = html.escape(str(item.get("source") or "unknown"))
+        context_s = html.escape(str(item.get("context") or ""))
+        fix = html.escape(_admin_error_recommended_fix(str(item.get("feature") or ""), str(item.get("message") or ""))[:600])
         return (
-            "🚨 <b>Error Center</b>\n\n"
-            "No captured runtime errors yet. New ERROR-level logs will appear here automatically.\n\n"
+            "🚨 <b>Error Detail</b>\n"
+            f"Fingerprint: <code>{html.escape(fp)}</code>\n"
+            f"Count: <b>{len(rows)}</b>\n"
+            f"Feature: <b>{feature}</b>\n"
+            f"Source: <code>{source}</code>\n"
+            f"Context: <code>{context_s}</code>\n\n"
+            f"<b>Message</b>\n<code>{message}</code>\n\n"
+            f"<b>Recommended fix</b>\n{fix}"
+        )[:3900]
+
+    groups = _admin_error_center_grouped(12)
+    total = _admin_error_center_total_count()
+    if not groups:
+        return (
+            "🚨 <b>Error Center Pro</b>\n\n"
+            "✅ No captured runtime errors yet. New ERROR-level logs will appear here automatically.\n\n"
             f"Storage: in-memory ring buffer, max <b>{_ADMIN_ERROR_CENTER_MAX}</b> items."
         )
+
+    critical = sum(1 for row in groups if str(row.get("level") or "").upper() in {"CRITICAL", "ERROR"})
     lines = [
-        "🚨 <b>Error Center</b>",
-        f"Showing latest <b>{len(rows)}</b> error(s).",
-        f"Total stored: <b>{len(_ADMIN_ERROR_CENTER)}</b> / {_ADMIN_ERROR_CENTER_MAX}",
+        "🚨 <b>Error Center Pro</b>",
+        f"Stored: <b>{total}</b> · Groups: <b>{len(groups)}</b> · Critical groups: <b>{critical}</b>",
         "",
+        "<b>Repeated groups</b>",
     ]
-    for idx, item in enumerate(rows, 1):
-        dt = _sched_parse_iso(item.get("ts"))
-        local_ts = _fmt_dt(dt) if dt else str(item.get("ts") or "")[:19]
-        lines.append(
-            f"{idx}. <b>{html.escape(str(item.get('level') or 'ERROR'))}</b> "
-            f"<code>{html.escape(str(item.get('fingerprint') or ''))}</code>\n"
-            f"   🕒 {html.escape(local_ts)}\n"
-            f"   📍 {html.escape(str(item.get('source') or 'unknown'))}\n"
-            f"   {html.escape(str(item.get('message') or '')[:450])}"
-        )
-    return "\n\n".join(lines)[:3900]
+    for idx, row in enumerate(groups[:8], 1):
+        fp = str(row.get("fingerprint") or "")
+        count = int(row.get("count") or 0)
+        feature = html.escape(str(row.get("feature") or "Runtime"))
+        level = html.escape(str(row.get("level") or "ERROR"))
+        msg = html.escape(str(row.get("message") or "")[:120])
+        lines.append(f"{idx}. <code>{html.escape(fp)}</code> · <b>{count}x</b> · {level} · {feature}\n   {msg}")
+    lines.append("\nTip: open a group first, then clear only after fixing the root cause.")
+    return "\n".join(lines)[:3900]
 
 
-def _error_center_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Refresh", callback_data="admin_errors"),
-         InlineKeyboardButton("🧹 Clear", callback_data="admin_errors_clear")],
+def _error_center_kb(fingerprint: str | None = None) -> InlineKeyboardMarkup:
+    if fingerprint:
+        fp = re.sub(r"[^a-fA-F0-9]", "", str(fingerprint or ""))[:12]
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🧹 Clear This Group", callback_data=f"admin_errors_remove:{fp}"),
+             InlineKeyboardButton("🔕 Mute Group", callback_data=f"admin_errors_mute:{fp}")],
+            [InlineKeyboardButton("⬅️ Error Groups", callback_data="admin_errors"),
+             InlineKeyboardButton("🩺 Health", callback_data="admin_health")],
+            [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+             InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
+        ])
+
+    rows = [[InlineKeyboardButton("🔄 Refresh", callback_data="admin_errors"),
+             InlineKeyboardButton("🧹 Clear All", callback_data="admin_errors_clear")]]
+    for row in _admin_error_center_grouped(6):
+        fp = str(row.get("fingerprint") or "")[:12]
+        if fp:
+            label = f"🔍 {fp} · {int(row.get('count') or 0)}x"[:60]
+            rows.append([InlineKeyboardButton(label, callback_data=f"admin_errors_detail:{fp}")])
+    rows.extend([
         [InlineKeyboardButton("🩺 Health", callback_data="admin_health"),
          InlineKeyboardButton("🎛 TTS Provider", callback_data="admin_tts")],
         [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
          InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
+    return InlineKeyboardMarkup(rows)
 
 
-async def _admin_open_error_center(query, notice: str = "") -> None:
-    text = _error_center_text()
+async def _admin_open_error_center(query, notice: str = "", fingerprint: str | None = None) -> None:
+    text = _error_center_text(fingerprint=fingerprint)
     if notice:
         text = f"{html.escape(notice)}\n\n{text}"
     await safe_send(lambda: query.message.edit_text(
         text,
         parse_mode="HTML",
-        reply_markup=_error_center_kb(),
+        reply_markup=_error_center_kb(fingerprint),
         disable_web_page_preview=True,
     ))
 
@@ -19435,7 +19565,7 @@ async def _admin_send_settings_sql(message) -> None:
     for page in _paginate_pre_html(
         ADMIN_V2_TABLES_SQL,
         limit=3800,
-        header="🧩 <b>Admin System Center V7 SQL</b>\n\n",
+        header="🧩 <b>Admin System Center V9 SQL</b>\n\n",
     ):
         await safe_send(lambda p=page: message.reply_text(
             p,
@@ -19536,9 +19666,58 @@ async def _admin_start_schedule_from_button(query, context: ContextTypes.DEFAULT
 
 @admin_only
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Preserve the full Telegram Admin System Center V7 on /admin.
-    # Runtime controls are now reachable from the "🛠️ Runtime" submenu button.
+    """Telegram /admin entry point with mobile shortcuts.
+
+    Supported shortcuts:
+      /admin compact, /admin health, /admin errors, /admin broadcast,
+      /admin report, /admin optimize, /admin users, /admin settings, /admin runtime
+    """
     user_id = update.effective_user.id if update.effective_user else 0
+    arg = ""
+    with suppress(Exception):
+        arg = str((context.args or [""])[0]).strip().lower()
+
+    if arg in {"compact", "mobile", "mini"}:
+        text = await _admin_compact_text(user_id)
+        await safe_send(lambda: update.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=get_admin_compact_kb(),
+            disable_web_page_preview=True,
+        ))
+        return
+    if arg in {"health", "status"}:
+        text = await _admin_health_text()
+        await safe_send(lambda: update.message.reply_text(text, parse_mode="HTML", reply_markup=get_admin_dashboard_kb(), disable_web_page_preview=True))
+        return
+    if arg in {"errors", "error"}:
+        await safe_send(lambda: update.message.reply_text(_error_center_text(), parse_mode="HTML", reply_markup=_error_center_kb(), disable_web_page_preview=True))
+        return
+    if arg in {"optimize", "perf", "performance"}:
+        await safe_send(lambda: update.message.reply_text(_admin_optimize_text(), parse_mode="HTML", reply_markup=get_admin_optimize_kb(), disable_web_page_preview=True))
+        return
+    if arg in {"report", "pdf"}:
+        await safe_send(lambda: update.message.reply_text("📄 <b>PDF Report</b>\n\nChoose report range:", parse_mode="HTML", reply_markup=get_admin_report_day_kb(), disable_web_page_preview=True))
+        return
+    if arg in {"users", "user"}:
+        await safe_send(lambda: update.message.reply_text("👥 Opening Users panel...", reply_markup=get_admin_dashboard_kb()))
+        return
+    if arg in {"broadcast", "bc"}:
+        context.user_data["bc_state"] = BROADCAST_WAIT_MESSAGE
+        await safe_send(lambda: update.message.reply_text(
+            "📢 <b>Broadcast Safety Flow</b>\n\nSend text or photo + caption now. The bot will show a preview before sending.\n\nUse /cancel to stop.",
+            parse_mode="HTML",
+            reply_markup=get_admin_action_kb(),
+        ))
+        return
+    if arg in {"settings", "setting"}:
+        settings, _status = await get_bot_settings_async(force=True)
+        await safe_send(lambda: update.message.reply_text("⚙️ <b>Bot Settings</b>", parse_mode="HTML", reply_markup=get_bot_settings_kb(settings)))
+        return
+    if arg in {"runtime", "run"}:
+        await safe_send(lambda: update.message.reply_text(_runtime_admin_text(), parse_mode="HTML", reply_markup=get_runtime_admin_kb(), disable_web_page_preview=True))
+        return
+
     text = await _admin_home_text(user_id)
     await safe_send(lambda: update.message.reply_text(
         text,
@@ -20091,6 +20270,17 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         ))
         return
 
+    if data == "admin_compact":
+        await _clear_admin_transient_state(context, user_id)
+        text = await _admin_compact_text(user_id)
+        await safe_send(lambda: query.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=get_admin_compact_kb(),
+            disable_web_page_preview=True,
+        ))
+        return
+
     if data == "admin_stats":
         text = await _admin_stats_text(user_id)
         await safe_send(lambda: query.message.edit_text(
@@ -20251,8 +20441,36 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         return
 
     if data == "admin_errors_clear":
+        await safe_send(lambda: query.message.edit_text(
+            "⚠️ <b>Clear Error Center?</b>\n\nThis removes all captured runtime error entries from memory. Use this only after reviewing repeated groups.",
+            parse_mode="HTML",
+            reply_markup=get_admin_confirm_kb("clear_errors", back="admin_errors"),
+            disable_web_page_preview=True,
+        ))
+        return
+
+    if data == "admin_confirm:clear_errors":
         cleared = _admin_error_center_clear()
         await _admin_open_error_center(query, notice=f"🧹 Cleared {cleared} captured error(s).")
+        return
+
+    if data.startswith("admin_errors_detail:"):
+        fp = data.split(":", 1)[1].strip()[:12]
+        await _admin_open_error_center(query, fingerprint=fp)
+        return
+
+    if data.startswith("admin_errors_remove:"):
+        fp = data.split(":", 1)[1].strip()[:12]
+        removed = _admin_error_center_remove_fingerprint(fp)
+        await _admin_open_error_center(query, notice=f"🧹 Removed {removed} error(s) from group {fp}.")
+        return
+
+    if data.startswith("admin_errors_mute:"):
+        fp = data.split(":", 1)[1].strip()[:12]
+        if fp:
+            with _ADMIN_ERROR_CENTER_LOCK:
+                _ADMIN_ERROR_CENTER_MUTED.add(fp)
+        await _admin_open_error_center(query, notice=f"🔕 Muted error group {fp}.")
         return
 
     if data == "admin_api":
@@ -21852,9 +22070,23 @@ async def _clear_admin_transient_state(context: Any, admin_id: int) -> list[str]
         cleared.append("schedule")
 
     _pop_state("admin_report_state", "report")
+    _pop_state("admin_input_mode", "admin-input")
+    _pop_state("awaiting_broadcast", "broadcast")
+    _pop_state("awaiting_schedule", "schedule")
+    _pop_state("awaiting_report_date", "report")
+    _pop_state("awaiting_user_search", "user-search")
+    _pop_state("awaiting_setting_value", "settings")
+    _pop_state("broadcast_draft", "broadcast")
+    _pop_state("schedule_draft", "schedule")
+    _pop_state("report_range", "report")
     _pop_state("user_search_state", "user-search")
     _pop_state("users_search_query", "user-search")
     _pop_state("users_search_results", "user-search")
+    prefix = f"admin:{int(admin_id)}:"
+    for state_key in list(user_data.keys()):
+        if str(state_key).startswith(prefix):
+            user_data.pop(state_key, None)
+            cleared.append("admin-prefixed-state")
 
     if int(user_data.get("chat_state") or 0) == CHAT_WAIT_MESSAGE:
         _pop_state("chat_state", "admin-chat")
