@@ -10166,7 +10166,7 @@ async def _telegram_user_security_guard(update: Any, context: Any) -> None:
 
     query = update.callback_query
     data = str(getattr(query, "data", "") or "") if query is not None else ""
-    admin_callback_prefixes = ("admin_", "api_", "rtadmin_", "user_", "users_", "history_", "sched_", "bc_", "admin_report_")
+    admin_callback_prefixes = ("admin_", "needs_", "api_", "rtadmin_", "user_", "users_", "history_", "sched_", "bc_", "admin_report_")
     if _env_bool("ADMIN_CALLBACK_GUARD_ENABLED", True) and data.startswith(admin_callback_prefixes):
         _metric_inc("admin_denied")
         await _security_notice_once(update, f"admin_cb:{user_id}", "⛔ Admin only.", alert=True)
@@ -14560,6 +14560,8 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🗓 Schedules", callback_data="admin_schedules")],
         [InlineKeyboardButton("👥 Users", callback_data="admin_users"),
          InlineKeyboardButton("⭐ CRM", callback_data="admin_crm")],
+        [InlineKeyboardButton("🧠 User Needs", callback_data="admin_user_needs"),
+         InlineKeyboardButton("💬 Open Answers", callback_data="needs_open_answers")],
         [InlineKeyboardButton("🚨 Errors", callback_data="admin_errors"),
          InlineKeyboardButton("⚡ Optimize", callback_data="admin_optimize")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings"),
@@ -19025,6 +19027,797 @@ async def _admin_home_text(admin_id: int, title: str = ADMIN_UI_TITLE) -> str:
     )
 
 
+# ── User Needs Center V10.1: open answers + request inbox ───────────────────
+FEATURE_REQUEST_WAIT_TEXT = "feature_request_wait_text"
+FEATURE_REQUEST_TEXT_MAX = 500
+FEATURE_REQUEST_ADMIN_REPLY_MAX = 1000
+FEATURE_REQUEST_COOLDOWN_S = 300.0
+FEATURE_REQUEST_MEMORY_MAX = 1000
+FEATURE_REQUEST_STATUS_ORDER = (
+    "new",
+    "reviewing",
+    "accepted",
+    "planned",
+    "in_progress",
+    "completed",
+    "later",
+    "rejected",
+    "duplicate",
+)
+FEATURE_REQUEST_STATUS_LABELS = {
+    "new": "ថ្មី",
+    "reviewing": "កំពុងពិនិត្យ",
+    "accepted": "ទទួលយក",
+    "planned": "គ្រោងធ្វើ",
+    "in_progress": "កំពុងធ្វើ",
+    "completed": "រួចរាល់",
+    "later": "ទុកពេលក្រោយ",
+    "rejected": "បដិសេធ",
+    "duplicate": "សំណើស្ទួន",
+}
+FEATURE_REQUEST_ADMIN_STATUS_OPTIONS = {
+    "accepted": "✅ Accept",
+    "later": "⏳ Later",
+    "rejected": "❌ Reject",
+    "completed": "✅ Completed",
+}
+_FEATURE_REQUESTS_MEMORY: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_FEATURE_REQUEST_LAST_SUBMIT: dict[int, float] = {}
+_FEATURE_REQUEST_MEMORY_LOCK = threading.RLock()
+
+
+def _feature_request_clean_id(value: Any) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]", "", str(value or "").strip())[:48]
+
+
+def _feature_request_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _feature_request_status_label(status: Any) -> str:
+    key = str(status or "new").strip().lower()
+    return FEATURE_REQUEST_STATUS_LABELS.get(key, key or "new")
+
+
+def _feature_request_status_icon(status: Any) -> str:
+    key = str(status or "new").strip().lower()
+    return {
+        "new": "🆕",
+        "reviewing": "🔎",
+        "accepted": "✅",
+        "planned": "📌",
+        "in_progress": "🛠",
+        "completed": "🎉",
+        "later": "⏳",
+        "rejected": "❌",
+        "duplicate": "🔁",
+    }.get(key, "•")
+
+
+def _feature_request_sanitize_detail(value: Any, *, limit: int = FEATURE_REQUEST_TEXT_MAX) -> str:
+    text_value = str(value or "").replace("\x00", " ")
+    text_value = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", text_value)
+    text_value = re.sub(r"\s+", " ", text_value).strip()
+    if text_value.startswith("/"):
+        return ""
+    return text_value[:limit].strip()
+
+
+def _feature_request_title(detail: str) -> str:
+    title = re.sub(r"\s+", " ", str(detail or "")).strip()
+    return title[:80] or "User feature request"
+
+
+def _feature_request_similar_key(detail: str) -> str:
+    text_value = str(detail or "").lower()
+    if any(k in text_value for k in ("khmer voice", "សម្លេងខ្មែរ", "voice khmer", "female voice", "male voice")):
+        return "khmer_voice"
+    if any(k in text_value for k in ("pdf", "សង្ខេប pdf", "summary")):
+        return "pdf_summary"
+    if any(k in text_value for k in ("ocr", "អានអក្សរ", "រូបភាព")):
+        return "ocr"
+    if any(k in text_value for k in ("tts", "លឿន", "speed", "សំឡេង")):
+        return "tts"
+    words = re.findall(r"[\w\u1780-\u17ff]+", text_value)[:5]
+    key = "_".join(words)[:48]
+    return key or "other"
+
+
+def _feature_request_memory_save(row: dict[str, Any]) -> dict[str, Any]:
+    with _FEATURE_REQUEST_MEMORY_LOCK:
+        row_id = _feature_request_clean_id(row.get("id")) or f"mem_{secrets.token_hex(6)}"
+        row = dict(row)
+        row["id"] = row_id
+        _FEATURE_REQUESTS_MEMORY[row_id] = row
+        _FEATURE_REQUESTS_MEMORY.move_to_end(row_id)
+        while len(_FEATURE_REQUESTS_MEMORY) > FEATURE_REQUEST_MEMORY_MAX:
+            _FEATURE_REQUESTS_MEMORY.popitem(last=False)
+        return dict(row)
+
+
+def _feature_request_memory_list(status: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    with _FEATURE_REQUEST_MEMORY_LOCK:
+        rows = list(_FEATURE_REQUESTS_MEMORY.values())[::-1]
+    status = str(status or "").strip().lower()
+    if status:
+        rows = [r for r in rows if str(r.get("status") or "new").lower() == status]
+    return [dict(r) for r in rows[:max(1, int(limit or 20))]]
+
+
+def _feature_request_memory_get(request_id: str) -> dict[str, Any] | None:
+    request_id = _feature_request_clean_id(request_id)
+    with _FEATURE_REQUEST_MEMORY_LOCK:
+        row = _FEATURE_REQUESTS_MEMORY.get(request_id)
+        if row:
+            _FEATURE_REQUESTS_MEMORY.move_to_end(request_id)
+            return dict(row)
+    return None
+
+
+def _feature_request_memory_update(request_id: str, **changes: Any) -> dict[str, Any] | None:
+    request_id = _feature_request_clean_id(request_id)
+    with _FEATURE_REQUEST_MEMORY_LOCK:
+        row = _FEATURE_REQUESTS_MEMORY.get(request_id)
+        if not row:
+            return None
+        row.update(changes)
+        row["updated_at"] = _feature_request_now_iso()
+        _FEATURE_REQUESTS_MEMORY.move_to_end(request_id)
+        return dict(row)
+
+
+def db_feature_request_create(user_id: int, detail: str, *, username: str = "", language: str = "", source: str = "open_answer") -> tuple[bool, dict[str, Any] | None, str]:
+    user_id = int(user_id or 0)
+    detail = _feature_request_sanitize_detail(detail)
+    if not detail:
+        return False, None, "សំណើមិនត្រឹមត្រូវ ឬទទេ។"
+    if len(detail) < 3:
+        return False, None, "សូមសរសេរព័ត៌មានលម្អិតបន្តិចទៀត។"
+    if db_user_is_blocked(user_id):
+        return False, None, "អ្នកត្រូវបាន Block មិនអាចផ្ញើសំណើបានទេ។"
+
+    now = _feature_request_now_iso()
+    base_row: dict[str, Any] = {
+        "id": f"mem_{secrets.token_hex(6)}",
+        "user_id": user_id,
+        "title": _feature_request_title(detail),
+        "detail": detail,
+        "status": "new",
+        "admin_note": "",
+        "similar_key": _feature_request_similar_key(detail),
+        "votes": 1,
+        "priority": 0,
+        "source": source or "open_answer",
+        "language": language or "",
+        "username": username or "",
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    if supabase:
+        payload = {
+            "user_id": base_row["user_id"],
+            "title": base_row["title"],
+            "detail": base_row["detail"],
+            "status": base_row["status"],
+            "admin_note": base_row["admin_note"],
+            "similar_key": base_row["similar_key"],
+            "votes": base_row["votes"],
+            "priority": base_row["priority"],
+            "source": base_row["source"],
+            "language": base_row["language"],
+            "created_at": now,
+            "updated_at": now,
+        }
+        try:
+            res = supabase.table("feature_requests").insert(payload).execute()
+            if getattr(res, "data", None):
+                row = dict(res.data[0])
+                row.setdefault("username", username or "")
+                return True, row, "saved"
+        except Exception as exc:
+            # Keep the bot usable before the admin runs the SQL setup.
+            logger.warning("feature_requests insert fallback to memory: %s", str(exc)[:300])
+
+    row = _feature_request_memory_save(base_row)
+    return True, row, "memory-only"
+
+
+def db_feature_request_list(status: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    status = str(status or "").strip().lower()
+    limit = max(1, min(int(limit or 20), 50))
+    rows: list[dict[str, Any]] = []
+    if supabase:
+        try:
+            query = supabase.table("feature_requests").select("*").order("updated_at", desc=True).limit(limit)
+            if status:
+                query = query.eq("status", status)
+            res = query.execute()
+            rows = [dict(r) for r in (getattr(res, "data", None) or [])]
+        except Exception as exc:
+            logger.warning("feature_requests list fallback to memory: %s", str(exc)[:300])
+    if not rows:
+        rows = _feature_request_memory_list(status or None, limit)
+    return rows[:limit]
+
+
+def db_feature_request_get(request_id: str) -> dict[str, Any] | None:
+    request_id = _feature_request_clean_id(request_id)
+    if not request_id:
+        return None
+    row = _feature_request_memory_get(request_id)
+    if row:
+        return row
+    if supabase:
+        try:
+            res = supabase.table("feature_requests").select("*").eq("id", request_id).limit(1).execute()
+            if getattr(res, "data", None):
+                return dict(res.data[0])
+        except Exception as exc:
+            logger.warning("feature_requests get failed id=%s: %s", request_id, str(exc)[:300])
+    return None
+
+
+def db_feature_request_update_status(request_id: str, status: str, *, admin_id: int = 0) -> tuple[bool, dict[str, Any] | None, str]:
+    request_id = _feature_request_clean_id(request_id)
+    status = str(status or "").strip().lower()
+    if status not in FEATURE_REQUEST_STATUS_ORDER:
+        return False, None, "Unknown status."
+    now = _feature_request_now_iso()
+    payload: dict[str, Any] = {"status": status, "updated_at": now}
+    if status == "completed":
+        payload["completed_at"] = now
+    updated: dict[str, Any] | None = None
+    if supabase and not request_id.startswith("mem_"):
+        try:
+            res = supabase.table("feature_requests").update(payload).eq("id", request_id).execute()
+            if getattr(res, "data", None):
+                updated = dict(res.data[0])
+        except Exception as exc:
+            # Some deployments may not yet have completed_at; retry minimal update.
+            logger.warning("feature_requests status update retry minimal id=%s: %s", request_id, str(exc)[:300])
+            try:
+                res = supabase.table("feature_requests").update({"status": status, "updated_at": now}).eq("id", request_id).execute()
+                if getattr(res, "data", None):
+                    updated = dict(res.data[0])
+            except Exception as exc2:
+                logger.warning("feature_requests status update failed id=%s: %s", request_id, str(exc2)[:300])
+    if updated is None:
+        updated = _feature_request_memory_update(request_id, status=status, updated_at=now)
+    if updated is None:
+        return False, None, "Request not found."
+    return True, updated, "updated"
+
+
+def db_feature_request_set_admin_note(request_id: str, note: str, *, admin_id: int = 0) -> tuple[bool, dict[str, Any] | None, str]:
+    request_id = _feature_request_clean_id(request_id)
+    note = str(note or "").strip()[:FEATURE_REQUEST_ADMIN_REPLY_MAX]
+    now = _feature_request_now_iso()
+    payload = {"admin_note": note, "updated_at": now}
+    updated: dict[str, Any] | None = None
+    if supabase and not request_id.startswith("mem_"):
+        try:
+            res = supabase.table("feature_requests").update(payload).eq("id", request_id).execute()
+            if getattr(res, "data", None):
+                updated = dict(res.data[0])
+        except Exception as exc:
+            logger.warning("feature_requests note update failed id=%s: %s", request_id, str(exc)[:300])
+    if updated is None:
+        updated = _feature_request_memory_update(request_id, admin_note=note, updated_at=now)
+    if updated is None:
+        return False, None, "Request not found."
+    return True, updated, "updated"
+
+
+def db_feature_request_mark_notified(request_id: str) -> None:
+    request_id = _feature_request_clean_id(request_id)
+    now = _feature_request_now_iso()
+    if supabase and not request_id.startswith("mem_"):
+        try:
+            supabase.table("feature_requests").update({"notified_at": now, "updated_at": now}).eq("id", request_id).execute()
+            return
+        except Exception:
+            with suppress(Exception):
+                supabase.table("feature_requests").update({"updated_at": now}).eq("id", request_id).execute()
+    _feature_request_memory_update(request_id, notified_at=now, updated_at=now)
+
+
+def db_feature_request_counts() -> dict[str, int]:
+    counts = {key: 0 for key in FEATURE_REQUEST_STATUS_ORDER}
+    rows = db_feature_request_list(limit=200)
+    for row in rows:
+        key = str(row.get("status") or "new").strip().lower()
+        if key not in counts:
+            counts[key] = 0
+        counts[key] += 1
+    counts["total"] = sum(counts.values())
+    return counts
+
+
+def _feature_request_sql_text() -> str:
+    return """
+create table if not exists feature_requests (
+  id uuid primary key default gen_random_uuid(),
+  user_id bigint not null,
+  title text,
+  detail text not null,
+  status text default 'new',
+  admin_note text,
+  similar_key text,
+  votes int default 1,
+  priority int default 0,
+  source text default 'open_answer',
+  language text,
+  completed_at timestamptz,
+  notified_at timestamptz,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create index if not exists idx_feature_requests_status_updated
+  on feature_requests(status, updated_at desc);
+
+create index if not exists idx_feature_requests_user_created
+  on feature_requests(user_id, created_at desc);
+
+create index if not exists idx_feature_requests_similar_key
+  on feature_requests(similar_key);
+""".strip()
+
+
+def get_user_needs_home_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📌 Feature Request Inbox", callback_data="needs_inbox")],
+        [InlineKeyboardButton("💬 Open Answers", callback_data="needs_open_answers"),
+         InlineKeyboardButton("📊 Status Summary", callback_data="admin_user_needs")],
+        [InlineKeyboardButton("🧩 Setup SQL", callback_data="needs_sql")],
+        [InlineKeyboardButton("⬅️ Admin V9", callback_data="admin_home"),
+         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
+    ])
+
+
+def get_feature_request_inbox_kb(rows: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    buttons: list[list[InlineKeyboardButton]] = []
+    for row in rows[:10]:
+        request_id = _feature_request_clean_id(row.get("id"))
+        if not request_id:
+            continue
+        status = str(row.get("status") or "new")
+        title = _feature_request_title(str(row.get("title") or row.get("detail") or "Request"))
+        label = f"{_feature_request_status_icon(status)} {title[:34]}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"needs_request:{request_id}")])
+    buttons.append([InlineKeyboardButton("🔄 Refresh", callback_data="needs_inbox"),
+                    InlineKeyboardButton("🧩 SQL", callback_data="needs_sql")])
+    buttons.append([InlineKeyboardButton("⬅️ User Needs", callback_data="admin_user_needs"),
+                    InlineKeyboardButton("❌ បិទ", callback_data="admin_close")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def get_feature_request_detail_kb(request_id: str, status: str = "new") -> InlineKeyboardMarkup:
+    request_id = _feature_request_clean_id(request_id)
+    rows = [
+        [InlineKeyboardButton("✅ Accept", callback_data=f"needs_status:{request_id}:accepted"),
+         InlineKeyboardButton("⏳ Later", callback_data=f"needs_status:{request_id}:later")],
+        [InlineKeyboardButton("🛠 In Progress", callback_data=f"needs_status:{request_id}:in_progress"),
+         InlineKeyboardButton("🎉 Completed", callback_data=f"needs_status:{request_id}:completed")],
+        [InlineKeyboardButton("❌ Reject", callback_data=f"needs_status:{request_id}:rejected"),
+         InlineKeyboardButton("🔁 Duplicate", callback_data=f"needs_status:{request_id}:duplicate")],
+        [InlineKeyboardButton("💬 Reply User", callback_data=f"needs_reply:{request_id}"),
+         InlineKeyboardButton("🔔 Notify Done", callback_data=f"needs_notify_ask:{request_id}")],
+        [InlineKeyboardButton("⬅️ Inbox", callback_data="needs_inbox"),
+         InlineKeyboardButton("🧠 User Needs", callback_data="admin_user_needs")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def get_feature_notify_confirm_kb(request_id: str) -> InlineKeyboardMarkup:
+    request_id = _feature_request_clean_id(request_id)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Notify User", callback_data=f"needs_notify_run:{request_id}")],
+        [InlineKeyboardButton("⬅️ Request", callback_data=f"needs_request:{request_id}"),
+         InlineKeyboardButton("❌ Cancel", callback_data="needs_inbox")],
+    ])
+
+
+def _feature_request_row_summary(row: dict[str, Any], *, detail_limit: int = 180) -> str:
+    request_id = _feature_request_clean_id(row.get("id"))
+    status = str(row.get("status") or "new")
+    user_id = int(row.get("user_id") or 0)
+    created = str(row.get("created_at") or "")[:19].replace("T", " ") or "-"
+    detail = html.escape(str(row.get("detail") or "")[:detail_limit])
+    return (
+        f"<b>#{html.escape(request_id[:8])}</b> · {_feature_request_status_icon(status)} "
+        f"<b>{html.escape(_feature_request_status_label(status))}</b>\n"
+        f"User: <code>{user_id}</code> · {html.escape(created)}\n"
+        f"{detail}"
+    )
+
+
+async def _user_needs_home_text(admin_id: int) -> str:
+    counts = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, db_feature_request_counts)
+    total = int(counts.get("total") or 0)
+    lines = [
+        "🧠 <b>User Needs Center V10.1</b>",
+        "<code>/admin › user-needs</code>",
+        "",
+        "មុខងារនេះប្រមូលចម្លើយ Open Answer ពី User ថា ត្រូវការ Feature អ្វីថ្មី។",
+        "",
+        f"សរុប: <b>{total}</b>",
+        f"🆕 ថ្មី: <b>{int(counts.get('new') or 0)}</b>",
+        f"✅ ទទួលយក: <b>{int(counts.get('accepted') or 0)}</b>",
+        f"🛠 កំពុងធ្វើ: <b>{int(counts.get('in_progress') or 0)}</b>",
+        f"🎉 រួចរាល់: <b>{int(counts.get('completed') or 0)}</b>",
+        f"⏳ ទុកពេលក្រោយ: <b>{int(counts.get('later') or 0)}</b>",
+        f"❌ បដិសេធ: <b>{int(counts.get('rejected') or 0)}</b>",
+        "",
+        "User អាចប្រើ: <code>/need</code>, <code>/feedback</code>, ឬ <code>/request_feature</code>",
+    ]
+    return "\n".join(lines)
+
+
+async def _open_feature_request_inbox(query, *, status: str | None = None, notice: str = "") -> None:
+    rows = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_feature_request_list(status=status, limit=10))
+    body = ["📌 <b>Feature Request Inbox</b>", "<code>/admin › user-needs › inbox</code>", ""]
+    if notice:
+        body.extend([html.escape(notice), ""])
+    if rows:
+        for row in rows:
+            body.append(_feature_request_row_summary(row, detail_limit=120))
+            body.append("")
+    else:
+        body.append("មិនទាន់មាន Feature Request ទេ។ User អាចផ្ញើដោយប្រើ /need។")
+    await safe_send(lambda: query.message.edit_text(
+        "\n".join(body).strip(),
+        parse_mode="HTML",
+        reply_markup=get_feature_request_inbox_kb(rows),
+        disable_web_page_preview=True,
+    ))
+
+
+async def _open_feature_request_detail(query, request_id: str, *, notice: str = "") -> None:
+    row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_feature_request_get(request_id))
+    if not row:
+        await _open_feature_request_inbox(query, notice="⚠️ Request not found.")
+        return
+    status = str(row.get("status") or "new")
+    user_id = int(row.get("user_id") or 0)
+    created = str(row.get("created_at") or "")[:19].replace("T", " ") or "-"
+    updated = str(row.get("updated_at") or "")[:19].replace("T", " ") or "-"
+    detail = html.escape(str(row.get("detail") or ""))
+    note = html.escape(str(row.get("admin_note") or "")) or "-"
+    similar = html.escape(str(row.get("similar_key") or "other"))
+    lines = [
+        "🧠 <b>Feature Request Detail</b>",
+        f"ID: <code>{html.escape(_feature_request_clean_id(row.get('id')))}</code>",
+        f"Status: {_feature_request_status_icon(status)} <b>{html.escape(_feature_request_status_label(status))}</b>",
+        f"User: <code>{user_id}</code>",
+        f"Similar key: <code>{similar}</code>",
+        f"Created: <code>{html.escape(created)}</code>",
+        f"Updated: <code>{html.escape(updated)}</code>",
+        "",
+        "<b>Request</b>",
+        detail or "-",
+        "",
+        "<b>Admin note / last reply</b>",
+        note,
+    ]
+    if notice:
+        lines.insert(2, html.escape(notice))
+    await safe_send(lambda: query.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=get_feature_request_detail_kb(str(row.get("id")), status),
+        disable_web_page_preview=True,
+    ))
+
+
+async def _send_feature_request_sql(query) -> None:
+    sql = _feature_request_sql_text()
+    await safe_send(lambda: query.message.reply_text(
+        "🧩 <b>User Needs Center SQL</b>\n\n"
+        "Run this in Supabase SQL editor once. The bot also works in memory fallback before this table exists.\n\n"
+        f"<pre>{html.escape(sql)}</pre>",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    ))
+    await safe_send(lambda: query.message.edit_text(
+        "✅ SQL setup message sent. After running it in Supabase, feature requests will persist permanently.",
+        parse_mode="HTML",
+        reply_markup=get_user_needs_home_kb(),
+        disable_web_page_preview=True,
+    ))
+
+
+async def _save_user_feature_request(update: Update, context: ContextTypes.DEFAULT_TYPE, detail: str) -> bool:
+    user = update.effective_user
+    msg = update.message or update.effective_message
+    if not user or not msg:
+        return True
+    user_id = int(user.id)
+    clean = _feature_request_sanitize_detail(detail)
+    if not clean:
+        await safe_send(lambda: msg.reply_text(
+            "⚠️ សូមសរសេរ Feature ដែលអ្នកចង់បាន ជាអត្ថបទធម្មតា។\n"
+            "ឧទាហរណ៍: <code>/need ចង់បានសង្ខេប PDF ជាខ្មែរ</code>",
+            parse_mode="HTML",
+        ))
+        return True
+    now = time.monotonic()
+    last = float(_FEATURE_REQUEST_LAST_SUBMIT.get(user_id) or 0.0)
+    if now - last < FEATURE_REQUEST_COOLDOWN_S:
+        wait_s = int(FEATURE_REQUEST_COOLDOWN_S - (now - last))
+        await safe_send(lambda: msg.reply_text(f"⏳ សូមរង់ចាំ {wait_s}s មុនផ្ញើសំណើថ្មីម្តងទៀត។"))
+        return True
+    lang = str(getattr(user, "language_code", "") or "")[:16]
+    username = user.username or user.first_name or ""
+    ok, row, info = await asyncio.get_running_loop().run_in_executor(
+        _DB_EXECUTOR,
+        lambda: db_feature_request_create(user_id, clean, username=username, language=lang, source="open_answer"),
+    )
+    if not ok or not row:
+        await safe_send(lambda: msg.reply_text(f"⚠️ មិនអាចរក្សាទុកបានទេ: {html.escape(str(info)[:300])}", parse_mode="HTML"))
+        return True
+    _FEATURE_REQUEST_LAST_SUBMIT[user_id] = now
+    context.user_data.pop(FEATURE_REQUEST_WAIT_TEXT, None)
+    request_id = _feature_request_clean_id(row.get("id"))
+    await safe_send(lambda: msg.reply_text(
+        "✅ <b>បានរក្សាទុកសំណើរបស់អ្នកហើយ!</b>\n\n"
+        f"Request ID: <code>{html.escape(request_id[:12])}</code>\n"
+        f"សំណើ: {html.escape(clean)}\n\n"
+        "Admin នឹងពិនិត្យមើល។ អរគុណសម្រាប់ការជួយកែលម្អ Bot 🙏",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    ))
+    with suppress(Exception):
+        first_admin = next(iter(ADMIN_IDS), None) if isinstance(ADMIN_IDS, set) else None
+        if first_admin:
+            await context.bot.send_message(
+                chat_id=int(first_admin),
+                text=(
+                    "🧠 <b>New Feature Request</b>\n\n"
+                    f"From: <code>{user_id}</code>\n"
+                    f"ID: <code>{html.escape(request_id)}</code>\n"
+                    f"{html.escape(clean[:300])}"
+                ),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📌 Open Request", callback_data=f"needs_request:{request_id}")]]),
+                disable_web_page_preview=True,
+            )
+    return True
+
+
+async def cmd_feature_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User command: /need, /feedback, /request_feature."""
+    user = update.effective_user
+    msg = update.message
+    if not user or not msg:
+        return
+    detail = " ".join(context.args or []).strip()
+    if detail:
+        await _save_user_feature_request(update, context, detail)
+        return
+    context.user_data[FEATURE_REQUEST_WAIT_TEXT] = True
+    await safe_send(lambda: msg.reply_text(
+        "💬 <b>Open Answer</b>\n\n"
+        "សូមសរសេរ Feature ថ្មី ឬការកែលម្អដែលអ្នកចង់បាន។\n\n"
+        "ឧទាហរណ៍:\n"
+        "• ចង់បានសង្ខេប PDF ជាខ្មែរ\n"
+        "• ចង់បាន Khmer female voice ច្បាស់ជាងមុន\n"
+        "• ចង់ឲ្យ OCR អានអក្សរខ្មែរពីរូបភាពបានល្អ\n\n"
+        "Safety: អត្ថបទអតិបរមា 500 តួអក្សរ។ វាយ <code>cancel</code> ដើម្បីបោះបង់។",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    ))
+
+
+async def _handle_feature_request_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not context.user_data.get(FEATURE_REQUEST_WAIT_TEXT):
+        return False
+    msg = update.message
+    if not msg:
+        return True
+    raw = str(msg.text or "").strip()
+    if raw.lower() in {"cancel", "/cancel", "បោះបង់"}:
+        context.user_data.pop(FEATURE_REQUEST_WAIT_TEXT, None)
+        await safe_send(lambda: msg.reply_text("បានបោះបង់ Feature Request។"))
+        return True
+    return await _save_user_feature_request(update, context, raw)
+
+
+async def _handle_feature_request_admin_reply_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user or not _is_admin(user.id):
+        return False
+    async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+        state = dict(ACTIVE_ADMIN_CONVERSATIONS.get(int(user.id)) or {})
+    if state.get("state") != "awaiting_feature_request_reply":
+        return False
+    request_id = _feature_request_clean_id(state.get("request_id"))
+    raw = str(msg.text or "").strip()
+    if raw.lower() in {"cancel", "/cancel", "បោះបង់"}:
+        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+            ACTIVE_ADMIN_CONVERSATIONS.pop(int(user.id), None)
+        await safe_send(lambda: msg.reply_text("បានបោះបង់ Reply User។", reply_markup=get_admin_dashboard_kb()))
+        return True
+    reply_text = raw[:FEATURE_REQUEST_ADMIN_REPLY_MAX]
+    row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_feature_request_get(request_id))
+    if not row:
+        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+            ACTIVE_ADMIN_CONVERSATIONS.pop(int(user.id), None)
+        await safe_send(lambda: msg.reply_text("⚠️ Request not found.", reply_markup=get_admin_dashboard_kb()))
+        return True
+    target_id = int(row.get("user_id") or 0)
+    ok_send = False
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=(
+                "💬 <b>សារពី Admin</b>\n\n"
+                f"{html.escape(reply_text)}\n\n"
+                "អរគុណសម្រាប់មតិរបស់អ្នក 🙏"
+            ),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        ok_send = True
+    except Forbidden:
+        ok_send = False
+    except Exception as exc:
+        logger.warning("feature request admin reply failed request_id=%s user=%s: %s", request_id, target_id, exc)
+        ok_send = False
+    await asyncio.get_running_loop().run_in_executor(
+        _DB_EXECUTOR,
+        lambda: db_feature_request_set_admin_note(request_id, reply_text, admin_id=int(user.id)),
+    )
+    async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+        ACTIVE_ADMIN_CONVERSATIONS.pop(int(user.id), None)
+    if ok_send:
+        await safe_send(lambda: msg.reply_text(
+            f"✅ Reply sent to user <code>{target_id}</code>.",
+            parse_mode="HTML",
+            reply_markup=get_admin_dashboard_kb(),
+        ))
+    else:
+        await safe_send(lambda: msg.reply_text(
+            f"⚠️ មិនអាចផ្ញើទៅ user <code>{target_id}</code> បានទេ។ ប្រហែលជា user blocked bot។ Admin note ត្រូវបានរក្សាទុក។",
+            parse_mode="HTML",
+            reply_markup=get_admin_dashboard_kb(),
+        ))
+    return True
+
+
+async def _cb_user_needs_admin(query, user_id: int, context: ContextTypes.DEFAULT_TYPE, data: str) -> None:
+    if not _is_admin(user_id):
+        await query.answer("Admin only", show_alert=True)
+        return
+    if data in {"admin_user_needs", "needs_inbox", "needs_open_answers", "needs_sql"} or data.startswith("needs_request:"):
+        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+            state = ACTIVE_ADMIN_CONVERSATIONS.get(int(user_id)) or {}
+            if state.get("state") == "awaiting_feature_request_reply":
+                ACTIVE_ADMIN_CONVERSATIONS.pop(int(user_id), None)
+    if data == "admin_user_needs":
+        text = await _user_needs_home_text(user_id)
+        await safe_send(lambda: query.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=get_user_needs_home_kb(),
+            disable_web_page_preview=True,
+        ))
+        return
+    if data == "needs_open_answers":
+        await safe_send(lambda: query.message.edit_text(
+            "💬 <b>Open Answer Feature Request</b>\n\n"
+            "User អាចសរសេរតម្រូវការថ្មីដោយខ្លួនឯង៖\n"
+            "• <code>/need ចង់បានសង្ខេប PDF ជាខ្មែរ</code>\n"
+            "• <code>/feedback Khmer voice ត្រូវការសម្លេងធម្មជាតិជាងនេះ</code>\n"
+            "• <code>/request_feature OCR Khmer ពីរូបភាព</code>\n\n"
+            "Safety Rules:\n"
+            "✅ Max 500 chars\n"
+            "✅ Cooldown 5 minutes/user\n"
+            "✅ Blocked user cannot submit\n"
+            "✅ Admin can reply / change status / notify completed",
+            parse_mode="HTML",
+            reply_markup=get_user_needs_home_kb(),
+            disable_web_page_preview=True,
+        ))
+        return
+    if data == "needs_inbox":
+        await _open_feature_request_inbox(query)
+        return
+    if data == "needs_sql":
+        await _send_feature_request_sql(query)
+        return
+    if data.startswith("needs_request:"):
+        await _open_feature_request_detail(query, data.split(":", 1)[1])
+        return
+    if data.startswith("needs_status:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            await query.answer("Invalid status action", show_alert=True)
+            return
+        request_id, status = parts[1], parts[2]
+        ok, _row, info = await asyncio.get_running_loop().run_in_executor(
+            _DB_EXECUTOR,
+            lambda: db_feature_request_update_status(request_id, status, admin_id=user_id),
+        )
+        notice = f"✅ Status changed to {_feature_request_status_label(status)}." if ok else f"⚠️ {info}"
+        await _open_feature_request_detail(query, request_id, notice=notice)
+        return
+    if data.startswith("needs_reply:"):
+        request_id = data.split(":", 1)[1]
+        row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_feature_request_get(request_id))
+        if not row:
+            await _open_feature_request_inbox(query, notice="⚠️ Request not found.")
+            return
+        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+            ACTIVE_ADMIN_CONVERSATIONS[int(user_id)] = {
+                "state": "awaiting_feature_request_reply",
+                "request_id": _feature_request_clean_id(request_id),
+                "target_user_id": int(row.get("user_id") or 0),
+                "ts": time.monotonic(),
+            }
+        await safe_send(lambda: query.message.edit_text(
+            "💬 <b>Reply User</b>\n\n"
+            f"Request ID: <code>{html.escape(_feature_request_clean_id(request_id))}</code>\n"
+            f"User: <code>{int(row.get('user_id') or 0)}</code>\n\n"
+            "សូមវាយសារដែលចង់ផ្ញើទៅ User។\n"
+            "វាយ <code>cancel</code> ដើម្បីបោះបង់។",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"needs_request:{_feature_request_clean_id(request_id)}")]]),
+            disable_web_page_preview=True,
+        ))
+        return
+    if data.startswith("needs_notify_ask:"):
+        request_id = data.split(":", 1)[1]
+        await safe_send(lambda: query.message.edit_text(
+            "🔔 <b>Notify User?</b>\n\n"
+            "Bot នឹងផ្ញើសារ​ទៅ User ថា Feature ដែលគាត់ស្នើបានរួចរាល់។\n"
+            "សូម confirm មុនផ្ញើ។",
+            parse_mode="HTML",
+            reply_markup=get_feature_notify_confirm_kb(request_id),
+            disable_web_page_preview=True,
+        ))
+        return
+    if data.startswith("needs_notify_run:"):
+        request_id = data.split(":", 1)[1]
+        row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_feature_request_get(request_id))
+        if not row:
+            await _open_feature_request_inbox(query, notice="⚠️ Request not found.")
+            return
+        target_id = int(row.get("user_id") or 0)
+        detail = str(row.get("title") or row.get("detail") or "Feature request")[:120]
+        sent = False
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=(
+                    "🎉 <b>Feature ដែលអ្នកបានស្នើមានហើយ!</b>\n\n"
+                    f"Feature: <b>{html.escape(detail)}</b>\n\n"
+                    "អរគុណដែលបានជួយកែលម្អ Bot។ សូមបើក Bot ហើយសាកល្បងមុខងារថ្មីនេះបានឥឡូវនេះ។"
+                ),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            sent = True
+        except Forbidden:
+            sent = False
+        except Exception as exc:
+            logger.warning("feature done notify failed request_id=%s user=%s: %s", request_id, target_id, exc)
+            sent = False
+        if sent:
+            await asyncio.get_running_loop().run_in_executor(
+                _DB_EXECUTOR,
+                lambda: (db_feature_request_update_status(request_id, "completed", admin_id=user_id), db_feature_request_mark_notified(request_id)),
+            )
+            await _open_feature_request_detail(query, request_id, notice="✅ User notified and status marked Completed.")
+        else:
+            await _open_feature_request_detail(query, request_id, notice="⚠️ Could not notify user. They may have blocked the bot.")
+        return
+    await _user_needs_home_text(user_id)
+
+
+
 async def _admin_health_text() -> str:
     """Admin-facing whole-bot health snapshot.
 
@@ -19670,12 +20463,22 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     Supported shortcuts:
       /admin compact, /admin health, /admin errors, /admin broadcast,
-      /admin report, /admin optimize, /admin users, /admin settings, /admin runtime
+      /admin report, /admin optimize, /admin users, /admin settings, /admin runtime, /admin needs
     """
     user_id = update.effective_user.id if update.effective_user else 0
     arg = ""
     with suppress(Exception):
         arg = str((context.args or [""])[0]).strip().lower()
+
+    if arg in {"needs", "userneeds", "user_needs", "feedback"}:
+        text = await _user_needs_home_text(user_id)
+        await safe_send(lambda: update.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=get_user_needs_home_kb(),
+            disable_web_page_preview=True,
+        ))
+        return
 
     if arg in {"compact", "mobile", "mini"}:
         text = await _admin_compact_text(user_id)
@@ -20287,6 +21090,16 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
             text,
             parse_mode="HTML",
             reply_markup=get_admin_dashboard_kb(),
+            disable_web_page_preview=True,
+        ))
+        return
+
+    if data == "admin_user_needs":
+        text = await _user_needs_home_text(user_id)
+        await safe_send(lambda: query.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=get_user_needs_home_kb(),
             disable_web_page_preview=True,
         ))
         return
@@ -22071,6 +22884,7 @@ async def _clear_admin_transient_state(context: Any, admin_id: int) -> list[str]
 
     _pop_state("admin_report_state", "report")
     _pop_state("admin_input_mode", "admin-input")
+    _pop_state(FEATURE_REQUEST_WAIT_TEXT, "feature-request")
     _pop_state("awaiting_broadcast", "broadcast")
     _pop_state("awaiting_schedule", "schedule")
     _pop_state("awaiting_report_date", "report")
@@ -22703,6 +23517,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Admin flow intercepts
     if _is_admin(user_id):
+        if await _handle_feature_request_admin_reply_text(update, context):
+            return
         if await _handle_runtime_admin_text(update, context):
             return
         if await _handle_user_search_text(update, context):
@@ -22745,6 +23561,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     _close_session(user_id)
                     context.user_data.pop("chat_state", None)
             return
+
+    if await _handle_feature_request_user_text(update, context):
+        return
 
     admin_id = _get_admin_for_user(user_id)
     if admin_id is not None:
@@ -23309,6 +24128,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cb_doc_read(query, user_id, context, data)
         elif data.startswith("audio_tts:"):
             await _cb_audio_tts(query, user_id, context, data)
+        elif data.startswith("needs_"):
+            await _cb_user_needs_admin(query, user_id, context, data)
         elif data.startswith("api_"):
             await _cb_api_dashboard(query, user_id, context, data)
         elif data.startswith("admin_"):
@@ -23433,6 +24254,9 @@ async def _run_bot():
     app.add_handler(CommandHandler("stats",           admin_stats))
     app.add_handler(CommandHandler("health",          cmd_health))
     app.add_handler(CommandHandler("admin",           cmd_admin))
+    app.add_handler(CommandHandler("need",            cmd_feature_request))
+    app.add_handler(CommandHandler("feedback",        cmd_feature_request))
+    app.add_handler(CommandHandler("request_feature", cmd_feature_request))
     app.add_handler(CommandHandler("runtime",         cmd_runtime))
     app.add_handler(CommandHandler("api",             cmd_api))
     app.add_handler(CommandHandler("botsettings",     cmd_botsettings))
