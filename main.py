@@ -19064,6 +19064,21 @@ FEATURE_REQUEST_ADMIN_STATUS_OPTIONS = {
 _FEATURE_REQUESTS_MEMORY: OrderedDict[str, dict[str, Any]] = OrderedDict()
 _FEATURE_REQUEST_LAST_SUBMIT: dict[int, float] = {}
 _FEATURE_REQUEST_MEMORY_LOCK = threading.RLock()
+_FEATURE_REQUEST_COUNTS_CACHE: tuple[float, dict[str, int]] = (0.0, {})
+FEATURE_REQUEST_COUNTS_CACHE_TTL_S = 15.0
+
+
+def _feature_request_reset_counts_cache() -> None:
+    global _FEATURE_REQUEST_COUNTS_CACHE
+    _FEATURE_REQUEST_COUNTS_CACHE = (0.0, {})
+
+
+def _feature_request_safe_blocked(user_id: int) -> bool:
+    try:
+        return bool(db_user_is_blocked(int(user_id or 0)))
+    except Exception as exc:
+        logger.warning("feature request blocked-check failed user=%s: %s", user_id, str(exc)[:200])
+        return False
 
 
 def _feature_request_clean_id(value: Any) -> str:
@@ -19132,8 +19147,8 @@ def _feature_request_memory_save(row: dict[str, Any]) -> dict[str, Any]:
         _FEATURE_REQUESTS_MEMORY.move_to_end(row_id)
         while len(_FEATURE_REQUESTS_MEMORY) > FEATURE_REQUEST_MEMORY_MAX:
             _FEATURE_REQUESTS_MEMORY.popitem(last=False)
-        return dict(row)
-
+    _feature_request_reset_counts_cache()
+    return dict(row)
 
 def _feature_request_memory_list(status: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
     with _FEATURE_REQUEST_MEMORY_LOCK:
@@ -19163,8 +19178,9 @@ def _feature_request_memory_update(request_id: str, **changes: Any) -> dict[str,
         row.update(changes)
         row["updated_at"] = _feature_request_now_iso()
         _FEATURE_REQUESTS_MEMORY.move_to_end(request_id)
-        return dict(row)
-
+        updated = dict(row)
+    _feature_request_reset_counts_cache()
+    return updated
 
 def db_feature_request_create(user_id: int, detail: str, *, username: str = "", language: str = "", source: str = "open_answer") -> tuple[bool, dict[str, Any] | None, str]:
     user_id = int(user_id or 0)
@@ -19173,7 +19189,7 @@ def db_feature_request_create(user_id: int, detail: str, *, username: str = "", 
         return False, None, "សំណើមិនត្រឹមត្រូវ ឬទទេ។"
     if len(detail) < 3:
         return False, None, "សូមសរសេរព័ត៌មានលម្អិតបន្តិចទៀត។"
-    if db_user_is_blocked(user_id):
+    if _feature_request_safe_blocked(user_id):
         return False, None, "អ្នកត្រូវបាន Block មិនអាចផ្ញើសំណើបានទេ។"
 
     now = _feature_request_now_iso()
@@ -19214,6 +19230,7 @@ def db_feature_request_create(user_id: int, detail: str, *, username: str = "", 
             if getattr(res, "data", None):
                 row = dict(res.data[0])
                 row.setdefault("username", username or "")
+                _feature_request_reset_counts_cache()
                 return True, row, "saved"
         except Exception as exc:
             # Keep the bot usable before the admin runs the SQL setup.
@@ -19222,10 +19239,9 @@ def db_feature_request_create(user_id: int, detail: str, *, username: str = "", 
     row = _feature_request_memory_save(base_row)
     return True, row, "memory-only"
 
-
 def db_feature_request_list(status: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
     status = str(status or "").strip().lower()
-    limit = max(1, min(int(limit or 20), 50))
+    limit = max(1, min(int(limit or 20), 500))
     rows: list[dict[str, Any]] = []
     if supabase:
         try:
@@ -19239,7 +19255,6 @@ def db_feature_request_list(status: str | None = None, limit: int = 20) -> list[
     if not rows:
         rows = _feature_request_memory_list(status or None, limit)
     return rows[:limit]
-
 
 def db_feature_request_get(request_id: str) -> dict[str, Any] | None:
     request_id = _feature_request_clean_id(request_id)
@@ -19273,21 +19288,27 @@ def db_feature_request_update_status(request_id: str, status: str, *, admin_id: 
             res = supabase.table("feature_requests").update(payload).eq("id", request_id).execute()
             if getattr(res, "data", None):
                 updated = dict(res.data[0])
+            else:
+                # Some Supabase/PostgREST configs update successfully but return no rows.
+                updated = db_feature_request_get(request_id)
         except Exception as exc:
             # Some deployments may not yet have completed_at; retry minimal update.
             logger.warning("feature_requests status update retry minimal id=%s: %s", request_id, str(exc)[:300])
             try:
-                res = supabase.table("feature_requests").update({"status": status, "updated_at": now}).eq("id", request_id).execute()
+                minimal = {"status": status, "updated_at": now}
+                res = supabase.table("feature_requests").update(minimal).eq("id", request_id).execute()
                 if getattr(res, "data", None):
                     updated = dict(res.data[0])
+                else:
+                    updated = db_feature_request_get(request_id)
             except Exception as exc2:
                 logger.warning("feature_requests status update failed id=%s: %s", request_id, str(exc2)[:300])
     if updated is None:
         updated = _feature_request_memory_update(request_id, status=status, updated_at=now)
     if updated is None:
         return False, None, "Request not found."
+    _feature_request_reset_counts_cache()
     return True, updated, "updated"
-
 
 def db_feature_request_set_admin_note(request_id: str, note: str, *, admin_id: int = 0) -> tuple[bool, dict[str, Any] | None, str]:
     request_id = _feature_request_clean_id(request_id)
@@ -19300,6 +19321,8 @@ def db_feature_request_set_admin_note(request_id: str, note: str, *, admin_id: i
             res = supabase.table("feature_requests").update(payload).eq("id", request_id).execute()
             if getattr(res, "data", None):
                 updated = dict(res.data[0])
+            else:
+                updated = db_feature_request_get(request_id)
         except Exception as exc:
             logger.warning("feature_requests note update failed id=%s: %s", request_id, str(exc)[:300])
     if updated is None:
@@ -19307,7 +19330,6 @@ def db_feature_request_set_admin_note(request_id: str, note: str, *, admin_id: i
     if updated is None:
         return False, None, "Request not found."
     return True, updated, "updated"
-
 
 def db_feature_request_mark_notified(request_id: str) -> None:
     request_id = _feature_request_clean_id(request_id)
@@ -19323,16 +19345,22 @@ def db_feature_request_mark_notified(request_id: str) -> None:
 
 
 def db_feature_request_counts() -> dict[str, int]:
+    global _FEATURE_REQUEST_COUNTS_CACHE
+    now = time.monotonic()
+    cached_ts, cached_counts = _FEATURE_REQUEST_COUNTS_CACHE
+    if cached_counts and now - cached_ts < FEATURE_REQUEST_COUNTS_CACHE_TTL_S:
+        return dict(cached_counts)
+
     counts = {key: 0 for key in FEATURE_REQUEST_STATUS_ORDER}
-    rows = db_feature_request_list(limit=200)
+    rows = db_feature_request_list(limit=500)
     for row in rows:
         key = str(row.get("status") or "new").strip().lower()
         if key not in counts:
             counts[key] = 0
         counts[key] += 1
     counts["total"] = sum(counts.values())
+    _FEATURE_REQUEST_COUNTS_CACHE = (now, dict(counts))
     return counts
-
 
 def _feature_request_sql_text() -> str:
     return """
@@ -19341,7 +19369,7 @@ create table if not exists feature_requests (
   user_id bigint not null,
   title text,
   detail text not null,
-  status text default 'new',
+  status text default 'new' check (status in ('new','reviewing','accepted','planned','in_progress','completed','later','rejected','duplicate')),
   admin_note text,
   similar_key text,
   votes int default 1,
@@ -19363,7 +19391,6 @@ create index if not exists idx_feature_requests_user_created
 create index if not exists idx_feature_requests_similar_key
   on feature_requests(similar_key);
 """.strip()
-
 
 def get_user_needs_home_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -19543,6 +19570,12 @@ async def _save_user_feature_request(update: Update, context: ContextTypes.DEFAU
         ))
         return True
     now = time.monotonic()
+    # Keep the in-memory cooldown map bounded on long-running deployments.
+    if len(_FEATURE_REQUEST_LAST_SUBMIT) > 5000:
+        stale_before = now - (FEATURE_REQUEST_COOLDOWN_S * 2)
+        for old_user_id, old_ts in list(_FEATURE_REQUEST_LAST_SUBMIT.items()):
+            if float(old_ts or 0.0) < stale_before:
+                _FEATURE_REQUEST_LAST_SUBMIT.pop(old_user_id, None)
     last = float(_FEATURE_REQUEST_LAST_SUBMIT.get(user_id) or 0.0)
     if now - last < FEATURE_REQUEST_COOLDOWN_S:
         wait_s = int(FEATURE_REQUEST_COOLDOWN_S - (now - last))
@@ -19814,8 +19847,13 @@ async def _cb_user_needs_admin(query, user_id: int, context: ContextTypes.DEFAUL
         else:
             await _open_feature_request_detail(query, request_id, notice="⚠️ Could not notify user. They may have blocked the bot.")
         return
-    await _user_needs_home_text(user_id)
-
+    text = await _user_needs_home_text(user_id)
+    await safe_send(lambda: query.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=get_user_needs_home_kb(),
+        disable_web_page_preview=True,
+    ))
 
 
 async def _admin_health_text() -> str:
