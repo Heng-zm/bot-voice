@@ -3784,9 +3784,30 @@ window.WEB_CSRF={{ csrf|tojson }};
   qsa('[data-nav-item],.bottom-nav a').forEach(function(a){a.addEventListener('click',function(){var t=qs('#menu-toggle');if(t)t.checked=false;})});
   var live=qs('[data-live-status]');
   function applyStatus(data){if(!data||!data.ok)return;qsa('[data-metric]').forEach(function(el){var k=el.getAttribute('data-metric');if(data.metrics&&Object.prototype.hasOwnProperty.call(data.metrics,k)){el.textContent=data.metrics[k]}});var up=qs('[data-uptime]');if(up)up.textContent=data.uptime||'';var lt=qs('[data-local-time]');if(lt&&data.local_time)lt.textContent=data.local_time;}
-  function refreshStatus(){fetch('/admin/status.json?light=1',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null}).then(applyStatus).catch(function(){});}
-  function refreshLiveDashboard(){var root=qs('[data-realtime-dashboard]');if(!root)return;fetch('/admin/live.json',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null}).then(function(data){if(!data||!data.ok)return;applyStatus(data);if(data.counts){qsa('[data-count]').forEach(function(el){var k=el.getAttribute('data-count');if(Object.prototype.hasOwnProperty.call(data.counts,k)){el.textContent=data.counts[k]}})}var jobs=qs('[data-live-jobs]');if(jobs&&typeof data.jobs_html==='string')jobs.innerHTML=data.jobs_html;var sch=qs('[data-live-schedules]');if(sch&&typeof data.schedules_html==='string')sch.innerHTML=data.schedules_html;var stamp=qs('[data-live-updated]');if(stamp&&data.local_time)stamp.textContent='Updated '+data.local_time;}).catch(function(){});}
-  function refreshBroadcastJobs(){var target=qs('[data-broadcast-jobs]');if(!target)return;fetch('/admin/broadcast/jobs.json',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null}).then(function(data){if(!data||!data.ok)return;if(typeof data.rows_html==='string')target.innerHTML=data.rows_html;}).catch(function(){});}
+  function safeAdminRows(target, htmlText){
+    if(!target||typeof htmlText!=='string')return;
+    var allowedTags={A:1,B:1,BR:1,BUTTON:1,CODE:1,DIV:1,EM:1,FORM:1,INPUT:1,LI:1,P:1,SMALL:1,SPAN:1,STRONG:1,TD:1,TH:1,TR:1,UL:1};
+    var allowedAttrs={ACTION:1,ARIA_LABEL:1,CLASS:1,COLSPAN:1,DATA_CONFIRM:1,DATA_COPY:1,DISABLED:1,HREF:1,METHOD:1,NAME:1,ROLE:1,TARGET:1,TITLE:1,TYPE:1,VALUE:1};
+    function attrKey(name){return String(name||'').replace(/-/g,'_').toUpperCase()}
+    function safeUrl(value){var v=String(value||'').trim().toLowerCase();return !v||v.charAt(0)==='/'||v.charAt(0)==='#'||v.indexOf('http://')===0||v.indexOf('https://')===0||v.indexOf('mailto:')===0||v.indexOf('tel:')===0}
+    function scrub(node){
+      Array.from(node.children||[]).forEach(function(child){
+        if(!allowedTags[child.tagName]){child.replaceWith(document.createTextNode(child.textContent||''));return;}
+        Array.from(child.attributes||[]).forEach(function(attr){
+          var key=attrKey(attr.name);
+          if(key.indexOf('ON')===0||!allowedAttrs[key]||(key==='HREF'&&!safeUrl(attr.value))){child.removeAttribute(attr.name);}
+        });
+        scrub(child);
+      });
+    }
+    var t=document.createElement('template');
+    t.innerHTML=htmlText;
+    scrub(t.content);
+    target.replaceChildren(t.content.cloneNode(true));
+  }
+  function refreshStatus(){fetch('/admin/status.json?light=1',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null}).then(applyStatus).catch(function(err){if(window.console)console.warn('status refresh failed',err);});}
+  function refreshLiveDashboard(){var root=qs('[data-realtime-dashboard]');if(!root)return;fetch('/admin/live.json',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null}).then(function(data){if(!data||!data.ok)return;applyStatus(data);if(data.counts){qsa('[data-count]').forEach(function(el){var k=el.getAttribute('data-count');if(Object.prototype.hasOwnProperty.call(data.counts,k)){el.textContent=data.counts[k]}})}var jobs=qs('[data-live-jobs]');safeAdminRows(jobs,data.jobs_html);var sch=qs('[data-live-schedules]');safeAdminRows(sch,data.schedules_html);var stamp=qs('[data-live-updated]');if(stamp&&data.local_time)stamp.textContent='Updated '+data.local_time;}).catch(function(err){if(window.console)console.warn('live dashboard refresh failed',err);});}
+  function refreshBroadcastJobs(){var target=qs('[data-broadcast-jobs]');if(!target)return;fetch('/admin/broadcast/jobs.json',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null}).then(function(data){if(!data||!data.ok)return;safeAdminRows(target,data.rows_html);}).catch(function(err){if(window.console)console.warn('broadcast jobs refresh failed',err);});}
   var hasRealtime=!!qs('[data-realtime-dashboard]');
   if(live&&!hasRealtime){refreshStatus();setInterval(refreshStatus,{{ status_poll_ms }})}
   if(hasRealtime){refreshLiveDashboard();setInterval(refreshLiveDashboard,{{ live_poll_ms }})}
@@ -7296,8 +7317,8 @@ def _optimization_score(snap: dict[str, Any] | None = None) -> tuple[int, list[s
             score -= 10
             warnings.append("Broadcast queue is near capacity")
             tips.append("Pause new broadcasts or increase queue size then restart.")
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_once(logging.WARNING, "admin_optimize_queue_score_failed", "Admin optimize queue score failed: %s", exc)
     for name, sem in (semaphores or {}).items():
         try:
             configured = int(sem.get("configured") or 0)
@@ -7306,8 +7327,8 @@ def _optimization_score(snap: dict[str, Any] | None = None) -> tuple[int, list[s
                 score -= 8
                 warnings.append(f"{name.upper()} concurrency is saturated")
                 tips.append(f"Lower incoming load or increase MAX_CONCURRENT_{name.upper()} if CPU/RAM allows.")
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_once(logging.WARNING, f"admin_optimize_semaphore_score_failed:{name}", "Admin optimize semaphore score failed for %s: %s", name, exc)
     if not warnings:
         tips.append("System looks stable. Keep Balanced preset unless you see queue growth or slow requests.")
     return max(0, min(100, score)), warnings, tips[:6]
@@ -7569,7 +7590,7 @@ def web_admin_optimize():
             elif action == "clear_dashboard_caches":
                 _web_counts_invalidate()
                 _api_key_cache_clear()
-                with _blocked_cache_lock:
+                with _BLOCKED_USER_CACHE_LOCK:
                     _blocked_user_cache.clear()
                 _bot_settings_cache["ts"] = 0.0
                 msg = "Dashboard, settings, API key, and blocked-user caches cleared."
@@ -7687,7 +7708,7 @@ def web_admin_control_action():
         if action == "refresh_caches":
             _web_counts_invalidate()
             _api_key_cache_clear()
-            with _blocked_cache_lock:
+            with _BLOCKED_USER_CACHE_LOCK:
                 _blocked_user_cache.clear()
             _bot_settings_cache["ts"] = 0.0
             msg = "Dashboard, settings, API-key, and blocked-user caches refreshed."
@@ -12534,6 +12555,7 @@ _bot_settings_cache: dict = {
 
 _blocked_users_memory: set[int] = set()
 _blocked_user_cache: OrderedDict[int, tuple[bool, float]] = OrderedDict()
+_BLOCKED_USER_CACHE_LOCK = threading.RLock()
 _BLOCKED_USER_CACHE_TTL_S = 60.0
 _BLOCKED_USER_CACHE_MAX = 20_000
 
@@ -12715,22 +12737,26 @@ def db_bot_setting_set(key: str, enabled: bool, admin_id: int) -> tuple[bool, st
 
 
 def _blocked_cache_set(user_id: int, blocked: bool) -> None:
-    _blocked_user_cache.pop(int(user_id), None)
-    _blocked_user_cache[int(user_id)] = (bool(blocked), time.monotonic())
-    while len(_blocked_user_cache) > _BLOCKED_USER_CACHE_MAX:
-        _blocked_user_cache.popitem(last=False)
+    user_id = int(user_id)
+    with _BLOCKED_USER_CACHE_LOCK:
+        _blocked_user_cache.pop(user_id, None)
+        _blocked_user_cache[user_id] = (bool(blocked), time.monotonic())
+        while len(_blocked_user_cache) > _BLOCKED_USER_CACHE_MAX:
+            _blocked_user_cache.popitem(last=False)
 
 
 def _blocked_cache_get(user_id: int) -> bool | None:
-    item = _blocked_user_cache.get(int(user_id))
-    if not item:
-        return None
-    blocked, ts = item
-    if time.monotonic() - ts > _BLOCKED_USER_CACHE_TTL_S:
-        _blocked_user_cache.pop(int(user_id), None)
-        return None
-    _blocked_user_cache.move_to_end(int(user_id))
-    return blocked
+    user_id = int(user_id)
+    with _BLOCKED_USER_CACHE_LOCK:
+        item = _blocked_user_cache.get(user_id)
+        if not item:
+            return None
+        blocked, ts = item
+        if time.monotonic() - ts > _BLOCKED_USER_CACHE_TTL_S:
+            _blocked_user_cache.pop(user_id, None)
+            return None
+        _blocked_user_cache.move_to_end(user_id)
+        return blocked
 
 
 def db_user_is_blocked(user_id: int) -> bool:
@@ -19869,18 +19895,21 @@ async def _admin_health_text() -> str:
     try:
         temp_dir = _get_temp_dir()
         temp_ok = os.path.isdir(temp_dir) and os.access(temp_dir, os.W_OK)
-    except Exception:
+    except Exception as exc:
+        _log_once(logging.WARNING, "admin_health_temp_dir_failed", "Admin health temp-dir check failed: %s", exc)
         temp_dir = "ERROR"
 
     loop = asyncio.get_running_loop()
     try:
         counts = await _admin_summary_counts(0)
-    except Exception:
+    except Exception as exc:
+        _log_once(logging.WARNING, "admin_health_counts_failed", "Admin health counts failed: %s", exc)
         counts = {}
 
     try:
-        template_count = await loop.run_in_executor(_DB_EXECUTOR, lambda: len(_broadcast_template_load_sync()))
-    except Exception:
+        template_count = await loop.run_in_executor(_DB_EXECUTOR, lambda: len(db_broadcast_templates_fetch()))
+    except Exception as exc:
+        _log_once(logging.WARNING, "admin_health_templates_failed", "Admin health broadcast-template count failed: %s", exc)
         template_count = 0
 
     with _BROADCAST_SENT_DELETE_LOCK:
@@ -19888,12 +19917,14 @@ async def _admin_health_text() -> str:
 
     try:
         db_queue = _db_executor_queue_size()
-    except Exception:
+    except Exception as exc:
+        _log_once(logging.WARNING, "admin_health_db_queue_failed", "Admin health DB queue check failed: %s", exc)
         db_queue = 0
 
     try:
         active_requests = int(globals().get("_WEB_ACTIVE_REQUESTS", 0) or 0)
-    except Exception:
+    except Exception as exc:
+        _log_once(logging.WARNING, "admin_health_active_requests_failed", "Admin health active request count failed: %s", exc)
         active_requests = 0
 
     mode = _run_state_bot_mode() if "_run_state_bot_mode" in globals() else str(globals().get("BOT_MODE", "POLLING"))
