@@ -156,7 +156,18 @@ def _resolve_maybe_awaitable_sync(value: Any) -> Any:
 
     resolver_loop = _get_async_resolver_loop()
     future = asyncio.run_coroutine_threadsafe(_await_sync_value(value), resolver_loop)
-    return future.result()
+    timeout_s = 60.0
+    try:
+        env_float = globals().get("_env_float")
+        if callable(env_float):
+            timeout_s = float(env_float("ASYNC_RESOLVER_TIMEOUT_S", 60.0, minimum=1.0, maximum=300.0))
+    except Exception:
+        timeout_s = 60.0
+    try:
+        return future.result(timeout=timeout_s)
+    except Exception:
+        future.cancel()
+        raise
 
 
 class _SyncExecuteProxy:
@@ -3435,7 +3446,8 @@ def _web_blocked_ids_for_users(users: list[Any]) -> set[int]:
     if not ids:
         return set()
 
-    blocked = {uid for uid in ids if uid in _blocked_users_memory}
+    with _BLOCKED_USER_CACHE_LOCK:
+        blocked = {uid for uid in ids if uid in _blocked_users_memory}
     unknown: list[int] = []
     for uid in ids:
         cached = _blocked_cache_get(uid)
@@ -7115,6 +7127,7 @@ def _runtime_performance_snapshot(light: bool = False) -> dict:
             "tts_audio_cache_mb": round((_TTS_AUDIO_CACHE_BYTES if "_TTS_AUDIO_CACHE_BYTES" in globals() else 0) / 1024 / 1024, 2),
             "prefs_load_locks": len(_prefs_load_locks) if "_prefs_load_locks" in globals() else 0,
             "api_key_cache": len(_api_key_validation_cache),
+            "cache_snapshot": _admin_runtime_cache_snapshot_sync() if "_admin_runtime_cache_snapshot_sync" in globals() else {},
         },
         "executors": {
             "db": _executor_status("db", globals().get("_DB_EXECUTOR")),
@@ -7400,23 +7413,194 @@ def _slow_request_rows_html(limit: int = 12) -> str:
     return "".join(rows) or '<tr><td colspan="6"><div class="empty">No slow requests recorded.</div></td></tr>'
 
 
+def _admin_cache_len(name: str) -> int:
+    obj = globals().get(name)
+    try:
+        return len(obj) if obj is not None else 0
+    except Exception:
+        return 0
+
+
+def _admin_runtime_cache_snapshot_sync() -> dict[str, Any]:
+    """Small, safe cache-size snapshot for /admin/optimize diagnostics."""
+    now = time.monotonic()
+
+    def _age(cache_name: str) -> float:
+        cache = globals().get(cache_name)
+        if not isinstance(cache, dict):
+            return 0.0
+        ts = float(cache.get("ts") or 0.0)
+        return round(max(0.0, now - ts), 1) if ts else 0.0
+
+    analytics_cache = globals().get("_WEB_ANALYTICS_CACHE")
+    return {
+        "jinja_templates": _admin_cache_len("_JINJA_TEMPLATE_CACHE"),
+        "api_key_validation": _admin_cache_len("_api_key_validation_cache"),
+        "blocked_users": _admin_cache_len("_blocked_user_cache"),
+        "prefs": _admin_cache_len("_prefs_cache"),
+        "history": _hist_cache_size_sync() if callable(globals().get("_hist_cache_size_sync")) else _admin_cache_len("_hist_cache"),
+        "text_memory": _admin_cache_len("_text_cache_memory"),
+        "tts_audio_items": _admin_cache_len("_TTS_AUDIO_CACHE"),
+        "tts_audio_mb": round(float(globals().get("_TTS_AUDIO_CACHE_BYTES", 0) or 0) / 1024 / 1024, 2),
+        "crm_snapshot": 1 if (globals().get("_CRM_SNAPSHOT_CACHE") or {}).get("rows") else 0,
+        "analytics_entries": len(analytics_cache) if analytics_cache is not None else 0,
+        "sched_pending_admins": _admin_cache_len("_sched_admin_pending_cache"),
+        "feature_request_counts": 1 if (globals().get("_FEATURE_REQUEST_COUNTS_CACHE") or (0.0, {}))[1] else 0,
+        "web_counts_age_s": _age("_WEB_COUNTS_CACHE"),
+        "live_schedules_age_s": _age("_WEB_LIVE_SCHEDULES_CACHE"),
+    }
+
+
+def _admin_clear_runtime_caches_sync(*, deep: bool = False, templates: bool = False, tts_audio: bool = False) -> str:
+    """Centralised admin cache cleanup.
+
+    Normal mode invalidates dashboard/database-derived caches only.
+    Deep mode also clears per-user memory caches that will be rebuilt lazily.
+    It intentionally does not delete Redis/Supabase data.
+    """
+    before = _admin_runtime_cache_snapshot_sync()
+    cleared: list[str] = []
+
+    with suppress(Exception):
+        _web_counts_invalidate()
+        cleared.append("dashboard counts")
+
+    with suppress(Exception):
+        with _WEB_LIVE_SCHEDULES_LOCK:
+            _WEB_LIVE_SCHEDULES_CACHE["ts"] = 0.0
+            _WEB_LIVE_SCHEDULES_CACHE["rows"] = []
+        cleared.append("live schedules")
+
+    with suppress(Exception):
+        _api_key_cache_clear()
+        cleared.append("API key validation")
+
+    with suppress(Exception):
+        with _BLOCKED_USER_CACHE_LOCK:
+            _blocked_user_cache.clear()
+        cleared.append("blocked users")
+
+    with suppress(Exception):
+        _bot_settings_cache["ts"] = 0.0
+        cleared.append("bot settings")
+
+    with suppress(Exception):
+        _crm_clear_cache()
+        cleared.append("CRM snapshot")
+
+    with suppress(Exception):
+        cache_lock = globals().get("_WEB_ANALYTICS_CACHE_LOCK")
+        cache = globals().get("_WEB_ANALYTICS_CACHE")
+        if cache is not None:
+            if cache_lock is not None:
+                with cache_lock:
+                    cache.clear()
+            else:
+                cache.clear()
+            cleared.append("analytics")
+
+    with suppress(Exception):
+        _sched_admin_pending_cache_clear(None)
+        cleared.append("scheduler admin pending")
+
+    with suppress(Exception):
+        _feature_request_reset_counts_cache()
+        cleared.append("feature request counts")
+
+    if deep:
+        with suppress(Exception):
+            with _prefs_cache_thread_lock:
+                _prefs_cache.clear()
+            cleared.append("prefs memory")
+        with suppress(Exception):
+            clear_hist = globals().get("_hist_cache_clear_all_sync")
+            if callable(clear_hist):
+                clear_hist()
+            else:
+                _hist_cache.clear()
+            cleared.append("chat history memory")
+        with suppress(Exception):
+            clear_text_cache = globals().get("_text_cache_memory_clear_sync")
+            if callable(clear_text_cache):
+                clear_text_cache()
+            else:
+                _text_cache_memory.clear()
+            cleared.append("text memory")
+        with suppress(Exception):
+            with _user_locks_guard:
+                for uid, lock in list(_user_locks.items()):
+                    if not lock.locked():
+                        _user_locks.pop(uid, None)
+            cleared.append("idle user locks")
+
+    if templates:
+        with suppress(Exception):
+            with _JINJA_TEMPLATE_CACHE_LOCK:
+                _JINJA_TEMPLATE_CACHE.clear()
+            cleared.append("Jinja templates")
+
+    if tts_audio:
+        with suppress(Exception):
+            clear_tts = globals().get("_tts_audio_cache_clear")
+            if callable(clear_tts):
+                clear_tts()
+            else:
+                with _TTS_AUDIO_CACHE_LOCK:
+                    _TTS_AUDIO_CACHE.clear()
+            cleared.append("TTS audio")
+
+    after = _admin_runtime_cache_snapshot_sync()
+    return (
+        f"Cleared {len(cleared)} cache group(s): {', '.join(cleared) or 'none'}. "
+        f"Before={before}; After={after}"
+    )
+
+
 def _admin_trim_runtime_memory_sync() -> str:
     """Safe in-process cleanup for admin Optimize page."""
     now = time.monotonic()
     removed = 0
     stale_notice_before = now - max(USER_RATE_LIMIT_NOTICE_COOLDOWN_S * 4, 300.0)
-    for key, old_ts in list(_RATE_LIMIT_NOTICE_MEMORY.items()):
-        if old_ts < stale_notice_before:
-            _RATE_LIMIT_NOTICE_MEMORY.pop(key, None)
-            removed += 1
-    # Do not clear active rate buckets blindly; keep recent buckets and remove empty/stale ones.
-    wall_now = time.time()
-    stale_bucket_before = wall_now - max(_run_state_user_rate_window() * 4, 120.0)
-    for key, dq in list(_RATE_LIMIT_MEMORY.items()):
-        if not dq or (dq and dq[-1] < stale_bucket_before):
-            _RATE_LIMIT_MEMORY.pop(key, None)
-            removed += 1
-    return f"Removed {removed} stale in-memory limiter entries."
+    with _RATE_LIMIT_MEMORY_THREAD_LOCK:
+        for key, old_ts in list(_RATE_LIMIT_NOTICE_MEMORY.items()):
+            if old_ts < stale_notice_before:
+                _RATE_LIMIT_NOTICE_MEMORY.pop(key, None)
+                removed += 1
+        # Do not clear active rate buckets blindly; keep recent buckets and remove empty/stale ones.
+        wall_now = time.time()
+        stale_bucket_before = wall_now - max(_run_state_user_rate_window() * 4, 120.0)
+        for key, dq in list(_RATE_LIMIT_MEMORY.items()):
+            if not dq or (dq and dq[-1] < stale_bucket_before):
+                _RATE_LIMIT_MEMORY.pop(key, None)
+                removed += 1
+
+    with suppress(Exception):
+        with _ADMIN_SECURITY_NOTICE_MEMORY_LOCK:
+            for key, old_ts in list(_ADMIN_SECURITY_NOTICE_MEMORY.items()):
+                if old_ts < stale_notice_before:
+                    _ADMIN_SECURITY_NOTICE_MEMORY.pop(key, None)
+                    removed += 1
+
+    with suppress(Exception):
+        removed += int(_text_cache_memory_trim_sync())
+
+    with suppress(Exception):
+        removed += int(_tts_audio_cache_trim_expired())
+
+    with suppress(Exception):
+        with _prefs_cache_thread_lock:
+            stale_prefs_before = now - max(_run_state_float("PREFS_CACHE_TTL_S", PREFS_CACHE_TTL_S, minimum=30.0, maximum=86400.0) * 2, 300.0)
+            for uid, (_prefs, ts) in list(_prefs_cache.items()):
+                if float(ts or 0.0) < stale_prefs_before:
+                    _prefs_cache.pop(uid, None)
+                    removed += 1
+
+    with suppress(Exception):
+        with _user_locks_guard:
+            removed += int(_evict_idle_user_locks())
+
+    gc.collect()
+    return f"Removed {removed} stale in-memory cache/limiter entries and ran garbage collection."
 
 def _runtime_display_value(key: str) -> str:
     value = RUN_STATE.get(key, globals().get(key, ""))
@@ -7588,15 +7772,11 @@ def web_admin_optimize():
                 _web_counts_invalidate()
                 msg = f"Applied {preset} optimization preset. Updated: {', '.join(changed) if changed else 'no changes needed'}."
             elif action == "clear_dashboard_caches":
-                _web_counts_invalidate()
-                _api_key_cache_clear()
-                with _BLOCKED_USER_CACHE_LOCK:
-                    _blocked_user_cache.clear()
-                _bot_settings_cache["ts"] = 0.0
-                msg = "Dashboard, settings, API key, and blocked-user caches cleared."
+                msg = _admin_clear_runtime_caches_sync()
+            elif action == "deep_cache_cleanup":
+                msg = _admin_clear_runtime_caches_sync(deep=True, templates=True, tts_audio=True)
             elif action == "trim_runtime_memory":
                 msg = _admin_trim_runtime_memory_sync()
-                gc.collect()
             elif action == "slow_admin_polling":
                 changed = _admin_runtime_update_many_sync({
                     "WEB_STATUS_POLL_SECONDS": 60,
@@ -7626,8 +7806,9 @@ def web_admin_optimize():
 
     snap = _runtime_performance_snapshot(light=False)
     quick_actions = [
-        ("clear_dashboard_caches", "Clear dashboard caches", "Refresh counts, settings, API-key, and blocked-user caches.", "secondary"),
-        ("trim_runtime_memory", "Trim runtime memory", "Remove stale in-memory limiter/notice entries and run GC.", "secondary"),
+        ("clear_dashboard_caches", "Clear dashboard caches", "Refresh counts, settings, API-key, CRM, analytics, scheduler, and blocked-user caches.", "secondary"),
+        ("deep_cache_cleanup", "Deep cache cleanup", "Clear rebuildable memory caches too: prefs, text cache, history, idle locks, templates, and TTS audio.", "warn"),
+        ("trim_runtime_memory", "Trim runtime memory", "Remove stale limiter, text, prefs, TTS, and idle-lock cache entries, then run GC.", "secondary"),
         ("slow_admin_polling", "Reduce admin polling", "Use 60s live polling and longer count cache TTL to reduce Supabase/API pressure.", "warn"),
         ("normal_admin_polling", "Restore normal polling", "Return dashboard live refresh to balanced 30s settings.", "ok"),
         ("purge_temp", "Purge temp files", "Run temp sweeper and garbage collector now.", "secondary"),
@@ -7647,6 +7828,7 @@ def web_admin_optimize():
       <div class='card'><h2>Optimization Actions</h2><p class='muted'>Safe cleanup and admin-poll tuning without restarting the bot.</p><div class='table-wrap'><table class='table'><thead><tr><th>Action</th><th>Run</th></tr></thead><tbody>{quick_rows}</tbody></table></div></div>
       <div class='card'><h2>Current Runtime Core</h2><div class='table-wrap'><table class='table'><thead><tr><th>Key</th><th>Value</th><th>Note</th></tr></thead><tbody>{_runtime_core_rows_html()}</tbody></table></div><p><a class='btn secondary' href='/admin/runtime'>Advanced runtime config</a> <a class='btn secondary' href='/admin/performance.json'>JSON snapshot</a></p></div>
     </div>
+    <div class='card'><h2>Cache Snapshot</h2><p class='muted'>Shows rebuildable in-memory cache sizes before you run cleanup.</p><pre>{_web_h(_json.dumps(_admin_runtime_cache_snapshot_sync(), ensure_ascii=False, indent=2, default=str))}</pre></div>
     <div class='card'><h2>Recent Slow Requests</h2><p class='muted'>Useful for finding heavy admin pages or browser polling storms.</p><div class='table-wrap'><table class='table'><thead><tr><th>Time</th><th>Method</th><th>Path</th><th>Status</th><th>Latency</th><th>Active</th></tr></thead><tbody>{_slow_request_rows_html()}</tbody></table></div></div>
     <div class='card'><h2>Full Performance Snapshot</h2><pre>{_web_h(_json.dumps(snap, ensure_ascii=False, indent=2, default=str))}</pre></div>
     """
@@ -7706,12 +7888,7 @@ def web_admin_control_action():
     msg = "Done."
     try:
         if action == "refresh_caches":
-            _web_counts_invalidate()
-            _api_key_cache_clear()
-            with _BLOCKED_USER_CACHE_LOCK:
-                _blocked_user_cache.clear()
-            _bot_settings_cache["ts"] = 0.0
-            msg = "Dashboard, settings, API-key, and blocked-user caches refreshed."
+            msg = _admin_clear_runtime_caches_sync()
         elif action == "clear_runtime_metrics":
             for key in list(_RUNTIME_METRICS.keys()):
                 _RUNTIME_METRICS[key] = 0
@@ -9989,6 +10166,9 @@ async def _redis_delete(key: str) -> None:
 # ---------------------------------------------------------------------------
 _RATE_LIMIT_MEMORY: dict[str, deque[float]] = {}
 _RATE_LIMIT_MEMORY_LOCK = asyncio.Lock()
+# Thread guard is used by sync admin cleanup while async handlers use the
+# limiter. This prevents dictionary-size-change races during /admin/optimize.
+_RATE_LIMIT_MEMORY_THREAD_LOCK = threading.RLock()
 _RATE_LIMIT_NOTICE_MEMORY: dict[str, float] = {}
 
 
@@ -10081,21 +10261,22 @@ async def _rate_limit_check(key: str, limit: int, window_s: float) -> tuple[bool
             _log_once(logging.WARNING, "rate_limit_redis_fallback", "Redis rate limiter fallback: %s", exc)
 
     async with _RATE_LIMIT_MEMORY_LOCK:
-        dq = _RATE_LIMIT_MEMORY.setdefault(key, deque())
-        cutoff = now - window
-        while dq and dq[0] < cutoff:
-            dq.popleft()
-        allowed = len(dq) < limit_i
-        if allowed:
-            dq.append(now)
-        # Opportunistic cleanup so offline Redis mode stays bounded.
-        if len(_RATE_LIMIT_MEMORY) > 100_000:
-            stale_before = now - max(window * 4, 60.0)
-            for old_key in list(_RATE_LIMIT_MEMORY.keys())[:5000]:
-                old_dq = _RATE_LIMIT_MEMORY.get(old_key)
-                if not old_dq or (old_dq and old_dq[-1] < stale_before):
-                    _RATE_LIMIT_MEMORY.pop(old_key, None)
-        return allowed, max(0, limit_i - len(dq))
+        with _RATE_LIMIT_MEMORY_THREAD_LOCK:
+            dq = _RATE_LIMIT_MEMORY.setdefault(key, deque())
+            cutoff = now - window
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+            allowed = len(dq) < limit_i
+            if allowed:
+                dq.append(now)
+            # Opportunistic cleanup so offline Redis mode stays bounded.
+            if len(_RATE_LIMIT_MEMORY) > 100_000:
+                stale_before = now - max(window * 4, 60.0)
+                for old_key in list(_RATE_LIMIT_MEMORY.keys())[:5000]:
+                    old_dq = _RATE_LIMIT_MEMORY.get(old_key)
+                    if not old_dq or (old_dq and old_dq[-1] < stale_before):
+                        _RATE_LIMIT_MEMORY.pop(old_key, None)
+            return allowed, max(0, limit_i - len(dq))
 
 
 def _update_rate_limit_key(update: Any) -> str:
@@ -10117,14 +10298,18 @@ async def _telegram_rate_limit_guard(update: Any, context: Any) -> None:
         return
     _metric_inc("rate_limited")
     now = time.monotonic()
-    last = _RATE_LIMIT_NOTICE_MEMORY.get(key, 0.0)
-    if now - last >= USER_RATE_LIMIT_NOTICE_COOLDOWN_S:
-        _RATE_LIMIT_NOTICE_MEMORY[key] = now
-        if len(_RATE_LIMIT_NOTICE_MEMORY) > 50_000:
-            stale_before = now - max(USER_RATE_LIMIT_NOTICE_COOLDOWN_S * 4, 300.0)
-            for old_key, old_ts in list(_RATE_LIMIT_NOTICE_MEMORY.items())[:5000]:
-                if old_ts < stale_before:
-                    _RATE_LIMIT_NOTICE_MEMORY.pop(old_key, None)
+    should_send_notice = False
+    with _RATE_LIMIT_MEMORY_THREAD_LOCK:
+        last = _RATE_LIMIT_NOTICE_MEMORY.get(key, 0.0)
+        if now - last >= USER_RATE_LIMIT_NOTICE_COOLDOWN_S:
+            _RATE_LIMIT_NOTICE_MEMORY[key] = now
+            should_send_notice = True
+            if len(_RATE_LIMIT_NOTICE_MEMORY) > 50_000:
+                stale_before = now - max(USER_RATE_LIMIT_NOTICE_COOLDOWN_S * 4, 300.0)
+                for old_key, old_ts in list(_RATE_LIMIT_NOTICE_MEMORY.items())[:5000]:
+                    if old_ts < stale_before:
+                        _RATE_LIMIT_NOTICE_MEMORY.pop(old_key, None)
+    if should_send_notice:
         msg = getattr(update, "effective_message", None)
         if msg is not None:
             with suppress(Exception):
@@ -10137,6 +10322,7 @@ _ADMIN_ONLY_COMMANDS = {
     "runtime", "api", "botsettings", "users", "chat", "endchat",
 }
 _ADMIN_SECURITY_NOTICE_MEMORY: dict[str, float] = {}
+_ADMIN_SECURITY_NOTICE_MEMORY_LOCK = threading.RLock()
 
 
 def _telegram_command_name(update: Update) -> str:
@@ -10149,15 +10335,16 @@ def _telegram_command_name(update: Update) -> str:
 
 async def _security_notice_once(update: Update, key: str, text: str, *, alert: bool = False) -> None:
     now = time.monotonic()
-    last = _ADMIN_SECURITY_NOTICE_MEMORY.get(key, 0.0)
-    if now - last < USER_RATE_LIMIT_NOTICE_COOLDOWN_S:
-        return
-    _ADMIN_SECURITY_NOTICE_MEMORY[key] = now
-    if len(_ADMIN_SECURITY_NOTICE_MEMORY) > 50_000:
-        stale_before = now - max(USER_RATE_LIMIT_NOTICE_COOLDOWN_S * 4, 300.0)
-        for old_key, old_ts in list(_ADMIN_SECURITY_NOTICE_MEMORY.items())[:5000]:
-            if old_ts < stale_before:
-                _ADMIN_SECURITY_NOTICE_MEMORY.pop(old_key, None)
+    with _ADMIN_SECURITY_NOTICE_MEMORY_LOCK:
+        last = _ADMIN_SECURITY_NOTICE_MEMORY.get(key, 0.0)
+        if now - last < USER_RATE_LIMIT_NOTICE_COOLDOWN_S:
+            return
+        _ADMIN_SECURITY_NOTICE_MEMORY[key] = now
+        if len(_ADMIN_SECURITY_NOTICE_MEMORY) > 50_000:
+            stale_before = now - max(USER_RATE_LIMIT_NOTICE_COOLDOWN_S * 4, 300.0)
+            for old_key, old_ts in list(_ADMIN_SECURITY_NOTICE_MEMORY.items())[:5000]:
+                if old_ts < stale_before:
+                    _ADMIN_SECURITY_NOTICE_MEMORY.pop(old_key, None)
     query = update.callback_query
     if query is not None:
         with suppress(Exception):
@@ -12158,7 +12345,9 @@ _rls_warned = False
 
 # Fast cache for callback buttons: memory -> Redis -> Supabase.
 _TEXT_CACHE_MEMORY_MAX = 20_000
+_TEXT_CACHE_MEMORY_TTL_S = _env_float("TEXT_CACHE_MEMORY_TTL_S", 3600.0, minimum=60.0, maximum=86400.0)
 _text_cache_memory: OrderedDict[tuple[int, int], tuple[str, float]] = OrderedDict()
+_TEXT_CACHE_MEMORY_LOCK = threading.RLock()
 
 
 def _text_cache_redis_key(msg_id: int, chat_id: int) -> str:
@@ -12170,19 +12359,50 @@ def _remember_text_cache_sync(msg_id: int, chat_id: int, text: str) -> None:
     if not text:
         return
     key = (int(chat_id or 0), int(msg_id))
-    _text_cache_memory.pop(key, None)
-    _text_cache_memory[key] = (text, time.monotonic())
-    while len(_text_cache_memory) > _TEXT_CACHE_MEMORY_MAX:
-        _text_cache_memory.popitem(last=False)
+    now = time.monotonic()
+    with _TEXT_CACHE_MEMORY_LOCK:
+        _text_cache_memory.pop(key, None)
+        _text_cache_memory[key] = (text, now)
+        while len(_text_cache_memory) > _TEXT_CACHE_MEMORY_MAX:
+            _text_cache_memory.popitem(last=False)
 
 
 def _get_text_cache_memory_sync(msg_id: int, chat_id: int) -> str | None:
     key = (int(chat_id or 0), int(msg_id))
-    item = _text_cache_memory.get(key)
-    if not item:
-        return None
-    _text_cache_memory.move_to_end(key)
-    return item[0]
+    now = time.monotonic()
+    with _TEXT_CACHE_MEMORY_LOCK:
+        item = _text_cache_memory.get(key)
+        if not item:
+            return None
+        text, cached_at = item
+        if now - float(cached_at or 0.0) > _TEXT_CACHE_MEMORY_TTL_S:
+            _text_cache_memory.pop(key, None)
+            return None
+        _text_cache_memory.move_to_end(key)
+        return text
+
+
+def _text_cache_memory_trim_sync(max_age_s: float | None = None) -> int:
+    """Remove stale in-memory callback text entries without touching Redis/DB."""
+    now = time.monotonic()
+    ttl = max(60.0, float(max_age_s or _TEXT_CACHE_MEMORY_TTL_S))
+    removed = 0
+    with _TEXT_CACHE_MEMORY_LOCK:
+        for key, (_text, cached_at) in list(_text_cache_memory.items()):
+            if now - float(cached_at or 0.0) > ttl:
+                _text_cache_memory.pop(key, None)
+                removed += 1
+        while len(_text_cache_memory) > _TEXT_CACHE_MEMORY_MAX:
+            _text_cache_memory.popitem(last=False)
+            removed += 1
+    return removed
+
+
+def _text_cache_memory_clear_sync() -> int:
+    with _TEXT_CACHE_MEMORY_LOCK:
+        removed = len(_text_cache_memory)
+        _text_cache_memory.clear()
+        return removed
 
 
 def _write_text_cache_redis_sync(msg_id: int, chat_id: int, text: str) -> None:
@@ -12764,7 +12984,9 @@ def db_user_is_blocked(user_id: int) -> bool:
     cached = _blocked_cache_get(user_id)
     if cached is not None:
         return cached
-    if user_id in _blocked_users_memory:
+    with _BLOCKED_USER_CACHE_LOCK:
+        memory_blocked = user_id in _blocked_users_memory
+    if memory_blocked:
         _blocked_cache_set(user_id, True)
         return True
     if not supabase:
@@ -12783,7 +13005,8 @@ def db_user_is_blocked(user_id: int) -> bool:
 
 def db_blocked_user_count() -> int:
     if not supabase:
-        return len(_blocked_users_memory)
+        with _BLOCKED_USER_CACHE_LOCK:
+            return len(_blocked_users_memory)
     try:
         res = (
             supabase.table("blocked_users")
@@ -12792,18 +13015,22 @@ def db_blocked_user_count() -> int:
             .execute()
         )
         db_count = int(getattr(res, "count", None) or 0)
-        return max(db_count, len(_blocked_users_memory))
+        with _BLOCKED_USER_CACHE_LOCK:
+            memory_count = len(_blocked_users_memory)
+        return max(db_count, memory_count)
     except Exception:
-        return len(_blocked_users_memory)
+        with _BLOCKED_USER_CACHE_LOCK:
+            return len(_blocked_users_memory)
 
 
 def db_user_set_blocked(user_id: int, admin_id: int, blocked: bool, reason: str = "") -> tuple[bool, str]:
     user_id = int(user_id)
     admin_id = int(admin_id)
-    if blocked:
-        _blocked_users_memory.add(user_id)
-    else:
-        _blocked_users_memory.discard(user_id)
+    with _BLOCKED_USER_CACHE_LOCK:
+        if blocked:
+            _blocked_users_memory.add(user_id)
+        else:
+            _blocked_users_memory.discard(user_id)
     _blocked_cache_set(user_id, blocked)
     if not supabase:
         return True, "memory-only"
@@ -12957,6 +13184,7 @@ ADMIN_HISTORY_PAGE_SIZE    = _env_int("ADMIN_HISTORY_PAGE_SIZE", 10, minimum=5, 
 _HIST_CACHE_MAX_USERS = 5_000
 _HIST_CACHE_TURNS     = max(ADMIN_FULL_HISTORY_TURNS, 50)
 _hist_cache: OrderedDict[int, deque] = OrderedDict()
+_HIST_CACHE_LOCK = threading.RLock()
 
 
 def _hist_redis_key(user_id: int) -> str:
@@ -12973,28 +13201,45 @@ def _hist_cache_append(user_id: int, role: str, content: str) -> None:
     content = (content or "").strip()
     if not content:
         return
-    if user_id not in _hist_cache:
-        while len(_hist_cache) >= _HIST_CACHE_MAX_USERS:
-            _hist_cache.popitem(last=False)
-        _hist_cache[user_id] = deque(maxlen=_HIST_CACHE_TURNS)
-    _hist_cache.move_to_end(user_id)
-    _hist_cache[user_id].append({
-        "role": role,
-        "content": content,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    })
+    user_id = int(user_id)
+    with _HIST_CACHE_LOCK:
+        if user_id not in _hist_cache:
+            while len(_hist_cache) >= _HIST_CACHE_MAX_USERS:
+                _hist_cache.popitem(last=False)
+            _hist_cache[user_id] = deque(maxlen=_HIST_CACHE_TURNS)
+        _hist_cache.move_to_end(user_id)
+        _hist_cache[user_id].append({
+            "role": role,
+            "content": content,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
 
 
 def _hist_cache_get(user_id: int) -> list[dict] | None:
-    d = _hist_cache.get(user_id)
-    if d is None:
-        return None
-    _hist_cache.move_to_end(user_id)
-    return list(d)
+    user_id = int(user_id)
+    with _HIST_CACHE_LOCK:
+        d = _hist_cache.get(user_id)
+        if d is None:
+            return None
+        _hist_cache.move_to_end(user_id)
+        return list(d)
 
 
 def _hist_cache_clear(user_id: int) -> None:
-    _hist_cache.pop(user_id, None)
+    with _HIST_CACHE_LOCK:
+        _hist_cache.pop(int(user_id), None)
+
+
+def _hist_cache_clear_all_sync() -> int:
+    with _HIST_CACHE_LOCK:
+        removed = len(_hist_cache)
+        _hist_cache.clear()
+        return removed
+
+
+def _hist_cache_size_sync() -> int:
+    with _HIST_CACHE_LOCK:
+        return len(_hist_cache)
 
 
 def _hist_rows_normalized(rows: list[dict] | None) -> list[dict]:
@@ -15939,6 +16184,30 @@ def _tts_audio_cache_set(key: str, data: bytes) -> None:
         while _TTS_AUDIO_CACHE_BYTES > TTS_AUDIO_CACHE_MAX_BYTES and _TTS_AUDIO_CACHE:
             _old_key, (_old_data, _old_created, old_size) = _TTS_AUDIO_CACHE.popitem(last=False)
             _TTS_AUDIO_CACHE_BYTES = max(0, _TTS_AUDIO_CACHE_BYTES - old_size)
+
+
+def _tts_audio_cache_trim_expired() -> int:
+    global _TTS_AUDIO_CACHE_BYTES
+    now = time.monotonic()
+    removed = 0
+    with _TTS_AUDIO_CACHE_LOCK:
+        if not _TTS_AUDIO_CACHE:
+            return 0
+        for key, (_data, created, size) in list(_TTS_AUDIO_CACHE.items()):
+            if now - float(created or 0.0) > TTS_AUDIO_CACHE_TTL_S:
+                _TTS_AUDIO_CACHE.pop(key, None)
+                _TTS_AUDIO_CACHE_BYTES = max(0, _TTS_AUDIO_CACHE_BYTES - int(size or 0))
+                removed += 1
+    return removed
+
+
+def _tts_audio_cache_clear() -> int:
+    global _TTS_AUDIO_CACHE_BYTES
+    with _TTS_AUDIO_CACHE_LOCK:
+        removed = len(_TTS_AUDIO_CACHE)
+        _TTS_AUDIO_CACHE.clear()
+        _TTS_AUDIO_CACHE_BYTES = 0
+        return removed
 
 
 def _write_cached_audio_to_path(path: str, data: bytes) -> None:
