@@ -3,6 +3,7 @@ import os
 import re
 import asyncio
 import inspect
+import io
 import threading
 import time
 import contextvars
@@ -43,6 +44,30 @@ from fastapi.encoders import jsonable_encoder
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.concurrency import run_in_threadpool
 from jinja2 import Environment, Template, select_autoescape
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
+from telegram.error import (
+    NetworkError,
+    TimedOut,
+    RetryAfter,
+    BadRequest,
+    TelegramError,
+    Forbidden,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    TypeHandler,
+    CallbackQueryHandler,
+    ApplicationHandlerStop,
+)
 try:
     from pydantic_settings import BaseSettings, SettingsConfigDict
 except Exception as exc:
@@ -269,6 +294,24 @@ class _FastJSONResponse(StarletteResponse):
     def render(self, content: Any) -> bytes:
         return _json_dumps_fast(content)
 
+
+def _read_file_bytes_sync(path: str, *, max_bytes: int | None = None) -> bytes:
+    """Read a file with deterministic handle cleanup and an optional hard limit."""
+    limit = None if max_bytes is None else max(0, int(max_bytes))
+    with open(path, "rb") as handle:
+        if limit is None:
+            return handle.read()
+        data = handle.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f"File too large. Max {limit} bytes.")
+    return data
+
+
+async def _read_file_bytes_async(path: str, *, max_bytes: int | None = None) -> bytes:
+    """Move blocking disk reads off the event loop."""
+    return await asyncio.to_thread(_read_file_bytes_sync, path, max_bytes=max_bytes)
+
+
 # Load local .env before any environment-driven config is read.
 # This keeps local/dev runs consistent with Render environment variables.
 try:
@@ -276,6 +319,9 @@ try:
     _early_load_dotenv()
 except Exception as exc:
     logging.getLogger(__name__).warning("Optional dependency python-dotenv is not available; .env file was not loaded: %s", exc)
+
+    def _early_load_dotenv(*args: Any, **kwargs: Any) -> bool:
+        return False
 
 try:
     import redis as redis_lib
@@ -903,23 +949,21 @@ def abort(status_code: int = 400):
 
 
 _JINJA_TEMPLATE_CACHE_MAX = 256
-_JINJA_TEMPLATE_CACHE: OrderedDict[tuple[int, str], tuple[str, Any]] = OrderedDict()
+_JINJA_TEMPLATE_CACHE: OrderedDict[str, Any] = OrderedDict()
 _JINJA_TEMPLATE_CACHE_LOCK = threading.RLock()
 _JINJA_ENV = Environment(autoescape=select_autoescape(["html", "xml"]), enable_async=False)
 
 
 def render_template_string(template: str, **context: Any) -> str:
-    # Compile each unique template string once. The compatibility layer uses
-    # large inline dashboard templates, so this avoids repeated Jinja parsing
-    # on every admin page render while keeping Flask's function name intact.
+    # Python caches a string's hash after the first use. Keying directly by the
+    # immutable template avoids a full SHA-256 pass over large inline templates
+    # on every render while retaining exact collision-safe dictionary matching.
     template = str(template or "")
-    key = (len(template), hashlib.sha256(template.encode("utf-8")).hexdigest())
     compiled = None
     with _JINJA_TEMPLATE_CACHE_LOCK:
-        cached = _JINJA_TEMPLATE_CACHE.get(key)
-        if cached and cached[0] == template:
-            compiled = cached[1]
-            _JINJA_TEMPLATE_CACHE.move_to_end(key)
+        compiled = _JINJA_TEMPLATE_CACHE.get(template)
+        if compiled is not None:
+            _JINJA_TEMPLATE_CACHE.move_to_end(template)
     if compiled is None:
         try:
             compiled = _JINJA_ENV.from_string(template)
@@ -928,7 +972,7 @@ def render_template_string(template: str, **context: Any) -> str:
             # unusual template edge case is not accepted by the shared env.
             return Template(template, autoescape=select_autoescape(["html", "xml"])).render(**context)
         with _JINJA_TEMPLATE_CACHE_LOCK:
-            _JINJA_TEMPLATE_CACHE[key] = (template, compiled)
+            _JINJA_TEMPLATE_CACHE[template] = compiled
             while len(_JINJA_TEMPLATE_CACHE) > _JINJA_TEMPLATE_CACHE_MAX:
                 _JINJA_TEMPLATE_CACHE.popitem(last=False)
     return compiled.render(**context)
@@ -2071,7 +2115,6 @@ def keep_alive():
     asyncio.run(keep_alive_async())
 
 # ── AI Assistant REST API ──────────────────────────────────────────────────
-import base64
 
 try:
     from huggingface_hub import InferenceClient
@@ -4971,7 +5014,7 @@ def web_admin_insights():
 @app_flask.route("/admin/report")
 @web_admin_required
 def web_admin_report():
-    body = f"""
+    body = """
     <div class='card'>
       <h2>📄 Admin PDF Report</h2>
       <p class='muted'>Generate a PDF with graphs, selected-day/range analytics, system status, runtime settings, feature toggles, Smart Error Inbox summary, and recent errors.</p>
@@ -7589,7 +7632,8 @@ def _admin_trim_runtime_memory_sync() -> str:
 
     with suppress(Exception):
         with _prefs_cache_thread_lock:
-            stale_prefs_before = now - max(_run_state_float("PREFS_CACHE_TTL_S", PREFS_CACHE_TTL_S, minimum=30.0, maximum=86400.0) * 2, 300.0)
+            prefs_ttl_default = float(globals().get("_PREFS_TTL", _perf_default("PREFS_CACHE_TTL_S", 600.0)))
+            stale_prefs_before = now - max(_run_state_float("PREFS_CACHE_TTL_S", prefs_ttl_default, minimum=30.0, maximum=86400.0) * 2, 300.0)
             for uid, (_prefs, ts) in list(_prefs_cache.items()):
                 if float(ts or 0.0) < stale_prefs_before:
                     _prefs_cache.pop(uid, None)
@@ -7759,7 +7803,6 @@ def web_admin_runtime_config():
 def web_admin_optimize():
     """One-screen admin optimization center for performance presets and cleanup."""
     csrf = _web_csrf_token()
-    admin_id = _web_current_admin_id()
     if request.method == "POST":
         _web_check_csrf()
         action = str(request.form.get("action") or "").strip().lower()
@@ -8006,32 +8049,7 @@ try:
     from gradio_client import Client as GradioClient
 except Exception:
     GradioClient = None
-import io
-from dotenv import load_dotenv
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardRemove,
-)
-from telegram.error import (
-    NetworkError,
-    TimedOut,
-    RetryAfter,
-    BadRequest,
-    TelegramError,
-    Forbidden,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-    TypeHandler,
-    CallbackQueryHandler,
-    ApplicationHandlerStop,
-)
+load_dotenv = _early_load_dotenv
 try:
     from telegram.request import HTTPXRequest
 except Exception:
@@ -8545,14 +8563,14 @@ RUN_STATE: dict[str, Any] = {
     "TELEGRAM_CONCURRENT_UPDATES": TELEGRAM_CONCURRENT_UPDATES,
     "TELEGRAM_CONNECTION_POOL_SIZE": TELEGRAM_CONNECTION_POOL_SIZE,
     "DB_EXECUTOR_MAX_WORKERS": int(_perf_default("DB_EXECUTOR_MAX_WORKERS", 3)),
-    "USER_SYNC_TTL_S": _USER_SYNC_TTL if "_USER_SYNC_TTL" in globals() else float(_perf_default("USER_SYNC_TTL_S", 1800.0)),
-    "PREFS_CACHE_TTL_S": _PREFS_TTL if "_PREFS_TTL" in globals() else float(_perf_default("PREFS_CACHE_TTL_S", 600.0)),
-    "TTS_AUDIO_CACHE_ENABLED": TTS_AUDIO_CACHE_ENABLED if "TTS_AUDIO_CACHE_ENABLED" in globals() else bool(_perf_default("TTS_AUDIO_CACHE_ENABLED", True)),
-    "TTS_AUDIO_CACHE_MAX_MB": TTS_AUDIO_CACHE_MAX_MB if "TTS_AUDIO_CACHE_MAX_MB" in globals() else int(_perf_default("TTS_AUDIO_CACHE_MAX_MB", 64)),
-    "TTS_AUDIO_CACHE_ITEM_MAX_MB": TTS_AUDIO_CACHE_ITEM_MAX_MB if "TTS_AUDIO_CACHE_ITEM_MAX_MB" in globals() else int(_perf_default("TTS_AUDIO_CACHE_ITEM_MAX_MB", 8)),
-    "TTS_AUDIO_CACHE_TTL_S": TTS_AUDIO_CACHE_TTL_S if "TTS_AUDIO_CACHE_TTL_S" in globals() else float(_perf_default("TTS_AUDIO_CACHE_TTL_S", 1200.0)),
-    "EDGE_TTS_PARALLEL_CHUNKS": EDGE_TTS_PARALLEL_CHUNKS if "EDGE_TTS_PARALLEL_CHUNKS" in globals() else int(_perf_default("EDGE_TTS_PARALLEL_CHUNKS", 1)),
-    "PAGED_TTS_SEND_DELAY_S": PAGED_TTS_SEND_DELAY_S if "PAGED_TTS_SEND_DELAY_S" in globals() else float(_perf_default("PAGED_TTS_SEND_DELAY_S", 0.10)),
+    "USER_SYNC_TTL_S": float(globals().get("_USER_SYNC_TTL", _perf_default("USER_SYNC_TTL_S", 1800.0))),
+    "PREFS_CACHE_TTL_S": float(globals().get("_PREFS_TTL", _perf_default("PREFS_CACHE_TTL_S", 600.0))),
+    "TTS_AUDIO_CACHE_ENABLED": bool(globals().get("TTS_AUDIO_CACHE_ENABLED", _perf_default("TTS_AUDIO_CACHE_ENABLED", True))),
+    "TTS_AUDIO_CACHE_MAX_MB": int(globals().get("TTS_AUDIO_CACHE_MAX_MB", _perf_default("TTS_AUDIO_CACHE_MAX_MB", 64))),
+    "TTS_AUDIO_CACHE_ITEM_MAX_MB": int(globals().get("TTS_AUDIO_CACHE_ITEM_MAX_MB", _perf_default("TTS_AUDIO_CACHE_ITEM_MAX_MB", 8))),
+    "TTS_AUDIO_CACHE_TTL_S": float(globals().get("TTS_AUDIO_CACHE_TTL_S", _perf_default("TTS_AUDIO_CACHE_TTL_S", 1200.0))),
+    "EDGE_TTS_PARALLEL_CHUNKS": int(globals().get("EDGE_TTS_PARALLEL_CHUNKS", _perf_default("EDGE_TTS_PARALLEL_CHUNKS", 1))),
+    "PAGED_TTS_SEND_DELAY_S": float(globals().get("PAGED_TTS_SEND_DELAY_S", _perf_default("PAGED_TTS_SEND_DELAY_S", 0.10))),
 }
 RUN_STATE_LOCK = asyncio.Lock()
 ACTIVE_ADMIN_CONVERSATIONS: dict[int, dict[str, Any]] = {}
@@ -8710,6 +8728,10 @@ def _run_state_broadcast_delay() -> float:
 
 def _run_state_max_concurrent_broadcast() -> int:
     return _run_state_int("MAX_CONCURRENT_BROADCAST", MAX_CONCURRENT_BROADCAST, minimum=1, maximum=50)
+
+
+def _run_state_max_concurrent_tts_users() -> int:
+    return _run_state_int("MAX_CONCURRENT_TTS_USERS", MAX_CONCURRENT_TTS_USERS, minimum=1, maximum=50)
 
 
 def _run_state_web_counts_cache_ttl() -> float:
@@ -9260,8 +9282,9 @@ async def _runtime_admin_callback(update: Any, context: Any) -> None:
                 ))
             except Exception as exc:
                 webhook_logger.error("Webhook secret rotation failed admin_id=%s: %s", admin_id, exc, exc_info=True)
+                error_text = html.escape(str(exc)[:800])
                 await safe_send(lambda: query.message.edit_text(
-                    _runtime_admin_text() + f"\n\n❌ Rotate secret failed: <code>{html.escape(str(exc)[:800])}</code>",
+                    _runtime_admin_text() + f"\n\n❌ Rotate secret failed: <code>{error_text}</code>",
                     parse_mode="HTML",
                     reply_markup=_refresh_runtime_admin_markup(),
                     disable_web_page_preview=True,
@@ -9284,8 +9307,9 @@ async def _runtime_admin_callback(update: Any, context: Any) -> None:
             ))
         except Exception as exc:
             webhook_logger.error("Runtime mode switch failed admin_id=%s target=%s: %s", admin_id, target, exc, exc_info=True)
+            error_text = html.escape(str(exc)[:800])
             await safe_send(lambda: query.message.edit_text(
-                _runtime_admin_text() + f"\n\n❌ ប្ដូរ Mode មិនបាន: <code>{html.escape(str(exc)[:800])}</code>",
+                _runtime_admin_text() + f"\n\n❌ ប្ដូរ Mode មិនបាន: <code>{error_text}</code>",
                 parse_mode="HTML",
                 reply_markup=_refresh_runtime_admin_markup(),
                 disable_web_page_preview=True,
@@ -14985,9 +15009,10 @@ async def _admin_generate_web_key(query, user_id: int, context: ContextTypes.DEF
         return
     except Exception as exc:
         logger.error("WEB_SECRET_KEY private delivery failed admin_id=%s fingerprint=%s: %s", user_id, fingerprint, exc, exc_info=True)
+        error_text = html.escape(str(exc)[:300])
         await safe_send(lambda: query.message.edit_text(
             "⚠️ <b>WEB_KEY generation failed to deliver.</b>\n\n"
-            f"Reason: <code>{html.escape(str(exc)[:300])}</code>\n\n"
+            f"Reason: <code>{error_text}</code>\n\n"
             "The key was already stored in Redis; restart all backend instances to apply it.",
             parse_mode="HTML",
             reply_markup=get_admin_dashboard_kb(),
@@ -15198,9 +15223,11 @@ def get_schedules_list_kb(rows: list[dict], page: int, page_size: int = 5) -> In
         icon = "🟡" if _sched_is_draft(r) else "🟢"
         kbd_rows.append([InlineKeyboardButton(f"{icon} #{r['id']}  {dt_str}", callback_data=f"sched_view:{r['id']}")])
     nav = []
-    if page > 0:            nav.append(InlineKeyboardButton("⬅️", callback_data=f"sched_page:{page-1}"))
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"sched_page:{page-1}"))
     nav.append(InlineKeyboardButton(f"{page+1}/{total}", callback_data="sched_noop"))
-    if page < total - 1:    nav.append(InlineKeyboardButton("➡️", callback_data=f"sched_page:{page+1}"))
+    if page < total - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"sched_page:{page+1}"))
     if nav:
         kbd_rows.append(nav)
     kbd_rows.append([InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
@@ -16046,9 +16073,8 @@ async def _convert_audio_files_to_telegram_voice(input_paths: list[str], speed: 
         raise RuntimeError(f"FFmpeg failed converting HF TTS audio (code {proc.returncode}): {snippet}")
 
     try:
-        loop = asyncio.get_running_loop()
         return await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: open(output_path, "rb").read()),
+            _read_file_bytes_async(output_path),
             timeout=10,
         )
     except asyncio.TimeoutError:
@@ -16309,9 +16335,8 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
         raise RuntimeError(f"FFmpeg failed (code {proc.returncode}): {snippet}")
 
     try:
-        loop        = asyncio.get_running_loop()
         audio_bytes = await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: open(output_path, "rb").read()),
+            _read_file_bytes_async(output_path),
             timeout=10,
         )
     except asyncio.TimeoutError:
@@ -16397,7 +16422,7 @@ async def transcribe_voice(ogg_path: str) -> str:
         raise RuntimeError("GEMINI_API_KEY not set.")
     loop = asyncio.get_running_loop()
     try:
-        audio_bytes = await loop.run_in_executor(None, lambda: open(ogg_path, "rb").read())
+        audio_bytes = await _read_file_bytes_async(ogg_path)
     except OSError as e:
         raise RuntimeError(f"Cannot read voice file: {e}") from e
 
@@ -16434,7 +16459,7 @@ async def transcribe_audio_file(file_path: str, mime_type: str) -> str:
         raise RuntimeError("GEMINI_API_KEY not set.")
     loop = asyncio.get_running_loop()
     try:
-        audio_bytes = await loop.run_in_executor(None, lambda: open(file_path, "rb").read())
+        audio_bytes = await _read_file_bytes_async(file_path)
     except OSError as e:
         raise RuntimeError(f"Cannot read audio file: {e}") from e
 
@@ -16525,10 +16550,14 @@ def _detect_image_mime(path: str) -> str:
     try:
         with open(path, "rb") as f:
             header = f.read(12)
-        if header[:8] == b"\x89PNG\r\n\x1a\n":   return "image/png"
-        if header[:4] == b"RIFF" and header[8:12] == b"WEBP": return "image/webp"
-        if header[:2] == b"\xff\xd8":              return "image/jpeg"
-        if header[:6] in (b"GIF87a", b"GIF89a"):   return "image/gif"
+        if header[:8] == b"\x89PNG\r\n\x1a\n":
+            return "image/png"
+        if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+            return "image/webp"
+        if header[:2] == b"\xff\xd8":
+            return "image/jpeg"
+        if header[:6] in (b"GIF87a", b"GIF89a"):
+            return "image/gif"
     except Exception:
         pass
     return "image/jpeg"
@@ -16542,7 +16571,7 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
         raise RuntimeError(_ocr_status_for_user())
     loop = asyncio.get_running_loop()
     try:
-        image_bytes = await loop.run_in_executor(None, lambda: open(image_path, "rb").read())
+        image_bytes = await _read_file_bytes_async(image_path)
     except OSError as e:
         raise RuntimeError(f"Cannot read image file: {e}") from e
 
@@ -17818,9 +17847,10 @@ async def _run_broadcast_to_all(
                 max_chars=TELE_MSG_LIMIT,
             )
     except ValueError as exc:
+        error_text = html.escape(str(exc))
         await safe_send(lambda: bot.send_message(
             chat_id=admin_id,
-            text=f"❌ {label}: {html.escape(str(exc))}",
+            text=f"❌ {label}: {error_text}",
             parse_mode="HTML",
         ))
         return (0, 0, 0)
@@ -18573,7 +18603,6 @@ def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
             BaseDocTemplate,
             Frame,
             KeepTogether,
-            PageBreak,
             PageTemplate,
             Paragraph,
             Spacer,
@@ -18594,7 +18623,6 @@ def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
         soft = colors.HexColor("#F8FAFC")
         good = colors.HexColor("#16A34A")
         warn = colors.HexColor("#DC2626")
-        amber = colors.HexColor("#D97706")
 
         doc = BaseDocTemplate(
             path,
@@ -19140,11 +19168,12 @@ async def _admin_send_report_pdf_for_range(query, context: ContextTypes.DEFAULT_
                 await progress.edit_text("✅ PDF report generated and sent.")
     except Exception as exc:
         logger.error("admin_report_pdf failed: %s", exc, exc_info=True)
+        error_text = html.escape(str(exc)[:300])
         if progress:
             with suppress(Exception):
-                await progress.edit_text(f"⚠️ Report generation failed: {html.escape(str(exc)[:300])}")
+                await progress.edit_text(f"⚠️ Report generation failed: {error_text}")
         else:
-            await safe_send(lambda: query.message.reply_text(f"⚠️ Report generation failed: {html.escape(str(exc)[:300])}"))
+            await safe_send(lambda: query.message.reply_text(f"⚠️ Report generation failed: {error_text}"))
     finally:
         if path:
             with suppress(Exception):
@@ -19192,11 +19221,12 @@ async def _handle_admin_report_day_text(update: Update, context: ContextTypes.DE
                 await progress.edit_text("✅ PDF report generated and sent.")
     except Exception as exc:
         logger.error("admin_report_pdf_text_date failed: %s", exc, exc_info=True)
+        error_text = html.escape(str(exc)[:300])
         if progress:
             with suppress(Exception):
-                await progress.edit_text(f"⚠️ Report generation failed: {html.escape(str(exc)[:300])}")
+                await progress.edit_text(f"⚠️ Report generation failed: {error_text}")
         else:
-            await safe_send(lambda: msg.reply_text(f"⚠️ Report generation failed: {html.escape(str(exc)[:300])}"))
+            await safe_send(lambda: msg.reply_text(f"⚠️ Report generation failed: {error_text}"))
     finally:
         if path:
             with suppress(Exception):
@@ -20218,7 +20248,7 @@ async def _admin_health_text() -> str:
         f"🗣️ TTS provider: <code>{html.escape(tts_provider)}</code>",
         f"🧠 Hugging Face: <b>{_ok_bad(bool(_hf_client))}</b>",
         f"🔍 OCR: <b>{_ok_bad(bool(ocr_ready), 'READY', 'OFF')}</b>",
-        f"🔒 TTS concurrency: <b>{_run_state_max_concurrent_tts_users() if '_run_state_max_concurrent_tts_users' in globals() else MAX_CONCURRENT_TTS_USERS}</b>",
+        f"🔒 TTS concurrency: <b>{_run_state_max_concurrent_tts_users()}</b>",
         "",
         "<b>Broadcast / Schedule</b>",
         f"👥 Users: <b>{int(counts.get('total_users') or 0)}</b> | 🚫 Blocked: <b>{int(counts.get('blocked_users') or 0)}</b>",
@@ -20773,9 +20803,10 @@ async def _admin_show_broadcast_preview_message(message, bot, user_id: int, payl
         ))
         return True
     except Exception as exc:
+        error_text = html.escape(str(exc)[:300])
         await safe_send(lambda: message.reply_text(
             "❌ Preview មិនជោគជ័យ ដូច្នេះ Broadcast មិនត្រូវបានដាក់ Queue ទេ។\n"
-            f"មូលហេតុ: <code>{html.escape(str(exc)[:300])}</code>",
+            f"មូលហេតុ: <code>{error_text}</code>",
             parse_mode="HTML",
         ))
         return False
@@ -21257,9 +21288,10 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
             reply_markup=get_sched_confirm_kb(row_id),
         ))
     except Exception as exc:
+        error_text = html.escape(str(exc)[:300])
         await safe_send(lambda: msg.reply_text(
             "❌ Schedule was saved, but the rendered preview failed. You can cancel it from /schedules.\n"
-            f"Reason: <code>{html.escape(str(exc)[:300])}</code>",
+            f"Reason: <code>{error_text}</code>",
             parse_mode="HTML",
             reply_markup=get_sched_confirm_kb(row_id),
         ))
@@ -21942,7 +21974,7 @@ async def _download_telegram_file_to_temp_path(tg_file, max_bytes: int, suffix: 
     os.close(fd)
     try:
         await tg_file.download_to_drive(path)
-        actual_size = os.path.getsize(path)
+        actual_size = await asyncio.to_thread(os.path.getsize, path)
         if actual_size > max_bytes:
             raise ValueError(f"File too large. Max {max_bytes // 1024 // 1024} MB.")
         return path
@@ -21960,18 +21992,10 @@ async def _download_telegram_file_to_bytes(tg_file, max_bytes: int) -> bytes:
     """
     path = await _download_telegram_file_to_temp_path(tg_file, max_bytes)
     try:
-        chunks: list[bytes] = []
-        total = 0
-        with open(path, "rb") as fh:
-            while True:
-                chunk = fh.read(1024 * 1024)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > max_bytes:
-                    raise ValueError(f"File too large. Max {max_bytes // 1024 // 1024} MB.")
-                chunks.append(chunk)
-        return b"".join(chunks)
+        try:
+            return await _read_file_bytes_async(path, max_bytes=max_bytes)
+        except ValueError as exc:
+            raise ValueError(f"File too large. Max {max_bytes // 1024 // 1024} MB.") from exc
     finally:
         _cleanup(path)
 
@@ -21990,7 +22014,6 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id  = msg.chat_id
     document = msg.document
     filename = document.file_name or ""
-    mime_type = document.mime_type or ""
 
     if _is_subtitle_file(filename):
         status_msg = await safe_send(lambda: msg.reply_text("🎬 កំពុងអាន subtitle/text file..."))
@@ -22011,7 +22034,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             preview = cleaned[:1200] + ("\n\n..." if len(cleaned) > 1200 else "")
-            sent    = await safe_send(lambda: msg.reply_text(
+            await safe_send(lambda: msg.reply_text(
                 "🎬 <b>Subtitle/Text detected</b>\n\n"
                 f"📄 File: <code>{html.escape(filename)}</code>\n"
                 f"🔤 Characters: <b>{len(cleaned)}</b>\n\n"
@@ -22056,8 +22079,6 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
         return
 
     chat_id = query.message.chat.id
-    loop    = asyncio.get_running_loop()
-
     full_text, prefs = await asyncio.gather(
         get_text_cache_async(src_msg_id, chat_id),
         get_user_prefs_async(user_id),
@@ -22841,10 +22862,11 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "list":
         try:
             rows = await loop.run_in_executor(_DB_EXECUTOR, lambda: db_ai_api_key_list(limit=20))
-        except Exception as e:
-            logger.error(f"/api list failed: {e}", exc_info=True)
+        except Exception as exc:
+            logger.error("/api list failed: %s", exc, exc_info=True)
+            error_text = html.escape(str(exc)[:3500])
             await safe_send(lambda: msg.reply_text(
-                f"❌ Cannot list API keys.\n<pre>{html.escape(str(e)[:3500])}</pre>",
+                f"❌ Cannot list API keys.\n<pre>{error_text}</pre>",
                 parse_mode="HTML",
                 reply_markup=get_api_admin_kb(),
             ))
@@ -22884,10 +22906,11 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _DB_EXECUTOR,
                 lambda: db_ai_api_key_revoke(identifier),
             )
-        except Exception as e:
-            logger.error(f"/api revoke failed: {e}", exc_info=True)
+        except Exception as exc:
+            logger.error("/api revoke failed: %s", exc, exc_info=True)
+            error_text = html.escape(str(exc)[:3500])
             await safe_send(lambda: msg.reply_text(
-                f"❌ Cannot revoke API key.\n<pre>{html.escape(str(e)[:3500])}</pre>",
+                f"❌ Cannot revoke API key.\n<pre>{error_text}</pre>",
                 parse_mode="HTML",
                 reply_markup=get_api_admin_kb(),
             ))
@@ -23035,12 +23058,13 @@ async def _api_list_from_button(query) -> None:
     loop = asyncio.get_running_loop()
     try:
         rows = await loop.run_in_executor(_DB_EXECUTOR, lambda: db_ai_api_key_list(limit=20))
-    except Exception as e:
-        logger.error("api_list button failed: %s", e, exc_info=True)
+    except Exception as exc:
+        logger.error("api_list button failed: %s", exc, exc_info=True)
+        error_text = html.escape(str(exc)[:1800])
         await safe_send(lambda: query.message.edit_text(
             "❌ <b>Cannot list API keys</b>\n\n"
             "Run setup SQL first, then ensure <code>SUPABASE_SERVICE_ROLE_KEY</code> is set.\n\n"
-            f"<pre>{html.escape(str(e)[:1800])}</pre>",
+            f"<pre>{error_text}</pre>",
             parse_mode="HTML",
             reply_markup=get_api_admin_kb(),
         ))
@@ -23133,11 +23157,12 @@ async def _cb_api_dashboard(query, user_id: int, context: ContextTypes.DEFAULT_T
                 _DB_EXECUTOR,
                 lambda: db_ai_api_key_revoke(identifier),
             )
-        except Exception as e:
-            logger.error("api_revoke button failed: %s", e, exc_info=True)
+        except Exception as exc:
+            logger.error("api_revoke button failed: %s", exc, exc_info=True)
+            error_text = html.escape(str(exc)[:1800])
             await safe_send(lambda: query.message.edit_text(
                 "❌ <b>Cannot revoke API key</b>\n\n"
-                f"<pre>{html.escape(str(e)[:1800])}</pre>",
+                f"<pre>{error_text}</pre>",
                 parse_mode="HTML",
                 reply_markup=get_api_admin_kb(),
             ))
@@ -24303,7 +24328,6 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
         return
 
     chat_id = query.message.chat.id
-    loop    = asyncio.get_running_loop()
     original_text, prefs = await asyncio.gather(
         get_text_cache_async(transcript_msg_id, chat_id),
         get_user_prefs_async(user_id),
@@ -24365,8 +24389,6 @@ async def _cb_audio_tts(query, user_id: int, context, data: str):
         await safe_send(lambda: query.message.reply_text("❌ Invalid audio transcript id."))
         return
     chat_id    = query.message.chat.id
-    loop       = asyncio.get_running_loop()
-
     full_text, prefs = await asyncio.gather(
         get_text_cache_async(src_msg_id, chat_id),
         get_user_prefs_async(user_id),
