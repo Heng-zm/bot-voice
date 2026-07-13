@@ -2466,6 +2466,7 @@ insert into public.bot_settings (key, value) values
   ('ocr_enabled', '1'),
   ('voice_transcribe_enabled', '1'),
   ('audio_transcribe_enabled', '1'),
+  ('audio_to_voice_enabled', '1'),
   ('ai_resolver_enabled', '1'),
   ('TELEGRAM_CONCURRENT_UPDATES', '4'),
   ('TELEGRAM_CONNECTION_POOL_SIZE', '24'),
@@ -7962,13 +7963,13 @@ def web_admin_control_action():
                         count += 1
             msg = f"Cancel requested for {count} active web broadcast job(s)."
         elif action == "pause_all":
-            for key in ("maintenance_mode", "tts_enabled", "ocr_enabled", "voice_transcribe_enabled", "audio_transcribe_enabled", "ai_resolver_enabled"):
+            for key in ("maintenance_mode", "tts_enabled", "ocr_enabled", "voice_transcribe_enabled", "audio_transcribe_enabled", "audio_to_voice_enabled", "ai_resolver_enabled"):
                 db_bot_setting_set(key, key == "maintenance_mode", _web_current_admin_id())
             _bot_settings_cache["ts"] = 0.0
             msg = "Emergency pause enabled. Maintenance is ON and public features are OFF."
         elif action == "resume_all":
             db_bot_setting_set("maintenance_mode", False, _web_current_admin_id())
-            for key in ("tts_enabled", "ocr_enabled", "voice_transcribe_enabled", "audio_transcribe_enabled", "ai_resolver_enabled"):
+            for key in ("tts_enabled", "ocr_enabled", "voice_transcribe_enabled", "audio_transcribe_enabled", "audio_to_voice_enabled", "ai_resolver_enabled"):
                 db_bot_setting_set(key, True, _web_current_admin_id())
             _bot_settings_cache["ts"] = 0.0
             msg = "Normal service resumed."
@@ -9548,6 +9549,7 @@ HF_TTS_CLIENT_CACHE      = _env_bool("HF_TTS_CLIENT_CACHE", True)
 HF_TTS_SERIALIZE_CALLS   = _env_bool("HF_TTS_SERIALIZE_CALLS", True)
 FFMPEG_START_TIMEOUT_S  = _env_float("FFMPEG_START_TIMEOUT_S", 5.0, minimum=1.0, maximum=30.0)
 FFMPEG_CONVERT_TIMEOUT_S = _env_float("FFMPEG_CONVERT_TIMEOUT_S", 120.0, minimum=15.0, maximum=600.0)
+AUDIO_TO_VOICE_MAX_CONCURRENT = _env_int("AUDIO_TO_VOICE_MAX_CONCURRENT", 2, minimum=1, maximum=8)
 DEFAULT_SPEED           = 1.0
 TELE_MSG_LIMIT          = 4000
 USER_COOLDOWN_S         = 3.0
@@ -11270,7 +11272,8 @@ SPEED_OPTIONS = {
 }
 WELCOME_TEXT = (
     "🎵 សួស្តី! ខ្ញុំជា Bot បំលែងអក្សរទៅជាសំឡេង អេអាយ\n\n"
-    "📌 វាយអក្សរភាសាណាមួយ ផ្ញើរមក Bot នឹងបំលែងដោយស្វ័យប្រវត្តិ!\n\n"
+    "📌 វាយអក្សរភាសាណាមួយ ផ្ញើរមក Bot នឹងបំលែងដោយស្វ័យប្រវត្តិ!\n"
+    "🎙️ ផ្ញើ MP3/Audio file ដើម្បីបំលែងទៅជា Telegram Voice Record។\n\n"
     "🌍 ភាសាដែល Support:\n"
     "🇰🇭 ភាសាខ្មែរ | 🇺🇸 English | 🇨🇳 中文 | 🇰🇷 한국어 | 🇯🇵 日本語\n"
     "💡 Japanese/Chinese Kanji ambiguous? use: ja: 日本語 or zh: 中文\n\n"
@@ -12740,6 +12743,7 @@ BOT_FEATURE_SETTING_KEYS: tuple[str, ...] = (
     "ocr_enabled",
     "voice_transcribe_enabled",
     "audio_transcribe_enabled",
+    "audio_to_voice_enabled",
     "ai_resolver_enabled",
 )
 
@@ -12768,6 +12772,7 @@ BOT_SETTING_DEFAULTS: dict[str, str] = {
     "ocr_enabled": "1",
     "voice_transcribe_enabled": "1",
     "audio_transcribe_enabled": "1",
+    "audio_to_voice_enabled": "1",
     "ai_resolver_enabled": "1",
     **{key: str(_perf_default(key, spec.get("default", ""))) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
@@ -12777,6 +12782,7 @@ BOT_SETTING_LABELS: dict[str, str] = {
     "ocr_enabled": "🔍 Image OCR",
     "voice_transcribe_enabled": "🎙️ Voice Transcribe",
     "audio_transcribe_enabled": "🎵 Audio File Transcribe",
+    "audio_to_voice_enabled": "🎙️ MP3/Audio → Voice Record",
     "ai_resolver_enabled": "🧠 AI Text Resolver",
     **{key: str(spec.get("label", key)) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
@@ -12786,6 +12792,7 @@ BOT_SETTING_DESCRIPTIONS: dict[str, str] = {
     "ocr_enabled": "Allow photo OCR reading.",
     "voice_transcribe_enabled": "Allow Telegram voice transcription.",
     "audio_transcribe_enabled": "Allow uploaded audio-file transcription.",
+    "audio_to_voice_enabled": "Convert uploaded MP3/audio files to Telegram OGG/Opus voice records.",
     "ai_resolver_enabled": "Allow AI to rewrite/resolve text before TTS when enabled by env.",
     **{key: str(spec.get("help", "")) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
@@ -12808,6 +12815,7 @@ _RUNTIME_METRICS: OrderedDict[str, int] = OrderedDict([
     ("ocr", 0),
     ("voice", 0),
     ("audio", 0),
+    ("audio_to_voice", 0),
     ("blocked_hits", 0),
     ("disabled_hits", 0),
     ("admin_denied", 0),
@@ -15291,8 +15299,8 @@ _OCR_FRAMES = [
     "🔍 កំពុង OCR រូបភាព ···", "🔍 កំពុង OCR រូបភាព ····",
 ]
 _AUDIO_FILE_FRAMES = [
-    "🎵 កំពុង Transcribe ឯកសារអូឌីយ៉ូ ·", "🎵 កំពុង Transcribe ឯកសារអូឌីយ៉ូ ··",
-    "🎵 កំពុង Transcribe ឯកសារអូឌីយ៉ូ ···", "🎵 កំពុង Transcribe ឯកសារអូឌីយ៉ូ ····",
+    "🎵 កំពុងដំណើរការឯកសារអូឌីយ៉ូ ·", "🎵 កំពុងដំណើរការឯកសារអូឌីយ៉ូ ··",
+    "🎵 កំពុងដំណើរការឯកសារអូឌីយ៉ូ ···", "🎵 កំពុងដំណើរការឯកសារអូឌីយ៉ូ ····",
 ]
 
 
@@ -16083,6 +16091,112 @@ async def _convert_audio_files_to_telegram_voice(input_paths: list[str], speed: 
     except OSError as exc:
         _cleanup(output_path)
         raise RuntimeError(f"Failed to read converted HF TTS output: {exc}") from exc
+
+
+
+_AUDIO_TO_VOICE_SEMAPHORE: asyncio.Semaphore | None = None
+_AUDIO_TO_VOICE_SEMAPHORE_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def _get_audio_to_voice_semaphore() -> asyncio.Semaphore:
+    """Return a loop-local semaphore so FFmpeg conversions stay bounded."""
+    global _AUDIO_TO_VOICE_SEMAPHORE, _AUDIO_TO_VOICE_SEMAPHORE_LOOP
+    loop = asyncio.get_running_loop()
+    if _AUDIO_TO_VOICE_SEMAPHORE is None or _AUDIO_TO_VOICE_SEMAPHORE_LOOP is not loop:
+        _AUDIO_TO_VOICE_SEMAPHORE = asyncio.Semaphore(AUDIO_TO_VOICE_MAX_CONCURRENT)
+        _AUDIO_TO_VOICE_SEMAPHORE_LOOP = loop
+    return _AUDIO_TO_VOICE_SEMAPHORE
+
+
+async def _convert_uploaded_audio_to_telegram_voice(input_path: str, output_path: str) -> bytes:
+    """Convert an uploaded audio file to a Telegram voice-record OGG/Opus file.
+
+    Telegram voice bubbles require OGG with the Opus codec. The conversion is
+    mono, 48 kHz, optimized for speech, strips metadata/artwork, and runs under a
+    bounded semaphore so several uploads cannot exhaust a small server.
+    """
+    if not input_path or not os.path.isfile(input_path):
+        raise RuntimeError("Uploaded audio file is missing.")
+
+    try:
+        input_size = await asyncio.to_thread(os.path.getsize, input_path)
+    except OSError as exc:
+        raise RuntimeError(f"Could not inspect uploaded audio: {exc}") from exc
+
+    cmd = [
+        _FFMPEG_EXE,
+        "-hide_banner",
+        "-loglevel", "error",
+        "-nostdin",
+        "-y",
+        "-i", input_path,
+        "-map", "0:a:0",
+        "-map_metadata", "-1",
+        "-vn",
+        "-ac", "1",
+        "-ar", "48000",
+        "-c:a", "libopus",
+        "-application", "voip",
+        "-b:a", "32k",
+        "-vbr", "on",
+        "-compression_level", "10",
+        "-f", "ogg",
+        output_path,
+    ]
+
+    proc: asyncio.subprocess.Process | None = None
+    semaphore = _get_audio_to_voice_semaphore()
+    try:
+        async with semaphore:
+            proc = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                ),
+                timeout=FFMPEG_START_TIMEOUT_S,
+            )
+            timeout_s = _ffmpeg_tts_timeout_s(chunk_count=1, input_bytes=input_size)
+            _, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+    except FileNotFoundError as exc:
+        _cleanup(output_path)
+        raise RuntimeError(f"FFmpeg executable not found: {_FFMPEG_EXE}") from exc
+    except asyncio.TimeoutError as exc:
+        _cleanup(output_path)
+        await _terminate_subprocess(proc, "audio-to-voice FFmpeg")
+        raise RuntimeError("FFmpeg timed out while converting the audio file to voice.") from exc
+    except asyncio.CancelledError:
+        _cleanup(output_path)
+        await _terminate_subprocess(proc, "audio-to-voice FFmpeg")
+        raise
+
+    if proc is None or proc.returncode != 0:
+        _cleanup(output_path)
+        snippet = (stderr_data or b"").decode(errors="replace")[-800:]
+        return_code = proc.returncode if proc is not None else "not-started"
+        raise RuntimeError(f"FFmpeg audio-to-voice conversion failed ({return_code}): {snippet}")
+
+    try:
+        voice_bytes = await asyncio.wait_for(
+            _read_file_bytes_async(output_path, max_bytes=MAX_VOICE_BYTES),
+            timeout=15,
+        )
+    except ValueError as exc:
+        _cleanup(output_path)
+        raise RuntimeError(
+            f"Converted voice is too large. Max {MAX_VOICE_BYTES // 1024 // 1024} MB."
+        ) from exc
+    except asyncio.TimeoutError as exc:
+        _cleanup(output_path)
+        raise RuntimeError("Timed out reading the converted voice file.") from exc
+    except OSError as exc:
+        _cleanup(output_path)
+        raise RuntimeError(f"Could not read the converted voice file: {exc}") from exc
+
+    if not voice_bytes or not voice_bytes.startswith(b"OggS"):
+        _cleanup(output_path)
+        raise RuntimeError("FFmpeg produced an invalid Telegram voice file.")
+    return voice_bytes
 
 
 async def _generate_voice_hf_space(text: str, speed: float, output_path: str) -> bytes:
@@ -23619,17 +23733,23 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg     = update.message
-    user    = update.effective_user
+    """Handle uploaded audio without requiring Gemini for voice conversion.
+
+    Every supported MP3/audio upload can be converted to a real Telegram voice
+    record (OGG/Opus). Existing audio transcription remains available and runs
+    from the same downloaded temp file when that feature and Gemini are enabled.
+    """
+    msg = update.message
+    user = update.effective_user
     user_id = user.id if user else None
-    if user_id is None:
+    if user_id is None or msg is None:
         return
 
     # Admin chat-session forward
     if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
         target_id = _admin_chat_target.get(user_id)
         if target_id:
-            ok    = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
+            ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
             reply = (
                 f"✅ ផ្ញើដល់ User <code>{target_id}</code> ។"
                 if ok else
@@ -23648,36 +23768,40 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: msg.reply_text("✅ ឯកសារបានផ្ញើដល់ Admin ។"))
         return
 
-    doc   = msg.document
+    doc = msg.document
     audio = msg.audio
 
     if doc is not None:
-        filename  = doc.file_name or ""
+        filename = doc.file_name or ""
         mime_type = doc.mime_type or ""
-        file_id   = doc.file_id
-        file_size = doc.file_size or 0
-        # FIX: Check subtitle BEFORE audio — subtitle files (.txt/.srt/.vtt) must
-        # be handled by on_document, not the audio transcriber.
-        if _is_subtitle_file(filename):
-            await on_document(update, context)
-            return
-        if not _is_audio_file(filename, mime_type):
+        file_id = doc.file_id
+        file_size = int(doc.file_size or 0)
+        # Subtitle/text documents belong to the document reader, not FFmpeg.
+        if _is_subtitle_file(filename) or not _is_audio_file(filename, mime_type):
             await on_document(update, context)
             return
     elif audio is not None:
-        filename  = audio.file_name or ""
+        filename = audio.file_name or ""
         mime_type = audio.mime_type or ""
-        file_id   = audio.file_id
-        file_size = audio.file_size or 0
+        file_id = audio.file_id
+        file_size = int(audio.file_size or 0)
     else:
         return
 
-    if not await _ensure_user_allowed(update, context, "audio_transcribe_enabled", "Audio file transcribe"):
+    # Check block/maintenance once. Feature flags are evaluated below so admins
+    # retain the existing bypass and conversion can still work without Gemini.
+    if not await _ensure_user_allowed(update, context):
         return
 
-    if not _gemini:
+    is_admin = _is_admin(user_id)
+    settings, _settings_status = await get_bot_settings_async()
+    convert_enabled = is_admin or _setting_bool_from(settings, "audio_to_voice_enabled", True)
+    transcribe_enabled = is_admin or _setting_bool_from(settings, "audio_transcribe_enabled", True)
+
+    if not convert_enabled and not transcribe_enabled:
+        _metric_inc("disabled_hits")
         await safe_send(lambda: msg.reply_text(
-            "❌ Gemini API មិន Activate ទេ។ Transcribe ត្រូវការ GEMINI_API_KEY ។"
+            "⚠️ Audio → Voice និង Audio Transcribe ត្រូវបានបិទបណ្តោះអាសន្នដោយ Admin។"
         ))
         return
 
@@ -23690,61 +23814,136 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _check_cooldown(msg, user_id):
         return
 
-    _metric_inc("audio")
     sync_user_data(user)
-    uname       = user.username or user.first_name or str(user_id)
-    ext         = os.path.splitext(filename)[1].lower() if filename else ".mp3"
+    uname = user.username or user.first_name or str(user_id)
+    ext = os.path.splitext(filename)[1].lower() if filename else ".mp3"
     if ext not in _AUDIO_EXTENSIONS:
         ext = ".mp3"
     gemini_mime = _audio_mime_for_gemini(filename, mime_type)
-    audio_path  = _make_temp_audio(suffix=ext)
+    audio_path: str | None = None
+    voice_path: str | None = None
+    voice_sent = False
+    transcript_sent = False
+    conversion_error: Exception | None = None
+    transcription_error: Exception | None = None
 
-    stop_event  = asyncio.Event()
-    timer_task  = asyncio.create_task(
+    stop_event = asyncio.Event()
+    timer_task = asyncio.create_task(
         send_status_timer(msg.chat_id, context.bot, stop_event, frames=_AUDIO_FILE_FRAMES)
     )
+
     try:
         tg_file = await safe_send(lambda: context.bot.get_file(file_id))
         if not tg_file:
             raise RuntimeError("Could not download audio file.")
-        await tg_file.download_to_drive(audio_path)
-        transcript = await transcribe_audio_file(audio_path, gemini_mime)
+        audio_path = await _download_telegram_file_to_temp_path(
+            tg_file,
+            MAX_AUDIO_FILE_BYTES,
+            suffix=ext,
+        )
 
-        if not transcript:
-            await safe_send(lambda: msg.reply_text(
-                "❌ រក Transcript មិនឃើញ — ឯកសារប្រហែលជាស្ងាត់ ឬ មិន Support ។"
+        if convert_enabled:
+            voice_path = _make_temp_ogg()
+            try:
+                voice_bytes = await _convert_uploaded_audio_to_telegram_voice(audio_path, voice_path)
+                display_name = html.escape((filename or "audio")[:80])
+                sent_voice = await safe_send(lambda vb=voice_bytes, dn=display_name: msg.reply_voice(
+                    voice=vb,
+                    caption=f"🎙️ <b>Voice record</b> — <code>{dn}</code>",
+                    parse_mode="HTML",
+                ))
+                voice_sent = sent_voice is not None
+                if voice_sent:
+                    _metric_inc("audio_to_voice")
+            except Exception as exc:
+                conversion_error = exc
+                logger.error("Audio-to-voice conversion failed: %s", exc, exc_info=True)
+
+        # Preserve the original transcription feature. It is independent from
+        # conversion and therefore still works when FFmpeg conversion fails.
+        if transcribe_enabled:
+            if _gemini is None:
+                if not voice_sent:
+                    transcription_error = RuntimeError(
+                        "Gemini API is not active. Set GEMINI_API_KEY for transcription."
+                    )
+            else:
+                try:
+                    transcript = await transcribe_audio_file(audio_path, gemini_mime)
+                    if transcript:
+                        _metric_inc("audio")
+                        record_turn(user_id, "user", f"[Audio File Transcript]: {transcript[:500]}")
+                        is_khmer = bool(_KHMER_RE.search(transcript))
+                        lang_flag = "🇰🇭" if is_khmer else "🇺🇸"
+                        fname_display = html.escape(filename[:50]) if filename else "audio"
+                        header = f"🎵 <b>Transcript</b> {lang_flag} — <code>{fname_display}</code>\n\n"
+                        plain_pages = _paginate_plain(transcript, limit=TELE_MSG_LIMIT - len(header))
+                        sent_pages = []
+                        for idx, plain_page in enumerate(plain_pages):
+                            page_body = (header if idx == 0 else "") + html.escape(plain_page)
+                            sent = await safe_send(
+                                lambda pb=page_body: msg.reply_text(pb, parse_mode="HTML")
+                            )
+                            sent_pages.append(sent)
+                            await asyncio.sleep(0.2)
+
+                        last_sent = sent_pages[-1] if sent_pages else None
+                        if last_sent:
+                            save_text_cache(
+                                last_sent.message_id,
+                                transcript,
+                                chat_id=msg.chat_id,
+                                user_id=user_id,
+                                username=uname,
+                            )
+                            await safe_send(lambda: last_sent.edit_reply_markup(
+                                reply_markup=get_audio_file_kb(last_sent.message_id)
+                            ))
+                            transcript_sent = True
+                    else:
+                        transcription_error = RuntimeError(
+                            "No transcript was found; the file may be silent or unsupported."
+                        )
+                except Exception as exc:
+                    transcription_error = exc
+                    logger.error("Audio transcription failed: %s", exc, exc_info=True)
+
+        if not voice_sent and not transcript_sent:
+            if conversion_error and transcription_error:
+                detail = f"Voice conversion: {conversion_error}; transcription: {transcription_error}"
+            elif conversion_error:
+                detail = str(conversion_error)
+            elif transcription_error:
+                detail = str(transcription_error)
+            else:
+                detail = "No enabled audio operation completed."
+            await safe_send(lambda d=detail: msg.reply_text(
+                "❌ មិនអាចដំណើរការឯកសារអូឌីយ៉ូបានទេ។\n"
+                f"<code>{html.escape(d[:900])}</code>",
+                parse_mode="HTML",
             ))
-            return
-
-        record_turn(user_id, "user", f"[Audio File Transcript]: {transcript[:500]}")
-        is_khmer   = bool(_KHMER_RE.search(transcript))
-        lang_flag  = "🇰🇭" if is_khmer else "🇺🇸"
-        fname_display = html.escape(filename[:50]) if filename else "audio"
-        header     = f"🎵 <b>Transcript</b> {lang_flag} — <code>{fname_display}</code>\n\n"
-        plain_pages = _paginate_plain(transcript, limit=TELE_MSG_LIMIT - len(header))
-        sent_pages  = []
-        for idx, plain_page in enumerate(plain_pages):
-            page_body = (header if idx == 0 else "") + html.escape(plain_page)
-            sent      = await safe_send(lambda pb=page_body: msg.reply_text(pb, parse_mode="HTML"))
-            sent_pages.append(sent)
-            await asyncio.sleep(0.2)
-
-        last_sent = sent_pages[-1] if sent_pages else None
-        if last_sent:
-            save_text_cache(
-                last_sent.message_id, transcript,
-                chat_id=msg.chat_id, user_id=user_id, username=uname,
-            )
-            await safe_send(lambda: last_sent.edit_reply_markup(
-                reply_markup=get_audio_file_kb(last_sent.message_id)
+        elif conversion_error:
+            # Transcription succeeded, but make the requested conversion failure visible.
+            await safe_send(lambda e=conversion_error: msg.reply_text(
+                "⚠️ Transcript បានជោគជ័យ ប៉ុន្តែ Audio → Voice បរាជ័យ។\n"
+                f"<code>{html.escape(str(e)[:700])}</code>",
+                parse_mode="HTML",
             ))
 
-    except Exception as e:
-        logger.error(f"on_audio_file error: {e}", exc_info=True)
-        await safe_send(lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការ Transcribe ឯកសារអូឌីយ៉ូ។"))
+    except ValueError as exc:
+        logger.warning("Audio upload rejected: %s", exc)
+        await safe_send(lambda err=str(exc): msg.reply_text(f"❌ {html.escape(err)}", parse_mode="HTML"))
+    except Exception as exc:
+        logger.error("on_audio_file error: %s", exc, exc_info=True)
+        await safe_send(lambda: msg.reply_text(
+            "❌ មានបញ្ហាក្នុងការទាញយក ឬដំណើរការឯកសារអូឌីយ៉ូ។"
+        ))
     finally:
         await _stop_timer(stop_event, timer_task)
-        _cleanup(audio_path)
+        if audio_path:
+            _cleanup(audio_path)
+        if voice_path:
+            _cleanup(voice_path)
 
 
 async def on_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
