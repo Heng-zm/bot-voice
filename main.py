@@ -8050,6 +8050,10 @@ try:
     from gradio_client import Client as GradioClient
 except Exception:
     GradioClient = None
+try:
+    from gradio_client import handle_file as GradioHandleFile
+except Exception:
+    GradioHandleFile = None
 load_dotenv = _early_load_dotenv
 try:
     from telegram.request import HTTPXRequest
@@ -8119,7 +8123,7 @@ def _admin_error_feature(source: str, message: str) -> str:
         return "Supabase / DB"
     if "redis" in hay or "lock" in hay:
         return "Redis / Locks"
-    if "edge-tts" in hay or "speech.platform.bing" in hay or "tts" in hay:
+    if "edge-tts" in hay or "speech.platform.bing" in hay or "tts" in hay or "voxcpm" in hay:
         return "TTS Engine"
     if "gemini" in hay or "huggingface" in hay or "hf_" in hay or "ai-assistant" in hay:
         return "AI / OCR"
@@ -9547,6 +9551,29 @@ HF_TTS_QUOTA_COOLDOWN_S  = _env_float("HF_TTS_QUOTA_COOLDOWN_S", 1800.0, minimum
 HF_TTS_NO_AUDIO_COOLDOWN_S = _env_float("HF_TTS_NO_AUDIO_COOLDOWN_S", 600.0, minimum=60.0, maximum=3600.0)
 HF_TTS_CLIENT_CACHE      = _env_bool("HF_TTS_CLIENT_CACHE", True)
 HF_TTS_SERIALIZE_CALLS   = _env_bool("HF_TTS_SERIALIZE_CALLS", True)
+
+# VoxCPM2 — controllable voice cloning through the official openbmb Gradio demo.
+# The public Space exposes api_name="generate" with the inputs:
+# text, control instruction, reference audio, ultimate-mode flag, prompt text,
+# CFG, normalize-text flag, and denoise-reference flag. This integration uses
+# Controllable Cloning: reference audio + optional Control Instruction.
+VOXCPM2_ENABLED             = _env_bool("VOXCPM2_ENABLED", True)
+VOXCPM2_SPACE               = (os.environ.get("VOXCPM2_SPACE") or "openbmb/VoxCPM-Demo").strip()
+VOXCPM2_API_NAME            = (os.environ.get("VOXCPM2_API_NAME") or "/generate").strip()
+VOXCPM2_TOKEN               = (os.environ.get("VOXCPM2_TOKEN") or os.environ.get("HF_TOKEN") or "").strip()
+VOXCPM2_CFG_VALUE           = _env_float("VOXCPM2_CFG_VALUE", 2.0, minimum=1.0, maximum=3.0)
+VOXCPM2_NORMALIZE_TEXT      = _env_bool("VOXCPM2_NORMALIZE_TEXT", False)
+VOXCPM2_DENOISE_REFERENCE   = _env_bool("VOXCPM2_DENOISE_REFERENCE", False)
+VOXCPM2_TIMEOUT_S           = _env_float("VOXCPM2_TIMEOUT_S", 180.0, minimum=30.0, maximum=900.0)
+VOXCPM2_RETRIES             = _env_int("VOXCPM2_RETRIES", 2, minimum=1, maximum=5)
+VOXCPM2_RETRY_DELAY_S       = _env_float("VOXCPM2_RETRY_DELAY_S", 3.0, minimum=0.5, maximum=30.0)
+VOXCPM2_MAX_CHARS           = _env_int("VOXCPM2_MAX_CHARS", 500, minimum=80, maximum=1200)
+VOXCPM2_MAX_REFERENCE_BYTES = _env_int("VOXCPM2_MAX_REFERENCE_MB", 20, minimum=1, maximum=50) * 1024 * 1024
+VOXCPM2_MAX_REFERENCE_SECONDS = _env_float("VOXCPM2_MAX_REFERENCE_SECONDS", 50.0, minimum=5.0, maximum=120.0)
+VOXCPM2_PROFILE_TTL_S       = _env_int("VOXCPM2_PROFILE_TTL_S", 30 * 86400, minimum=3600, maximum=365 * 86400)
+VOXCPM2_PROFILE_MEMORY_TTL_S = _env_float("VOXCPM2_PROFILE_MEMORY_TTL_S", 300.0, minimum=10.0, maximum=86400.0)
+VOXCPM2_CONTROL_MAX_CHARS   = _env_int("VOXCPM2_CONTROL_MAX_CHARS", 300, minimum=20, maximum=1000)
+VOXCPM2_SERIALIZE_CALLS     = _env_bool("VOXCPM2_SERIALIZE_CALLS", True)
 FFMPEG_START_TIMEOUT_S  = _env_float("FFMPEG_START_TIMEOUT_S", 5.0, minimum=1.0, maximum=30.0)
 FFMPEG_CONVERT_TIMEOUT_S = _env_float("FFMPEG_CONVERT_TIMEOUT_S", 120.0, minimum=15.0, maximum=600.0)
 AUDIO_TO_VOICE_MAX_CONCURRENT = _env_int("AUDIO_TO_VOICE_MAX_CONCURRENT", 2, minimum=1, maximum=8)
@@ -11303,6 +11330,7 @@ WELCOME_TEXT = (
     "🇰🇭 ភាសាខ្មែរ | 🇺🇸 English | 🇨🇳 中文 | 🇰🇷 한국어 | 🇯🇵 日本語\n"
     "💡 Japanese/Chinese Kanji ambiguous? use: ja: 日本語 or zh: 中文\n\n"
     "⚙️ ប្រើ /myprefs ដើម្បីមើលការកំណត់របស់អ្នក\n"
+    "🎙️ ប្រើ /voxcpm2 សម្រាប់ Controllable Voice Cloning\n"
     "📢 Join My Channel: https://t.me/m11mmm112"
 )
 BOT_TAG = "@voicekhaibot"
@@ -11350,6 +11378,7 @@ TTS_MODEL_OPTIONS = {
     "auto": ("Auto", "Kiri → Edge TTS"),
     "hf_space": ("Kiri", ""),
     "edge": ("Edge TTS", ""),
+    "voxcpm2": ("VoxCPM2 Clone", "Reference + Style Control"),
 }
 TTS_MODEL_ALIASES = {
     "auto": "auto",
@@ -11364,6 +11393,11 @@ TTS_MODEL_ALIASES = {
     "edge": "edge",
     "edge_tts": "edge",
     "msedge": "edge",
+    "voxcpm2": "voxcpm2",
+    "vox_cpm2": "voxcpm2",
+    "vox": "voxcpm2",
+    "voice_clone": "voxcpm2",
+    "clone": "voxcpm2",
 }
 DEFAULT_TTS_MODEL = (os.environ.get("DEFAULT_TTS_MODEL") or os.environ.get("USER_DEFAULT_TTS_MODEL") or "auto").strip().lower()
 
@@ -11380,6 +11414,132 @@ def _tts_model_label(value: Any) -> str:
 
 
 DEFAULT_USER_PREFS: dict = {"gender": "female", "speed": DEFAULT_SPEED, "tts_model": _normalize_tts_model(DEFAULT_TTS_MODEL)}
+
+
+# VoxCPM2 profile data stores only reusable Telegram file identifiers and the
+# optional style instruction. Raw reference-audio bytes are downloaded to a
+# temporary file only while a generation request is running.
+VOXCPM2_WAIT_REFERENCE = "await_reference"
+VOXCPM2_WAIT_CONTROL = "await_control"
+_VOXCPM2_PROFILE_MEMORY: OrderedDict[int, tuple[dict[str, Any], float]] = OrderedDict()
+_VOXCPM2_PROFILE_MEMORY_LOCK = threading.RLock()
+_VOXCPM2_PROFILE_MEMORY_MAX = _env_int("VOXCPM2_PROFILE_MEMORY_MAX", 5000, minimum=100, maximum=50000)
+
+
+def _voxcpm2_profile_redis_key(user_id: int) -> str:
+    return _redis_key("voxcpm2", "profile", int(user_id))
+
+
+def _voxcpm2_normalize_profile(value: Any) -> dict[str, Any]:
+    raw = dict(value) if isinstance(value, dict) else {}
+    profile = {
+        "file_id": str(raw.get("file_id") or "").strip(),
+        "file_unique_id": str(raw.get("file_unique_id") or "").strip(),
+        "filename": str(raw.get("filename") or "reference_audio").strip()[:160],
+        "mime_type": str(raw.get("mime_type") or "audio/ogg").strip()[:100],
+        "suffix": str(raw.get("suffix") or ".ogg").strip()[:12],
+        "duration": float(raw.get("duration") or 0.0),
+        "file_size": int(raw.get("file_size") or 0),
+        "control": str(raw.get("control") or "").strip()[:VOXCPM2_CONTROL_MAX_CHARS],
+        "updated_at": str(raw.get("updated_at") or "").strip(),
+    }
+    if not profile["suffix"].startswith(".") or not re.fullmatch(r"\.[a-z0-9]{1,8}", profile["suffix"], re.I):
+        profile["suffix"] = ".ogg"
+    return profile
+
+
+def _voxcpm2_profile_memory_get(user_id: int) -> dict[str, Any] | None:
+    user_id = int(user_id)
+    now = time.monotonic()
+    with _VOXCPM2_PROFILE_MEMORY_LOCK:
+        item = _VOXCPM2_PROFILE_MEMORY.get(user_id)
+        if not item:
+            return None
+        profile, created = item
+        if now - float(created or 0.0) > VOXCPM2_PROFILE_MEMORY_TTL_S:
+            _VOXCPM2_PROFILE_MEMORY.pop(user_id, None)
+            return None
+        _VOXCPM2_PROFILE_MEMORY.move_to_end(user_id)
+        return dict(profile)
+
+
+def _voxcpm2_profile_memory_set(user_id: int, profile: dict[str, Any]) -> None:
+    user_id = int(user_id)
+    normalized = _voxcpm2_normalize_profile(profile)
+    with _VOXCPM2_PROFILE_MEMORY_LOCK:
+        _VOXCPM2_PROFILE_MEMORY[user_id] = (normalized, time.monotonic())
+        _VOXCPM2_PROFILE_MEMORY.move_to_end(user_id)
+        while len(_VOXCPM2_PROFILE_MEMORY) > _VOXCPM2_PROFILE_MEMORY_MAX:
+            _VOXCPM2_PROFILE_MEMORY.popitem(last=False)
+
+
+async def _voxcpm2_profile_get(user_id: int, *, force: bool = False) -> dict[str, Any]:
+    user_id = int(user_id)
+    if not force:
+        cached = _voxcpm2_profile_memory_get(user_id)
+        if cached is not None:
+            return cached
+    profile: dict[str, Any] = {}
+    if redis_client is not None:
+        try:
+            loaded = await asyncio.to_thread(
+                _redis_get_json_sync,
+                _voxcpm2_profile_redis_key(user_id),
+                {},
+            )
+            if isinstance(loaded, dict):
+                profile = loaded
+        except Exception as exc:
+            logger.warning("VoxCPM2 profile Redis read failed user=%s: %s", user_id, exc)
+    normalized = _voxcpm2_normalize_profile(profile)
+    _voxcpm2_profile_memory_set(user_id, normalized)
+    return normalized
+
+
+async def _voxcpm2_profile_set(user_id: int, profile: dict[str, Any]) -> dict[str, Any]:
+    user_id = int(user_id)
+    normalized = _voxcpm2_normalize_profile(profile)
+    if not normalized.get("updated_at"):
+        normalized["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _voxcpm2_profile_memory_set(user_id, normalized)
+    if redis_client is not None:
+        try:
+            await asyncio.to_thread(
+                _redis_set_json_sync,
+                _voxcpm2_profile_redis_key(user_id),
+                normalized,
+                int(VOXCPM2_PROFILE_TTL_S),
+            )
+        except Exception as exc:
+            logger.warning("VoxCPM2 profile Redis write failed user=%s: %s", user_id, exc)
+    return normalized
+
+
+async def _voxcpm2_profile_delete(user_id: int) -> None:
+    user_id = int(user_id)
+    with _VOXCPM2_PROFILE_MEMORY_LOCK:
+        _VOXCPM2_PROFILE_MEMORY.pop(user_id, None)
+    if redis_client is not None:
+        with suppress(Exception):
+            await asyncio.to_thread(_redis_delete_sync, _voxcpm2_profile_redis_key(user_id))
+
+
+def _voxcpm2_reference_ready(profile: dict[str, Any] | None) -> bool:
+    return bool(isinstance(profile, dict) and str(profile.get("file_id") or "").strip())
+
+
+def _voxcpm2_reference_suffix(filename: str, mime_type: str, fallback: str = ".ogg") -> str:
+    suffix = os.path.splitext(str(filename or ""))[1].lower()
+    if suffix in _AUDIO_EXTENSIONS:
+        return suffix
+    mt = str(mime_type or "").lower()
+    mapping = {
+        "audio/ogg": ".ogg", "audio/opus": ".opus", "audio/mpeg": ".mp3",
+        "audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/wav": ".wav",
+        "audio/x-wav": ".wav", "audio/flac": ".flac", "audio/aac": ".aac",
+        "video/mp4": ".mp4", "video/webm": ".webm",
+    }
+    return mapping.get(mt, fallback)
 
 # Optional Supabase column state. Older deployments may not have
 # user_prefs.tts_model yet, and PostgREST may keep a stale schema cache right
@@ -12749,6 +12909,10 @@ def startup_self_check() -> None:
         checks.append("gradio_client is missing; Khmer HF Space TTS will fall back to Edge. Add `gradio_client` to requirements.txt")
     if _should_try_hf_khmer_tts("សាកល្បង", "hf_space") and not HF_TTS_SPACE:
         checks.append("HF_TTS_SPACE is empty; Khmer HF Space TTS is disabled")
+    if VOXCPM2_ENABLED and (GradioClient is None or GradioHandleFile is None):
+        checks.append("VoxCPM2 requires a recent gradio_client with handle_file. Add `gradio_client>=1.8` to requirements.txt")
+    if VOXCPM2_ENABLED and not VOXCPM2_SPACE:
+        checks.append("VOXCPM2_SPACE is empty; VoxCPM2 controllable cloning is unavailable")
     if not REDIS_URL:
         checks.append("REDIS_URL is missing; cache/history fallback will use memory + Supabase only")
 
@@ -15530,12 +15694,19 @@ _HF_TTS_DISABLED_UNTIL = 0.0
 _HF_TTS_CLIENT = None
 _HF_TTS_CLIENT_KEY: tuple[str, str] | None = None
 
+# VoxCPM2 Gradio client state is separate from the Khmer HF Space client.
+_VOXCPM2_CLIENT_LOCK = threading.Lock()
+_VOXCPM2_CLIENT_CALL_LOCK = threading.Lock()
+_VOXCPM2_CLIENT = None
+_VOXCPM2_CLIENT_KEY: tuple[str, str] | None = None
+
 
 def _tts_provider_summary() -> str:
     return (
         f"provider={TTS_PROVIDER}, khmer={KHMER_TTS_PROVIDER}, "
         f"hf_space={HF_TTS_SPACE}{HF_TTS_API_NAME}, "
         f"gradio_client={'on' if GradioClient is not None else 'missing'}, "
+        f"voxcpm2={'on' if VOXCPM2_ENABLED else 'off'}:{VOXCPM2_SPACE}{VOXCPM2_API_NAME}, "
         f"edge_fallback={'on' if HF_TTS_EDGE_FALLBACK else 'off'}"
     )
 
@@ -16277,6 +16448,222 @@ async def _convert_uploaded_audio_to_telegram_voice(input_path: str, output_path
     return voice_bytes
 
 
+def _voxcpm2_make_client_sync():
+    if not VOXCPM2_ENABLED:
+        raise RuntimeError("VoxCPM2 is disabled by VOXCPM2_ENABLED=false.")
+    if GradioClient is None:
+        raise RuntimeError("gradio_client is not installed. Add `gradio_client>=1.8` to requirements.txt.")
+    if GradioHandleFile is None:
+        raise RuntimeError("gradio_client.handle_file is unavailable. Upgrade `gradio_client`.")
+    if not VOXCPM2_SPACE:
+        raise RuntimeError("VOXCPM2_SPACE is empty.")
+    if VOXCPM2_TOKEN:
+        try:
+            return GradioClient(VOXCPM2_SPACE, hf_token=VOXCPM2_TOKEN)
+        except TypeError:
+            return GradioClient(VOXCPM2_SPACE)
+    return GradioClient(VOXCPM2_SPACE)
+
+
+def _voxcpm2_get_client_sync():
+    global _VOXCPM2_CLIENT, _VOXCPM2_CLIENT_KEY
+    key = (VOXCPM2_SPACE, "token" if VOXCPM2_TOKEN else "public")
+    with _VOXCPM2_CLIENT_LOCK:
+        if _VOXCPM2_CLIENT is not None and _VOXCPM2_CLIENT_KEY == key:
+            return _VOXCPM2_CLIENT
+        _VOXCPM2_CLIENT = _voxcpm2_make_client_sync()
+        _VOXCPM2_CLIENT_KEY = key
+        return _VOXCPM2_CLIENT
+
+
+def _voxcpm2_should_retry(exc: Exception | str) -> bool:
+    msg = str(exc).lower()
+    if any(token in msg for token in (
+        "401", "403", "unauthorized", "forbidden", "invalid token",
+        "invalid api", "api_name", "not found", "reference audio is too long",
+    )):
+        return False
+    return any(token in msg for token in (
+        "429", "500", "502", "503", "504", "busy", "queue", "queued",
+        "timeout", "timed out", "temporarily", "connection", "cold start",
+        "backend_retry", "backend is busy", "backend request timed out",
+    ))
+
+
+def _voxcpm2_predict_sync(text: str, control: str, reference_path: str) -> bytes:
+    if not reference_path or not os.path.isfile(reference_path):
+        raise RuntimeError("VoxCPM2 reference audio is missing. Use /voxcpm2 to upload it again.")
+    if os.path.getsize(reference_path) > VOXCPM2_MAX_REFERENCE_BYTES:
+        raise RuntimeError(
+            f"VoxCPM2 reference audio is too large. Max {VOXCPM2_MAX_REFERENCE_BYTES // 1024 // 1024}MB."
+        )
+    client = _voxcpm2_get_client_sync()
+
+    def _predict_once() -> bytes:
+        reference_upload = GradioHandleFile(reference_path)
+        def _call():
+            return client.predict(
+                text,
+                control,
+                reference_upload,
+                False,   # Controllable Cloning, not Ultimate Cloning
+                "",      # no prompt transcript in controllable mode
+                VOXCPM2_CFG_VALUE,
+                VOXCPM2_NORMALIZE_TEXT,
+                VOXCPM2_DENOISE_REFERENCE,
+                api_name=VOXCPM2_API_NAME,
+            )
+        if VOXCPM2_SERIALIZE_CALLS:
+            with _VOXCPM2_CLIENT_CALL_LOCK:
+                result = _call()
+        else:
+            result = _call()
+
+        data = _extract_hf_audio_bytes_from_result(result)
+        if data:
+            return data
+        path_or_url = _extract_hf_audio_path_or_url(result)
+        if not path_or_url:
+            preview = _web_short(result, 300) if "_web_short" in globals() else str(result)[:300]
+            raise RuntimeError(
+                f"VoxCPM2 returned no valid audio. result_type={type(result).__name__} result={preview!r}"
+            )
+        if re.match(r"^https?://", path_or_url, re.I):
+            response = httpx.get(path_or_url, timeout=VOXCPM2_TIMEOUT_S)
+            response.raise_for_status()
+            data = response.content or b""
+        else:
+            if not os.path.isfile(path_or_url):
+                raise RuntimeError(f"VoxCPM2 returned a missing audio file: {path_or_url!r}")
+            data = _read_file_bytes_sync(path_or_url, max_bytes=MAX_AUDIO_FILE_BYTES)
+        if not data:
+            raise RuntimeError("VoxCPM2 returned empty audio.")
+        return data
+
+    last_exc: Exception | None = None
+    for attempt in range(1, max(1, int(VOXCPM2_RETRIES)) + 1):
+        try:
+            return _predict_once()
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= VOXCPM2_RETRIES or not _voxcpm2_should_retry(exc):
+                raise
+            logger.warning(
+                "VoxCPM2 call failed attempt=%s/%s; retrying: %s",
+                attempt, VOXCPM2_RETRIES, exc,
+            )
+            time.sleep(min(VOXCPM2_RETRY_DELAY_S * (2 ** (attempt - 1)), 30.0))
+    raise RuntimeError(f"VoxCPM2 failed after retries: {last_exc}")
+
+
+async def _generate_voice_voxcpm2(
+    text: str,
+    control: str,
+    reference_path: str,
+    speed: float,
+    output_path: str,
+) -> bytes:
+    text = _clean_tts_text_for_edge(text)
+    if not text:
+        raise ValueError("VoxCPM2 target text must not be empty.")
+    chunks = _split_text_chunks(text, max_chars=VOXCPM2_MAX_CHARS)
+    if not chunks:
+        raise ValueError("VoxCPM2 found no speakable text chunks.")
+    loop = asyncio.get_running_loop()
+    with tempfile.TemporaryDirectory(prefix="voxcpm2_tts_") as tmpdir:
+        input_paths: list[str] = []
+        for index, chunk in enumerate(chunks, 1):
+            try:
+                timeout_budget = (VOXCPM2_TIMEOUT_S * max(1, VOXCPM2_RETRIES)) + 30.0
+                audio_data = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        _AI_EXECUTOR,
+                        _voxcpm2_predict_sync,
+                        chunk,
+                        str(control or "").strip(),
+                        reference_path,
+                    ),
+                    timeout=timeout_budget,
+                )
+            except Exception as exc:
+                preview = chunk[:100].replace("\n", " ")
+                raise RuntimeError(
+                    f"VoxCPM2 failed at chunk {index}/{len(chunks)} ({preview!r}): {exc}"
+                ) from exc
+            suffix = _audio_suffix_from_bytes(audio_data)
+            source_path = os.path.join(tmpdir, f"chunk_{index:03d}{suffix}")
+            with open(source_path, "wb") as handle:
+                handle.write(audio_data)
+            input_paths.append(source_path)
+        converted = await _convert_audio_files_to_telegram_voice(input_paths, speed, output_path)
+        if not converted:
+            raise RuntimeError("VoxCPM2 produced empty converted audio.")
+        logger.info(
+            "VoxCPM2 controllable cloning generated %s chunk(s) via %s%s control=%s",
+            len(chunks), VOXCPM2_SPACE, VOXCPM2_API_NAME, bool(str(control or "").strip()),
+        )
+        return converted
+
+
+async def generate_user_voice_limited(
+    text: str,
+    gender: str,
+    speed: float,
+    output_path: str,
+    tts_model: str,
+    *,
+    user_id: int,
+    bot,
+) -> bytes:
+    """Generate TTS for a user, resolving VoxCPM2 reference audio when selected."""
+    model = _normalize_tts_model(tts_model)
+    if model != "voxcpm2":
+        return await generate_voice_limited(text, gender, speed, output_path, model)
+
+    profile = await _voxcpm2_profile_get(user_id)
+    if not _voxcpm2_reference_ready(profile):
+        raise RuntimeError("VoxCPM2 reference audio is not configured. Use /voxcpm2 and upload a 5–30 second clean voice clip.")
+
+    reference_id = str(profile.get("file_unique_id") or profile.get("file_id") or "")
+    control = str(profile.get("control") or "").strip()
+    provider_context = hashlib.sha256(
+        f"{reference_id}|{control}|{VOXCPM2_CFG_VALUE}|{VOXCPM2_NORMALIZE_TEXT}|{VOXCPM2_DENOISE_REFERENCE}".encode("utf-8")
+    ).hexdigest()
+    cleaned = _clean_tts_text_for_edge(text)
+    cache_key = _tts_audio_cache_key(cleaned, gender, speed, model, provider_context=provider_context)
+    cached = _tts_audio_cache_get(cache_key)
+    if cached is not None:
+        await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
+        return cached
+
+    telegram_file = await safe_send(lambda: bot.get_file(str(profile.get("file_id"))))
+    if not telegram_file:
+        raise RuntimeError("Telegram could not retrieve the saved VoxCPM2 reference audio. Upload it again with /voxcpm2.")
+    suffix = str(profile.get("suffix") or ".ogg")
+    reference_path: str | None = None
+    try:
+        reference_path = await _download_telegram_file_to_temp_path(
+            telegram_file,
+            VOXCPM2_MAX_REFERENCE_BYTES,
+            suffix=suffix,
+        )
+        sem = _TTS_CHUNK_SEMAPHORE
+        if sem is None:
+            audio = await _generate_voice_voxcpm2(cleaned, control, reference_path, speed, output_path)
+        else:
+            async with sem:
+                cached = _tts_audio_cache_get(cache_key)
+                if cached is not None:
+                    await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
+                    return cached
+                audio = await _generate_voice_voxcpm2(cleaned, control, reference_path, speed, output_path)
+        _tts_audio_cache_set(cache_key, audio)
+        return audio
+    finally:
+        if reference_path:
+            _cleanup(reference_path)
+
+
 async def _generate_voice_hf_space(text: str, speed: float, output_path: str) -> bytes:
     """Generate Khmer TTS with mrrtmob/khmer-tts and convert to Telegram voice."""
     if _hf_tts_is_temporarily_disabled():
@@ -16330,6 +16717,10 @@ async def _generate_voice_hf_space(text: str, speed: float, output_path: str) ->
 
 def _tts_user_error_message(exc: Exception | str) -> str:
     msg = str(exc).lower()
+    if "voxcpm2 reference audio" in msg or "use /voxcpm2" in msg:
+        return "❌ VoxCPM2 ត្រូវការ Reference Audio។ ប្រើ /voxcpm2 ហើយ Upload សំឡេងស្អាត 5–30 វិនាទី។"
+    if "voxcpm2" in msg and any(token in msg for token in ("busy", "queue", "timeout", "temporarily", "503")):
+        return "❌ VoxCPM2 កំពុងរវល់/timeout។ សូមសាកអត្ថបទខ្លីជាងនេះ ឬសាកម្តងទៀត។"
     if "no audio" in msg or "edge-tts failed" in msg:
         return (
             "❌ TTS service មិនបានបញ្ជូនសំឡេងមកវិញ។\n"
@@ -16350,17 +16741,24 @@ _TTS_AUDIO_CACHE_LOCK = threading.RLock()
 _TTS_AUDIO_CACHE_BYTES = 0
 
 
-def _tts_audio_cache_key(text: str, gender: str, speed: float, tts_model: str) -> str:
+def _tts_audio_cache_key(
+    text: str,
+    gender: str,
+    speed: float,
+    tts_model: str,
+    provider_context: str = "",
+) -> str:
     cleaned = _clean_tts_text_for_edge(text)
     lang = _detect_tts_lang_key(cleaned)
     payload = {
-        "v": 3,
+        "v": 4,
         "lang": lang,
         "gender": gender if gender in ("female", "male") else "female",
         "speed": _rounded_speed(speed),
         "model": _normalize_tts_model(tts_model),
         "tts_provider": TTS_PROVIDER,
         "khmer_provider": KHMER_TTS_PROVIDER,
+        "provider_context": str(provider_context or ""),
         "text_hash": hashlib.sha256(cleaned.encode("utf-8")).hexdigest(),
     }
     raw = _json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -16867,7 +17265,9 @@ async def _deliver_paged_tts(
     for i, chunk in enumerate(chunks, 1):
         file_path = _make_temp_ogg()
         try:
-            audio_bytes = await generate_voice_limited(chunk, gender, speed, file_path, tts_model)
+            audio_bytes = await generate_user_voice_limited(
+                chunk, gender, speed, file_path, tts_model, user_id=user_id, bot=bot
+            )
             sent = await safe_send(
                 lambda ab=audio_bytes, ci=i, ct=total: bot.send_voice(
                     chat_id=chat_id,
@@ -20574,6 +20974,8 @@ def _admin_tts_provider_text(notice: str = "") -> str:
         f"Default user model: <code>{html.escape(_normalize_tts_model(DEFAULT_TTS_MODEL))}</code>",
         f"HF Space: <code>{html.escape(str(HF_TTS_SPACE))}{html.escape(str(HF_TTS_API_NAME))}</code>",
         f"Gradio client: <b>{'READY' if GradioClient is not None else 'MISSING'}</b>",
+        f"VoxCPM2: <b>{'ON' if VOXCPM2_ENABLED else 'OFF'}</b> · <code>{html.escape(str(VOXCPM2_SPACE))}{html.escape(str(VOXCPM2_API_NAME))}</code>",
+        f"Vox upload helper: <b>{'READY' if GradioHandleFile is not None else 'MISSING'}</b>",
         f"HF cached client: <b>{'YES' if hf_client_ready else 'NO'}</b>",
         f"HF cooldown: <b>{hf_remaining}s</b> {'⚠️' if hf_disabled else '✅'}",
         f"Edge fallback: <b>{'ON' if HF_TTS_EDGE_FALLBACK else 'OFF'}</b>",
@@ -23514,7 +23916,12 @@ async def _clear_admin_transient_state(context: Any, admin_id: int) -> list[str]
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    vox_state = context.user_data.pop("voxcpm2_state", None)
     if not _is_admin(uid):
+        if vox_state:
+            await safe_send(lambda: update.message.reply_text("✅ VoxCPM2 setup cancelled."))
+        else:
+            await safe_send(lambda: update.message.reply_text("ℹ️ No operation to cancel."))
         return
 
     # Preserve the old admin-chat notification behavior while still using the
@@ -23600,7 +24007,9 @@ async def cmd_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_send(lambda: update.effective_message.reply_text(
         "🔒 <b>Privacy</b>\n\n"
         "This bot stores only what it needs for preferences, cached text/audio workflow, "
-        "conversation context, admin safety, and delivery logs.\n\n"
+        "conversation context, admin safety, delivery logs, and—when VoxCPM2 is configured—"
+        "the reusable Telegram reference-audio file identifier plus your optional style instruction. "
+        "Raw clone-reference bytes are downloaded to temporary storage and sent to the configured VoxCPM2 service only during generation.\n\n"
         "You can use /clear to remove current conversation context, or /deleteme to delete "
         "your saved bot history and preferences from cache/database where configured.",
         parse_mode="HTML",
@@ -23611,6 +24020,7 @@ async def _delete_user_personal_data(user_id: int) -> None:
     user_id = int(user_id)
     db_history_clear(user_id)
     _invalidate_prefs(user_id)
+    await _voxcpm2_profile_delete(user_id)
 
     def _run():
         with suppress(Exception):
@@ -23659,9 +24069,183 @@ async def cmd_delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     await _delete_user_personal_data(int(user.id))
     await safe_send(lambda: update.effective_message.reply_text(
-        "✅ Your saved bot history, text cache, and preferences were cleared.\n"
+        "✅ Your saved bot history, text cache, preferences, and VoxCPM2 reference profile were cleared.\n"
         "Note: security block records and required delivery/audit logs may be retained by admins for abuse prevention."
     ))
+
+
+def _voxcpm2_panel_kb(selected: bool = False) -> InlineKeyboardMarkup:
+    select_label = "✅ VoxCPM2 Selected" if selected else "✅ Select VoxCPM2"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎙 Upload Reference", callback_data="voxcpm2:set_ref"),
+         InlineKeyboardButton("🎛 Control Instruction", callback_data="voxcpm2:set_control")],
+        [InlineKeyboardButton("🧹 Clear Control", callback_data="voxcpm2:clear_control"),
+         InlineKeyboardButton("🗑 Clear Reference", callback_data="voxcpm2:clear_ref")],
+        [InlineKeyboardButton(select_label, callback_data="voxcpm2:select"),
+         InlineKeyboardButton("🔄 Refresh", callback_data="voxcpm2:refresh")],
+        [InlineKeyboardButton("🤖 TTS Models", callback_data="show_tts_model"),
+         InlineKeyboardButton("❌ Close", callback_data="voxcpm2:close")],
+    ])
+
+
+def _voxcpm2_panel_text(profile: dict[str, Any], selected: bool, notice: str = "") -> str:
+    ready = _voxcpm2_reference_ready(profile)
+    duration = float(profile.get("duration") or 0.0)
+    ref_name = html.escape(str(profile.get("filename") or "reference audio")[:80])
+    reference_line = f"✅ <code>{ref_name}</code>" if ready else "❌ Not uploaded"
+    if ready and duration > 0:
+        reference_line += f" · {duration:g}s"
+    control = str(profile.get("control") or "").strip()
+    control_line = html.escape(control[:220]) if control else "Default style from the reference voice"
+    prefix = f"✅ {html.escape(notice)}\n\n" if notice else ""
+    return (
+        prefix
+        + "🎙 <b>VoxCPM2 — Controllable Cloning</b>\n\n"
+        + f"Reference: {reference_line}\n"
+        + f"Control: <i>{control_line}</i>\n"
+        + f"Selected model: <b>{'YES' if selected else 'NO'}</b>\n\n"
+        + "Upload a clear reference clip, then optionally describe emotion, speaking pace, tone, or style. "
+          "The cloned voice keeps the reference timbre while applying the instruction.\n\n"
+        + f"💡 Best reference: one speaker, clean audio, about 5–30 seconds (hard limit {VOXCPM2_MAX_REFERENCE_SECONDS:g} seconds).\n"
+        + "⚠️ Use only your own voice or a voice you have permission to clone. The reference is sent to the configured VoxCPM2 service for generation."
+    )
+
+
+async def _voxcpm2_send_panel(target_message, user_id: int, notice: str = "", *, edit: bool = False) -> None:
+    profile, prefs = await asyncio.gather(
+        _voxcpm2_profile_get(user_id),
+        get_user_prefs_async(user_id),
+    )
+    selected = _normalize_tts_model(prefs.get("tts_model", "auto")) == "voxcpm2"
+    text = _voxcpm2_panel_text(profile, selected, notice)
+    if edit:
+        with suppress(Exception):
+            await safe_send(lambda: target_message.edit_text(
+                text, parse_mode="HTML", reply_markup=_voxcpm2_panel_kb(selected),
+                disable_web_page_preview=True,
+            ))
+            return
+    await safe_send(lambda: target_message.reply_text(
+        text, parse_mode="HTML", reply_markup=_voxcpm2_panel_kb(selected),
+        disable_web_page_preview=True,
+    ))
+
+
+async def cmd_voxcpm2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.effective_message:
+        return
+    if not await _ensure_user_allowed(update, context):
+        return
+    await _voxcpm2_send_panel(update.effective_message, int(update.effective_user.id))
+
+
+async def _voxcpm2_accept_reference(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    file_id: str,
+    file_unique_id: str,
+    filename: str,
+    mime_type: str,
+    file_size: int,
+    duration: float,
+) -> None:
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    if file_size and file_size > VOXCPM2_MAX_REFERENCE_BYTES:
+        await safe_send(lambda: msg.reply_text(
+            f"❌ Reference audio is too large. Max {VOXCPM2_MAX_REFERENCE_BYTES // 1024 // 1024}MB."
+        ))
+        return
+    if duration and duration > VOXCPM2_MAX_REFERENCE_SECONDS:
+        await safe_send(lambda: msg.reply_text(
+            f"❌ Reference audio is too long. Max {VOXCPM2_MAX_REFERENCE_SECONDS:g} seconds."
+        ))
+        return
+    profile = await _voxcpm2_profile_get(int(user.id))
+    profile.update({
+        "file_id": str(file_id),
+        "file_unique_id": str(file_unique_id or ""),
+        "filename": str(filename or "reference_audio")[:160],
+        "mime_type": str(mime_type or "audio/ogg")[:100],
+        "suffix": _voxcpm2_reference_suffix(filename, mime_type),
+        "duration": float(duration or 0.0),
+        "file_size": int(file_size or 0),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+    await _voxcpm2_profile_set(int(user.id), profile)
+    context.user_data.pop("voxcpm2_state", None)
+    update_user_tts_model(int(user.id), "voxcpm2")
+    await _voxcpm2_send_panel(msg, int(user.id), "Reference audio saved and VoxCPM2 selected.")
+
+
+async def _voxcpm2_save_control_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    control = str(text or "").strip()
+    if control.lower() in {"clear", "none", "default", "-"}:
+        control = ""
+    if len(control) > VOXCPM2_CONTROL_MAX_CHARS:
+        await safe_send(lambda: msg.reply_text(
+            f"❌ Control Instruction is too long. Max {VOXCPM2_CONTROL_MAX_CHARS} characters."
+        ))
+        return
+    profile = await _voxcpm2_profile_get(int(user.id))
+    profile["control"] = control
+    profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await _voxcpm2_profile_set(int(user.id), profile)
+    context.user_data.pop("voxcpm2_state", None)
+    notice = "Control Instruction saved." if control else "Control Instruction cleared."
+    await _voxcpm2_send_panel(msg, int(user.id), notice)
+
+
+async def _cb_voxcpm2(query, user_id: int, context, data: str) -> None:
+    action = data.split(":", 1)[1] if ":" in data else "refresh"
+    if action == "set_ref":
+        context.user_data["voxcpm2_state"] = VOXCPM2_WAIT_REFERENCE
+        await safe_send(lambda: query.message.reply_text(
+            "🎙 Send a Telegram voice message or upload WAV/MP3/OGG/FLAC audio.\n"
+            "Best result: one speaker, clean recording, 5–30 seconds. /cancel to stop."
+        ))
+        return
+    if action == "set_control":
+        context.user_data["voxcpm2_state"] = VOXCPM2_WAIT_CONTROL
+        await safe_send(lambda: query.message.reply_text(
+            "🎛 Send the Control Instruction as text.\n"
+            "Examples: ‘warm and cheerful, slightly faster’ or ‘calm, slow, professional’.\n"
+            "Send ‘clear’ to remove it, or /cancel to stop."
+        ))
+        return
+    if action == "clear_control":
+        profile = await _voxcpm2_profile_get(user_id)
+        profile["control"] = ""
+        profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await _voxcpm2_profile_set(user_id, profile)
+        await _voxcpm2_send_panel(query.message, user_id, "Control Instruction cleared.", edit=True)
+        return
+    if action == "clear_ref":
+        profile = await _voxcpm2_profile_get(user_id)
+        for key in ("file_id", "file_unique_id", "filename", "mime_type", "suffix", "duration", "file_size"):
+            profile.pop(key, None)
+        profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await _voxcpm2_profile_set(user_id, profile)
+        await _voxcpm2_send_panel(query.message, user_id, "Reference audio cleared.", edit=True)
+        return
+    if action == "select":
+        update_user_tts_model(user_id, "voxcpm2")
+        profile = await _voxcpm2_profile_get(user_id)
+        notice = "VoxCPM2 selected." if _voxcpm2_reference_ready(profile) else "VoxCPM2 selected. Upload a reference before generating speech."
+        await _voxcpm2_send_panel(query.message, user_id, notice, edit=True)
+        return
+    if action == "close":
+        with suppress(Exception):
+            await query.message.delete()
+        return
+    await _voxcpm2_send_panel(query.message, user_id, edit=True)
 
 
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -23695,7 +24279,8 @@ async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚙️ <b>ការកំណត់របស់អ្នក</b>\n\n"
         f"🗣️ សំឡេង: <b>{gender_label}</b>\n"
         f"🎚️ ល្បឿន: <b>{speed_label}</b>\n"
-        f"🤖 ម៉ូដែល TTS: <b>{html.escape(model_label)}</b>\n\n"
+        f"🤖 ម៉ូដែល TTS: <b>{html.escape(model_label)}</b>\n"
+        f"🎙️ VoxCPM2 setup: <b>{'Use /voxcpm2' if _normalize_tts_model(prefs.get('tts_model', 'auto')) == 'voxcpm2' else 'Optional'}</b>\n\n"
         "ផ្ញើ text ណាមួយ ហើយប្រើប៊ូតុងក្រោមសំឡេង ដើម្បីប្តូរ។",
         parse_mode="HTML",
         reply_markup=get_main_kb(prefs["gender"], prefs.get("tts_model", "auto")),
@@ -23709,7 +24294,8 @@ async def cmd_ttsmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 <b>ជ្រើសរើសម៉ូដែល TTS</b>\n\n"
         "Auto: Khmer HF Space សម្រាប់ខ្មែរ និង Edge fallback\n"
         "Khmer HF: ប្រើ mrrtmob/khmer-tts សម្រាប់អត្ថបទខ្មែរ\n"
-        "Edge: ប្រើ Microsoft Edge TTS គ្រប់ភាសា",
+        "Edge: ប្រើ Microsoft Edge TTS គ្រប់ភាសា\n"
+        "VoxCPM2 Clone: Upload reference audio + optional style Control Instruction (/voxcpm2)",
         parse_mode="HTML",
         reply_markup=get_tts_model_kb(prefs.get("tts_model", "auto")),
     ))
@@ -23896,7 +24482,9 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filename = doc.file_name or ""
         mime_type = doc.mime_type or ""
         file_id = doc.file_id
+        file_unique_id = doc.file_unique_id
         file_size = int(doc.file_size or 0)
+        duration = 0.0
         # Subtitle/text documents belong to the document reader, not FFmpeg.
         if _is_subtitle_file(filename) or not _is_audio_file(filename, mime_type):
             await on_document(update, context)
@@ -23905,8 +24493,20 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filename = audio.file_name or ""
         mime_type = audio.mime_type or ""
         file_id = audio.file_id
+        file_unique_id = audio.file_unique_id
         file_size = int(audio.file_size or 0)
+        duration = float(audio.duration or 0.0)
     else:
+        return
+
+    if context.user_data.get("voxcpm2_state") == VOXCPM2_WAIT_REFERENCE:
+        if not await _ensure_user_allowed(update, context):
+            return
+        await _voxcpm2_accept_reference(
+            update, context, file_id=file_id, file_unique_id=file_unique_id,
+            filename=filename or "reference_audio", mime_type=mime_type or "audio/ogg",
+            file_size=file_size, duration=duration,
+        )
         return
 
     # Check block/maintenance once. Feature flags are evaluated below so admins
@@ -24123,6 +24723,20 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: msg.reply_text("✅ Voice ផ្ញើដល់ Admin ។"))
         return
 
+    if context.user_data.get("voxcpm2_state") == VOXCPM2_WAIT_REFERENCE:
+        if not await _ensure_user_allowed(update, context):
+            return
+        await _voxcpm2_accept_reference(
+            update, context,
+            file_id=msg.voice.file_id,
+            file_unique_id=msg.voice.file_unique_id,
+            filename="telegram_voice.ogg",
+            mime_type=msg.voice.mime_type or "audio/ogg",
+            file_size=int(msg.voice.file_size or 0),
+            duration=float(msg.voice.duration or 0.0),
+        )
+        return
+
     if not await _ensure_user_allowed(update, context, "voice_transcribe_enabled", "Voice transcribe"):
         return
 
@@ -24245,6 +24859,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     context.user_data.pop("chat_state", None)
             return
 
+    if context.user_data.get("voxcpm2_state") == VOXCPM2_WAIT_CONTROL:
+        if not await _ensure_user_allowed(update, context):
+            return
+        await _voxcpm2_save_control_text(update, context, text)
+        return
+
     if await _handle_feature_request_user_text(update, context):
         return
 
@@ -24317,7 +24937,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _set_last_tts(user_id)
                 return
 
-            audio_bytes = await generate_voice_limited(tts_text, gender, speed, file_path, tts_model)
+            audio_bytes = await generate_user_voice_limited(
+                tts_text, gender, speed, file_path, tts_model, user_id=user_id, bot=context.bot
+            )
             sent_msg    = await safe_send(
                 lambda ab=audio_bytes: msg.reply_voice(
                     voice=io.BytesIO(ab),
@@ -24381,7 +25003,7 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
     """Save the selected TTS model and regenerate the current voice message.
 
     UX rule:
-      - When the user taps Auto / Khmer HF / Edge from the model menu, save it.
+      - When the user taps Auto / Khmer HF / Edge / VoxCPM2, save it.
       - If the original text for this voice message can be resolved, immediately
         regenerate the same text with the selected model.
       - If the original text cannot be found, only save the preference and return
@@ -24402,6 +25024,17 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
 
     gender = prefs["gender"]
     speed  = prefs["speed"]
+
+    if model == "voxcpm2":
+        profile = await _voxcpm2_profile_get(user_id)
+        if not _voxcpm2_reference_ready(profile):
+            with suppress(Exception):
+                await query.message.edit_reply_markup(reply_markup=get_main_kb(gender, model))
+            await _voxcpm2_send_panel(
+                query.message, user_id,
+                "VoxCPM2 selected. Upload a reference audio clip before generating speech.",
+            )
+            return
 
     if not original_text:
         await safe_send(lambda: query.message.edit_reply_markup(
@@ -24433,7 +25066,9 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
     try:
         async with lock:
             try:
-                audio_bytes = await generate_voice_limited(original_text, gender, speed, file_path, model)
+                audio_bytes = await generate_user_voice_limited(
+                    original_text, gender, speed, file_path, model, user_id=user_id, bot=context.bot
+                )
                 with suppress(Exception):
                     await query.message.delete()
                 new_msg = await safe_send(
@@ -24541,7 +25176,9 @@ async def _cb_speed(query, user_id: int, context, data: str):
     try:
         async with lock:
             try:
-                audio_bytes = await generate_voice_limited(original_text, gender, new_speed, file_path, tts_model)
+                audio_bytes = await generate_user_voice_limited(
+                    original_text, gender, new_speed, file_path, tts_model, user_id=user_id, bot=context.bot
+                )
                 with suppress(Exception):
                     await query.message.delete()
                 # FIX: was query.message.chat.send_voice() which is not a valid method.
@@ -24606,7 +25243,9 @@ async def _cb_gender(query, user_id: int, context, data: str):
     try:
         async with lock:
             try:
-                audio_bytes = await generate_voice_limited(original_text, new_gender, speed, file_path, tts_model)
+                audio_bytes = await generate_user_voice_limited(
+                    original_text, new_gender, speed, file_path, tts_model, user_id=user_id, bot=context.bot
+                )
                 with suppress(Exception):
                     await query.message.delete()
                 # FIX: was query.message.chat.send_voice() — Chat object has no send_voice.
@@ -24671,7 +25310,9 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
     try:
         async with lock:
             try:
-                audio_bytes = await generate_voice_limited(original_text, gender, speed, file_path, tts_model)
+                audio_bytes = await generate_user_voice_limited(
+                    original_text, gender, speed, file_path, tts_model, user_id=user_id, bot=context.bot
+                )
                 # FIX: was query.message.chat.send_voice() — Chat object has no send_voice.
                 new_msg = await safe_send(
                     lambda ab=audio_bytes, g=gender: context.bot.send_voice(
@@ -24793,6 +25434,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cb_show_tts_model(query, user_id, context)
         elif data == "hide_tts_model":
             await _cb_hide_tts_model(query, user_id, context)
+        elif data.startswith("voxcpm2:"):
+            await _cb_voxcpm2(query, user_id, context, data)
         elif data.startswith("ttsmodel_"):
             await _cb_tts_model(query, user_id, context, data)
         elif data in SPEED_OPTIONS:
@@ -24878,7 +25521,7 @@ async def _run_bot():
         _prefs_cache, _user_last_tts, _sched_payload,
         _hist_cache, _user_locks,
         # FIX: These two were missing from the original reset list:
-        _last_tts_text, _text_cache_memory,
+        _last_tts_text, _text_cache_memory, _VOXCPM2_PROFILE_MEMORY,
     ):
         store.clear()
     _api_key_cache_clear()
@@ -24922,6 +25565,7 @@ async def _run_bot():
     app.add_handler(CommandHandler("help",            on_help))
     app.add_handler(CommandHandler("myprefs",         cmd_myprefs))
     app.add_handler(CommandHandler("ttsmodel",        cmd_ttsmodel))
+    app.add_handler(CommandHandler("voxcpm2",         cmd_voxcpm2))
     app.add_handler(CommandHandler("clear",           cmd_clear))
     app.add_handler(CommandHandler("security",        cmd_security))
     app.add_handler(CommandHandler("privacy",         cmd_privacy))
