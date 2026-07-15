@@ -9715,8 +9715,33 @@ def _log_once(level: int, key: str, message: str, *args, exc_info=False) -> None
     logger.log(level, message, *args, exc_info=exc_info)
 
 
+def _format_exception_detail(exc: BaseException) -> str:
+    """Return the most useful structured error detail available."""
+    for value in getattr(exc, "args", ()):
+        if isinstance(value, dict):
+            try:
+                return _json.dumps(value, ensure_ascii=False, default=str)
+            except Exception:
+                return repr(value)
+    return repr(exc)
+
+
 def _is_retryable_store_error(exc: BaseException | str) -> bool:
     msg = str(exc).lower()
+
+    # postgrest/supabase occasionally returns an HTTP response that the client
+    # cannot decode as JSON. Although the wrapper may expose code=400, this can
+    # be caused by a transient gateway/proxy response and is safe to retry.
+    json_response_errors = (
+        "json could not be generated",
+        "json could not be decoded",
+        "invalid json response",
+        "expecting value: line 1 column 1",
+        "unterminated string starting at",
+    )
+    if any(word in msg for word in json_response_errors):
+        return True
+
     retryable_words = (
         "server disconnected", "connection reset", "connection aborted",
         "connection refused", "temporarily unavailable", "temporary failure",
@@ -9777,7 +9802,7 @@ def retry_call_sync(
                     f"{name}:non_retryable:{type(exc).__name__}:{str(exc)[:120]}",
                     "%s failed with non-retryable error: %s",
                     name,
-                    exc,
+                    _format_exception_detail(exc),
                 )
                 if critical:
                     raise
@@ -9792,12 +9817,12 @@ def retry_call_sync(
                     "%s failed after %d attempt(s): %s",
                     name,
                     attempts,
-                    exc,
+                    _format_exception_detail(exc),
                 )
                 break
 
             delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
-            logger.warning("%s temporary error attempt %d/%d: %s", name, attempt, attempts, exc)
+            logger.warning("%s temporary error attempt %d/%d: %s", name, attempt, attempts, _format_exception_detail(exc))
             time.sleep(delay)
 
     if critical and last_exc:
@@ -9845,7 +9870,7 @@ async def retry_call(
                     f"{name}:non_retryable:{type(exc).__name__}:{str(exc)[:120]}",
                     "%s failed with non-retryable error: %s",
                     name,
-                    exc,
+                    _format_exception_detail(exc),
                 )
                 if critical:
                     raise
@@ -9860,12 +9885,12 @@ async def retry_call(
                     "%s failed after %d attempt(s): %s",
                     name,
                     attempts,
-                    exc,
+                    _format_exception_detail(exc),
                 )
                 break
 
             delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
-            logger.warning("%s temporary error attempt %d/%d: %s", name, attempt, attempts, exc)
+            logger.warning("%s temporary error attempt %d/%d: %s", name, attempt, attempts, _format_exception_detail(exc))
             await asyncio.sleep(delay)
 
     if critical and last_exc:
@@ -10025,7 +10050,7 @@ def _supabase_select_schema_safe_sync(
                     f"schema_safe_select:{name}:{type(exc).__name__}:{str(exc)[:120]}",
                     "Supabase:%s failed: %s",
                     name,
-                    exc,
+                    _format_exception_detail(exc),
                 )
                 return default
     return default
@@ -14430,7 +14455,7 @@ def db_sched_fetch_due(limit: int = _SCHED_DUE_LIMIT) -> list[dict]:
         "sched_fetch_due",
         lambda: (
             supabase.table("scheduled_broadcasts")
-            .select("*")
+            .select("id,admin_id,photo_file_id,caption,plain_text,broadcast_at,status,error_msg")
             .eq("status", SCHED_STATUS_PENDING)
             .lte("broadcast_at", now)
             .order("broadcast_at")
@@ -16111,9 +16136,9 @@ def _get_audio_to_voice_semaphore() -> asyncio.Semaphore:
 async def _convert_uploaded_audio_to_telegram_voice(input_path: str, output_path: str) -> bytes:
     """Convert an uploaded audio file to a Telegram voice-record OGG/Opus file.
 
-    Telegram voice bubbles require OGG with the Opus codec. The conversion is
-    mono, 48 kHz, optimized for speech, strips metadata/artwork, and runs under a
-    bounded semaphore so several uploads cannot exhaust a small server.
+    Telegram voice bubbles require OGG with the Opus codec. A strict conversion
+    runs first. If the source is damaged or has unusual timestamps/container
+    metadata, one tolerant recovery conversion is attempted before failing.
     """
     if not input_path or not os.path.isfile(input_path):
         raise RuntimeError("Uploaded audio file is missing.")
@@ -16122,17 +16147,15 @@ async def _convert_uploaded_audio_to_telegram_voice(input_path: str, output_path
         input_size = await asyncio.to_thread(os.path.getsize, input_path)
     except OSError as exc:
         raise RuntimeError(f"Could not inspect uploaded audio: {exc}") from exc
+    if input_size <= 0:
+        raise RuntimeError("Uploaded audio file is empty.")
 
-    cmd = [
-        _FFMPEG_EXE,
-        "-hide_banner",
-        "-loglevel", "error",
-        "-nostdin",
-        "-y",
-        "-i", input_path,
+    common_output = [
         "-map", "0:a:0",
         "-map_metadata", "-1",
         "-vn",
+        "-sn",
+        "-dn",
         "-ac", "1",
         "-ar", "48000",
         "-c:a", "libopus",
@@ -16143,38 +16166,93 @@ async def _convert_uploaded_audio_to_telegram_voice(input_path: str, output_path
         "-f", "ogg",
         output_path,
     ]
+    strict_cmd = [
+        _FFMPEG_EXE,
+        "-hide_banner",
+        "-loglevel", "error",
+        "-nostdin",
+        "-y",
+        "-i", input_path,
+        *common_output,
+    ]
+    fallback_cmd = [
+        _FFMPEG_EXE,
+        "-hide_banner",
+        "-loglevel", "error",
+        "-nostdin",
+        "-y",
+        "-fflags", "+discardcorrupt",
+        "-err_detect", "ignore_err",
+        "-probesize", "100M",
+        "-analyzeduration", "100M",
+        "-i", input_path,
+        "-map", "0:a:0",
+        "-map_metadata", "-1",
+        "-vn",
+        "-sn",
+        "-dn",
+        "-af", "aresample=async=1:first_pts=0",
+        "-ac", "1",
+        "-ar", "48000",
+        "-threads", "1",
+        "-c:a", "libopus",
+        "-application", "voip",
+        "-b:a", "32k",
+        "-vbr", "on",
+        "-compression_level", "10",
+        "-f", "ogg",
+        output_path,
+    ]
 
-    proc: asyncio.subprocess.Process | None = None
-    semaphore = _get_audio_to_voice_semaphore()
-    try:
-        async with semaphore:
+    timeout_s = _ffmpeg_tts_timeout_s(chunk_count=1, input_bytes=input_size)
+
+    async def _run_ffmpeg(command: list[str], label: str) -> tuple[int, bytes]:
+        proc: asyncio.subprocess.Process | None = None
+        try:
             proc = await asyncio.wait_for(
                 asyncio.create_subprocess_exec(
-                    *cmd,
+                    *command,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
                 ),
                 timeout=FFMPEG_START_TIMEOUT_S,
             )
-            timeout_s = _ffmpeg_tts_timeout_s(chunk_count=1, input_bytes=input_size)
             _, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-    except FileNotFoundError as exc:
-        _cleanup(output_path)
-        raise RuntimeError(f"FFmpeg executable not found: {_FFMPEG_EXE}") from exc
-    except asyncio.TimeoutError as exc:
-        _cleanup(output_path)
-        await _terminate_subprocess(proc, "audio-to-voice FFmpeg")
-        raise RuntimeError("FFmpeg timed out while converting the audio file to voice.") from exc
-    except asyncio.CancelledError:
-        _cleanup(output_path)
-        await _terminate_subprocess(proc, "audio-to-voice FFmpeg")
-        raise
+            return int(proc.returncode or 0), stderr_data or b""
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"FFmpeg executable not found: {_FFMPEG_EXE}") from exc
+        except asyncio.TimeoutError as exc:
+            await _terminate_subprocess(proc, label)
+            raise RuntimeError(
+                f"FFmpeg timed out while converting the audio file after {timeout_s:.0f}s."
+            ) from exc
+        except asyncio.CancelledError:
+            await _terminate_subprocess(proc, label)
+            raise
 
-    if proc is None or proc.returncode != 0:
-        _cleanup(output_path)
-        snippet = (stderr_data or b"").decode(errors="replace")[-800:]
-        return_code = proc.returncode if proc is not None else "not-started"
-        raise RuntimeError(f"FFmpeg audio-to-voice conversion failed ({return_code}): {snippet}")
+    semaphore = _get_audio_to_voice_semaphore()
+    try:
+        async with semaphore:
+            strict_code, strict_stderr = await _run_ffmpeg(strict_cmd, "audio-to-voice FFmpeg")
+            if strict_code != 0:
+                _cleanup(output_path)
+                fallback_code, fallback_stderr = await _run_ffmpeg(
+                    fallback_cmd,
+                    "audio-to-voice FFmpeg fallback",
+                )
+                if fallback_code != 0:
+                    _cleanup(output_path)
+                    strict_detail = strict_stderr.decode(errors="replace")[-1200:]
+                    fallback_detail = fallback_stderr.decode(errors="replace")[-1600:]
+                    raise RuntimeError(
+                        "FFmpeg audio-to-voice conversion failed "
+                        f"(strict={strict_code}, fallback={fallback_code}). "
+                        f"Strict: {strict_detail} | Fallback: {fallback_detail}"
+                    )
+    except Exception:
+        if not os.path.isfile(output_path):
+            _cleanup(output_path)
+        raise
 
     try:
         voice_bytes = await asyncio.wait_for(
@@ -16531,78 +16609,121 @@ async def generate_voice_limited(text: str, gender: str, speed: float, output_pa
 # ---------------------------------------------------------------------------
 # Gemini transcription helpers
 # ---------------------------------------------------------------------------
-async def transcribe_voice(ogg_path: str) -> str:
+def _is_retryable_gemini_error(exc: BaseException | str) -> bool:
+    msg = str(exc).lower()
+    return any(token in msg for token in (
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "unavailable",
+        "high demand",
+        "resource exhausted",
+        "temporarily overloaded",
+        "service unavailable",
+    ))
+
+
+async def _gemini_generate_with_retry(
+    contents: list[Any],
+    *,
+    timeout_s: float,
+    operation: str,
+) -> Any:
+    """Retry transient Gemini availability errors with bounded backoff."""
     if not _gemini:
         raise RuntimeError("GEMINI_API_KEY not set.")
-    loop = asyncio.get_running_loop()
-    try:
-        audio_bytes = await _read_file_bytes_async(ogg_path)
-    except OSError as e:
-        raise RuntimeError(f"Cannot read voice file: {e}") from e
-
-    prompt    = (
-        "Transcribe this audio exactly as spoken. "
-        "Output ONLY the transcribed text — no labels, no explanation. "
-        "Support Khmer, English, Chinese, Korean, and Japanese."
-    )
     semaphore = _AI_SEMAPHORE
     if semaphore is None:
         raise RuntimeError("Gemini semaphore not initialised.")
 
-    async def _guarded_call():
-        async with semaphore:
-            def _call():
-                return _gemini.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=[
-                        genai_types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"),
-                        prompt,
-                    ],
-                )
-            return await loop.run_in_executor(_AI_EXECUTOR, _call)
+    loop = asyncio.get_running_loop()
+    attempts = max(1, _env_int("GEMINI_TRANSCRIBE_RETRIES", 3, minimum=1, maximum=5))
+    last_error: BaseException | None = None
 
+    for attempt in range(1, attempts + 1):
+        try:
+            async with semaphore:
+                def _call():
+                    return _gemini.models.generate_content(
+                        model=GEMINI_MODEL,
+                        contents=contents,
+                    )
+
+                return await asyncio.wait_for(
+                    loop.run_in_executor(_AI_EXECUTOR, _call),
+                    timeout=timeout_s,
+                )
+        except asyncio.TimeoutError as exc:
+            # The executor thread may still be running after wait_for times out;
+            # avoid starting duplicate requests in that situation.
+            raise RuntimeError(
+                f"{operation} timed out after {timeout_s:.0f}s"
+            ) from exc
+        except Exception as exc:
+            last_error = exc
+            if attempt >= attempts or not _is_retryable_gemini_error(exc):
+                raise
+            delay = min(8.0, 1.5 * (2 ** (attempt - 1)))
+            logger.warning(
+                "%s temporary error attempt %d/%d: %s",
+                operation,
+                attempt,
+                attempts,
+                exc,
+            )
+            await asyncio.sleep(delay)
+
+    raise RuntimeError(f"{operation} failed: {last_error}")
+
+
+async def transcribe_voice(ogg_path: str) -> str:
+    if not _gemini:
+        raise RuntimeError("GEMINI_API_KEY not set.")
     try:
-        response = await asyncio.wait_for(_guarded_call(), timeout=60)
-        return (response.text or "").strip()
-    except asyncio.TimeoutError:
-        raise RuntimeError("Gemini transcription timed out after 60s")
+        audio_bytes = await _read_file_bytes_async(ogg_path)
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read voice file: {exc}") from exc
+
+    prompt = (
+        "Transcribe this audio exactly as spoken. "
+        "Output ONLY the transcribed text — no labels, no explanation. "
+        "Support Khmer, English, Chinese, Korean, and Japanese."
+    )
+    response = await _gemini_generate_with_retry(
+        [
+            genai_types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"),
+            prompt,
+        ],
+        timeout_s=60,
+        operation="Gemini voice transcription",
+    )
+    return (response.text or "").strip()
 
 
 async def transcribe_audio_file(file_path: str, mime_type: str) -> str:
     if not _gemini:
         raise RuntimeError("GEMINI_API_KEY not set.")
-    loop = asyncio.get_running_loop()
     try:
         audio_bytes = await _read_file_bytes_async(file_path)
-    except OSError as e:
-        raise RuntimeError(f"Cannot read audio file: {e}") from e
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read audio file: {exc}") from exc
 
-    prompt    = (
+    prompt = (
         "Transcribe this audio exactly as spoken. "
         "Output ONLY the transcribed text — no labels, no explanation. "
         "Support Khmer, English, Chinese, Korean, and Japanese."
     )
-    semaphore = _AI_SEMAPHORE
-    if semaphore is None:
-        raise RuntimeError("Gemini semaphore not initialised.")
-
-    async def _guarded_call():
-        async with semaphore:
-            def _call():
-                return _gemini.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=[
-                        genai_types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
-                        prompt,
-                    ],
-                )
-            return await loop.run_in_executor(_AI_EXECUTOR, _call)
-
-    try:
-        response = await asyncio.wait_for(_guarded_call(), timeout=90)
-        return (response.text or "").strip()
-    except asyncio.TimeoutError:
-        raise RuntimeError("Gemini audio transcription timed out after 90s")
+    response = await _gemini_generate_with_retry(
+        [
+            genai_types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+            prompt,
+        ],
+        timeout_s=90,
+        operation="Gemini audio transcription",
+    )
+    return (response.text or "").strip()
 
 
 # ---------------------------------------------------------------------------
