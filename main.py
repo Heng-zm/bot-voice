@@ -374,6 +374,152 @@ def _perf_default(name: str, fallback: Any = None) -> Any:
     return PERFORMANCE_CODE_DEFAULTS.get(name, fallback)
 
 
+# ── Clean environment policy ────────────────────────────────────────────────
+# Keep .env for secrets, service URLs, and deployment identity only.  Bot tuning
+# and feature defaults live in code below or in Redis runtime state.
+IMPORTANT_ENV_TEMPLATE: "OrderedDict[str, list[tuple[str, str, str]]]" = OrderedDict([
+    ("required", [
+        ("TELEGRAM_BOT_TOKEN", "", "Telegram bot token from BotFather."),
+        ("ADMIN_IDS", "1272791365", "Comma-separated Telegram user IDs allowed to administer the bot."),
+    ]),
+    ("recommended", [
+        ("REDIS_URL", "", "Redis connection URL for runtime state, locks, cache, and stable web session secret."),
+        ("SUPABASE_URL", "", "Supabase project API URL."),
+        ("SUPABASE_SERVICE_ROLE_KEY", "", "Supabase service role key for server-side DB access."),
+    ]),
+    ("optional_ai", [
+        ("GEMINI_API_KEY", "", "Gemini OCR/audio transcription fallback."),
+        ("HF_TOKEN", "", "Hugging Face token for HF OCR/TTS and VoxCPM2 private/quota access."),
+        ("VOXCPM2_TOKEN", "", "Optional separate token for VoxCPM2; if empty, HF_TOKEN is used."),
+    ]),
+    ("deployment", [
+        ("PORT", "8080", "Platform HTTP port."),
+        ("RENDER", "true", "Set true on Render deployments."),
+        ("RENDER_EXTERNAL_URL", "https://your-service.onrender.com", "Public backend URL used for webhook base URL fallback."),
+        ("TELEGRAM_WEBHOOK_URL", "", "Optional exact webhook URL; otherwise derived from public backend URL."),
+        ("ADMIN_FRONTEND_URL", "", "Optional separated admin frontend origin."),
+        ("FRONTEND_ALLOWED_ORIGINS", "", "Optional comma-separated exact admin frontend origins."),
+    ]),
+    ("admin_login", [
+        ("ADMIN_WEB_PASSWORD", "", "Optional admin web password. Leave empty if web admin login is disabled/not used."),
+    ]),
+])
+
+IMPORTANT_ENV_KEYS: set[str] = {
+    key
+    for _section, rows in IMPORTANT_ENV_TEMPLATE.items()
+    for key, _example, _help in rows
+}
+
+# These keys are intentionally controlled by code defaults, runtime Redis state,
+# or the admin dashboard. They should not be kept in .env for normal deploys.
+CODE_DEFAULT_ENV_KEYS: set[str] = {
+    "ADMIN_API_TOKEN_FALLBACK_ENABLED", "ADMIN_API_TOKEN_TTL_SECONDS", "ADMIN_CALLBACK_GUARD_ENABLED",
+    "ADMIN_DETAIL_HISTORY_TURNS", "ADMIN_ERROR_CENTER_MAX", "ADMIN_ERROR_MESSAGE_MAX",
+    "ADMIN_FULL_HISTORY_TURNS", "ADMIN_HISTORY_PAGE_SIZE", "ADMIN_LOGIN_RATE_LIMIT_ATTEMPTS",
+    "ADMIN_LOGIN_RATE_LIMIT_REDIS_ENABLED", "ADMIN_LOGIN_RATE_LIMIT_WINDOW_S",
+    "ADMIN_ORIGIN_GUARD_ENABLED", "ADMIN_TEXT_CACHE_REDIS_TURNS", "AI_API_ALLOWED_ORIGINS",
+    "AI_API_KEY_CACHE_TTL_S", "AI_API_KEY_TOUCH_INTERVAL_S", "AI_API_QUERY_KEY_ENABLED",
+    "AI_PROVIDER", "API_DOCS_ENABLED", "API_DOCS_INCLUDE_COMPAT_ROUTES",
+    "API_RATE_LIMIT_PER_SECOND", "API_RATE_LIMIT_WINDOW_S", "APP_TIMEZONE", "APP_TIMEZONE_ALIAS",
+    "APP_TIMEZONE_UTC_LABEL", "AUDIO_TO_VOICE_MAX_CONCURRENT", "BACKEND_ONLY", "BOT_MODE",
+    "BOT_SETTINGS_CACHE_TTL_S", "BOT_TMP_DIR", "BROADCAST_BATCH_SIZE", "BROADCAST_INTER_BATCH_DELAY",
+    "CACHE_ASIDE_DEFAULT_TTL_S", "CRM_CACHE_TTL_S", "CRM_DEFAULT_LIMIT", "DB_DROP_BACKLOG_LIMIT",
+    "DB_EXECUTOR_MAX_WORKERS", "DEFAULT_TTS_MODEL", "EDGE_TTS_CHUNK_CHARS",
+    "EDGE_TTS_CROSS_LANG_FALLBACK", "EDGE_TTS_PARALLEL_CHUNKS", "EDGE_TTS_RETRIES",
+    "EDGE_TTS_RETRY_DELAY_S", "EDGE_TTS_STREAM_TIMEOUT_S", "FFMPEG_CONVERT_TIMEOUT_S",
+    "FFMPEG_START_TIMEOUT_S", "FRONTEND_ALLOW_ALL_ORIGINS", "FRONTEND_LOCAL_DEV_ORIGINS_ENABLED",
+    "GEMINI_MODEL", "GEMINI_TRANSCRIBE_RETRIES", "GOOGLE_GENAI_MODEL", "GRADIO_CLIENT_CONNECT_TIMEOUT_S",
+    "GRADIO_CLIENT_MAX_WORKERS", "HF_MAX_TOKENS", "HF_MODEL", "HF_OCR_MODEL", "HF_TEMPERATURE",
+    "HF_TTS_API_NAME", "HF_TTS_CLIENT_CACHE", "HF_TTS_COOLDOWN_S", "HF_TTS_EDGE_FALLBACK",
+    "HF_TTS_FAILURE_LIMIT", "HF_TTS_MAX_CHARS", "HF_TTS_MAX_TOK", "HF_TTS_NO_AUDIO_COOLDOWN_S",
+    "HF_TTS_QUOTA_COOLDOWN_S", "HF_TTS_REP_PEN", "HF_TTS_RETRIES", "HF_TTS_RETRY_DELAY_S",
+    "HF_TTS_SERIALIZE_CALLS", "HF_TTS_SPACE", "HF_TTS_TEMP", "HF_TTS_TIMEOUT_S", "HF_TTS_TOKEN",
+    "HF_TTS_TOP_P", "HF_TTS_VOICE", "HTTP_MAX_CONNECTIONS", "HTTP_MAX_KEEPALIVE_CONNECTIONS",
+    "KHMER_TTS_PROVIDER", "LOG_ONCE_TTL_S", "MAX_CONCURRENT_AI", "MAX_CONCURRENT_BROADCAST",
+    "MAX_CONCURRENT_GEMINI", "MAX_CONCURRENT_TTS_USERS", "OCR_AUTO_PREFER", "OCR_AUTO_PREFER_PROVIDER",
+    "OCR_PROVIDER", "OCR_PROVIDER_COOLDOWN_S", "OCR_PROVIDER_FAILURE_LIMIT", "PAGED_TTS_SEND_DELAY_S",
+    "PREFS_CACHE_MAX_SIZE", "PREFS_CACHE_TTL_S", "PREFS_LOAD_LOCKS_MAX", "RATE_LIMIT_ENABLED",
+    "RATE_LIMIT_REDIS_TTL_S", "REDIS_BREAKER_FAILURES", "REDIS_BREAKER_RESET_S", "REDIS_CACHE_PREFIX",
+    "REDIS_HISTORY_TTL_S", "REDIS_MAX_CONNECTIONS", "REDIS_PREFS_TTL_S", "REDIS_SOCKET_TIMEOUT_S",
+    "REDIS_TEXT_CACHE_TTL_S", "SCHED_ADMIN_PENDING_CACHE_TTL_S", "SCHED_DUE_LIMIT",
+    "SCHED_LOCK_ENABLED", "SCHED_LOCK_KEY", "SCHED_LOCK_REQUIRED", "SCHED_LOCK_TTL_S",
+    "SCHED_POLL_INTERVAL", "SCHED_SCAN_LIMIT", "SCHED_SENDING_STALE_SECONDS",
+    "SUPABASE_BREAKER_FAILURES", "SUPABASE_BREAKER_RESET_S", "TELEGRAM_ACTIVE_LOCK_ENABLED",
+    "TELEGRAM_ACTIVE_LOCK_KEY", "TELEGRAM_ACTIVE_LOCK_REQUIRED", "TELEGRAM_ACTIVE_LOCK_TTL_S",
+    "TELEGRAM_ALLOWED_UPDATES", "TELEGRAM_CONCURRENT_UPDATES", "TELEGRAM_CONNECTION_POOL_SIZE",
+    "TELEGRAM_INSTANCE_ID", "TELEGRAM_MULTI_SERVER_ENABLED", "TELEGRAM_POLLING_DROP_PENDING_UPDATES",
+    "TELEGRAM_SETWEBHOOK_MAX_RETRIES", "TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES",
+    "TELEGRAM_WEBHOOK_RECONFIGURE_INTERVAL_S", "TELEGRAM_WEBHOOK_SECRET_TOKEN",
+    "TEXT_CACHE_MEMORY_TTL_S", "TTS_AUDIO_CACHE_ENABLED", "TTS_AUDIO_CACHE_ITEM_MAX_MB",
+    "TTS_AUDIO_CACHE_MAX_MB", "TTS_AUDIO_CACHE_TTL_S", "TTS_MODEL_COLUMN_RECHECK_S",
+    "TTS_PROVIDER", "TTS_RESOLVER_AI_ENABLED", "TTS_SINGLE_VOICE_MAX_CHARS", "USER_DEFAULT_TTS_MODEL",
+    "USER_RATE_LIMIT_NOTICE_COOLDOWN_S", "USER_RATE_LIMIT_PER_SECOND", "USER_RATE_LIMIT_WINDOW_S",
+    "USER_SEARCH_CACHE_TTL_S", "USER_SYNC_MAX", "USER_SYNC_TTL_S", "UVICORN_LOG_LEVEL",
+    "VOXCPM2_API_NAME", "VOXCPM2_CFG_VALUE", "VOXCPM2_CLIENT_CACHE", "VOXCPM2_CONTROL_MAX_CHARS",
+    "VOXCPM2_COOLDOWN_S", "VOXCPM2_DENOISE_REFERENCE", "VOXCPM2_ENABLED", "VOXCPM2_FAILURE_LIMIT",
+    "VOXCPM2_MAX_CHARS", "VOXCPM2_MAX_REFERENCE_MB", "VOXCPM2_MAX_REFERENCE_SECONDS",
+    "VOXCPM2_NORMALIZE_TEXT", "VOXCPM2_PROFILE_MEMORY_MAX", "VOXCPM2_PROFILE_MEMORY_TTL_S",
+    "VOXCPM2_PROFILE_TTL_S", "VOXCPM2_QUOTA_COOLDOWN_S", "VOXCPM2_RETRIES",
+    "VOXCPM2_RETRY_DELAY_S", "VOXCPM2_SERIALIZE_CALLS", "VOXCPM2_SPACE", "VOXCPM2_TIMEOUT_S",
+    "WEBHOOK_REPLAY_TTL_S", "WEBHOOK_ROTATE_COOLDOWN_S", "WEBHOOK_SLOW_REQUEST_MS",
+    "WEB_ADMIN_AUDIT_MAX", "WEB_ADMIN_ENABLED", "WEB_ADMIN_FRONTEND_ENABLED", "WEB_ADMIN_SESSION_DAYS",
+    "WEB_ADMIN_TIMEZONE", "WEB_ANALYTICS_CACHE_TTL_S", "WEB_BROADCAST_DELAY_S",
+    "WEB_BROADCAST_JOBS_MAX", "WEB_BROADCAST_MAX_ACTIVE_JOBS", "WEB_BROADCAST_QUEUE_MAXSIZE",
+    "WEB_BROADCAST_WORKERS", "WEB_COOKIE_SAMESITE", "WEB_COOKIE_SECURE", "WEB_COUNTS_CACHE_TTL_S",
+    "WEB_LIVE_POLL_SECONDS", "WEB_LIVE_SCHEDULES_CACHE_TTL_S", "WEB_MAX_CONTENT_LENGTH",
+    "WEB_REQUIRE_STABLE_SECRET_IN_PRODUCTION", "WEB_SECRET_KEY", "WEB_SECRET_REDIS_KEY",
+    "WEB_SECRET_REDIS_MAX_CONNECTIONS", "WEB_SECRET_REDIS_SOCKET_TIMEOUT_S", "WEB_SESSION_COOKIE_NAME",
+    "WEB_SLOW_REQUEST_MS", "WEB_STATUS_POLL_SECONDS", "WEB_TABLE_PAGE_SIZE", "WEB_TRUST_PROXY",
+}
+
+LEGACY_ENV_ALIASES: dict[str, str] = {
+    "WEB_ADMIN_PASSWORD": "ADMIN_WEB_PASSWORD",
+    "FLASK_SECRET_KEY": "REDIS_URL/WEB_SECRET_KEY compatibility only; Redis is preferred",
+    "SUPABASE_KEY": "SUPABASE_SERVICE_ROLE_KEY",
+    "SUPABASE_POOLER_URL": "SUPABASE_DB_POOLER_URL",
+    "DATABASE_URL_POOLER": "SUPABASE_DB_POOLER_URL",
+    "AI_API_KEY": "GEMINI_API_KEY or HF_TOKEN depending on provider",
+}
+
+
+def _important_env_template_text(*, include_optional_empty: bool = True) -> str:
+    lines: list[str] = []
+    for section, rows in IMPORTANT_ENV_TEMPLATE.items():
+        title = section.replace("_", " ").title()
+        lines.append(f"# {title}")
+        for key, example, help_text in rows:
+            if not include_optional_empty and not example and section not in {"required", "recommended"}:
+                continue
+            value = os.environ.get(key, example)
+            if key == "VOXCPM2_TOKEN" and not value and os.environ.get("HF_TOKEN"):
+                # HF_TOKEN already covers VoxCPM2 by default.
+                continue
+            lines.append(f"{key}={value}")
+            if help_text:
+                lines.append(f"# {help_text}")
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def _configured_code_default_env_keys() -> list[str]:
+    return sorted(key for key in CODE_DEFAULT_ENV_KEYS if key in os.environ)
+
+
+def _log_env_cleanup_advice() -> None:
+    removable = _configured_code_default_env_keys()
+    if not removable:
+        return
+    preview = ", ".join(removable[:40])
+    suffix = "" if len(removable) <= 40 else f", ... +{len(removable) - 40} more"
+    logging.getLogger(__name__).info(
+        "Env cleanup: %s non-secret setting env vars can be removed because code defaults/runtime settings cover them: %s%s",
+        len(removable),
+        preview,
+        suffix,
+    )
+
+
 # ── Admin cookie defaults ──────────────────────────────────────────────────
 # Default cookie mode for separated frontend/backend deployments.
 # SameSite=None requires Secure=True in modern browsers.
@@ -7781,7 +7927,7 @@ def web_admin_runtime_config():
         return redirect(url_for("web_admin_runtime_config"))
 
     webhook_ready = bool(_runtime_webhook_base_url() and _runtime_webhook_secret_token())
-    minimal_env_text = 'PORT=8080\nRENDER=true\nRENDER_EXTERNAL_URL=https://your-service.onrender.com\nTELEGRAM_BOT_TOKEN=CHANGE_ME\nADMIN_IDS=1272791365\nADMIN_WEB_PASSWORD=CHANGE_ME\nSUPABASE_URL=https://your-project.supabase.co\nSUPABASE_SERVICE_ROLE_KEY=CHANGE_ME\nREDIS_URL=redis://default:password@host:6379\nHF_TOKEN=CHANGE_ME_OPTIONAL\nGEMINI_API_KEY=CHANGE_ME_OPTIONAL'
+    minimal_env_text = _important_env_template_text()
     body = f"""
     <div data-live-status></div>
     <div class='card'>
@@ -12972,6 +13118,8 @@ def startup_self_check() -> None:
         checks.append("VOXCPM2_SPACE is empty; VoxCPM2 controllable cloning is unavailable")
     if not REDIS_URL:
         checks.append("REDIS_URL is missing; cache/history fallback will use memory + Supabase only")
+
+    _log_env_cleanup_advice()
 
     if checks:
         logger.warning("Startup self-check warnings:\n- %s", "\n- ".join(checks))
