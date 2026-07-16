@@ -11551,7 +11551,7 @@ TTS_MODEL_OPTIONS = {
     "auto": ("Auto", "Kiri → Edge TTS"),
     "hf_space": ("Kiri", ""),
     "edge": ("Edge TTS", ""),
-    "voxcpm2": ("VoxCPM2 Clone", "Reference + Style Control"),
+    "voxcpm2": ("VoxCPM2 Clone", "សំឡេងគំរូ + ការគ្រប់គ្រងស្ទីល"),
 }
 TTS_MODEL_ALIASES = {
     "auto": "auto",
@@ -11703,17 +11703,17 @@ def _voxcpm2_reference_ready(profile: dict[str, Any] | None) -> bool:
 
 def _voxcpm2_unavailable_reason(*, include_cooldown: bool = True) -> str:
     if not VOXCPM2_ENABLED:
-        return "VoxCPM2 is disabled by server configuration."
+        return "VoxCPM2 ត្រូវបានបិទនៅក្នុងការកំណត់ server។"
     if GradioClient is None:
-        return "gradio_client is not installed."
+        return "មិនទាន់បានដំឡើង gradio_client។"
     if GradioHandleFile is None:
-        return "gradio_client.handle_file is unavailable; upgrade gradio_client."
+        return "gradio_client.handle_file មិនអាចប្រើបានទេ; សូម upgrade gradio_client។"
     if not VOXCPM2_SPACE:
-        return "VOXCPM2_SPACE is empty."
+        return "VOXCPM2_SPACE មិនទាន់បានកំណត់។"
     if include_cooldown:
         remaining = _voxcpm2_disabled_remaining_s() if "_voxcpm2_disabled_remaining_s" in globals() else 0
         if remaining > 0:
-            return f"VoxCPM2 is cooling down after provider failures ({remaining}s remaining)."
+            return f"VoxCPM2 កំពុងសម្រាកបណ្ដោះអាសន្ន បន្ទាប់ពី provider បរាជ័យ ({remaining}s នៅសល់)។"
     return ""
 
 
@@ -15270,7 +15270,7 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔑 API Keys", callback_data="admin_api"),
          InlineKeyboardButton("🕘 History", callback_data="admin_history")],
         [InlineKeyboardButton("📱 Compact", callback_data="admin_compact"),
-         InlineKeyboardButton("🔄 Refresh", callback_data="admin_home")],
+         InlineKeyboardButton("🔄 ផ្ទុកឡើងវិញ", callback_data="admin_home")],
         [InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
 
@@ -15285,7 +15285,7 @@ def get_admin_compact_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📄 Report", callback_data="admin_report"),
          InlineKeyboardButton("🩺 Health", callback_data="admin_health")],
         [InlineKeyboardButton("🏠 Full Admin", callback_data="admin_home"),
-         InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
 
 
@@ -15520,7 +15520,7 @@ def get_admin_optimize_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🛠 Runtime", callback_data="admin_runtime"),
          InlineKeyboardButton("🩺 Health", callback_data="admin_health")],
         [InlineKeyboardButton("🚨 Error Center", callback_data="admin_errors"),
-         InlineKeyboardButton("🔄 Refresh", callback_data="admin_optimize")],
+         InlineKeyboardButton("🔄 ផ្ទុកឡើងវិញ", callback_data="admin_optimize")],
         [InlineKeyboardButton("⬅️ Admin V9", callback_data="admin_home"),
          InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
@@ -18075,7 +18075,7 @@ def get_broadcast_templates_kb(templates: list[dict]) -> InlineKeyboardMarkup:
             InlineKeyboardButton(f"▶️ {title}", callback_data=f"bc_tpl_use:{tpl_id}"),
             InlineKeyboardButton("🗑", callback_data=f"bc_tpl_delask:{tpl_id}"),
         ])
-    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="bc_templates"),
+    rows.append([InlineKeyboardButton("🔄 ផ្ទុកឡើងវិញ", callback_data="bc_templates"),
                  InlineKeyboardButton("➕ Broadcast ថ្មី", callback_data="admin_broadcast")])
     rows.append([InlineKeyboardButton("⬅️ Admin V9", callback_data="admin_home"),
                  InlineKeyboardButton("❌ បិទ", callback_data="admin_close")])
@@ -18623,7 +18623,7 @@ def get_users_page_kb(users: list[dict], page: int, page_size: int = 7) -> Inlin
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton("🔎 Search User", callback_data="users_search"),
-                 InlineKeyboardButton("🔄 Refresh", callback_data=f"users_page:{page}")])
+                 InlineKeyboardButton("🔄 ផ្ទុកឡើងវិញ", callback_data=f"users_page:{page}")])
     rows.append([InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
                  InlineKeyboardButton("❌ បិទ", callback_data="users_close")])
     return InlineKeyboardMarkup(rows)
@@ -18698,7 +18698,7 @@ def get_recent_history_kb(rows: list[dict], page: int, page_size: int = 7) -> In
     if nav:
         kbd_rows.append(nav)
 
-    kbd_rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="history_refresh"),
+    kbd_rows.append([InlineKeyboardButton("🔄 ផ្ទុកឡើងវិញ", callback_data="history_refresh"),
                      InlineKeyboardButton("👥 Users", callback_data="users_page:0")])
     kbd_rows.append([InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
                      InlineKeyboardButton("❌ បិទ", callback_data="history_close")])
@@ -18764,7 +18764,7 @@ def get_bot_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
 
     rows.append([InlineKeyboardButton("⚡ Performance Settings", callback_data="admin_perf")])
     rows.extend([
-        [InlineKeyboardButton("🔄 Refresh", callback_data="admin_settings_refresh"),
+        [InlineKeyboardButton("🔄 ផ្ទុកឡើងវិញ", callback_data="admin_settings_refresh"),
          InlineKeyboardButton("🧩 Setup SQL", callback_data="admin_settings_sql")],
         [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
          InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
@@ -21060,7 +21060,7 @@ def get_feature_request_inbox_kb(rows: list[dict[str, Any]]) -> InlineKeyboardMa
         title = _feature_request_title(str(row.get("title") or row.get("detail") or "Request"))
         label = f"{_feature_request_status_icon(status)} {title[:34]}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"needs_request:{request_id}")])
-    buttons.append([InlineKeyboardButton("🔄 Refresh", callback_data="needs_inbox"),
+    buttons.append([InlineKeyboardButton("🔄 ផ្ទុកឡើងវិញ", callback_data="needs_inbox"),
                     InlineKeyboardButton("🧩 SQL", callback_data="needs_sql")])
     buttons.append([InlineKeyboardButton("⬅️ User Needs", callback_data="admin_user_needs"),
                     InlineKeyboardButton("❌ បិទ", callback_data="admin_close")])
@@ -21640,7 +21640,7 @@ def _tts_provider_control_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✅ Enable HF Now", callback_data="admin_tts_hf_enable"),
          InlineKeyboardButton("⏸ Disable HF 5m", callback_data="admin_tts_hf_5m")],
         [InlineKeyboardButton("🧹 Clear HF Client", callback_data="admin_tts_hf_clear"),
-         InlineKeyboardButton("🔄 Refresh", callback_data="admin_tts")],
+         InlineKeyboardButton("🔄 ផ្ទុកឡើងវិញ", callback_data="admin_tts")],
         [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
          InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
@@ -21883,7 +21883,7 @@ def _error_center_kb(fingerprint: str | None = None) -> InlineKeyboardMarkup:
              InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
         ])
 
-    rows = [[InlineKeyboardButton("🔄 Refresh", callback_data="admin_errors"),
+    rows = [[InlineKeyboardButton("🔄 ផ្ទុកឡើងវិញ", callback_data="admin_errors"),
              InlineKeyboardButton("🧹 Clear All", callback_data="admin_errors_clear")]]
     for row in _admin_error_center_grouped(6):
         fp = str(row.get("fingerprint") or "")[:12]
@@ -24606,9 +24606,9 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vox_state = context.user_data.pop("voxcpm2_state", None)
     if not _is_admin(uid):
         if vox_state:
-            await safe_send(lambda: update.message.reply_text("✅ VoxCPM2 setup cancelled."))
+            await safe_send(lambda: update.message.reply_text("✅ បានបោះបង់ការរៀបចំ VoxCPM2 រួច។"))
         else:
-            await safe_send(lambda: update.message.reply_text("ℹ️ No operation to cancel."))
+            await safe_send(lambda: update.message.reply_text("ℹ️ មិនមានការងារត្រូវបោះបង់ទេ។"))
         return
 
     # Preserve the old admin-chat notification behavior while still using the
@@ -24765,42 +24765,42 @@ async def cmd_delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 def _voxcpm2_panel_kb(selected: bool = False) -> InlineKeyboardMarkup:
-    select_label = "✅ VoxCPM2 Selected" if selected else "✅ Select VoxCPM2"
+    select_label = "✅ បានជ្រើស VoxCPM2" if selected else "✅ ជ្រើស VoxCPM2"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎙 Upload Reference", callback_data="voxcpm2:set_ref"),
-         InlineKeyboardButton("🎛 Control Instruction", callback_data="voxcpm2:set_control")],
-        [InlineKeyboardButton("🧹 Clear Control", callback_data="voxcpm2:clear_control"),
-         InlineKeyboardButton("🗑 Clear Reference", callback_data="voxcpm2:clear_ref")],
+        [InlineKeyboardButton("🎙 ផ្ញើសំឡេងគំរូ", callback_data="voxcpm2:set_ref"),
+         InlineKeyboardButton("🎛 កំណត់ស្ទីលសំឡេង", callback_data="voxcpm2:set_control")],
+        [InlineKeyboardButton("🧹 លុបស្ទីល", callback_data="voxcpm2:clear_control"),
+         InlineKeyboardButton("🗑 លុបសំឡេងគំរូ", callback_data="voxcpm2:clear_ref")],
         [InlineKeyboardButton(select_label, callback_data="voxcpm2:select"),
-         InlineKeyboardButton("🔄 Refresh", callback_data="voxcpm2:refresh")],
-        [InlineKeyboardButton("🤖 TTS Models", callback_data="show_tts_model"),
-         InlineKeyboardButton("❌ Close", callback_data="voxcpm2:close")],
+         InlineKeyboardButton("🔄 ផ្ទុកឡើងវិញ", callback_data="voxcpm2:refresh")],
+        [InlineKeyboardButton("🤖 ម៉ូដែល TTS", callback_data="show_tts_model"),
+         InlineKeyboardButton("❌ បិទ", callback_data="voxcpm2:close")],
     ])
 
 
 def _voxcpm2_panel_text(profile: dict[str, Any], selected: bool, notice: str = "") -> str:
     ready = _voxcpm2_reference_ready(profile)
     duration = float(profile.get("duration") or 0.0)
-    ref_name = html.escape(str(profile.get("filename") or "reference audio")[:80])
-    reference_line = f"✅ <code>{ref_name}</code>" if ready else "❌ Not uploaded"
+    ref_name = html.escape(str(profile.get("filename") or "សំឡេងគំរូ")[:80])
+    reference_line = f"✅ <code>{ref_name}</code>" if ready else "❌ មិនទាន់បានផ្ញើ"
     if ready and duration > 0:
         reference_line += f" · {duration:g}s"
     control = str(profile.get("control") or "").strip()
-    control_line = html.escape(control[:220]) if control else "Default style from the reference voice"
+    control_line = html.escape(control[:220]) if control else "ប្រើស្ទីលដើមពីសំឡេងគំរូ"
     unavailable = _voxcpm2_unavailable_reason()
-    status_line = f"⚠️ {html.escape(unavailable)}" if unavailable else "✅ Ready"
+    status_line = f"⚠️ {html.escape(unavailable)}" if unavailable else "✅ រួចរាល់"
     prefix = f"✅ {html.escape(notice)}\n\n" if notice else ""
     return (
         prefix
-        + "🎙 <b>VoxCPM2 — Controllable Cloning</b>\n\n"
-        + f"Service: {status_line}\n"
-        + f"Reference: {reference_line}\n"
-        + f"Control: <i>{control_line}</i>\n"
-        + f"Selected model: <b>{'YES' if selected else 'NO'}</b>\n\n"
-        + "Upload a clear reference clip, then optionally describe emotion, speaking pace, tone, or style. "
-          "The cloned voice keeps the reference timbre while applying the instruction.\n\n"
-        + f"💡 Best reference: one speaker, clean audio, about 5–30 seconds (hard limit {VOXCPM2_MAX_REFERENCE_SECONDS:g} seconds).\n"
-        + "⚠️ Use only your own voice or a voice you have permission to clone. The reference is sent to the configured VoxCPM2 service for generation."
+        + "🎙 <b>VoxCPM2 — ក្លូនសំឡេងដែលអាចគ្រប់គ្រងស្ទីលបាន</b>\n\n"
+        + f"សេវាកម្ម: {status_line}\n"
+        + f"សំឡេងគំរូ: {reference_line}\n"
+        + f"ស្ទីល/ការណែនាំ: <i>{control_line}</i>\n"
+        + f"ម៉ូដែលបានជ្រើស: <b>{'បាទ/ចាស' if selected else 'ទេ'}</b>\n\n"
+        + "សូមផ្ញើសំឡេងគំរូឱ្យច្បាស់។ បន្ទាប់មក អ្នកអាចសរសេរការណែនាំអំពីអារម្មណ៍ ល្បឿននិយាយ ទឹកដមសំឡេង ឬស្ទីល។ "
+          "សំឡេងក្លូននឹងរក្សាទឹកសំឡេងដើម ហើយអនុវត្តតាមការណែនាំរបស់អ្នក។\n\n"
+        + f"💡 សំឡេងគំរូល្អបំផុត: មនុស្សនិយាយម្នាក់ សំឡេងស្អាត ប្រហែល 5–30 វិនាទី (កំណត់អតិបរមា {VOXCPM2_MAX_REFERENCE_SECONDS:g} វិនាទី)។\n"
+        + "⚠️ ប្រើតែសំឡេងផ្ទាល់ខ្លួន ឬសំឡេងដែលអ្នកមានការអនុញ្ញាតឱ្យក្លូនប៉ុណ្ណោះ។ សំឡេងគំរូនឹងត្រូវផ្ញើទៅសេវា VoxCPM2 ដែលបានកំណត់ ដើម្បីបង្កើតសំឡេង។"
     )
 
 
@@ -24849,12 +24849,12 @@ async def _voxcpm2_accept_reference(
         return
     if file_size and file_size > VOXCPM2_MAX_REFERENCE_BYTES:
         await safe_send(lambda: msg.reply_text(
-            f"❌ Reference audio is too large. Max {VOXCPM2_MAX_REFERENCE_BYTES // 1024 // 1024}MB."
+            f"❌ សំឡេងគំរូធំពេក។ អតិបរមា {VOXCPM2_MAX_REFERENCE_BYTES // 1024 // 1024}MB។"
         ))
         return
     if duration and duration > VOXCPM2_MAX_REFERENCE_SECONDS:
         await safe_send(lambda: msg.reply_text(
-            f"❌ Reference audio is too long. Max {VOXCPM2_MAX_REFERENCE_SECONDS:g} seconds."
+            f"❌ សំឡេងគំរូវែងពេក។ អតិបរមា {VOXCPM2_MAX_REFERENCE_SECONDS:g} វិនាទី។"
         ))
         return
     profile = await _voxcpm2_profile_get(int(user.id))
@@ -24872,10 +24872,10 @@ async def _voxcpm2_accept_reference(
     context.user_data.pop("voxcpm2_state", None)
     unavailable = _voxcpm2_unavailable_reason()
     if unavailable:
-        notice = f"Reference audio saved. VoxCPM2 is not selectable yet: {unavailable}"
+        notice = f"បានរក្សាទុកសំឡេងគំរូរួច។ ប៉ុន្តែមិនទាន់អាចជ្រើស VoxCPM2 បានទេ: {unavailable}"
     else:
         update_user_tts_model(int(user.id), "voxcpm2")
-        notice = "Reference audio saved and VoxCPM2 selected."
+        notice = "បានរក្សាទុកសំឡេងគំរូ និងបានជ្រើស VoxCPM2 រួច។"
     await _voxcpm2_send_panel(msg, int(user.id), notice)
 
 
@@ -24889,7 +24889,7 @@ async def _voxcpm2_save_control_text(update: Update, context: ContextTypes.DEFAU
         control = ""
     if len(control) > VOXCPM2_CONTROL_MAX_CHARS:
         await safe_send(lambda: msg.reply_text(
-            f"❌ Control Instruction is too long. Max {VOXCPM2_CONTROL_MAX_CHARS} characters."
+            f"❌ ការណែនាំស្ទីលវែងពេក។ អតិបរមា {VOXCPM2_CONTROL_MAX_CHARS} តួអក្សរ។"
         ))
         return
     profile = await _voxcpm2_profile_get(int(user.id))
@@ -24897,7 +24897,7 @@ async def _voxcpm2_save_control_text(update: Update, context: ContextTypes.DEFAU
     profile["updated_at"] = datetime.now(timezone.utc).isoformat()
     await _voxcpm2_profile_set(int(user.id), profile)
     context.user_data.pop("voxcpm2_state", None)
-    notice = "Control Instruction saved." if control else "Control Instruction cleared."
+    notice = "បានរក្សាទុកការណែនាំស្ទីលរួច។" if control else "បានលុបការណែនាំស្ទីលរួច។"
     await _voxcpm2_send_panel(msg, int(user.id), notice)
 
 
@@ -24906,16 +24906,16 @@ async def _cb_voxcpm2(query, user_id: int, context, data: str) -> None:
     if action == "set_ref":
         context.user_data["voxcpm2_state"] = VOXCPM2_WAIT_REFERENCE
         await safe_send(lambda: query.message.reply_text(
-            "🎙 Send a Telegram voice message or upload WAV/MP3/OGG/FLAC audio.\n"
-            "Best result: one speaker, clean recording, 5–30 seconds. /cancel to stop."
+            "🎙 សូមផ្ញើ Telegram voice message ឬ upload audio ប្រភេទ WAV/MP3/OGG/FLAC។\n"
+            "លទ្ធផលល្អបំផុត: មនុស្សនិយាយម្នាក់ សំឡេងច្បាស់ 5–30 វិនាទី។ ប្រើ /cancel ដើម្បីបោះបង់។"
         ))
         return
     if action == "set_control":
         context.user_data["voxcpm2_state"] = VOXCPM2_WAIT_CONTROL
         await safe_send(lambda: query.message.reply_text(
-            "🎛 Send the Control Instruction as text.\n"
-            "Examples: ‘warm and cheerful, slightly faster’ or ‘calm, slow, professional’.\n"
-            "Send ‘clear’ to remove it, or /cancel to stop."
+            "🎛 សូមផ្ញើការណែនាំស្ទីលជាអត្ថបទ។\n"
+            "ឧទាហរណ៍: ‘warm and cheerful, slightly faster’ ឬ ‘calm, slow, professional’។\n"
+            "ផ្ញើ ‘clear’ ដើម្បីលុប ឬប្រើ /cancel ដើម្បីបោះបង់។"
         ))
         return
     if action == "clear_control":
@@ -24923,7 +24923,7 @@ async def _cb_voxcpm2(query, user_id: int, context, data: str) -> None:
         profile["control"] = ""
         profile["updated_at"] = datetime.now(timezone.utc).isoformat()
         await _voxcpm2_profile_set(user_id, profile)
-        await _voxcpm2_send_panel(query.message, user_id, "Control Instruction cleared.", edit=True)
+        await _voxcpm2_send_panel(query.message, user_id, "បានលុបការណែនាំស្ទីលរួច។", edit=True)
         return
     if action == "clear_ref":
         profile = await _voxcpm2_profile_get(user_id)
@@ -24931,7 +24931,7 @@ async def _cb_voxcpm2(query, user_id: int, context, data: str) -> None:
             profile.pop(key, None)
         profile["updated_at"] = datetime.now(timezone.utc).isoformat()
         await _voxcpm2_profile_set(user_id, profile)
-        await _voxcpm2_send_panel(query.message, user_id, "Reference audio cleared.", edit=True)
+        await _voxcpm2_send_panel(query.message, user_id, "បានលុបសំឡេងគំរូរួច។", edit=True)
         return
     if action == "select":
         unavailable = _voxcpm2_unavailable_reason()
@@ -24939,16 +24939,16 @@ async def _cb_voxcpm2(query, user_id: int, context, data: str) -> None:
             await _voxcpm2_send_panel(
                 query.message,
                 user_id,
-                f"Cannot select VoxCPM2: {unavailable}",
+                f"មិនអាចជ្រើស VoxCPM2 បានទេ: {unavailable}",
                 edit=True,
             )
             return
         update_user_tts_model(user_id, "voxcpm2")
         profile = await _voxcpm2_profile_get(user_id)
         notice = (
-            "VoxCPM2 selected."
+            "បានជ្រើស VoxCPM2 រួច។"
             if _voxcpm2_reference_ready(profile)
-            else "VoxCPM2 selected. Upload a reference before generating speech."
+            else "បានជ្រើស VoxCPM2 រួច។ សូមផ្ញើសំឡេងគំរូ មុនពេលបង្កើតសំឡេង។"
         )
         await _voxcpm2_send_panel(query.message, user_id, notice, edit=True)
         return
@@ -24991,7 +24991,7 @@ async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🗣️ សំឡេង: <b>{gender_label}</b>\n"
         f"🎚️ ល្បឿន: <b>{speed_label}</b>\n"
         f"🤖 ម៉ូដែល TTS: <b>{html.escape(model_label)}</b>\n"
-        f"🎙️ VoxCPM2 setup: <b>{'Use /voxcpm2' if _normalize_tts_model(prefs.get('tts_model', 'auto')) == 'voxcpm2' else 'Optional'}</b>\n\n"
+        f"🎙️ ការរៀបចំ VoxCPM2: <b>{'ប្រើ /voxcpm2' if _normalize_tts_model(prefs.get('tts_model', 'auto')) == 'voxcpm2' else 'ជម្រើសបន្ថែម'}</b>\n\n"
         "ផ្ញើ text ណាមួយ ហើយប្រើប៊ូតុងក្រោមសំឡេង ដើម្បីប្តូរ។",
         parse_mode="HTML",
         reply_markup=get_main_kb(prefs["gender"], prefs.get("tts_model", "auto")),
@@ -25006,7 +25006,7 @@ async def cmd_ttsmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Auto: Khmer HF Space សម្រាប់ខ្មែរ និង Edge fallback\n"
         "Khmer HF: ប្រើ mrrtmob/khmer-tts សម្រាប់អត្ថបទខ្មែរ\n"
         "Edge: ប្រើ Microsoft Edge TTS គ្រប់ភាសា\n"
-        "VoxCPM2 Clone: Upload reference audio + optional style Control Instruction (/voxcpm2)",
+        "VoxCPM2 Clone: ផ្ញើសំឡេងគំរូ + កំណត់ស្ទីលសំឡេងជាជម្រើស (/voxcpm2)",
         parse_mode="HTML",
         reply_markup=get_tts_model_kb(prefs.get("tts_model", "auto")),
     ))
@@ -25732,7 +25732,7 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
             await _voxcpm2_send_panel(
                 query.message,
                 user_id,
-                f"Cannot select VoxCPM2: {unavailable}",
+                f"មិនអាចជ្រើស VoxCPM2 បានទេ: {unavailable}",
             )
             return
     model = update_user_tts_model(user_id, requested_key)
@@ -25753,7 +25753,7 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
                 await query.message.edit_reply_markup(reply_markup=get_main_kb(gender, model))
             await _voxcpm2_send_panel(
                 query.message, user_id,
-                "VoxCPM2 selected. Upload a reference audio clip before generating speech.",
+                "បានជ្រើស VoxCPM2 រួច។ សូមផ្ញើសំឡេងគំរូ មុនពេលបង្កើតសំឡេង។",
             )
             return
 
