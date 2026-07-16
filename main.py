@@ -9588,6 +9588,8 @@ VOXCPM2_RETRY_DELAY_S       = _env_float("VOXCPM2_RETRY_DELAY_S", 3.0, minimum=0
 # remain available for emergency tuning.
 VOXCPM2_QUEUE_RETRY_DELAY_S = _env_float("VOXCPM2_QUEUE_RETRY_DELAY_S", 45.0, minimum=5.0, maximum=300.0)
 VOXCPM2_QUEUE_COOLDOWN_S    = _env_float("VOXCPM2_QUEUE_COOLDOWN_S", 180.0, minimum=30.0, maximum=3600.0)
+VOXCPM2_AUTO_FALLBACK_ON_QUEUE = _env_bool("VOXCPM2_AUTO_FALLBACK_ON_QUEUE", True)
+VOXCPM2_FALLBACK_NOTICE_ENABLED = _env_bool("VOXCPM2_FALLBACK_NOTICE_ENABLED", True)
 VOXCPM2_MAX_CHARS           = _env_int("VOXCPM2_MAX_CHARS", 500, minimum=80, maximum=1200)
 VOXCPM2_MAX_REFERENCE_BYTES = _env_int("VOXCPM2_MAX_REFERENCE_MB", 20, minimum=1, maximum=50) * 1024 * 1024
 VOXCPM2_MAX_REFERENCE_SECONDS = _env_float("VOXCPM2_MAX_REFERENCE_SECONDS", 50.0, minimum=5.0, maximum=120.0)
@@ -15766,6 +15768,10 @@ _VOXCPM2_CLIENT = None
 _VOXCPM2_CLIENT_KEY: tuple[str, str] | None = None
 _VOXCPM2_FAILURES = 0
 _VOXCPM2_DISABLED_UNTIL = 0.0
+_VOXCPM2_LAST_ERROR = ""
+_VOXCPM2_LAST_ERROR_AT = 0.0
+_VOXCPM2_LAST_SUCCESS_AT = 0.0
+_VOXCPM2_QUEUE_FULL_HITS = 0
 
 
 def _tts_provider_summary() -> str:
@@ -16759,10 +16765,11 @@ def _voxcpm2_reset_client_sync() -> None:
 
 
 def _voxcpm2_record_success() -> None:
-    global _VOXCPM2_FAILURES, _VOXCPM2_DISABLED_UNTIL
+    global _VOXCPM2_FAILURES, _VOXCPM2_DISABLED_UNTIL, _VOXCPM2_LAST_SUCCESS_AT
     with _VOXCPM2_STATE_LOCK:
         _VOXCPM2_FAILURES = 0
         _VOXCPM2_DISABLED_UNTIL = 0.0
+        _VOXCPM2_LAST_SUCCESS_AT = time.monotonic()
 
 
 def _voxcpm2_is_queue_full_error(exc: Exception | str) -> bool:
@@ -16778,7 +16785,7 @@ def _voxcpm2_is_queue_full_error(exc: Exception | str) -> bool:
 
 def _voxcpm2_record_failure(exc: Exception | str) -> None:
     """Apply a circuit breaker for repeated public-Space failures."""
-    global _VOXCPM2_FAILURES, _VOXCPM2_DISABLED_UNTIL
+    global _VOXCPM2_FAILURES, _VOXCPM2_DISABLED_UNTIL, _VOXCPM2_LAST_ERROR, _VOXCPM2_LAST_ERROR_AT, _VOXCPM2_QUEUE_FULL_HITS
     msg = str(exc).lower()
     queue_full = _voxcpm2_is_queue_full_error(exc)
     quota_error = any(token in msg for token in (
@@ -16797,6 +16804,10 @@ def _voxcpm2_record_failure(exc: Exception | str) -> None:
     ))
     with _VOXCPM2_STATE_LOCK:
         _VOXCPM2_FAILURES += 1
+        _VOXCPM2_LAST_ERROR = str(exc)[:500]
+        _VOXCPM2_LAST_ERROR_AT = time.monotonic()
+        if queue_full:
+            _VOXCPM2_QUEUE_FULL_HITS += 1
         # Queue-full is not a broken reference or code bug; it is public Space
         # capacity. Cool down immediately so all users do not keep submitting
         # into the same full queue while the service is saturated.
@@ -16807,6 +16818,110 @@ def _voxcpm2_record_failure(exc: Exception | str) -> None:
             )
     if should_reset:
         _voxcpm2_reset_client_sync()
+
+
+def _voxcpm2_force_cooldown(seconds: float) -> None:
+    global _VOXCPM2_DISABLED_UNTIL
+    seconds = max(1.0, float(seconds or 0.0))
+    with _VOXCPM2_STATE_LOCK:
+        _VOXCPM2_DISABLED_UNTIL = max(_VOXCPM2_DISABLED_UNTIL, time.monotonic() + seconds)
+
+
+def _voxcpm2_is_fallbackable_queue_error(exc: Exception | str) -> bool:
+    msg = str(exc).lower()
+    return (
+        _voxcpm2_is_queue_full_error(exc)
+        or ("voxcpm2" in msg and "cooldown active" in msg)
+        or ("voxcpm2" in msg and any(token in msg for token in ("queue", "busy", "temporarily")))
+    )
+
+
+def _voxcpm2_fallback_model_for_text(text: str) -> str:
+    # Khmer gets the Khmer HF provider first; other languages use Edge directly.
+    return "hf_space" if _detect_tts_lang_key(text or "") == "km" else "edge"
+
+
+def _voxcpm2_fallback_model_label(model: str) -> str:
+    key = _normalize_tts_model(model)
+    if key == "hf_space":
+        return "Kiri / Khmer TTS"
+    if key == "edge":
+        return "Edge TTS"
+    return TTS_MODEL_OPTIONS.get(key, TTS_MODEL_OPTIONS["auto"])[0]
+
+
+def _voxcpm2_fallback_notice_text(exc: Exception | str, fallback_model: str) -> str:
+    msg = str(exc).lower()
+    fallback_label = html.escape(_voxcpm2_fallback_model_label(fallback_model))
+    if _voxcpm2_is_queue_full_error(exc):
+        reason = "ជួរ VoxCPM2 ពេញ ព្រោះមានអ្នកប្រើច្រើន"
+    elif "cooldown" in msg:
+        reason = "VoxCPM2 កំពុងសម្រាកបណ្ដោះអាសន្ន"
+    elif "quota" in msg or "zerogpu" in msg or "zero gpu" in msg:
+        reason = "VoxCPM2 អស់ quota បណ្ដោះអាសន្ន"
+    else:
+        reason = "VoxCPM2 កំពុងរវល់"
+    return (
+        f"⚠️ <b>{reason}</b>។\n"
+        f"✅ Bot នឹងប្រើសំឡេងបម្រុង <b>{fallback_label}</b> ជំនួសសិន។\n"
+        "🔁 សូមសាក VoxCPM2 ម្តងទៀតក្រោយ 2–3 នាទី។"
+    )
+
+
+async def _send_voxcpm2_fallback_notice(bot: Any, chat_id: int | None, exc: Exception | str, fallback_model: str) -> None:
+    if not VOXCPM2_FALLBACK_NOTICE_ENABLED or bot is None or not chat_id:
+        return
+    text = _voxcpm2_fallback_notice_text(exc, fallback_model)
+    with suppress(Exception):
+        await safe_send(lambda: bot.send_message(
+            chat_id=int(chat_id),
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        ))
+
+
+def _voxcpm2_age_text(monotonic_ts: float) -> str:
+    if not monotonic_ts:
+        return "never"
+    age = max(0, int(time.monotonic() - float(monotonic_ts)))
+    if age < 60:
+        return f"{age}s ago"
+    if age < 3600:
+        return f"{age // 60}m {age % 60}s ago"
+    return f"{age // 3600}h {(age % 3600) // 60}m ago"
+
+
+def _voxcpm2_health_snapshot() -> dict[str, Any]:
+    with _VOXCPM2_STATE_LOCK:
+        remaining = max(0, int(_VOXCPM2_DISABLED_UNTIL - time.monotonic()))
+        failures = int(_VOXCPM2_FAILURES)
+        queue_hits = int(_VOXCPM2_QUEUE_FULL_HITS)
+        last_error = str(_VOXCPM2_LAST_ERROR or "")
+        last_error_at = float(_VOXCPM2_LAST_ERROR_AT or 0.0)
+        last_success_at = float(_VOXCPM2_LAST_SUCCESS_AT or 0.0)
+    if not VOXCPM2_ENABLED:
+        status = "OFF"
+    elif GradioClient is None or GradioHandleFile is None:
+        status = "MISSING DEPENDENCY"
+    elif remaining > 0 and _voxcpm2_is_queue_full_error(last_error):
+        status = "QUEUE FULL / COOLDOWN"
+    elif remaining > 0:
+        status = "COOLDOWN"
+    else:
+        status = "READY"
+    return {
+        "status": status,
+        "enabled": bool(VOXCPM2_ENABLED),
+        "cooldown_s": remaining,
+        "failures": failures,
+        "queue_full_hits": queue_hits,
+        "last_error": last_error,
+        "last_error_age": _voxcpm2_age_text(last_error_at),
+        "last_success_age": _voxcpm2_age_text(last_success_at),
+        "client_cached": bool(_VOXCPM2_CLIENT is not None),
+        "auto_fallback": bool(VOXCPM2_AUTO_FALLBACK_ON_QUEUE),
+    }
 
 
 def _voxcpm2_make_client_sync():
@@ -17179,8 +17294,13 @@ async def generate_user_voice_limited(
     user_id: int,
     bot,
     voxcpm2_session: dict[str, Any] | None = None,
+    chat_id: int | None = None,
 ) -> bytes:
-    """Generate user TTS, resolving VoxCPM2 reference audio when selected."""
+    """Generate user TTS, resolving VoxCPM2 reference audio when selected.
+
+    When the public VoxCPM2 queue is full, fall back automatically so the user
+    still receives a voice message instead of a hard failure.
+    """
     model = _normalize_tts_model(tts_model)
     if model != "voxcpm2":
         return await generate_voice_limited(text, gender, speed, output_path, model)
@@ -17190,13 +17310,44 @@ async def generate_user_voice_limited(
     if session_data is None:
         session_data = await _prepare_voxcpm2_session(user_id, bot)
     try:
-        return await _generate_user_voice_voxcpm2_session(
-            text,
-            gender,
-            speed,
-            output_path,
-            session_data,
-        )
+        try:
+            return await _generate_user_voice_voxcpm2_session(
+                text,
+                gender,
+                speed,
+                output_path,
+                session_data,
+            )
+        except Exception as exc:
+            if not VOXCPM2_AUTO_FALLBACK_ON_QUEUE or not _voxcpm2_is_fallbackable_queue_error(exc):
+                raise
+
+            # Queue-full means the public Space has no capacity.  Do not fail the
+            # user request; tell them in Khmer and generate with the best local
+            # fallback path for the text language.
+            fallback_model = _voxcpm2_fallback_model_for_text(text)
+            if isinstance(session_data, dict) and not session_data.get("fallback_notice_sent"):
+                await _send_voxcpm2_fallback_notice(
+                    bot,
+                    chat_id if chat_id is not None else user_id,
+                    exc,
+                    fallback_model,
+                )
+                session_data["fallback_notice_sent"] = True
+            elif not isinstance(session_data, dict):
+                await _send_voxcpm2_fallback_notice(
+                    bot,
+                    chat_id if chat_id is not None else user_id,
+                    exc,
+                    fallback_model,
+                )
+            logger.warning(
+                "VoxCPM2 fallback activated user_id=%s fallback_model=%s reason=%s",
+                user_id,
+                fallback_model,
+                str(exc)[:300],
+            )
+            return await generate_voice_limited(text, gender, speed, output_path, fallback_model)
     finally:
         if owned_session:
             _cleanup_voxcpm2_session(session_data)
@@ -17262,9 +17413,17 @@ def _tts_user_error_message(exc: Exception | str) -> str:
     if "voxcpm2" in msg and any(token in msg for token in ("disabled", "not installed", "unavailable", "api_name", "401", "403")):
         return "❌ VoxCPM2 មិនទាន់ត្រូវបានកំណត់ត្រឹមត្រូវនៅលើ server ទេ។ សូមទាក់ទង Admin។"
     if "voxcpm2" in msg and "queue is full" in msg:
-        return "❌ VoxCPM2 កំពុងមានអ្នកប្រើច្រើនពេក។ Bot បានផ្អាកសេវានេះបណ្ដោះអាសន្ន សូមរង់ចាំប្រហែល 2–3 នាទី ហើយសាកម្តងទៀត។"
+        return (
+            "⚠️ VoxCPM2 កំពុងមានអ្នកប្រើច្រើនពេក។\n"
+            "✅ Bot នឹងប្រើសំឡេងបម្រុងជំនួសសិន ប្រសិនបើអាចធ្វើបាន។\n"
+            "🔁 សូមសាក VoxCPM2 ម្តងទៀតក្រោយ 2–3 នាទី។"
+        )
     if "voxcpm2" in msg and any(token in msg for token in ("busy", "queue", "timeout", "temporarily", "503", "cooldown", "quota", "zerogpu")):
-        return "❌ VoxCPM2 កំពុងរវល់ ឬស្ថិតក្នុង cooldown។ សូមរង់ចាំបន្តិច ហើយសាកម្តងទៀត។"
+        return (
+            "⚠️ VoxCPM2 កំពុងរវល់ ឬស្ថិតក្នុង cooldown។\n"
+            "✅ Bot នឹងព្យាយាមប្រើសំឡេងបម្រុងជំនួស។\n"
+            "🔁 សូមរង់ចាំបន្តិច ហើយសាកម្តងទៀត។"
+        )
     if "no audio" in msg or "edge-tts failed" in msg:
         return (
             "❌ TTS service មិនបានបញ្ជូនសំឡេងមកវិញ។\n"
@@ -17826,6 +17985,7 @@ async def _deliver_paged_tts(
                     user_id=user_id,
                     bot=bot,
                     voxcpm2_session=voxcpm2_session,
+                    chat_id=chat_id,
                 )
                 sent = await safe_send(
                     lambda ab=audio_bytes, ci=i, ct=total: bot.send_voice(
@@ -21528,7 +21688,8 @@ def _tts_provider_control_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✅ Enable HF Now", callback_data="admin_tts_hf_enable"),
          InlineKeyboardButton("⏸ Disable HF 5m", callback_data="admin_tts_hf_5m")],
         [InlineKeyboardButton("🧹 Clear HF Client", callback_data="admin_tts_hf_clear"),
-         InlineKeyboardButton("🔄 Refresh", callback_data="admin_tts")],
+         InlineKeyboardButton("🎙 VoxCPM2 Health", callback_data="admin_voxcpm2_health")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="admin_tts")],
         [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
          InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
@@ -21551,6 +21712,7 @@ def _admin_tts_provider_text(notice: str = "") -> str:
         f"Gradio client: <b>{'READY' if GradioClient is not None else 'MISSING'}</b>",
         f"VoxCPM2: <b>{'ON' if VOXCPM2_ENABLED else 'OFF'}</b> · <code>{html.escape(str(VOXCPM2_SPACE))}{html.escape(str(VOXCPM2_API_NAME))}</code>",
         f"Vox upload helper: <b>{'READY' if GradioHandleFile is not None else 'MISSING'}</b>",
+        f"Vox status: <b>{html.escape(str(_voxcpm2_health_snapshot().get('status')))}</b> · cooldown: <b>{_voxcpm2_health_snapshot().get('cooldown_s')}s</b> · fallback: <b>{'ON' if VOXCPM2_AUTO_FALLBACK_ON_QUEUE else 'OFF'}</b>",
         f"HF cached client: <b>{'YES' if hf_client_ready else 'NO'}</b>",
         f"HF cooldown: <b>{hf_remaining}s</b> {'⚠️' if hf_disabled else '✅'}",
         f"Edge fallback: <b>{'ON' if HF_TTS_EDGE_FALLBACK else 'OFF'}</b>",
@@ -21572,6 +21734,70 @@ async def _admin_open_tts_provider_panel(query, notice: str = "") -> None:
         _admin_tts_provider_text(notice),
         parse_mode="HTML",
         reply_markup=_tts_provider_control_kb(),
+        disable_web_page_preview=True,
+    ))
+
+
+def _voxcpm2_health_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh", callback_data="admin_voxcpm2_health")],
+        [InlineKeyboardButton("✅ Enable VoxCPM2", callback_data="admin_voxcpm2_enable"),
+         InlineKeyboardButton("⏸ Cooldown 5m", callback_data="admin_voxcpm2_5m")],
+        [InlineKeyboardButton("🧹 Clear Vox Client", callback_data="admin_voxcpm2_clear")],
+        [InlineKeyboardButton("⬅️ TTS Provider", callback_data="admin_tts"),
+         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
+    ])
+
+
+def _admin_voxcpm2_health_text(notice: str = "") -> str:
+    snap = _voxcpm2_health_snapshot()
+    last_error = str(snap.get("last_error") or "")
+    if len(last_error) > 450:
+        last_error = last_error[:447] + "..."
+    status_icon = "✅" if snap.get("status") == "READY" else "⚠️"
+    lines: list[str] = []
+    if notice:
+        lines.append(f"{html.escape(notice)}\n")
+    lines.extend([
+        "🎙 <b>VoxCPM2 Provider Health</b>",
+        "",
+        f"Service: <b>{status_icon} {html.escape(str(snap.get('status') or 'UNKNOWN'))}</b>",
+        f"Enabled: <b>{'YES' if snap.get('enabled') else 'NO'}</b>",
+        f"Space: <code>{html.escape(str(VOXCPM2_SPACE))}{html.escape(str(VOXCPM2_API_NAME))}</code>",
+        f"Client cached: <b>{'YES' if snap.get('client_cached') else 'NO'}</b>",
+        f"Upload helper: <b>{'READY' if GradioHandleFile is not None else 'MISSING'}</b>",
+        "",
+        f"Cooldown remaining: <b>{int(snap.get('cooldown_s') or 0)}s</b>",
+        f"Failure count: <b>{int(snap.get('failures') or 0)}</b>",
+        f"Queue-full hits: <b>{int(snap.get('queue_full_hits') or 0)}</b>",
+        f"Last success: <b>{html.escape(str(snap.get('last_success_age')))}</b>",
+        f"Last error: <b>{html.escape(str(snap.get('last_error_age')))}</b>",
+        "",
+        f"Auto fallback on queue-full: <b>{'ON' if snap.get('auto_fallback') else 'OFF'}</b>",
+        f"Fallback route: <code>Khmer → Kiri/HF, other languages → Edge</code>",
+        f"Retry: <b>{VOXCPM2_RETRIES}</b> · queue delay: <b>{VOXCPM2_QUEUE_RETRY_DELAY_S:g}s</b> · queue cooldown: <b>{VOXCPM2_QUEUE_COOLDOWN_S:g}s</b>",
+    ])
+    if last_error:
+        lines.extend([
+            "",
+            "<b>Last error preview</b>",
+            f"<code>{html.escape(last_error)}</code>",
+        ])
+    lines.extend([
+        "",
+        "<b>Khmer user behavior</b>",
+        "• Queue full: បង្ហាញសារ Khmer ជាមុន",
+        "• បន្ទាប់មកបង្កើតសំឡេងបម្រុងដោយស្វ័យប្រវត្តិ",
+        "• អ្នកប្រើអាចសាក VoxCPM2 ម្តងទៀតក្រោយ cooldown",
+    ])
+    return "\n".join(lines)
+
+
+async def _admin_open_voxcpm2_health_panel(query, notice: str = "") -> None:
+    await safe_send(lambda: query.message.edit_text(
+        _admin_voxcpm2_health_text(notice),
+        parse_mode="HTML",
+        reply_markup=_voxcpm2_health_kb(),
         disable_web_page_preview=True,
     ))
 
@@ -22821,6 +23047,25 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
             _HF_TTS_CLIENT = None
             _HF_TTS_CLIENT_KEY = None
         await _admin_open_tts_provider_panel(query, notice="🧹 HF cached client cleared.")
+        return
+
+    if data == "admin_voxcpm2_health":
+        await _admin_open_voxcpm2_health_panel(query)
+        return
+
+    if data == "admin_voxcpm2_enable":
+        _reset_voxcpm2_cooldown()
+        await _admin_open_voxcpm2_health_panel(query, notice="✅ VoxCPM2 cooldown cleared.")
+        return
+
+    if data == "admin_voxcpm2_5m":
+        _voxcpm2_force_cooldown(300)
+        await _admin_open_voxcpm2_health_panel(query, notice="⏸ VoxCPM2 disabled for 5 minutes.")
+        return
+
+    if data == "admin_voxcpm2_clear":
+        _voxcpm2_reset_client_sync()
+        await _admin_open_voxcpm2_health_panel(query, notice="🧹 VoxCPM2 cached client cleared.")
         return
 
     if data == "admin_calendar" or data.startswith("admin_calendar:"):
@@ -25537,7 +25782,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             audio_bytes = await generate_user_voice_limited(
-                tts_text, gender, speed, file_path, tts_model, user_id=user_id, bot=context.bot
+                tts_text, gender, speed, file_path, tts_model, user_id=user_id, bot=context.bot, chat_id=msg.chat_id
             )
             sent_msg    = await safe_send(
                 lambda ab=audio_bytes: msg.reply_voice(
@@ -25676,7 +25921,7 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
         async with lock:
             try:
                 audio_bytes = await generate_user_voice_limited(
-                    original_text, gender, speed, file_path, model, user_id=user_id, bot=context.bot
+                    original_text, gender, speed, file_path, model, user_id=user_id, bot=context.bot, chat_id=chat_id
                 )
                 with suppress(Exception):
                     await query.message.delete()
@@ -25786,7 +26031,7 @@ async def _cb_speed(query, user_id: int, context, data: str):
         async with lock:
             try:
                 audio_bytes = await generate_user_voice_limited(
-                    original_text, gender, new_speed, file_path, tts_model, user_id=user_id, bot=context.bot
+                    original_text, gender, new_speed, file_path, tts_model, user_id=user_id, bot=context.bot, chat_id=chat_id
                 )
                 with suppress(Exception):
                     await query.message.delete()
@@ -25853,7 +26098,7 @@ async def _cb_gender(query, user_id: int, context, data: str):
         async with lock:
             try:
                 audio_bytes = await generate_user_voice_limited(
-                    original_text, new_gender, speed, file_path, tts_model, user_id=user_id, bot=context.bot
+                    original_text, new_gender, speed, file_path, tts_model, user_id=user_id, bot=context.bot, chat_id=chat_id
                 )
                 with suppress(Exception):
                     await query.message.delete()
@@ -25920,7 +26165,7 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
         async with lock:
             try:
                 audio_bytes = await generate_user_voice_limited(
-                    original_text, gender, speed, file_path, tts_model, user_id=user_id, bot=context.bot
+                    original_text, gender, speed, file_path, tts_model, user_id=user_id, bot=context.bot, chat_id=chat_id
                 )
                 # FIX: was query.message.chat.send_voice() — Chat object has no send_voice.
                 new_msg = await safe_send(
