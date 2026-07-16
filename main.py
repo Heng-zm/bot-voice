@@ -16,12 +16,13 @@ import hashlib
 import hmac
 import secrets
 import socket
+import subprocess
 import atexit
 import base64
 import httpx
 import imageio_ffmpeg as _iio_ffmpeg
 from collections import OrderedDict, deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from contextlib import suppress
 from datetime import datetime, timezone, timedelta
 try:
@@ -305,6 +306,19 @@ def _read_file_bytes_sync(path: str, *, max_bytes: int | None = None) -> bytes:
     if len(data) > limit:
         raise ValueError(f"File too large. Max {limit} bytes.")
     return data
+
+
+def _write_file_bytes_sync(path: str, data: bytes) -> None:
+    """Write bytes atomically enough for temporary/output audio paths."""
+    if not path:
+        raise ValueError("Output path is required.")
+    payload = bytes(data or b"")
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(payload)
+        handle.flush()
 
 
 async def _read_file_bytes_async(path: str, *, max_bytes: int | None = None) -> bytes:
@@ -8110,7 +8124,7 @@ def _admin_error_fingerprint(source: str, message: str) -> str:
     normalized = re.sub(r"[0-9a-f]{12,}", "#hex", normalized)
     normalized = re.sub(r"https?://\S+", "<url>", normalized)
     raw = f"{_admin_error_sanitize(source, 80).lower()}:{normalized}"[:2000]
-    return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    return hashlib.sha1(raw.encode("utf-8", errors="ignore"), usedforsecurity=False).hexdigest()[:12]
 
 
 def _admin_error_feature(source: str, message: str) -> str:
@@ -9023,12 +9037,12 @@ def _runtime_admin_log_state(action: str, admin_id: int, extra: str = "") -> Non
 
 
 async def _cancel_active_polling_task(reason: str = "runtime_switch") -> None:
+    global ACTIVE_POLLING_TASK
     """Cancel the tracked polling lifecycle task exactly once.
 
     This guard prevents duplicate long-polling workers and ensures mode changes
     cannot leave getUpdates running while a webhook is active.
     """
-    global ACTIVE_POLLING_TASK
     task = ACTIVE_POLLING_TASK
     if task is None:
         return
@@ -9046,13 +9060,13 @@ async def _cancel_active_polling_task(reason: str = "runtime_switch") -> None:
 
 
 async def _telegram_polling_task_guard(app_obj: Any) -> None:
+    global ACTIVE_POLLING_TASK
     """Small lifecycle guard for the active updater polling session.
 
     python-telegram-bot owns the actual getUpdates worker internally after
     updater.start_polling(); this task gives the runtime controller a single
     cancellable handle and exits if BOT_MODE changes away from POLLING.
     """
-    global ACTIVE_POLLING_TASK
     try:
         while True:
             if _run_state_bot_mode() != "POLLING":
@@ -9574,6 +9588,18 @@ VOXCPM2_PROFILE_TTL_S       = _env_int("VOXCPM2_PROFILE_TTL_S", 30 * 86400, mini
 VOXCPM2_PROFILE_MEMORY_TTL_S = _env_float("VOXCPM2_PROFILE_MEMORY_TTL_S", 300.0, minimum=10.0, maximum=86400.0)
 VOXCPM2_CONTROL_MAX_CHARS   = _env_int("VOXCPM2_CONTROL_MAX_CHARS", 300, minimum=20, maximum=1000)
 VOXCPM2_SERIALIZE_CALLS     = _env_bool("VOXCPM2_SERIALIZE_CALLS", True)
+VOXCPM2_CLIENT_CACHE        = _env_bool("VOXCPM2_CLIENT_CACHE", True)
+VOXCPM2_FAILURE_LIMIT       = _env_int("VOXCPM2_FAILURE_LIMIT", 3, minimum=1, maximum=20)
+VOXCPM2_COOLDOWN_S          = _env_float("VOXCPM2_COOLDOWN_S", 300.0, minimum=30.0, maximum=3600.0)
+VOXCPM2_QUOTA_COOLDOWN_S    = _env_float("VOXCPM2_QUOTA_COOLDOWN_S", 1800.0, minimum=300.0, maximum=86400.0)
+GRADIO_CLIENT_MAX_WORKERS   = _env_int("GRADIO_CLIENT_MAX_WORKERS", 4, minimum=1, maximum=16)
+GRADIO_CLIENT_CONNECT_TIMEOUT_S = _env_float("GRADIO_CLIENT_CONNECT_TIMEOUT_S", 10.0, minimum=2.0, maximum=60.0)
+GRADIO_CLIENT_READ_TIMEOUT_S = _env_float(
+    "GRADIO_CLIENT_READ_TIMEOUT_S",
+    max(float(HF_TTS_TIMEOUT_S), float(VOXCPM2_TIMEOUT_S)),
+    minimum=10.0,
+    maximum=900.0,
+)
 FFMPEG_START_TIMEOUT_S  = _env_float("FFMPEG_START_TIMEOUT_S", 5.0, minimum=1.0, maximum=30.0)
 FFMPEG_CONVERT_TIMEOUT_S = _env_float("FFMPEG_CONVERT_TIMEOUT_S", 120.0, minimum=15.0, maximum=600.0)
 AUDIO_TO_VOICE_MAX_CONCURRENT = _env_int("AUDIO_TO_VOICE_MAX_CONCURRENT", 2, minimum=1, maximum=8)
@@ -11190,7 +11216,7 @@ def ai_text_reply(prompt: str, history: list[dict] | None = None) -> tuple[str, 
 
 def _init_clients() -> None:
     global supabase, redis_client, _gemini, TELEGRAM_BOT_TOKEN, SB_URL, SB_KEY, REDIS_URL
-    global GEMINI_API_KEY, ADMIN_IDS, GEMINI_MODEL
+    global GEMINI_API_KEY, GEMINI_MODEL
     global HF_TOKEN, HF_MODEL, HF_OCR_MODEL, AI_PROVIDER, OCR_PROVIDER, OCR_AUTO_PREFER_PROVIDER
 
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -11342,6 +11368,7 @@ _PREFS_TTL      = _env_float("PREFS_CACHE_TTL_S", float(_perf_default("PREFS_CAC
 _PREFS_MAX_SIZE = _env_int("PREFS_CACHE_MAX_SIZE", 10_000, minimum=500, maximum=200_000)
 _prefs_cache: OrderedDict[int, tuple[dict, float]] = OrderedDict()
 _prefs_cache_lock: asyncio.Lock | None = None
+_prefs_cache_lock_loop: asyncio.AbstractEventLoop | None = None
 _prefs_cache_thread_lock = threading.RLock()
 _PREFS_LOAD_LOCKS_MAX = _env_int("PREFS_LOAD_LOCKS_MAX", 5000, minimum=100, maximum=50000)
 _prefs_load_locks: OrderedDict[int, asyncio.Lock] = OrderedDict()
@@ -11528,6 +11555,22 @@ def _voxcpm2_reference_ready(profile: dict[str, Any] | None) -> bool:
     return bool(isinstance(profile, dict) and str(profile.get("file_id") or "").strip())
 
 
+def _voxcpm2_unavailable_reason(*, include_cooldown: bool = True) -> str:
+    if not VOXCPM2_ENABLED:
+        return "VoxCPM2 is disabled by server configuration."
+    if GradioClient is None:
+        return "gradio_client is not installed."
+    if GradioHandleFile is None:
+        return "gradio_client.handle_file is unavailable; upgrade gradio_client."
+    if not VOXCPM2_SPACE:
+        return "VOXCPM2_SPACE is empty."
+    if include_cooldown:
+        remaining = _voxcpm2_disabled_remaining_s() if "_voxcpm2_disabled_remaining_s" in globals() else 0
+        if remaining > 0:
+            return f"VoxCPM2 is cooling down after provider failures ({remaining}s remaining)."
+    return ""
+
+
 def _voxcpm2_reference_suffix(filename: str, mime_type: str, fallback: str = ".ogg") -> str:
     suffix = os.path.splitext(str(filename or ""))[1].lower()
     if suffix in _AUDIO_EXTENSIONS:
@@ -11672,18 +11715,32 @@ def _invalidate_prefs(user_id: int) -> None:
         _submit_db(lambda: _redis_delete_sync(_prefs_redis_key(user_id)))
 
 
+def _get_prefs_cache_lock() -> asyncio.Lock:
+    """Return a lock bound to the current loop.
+
+    The thread lock still protects the underlying OrderedDict, while this async
+    lock prevents duplicate coroutine work inside one application loop. Creating
+    it lazily avoids assertions during tests/startup and avoids reusing a lock
+    across different event loops.
+    """
+    global _prefs_cache_lock, _prefs_cache_lock_loop
+    loop = asyncio.get_running_loop()
+    if _prefs_cache_lock is None or _prefs_cache_lock_loop is not loop:
+        _prefs_cache_lock = asyncio.Lock()
+        _prefs_cache_lock_loop = loop
+    return _prefs_cache_lock
+
+
 async def _async_cache_prefs(user_id: int, prefs: dict, *, write_redis: bool = False) -> None:
-    assert _prefs_cache_lock is not None
     prefs = _normalize_user_prefs(prefs)
-    async with _prefs_cache_lock:
+    async with _get_prefs_cache_lock():
         _cache_prefs_sync(user_id, prefs)
     if write_redis and redis_client is not None:
         await _redis_set_json(_prefs_redis_key(user_id), prefs, REDIS_PREFS_TTL_S)
 
 
 async def _async_get_cached_prefs(user_id: int) -> dict | None:
-    assert _prefs_cache_lock is not None
-    async with _prefs_cache_lock:
+    async with _get_prefs_cache_lock():
         return _get_cached_prefs_sync(user_id)
 
 
@@ -15697,8 +15754,11 @@ _HF_TTS_CLIENT_KEY: tuple[str, str] | None = None
 # VoxCPM2 Gradio client state is separate from the Khmer HF Space client.
 _VOXCPM2_CLIENT_LOCK = threading.Lock()
 _VOXCPM2_CLIENT_CALL_LOCK = threading.Lock()
+_VOXCPM2_STATE_LOCK = threading.Lock()
 _VOXCPM2_CLIENT = None
 _VOXCPM2_CLIENT_KEY: tuple[str, str] | None = None
+_VOXCPM2_FAILURES = 0
+_VOXCPM2_DISABLED_UNTIL = 0.0
 
 
 def _tts_provider_summary() -> str:
@@ -16049,6 +16109,72 @@ def _audio_suffix_from_bytes(data: bytes) -> str:
     return ".audio"
 
 
+def _download_url_bytes_limited_sync(
+    url: str,
+    *,
+    max_bytes: int,
+    timeout_s: float,
+    label: str,
+) -> bytes:
+    """Download a generated audio URL without allowing unbounded memory use."""
+    limit = max(1, int(max_bytes))
+    timeout = httpx.Timeout(
+        connect=min(float(timeout_s), float(GRADIO_CLIENT_CONNECT_TIMEOUT_S)),
+        read=float(timeout_s),
+        write=float(timeout_s),
+        pool=min(float(timeout_s), float(GRADIO_CLIENT_CONNECT_TIMEOUT_S)),
+    )
+    chunks: list[bytes] = []
+    total = 0
+    with httpx.stream("GET", url, timeout=timeout, follow_redirects=True) as response:
+        response.raise_for_status()
+        content_length = response.headers.get("content-length")
+        if content_length:
+            with suppress(ValueError):
+                if int(content_length) > limit:
+                    raise RuntimeError(
+                        f"{label} audio download is too large. Max {limit // 1024 // 1024}MB."
+                    )
+        for chunk in response.iter_bytes(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > limit:
+                raise RuntimeError(
+                    f"{label} audio download exceeded {limit // 1024 // 1024}MB."
+                )
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _read_generated_audio_path_or_url_sync(
+    path_or_url: str,
+    *,
+    max_bytes: int,
+    timeout_s: float,
+    label: str,
+) -> bytes:
+    """Read a generated Gradio audio result and clean temporary downloads."""
+    value = str(path_or_url or "").strip()
+    if not value:
+        return b""
+    if re.match(r"^https?://", value, re.I):
+        return _download_url_bytes_limited_sync(
+            value,
+            max_bytes=max_bytes,
+            timeout_s=timeout_s,
+            label=label,
+        )
+    if not os.path.isfile(value):
+        raise RuntimeError(f"{label} returned a missing audio file: {value!r}")
+    try:
+        return _read_file_bytes_sync(value, max_bytes=max_bytes)
+    finally:
+        # Gradio client output files are temporary downloads. The audio bytes are
+        # already copied into our request-owned temp directory after this call.
+        _cleanup(value)
+
+
 async def _terminate_subprocess(proc: asyncio.subprocess.Process | None, label: str) -> None:
     """Best-effort cleanup for timed-out FFmpeg/subprocess jobs.
 
@@ -16078,17 +16204,105 @@ def _ffmpeg_tts_timeout_s(*, chunk_count: int = 1, input_bytes: int = 0) -> floa
     return min(600.0, max(float(FFMPEG_CONVERT_TIMEOUT_S), dynamic))
 
 
-def _hf_tts_make_client_sync():
+def _make_gradio_client_sync(space: str, token: str = ""):
+    """Create a Gradio client with bounded workers and version-safe auth.
+
+    Current gradio_client releases use ``token=``. Older releases used
+    ``hf_token=``. Never silently drop a configured token: doing so makes
+    private/gated Spaces fail later with misleading 401/403 errors.
+    """
     if GradioClient is None:
-        raise RuntimeError("gradio_client is not installed. Add `gradio_client` to requirements.txt.")
+        raise RuntimeError("gradio_client is not installed. Add `gradio_client>=1.8` to requirements.txt.")
+    space = str(space or "").strip()
+    if not space:
+        raise RuntimeError("Gradio Space name is empty.")
+
+    try:
+        parameters = inspect.signature(GradioClient).parameters
+    except Exception:
+        parameters = {}
+
+    kwargs: dict[str, Any] = {}
+    if "max_workers" in parameters:
+        kwargs["max_workers"] = int(GRADIO_CLIENT_MAX_WORKERS)
+    if "verbose" in parameters:
+        kwargs["verbose"] = False
+    if "httpx_kwargs" in parameters:
+        kwargs["httpx_kwargs"] = {
+            "timeout": httpx.Timeout(
+                connect=float(GRADIO_CLIENT_CONNECT_TIMEOUT_S),
+                read=float(GRADIO_CLIENT_READ_TIMEOUT_S),
+                write=float(GRADIO_CLIENT_READ_TIMEOUT_S),
+                pool=float(GRADIO_CLIENT_CONNECT_TIMEOUT_S),
+            )
+        }
+
+    token = str(token or "").strip()
+    if token:
+        if "token" in parameters:
+            kwargs["token"] = token
+        elif "hf_token" in parameters:
+            kwargs["hf_token"] = token
+        else:
+            # Unknown/older signature: try the current keyword first below.
+            kwargs["token"] = token
+
+    try:
+        return GradioClient(space, **kwargs)
+    except TypeError as first_exc:
+        # Retry only for constructor-signature compatibility. Preserve both
+        # authentication and any supported worker/HTTP limits.
+        base_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in {"token", "hf_token"}
+        }
+        if token:
+            for token_name in ("token", "hf_token"):
+                candidate = dict(base_kwargs)
+                candidate[token_name] = token
+                try:
+                    return GradioClient(space, **candidate)
+                except TypeError:
+                    continue
+            raise RuntimeError(
+                "Configured Hugging Face token could not be passed to this "
+                "gradio_client version. Upgrade gradio_client."
+            ) from first_exc
+        if base_kwargs:
+            try:
+                return GradioClient(space, **base_kwargs)
+            except TypeError:
+                pass
+        return GradioClient(space)
+
+
+def _gradio_predict_with_timeout_sync(
+    client: Any,
+    *args: Any,
+    api_name: str,
+    timeout_s: float,
+    label: str,
+) -> Any:
+    """Run a Gradio endpoint with a cancellable, bounded wait when supported."""
+    submit = getattr(client, "submit", None)
+    if callable(submit):
+        job = submit(*args, api_name=api_name)
+        try:
+            return job.result(timeout=max(1.0, float(timeout_s)))
+        except (FutureTimeoutError, TimeoutError) as exc:
+            with suppress(Exception):
+                job.cancel()
+            raise RuntimeError(f"{label} timed out after {float(timeout_s):.0f}s.") from exc
+    # Legacy gradio_client fallback. The outer executor timeout still protects
+    # the async caller, but upgrading is recommended for true job cancellation.
+    return client.predict(*args, api_name=api_name)
+
+
+def _hf_tts_make_client_sync():
     if not HF_TTS_SPACE:
         raise RuntimeError("HF_TTS_SPACE is empty.")
-    if HF_TTS_TOKEN:
-        try:
-            return GradioClient(HF_TTS_SPACE, hf_token=HF_TTS_TOKEN)
-        except TypeError:
-            return GradioClient(HF_TTS_SPACE)
-    return GradioClient(HF_TTS_SPACE)
+    return _make_gradio_client_sync(HF_TTS_SPACE, HF_TTS_TOKEN)
 
 
 def _hf_tts_get_client_sync():
@@ -16161,7 +16375,8 @@ def _hf_tts_space_predict_sync(chunk_text: str) -> bytes:
     client = _hf_tts_get_client_sync()
 
     def _predict():
-        return client.predict(
+        return _gradio_predict_with_timeout_sync(
+            client,
             chunk_text,
             HF_TTS_VOICE,
             HF_TTS_TEMP,
@@ -16169,6 +16384,8 @@ def _hf_tts_space_predict_sync(chunk_text: str) -> bytes:
             HF_TTS_REP_PEN,
             HF_TTS_MAX_TOK,
             api_name=HF_TTS_API_NAME,
+            timeout_s=HF_TTS_TIMEOUT_S,
+            label="HF Khmer TTS",
         )
 
     def _predict_once() -> bytes:
@@ -16193,15 +16410,12 @@ def _hf_tts_space_predict_sync(chunk_text: str) -> bytes:
                 f"HF TTS returned no valid audio data/file/url. result_type={type(result).__name__} result={result_preview!r}"
             )
 
-        if re.match(r"^https?://", path_or_url, re.I):
-            resp = httpx.get(path_or_url, timeout=HF_TTS_TIMEOUT_S)
-            resp.raise_for_status()
-            data = resp.content or b""
-        else:
-            if not os.path.isfile(path_or_url):
-                raise RuntimeError(f"HF TTS returned missing audio file: {path_or_url!r}")
-            with open(path_or_url, "rb") as fh:
-                data = fh.read()
+        data = _read_generated_audio_path_or_url_sync(
+            path_or_url,
+            max_bytes=MAX_AUDIO_FILE_BYTES,
+            timeout_s=HF_TTS_TIMEOUT_S,
+            label="HF TTS",
+        )
         if not data:
             raise RuntimeError("HF TTS returned empty audio.")
         return data
@@ -16226,67 +16440,141 @@ def _hf_tts_space_predict_sync(chunk_text: str) -> bytes:
     raise RuntimeError(f"HF TTS failed after {retries} attempts: {last_exc}")
 
 
-async def _convert_audio_files_to_telegram_voice(input_paths: list[str], speed: float, output_path: str) -> bytes:
-    """Convert one or more audio files into Telegram voice-compatible OGG/Opus."""
-    if not input_paths:
+async def _convert_audio_files_to_telegram_voice(
+    input_paths: list[str],
+    speed: float,
+    output_path: str,
+) -> bytes:
+    """Convert generated chunks into one Telegram-compatible OGG/Opus voice.
+
+    Every input is normalized to mono/48 kHz before concatenation. This prevents
+    FFmpeg concat failures when providers return chunks with different sample
+    rates, channel layouts, or sample formats.
+    """
+    paths = [str(path) for path in input_paths if str(path or "").strip()]
+    if not paths:
         raise RuntimeError("No audio files to convert.")
+    for path in paths:
+        if not await asyncio.to_thread(os.path.isfile, path):
+            raise RuntimeError(f"Generated audio chunk is missing: {path!r}")
+        if await asyncio.to_thread(os.path.getsize, path) <= 0:
+            raise RuntimeError(f"Generated audio chunk is empty: {path!r}")
 
     speed_key = _rounded_speed(speed)
-    af = _build_atempo_chain(speed_key) if abs(speed_key - DEFAULT_SPEED) > 1e-4 else None
+    speed_filter = (
+        _build_atempo_chain(speed_key)
+        if abs(speed_key - DEFAULT_SPEED) > 1e-4
+        else ""
+    )
 
-    cmd = [_FFMPEG_EXE, "-y"]
-    for path in input_paths:
+    cmd = [
+        _FFMPEG_EXE,
+        "-hide_banner",
+        "-loglevel", "error",
+        "-nostdin",
+        "-y",
+    ]
+    for path in paths:
         cmd += ["-i", path]
 
-    if len(input_paths) > 1:
-        concat_inputs = "".join(f"[{idx}:a]" for idx in range(len(input_paths)))
-        filter_complex = f"{concat_inputs}concat=n={len(input_paths)}:v=0:a=1[a0]"
-        map_label = "[a0]"
-        if af:
-            filter_complex += f";[a0]{af}[aout]"
-            map_label = "[aout]"
-        cmd += ["-filter_complex", filter_complex, "-map", map_label]
-    elif af:
-        cmd += ["-filter:a", af]
+    if len(paths) > 1:
+        filters: list[str] = []
+        normalized_labels: list[str] = []
+        for index in range(len(paths)):
+            label = f"a{index}"
+            filters.append(
+                f"[{index}:a:0]aresample=48000,"
+                f"aformat=sample_fmts=fltp:channel_layouts=mono[{label}]"
+            )
+            normalized_labels.append(f"[{label}]")
+        filters.append(
+            f"{''.join(normalized_labels)}concat=n={len(paths)}:v=0:a=1[concat]"
+        )
+        output_label = "concat"
+        if speed_filter:
+            filters.append(f"[concat]{speed_filter}[paced]")
+            output_label = "paced"
+        cmd += ["-filter_complex", ";".join(filters), "-map", f"[{output_label}]"]
+    else:
+        audio_filters = ["aresample=48000", "aformat=sample_fmts=fltp:channel_layouts=mono"]
+        if speed_filter:
+            audio_filters.append(speed_filter)
+        cmd += ["-map", "0:a:0", "-filter:a", ",".join(audio_filters)]
 
-    cmd += ["-vn", "-c:a", "libopus", "-b:a", "32k", output_path]
+    cmd += [
+        "-map_metadata", "-1",
+        "-vn",
+        "-sn",
+        "-dn",
+        "-ac", "1",
+        "-ar", "48000",
+        "-c:a", "libopus",
+        "-application", "voip",
+        "-b:a", "32k",
+        "-vbr", "on",
+        "-compression_level", "10",
+        "-f", "ogg",
+        output_path,
+    ]
 
     proc: asyncio.subprocess.Process | None = None
+    timeout_s = _ffmpeg_tts_timeout_s(chunk_count=len(paths))
+    semaphore = _get_audio_to_voice_semaphore()
     try:
-        proc = await asyncio.wait_for(
-            asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            ),
-            timeout=FFMPEG_START_TIMEOUT_S,
-        )
-        timeout_s = _ffmpeg_tts_timeout_s(chunk_count=len(input_paths))
-        _, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        async with semaphore:
+            proc = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                ),
+                timeout=FFMPEG_START_TIMEOUT_S,
+            )
+            _, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
     except FileNotFoundError as exc:
         _cleanup(output_path)
         raise RuntimeError(f"FFmpeg executable not found: {_FFMPEG_EXE}") from exc
-    except asyncio.TimeoutError:
+    except asyncio.TimeoutError as exc:
         _cleanup(output_path)
-        await _terminate_subprocess(proc, "HF TTS FFmpeg")
-        raise RuntimeError("FFmpeg timed out while converting HF TTS audio")
+        await _terminate_subprocess(proc, "generated-audio FFmpeg")
+        raise RuntimeError(
+            f"FFmpeg timed out while converting generated audio after {timeout_s:.0f}s."
+        ) from exc
+    except asyncio.CancelledError:
+        _cleanup(output_path)
+        await _terminate_subprocess(proc, "generated-audio FFmpeg")
+        raise
 
-    if proc.returncode != 0:
+    if proc is None or proc.returncode != 0:
         _cleanup(output_path)
-        snippet = (stderr_data or b"").decode(errors="replace")[-600:]
-        raise RuntimeError(f"FFmpeg failed converting HF TTS audio (code {proc.returncode}): {snippet}")
+        snippet = (stderr_data or b"").decode(errors="replace")[-1400:]
+        code_value = None if proc is None else proc.returncode
+        raise RuntimeError(
+            f"FFmpeg failed converting generated TTS audio "
+            f"(code {code_value}): {snippet}"
+        )
 
     try:
-        return await asyncio.wait_for(
-            _read_file_bytes_async(output_path),
-            timeout=10,
+        voice_bytes = await asyncio.wait_for(
+            _read_file_bytes_async(output_path, max_bytes=MAX_VOICE_BYTES),
+            timeout=15,
         )
-    except asyncio.TimeoutError:
+    except ValueError as exc:
         _cleanup(output_path)
-        raise RuntimeError("Timed out reading converted HF TTS output")
+        raise RuntimeError(
+            f"Generated voice is too large. Max {MAX_VOICE_BYTES // 1024 // 1024}MB."
+        ) from exc
+    except asyncio.TimeoutError as exc:
+        _cleanup(output_path)
+        raise RuntimeError("Timed out reading converted generated TTS output.") from exc
     except OSError as exc:
         _cleanup(output_path)
-        raise RuntimeError(f"Failed to read converted HF TTS output: {exc}") from exc
+        raise RuntimeError(f"Failed to read converted generated TTS output: {exc}") from exc
+
+    if not voice_bytes or not voice_bytes.startswith(b"OggS"):
+        _cleanup(output_path)
+        raise RuntimeError("FFmpeg produced an invalid Telegram voice file.")
+    return voice_bytes
 
 
 
@@ -16311,7 +16599,7 @@ async def _convert_uploaded_audio_to_telegram_voice(input_path: str, output_path
     runs first. If the source is damaged or has unusual timestamps/container
     metadata, one tolerant recovery conversion is attempted before failing.
     """
-    if not input_path or not os.path.isfile(input_path):
+    if not input_path or not await asyncio.to_thread(os.path.isfile, input_path):
         raise RuntimeError("Uploaded audio file is missing.")
 
     try:
@@ -16421,8 +16709,7 @@ async def _convert_uploaded_audio_to_telegram_voice(input_path: str, output_path
                         f"Strict: {strict_detail} | Fallback: {fallback_detail}"
                     )
     except Exception:
-        if not os.path.isfile(output_path):
-            _cleanup(output_path)
+        _cleanup(output_path)
         raise
 
     try:
@@ -16448,25 +16735,67 @@ async def _convert_uploaded_audio_to_telegram_voice(input_path: str, output_path
     return voice_bytes
 
 
+def _voxcpm2_disabled_remaining_s() -> int:
+    with _VOXCPM2_STATE_LOCK:
+        return max(0, int(_VOXCPM2_DISABLED_UNTIL - time.monotonic()))
+
+
+def _voxcpm2_is_temporarily_disabled() -> bool:
+    return _voxcpm2_disabled_remaining_s() > 0
+
+
+def _voxcpm2_reset_client_sync() -> None:
+    global _VOXCPM2_CLIENT, _VOXCPM2_CLIENT_KEY
+    with _VOXCPM2_CLIENT_LOCK:
+        _VOXCPM2_CLIENT = None
+        _VOXCPM2_CLIENT_KEY = None
+
+
+def _voxcpm2_record_success() -> None:
+    global _VOXCPM2_FAILURES, _VOXCPM2_DISABLED_UNTIL
+    with _VOXCPM2_STATE_LOCK:
+        _VOXCPM2_FAILURES = 0
+        _VOXCPM2_DISABLED_UNTIL = 0.0
+
+
+def _voxcpm2_record_failure(exc: Exception | str) -> None:
+    """Apply a circuit breaker for repeated public-Space failures."""
+    global _VOXCPM2_FAILURES, _VOXCPM2_DISABLED_UNTIL
+    msg = str(exc).lower()
+    quota_error = any(token in msg for token in (
+        "quota", "daily limit", "gpu quota", "zero gpu", "zerogpu",
+        "resource exhausted", "exceeded your", "exceeded the",
+    ))
+    cooldown = float(VOXCPM2_QUOTA_COOLDOWN_S if quota_error else VOXCPM2_COOLDOWN_S)
+    should_reset = any(token in msg for token in (
+        "connection", "timeout", "timed out", "502", "503", "504",
+        "server disconnected", "protocol", "transport",
+    ))
+    with _VOXCPM2_STATE_LOCK:
+        _VOXCPM2_FAILURES += 1
+        if quota_error or _VOXCPM2_FAILURES >= int(VOXCPM2_FAILURE_LIMIT):
+            _VOXCPM2_DISABLED_UNTIL = max(
+                _VOXCPM2_DISABLED_UNTIL,
+                time.monotonic() + cooldown,
+            )
+    if should_reset:
+        _voxcpm2_reset_client_sync()
+
+
 def _voxcpm2_make_client_sync():
     if not VOXCPM2_ENABLED:
         raise RuntimeError("VoxCPM2 is disabled by VOXCPM2_ENABLED=false.")
-    if GradioClient is None:
-        raise RuntimeError("gradio_client is not installed. Add `gradio_client>=1.8` to requirements.txt.")
     if GradioHandleFile is None:
         raise RuntimeError("gradio_client.handle_file is unavailable. Upgrade `gradio_client`.")
     if not VOXCPM2_SPACE:
         raise RuntimeError("VOXCPM2_SPACE is empty.")
-    if VOXCPM2_TOKEN:
-        try:
-            return GradioClient(VOXCPM2_SPACE, hf_token=VOXCPM2_TOKEN)
-        except TypeError:
-            return GradioClient(VOXCPM2_SPACE)
-    return GradioClient(VOXCPM2_SPACE)
+    return _make_gradio_client_sync(VOXCPM2_SPACE, VOXCPM2_TOKEN)
 
 
 def _voxcpm2_get_client_sync():
     global _VOXCPM2_CLIENT, _VOXCPM2_CLIENT_KEY
+    if not VOXCPM2_CLIENT_CACHE:
+        return _voxcpm2_make_client_sync()
     key = (VOXCPM2_SPACE, "token" if VOXCPM2_TOKEN else "public")
     with _VOXCPM2_CLIENT_LOCK:
         if _VOXCPM2_CLIENT is not None and _VOXCPM2_CLIENT_KEY == key:
@@ -16481,18 +16810,70 @@ def _voxcpm2_should_retry(exc: Exception | str) -> bool:
     if any(token in msg for token in (
         "401", "403", "unauthorized", "forbidden", "invalid token",
         "invalid api", "api_name", "not found", "reference audio is too long",
+        "cooldown active",
     )):
         return False
     return any(token in msg for token in (
         "429", "500", "502", "503", "504", "busy", "queue", "queued",
         "timeout", "timed out", "temporarily", "connection", "cold start",
         "backend_retry", "backend is busy", "backend request timed out",
+        "quota", "daily limit", "gpu quota", "zero gpu", "zerogpu",
+        "resource exhausted", "exceeded your", "exceeded the",
     ))
+
+
+def _probe_audio_duration_seconds_sync(path: str) -> float:
+    """Best-effort duration probe using the bundled FFmpeg executable."""
+    if not path or not os.path.isfile(path):
+        raise RuntimeError("Audio file is missing.")
+    try:
+        completed = subprocess.run(
+            [_FFMPEG_EXE, "-hide_banner", "-nostdin", "-i", path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=15,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"FFmpeg executable not found: {_FFMPEG_EXE}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Timed out while probing reference-audio duration.") from exc
+    detail = (completed.stderr or b"").decode(errors="replace")
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", detail)
+    if not match:
+        return 0.0
+    hours, minutes, seconds = match.groups()
+    return (int(hours) * 3600.0) + (int(minutes) * 60.0) + float(seconds)
+
+
+async def _validate_voxcpm2_reference_path(reference_path: str) -> float:
+    """Validate the actual downloaded reference, including document uploads."""
+    try:
+        size = await asyncio.to_thread(os.path.getsize, reference_path)
+    except OSError as exc:
+        raise RuntimeError(f"Could not inspect VoxCPM2 reference audio: {exc}") from exc
+    if size <= 0:
+        raise RuntimeError("VoxCPM2 reference audio is empty.")
+    if size > VOXCPM2_MAX_REFERENCE_BYTES:
+        raise RuntimeError(
+            f"VoxCPM2 reference audio is too large. "
+            f"Max {VOXCPM2_MAX_REFERENCE_BYTES // 1024 // 1024}MB."
+        )
+    duration = await asyncio.to_thread(_probe_audio_duration_seconds_sync, reference_path)
+    if duration > float(VOXCPM2_MAX_REFERENCE_SECONDS):
+        raise RuntimeError(
+            f"VoxCPM2 reference audio is too long ({duration:.1f}s). "
+            f"Max {VOXCPM2_MAX_REFERENCE_SECONDS:g}s."
+        )
+    return duration
 
 
 def _voxcpm2_predict_sync(text: str, control: str, reference_path: str) -> bytes:
     if not reference_path or not os.path.isfile(reference_path):
         raise RuntimeError("VoxCPM2 reference audio is missing. Use /voxcpm2 to upload it again.")
+    remaining = _voxcpm2_disabled_remaining_s()
+    if remaining > 0:
+        raise RuntimeError(f"VoxCPM2 cooldown active ({remaining}s remaining).")
     if os.path.getsize(reference_path) > VOXCPM2_MAX_REFERENCE_BYTES:
         raise RuntimeError(
             f"VoxCPM2 reference audio is too large. Max {VOXCPM2_MAX_REFERENCE_BYTES // 1024 // 1024}MB."
@@ -16502,7 +16883,8 @@ def _voxcpm2_predict_sync(text: str, control: str, reference_path: str) -> bytes
     def _predict_once() -> bytes:
         reference_upload = GradioHandleFile(reference_path)
         def _call():
-            return client.predict(
+            return _gradio_predict_with_timeout_sync(
+                client,
                 text,
                 control,
                 reference_upload,
@@ -16512,6 +16894,8 @@ def _voxcpm2_predict_sync(text: str, control: str, reference_path: str) -> bytes
                 VOXCPM2_NORMALIZE_TEXT,
                 VOXCPM2_DENOISE_REFERENCE,
                 api_name=VOXCPM2_API_NAME,
+                timeout_s=VOXCPM2_TIMEOUT_S,
+                label="VoxCPM2",
             )
         if VOXCPM2_SERIALIZE_CALLS:
             with _VOXCPM2_CLIENT_CALL_LOCK:
@@ -16528,31 +16912,39 @@ def _voxcpm2_predict_sync(text: str, control: str, reference_path: str) -> bytes
             raise RuntimeError(
                 f"VoxCPM2 returned no valid audio. result_type={type(result).__name__} result={preview!r}"
             )
-        if re.match(r"^https?://", path_or_url, re.I):
-            response = httpx.get(path_or_url, timeout=VOXCPM2_TIMEOUT_S)
-            response.raise_for_status()
-            data = response.content or b""
-        else:
-            if not os.path.isfile(path_or_url):
-                raise RuntimeError(f"VoxCPM2 returned a missing audio file: {path_or_url!r}")
-            data = _read_file_bytes_sync(path_or_url, max_bytes=MAX_AUDIO_FILE_BYTES)
+        data = _read_generated_audio_path_or_url_sync(
+            path_or_url,
+            max_bytes=MAX_AUDIO_FILE_BYTES,
+            timeout_s=VOXCPM2_TIMEOUT_S,
+            label="VoxCPM2",
+        )
         if not data:
             raise RuntimeError("VoxCPM2 returned empty audio.")
         return data
 
     last_exc: Exception | None = None
-    for attempt in range(1, max(1, int(VOXCPM2_RETRIES)) + 1):
+    retries = max(1, int(VOXCPM2_RETRIES))
+    for attempt in range(1, retries + 1):
         try:
-            return _predict_once()
+            data = _predict_once()
+            _voxcpm2_record_success()
+            return data
         except Exception as exc:
             last_exc = exc
-            if attempt >= VOXCPM2_RETRIES or not _voxcpm2_should_retry(exc):
+            retryable = _voxcpm2_should_retry(exc)
+            if attempt >= retries or not retryable:
+                if retryable:
+                    _voxcpm2_record_failure(exc)
                 raise
             logger.warning(
                 "VoxCPM2 call failed attempt=%s/%s; retrying: %s",
-                attempt, VOXCPM2_RETRIES, exc,
+                attempt, retries, exc,
             )
+            _voxcpm2_reset_client_sync()
+            client = _voxcpm2_get_client_sync()
             time.sleep(min(VOXCPM2_RETRY_DELAY_S * (2 ** (attempt - 1)), 30.0))
+    if last_exc is not None:
+        _voxcpm2_record_failure(last_exc)
     raise RuntimeError(f"VoxCPM2 failed after retries: {last_exc}")
 
 
@@ -16562,10 +16954,14 @@ async def _generate_voice_voxcpm2(
     reference_path: str,
     speed: float,
     output_path: str,
+    *,
+    validate_reference: bool = True,
 ) -> bytes:
     text = _clean_tts_text_for_edge(text)
     if not text:
         raise ValueError("VoxCPM2 target text must not be empty.")
+    if validate_reference:
+        await _validate_voxcpm2_reference_path(reference_path)
     chunks = _split_text_chunks(text, max_chars=VOXCPM2_MAX_CHARS)
     if not chunks:
         raise ValueError("VoxCPM2 found no speakable text chunks.")
@@ -16592,8 +16988,7 @@ async def _generate_voice_voxcpm2(
                 ) from exc
             suffix = _audio_suffix_from_bytes(audio_data)
             source_path = os.path.join(tmpdir, f"chunk_{index:03d}{suffix}")
-            with open(source_path, "wb") as handle:
-                handle.write(audio_data)
+            await asyncio.to_thread(_write_file_bytes_sync, source_path, audio_data)
             input_paths.append(source_path)
         converted = await _convert_audio_files_to_telegram_voice(input_paths, speed, output_path)
         if not converted:
@@ -16605,6 +17000,141 @@ async def _generate_voice_voxcpm2(
         return converted
 
 
+def _voxcpm2_provider_context(profile: dict[str, Any]) -> str:
+    reference_id = str(
+        profile.get("file_unique_id")
+        or profile.get("file_id")
+        or profile.get("updated_at")
+        or ""
+    )
+    control = str(profile.get("control") or "").strip()
+    payload = {
+        "reference": reference_id,
+        "control": control,
+        "space": VOXCPM2_SPACE,
+        "api": VOXCPM2_API_NAME,
+        "cfg": VOXCPM2_CFG_VALUE,
+        "normalize": VOXCPM2_NORMALIZE_TEXT,
+        "denoise": VOXCPM2_DENOISE_REFERENCE,
+    }
+    return hashlib.sha256(
+        _json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+async def _prepare_voxcpm2_session(user_id: int, bot) -> dict[str, Any]:
+    """Download and validate one user's reference once for a generation batch."""
+    if not VOXCPM2_ENABLED:
+        raise RuntimeError("VoxCPM2 is disabled by VOXCPM2_ENABLED=false.")
+    remaining = _voxcpm2_disabled_remaining_s()
+    if remaining > 0:
+        raise RuntimeError(f"VoxCPM2 cooldown active ({remaining}s remaining).")
+
+    profile = await _voxcpm2_profile_get(user_id)
+    if not _voxcpm2_reference_ready(profile):
+        raise RuntimeError(
+            "VoxCPM2 reference audio is not configured. "
+            "Use /voxcpm2 and upload a 5-30 second clean voice clip."
+        )
+
+    telegram_file = await safe_send(lambda: bot.get_file(str(profile.get("file_id"))))
+    if not telegram_file:
+        raise RuntimeError(
+            "Telegram could not retrieve the saved VoxCPM2 reference audio. "
+            "Upload it again with /voxcpm2."
+        )
+
+    suffix = str(profile.get("suffix") or ".ogg")
+    reference_path: str | None = None
+    try:
+        reference_path = await _download_telegram_file_to_temp_path(
+            telegram_file,
+            VOXCPM2_MAX_REFERENCE_BYTES,
+            suffix=suffix,
+        )
+        duration = await _validate_voxcpm2_reference_path(reference_path)
+        # Document uploads do not always expose Telegram duration metadata.
+        if duration > 0 and abs(float(profile.get("duration") or 0.0) - duration) > 0.05:
+            profile["duration"] = round(duration, 3)
+            profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+            await _voxcpm2_profile_set(user_id, profile)
+        return {
+            "profile": profile,
+            "reference_path": reference_path,
+            "control": str(profile.get("control") or "").strip(),
+            "provider_context": _voxcpm2_provider_context(profile),
+        }
+    except Exception:
+        if reference_path:
+            _cleanup(reference_path)
+        raise
+
+
+def _cleanup_voxcpm2_session(session_data: dict[str, Any] | None) -> None:
+    if not isinstance(session_data, dict):
+        return
+    reference_path = str(session_data.get("reference_path") or "")
+    if reference_path:
+        _cleanup(reference_path)
+        session_data["reference_path"] = ""
+
+
+async def _generate_user_voice_voxcpm2_session(
+    text: str,
+    gender: str,
+    speed: float,
+    output_path: str,
+    session_data: dict[str, Any],
+) -> bytes:
+    cleaned = _clean_tts_text_for_edge(text)
+    if not cleaned:
+        raise ValueError("VoxCPM2 target text must not be empty.")
+    reference_path = str(session_data.get("reference_path") or "")
+    if not reference_path or not await asyncio.to_thread(os.path.isfile, reference_path):
+        raise RuntimeError("VoxCPM2 reference session expired. Upload the reference again.")
+
+    provider_context = str(session_data.get("provider_context") or "")
+    control = str(session_data.get("control") or "").strip()
+    cache_key = _tts_audio_cache_key(
+        cleaned,
+        gender,
+        speed,
+        "voxcpm2",
+        provider_context=provider_context,
+    )
+    cached = _tts_audio_cache_get(cache_key)
+    if cached is not None:
+        await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
+        return cached
+
+    sem = _TTS_CHUNK_SEMAPHORE
+    if sem is None:
+        audio = await _generate_voice_voxcpm2(
+            cleaned,
+            control,
+            reference_path,
+            speed,
+            output_path,
+            validate_reference=False,
+        )
+    else:
+        async with sem:
+            cached = _tts_audio_cache_get(cache_key)
+            if cached is not None:
+                await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
+                return cached
+            audio = await _generate_voice_voxcpm2(
+                cleaned,
+                control,
+                reference_path,
+                speed,
+                output_path,
+                validate_reference=False,
+            )
+    _tts_audio_cache_set(cache_key, audio)
+    return audio
+
+
 async def generate_user_voice_limited(
     text: str,
     gender: str,
@@ -16614,54 +17144,29 @@ async def generate_user_voice_limited(
     *,
     user_id: int,
     bot,
+    voxcpm2_session: dict[str, Any] | None = None,
 ) -> bytes:
-    """Generate TTS for a user, resolving VoxCPM2 reference audio when selected."""
+    """Generate user TTS, resolving VoxCPM2 reference audio when selected."""
     model = _normalize_tts_model(tts_model)
     if model != "voxcpm2":
         return await generate_voice_limited(text, gender, speed, output_path, model)
 
-    profile = await _voxcpm2_profile_get(user_id)
-    if not _voxcpm2_reference_ready(profile):
-        raise RuntimeError("VoxCPM2 reference audio is not configured. Use /voxcpm2 and upload a 5–30 second clean voice clip.")
-
-    reference_id = str(profile.get("file_unique_id") or profile.get("file_id") or "")
-    control = str(profile.get("control") or "").strip()
-    provider_context = hashlib.sha256(
-        f"{reference_id}|{control}|{VOXCPM2_CFG_VALUE}|{VOXCPM2_NORMALIZE_TEXT}|{VOXCPM2_DENOISE_REFERENCE}".encode("utf-8")
-    ).hexdigest()
-    cleaned = _clean_tts_text_for_edge(text)
-    cache_key = _tts_audio_cache_key(cleaned, gender, speed, model, provider_context=provider_context)
-    cached = _tts_audio_cache_get(cache_key)
-    if cached is not None:
-        await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
-        return cached
-
-    telegram_file = await safe_send(lambda: bot.get_file(str(profile.get("file_id"))))
-    if not telegram_file:
-        raise RuntimeError("Telegram could not retrieve the saved VoxCPM2 reference audio. Upload it again with /voxcpm2.")
-    suffix = str(profile.get("suffix") or ".ogg")
-    reference_path: str | None = None
+    owned_session = voxcpm2_session is None
+    session_data = voxcpm2_session
+    if session_data is None:
+        session_data = await _prepare_voxcpm2_session(user_id, bot)
     try:
-        reference_path = await _download_telegram_file_to_temp_path(
-            telegram_file,
-            VOXCPM2_MAX_REFERENCE_BYTES,
-            suffix=suffix,
+        return await _generate_user_voice_voxcpm2_session(
+            text,
+            gender,
+            speed,
+            output_path,
+            session_data,
         )
-        sem = _TTS_CHUNK_SEMAPHORE
-        if sem is None:
-            audio = await _generate_voice_voxcpm2(cleaned, control, reference_path, speed, output_path)
-        else:
-            async with sem:
-                cached = _tts_audio_cache_get(cache_key)
-                if cached is not None:
-                    await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
-                    return cached
-                audio = await _generate_voice_voxcpm2(cleaned, control, reference_path, speed, output_path)
-        _tts_audio_cache_set(cache_key, audio)
-        return audio
     finally:
-        if reference_path:
-            _cleanup(reference_path)
+        if owned_session:
+            _cleanup_voxcpm2_session(session_data)
+
 
 
 async def _generate_voice_hf_space(text: str, speed: float, output_path: str) -> bytes:
@@ -16703,8 +17208,7 @@ async def _generate_voice_hf_space(text: str, speed: float, output_path: str) ->
                 )
             suffix = _audio_suffix_from_bytes(audio_bytes)
             in_path = os.path.join(tmpdir, f"chunk_{idx:03d}{suffix}")
-            with open(in_path, "wb") as fh:
-                fh.write(audio_bytes)
+            await asyncio.to_thread(_write_file_bytes_sync, in_path, audio_bytes)
             input_paths.append(in_path)
 
         converted = await _convert_audio_files_to_telegram_voice(input_paths, speed, output_path)
@@ -16719,8 +17223,12 @@ def _tts_user_error_message(exc: Exception | str) -> str:
     msg = str(exc).lower()
     if "voxcpm2 reference audio" in msg or "use /voxcpm2" in msg:
         return "❌ VoxCPM2 ត្រូវការ Reference Audio។ ប្រើ /voxcpm2 ហើយ Upload សំឡេងស្អាត 5–30 វិនាទី។"
-    if "voxcpm2" in msg and any(token in msg for token in ("busy", "queue", "timeout", "temporarily", "503")):
-        return "❌ VoxCPM2 កំពុងរវល់/timeout។ សូមសាកអត្ថបទខ្លីជាងនេះ ឬសាកម្តងទៀត។"
+    if "voxcpm2" in msg and "too long" in msg:
+        return f"❌ Reference Audio វែងពេក។ អតិបរមា {VOXCPM2_MAX_REFERENCE_SECONDS:g} វិនាទី។"
+    if "voxcpm2" in msg and any(token in msg for token in ("disabled", "not installed", "unavailable", "api_name", "401", "403")):
+        return "❌ VoxCPM2 មិនទាន់ត្រូវបានកំណត់ត្រឹមត្រូវនៅលើ server ទេ។ សូមទាក់ទង Admin។"
+    if "voxcpm2" in msg and any(token in msg for token in ("busy", "queue", "timeout", "temporarily", "503", "cooldown", "quota", "zerogpu")):
+        return "❌ VoxCPM2 កំពុងរវល់ ឬស្ថិតក្នុង cooldown។ សូមរង់ចាំបន្តិច ហើយសាកម្តងទៀត។"
     if "no audio" in msg or "edge-tts failed" in msg:
         return (
             "❌ TTS service មិនបានបញ្ជូនសំឡេងមកវិញ។\n"
@@ -17261,41 +17769,72 @@ async def _deliver_paged_tts(
 
     set_last_tts_text(user_id, text)
     total = len(chunks)
+    model = _normalize_tts_model(tts_model)
+    voxcpm2_session: dict[str, Any] | None = None
 
-    for i, chunk in enumerate(chunks, 1):
-        file_path = _make_temp_ogg()
-        try:
-            audio_bytes = await generate_user_voice_limited(
-                chunk, gender, speed, file_path, tts_model, user_id=user_id, bot=bot
-            )
-            sent = await safe_send(
-                lambda ab=audio_bytes, ci=i, ct=total: bot.send_voice(
-                    chat_id=chat_id,
-                    voice=io.BytesIO(ab),
-                    caption=f"🗣️ {BOT_TAG}  [{ci}/{ct}]",
-                    reply_markup=get_main_kb(gender, tts_model),
-                )
-            )
-            if sent:
-                save_text_cache(
-                    sent.message_id, chunk,
-                    chat_id=chat_id, user_id=user_id, username=username,
-                )
-                set_last_tts_text(user_id, chunk)
-        except Exception as e:
-            logger.error(f"paged TTS chunk {i}/{total} error: {e}", exc_info=True)
-            await safe_send(
-                lambda ci=i, ct=total, err=e: bot.send_message(
-                    chat_id=chat_id, text=f"{_tts_user_error_message(err)}\nChunk {ci}/{ct}"
-                )
-            )
-        finally:
-            _cleanup(file_path)
+    try:
+        # A long VoxCPM2 response can contain many Telegram pages. Download and
+        # validate the reference once, then reuse the same request-owned temp file.
+        if model == "voxcpm2":
+            voxcpm2_session = await _prepare_voxcpm2_session(user_id, bot)
 
-        if i < total:
-            await asyncio.sleep(float(PAGED_TTS_SEND_DELAY_S))
+        for i, chunk in enumerate(chunks, 1):
+            file_path = _make_temp_ogg()
+            try:
+                audio_bytes = await generate_user_voice_limited(
+                    chunk,
+                    gender,
+                    speed,
+                    file_path,
+                    model,
+                    user_id=user_id,
+                    bot=bot,
+                    voxcpm2_session=voxcpm2_session,
+                )
+                sent = await safe_send(
+                    lambda ab=audio_bytes, ci=i, ct=total: bot.send_voice(
+                        chat_id=chat_id,
+                        voice=io.BytesIO(ab),
+                        caption=f"🗣️ {BOT_TAG}  [{ci}/{ct}]",
+                        reply_markup=get_main_kb(gender, model),
+                    )
+                )
+                if sent:
+                    save_text_cache(
+                        sent.message_id,
+                        chunk,
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        username=username,
+                    )
+                    set_last_tts_text(user_id, chunk)
+            except Exception as exc:
+                logger.error(
+                    "paged TTS chunk %s/%s error: %s",
+                    i,
+                    total,
+                    exc,
+                    exc_info=True,
+                )
+                await safe_send(
+                    lambda ci=i, ct=total, err=exc: bot.send_message(
+                        chat_id=chat_id,
+                        text=f"{_tts_user_error_message(err)}\nChunk {ci}/{ct}",
+                    )
+                )
+                # Provider/session failures are unlikely to recover for later
+                # pages in the same request. Stop to avoid repeated slow failures.
+                if model == "voxcpm2":
+                    break
+            finally:
+                _cleanup(file_path)
 
-    _set_last_tts(user_id)
+            if i < total:
+                await asyncio.sleep(float(PAGED_TTS_SEND_DELAY_S))
+    finally:
+        _cleanup_voxcpm2_session(voxcpm2_session)
+        _set_last_tts(user_id)
+
 
 
 # ---------------------------------------------------------------------------
@@ -23932,6 +24471,9 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             target_id = _admin_chat_target.get(uid)
 
     cleared = await _clear_admin_transient_state(context, uid)
+    if vox_state:
+        cleared.insert(0, "voxcpm2-setup")
+        cleared = list(dict.fromkeys(cleared))
 
     if target_id:
         with suppress(Exception):
@@ -24097,10 +24639,13 @@ def _voxcpm2_panel_text(profile: dict[str, Any], selected: bool, notice: str = "
         reference_line += f" · {duration:g}s"
     control = str(profile.get("control") or "").strip()
     control_line = html.escape(control[:220]) if control else "Default style from the reference voice"
+    unavailable = _voxcpm2_unavailable_reason()
+    status_line = f"⚠️ {html.escape(unavailable)}" if unavailable else "✅ Ready"
     prefix = f"✅ {html.escape(notice)}\n\n" if notice else ""
     return (
         prefix
         + "🎙 <b>VoxCPM2 — Controllable Cloning</b>\n\n"
+        + f"Service: {status_line}\n"
         + f"Reference: {reference_line}\n"
         + f"Control: <i>{control_line}</i>\n"
         + f"Selected model: <b>{'YES' if selected else 'NO'}</b>\n\n"
@@ -24177,8 +24722,13 @@ async def _voxcpm2_accept_reference(
     })
     await _voxcpm2_profile_set(int(user.id), profile)
     context.user_data.pop("voxcpm2_state", None)
-    update_user_tts_model(int(user.id), "voxcpm2")
-    await _voxcpm2_send_panel(msg, int(user.id), "Reference audio saved and VoxCPM2 selected.")
+    unavailable = _voxcpm2_unavailable_reason()
+    if unavailable:
+        notice = f"Reference audio saved. VoxCPM2 is not selectable yet: {unavailable}"
+    else:
+        update_user_tts_model(int(user.id), "voxcpm2")
+        notice = "Reference audio saved and VoxCPM2 selected."
+    await _voxcpm2_send_panel(msg, int(user.id), notice)
 
 
 async def _voxcpm2_save_control_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
@@ -24236,9 +24786,22 @@ async def _cb_voxcpm2(query, user_id: int, context, data: str) -> None:
         await _voxcpm2_send_panel(query.message, user_id, "Reference audio cleared.", edit=True)
         return
     if action == "select":
+        unavailable = _voxcpm2_unavailable_reason()
+        if unavailable:
+            await _voxcpm2_send_panel(
+                query.message,
+                user_id,
+                f"Cannot select VoxCPM2: {unavailable}",
+                edit=True,
+            )
+            return
         update_user_tts_model(user_id, "voxcpm2")
         profile = await _voxcpm2_profile_get(user_id)
-        notice = "VoxCPM2 selected." if _voxcpm2_reference_ready(profile) else "VoxCPM2 selected. Upload a reference before generating speech."
+        notice = (
+            "VoxCPM2 selected."
+            if _voxcpm2_reference_ready(profile)
+            else "VoxCPM2 selected. Upload a reference before generating speech."
+        )
         await _voxcpm2_send_panel(query.message, user_id, notice, edit=True)
         return
     if action == "close":
@@ -25014,7 +25577,17 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
 
     chat_id = query.message.chat.id
     requested_model = data.replace("ttsmodel_", "", 1)
-    model = update_user_tts_model(user_id, requested_model)
+    requested_key = _normalize_tts_model(requested_model)
+    if requested_key == "voxcpm2":
+        unavailable = _voxcpm2_unavailable_reason()
+        if unavailable:
+            await _voxcpm2_send_panel(
+                query.message,
+                user_id,
+                f"Cannot select VoxCPM2: {unavailable}",
+            )
+            return
+    model = update_user_tts_model(user_id, requested_key)
 
     original_text, prefs = await asyncio.gather(
         get_callback_original_text(query, user_id),
@@ -25495,7 +26068,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 async def _run_bot():
     global _BOT_START_TIME, _AI_SEMAPHORE, _BROADCAST_SEMAPHORE
-    global _prefs_cache_lock, _TTS_CHUNK_SEMAPHORE, _TELEGRAM_APP, _TELEGRAM_APP_READY, telegram_application
+    global _prefs_cache_lock, _prefs_cache_lock_loop, _TTS_CHUNK_SEMAPHORE, _TELEGRAM_APP, _TELEGRAM_APP_READY, telegram_application
 
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
@@ -25512,6 +26085,7 @@ async def _run_bot():
     _AI_SEMAPHORE        = asyncio.Semaphore(MAX_CONCURRENT_AI)
     _BROADCAST_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_BROADCAST)
     _prefs_cache_lock    = asyncio.Lock()
+    _prefs_cache_lock_loop = asyncio.get_running_loop()
     _TTS_CHUNK_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TTS_USERS)
 
     # FIX: Reset ALL mutable in-memory state on restart to prevent stale data
@@ -25742,7 +26316,6 @@ async def _run_startup_background_checks() -> None:
 # Main
 # ---------------------------------------------------------------------------
 async def _async_main_once():
-    global ACTIVE_POLLING_TASK
     load_dotenv()
     _refresh_arch_runtime_settings()
     _init_clients()
