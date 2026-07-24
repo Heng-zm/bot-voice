@@ -11990,15 +11990,15 @@ SPEED_OPTIONS = {
     "spd_2.0": ("x2.0", 2.0),
 }
 WELCOME_TEXT = (
-    "🎵 សួស្តី! ខ្ញុំជា Bot បំលែងអក្សរទៅជាសំឡេង អេអាយ\n\n"
-    "📌 វាយអក្សរភាសាណាមួយ ផ្ញើរមក Bot នឹងបំលែងដោយស្វ័យប្រវត្តិ!\n"
-    "🎙️ ផ្ញើ MP3/Audio file ដើម្បីបំលែងទៅជា Telegram Voice Record។\n\n"
-    "🌍 ភាសាដែល Support:\n"
-    "🇰🇭 ភាសាខ្មែរ | 🇺🇸 English | 🇨🇳 中文 | 🇰🇷 한국어 | 🇯🇵 日本語\n"
-    "💡 Japanese/Chinese Kanji ambiguous? use: ja: 日本語 or zh: 中文\n\n"
-    "⚙️ ប្រើ /myprefs ដើម្បីមើលការកំណត់របស់អ្នក\n"
-    "🎙️ ប្រើ /voxcpm2 សម្រាប់ Controllable Voice Cloning\n"
-    "📢 Join My Channel: https://t.me/m11mmm112"
+    "🎵 សួស្តី! ខ្ញុំជាបូតបម្លែងអត្ថបទទៅជាសំឡេងដោយ AI។\n\n"
+    "📌 វាយអត្ថបទជាភាសាណាមួយ ហើយផ្ញើមកបូត។ បូតនឹងបង្កើតសំឡេងដោយស្វ័យប្រវត្តិ។\n"
+    "🎙️ អ្នកក៏អាចផ្ញើឯកសារ MP3 ឬឯកសារសំឡេង ដើម្បីបម្លែងទៅជាសារសំឡេង Telegram បានផងដែរ។\n\n"
+    "🌍 ភាសាដែលគាំទ្រ៖\n"
+    "🇰🇭 ខ្មែរ | 🇺🇸 អង់គ្លេស | 🇨🇳 ចិន | 🇰🇷 កូរ៉េ | 🇯🇵 ជប៉ុន\n"
+    "💡 សម្រាប់អក្សរជប៉ុន ឬចិនដែលអាចអានបានច្រើនរបៀប សូមដាក់ ja: ឬ zh: នៅខាងមុខអត្ថបទ។\n\n"
+    "⚙️ ប្រើ /myprefs ដើម្បីមើលការកំណត់របស់អ្នក។\n"
+    "🎙️ ប្រើ /voxcpm2 ដើម្បីចម្លងសំឡេង និងកំណត់អារម្មណ៍ ឬស្ទីលនៃការនិយាយ។\n"
+    "📢 ចូលរួមឆានែល៖ https://t.me/m11mmm112"
 )
 BOT_TAG = "@voicekhaibot"
 
@@ -12043,10 +12043,10 @@ def _get_prefs_load_lock(user_id: int) -> asyncio.Lock:
         return lock
 
 TTS_MODEL_OPTIONS = {
-    "auto": ("Auto", "Kiri → Edge TTS"),
-    "hf_space": ("Kiri", ""),
-    "edge": ("Edge TTS", ""),
-    "voxcpm2": ("VoxCPM2 Clone", "Reference + Style Control"),
+    "auto": ("ស្វ័យប្រវត្តិ", "Kiri → Edge TTS"),
+    "hf_space": ("សំឡេងខ្មែរ Kiri", ""),
+    "edge": ("Edge TTS ពហុភាសា", ""),
+    "voxcpm2": ("ចម្លងសំឡេង VoxCPM2", "សំឡេងគំរូ + កំណត់ស្ទីល"),
 }
 TTS_MODEL_ALIASES = {
     "auto": "auto",
@@ -12197,18 +12197,19 @@ def _voxcpm2_reference_ready(profile: dict[str, Any] | None) -> bool:
 
 
 def _voxcpm2_unavailable_reason(*, include_cooldown: bool = True) -> str:
+    """Return a Khmer explanation suitable for user-facing VoxCPM2 screens."""
     if not VOXCPM2_ENABLED:
-        return "VoxCPM2 is disabled by server configuration."
+        return "សេវា VoxCPM2 ត្រូវបានបិទដោយការកំណត់របស់ម៉ាស៊ីនមេ។"
     if GradioClient is None:
-        return "gradio_client is not installed."
+        return "ម៉ាស៊ីនមេមិនទាន់ដំឡើង gradio_client ទេ។"
     if GradioHandleFile is None:
-        return "gradio_client.handle_file is unavailable; upgrade gradio_client."
+        return "កំណែ gradio_client ចាស់ពេក និងមិនគាំទ្រការបញ្ចូលឯកសារ។"
     if not VOXCPM2_SPACE:
-        return "VOXCPM2_SPACE is empty."
+        return "អ្នកគ្រប់គ្រងមិនទាន់កំណត់ VOXCPM2_SPACE ទេ។"
     if include_cooldown:
         remaining = _voxcpm2_disabled_remaining_s() if "_voxcpm2_disabled_remaining_s" in globals() else 0
         if remaining > 0:
-            return f"VoxCPM2 is cooling down after provider failures ({remaining}s remaining)."
+            return f"សេវា VoxCPM2 កំពុងសម្រាកបណ្ដោះអាសន្ន។ សូមសាកម្ដងទៀតក្រោយ {remaining} វិនាទី។"
     return ""
 
 
@@ -16168,26 +16169,38 @@ _STATUS_FRAMES = [
     "⏳ កំពុងបង្កើតសំឡេង ···", "⏳ កំពុងបង្កើតសំឡេង ····",
 ]
 _TRANSCRIBE_FRAMES = [
-    "🎙️ កំពុង Transcribe ·", "🎙️ កំពុង Transcribe ··",
-    "🎙️ កំពុង Transcribe ···", "🎙️ កំពុង Transcribe ····",
+    "🎙️ កំពុងបម្លែងសំឡេងទៅជាអត្ថបទ ·", "🎙️ កំពុងបម្លែងសំឡេងទៅជាអត្ថបទ ··",
+    "🎙️ កំពុងបម្លែងសំឡេងទៅជាអត្ថបទ ···", "🎙️ កំពុងបម្លែងសំឡេងទៅជាអត្ថបទ ····",
 ]
 _OCR_FRAMES = [
-    "🔍 កំពុង OCR រូបភាព ·", "🔍 កំពុង OCR រូបភាព ··",
-    "🔍 កំពុង OCR រូបភាព ···", "🔍 កំពុង OCR រូបភាព ····",
+    "🔍 កំពុងអានអត្ថបទពីរូបភាព ·", "🔍 កំពុងអានអត្ថបទពីរូបភាព ··",
+    "🔍 កំពុងអានអត្ថបទពីរូបភាព ···", "🔍 កំពុងអានអត្ថបទពីរូបភាព ····",
 ]
 _AUDIO_FILE_FRAMES = [
-    "🎵 កំពុងដំណើរការឯកសារអូឌីយ៉ូ ·", "🎵 កំពុងដំណើរការឯកសារអូឌីយ៉ូ ··",
-    "🎵 កំពុងដំណើរការឯកសារអូឌីយ៉ូ ···", "🎵 កំពុងដំណើរការឯកសារអូឌីយ៉ូ ····",
+    "🎵 កំពុងរៀបចំឯកសារសំឡេង ·", "🎵 កំពុងរៀបចំឯកសារសំឡេង ··",
+    "🎵 កំពុងរៀបចំឯកសារសំឡេង ···", "🎵 កំពុងរៀបចំឯកសារសំឡេង ····",
 ]
 
 
 async def send_status_timer(
-    chat_id: int, bot, stop_event: asyncio.Event, frames=None
+    chat_id: int,
+    bot,
+    stop_event: asyncio.Event,
+    frames=None,
+    *,
+    message: Any | None = None,
+    delete_on_stop: bool = True,
 ):
+    """Animate one Telegram status message.
+
+    Callers that need an editable final state pass an existing message and set
+    delete_on_stop=False. Legacy callers keep the previous auto-delete behavior.
+    """
     frames = frames or _STATUS_FRAMES
-    msg = None
+    msg = message
     try:
-        msg = await safe_send(lambda: bot.send_message(chat_id=chat_id, text=frames[0]))
+        if msg is None:
+            msg = await safe_send(lambda: bot.send_message(chat_id=chat_id, text=frames[0]))
         if msg is None:
             return
         frame_idx = 1
@@ -16201,21 +16214,80 @@ async def send_status_timer(
             with suppress(BadRequest, TelegramError):
                 await msg.edit_text(frames[frame_idx % len(frames)])
             frame_idx += 1
-    except (asyncio.CancelledError, Exception) as e:
-        if not isinstance(e, asyncio.CancelledError):
-            logger.warning(f"Status timer error: {e}")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("Status timer error: %s", exc)
     finally:
-        if msg:
+        if msg is not None and delete_on_stop:
             with suppress(Exception):
                 await msg.delete()
 
 
-async def _stop_timer(stop_event: asyncio.Event, timer_task: asyncio.Task):
-    stop_event.set()
-    if not timer_task.done():
+async def _stop_timer(
+    stop_event: asyncio.Event | None,
+    timer_task: asyncio.Task | None,
+) -> None:
+    if stop_event is not None:
+        stop_event.set()
+    if timer_task is not None and not timer_task.done():
         timer_task.cancel()
         with suppress(asyncio.CancelledError, Exception):
             await timer_task
+
+
+async def _delete_message_later(message: Any, delay_s: float) -> None:
+    try:
+        await asyncio.sleep(max(0.0, float(delay_s)))
+        await safe_send(lambda: message.delete(), retries=1)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.debug("Delayed status deletion skipped: %s", exc)
+
+
+async def _start_editable_status(
+    chat_id: int,
+    bot: Any,
+    frames: list[str] | tuple[str, ...] | None = None,
+) -> tuple[Any | None, asyncio.Event | None, asyncio.Task | None]:
+    """Create exactly one processing message and animate it by editing."""
+    status_frames = list(frames or _STATUS_FRAMES)
+    if not status_frames:
+        status_frames = list(_STATUS_FRAMES)
+    message = await safe_send(lambda: bot.send_message(chat_id=chat_id, text=status_frames[0]))
+    if message is None:
+        return None, None, None
+    stop_event = asyncio.Event()
+    timer_task = asyncio.create_task(
+        send_status_timer(
+            chat_id,
+            bot,
+            stop_event,
+            frames=status_frames,
+            message=message,
+            delete_on_stop=False,
+        )
+    )
+    return message, stop_event, timer_task
+
+
+async def _finish_editable_status(
+    message: Any | None,
+    stop_event: asyncio.Event | None,
+    timer_task: asyncio.Task | None,
+    final_text: str,
+    *,
+    delete_after_s: float | None = None,
+) -> None:
+    """Stop animation and edit the processing message to its final state."""
+    await _stop_timer(stop_event, timer_task)
+    if message is None:
+        return
+    with suppress(Exception):
+        await safe_send(lambda: message.edit_text(str(final_text or "")))
+    if delete_after_s is not None and delete_after_s >= 0:
+        asyncio.create_task(_delete_message_later(message, delete_after_s))
 
 
 # ---------------------------------------------------------------------------
@@ -25224,7 +25296,13 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vox_state = context.user_data.pop("voxcpm2_state", None)
     if not _is_admin(uid):
         if vox_state:
-            await safe_send(lambda: update.message.reply_text('✅ បានបោះបង់ការដំឡើង VoxCPM2។'))
+            await _voxcpm2_send_panel(
+                update.message,
+                int(uid),
+                "បានបោះបង់ការបញ្ចូលព័ត៌មាន VoxCPM2។",
+                context=context,
+                prefer_saved=True,
+            )
         else:
             await safe_send(lambda: update.message.reply_text('ℹ️ មិនមានប្រតិបត្តិការដែលត្រូវបោះបង់ទេ។'))
         return
@@ -25368,61 +25446,154 @@ async def cmd_delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 def _voxcpm2_panel_kb(selected: bool = False) -> InlineKeyboardMarkup:
-    select_label = "✅ VoxCPM2 Selected" if selected else "✅ Select VoxCPM2"
+    select_label = "✅ បានជ្រើស VoxCPM2" if selected else "✅ ជ្រើស VoxCPM2"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎙 Upload Reference", callback_data="voxcpm2:set_ref"),
-         InlineKeyboardButton("🎛 Control Instruction", callback_data="voxcpm2:set_control")],
-        [InlineKeyboardButton("🧹 Clear Control", callback_data="voxcpm2:clear_control"),
-         InlineKeyboardButton("🗑 Clear Reference", callback_data="voxcpm2:clear_ref")],
+        [InlineKeyboardButton("🎙 បញ្ចូលសំឡេងគំរូ", callback_data="voxcpm2:set_ref"),
+         InlineKeyboardButton("🎛 កំណត់អារម្មណ៍/ស្ទីល", callback_data="voxcpm2:set_control")],
+        [InlineKeyboardButton("🧹 លុបការណែនាំ", callback_data="voxcpm2:clear_control"),
+         InlineKeyboardButton("🗑 លុបសំឡេងគំរូ", callback_data="voxcpm2:clear_ref")],
         [InlineKeyboardButton(select_label, callback_data="voxcpm2:select"),
-         InlineKeyboardButton("🔄 Refresh", callback_data="voxcpm2:refresh")],
-        [InlineKeyboardButton("🤖 TTS Models", callback_data="show_tts_model"),
-         InlineKeyboardButton("❌ Close", callback_data="voxcpm2:close")],
+         InlineKeyboardButton("🔄 ផ្ទុកឡើងវិញ", callback_data="voxcpm2:refresh")],
+        [InlineKeyboardButton("🤖 ជ្រើសម៉ូដែលសំឡេង", callback_data="show_tts_model"),
+         InlineKeyboardButton("❌ បិទ", callback_data="voxcpm2:close")],
     ])
+
+
+def _voxcpm2_input_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("↩️ ត្រឡប់ទៅផ្ទាំង VoxCPM2", callback_data="voxcpm2:refresh")],
+        [InlineKeyboardButton("❌ បិទ", callback_data="voxcpm2:close")],
+    ])
+
+
+_VOXCPM2_PANEL_CHAT_KEY = "voxcpm2_panel_chat_id"
+_VOXCPM2_PANEL_MESSAGE_KEY = "voxcpm2_panel_message_id"
+
+
+def _voxcpm2_remember_panel(context: Any, message: Any) -> None:
+    if context is None or message is None:
+        return
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    message_id = getattr(message, "message_id", None)
+    if chat_id is None or message_id is None:
+        return
+    context.user_data[_VOXCPM2_PANEL_CHAT_KEY] = int(chat_id)
+    context.user_data[_VOXCPM2_PANEL_MESSAGE_KEY] = int(message_id)
+
+
+def _voxcpm2_forget_panel(context: Any) -> None:
+    if context is None:
+        return
+    context.user_data.pop(_VOXCPM2_PANEL_CHAT_KEY, None)
+    context.user_data.pop(_VOXCPM2_PANEL_MESSAGE_KEY, None)
 
 
 def _voxcpm2_panel_text(profile: dict[str, Any], selected: bool, notice: str = "") -> str:
     ready = _voxcpm2_reference_ready(profile)
     duration = float(profile.get("duration") or 0.0)
-    ref_name = html.escape(str(profile.get("filename") or "reference audio")[:80])
-    reference_line = f"✅ <code>{ref_name}</code>" if ready else "❌ Not uploaded"
+    ref_name = html.escape(str(profile.get("filename") or "សំឡេងគំរូ")[:80])
+    reference_line = f"✅ <code>{ref_name}</code>" if ready else "❌ មិនទាន់បញ្ចូល"
     if ready and duration > 0:
-        reference_line += f" · {duration:g}s"
+        reference_line += f" · {duration:g} វិនាទី"
+
     control = str(profile.get("control") or "").strip()
-    control_line = html.escape(control[:220]) if control else "Default style from the reference voice"
+    control_line = html.escape(control[:220]) if control else "ប្រើអារម្មណ៍ និងស្ទីលដើមពីសំឡេងគំរូ"
     unavailable = _voxcpm2_unavailable_reason()
-    status_line = f"⚠️ {html.escape(unavailable)}" if unavailable else "✅ Ready"
+    status_line = f"⚠️ {html.escape(unavailable)}" if unavailable else "✅ រួចរាល់"
+    selected_line = "បានជ្រើស" if selected else "មិនទាន់ជ្រើស"
     prefix = f"✅ {html.escape(notice)}\n\n" if notice else ""
+
     return (
         prefix
-        + "🎙 <b>VoxCPM2 — Controllable Cloning</b>\n\n"
-        + f"Service: {status_line}\n"
-        + f"Reference: {reference_line}\n"
-        + f"Control: <i>{control_line}</i>\n"
-        + f"Selected model: <b>{'YES' if selected else 'NO'}</b>\n\n"
-        + "Upload a clear reference clip, then optionally describe emotion, speaking pace, tone, or style. "
-          "The cloned voice keeps the reference timbre while applying the instruction.\n\n"
-        + f"💡 Best reference: one speaker, clean audio, about 5–30 seconds (hard limit {VOXCPM2_MAX_REFERENCE_SECONDS:g} seconds).\n"
-        + "⚠️ Use only your own voice or a voice you have permission to clone. The reference is sent to the configured VoxCPM2 service for generation."
+        + "🎙 <b>VoxCPM2 — ចម្លងសំឡេង និងកំណត់ស្ទីល</b>\n\n"
+        + f"សេវាកម្ម៖ {status_line}\n"
+        + f"សំឡេងគំរូ៖ {reference_line}\n"
+        + f"អារម្មណ៍/ស្ទីល៖ <i>{control_line}</i>\n"
+        + f"ម៉ូដែលដែលបានជ្រើស៖ <b>{selected_line}</b>\n\n"
+        + "សូមបញ្ចូលសំឡេងគំរូដែលច្បាស់។ បន្ទាប់មក អ្នកអាចកំណត់អារម្មណ៍ ល្បឿននិយាយ សូរសំឡេង ឬស្ទីលនៃការនិយាយបន្ថែមបាន។ "
+          "សំឡេងដែលបង្កើតនឹងរក្សាលក្ខណៈសំឡេងគំរូ និងអនុវត្តតាមការណែនាំរបស់អ្នក។\n\n"
+        + f"💡 ដើម្បីបានលទ្ធផលល្អ៖ ប្រើអ្នកនិយាយម្នាក់ សំឡេងស្អាត គ្មានតន្ត្រីខាងក្រោយ និងមានរយៈពេលប្រហែល ៥–៣០ វិនាទី "
+          f"(អតិបរមា {VOXCPM2_MAX_REFERENCE_SECONDS:g} វិនាទី)។\n"
+        + "⚠️ សូមប្រើតែសំឡេងរបស់ខ្លួនឯង ឬសំឡេងដែលអ្នកមានការអនុញ្ញាតឱ្យចម្លង។ សំឡេងគំរូនឹងត្រូវផ្ញើទៅសេវា VoxCPM2 ដែលបានកំណត់ ដើម្បីបង្កើតសំឡេង។"
     )
 
 
-async def _voxcpm2_send_panel(target_message, user_id: int, notice: str = "", *, edit: bool = False) -> None:
+async def _voxcpm2_send_panel(
+    target_message,
+    user_id: int,
+    notice: str = "",
+    *,
+    edit: bool = False,
+    context: Any | None = None,
+    prefer_saved: bool = False,
+) -> Any:
+    """Render one reusable VoxCPM2 panel instead of adding a new bot message.
+
+    The panel message id is stored in user_data. Uploads, control text, cancel,
+    refresh and validation errors edit that same panel whenever possible.
+    """
     profile, prefs = await asyncio.gather(
         _voxcpm2_profile_get(user_id),
         get_user_prefs_async(user_id),
     )
     selected = _normalize_tts_model(prefs.get("tts_model", "auto")) == "voxcpm2"
     text = _voxcpm2_panel_text(profile, selected, notice)
-    if edit:
-        with suppress(Exception):
-            await safe_send(lambda: target_message.edit_text(
-                text, parse_mode="HTML", reply_markup=_voxcpm2_panel_kb(selected),
+    reply_markup = _voxcpm2_panel_kb(selected)
+
+    if context is not None and (prefer_saved or edit):
+        chat_id = context.user_data.get(_VOXCPM2_PANEL_CHAT_KEY)
+        message_id = context.user_data.get(_VOXCPM2_PANEL_MESSAGE_KEY)
+        if chat_id is not None and message_id is not None:
+            try:
+                edited = await safe_send(lambda: context.bot.edit_message_text(
+                    chat_id=int(chat_id),
+                    message_id=int(message_id),
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True,
+                ))
+                if edited is not None:
+                    _voxcpm2_remember_panel(context, edited)
+                    return edited
+                # A stale/deleted stored message is treated as non-fatal by
+                # safe_send and returns None. Fall back to a new panel so the
+                # user never loses the setup screen.
+                _voxcpm2_forget_panel(context)
+            except Exception as exc:
+                logger.debug("Saved VoxCPM2 panel could not be edited; creating a new panel: %s", exc)
+                _voxcpm2_forget_panel(context)
+
+    if edit and target_message is not None:
+        try:
+            edited = await safe_send(lambda: target_message.edit_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
                 disable_web_page_preview=True,
             ))
-            return
-    await safe_send(lambda: target_message.reply_text(
-        text, parse_mode="HTML", reply_markup=_voxcpm2_panel_kb(selected),
+            _voxcpm2_remember_panel(context, edited or target_message)
+            return edited or target_message
+        except Exception as exc:
+            logger.debug("Current VoxCPM2 panel could not be edited; creating a new panel: %s", exc)
+
+    sent = await safe_send(lambda: target_message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
+    ))
+    _voxcpm2_remember_panel(context, sent)
+    return sent
+
+
+async def _voxcpm2_edit_prompt(query, context: Any, text: str) -> None:
+    _voxcpm2_remember_panel(context, query.message)
+    await safe_send(lambda: query.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=_voxcpm2_input_kb(),
         disable_web_page_preview=True,
     ))
 
@@ -25432,7 +25603,12 @@ async def cmd_voxcpm2(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not await _ensure_user_allowed(update, context):
         return
-    await _voxcpm2_send_panel(update.effective_message, int(update.effective_user.id))
+    context.user_data.pop("voxcpm2_state", None)
+    await _voxcpm2_send_panel(
+        update.effective_message,
+        int(update.effective_user.id),
+        context=context,
+    )
 
 
 async def _voxcpm2_accept_reference(
@@ -25450,17 +25626,28 @@ async def _voxcpm2_accept_reference(
     user = update.effective_user
     if not msg or not user:
         return
+    user_id = int(user.id)
+
     if file_size and file_size > VOXCPM2_MAX_REFERENCE_BYTES:
-        await safe_send(lambda: msg.reply_text(
-            f'❌ ឯកសារសំឡេងគំរូធំពេក។ អតិបរមា {VOXCPM2_MAX_REFERENCE_BYTES // 1024 // 1024} MB។'
-        ))
+        await _voxcpm2_send_panel(
+            msg,
+            user_id,
+            f"ឯកសារសំឡេងគំរូធំពេក។ អតិបរមា {VOXCPM2_MAX_REFERENCE_BYTES // 1024 // 1024} MB។",
+            context=context,
+            prefer_saved=True,
+        )
         return
     if duration and duration > VOXCPM2_MAX_REFERENCE_SECONDS:
-        await safe_send(lambda: msg.reply_text(
-            f'❌ សំឡេងគំរូវែងពេក។ អតិបរមា {VOXCPM2_MAX_REFERENCE_SECONDS:g} វិនាទី។'
-        ))
+        await _voxcpm2_send_panel(
+            msg,
+            user_id,
+            f"សំឡេងគំរូវែងពេក។ អតិបរមា {VOXCPM2_MAX_REFERENCE_SECONDS:g} វិនាទី។",
+            context=context,
+            prefer_saved=True,
+        )
         return
-    profile = await _voxcpm2_profile_get(int(user.id))
+
+    profile = await _voxcpm2_profile_get(user_id)
     profile.update({
         "file_id": str(file_id),
         "file_unique_id": str(file_unique_id or ""),
@@ -25471,15 +25658,23 @@ async def _voxcpm2_accept_reference(
         "file_size": int(file_size or 0),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     })
-    await _voxcpm2_profile_set(int(user.id), profile)
+    await _voxcpm2_profile_set(user_id, profile)
     context.user_data.pop("voxcpm2_state", None)
+
     unavailable = _voxcpm2_unavailable_reason()
     if unavailable:
-        notice = f"Reference audio saved. VoxCPM2 is not selectable yet: {unavailable}"
+        notice = f"បានរក្សាទុកសំឡេងគំរូ។ ប៉ុន្តែមិនទាន់អាចជ្រើស VoxCPM2 បានទេ៖ {unavailable}"
     else:
-        update_user_tts_model(int(user.id), "voxcpm2")
-        notice = "Reference audio saved and VoxCPM2 selected."
-    await _voxcpm2_send_panel(msg, int(user.id), notice)
+        update_user_tts_model(user_id, "voxcpm2")
+        notice = "បានរក្សាទុកសំឡេងគំរូ និងជ្រើស VoxCPM2 រួចរាល់។"
+
+    await _voxcpm2_send_panel(
+        msg,
+        user_id,
+        notice,
+        context=context,
+        prefer_saved=True,
+    )
 
 
 async def _voxcpm2_save_control_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
@@ -25487,76 +25682,137 @@ async def _voxcpm2_save_control_text(update: Update, context: ContextTypes.DEFAU
     user = update.effective_user
     if not msg or not user:
         return
+    user_id = int(user.id)
     control = str(text or "").strip()
-    if control.lower() in {"clear", "none", "default", "-"}:
+    if control.lower() in {"clear", "none", "default", "-", "លុប", "សម្អាត"}:
         control = ""
     if len(control) > VOXCPM2_CONTROL_MAX_CHARS:
-        await safe_send(lambda: msg.reply_text(
-            f'❌ ការណែនាំសំឡេងវែងពេក។ អតិបរមា {VOXCPM2_CONTROL_MAX_CHARS} តួអក្សរ។'
-        ))
+        await _voxcpm2_send_panel(
+            msg,
+            user_id,
+            f"ការណែនាំសំឡេងវែងពេក។ អតិបរមា {VOXCPM2_CONTROL_MAX_CHARS} តួអក្សរ។",
+            context=context,
+            prefer_saved=True,
+        )
         return
-    profile = await _voxcpm2_profile_get(int(user.id))
+
+    profile = await _voxcpm2_profile_get(user_id)
     profile["control"] = control
     profile["updated_at"] = datetime.now(timezone.utc).isoformat()
-    await _voxcpm2_profile_set(int(user.id), profile)
+    await _voxcpm2_profile_set(user_id, profile)
     context.user_data.pop("voxcpm2_state", None)
-    notice = "Control Instruction saved." if control else "Control Instruction cleared."
-    await _voxcpm2_send_panel(msg, int(user.id), notice)
+    notice = "បានរក្សាទុកអារម្មណ៍/ស្ទីលសំឡេង។" if control else "បានលុបការណែនាំអារម្មណ៍/ស្ទីលសំឡេង។"
+    await _voxcpm2_send_panel(
+        msg,
+        user_id,
+        notice,
+        context=context,
+        prefer_saved=True,
+    )
 
 
 async def _cb_voxcpm2(query, user_id: int, context, data: str) -> None:
     action = data.split(":", 1)[1] if ":" in data else "refresh"
+    _voxcpm2_remember_panel(context, query.message)
+
     if action == "set_ref":
         context.user_data["voxcpm2_state"] = VOXCPM2_WAIT_REFERENCE
-        await safe_send(lambda: query.message.reply_text(
-            '🎙 សូមផ្ញើសារជាសំឡេង Telegram ឬបញ្ចូលឯកសារ WAV/MP3/OGG/FLAC។\nដើម្បីបានលទ្ធផលល្អ សូមប្រើអ្នកនិយាយម្នាក់ សំឡេងច្បាស់ និងរយៈពេល ៥–៣០ វិនាទី។ ប្រើ /cancel ដើម្បីបោះបង់។'
-        ))
+        await _voxcpm2_edit_prompt(
+            query,
+            context,
+            "🎙 <b>បញ្ចូលសំឡេងគំរូ</b>\n\n"
+            "សូមផ្ញើសារជាសំឡេង Telegram ឬឯកសារ WAV, MP3, OGG ឬ FLAC។\n\n"
+            "💡 ដើម្បីបានលទ្ធផលល្អ សូមប្រើអ្នកនិយាយម្នាក់ សំឡេងច្បាស់ គ្មានតន្ត្រីខាងក្រោយ និងរយៈពេលប្រហែល ៥–៣០ វិនាទី។\n\n"
+            "ប្រើ /cancel ដើម្បីបោះបង់។",
+        )
         return
+
     if action == "set_control":
         context.user_data["voxcpm2_state"] = VOXCPM2_WAIT_CONTROL
-        await safe_send(lambda: query.message.reply_text(
-            '🎛 សូមផ្ញើការណែនាំសំឡេងជាអត្ថបទ។\nឧទាហរណ៍៖ “កក់ក្ដៅ រីករាយ និងលឿនបន្តិច” ឬ “ស្ងប់ស្ងាត់ យឺត និងមានវិជ្ជាជីវៈ”។\nផ្ញើ <code>clear</code> ដើម្បីលុប ឬប្រើ /cancel ដើម្បីបោះបង់។'
-        ))
+        await _voxcpm2_edit_prompt(
+            query,
+            context,
+            "🎛 <b>កំណត់អារម្មណ៍ និងស្ទីលនៃការនិយាយ</b>\n\n"
+            "សូមផ្ញើការណែនាំជាអត្ថបទ។\n\n"
+            "ឧទាហរណ៍៖\n"
+            "• កក់ក្ដៅ រីករាយ និងលឿនបន្តិច\n"
+            "• ស្ងប់ស្ងាត់ យឺត និងមានវិជ្ជាជីវៈ\n"
+            "• រំភើប មានថាមពល និងច្បាស់\n\n"
+            "ផ្ញើ <code>clear</code> ឬ <code>លុប</code> ដើម្បីលុបការណែនាំ។ ប្រើ /cancel ដើម្បីបោះបង់។",
+        )
         return
+
+    context.user_data.pop("voxcpm2_state", None)
+
     if action == "clear_control":
         profile = await _voxcpm2_profile_get(user_id)
         profile["control"] = ""
         profile["updated_at"] = datetime.now(timezone.utc).isoformat()
         await _voxcpm2_profile_set(user_id, profile)
-        await _voxcpm2_send_panel(query.message, user_id, "Control Instruction cleared.", edit=True)
+        await _voxcpm2_send_panel(
+            query.message,
+            user_id,
+            "បានលុបការណែនាំអារម្មណ៍/ស្ទីលសំឡេង។",
+            edit=True,
+            context=context,
+        )
         return
+
     if action == "clear_ref":
         profile = await _voxcpm2_profile_get(user_id)
         for key in ("file_id", "file_unique_id", "filename", "mime_type", "suffix", "duration", "file_size"):
             profile.pop(key, None)
         profile["updated_at"] = datetime.now(timezone.utc).isoformat()
         await _voxcpm2_profile_set(user_id, profile)
-        await _voxcpm2_send_panel(query.message, user_id, "Reference audio cleared.", edit=True)
+        await _voxcpm2_send_panel(
+            query.message,
+            user_id,
+            "បានលុបសំឡេងគំរូ។",
+            edit=True,
+            context=context,
+        )
         return
+
     if action == "select":
         unavailable = _voxcpm2_unavailable_reason()
         if unavailable:
             await _voxcpm2_send_panel(
                 query.message,
                 user_id,
-                f"Cannot select VoxCPM2: {unavailable}",
+                f"មិនអាចជ្រើស VoxCPM2 បានទេ៖ {unavailable}",
                 edit=True,
+                context=context,
             )
             return
         update_user_tts_model(user_id, "voxcpm2")
         profile = await _voxcpm2_profile_get(user_id)
         notice = (
-            "VoxCPM2 selected."
+            "បានជ្រើស VoxCPM2 រួចរាល់។"
             if _voxcpm2_reference_ready(profile)
-            else "VoxCPM2 selected. Upload a reference before generating speech."
+            else "បានជ្រើស VoxCPM2។ សូមបញ្ចូលសំឡេងគំរូ មុនពេលបង្កើតសំឡេង។"
         )
-        await _voxcpm2_send_panel(query.message, user_id, notice, edit=True)
+        await _voxcpm2_send_panel(
+            query.message,
+            user_id,
+            notice,
+            edit=True,
+            context=context,
+        )
         return
+
     if action == "close":
+        _voxcpm2_forget_panel(context)
         with suppress(Exception):
             await query.message.delete()
         return
-    await _voxcpm2_send_panel(query.message, user_id, edit=True)
+
+    await _voxcpm2_send_panel(
+        query.message,
+        user_id,
+        "បានផ្ទុកព័ត៌មានថ្មីរួច។" if action == "refresh" else "",
+        edit=True,
+        context=context,
+    )
 
 
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -25580,7 +25836,7 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     prefs   = await get_user_prefs_async(user_id)
-    gender_label = "👩 ស្រី (Female)" if prefs["gender"] == "female" else "👨 ប្រុស (Male)"
+    gender_label = "👩 សំឡេងស្រី" if prefs["gender"] == "female" else "👨 សំឡេងប្រុស"
     speed_label  = next(
         (lbl for _, (lbl, val) in SPEED_OPTIONS.items() if abs(val - prefs["speed"]) < 0.01),
         f"{prefs['speed']}x",
@@ -25591,8 +25847,8 @@ async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🗣️ សំឡេង: <b>{gender_label}</b>\n"
         f"🎚️ ល្បឿន: <b>{speed_label}</b>\n"
         f"🤖 ម៉ូដែល TTS: <b>{html.escape(model_label)}</b>\n"
-        f"🎙️ VoxCPM2 setup: <b>{'Use /voxcpm2' if _normalize_tts_model(prefs.get('tts_model', 'auto')) == 'voxcpm2' else 'Optional'}</b>\n\n"
-        "ផ្ញើ text ណាមួយ ហើយប្រើប៊ូតុងក្រោមសំឡេង ដើម្បីប្តូរ។",
+        f"🎙️ ការកំណត់ VoxCPM2៖ <b>{'ប្រើ /voxcpm2 ដើម្បីកែប្រែ' if _normalize_tts_model(prefs.get('tts_model', 'auto')) == 'voxcpm2' else 'មិនចាំបាច់'}</b>\n\n"
+        "ផ្ញើអត្ថបទណាមួយ ហើយប្រើប៊ូតុងក្រោមសារសំឡេង ដើម្បីប្តូរម៉ូដែល ល្បឿន ឬប្រភេទសំឡេង។",
         parse_mode="HTML",
         reply_markup=get_main_kb(prefs["gender"], prefs.get("tts_model", "auto")),
     ))
@@ -25659,7 +25915,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: msg.reply_text("✅ រូបភាពបានផ្ញើដល់ Admin ។"))
         return
 
-    if not await _ensure_user_allowed(update, context, "ocr_enabled", "Image OCR"):
+    if not await _ensure_user_allowed(update, context, "ocr_enabled", "អានអត្ថបទពីរូបភាព"):
         return
 
     if not _ocr_configured():
@@ -26043,7 +26299,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if not await _ensure_user_allowed(update, context, "voice_transcribe_enabled", "Voice transcribe"):
+    if not await _ensure_user_allowed(update, context, "voice_transcribe_enabled", "បម្លែងសំឡេងទៅជាអត្ថបទ"):
         return
 
     if not _gemini:
@@ -26181,7 +26437,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: msg.reply_text("✅ សាររបស់អ្នកបានផ្ញើដល់ Admin ។"))
         return
 
-    if not await _ensure_user_allowed(update, context, "tts_enabled", "Text to Voice"):
+    if not await _ensure_user_allowed(update, context, "tts_enabled", "បម្លែងអត្ថបទទៅជាសំឡេង"):
         return
 
     if text.strip() == "🎵 សួស្តី!":
@@ -26215,17 +26471,19 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tts_model = prefs.get("tts_model", "auto")
     tts_text  = tts_text.strip() or stripped
 
-    file_path  = _make_temp_ogg()
-    stop_event = asyncio.Event()
-    timer_task = asyncio.create_task(
-        send_status_timer(update.effective_chat.id, context.bot, stop_event)
+    file_path = _make_temp_ogg()
+    status_msg, stop_event, timer_task = await _start_editable_status(
+        update.effective_chat.id,
+        context.bot,
+        _STATUS_FRAMES,
     )
+    status_finished = False
     lock = _get_user_lock(user_id)
 
     async with lock:
         try:
-            # Long text is safer as multiple smaller voice messages.  This avoids
-            # one large MP3 -> OGG/Opus FFmpeg conversion timing out on Render.
+            # Long text is delivered in smaller voice messages, while the same
+            # processing message remains active and is edited on completion.
             if len(tts_text) > TTS_SINGLE_VOICE_MAX_CHARS:
                 uname = user.username or user.first_name or str(user_id)
                 await _deliver_paged_tts(
@@ -26241,12 +26499,27 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 record_turn(user_id, "user", stripped)
                 record_turn(user_id, "assistant", tts_text[:CONV_CONTEXT_MAX_CHARS])
                 _set_last_tts(user_id)
+                await _finish_editable_status(
+                    status_msg,
+                    stop_event,
+                    timer_task,
+                    "✅ បានបង្កើត និងផ្ញើសំឡេងរួចរាល់។",
+                    delete_after_s=4.0,
+                )
+                status_finished = True
                 return
 
             audio_bytes = await generate_user_voice_limited(
-                tts_text, gender, speed, file_path, tts_model, user_id=user_id, bot=context.bot, chat_id=msg.chat_id
+                tts_text,
+                gender,
+                speed,
+                file_path,
+                tts_model,
+                user_id=user_id,
+                bot=context.bot,
+                chat_id=msg.chat_id,
             )
-            sent_msg    = await safe_send(
+            sent_msg = await safe_send(
                 lambda ab=audio_bytes: msg.reply_voice(
                     voice=io.BytesIO(ab),
                     caption=f"🗣️ {BOT_TAG}",
@@ -26255,22 +26528,38 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             if sent_msg:
                 save_text_cache(
-                    sent_msg.message_id, tts_text,
-                    chat_id=msg.chat_id, user_id=user_id,
+                    sent_msg.message_id,
+                    tts_text,
+                    chat_id=msg.chat_id,
+                    user_id=user_id,
                     username=user.username or user.first_name,
                 )
                 set_last_tts_text(user_id, tts_text)
-                record_turn(user_id, "user",      stripped)
+                record_turn(user_id, "user", stripped)
                 record_turn(user_id, "assistant", tts_text)
             _set_last_tts(user_id)
+            await _finish_editable_status(
+                status_msg,
+                stop_event,
+                timer_task,
+                "✅ បានបង្កើតសំឡេងរួចរាល់។",
+                delete_after_s=4.0,
+            )
+            status_finished = True
 
         except Exception as e:
-            logger.error(f"on_text TTS error: {e}", exc_info=True)
-            with suppress(Exception):
-                await safe_send(lambda err=e: msg.reply_text(_tts_user_error_message(err)))
+            logger.error("on_text TTS error: %s", e, exc_info=True)
+            await _finish_editable_status(
+                status_msg,
+                stop_event,
+                timer_task,
+                _tts_user_error_message(e),
+            )
+            status_finished = True
 
         finally:
-            await _stop_timer(stop_event, timer_task)
+            if not status_finished:
+                await _stop_timer(stop_event, timer_task)
             _cleanup(file_path)
 
 
@@ -26327,7 +26616,7 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
             await _voxcpm2_send_panel(
                 query.message,
                 user_id,
-                f"Cannot select VoxCPM2: {unavailable}",
+                f"មិនអាចជ្រើស VoxCPM2 បានទេ៖ {unavailable}",
             )
             return
     model = update_user_tts_model(user_id, requested_key)
@@ -26348,7 +26637,7 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
                 await query.message.edit_reply_markup(reply_markup=get_main_kb(gender, model))
             await _voxcpm2_send_panel(
                 query.message, user_id,
-                "VoxCPM2 selected. Upload a reference audio clip before generating speech.",
+                "បានជ្រើស VoxCPM2។ សូមបញ្ចូលសំឡេងគំរូ មុនពេលបង្កើតសំឡេង។",
             )
             return
 
@@ -26369,52 +26658,74 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
     with suppress(Exception):
         await query.message.edit_reply_markup(reply_markup=get_main_kb(gender, model))
 
-    status_msg = await safe_send(lambda: context.bot.send_message(
-        chat_id=chat_id,
-        text=f"🔄 កំពុងប្តូរម៉ូដែល TTS ទៅ {html.escape(TTS_MODEL_OPTIONS.get(model, TTS_MODEL_OPTIONS['auto'])[0])} ហើយបង្កើតសំឡេងឡើងវិញ...",
-    ))
-
-    file_path  = _make_temp_ogg()
-    stop_event = asyncio.Event()
-    timer_task = asyncio.create_task(send_status_timer(chat_id, context.bot, stop_event))
-    lock       = _get_user_lock(user_id)
+    model_label = TTS_MODEL_OPTIONS.get(model, TTS_MODEL_OPTIONS["auto"])[0]
+    model_frames = [
+        f"🔄 កំពុងប្តូរទៅ {model_label} និងបង្កើតសំឡេងឡើងវិញ ·",
+        f"🔄 កំពុងប្តូរទៅ {model_label} និងបង្កើតសំឡេងឡើងវិញ ··",
+        f"🔄 កំពុងប្តូរទៅ {model_label} និងបង្កើតសំឡេងឡើងវិញ ···",
+    ]
+    status_msg, stop_event, timer_task = await _start_editable_status(
+        chat_id,
+        context.bot,
+        model_frames,
+    )
+    status_finished = False
+    file_path = _make_temp_ogg()
+    lock = _get_user_lock(user_id)
 
     try:
         async with lock:
-            try:
-                audio_bytes = await generate_user_voice_limited(
-                    original_text, gender, speed, file_path, model, user_id=user_id, bot=context.bot, chat_id=chat_id
+            audio_bytes = await generate_user_voice_limited(
+                original_text,
+                gender,
+                speed,
+                file_path,
+                model,
+                user_id=user_id,
+                bot=context.bot,
+                chat_id=chat_id,
+            )
+            with suppress(Exception):
+                await query.message.delete()
+            new_msg = await safe_send(
+                lambda ab=audio_bytes: context.bot.send_voice(
+                    chat_id=chat_id,
+                    voice=io.BytesIO(ab),
+                    caption=f"🗣️ {BOT_TAG}",
+                    reply_markup=get_main_kb(gender, model),
                 )
-                with suppress(Exception):
-                    await query.message.delete()
-                new_msg = await safe_send(
-                    lambda ab=audio_bytes: context.bot.send_voice(
-                        chat_id=chat_id,
-                        voice=io.BytesIO(ab),
-                        caption=f"🗣️ {BOT_TAG}",
-                        reply_markup=get_main_kb(gender, model),
-                    )
+            )
+            if new_msg:
+                save_text_cache(
+                    new_msg.message_id,
+                    original_text,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    username=query.from_user.username or query.from_user.first_name,
                 )
-                if new_msg:
-                    save_text_cache(
-                        new_msg.message_id, original_text,
-                        chat_id=chat_id, user_id=user_id,
-                        username=query.from_user.username or query.from_user.first_name,
-                    )
-                    set_last_tts_text(user_id, original_text)
-                    record_turn(user_id, "assistant", original_text)
-                with suppress(Exception):
-                    if status_msg:
-                        await status_msg.delete()
-                _set_last_tts(user_id)
-            except Exception as e:
-                logger.error("tts model regenerate error: %s", e, exc_info=True)
-                with suppress(Exception):
-                    await safe_send(lambda: context.bot.send_message(
-                        chat_id=chat_id, text="❌ មានបញ្ហាក្នុងការបង្កើតសំឡេងឡើងវិញ។"
-                    ))
+                set_last_tts_text(user_id, original_text)
+                record_turn(user_id, "assistant", original_text)
+            _set_last_tts(user_id)
+            await _finish_editable_status(
+                status_msg,
+                stop_event,
+                timer_task,
+                f"✅ បានប្តូរទៅ {model_label} និងបង្កើតសំឡេងរួចរាល់។",
+                delete_after_s=4.0,
+            )
+            status_finished = True
+    except Exception as e:
+        logger.error("tts model regenerate error: %s", e, exc_info=True)
+        await _finish_editable_status(
+            status_msg,
+            stop_event,
+            timer_task,
+            "❌ មិនអាចប្តូរម៉ូដែល និងបង្កើតសំឡេងឡើងវិញបានទេ។ សូមសាកម្ដងទៀត។",
+        )
+        status_finished = True
     finally:
-        await _stop_timer(stop_event, timer_task)
+        if not status_finished:
+            await _stop_timer(stop_event, timer_task)
         _cleanup(file_path)
 
 
@@ -26461,7 +26772,7 @@ async def get_callback_original_text(query, user_id: int) -> str | None:
 
 
 async def _cb_speed(query, user_id: int, context, data: str):
-    _, new_speed = SPEED_OPTIONS[data]
+    speed_label, new_speed = SPEED_OPTIONS[data]
     if query.message is None:
         return
 
@@ -26483,49 +26794,65 @@ async def _cb_speed(query, user_id: int, context, data: str):
     gender = prefs["gender"]
     tts_model = prefs.get("tts_model", "auto")
     update_user_speed(user_id, new_speed)
-
-    file_path  = _make_temp_ogg()
-    stop_event = asyncio.Event()
-    timer_task = asyncio.create_task(send_status_timer(chat_id, context.bot, stop_event))
-    lock       = _get_user_lock(user_id)
+    status_msg, stop_event, timer_task = await _start_editable_status(chat_id, context.bot)
+    status_finished = False
+    file_path = _make_temp_ogg()
+    lock = _get_user_lock(user_id)
 
     try:
         async with lock:
-            try:
-                audio_bytes = await generate_user_voice_limited(
-                    original_text, gender, new_speed, file_path, tts_model, user_id=user_id, bot=context.bot, chat_id=chat_id
+            audio_bytes = await generate_user_voice_limited(
+                original_text,
+                gender,
+                new_speed,
+                file_path,
+                tts_model,
+                user_id=user_id,
+                bot=context.bot,
+                chat_id=chat_id,
+            )
+            with suppress(Exception):
+                await query.message.delete()
+            new_msg = await safe_send(
+                lambda ab=audio_bytes, g=gender: context.bot.send_voice(
+                    chat_id=chat_id,
+                    voice=io.BytesIO(ab),
+                    caption=f"🗣️ {BOT_TAG}",
+                    reply_markup=get_main_kb(g, tts_model),
                 )
-                with suppress(Exception):
-                    await query.message.delete()
-                # FIX: was query.message.chat.send_voice() which is not a valid method.
-                # Chat object has no send_voice. Must use bot.send_voice(chat_id=...).
-                new_msg = await safe_send(
-                    lambda ab=audio_bytes, g=gender: context.bot.send_voice(
-                        chat_id=chat_id,
-                        voice=io.BytesIO(ab),
-                        caption=f"🗣️ {BOT_TAG}",
-                        reply_markup=get_main_kb(g, tts_model),
-                    )
+            )
+            if new_msg:
+                save_text_cache(
+                    new_msg.message_id,
+                    original_text,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    username=query.from_user.username or query.from_user.first_name,
                 )
-                if new_msg:
-                    save_text_cache(
-                        new_msg.message_id, original_text,
-                        chat_id=chat_id, user_id=user_id,
-                        username=query.from_user.username or query.from_user.first_name,
-                    )
-                    set_last_tts_text(user_id, original_text)
-                    record_turn(user_id, "assistant", original_text)
-                _set_last_tts(user_id)
-            except Exception as e:
-                logger.error(f"speed regen error: {e}", exc_info=True)
-                with suppress(Exception):
-                    await safe_send(lambda: context.bot.send_message(
-                        chat_id=chat_id, text="❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"
-                    ))
+                set_last_tts_text(user_id, original_text)
+                record_turn(user_id, "assistant", original_text)
+            _set_last_tts(user_id)
+            await _finish_editable_status(
+                status_msg,
+                stop_event,
+                timer_task,
+                f"✅ បានប្តូរល្បឿនទៅ {speed_label} និងបង្កើតសំឡេងរួចរាល់។",
+                delete_after_s=4.0,
+            )
+            status_finished = True
+    except Exception as e:
+        logger.error("speed regen error: %s", e, exc_info=True)
+        await _finish_editable_status(
+            status_msg,
+            stop_event,
+            timer_task,
+            "❌ មិនអាចប្តូរល្បឿន និងបង្កើតសំឡេងបានទេ។ សូមសាកម្ដងទៀត។",
+        )
+        status_finished = True
     finally:
-        await _stop_timer(stop_event, timer_task)
+        if not status_finished:
+            await _stop_timer(stop_event, timer_task)
         _cleanup(file_path)
-
 
 async def _cb_gender(query, user_id: int, context, data: str):
     new_gender = data.replace("tg_", "")
@@ -26550,49 +26877,66 @@ async def _cb_gender(query, user_id: int, context, data: str):
     speed = prefs["speed"]
     tts_model = prefs.get("tts_model", "auto")
     update_user_gender(user_id, new_gender)
-
-    file_path  = _make_temp_ogg()
-    stop_event = asyncio.Event()
-    timer_task = asyncio.create_task(send_status_timer(chat_id, context.bot, stop_event))
-    lock       = _get_user_lock(user_id)
+    gender_label = "ស្រី" if new_gender == "female" else "ប្រុស"
+    status_msg, stop_event, timer_task = await _start_editable_status(chat_id, context.bot)
+    status_finished = False
+    file_path = _make_temp_ogg()
+    lock = _get_user_lock(user_id)
 
     try:
         async with lock:
-            try:
-                audio_bytes = await generate_user_voice_limited(
-                    original_text, new_gender, speed, file_path, tts_model, user_id=user_id, bot=context.bot, chat_id=chat_id
+            audio_bytes = await generate_user_voice_limited(
+                original_text,
+                new_gender,
+                speed,
+                file_path,
+                tts_model,
+                user_id=user_id,
+                bot=context.bot,
+                chat_id=chat_id,
+            )
+            with suppress(Exception):
+                await query.message.delete()
+            new_msg = await safe_send(
+                lambda ab=audio_bytes, ng=new_gender: context.bot.send_voice(
+                    chat_id=chat_id,
+                    voice=io.BytesIO(ab),
+                    caption=f"🗣️ {BOT_TAG}",
+                    reply_markup=get_main_kb(ng, tts_model),
                 )
-                with suppress(Exception):
-                    await query.message.delete()
-                # FIX: was query.message.chat.send_voice() — Chat object has no send_voice.
-                # Must use bot.send_voice(chat_id=...).
-                new_msg = await safe_send(
-                    lambda ab=audio_bytes, ng=new_gender: context.bot.send_voice(
-                        chat_id=chat_id,
-                        voice=io.BytesIO(ab),
-                        caption=f"🗣️ {BOT_TAG}",
-                        reply_markup=get_main_kb(ng, tts_model),
-                    )
+            )
+            if new_msg:
+                save_text_cache(
+                    new_msg.message_id,
+                    original_text,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    username=query.from_user.username or query.from_user.first_name,
                 )
-                if new_msg:
-                    save_text_cache(
-                        new_msg.message_id, original_text,
-                        chat_id=chat_id, user_id=user_id,
-                        username=query.from_user.username or query.from_user.first_name,
-                    )
-                    set_last_tts_text(user_id, original_text)
-                    record_turn(user_id, "assistant", original_text)
-                _set_last_tts(user_id)
-            except Exception as e:
-                logger.error(f"gender regen error: {e}", exc_info=True)
-                with suppress(Exception):
-                    await safe_send(lambda: context.bot.send_message(
-                        chat_id=chat_id, text="❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"
-                    ))
+                set_last_tts_text(user_id, original_text)
+                record_turn(user_id, "assistant", original_text)
+            _set_last_tts(user_id)
+            await _finish_editable_status(
+                status_msg,
+                stop_event,
+                timer_task,
+                f"✅ បានប្តូរទៅសំឡេង{gender_label} និងបង្កើតសំឡេងរួចរាល់។",
+                delete_after_s=4.0,
+            )
+            status_finished = True
+    except Exception as e:
+        logger.error("gender regen error: %s", e, exc_info=True)
+        await _finish_editable_status(
+            status_msg,
+            stop_event,
+            timer_task,
+            "❌ មិនអាចប្តូរប្រភេទសំឡេង និងបង្កើតសំឡេងបានទេ។ សូមសាកម្ដងទៀត។",
+        )
+        status_finished = True
     finally:
-        await _stop_timer(stop_event, timer_task)
+        if not status_finished:
+            await _stop_timer(stop_event, timer_task)
         _cleanup(file_path)
-
 
 async def _cb_tts_transcript(query, user_id: int, context, data: str):
     transcript_msg_id = _callback_int_arg(data, "tts_transcript:")
@@ -26607,56 +26951,72 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
         get_text_cache_async(transcript_msg_id, chat_id),
         get_user_prefs_async(user_id),
     )
-
     if not original_text:
         await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទមិនឃើញ។"))
         return
-
     if await _check_cooldown(query.message, user_id):
         return
 
-    gender     = prefs["gender"]
-    speed      = prefs["speed"]
-    tts_model  = prefs.get("tts_model", "auto")
-    file_path  = _make_temp_ogg()
-    stop_event = asyncio.Event()
-    timer_task = asyncio.create_task(send_status_timer(chat_id, context.bot, stop_event))
-    lock       = _get_user_lock(user_id)
+    gender = prefs["gender"]
+    speed = prefs["speed"]
+    tts_model = prefs.get("tts_model", "auto")
+    status_msg, stop_event, timer_task = await _start_editable_status(chat_id, context.bot)
+    status_finished = False
+    file_path = _make_temp_ogg()
+    lock = _get_user_lock(user_id)
 
     try:
         async with lock:
-            try:
-                audio_bytes = await generate_user_voice_limited(
-                    original_text, gender, speed, file_path, tts_model, user_id=user_id, bot=context.bot, chat_id=chat_id
+            audio_bytes = await generate_user_voice_limited(
+                original_text,
+                gender,
+                speed,
+                file_path,
+                tts_model,
+                user_id=user_id,
+                bot=context.bot,
+                chat_id=chat_id,
+            )
+            new_msg = await safe_send(
+                lambda ab=audio_bytes, g=gender: context.bot.send_voice(
+                    chat_id=chat_id,
+                    voice=io.BytesIO(ab),
+                    caption=f"🗣️ {BOT_TAG}",
+                    reply_markup=get_main_kb(g, tts_model),
                 )
-                # FIX: was query.message.chat.send_voice() — Chat object has no send_voice.
-                new_msg = await safe_send(
-                    lambda ab=audio_bytes, g=gender: context.bot.send_voice(
-                        chat_id=chat_id,
-                        voice=io.BytesIO(ab),
-                        caption=f"🗣️ {BOT_TAG}",
-                        reply_markup=get_main_kb(g, tts_model),
-                    )
+            )
+            if new_msg:
+                save_text_cache(
+                    new_msg.message_id,
+                    original_text,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    username=query.from_user.username or query.from_user.first_name,
                 )
-                if new_msg:
-                    save_text_cache(
-                        new_msg.message_id, original_text,
-                        chat_id=chat_id, user_id=user_id,
-                        username=query.from_user.username or query.from_user.first_name,
-                    )
-                    set_last_tts_text(user_id, original_text)
-                    record_turn(user_id, "assistant", original_text)
-                _set_last_tts(user_id)
-            except Exception as e:
-                logger.error(f"transcript TTS error: {e}", exc_info=True)
-                with suppress(Exception):
-                    await safe_send(lambda: context.bot.send_message(
-                        chat_id=chat_id, text="❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។"
-                    ))
+                set_last_tts_text(user_id, original_text)
+                record_turn(user_id, "assistant", original_text)
+            _set_last_tts(user_id)
+            await _finish_editable_status(
+                status_msg,
+                stop_event,
+                timer_task,
+                "✅ បានបង្កើតសំឡេងពីអត្ថបទរួចរាល់។",
+                delete_after_s=4.0,
+            )
+            status_finished = True
+    except Exception as e:
+        logger.error("transcript TTS error: %s", e, exc_info=True)
+        await _finish_editable_status(
+            status_msg,
+            stop_event,
+            timer_task,
+            "❌ មិនអាចបង្កើតសំឡេងពីអត្ថបទនេះបានទេ។ សូមសាកម្ដងទៀត។",
+        )
+        status_finished = True
     finally:
-        await _stop_timer(stop_event, timer_task)
+        if not status_finished:
+            await _stop_timer(stop_event, timer_task)
         _cleanup(file_path)
-
 
 async def _cb_audio_tts(query, user_id: int, context, data: str):
     if query.message is None:
@@ -26665,7 +27025,7 @@ async def _cb_audio_tts(query, user_id: int, context, data: str):
     if src_msg_id is None:
         await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់អត្ថបទសំឡេងមិនត្រឹមត្រូវ។'))
         return
-    chat_id    = query.message.chat.id
+    chat_id = query.message.chat.id
     full_text, prefs = await asyncio.gather(
         get_text_cache_async(src_msg_id, chat_id),
         get_user_prefs_async(user_id),
@@ -26673,41 +27033,52 @@ async def _cb_audio_tts(query, user_id: int, context, data: str):
     if not full_text:
         await safe_send(lambda: query.message.reply_text('❌ រកអត្ថបទមិនឃើញ ព្រោះ Cache បានផុតកំណត់។'))
         return
-
     if await _check_cooldown(query.message, user_id):
         return
 
-    gender    = prefs["gender"]
-    speed     = prefs["speed"]
+    gender = prefs["gender"]
+    speed = prefs["speed"]
     tts_model = prefs.get("tts_model", "auto")
-    uname     = query.from_user.username or query.from_user.first_name or str(user_id)
-
-    # FIX: Only remove the button markup AFTER TTS succeeds. If we remove it
-    # before and TTS fails, the user has no way to retry. We suppress errors
-    # so a stale markup doesn't block delivery.
-    tts_stop  = asyncio.Event()
-    tts_timer = asyncio.create_task(send_status_timer(chat_id, context.bot, tts_stop))
-    lock      = _get_user_lock(user_id)
+    uname = query.from_user.username or query.from_user.first_name or str(user_id)
+    status_msg, stop_event, timer_task = await _start_editable_status(chat_id, context.bot)
+    status_finished = False
+    lock = _get_user_lock(user_id)
 
     try:
         async with lock:
-            try:
-                await _deliver_paged_tts(
-                    chat_id=chat_id, bot=context.bot,
-                    text=full_text, gender=gender, speed=speed,
-                    user_id=user_id, username=uname, tts_model=tts_model,
-                )
-                record_turn(user_id, "assistant", full_text[:CONV_CONTEXT_MAX_CHARS])
-                # Remove markup only after successful delivery
-                with suppress(Exception):
-                    await query.message.edit_reply_markup(reply_markup=None)
-            except Exception as e:
-                logger.error(f"_cb_audio_tts delivery error: {e}")
-                with suppress(Exception):
-                    await context.bot.send_message(chat_id=chat_id, text="❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។")
+            await _deliver_paged_tts(
+                chat_id=chat_id,
+                bot=context.bot,
+                text=full_text,
+                gender=gender,
+                speed=speed,
+                user_id=user_id,
+                username=uname,
+                tts_model=tts_model,
+            )
+            record_turn(user_id, "assistant", full_text[:CONV_CONTEXT_MAX_CHARS])
+            with suppress(Exception):
+                await query.message.edit_reply_markup(reply_markup=None)
+            await _finish_editable_status(
+                status_msg,
+                stop_event,
+                timer_task,
+                "✅ បានបង្កើត និងផ្ញើសំឡេងរួចរាល់។",
+                delete_after_s=4.0,
+            )
+            status_finished = True
+    except Exception as e:
+        logger.error("_cb_audio_tts delivery error: %s", e, exc_info=True)
+        await _finish_editable_status(
+            status_msg,
+            stop_event,
+            timer_task,
+            "❌ មិនអាចបង្កើតសំឡេងបានទេ។ សូមសាកម្ដងទៀត។",
+        )
+        status_finished = True
     finally:
-        await _stop_timer(tts_stop, tts_timer)
-
+        if not status_finished:
+            await _stop_timer(stop_event, timer_task)
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
