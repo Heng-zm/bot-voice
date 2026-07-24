@@ -1020,7 +1020,9 @@ def render_template_string(template: str, **context: Any) -> str:
 
 def flask_flash(message: str, category: str = "message") -> None:
     flashes = list(session.get("_flashes", []))
-    flashes.append((category, message))
+    translator = globals().get("_khmer_ui_text")
+    visible_message = translator(message) if callable(translator) else str(message)
+    flashes.append((category, visible_message))
     session["_flashes"] = flashes
 
 
@@ -1392,7 +1394,7 @@ def _request_wants_json() -> bool:
 def _admin_api_error(message: str, status_code: int = 400, *, code: str = "admin_error", **extra: Any):
     payload = {
         "ok": False,
-        "error": str(message),
+        "error": _khmer_ui_text(message),
         "code": code,
         "backend_only": _backend_only_mode(),
         "frontend_url": _admin_frontend_url(),
@@ -1659,7 +1661,7 @@ def _web_security_headers(resp):
 
 @app_flask.route("/")
 def health_check():
-    return "Bot is running!", 200
+    return "បូតកំពុងដំណើរការ!", 200
 
 @app_flask.route("/ping")
 def ping():
@@ -3619,8 +3621,318 @@ def _web_check_csrf() -> None:
         abort(403)
 
 
+# ── Khmer user-interface localization ────────────────────────────────────────
+# Routes, callback_data values, environment names, SQL identifiers, and API
+# fields stay unchanged. Only text rendered to users/admins is translated.
+KHMER_UI_TRANSLATIONS: dict[str, str] = {
+    "Admin": "អ្នកគ្រប់គ្រង",
+    "Admin Center": "មជ្ឈមណ្ឌលគ្រប់គ្រង",
+    "Admin System Center": "មជ្ឈមណ្ឌលគ្រប់គ្រងប្រព័ន្ធ",
+    "Admin Dashboard": "ផ្ទាំងគ្រប់គ្រង",
+    "Dashboard": "ផ្ទាំងគ្រប់គ្រង",
+    "Live Dashboard": "ផ្ទាំងតាមដានផ្ទាល់",
+    "Overview": "ទិដ្ឋភាពទូទៅ",
+    "Operate": "ប្រតិបត្តិការ",
+    "Understand": "តាមដាន និងវិភាគ",
+    "Control": "ការគ្រប់គ្រង",
+    "Control Center": "មជ្ឈមណ្ឌលបញ្ជា",
+    "Open": "បើក",
+    "Back": "ត្រឡប់ក្រោយ",
+    "Back to List": "ត្រឡប់ទៅបញ្ជី",
+    "Back to Dashboard": "ត្រឡប់ទៅផ្ទាំងគ្រប់គ្រង",
+    "Back to Admin": "ត្រឡប់ទៅផ្ទាំងគ្រប់គ្រង",
+    "Close": "បិទ",
+    "Close Menu": "បិទម៉ឺនុយ",
+    "Cancel": "បោះបង់",
+    'បានបោះបង់': "បានបោះបង់",
+    "Confirm": "បញ្ជាក់",
+    "Save": "រក្សាទុក",
+    "Create": "បង្កើត",
+    "Edit": "កែសម្រួល",
+    "Delete": "លុប",
+    "Clear": "សម្អាត",
+    "Refresh": "ផ្ទុកឡើងវិញ",
+    "Search": "ស្វែងរក",
+    "View": "មើល",
+    "Copy": "ចម្លង",
+    "Copied": "បានចម្លង",
+    "Copy failed": "ចម្លងមិនបានសម្រេច",
+    "Copied to clipboard": "បានចម្លងទៅក្ដារតម្បៀតខ្ទាស់",
+    "Apply": "អនុវត្ត",
+    "Reset": "កំណត់ឡើងវិញ",
+    "Start": "ចាប់ផ្ដើម",
+    "Stop": "បញ្ឈប់",
+    "Pause": "ផ្អាក",
+    "Resume": "បន្ត",
+    "Previous": "មុន",
+    "Next": "បន្ទាប់",
+    "New": "ថ្មី",
+    "Details": "ព័ត៌មានលម្អិត",
+    "Status": "ស្ថានភាព",
+    "Action": "សកម្មភាព",
+    "Actions": "សកម្មភាព",
+    "Value": "តម្លៃ",
+    "Name": "ឈ្មោះ",
+    "Note": "កំណត់ចំណាំ",
+    "Description": "ការពិពណ៌នា",
+    "Message": "សារ",
+    "Text": "អត្ថបទ",
+    "Photo": "រូបភាព",
+    "Optional": "មិនចាំបាច់",
+    "Required": "ចាំបាច់",
+    "Loading": "កំពុងផ្ទុក",
+    "Updated": "បានធ្វើបច្ចុប្បន្នភាព",
+    "Last updated": "បានធ្វើបច្ចុប្បន្នភាពចុងក្រោយ",
+    "Local time": "ម៉ោងក្នុងតំបន់",
+    "Today": "ថ្ងៃនេះ",
+    "Yesterday": "ម្សិលមិញ",
+    "7 Days": "៧ ថ្ងៃ",
+    "30 Days": "៣០ ថ្ងៃ",
+    "Type Date": "បញ្ចូលកាលបរិច្ឆេទ",
+    "Calendar": "ប្រតិទិន",
+    "History": "ប្រវត្តិ",
+    "Full History": "ប្រវត្តិពេញលេញ",
+    "Quick actions": "សកម្មភាពរហ័ស",
+    "Recommended next step": "ជំហានបន្ទាប់ដែលបានណែនាំ",
+    "Recommendations": "អនុសាសន៍",
+    "Warnings": "ការព្រមាន",
+    "Tip": "គន្លឹះ",
+    "Help": "ជំនួយ",
+    "Setup": "ដំឡើង",
+    "Setup SQL": "ដំឡើង SQL",
+    "SQL Setup": "ការដំឡើង SQL",
+    "Compact": "ម៉ឺនុយខ្លី",
+    "Full Admin": "ម៉ឺនុយគ្រប់គ្រងពេញលេញ",
+    "Broadcast": "ផ្សាយសារ",
+    "New Broadcast": "បង្កើតការផ្សាយថ្មី",
+    "Start Broadcast": "ចាប់ផ្ដើមផ្សាយសារ",
+    "Broadcast jobs": "ការងារផ្សាយសារ",
+    "Schedules": "កាលវិភាគ",
+    "Schedule": "កាលវិភាគ",
+    "Scheduled Broadcasts": "ការផ្សាយតាមកាលវិភាគ",
+    "New Schedule": "បង្កើតកាលវិភាគថ្មី",
+    "Create Schedule": "បង្កើតកាលវិភាគ",
+    "Cancel Schedule": "បោះបង់កាលវិភាគ",
+    "Edit Time": "កែម៉ោង",
+    "Edit Text": "កែអត្ថបទ",
+    "Replace Photo": "ប្ដូររូបភាព",
+    "Users": "អ្នកប្រើប្រាស់",
+    "User": "អ្នកប្រើប្រាស់",
+    "All Users": "អ្នកប្រើប្រាស់ទាំងអស់",
+    "Search Users": "ស្វែងរកអ្នកប្រើប្រាស់",
+    "Search User": "ស្វែងរកអ្នកប្រើប្រាស់",
+    "User Detail": "ព័ត៌មានអ្នកប្រើប្រាស់",
+    "User Needs": "តម្រូវការអ្នកប្រើប្រាស់",
+    "Open Answers": "មតិយោបល់បើកចំហ",
+    "CRM": "ការគ្រប់គ្រងអ្នកប្រើប្រាស់",
+    "Analytics": "ការវិភាគទិន្នន័យ",
+    "Insights": "ការយល់ដឹង",
+    "Health": "សុខភាពប្រព័ន្ធ",
+    "Optimize": "បង្កើនប្រសិទ្ធភាព",
+    "Optimize Now": "បង្កើនប្រសិទ្ធភាពឥឡូវនេះ",
+    "Optimization Center": "មជ្ឈមណ្ឌលបង្កើនប្រសិទ្ធភាព",
+    "Settings": "ការកំណត់",
+    "Bot Settings": "ការកំណត់បូត",
+    "Performance Settings": "ការកំណត់ប្រសិទ្ធភាព",
+    "Runtime": "ការដំណើរការបច្ចុប្បន្ន",
+    "Runtime Config": "ការកំណត់ពេលដំណើរការ",
+    "Report": "របាយការណ៍",
+    "PDF Report": "របាយការណ៍ PDF",
+    "Stats": "ស្ថិតិ",
+    "Errors": "កំហុស",
+    "Error": "កំហុស",
+    "Error Inbox": "ប្រអប់កំហុស",
+    "Error Center": "មជ្ឈមណ្ឌលកំហុស",
+    "Smart Error Inbox": "ប្រអប់កំហុសឆ្លាតវៃ",
+    "Error groups": "ក្រុមកំហុស",
+    "Error events": "ព្រឹត្តិការណ៍កំហុស",
+    "API Keys": "សោ API",
+    "API Key": "សោ API",
+    "Create API Key": "បង្កើតសោ API",
+    "List Keys": "បញ្ជីសោ API",
+    "API Status": "ស្ថានភាព API",
+    "API Menu": "ម៉ឺនុយ API",
+    "Create New": "បង្កើតថ្មី",
+    "Refresh List": "ផ្ទុកបញ្ជីឡើងវិញ",
+    "Revoke": "ដកសិទ្ធិ",
+    "Confirm Revoke": "បញ្ជាក់ការដកសិទ្ធិ",
+    "Locks": "សោប្រព័ន្ធ",
+    "Locks and Leader": "សោប្រព័ន្ធ និងម៉ាស៊ីនមេមេ",
+    "Maintenance": "ការថែទាំ",
+    "Block User": "បិទសិទ្ធិអ្នកប្រើប្រាស់",
+    "Unblock User": "បើកសិទ្ធិអ្នកប្រើប្រាស់",
+    "Clear History": "លុបប្រវត្តិ",
+    "Refresh History": "ផ្ទុកប្រវត្តិឡើងវិញ",
+    "Reset Prefs": "កំណត់ចំណូលចិត្តឡើងវិញ",
+    "Chat": "ជជែក",
+    "All": "ទាំងអស់",
+    "Power": "សកម្មខ្លាំង",
+    "Active": "សកម្ម",
+    "Warm": "កំពុងចាប់អារម្មណ៍",
+    "At-risk": "មានហានិភ័យ",
+    "Blocked": "ត្រូវបានបិទ",
+    "Accept": "ទទួលយក",
+    "Later": "ធ្វើពេលក្រោយ",
+    "In Progress": "កំពុងដំណើរការ",
+    "Completed": "បានបញ្ចប់",
+    "Reject": "បដិសេធ",
+    "Duplicate": "ស្ទួន",
+    "Reply User": "ឆ្លើយតបអ្នកប្រើប្រាស់",
+    "Notify Done": "ជូនដំណឹងថាបានបញ្ចប់",
+    "Notify User": "ជូនដំណឹងអ្នកប្រើប្រាស់",
+    "Feature Request Inbox": "ប្រអប់សំណើមុខងារ",
+    "Open Request": "បើកសំណើ",
+    "Status Summary": "សង្ខេបស្ថានភាព",
+    "TTS Models": "ម៉ូដែល TTS",
+    "TTS Provider": "អ្នកផ្តល់សេវា TTS",
+    "Auto": "ស្វ័យប្រវត្តិ",
+    "Edge Only": "ប្រើ Edge ប៉ុណ្ណោះ",
+    "HF Khmer": "HF សម្រាប់ភាសាខ្មែរ",
+    "Khmer → Edge": "ខ្មែរ → Edge",
+    "Enable HF Now": "បើក HF ឥឡូវនេះ",
+    "Disable HF 5m": "បិទ HF ៥ នាទី",
+    "Clear HF Client": "សម្អាត HF Client",
+    "VoxCPM2 Health": "សុខភាព VoxCPM2",
+    "Enable VoxCPM2": "បើក VoxCPM2",
+    "Cooldown 5m": "ផ្អាក ៥ នាទី",
+    "Clear Vox Client": "សម្អាត Vox Client",
+    "Upload Reference": "បញ្ចូលសំឡេងគំរូ",
+    "Control Instruction": "ការណែនាំសំឡេង",
+    "Clear Control": "លុបការណែនាំ",
+    "Clear Reference": "លុបសំឡេងគំរូ",
+    "OK": "ដំណើរការល្អ",
+    "MEMORY": "អង្គចងចាំ",
+    "Ready": "រួចរាល់",
+    "Running": "កំពុងដំណើរការ",
+    "Pending": "កំពុងរង់ចាំ",
+    "Sending": "កំពុងផ្ញើ",
+    "Done": "រួចរាល់",
+    "Failed": "បរាជ័យ",
+    "Unknown": "មិនស្គាល់",
+    "Enabled": "បានបើក",
+    "Disabled": "បានបិទ",
+    "Success": "ជោគជ័យ",
+    "Warning": "ការព្រមាន",
+    "Danger": "គ្រោះថ្នាក់",
+    "No data": "មិនមានទិន្នន័យ",
+    "No results": "រកមិនឃើញលទ្ធផល",
+    "No users found": "រកមិនឃើញអ្នកប្រើប្រាស់",
+    "No API keys found": "មិនមានសោ API",
+    "No critical warnings.": "មិនមានការព្រមានធ្ងន់ធ្ងរ។",
+    "Admin Login": "ចូលផ្ទាំងគ្រប់គ្រង",
+    "Login": "ចូលប្រើ",
+    "Logout": "ចាកចេញ",
+    "Password": "ពាក្យសម្ងាត់",
+    "Telegram Admin ID": "លេខសម្គាល់អ្នកគ្រប់គ្រង Telegram",
+    "Authentication required.": "តម្រូវឱ្យចូលប្រើជាមុន។",
+    "Authentication required": "តម្រូវឱ្យចូលប្រើជាមុន",
+    'សម្រាប់អ្នកគ្រប់គ្រងប៉ុណ្ណោះ': "សម្រាប់អ្នកគ្រប់គ្រងប៉ុណ្ណោះ",
+    'សម្រាប់អ្នកគ្រប់គ្រងប៉ុណ្ណោះ។': "សម្រាប់អ្នកគ្រប់គ្រងប៉ុណ្ណោះ។",
+    "Access denied": "មិនមានសិទ្ធិចូលប្រើ",
+    "Invalid password": "ពាក្យសម្ងាត់មិនត្រឹមត្រូវ",
+    "Login successful.": "ចូលប្រើបានជោគជ័យ។",
+    "Protected dashboard. Enter your web admin password.": "ផ្ទាំងនេះត្រូវបានការពារ។ សូមបញ្ចូលពាក្យសម្ងាត់អ្នកគ្រប់គ្រង។",
+    "Tip: set ADMIN_WEB_PASSWORD in Render/Railway environment.": "សម្គាល់៖ កំណត់ ADMIN_WEB_PASSWORD នៅក្នុង Environment របស់ Render/Railway។",
+    "Admin dashboard locked": "ផ្ទាំងគ្រប់គ្រងត្រូវបានចាក់សោ",
+    "Send new value": "ផ្ញើតម្លៃថ្មី",
+    'សូមផ្ញើជាលេខ': "សូមផ្ញើជាលេខ",
+    'កំពុងប្ដូរសោសម្ងាត់…': "កំពុងប្ដូរសោសម្ងាត់…",
+    'កំពុងប្ដូរ…': "កំពុងប្ដូរ…",
+    "Opening Users panel...": "កំពុងបើកផ្ទាំងអ្នកប្រើប្រាស់...",
+    "Choose report range:": "ជ្រើសរើសចន្លោះពេលរបាយការណ៍៖",
+    'សកម្មភាពស្ថានភាពមិនត្រឹមត្រូវ': "សកម្មភាពស្ថានភាពមិនត្រឹមត្រូវ",
+    'មិនស្គាល់ការកំណត់នេះ': "មិនស្គាល់ការកំណត់នេះ",
+    'សូមកែតម្លៃនេះក្នុងការកំណត់ប្រសិទ្ធភាព។': "សូមកែតម្លៃនេះក្នុងការកំណត់ប្រសិទ្ធភាព។",
+    "Invalid schedule id.": "លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។",
+    "Invalid document cache id.": "លេខសម្គាល់ឯកសារបណ្ដោះអាសន្នមិនត្រឹមត្រូវ។",
+    "Invalid transcript id.": "លេខសម្គាល់អត្ថបទសំឡេងមិនត្រឹមត្រូវ។",
+    "Invalid audio transcript id.": "លេខសម្គាល់អត្ថបទសំឡេងមិនត្រឹមត្រូវ។",
+    'រកសំណើមិនឃើញ។': "រកសំណើមិនឃើញ។",
+    "No operation to cancel.": "មិនមានប្រតិបត្តិការដែលត្រូវបោះបង់ទេ។",
+    "VoxCPM2 setup cancelled.": "បានបោះបង់ការដំឡើង VoxCPM2។",
+    "PDF report generated and sent.": "បានបង្កើត និងផ្ញើរបាយការណ៍ PDF រួចរាល់។",
+    "SQL setup message sent. After running it in Supabase, feature requests will persist permanently.": "បានផ្ញើសារ SQL រួចរាល់។ បន្ទាប់ពីដំណើរការវានៅ Supabase សំណើមុខងារនឹងត្រូវរក្សាទុកជាអចិន្ត្រៃយ៍។",
+    "Search text is empty. Press /users and try again.": "ពាក្យស្វែងរកទទេ។ សូមចុច /users ហើយព្យាយាមម្ដងទៀត។",
+    "Invalid or expired button data. Please refresh this panel.": "ទិន្នន័យប៊ូតុងមិនត្រឹមត្រូវ ឬផុតកំណត់។ សូមផ្ទុកផ្ទាំងនេះឡើងវិញ។",
+    "Admin user panel error. Please refresh and try again.": "ផ្ទាំងអ្នកប្រើប្រាស់មានបញ្ហា។ សូមផ្ទុកឡើងវិញ ហើយព្យាយាមម្ដងទៀត។",
+    "Broadcast queue is full; try again later.": "ជួររង់ចាំផ្សាយសារពេញហើយ។ សូមព្យាយាមម្ដងទៀតពេលក្រោយ។",
+    "Control every bot feature from one smooth dashboard.": "គ្រប់គ្រងមុខងារទាំងអស់របស់បូតពីផ្ទាំងតែមួយដែលងាយប្រើ។",
+    "Fast access to broadcasts, schedules, users, CRM, settings, runtime controls, health checks, locks, and SQL setup.": "ចូលប្រើការផ្សាយសារ កាលវិភាគ អ្នកប្រើប្រាស់ ការកំណត់ សុខភាពប្រព័ន្ធ សោប្រព័ន្ធ និង SQL បានយ៉ាងរហ័ស។",
+    "Realtime counts, schedules, jobs, and system status.": "តាមដានចំនួន កាលវិភាគ ការងារ និងស្ថានភាពប្រព័ន្ធភ្លាមៗ។",
+    "Send, queue, pause, resume, and inspect broadcast jobs.": "ផ្ញើ ដាក់ជួរ ផ្អាក បន្ត និងត្រួតពិនិត្យការងារផ្សាយសារ។",
+    "Create, preview, edit, cancel, and monitor scheduled sends.": "បង្កើត មើលជាមុន កែសម្រួល បោះបង់ និងតាមដានការផ្ញើតាមកាលវិភាគ។",
+    "View upcoming scheduled messages in a calendar-style flow.": "មើលសារដែលគ្រោងផ្ញើខាងមុខជាទម្រង់ប្រតិទិន។",
+    "Usage trends, recent activity, and delivery performance.": "មើលនិន្នាការប្រើប្រាស់ សកម្មភាពថ្មីៗ និងប្រសិទ្ធភាពការផ្ញើ។",
+    "Smart warnings, roadmap ideas, and next-feature recommendations.": "ការព្រមានឆ្លាតវៃ គំនិតអភិវឌ្ឍ និងអនុសាសន៍មុខងារបន្ទាប់។",
+    "Group repeated errors, mute noise, copy logs, and see recommended fixes.": "ដាក់ក្រុមកំហុសដដែលៗ បិទការរំខាន ចម្លងកំណត់ហេតុ និងមើលដំណោះស្រាយដែលបានណែនាំ។",
+    "Generate and download an admin PDF system report.": "បង្កើត និងទាញយករបាយការណ៍ប្រព័ន្ធ PDF សម្រាប់អ្នកគ្រប់គ្រង។",
+    "Search users, inspect profile details, and manage access.": "ស្វែងរកអ្នកប្រើប្រាស់ មើលព័ត៌មានលម្អិត និងគ្រប់គ្រងសិទ្ធិ។",
+    "Labels, notes, trust status, and CSV export for user care.": "គ្រប់គ្រងស្លាក កំណត់ចំណាំ ស្ថានភាពទុកចិត្ត និងនាំចេញ CSV។",
+    "Deployment checks, runtime metrics, cache and database status.": "ពិនិត្យការដាក់ប្រើប្រាស់ សូចនាករដំណើរការ Cache និងមូលដ្ឋានទិន្នន័យ។",
+    "Cleanup, cache refresh, and safe performance tuning actions.": "សម្អាត ផ្ទុក Cache ឡើងវិញ និងកែសម្រួលប្រសិទ្ធភាពដោយសុវត្ថិភាព។",
+    "Maintenance mode, polling/webhook mode, and protected controls.": "គ្រប់គ្រងរបៀបថែទាំ Polling/Webhook និងសកម្មភាពដែលត្រូវការការពារ។",
+    "Live runtime knobs for rate limits, pools, and bot mode.": "កែសម្រួល Rate Limit, Connection Pool និងរបៀបបូតពេលកំពុងដំណើរការ។",
+    "Feature toggles for TTS, OCR, AI resolver, and admin behavior.": "បើក/បិទ TTS, OCR, AI និងមុខងារអ្នកគ្រប់គ្រង។",
+    "Create, view, and revoke AI assistant API access keys.": "បង្កើត មើល និងដកសិទ្ធិសោ API សម្រាប់ជំនួយការ AI។",
+    "Inspect or release distributed scheduler locks safely.": "ពិនិត្យ ឬដោះសោ Scheduler ដោយសុវត្ថិភាព។",
+    "Copy required Supabase schema and setup instructions.": "ចម្លង Schema Supabase និងសេចក្ដីណែនាំដំឡើងដែលចាំបាច់។",
+    "Search admin features…": "ស្វែងរកមុខងារគ្រប់គ្រង…",
+    "Search admin features": "ស្វែងរកមុខងារគ្រប់គ្រង",
+    "tools": "ឧបករណ៍",
+    "Bot Admin": "ការគ្រប់គ្រងបូត",
+    "Admin System": "ប្រព័ន្ធគ្រប់គ្រង",
+    "System status": "ស្ថានភាពប្រព័ន្ធ",
+    "System Health": "សុខភាពប្រព័ន្ធ",
+    "Feature": "មុខងារ",
+    "Setting": "ការកំណត់",
+    "Quick mobile edits": "កែសម្រួលរហ័សលើទូរស័ព្ទ",
+    "Common admin tasks. Dangerous actions still require confirmation on their pages.": "សកម្មភាពអ្នកគ្រប់គ្រងដែលប្រើញឹកញាប់។ សកម្មភាពមានហានិភ័យនៅតែត្រូវការការបញ្ជាក់។"
+}
+KHMER_UI_TRANSLATIONS.update({'Prev': 'មុន', 'Inbox': 'ប្រអប់សារ', 'Modify Rate Limit': 'កែសម្រួលកម្រិតសំណើ', 'Rate Limit': 'កម្រិតសំណើ', 'Rotate Webhook Secret': 'ប្ដូរសោសម្ងាត់ Webhook', 'Webhook Secret': 'សោសម្ងាត់ Webhook', 'Template': 'គំរូ', 'Apply saved values now': 'អនុវត្តតម្លៃដែលបានរក្សាទុកឥឡូវនេះ', 'Reset to code defaults': 'កំណត់ឡើងវិញតាមតម្លៃដើមរបស់កូដ', 'Request': 'សំណើ', 'Client': 'កម្មវិធីភ្ជាប់', 'Previous 14d': '១៤ ថ្ងៃមុន', 'Next 14d': '១៤ ថ្ងៃបន្ទាប់', 'List': 'បញ្ជី', 'Clear This Group': 'សម្អាតក្រុមនេះ', 'Mute Group': 'បិទការជូនដំណឹងក្រុមនេះ', 'Error Groups': 'ក្រុមកំហុស', 'Group': 'ក្រុម', 'Groups': 'ក្រុម', 'Mute': 'បិទការជូនដំណឹង', 'End Chat': 'បញ្ចប់ការជជែក', 'Working…': 'កំពុងដំណើរការ…', 'Are you sure?': 'តើអ្នកប្រាកដទេ?', 'Jobs': 'ការងារ', 'Registered': 'បានចុះឈ្មោះ', 'Registered users': 'អ្នកប្រើប្រាស់ដែលបានចុះឈ្មោះ'})
+KHMER_UI_TRANSLATIONS.update({'Admin Insights & Roadmap': 'ការយល់ដឹង និងផែនការអភិវឌ្ឍសម្រាប់អ្នកគ្រប់គ្រង', 'Smart warnings plus recommended next features for this bot admin panel.': 'ការព្រមានឆ្លាតវៃ និងមុខងារបន្ទាប់ដែលបានណែនាំសម្រាប់ផ្ទាំងគ្រប់គ្រងបូត។', 'Current warnings': 'ការព្រមានបច្ចុប្បន្ន', 'Recommended new features': 'មុខងារថ្មីដែលបានណែនាំ', 'Prioritized for your current bot system: admin safety, broadcast reliability, CRM, and smoother mobile control.': 'រៀបចំអាទិភាពសម្រាប់ប្រព័ន្ធបូតបច្ចុប្បន្ន៖ សុវត្ថិភាពអ្នកគ្រប់គ្រង ភាពជឿជាក់នៃការផ្សាយសារ ការគ្រប់គ្រងអ្នកប្រើប្រាស់ និងការប្រើលើទូរស័ព្ទកាន់តែងាយ។', 'Priority': 'អាទិភាព', 'Recommended implementation': 'វិធីអនុវត្តដែលបានណែនាំ', 'Best next update package': 'កញ្ចប់បច្ចុប្បន្នភាពបន្ទាប់ដែលល្អបំផុត', 'Admin V9 Pro': 'Admin V9 Pro', 'Insights, Smart Error Inbox Pro, broadcast checker, backup center.': 'ការយល់ដឹង ប្រអប់កំហុសឆ្លាតវៃ ការត្រួតពិនិត្យការផ្សាយសារ និងមជ្ឈមណ្ឌលបម្រុងទុក។', 'Safe Operations': 'ប្រតិបត្តិការមានសុវត្ថិភាព', 'Group errors, retry failed, pause pressure, audit timeline, lock safety.': 'ដាក់ក្រុមកំហុស សាកល្បងការងារបរាជ័យម្ដងទៀត ផ្អាកពេលប្រព័ន្ធរវល់ មើលប្រវត្តិសវនកម្ម និងគ្រប់គ្រងសោដោយសុវត្ថិភាព។', 'Mobile Friendly': 'ងាយប្រើលើទូរស័ព្ទ', 'Error Inbox in bottom nav, compact pages, sticky filters.': 'ប្រអប់កំហុសនៅម៉ឺនុយខាងក្រោម ទំព័រខ្លី និងតម្រងដែលនៅជាប់អេក្រង់។', 'Implementation order': 'លំដាប់អនុវត្ត', 'Smart Error Inbox Pro is added. Open': 'ប្រអប់កំហុសឆ្លាតវៃត្រូវបានបន្ថែម។ បើក', 'Add Broadcast Quality Checker before every send.': 'បន្ថែមការត្រួតពិនិត្យគុណភាពការផ្សាយសារ មុនផ្ញើរាល់លើក។', 'Persist admin audit timeline to Supabase.': 'រក្សាទុកប្រវត្តិសវនកម្មអ្នកគ្រប់គ្រងក្នុង Supabase។', 'Add Backup & Restore Center for settings/schedules.': 'បន្ថែមមជ្ឈមណ្ឌលបម្រុងទុក និងស្ដារការកំណត់/កាលវិភាគ។', 'Add compact mode for small screens.': 'បន្ថែមរបៀបខ្លីសម្រាប់អេក្រង់តូច។', 'Admin PDF Report': 'របាយការណ៍ PDF សម្រាប់អ្នកគ្រប់គ្រង', 'Generate a PDF with graphs, selected-day/range analytics, system status, runtime settings, feature toggles, Smart Error Inbox summary, and recent errors.': 'បង្កើត PDF ដែលមានក្រាហ្វ ការវិភាគតាមថ្ងៃ/ចន្លោះពេល ស្ថានភាពប្រព័ន្ធ ការកំណត់ពេលដំណើរការ មុខងារបើក/បិទ សង្ខេបប្រអប់កំហុស និងកំហុសថ្មីៗ។', 'Last 7 Days': '៧ ថ្ងៃចុងក្រោយ', 'Last 30 Days': '៣០ ថ្ងៃចុងក្រោយ', 'Custom day URL example:': 'ឧទាហរណ៍ URL សម្រាប់ថ្ងៃកំណត់ផ្ទាល់ខ្លួន៖', 'System health': 'សុខភាពប្រព័ន្ធ', 'Uptime': 'រយៈពេលដំណើរការ', 'Supabase': 'Supabase', 'Redis': 'Redis', 'Scheduler lock': 'សោ Scheduler', 'Settings DB': 'មូលដ្ឋានទិន្នន័យការកំណត់', 'Runtime metrics': 'សូចនាករពេលដំណើរការ', 'Live schedules': 'កាលវិភាគផ្ទាល់', 'Time': 'ពេលវេលា', 'Content': 'មាតិកា', 'Progress': 'វឌ្ឍនភាព', 'Started': 'បានចាប់ផ្ដើម', 'Feature settings': 'ការកំណត់មុខងារ', 'Open settings': 'បើកការកំណត់', 'Manage Users': 'គ្រប់គ្រងអ្នកប្រើប្រាស់', 'Analytics V2': 'ការវិភាគទិន្នន័យ V2', 'Health Center': 'មជ្ឈមណ្ឌលសុខភាពប្រព័ន្ធ', 'System V4 Health Center': 'មជ្ឈមណ្ឌលសុខភាពប្រព័ន្ធ V4', 'safe local checks': 'ការត្រួតពិនិត្យក្នុងប្រព័ន្ធដោយសុវត្ថិភាព', 'Environment Checklist': 'បញ្ជីត្រួតពិនិត្យ Environment', 'This page does not show secrets. It only shows SET/MISSING.': 'ទំព័រនេះមិនបង្ហាញសោសម្ងាត់ទេ។ វាបង្ហាញតែ បានកំណត់/ខ្វះ។', 'Runtime Metrics': 'សូចនាករពេលដំណើរការ', 'Feature Switches': 'ការបើក/បិទមុខងារ', 'System V4 Notes': 'កំណត់ចំណាំប្រព័ន្ធ V4', 'Mobile V4': 'ទូរស័ព្ទ V4', 'bottom nav, touch buttons, sticky actions': 'ម៉ឺនុយខាងក្រោម ប៊ូតុងងាយចុច និងសកម្មភាពជាប់អេក្រង់', 'User Detail+': 'ព័ត៌មានអ្នកប្រើប្រាស់+', 'profile, usage cards, recent text_cache': 'ប្រវត្តិរូប កាតការប្រើប្រាស់ និង text_cache ថ្មីៗ', 'Cleaner UI': 'ផ្ទាំងកាន់តែស្អាត', 'Tailwind powered layout and responsive cards': 'ប្លង់ Tailwind និងកាតដែលសម្របតាមទំហំអេក្រង់', 'No CRM users found for this filter.': 'រកមិនឃើញអ្នកប្រើប្រាស់សម្រាប់តម្រងនេះទេ។', 'Calendar View': 'ទិដ្ឋភាពប្រតិទិន', 'Search user ID or username': 'ស្វែងរកលេខសម្គាល់ ឬឈ្មោះអ្នកប្រើប្រាស់', 'Enter': 'បញ្ចូល', 'Rows per page': 'ចំនួនជួរនៅមួយទំព័រ', 'Username': 'ឈ្មោះអ្នកប្រើប្រាស់', 'Voice': 'សំឡេង', 'Speed': 'ល្បឿន', 'Last active': 'សកម្មចុងក្រោយ', 'Send direct message': 'ផ្ញើសារផ្ទាល់', 'User ID': 'លេខសម្គាល់អ្នកប្រើប្រាស់', 'Send': 'ផ្ញើ', 'Export CSV': 'នាំចេញ CSV', 'User Quality / CRM Panel': 'ផ្ទាំងគុណភាព និងការគ្រប់គ្រងអ្នកប្រើប្រាស់', 'Scores users from': 'វាយតម្លៃអ្នកប្រើប្រាស់ពី', 'with batched queries and short cache.': 'ដោយប្រើការសួរទិន្នន័យជាក្រុម និង Cache រយៈពេលខ្លី។', 'Clear CRM Cache': 'សម្អាត Cache CRM', 'Segment': 'ក្រុមអ្នកប្រើប្រាស់', 'Limit': 'កំណត់ចំនួន', 'Apply Filter': 'អនុវត្តតម្រង', 'CRM Users': 'អ្នកប្រើប្រាស់ CRM', 'Sorted by quality score': 'តម្រៀបតាមពិន្ទុគុណភាព', 'Quality': 'គុណភាព', 'Recent Usage': 'ការប្រើប្រាស់ថ្មីៗ', 'Last Seen': 'ឃើញចុងក្រោយ', 'Latest Text': 'អត្ថបទចុងក្រោយ', 'How score works': 'របៀបគណនាពិន្ទុ', 'Recency': 'ភាពថ្មី', 'Recent last_active / last text_cache activity increases score.': 'សកម្មភាព last_active ឬ text_cache ថ្មីៗធ្វើឱ្យពិន្ទុកើន។', 'Engagement': 'ការចូលរួម', 'More recent text_cache messages and characters increase score.': 'សារ និងចំនួនតួអក្សរ text_cache ថ្មីៗកាន់តែច្រើន ពិន្ទុកាន់តែខ្ពស់។', 'Risk': 'ហានិភ័យ', 'Blocked users score 0; inactive users appear in risk segments.': 'អ្នកប្រើប្រាស់ដែលត្រូវបានបិទមានពិន្ទុ 0; អ្នកមិនសកម្មនឹងបង្ហាញក្នុងក្រុមហានិភ័យ។', 'CRM Actions': 'សកម្មភាព CRM', 'Use this panel to find high-value users, inactive users, blocked users, and users who need follow-up. For mass sends, open Broadcast and use a test message first.': 'ប្រើផ្ទាំងនេះដើម្បីរកអ្នកប្រើប្រាស់សំខាន់ អ្នកមិនសកម្ម អ្នកត្រូវបានបិទ និងអ្នកដែលត្រូវតាមដាន។ សម្រាប់ការផ្ញើច្រើន សូមបើកការផ្សាយសារ និងសាកល្បងសារជាមុន។', 'Open Broadcast': 'បើកការផ្សាយសារ', 'Open Users': 'បើកអ្នកប្រើប្រាស់', '← Back': '← ត្រឡប់ក្រោយ', 'Search ID': 'ស្វែងរកលេខសម្គាល់', 'Open Telegram': 'បើក Telegram', 'Copy ID': 'ចម្លងលេខសម្គាល់', 'User Detail Upgrade': 'ព័ត៌មានអ្នកប្រើប្រាស់កម្រិតខ្ពស់', 'Profile, usage summary, and text_cache history': 'ប្រវត្តិរូប សង្ខេបការប្រើប្រាស់ និងប្រវត្តិ text_cache', 'Messages': 'សារ', 'loaded from text_cache': 'បានផ្ទុកពី text_cache', 'Text size': 'ទំហំអត្ថបទ', 'characters loaded': 'តួអក្សរដែលបានផ្ទុក', 'First cached message': 'សារ Cache ដំបូង', 'Last cached message': 'សារ Cache ចុងក្រោយ', 'Mobile Quick Actions': 'សកម្មភាពរហ័សលើទូរស័ព្ទ', 'Large touch controls for phone admin work.': 'ប៊ូតុងធំ ងាយចុច សម្រាប់ការងារអ្នកគ្រប់គ្រងលើទូរស័ព្ទ។', 'Reset prefs': 'កំណត់ចំណូលចិត្តឡើងវិញ', 'Clear history': 'លុបប្រវត្តិ', 'Direct message': 'សារផ្ទាល់', 'Send Message': 'ផ្ញើសារ', 'Latest Message Preview': 'មើលសារចុងក្រោយជាមុន', 'Admin Notes': 'កំណត់ចំណាំអ្នកគ្រប់គ្រង', 'History source': 'ប្រភពប្រវត្តិ', 'Recent history uses': 'ប្រវត្តិថ្មីៗប្រើ', 'not conversation_history.': 'មិនមែន conversation_history ទេ។', 'Broadcast safety': 'សុវត្ថិភាពការផ្សាយសារ', 'Blocked users are skipped automatically during sends.': 'អ្នកប្រើប្រាស់ដែលត្រូវបានបិទ នឹងត្រូវរំលងដោយស្វ័យប្រវត្តិពេលផ្ញើ។', 'Recent text_cache history': 'ប្រវត្តិ text_cache ថ្មីៗ', 'Open in users list': 'បើកក្នុងបញ្ជីអ្នកប្រើប្រាស់', '7 days': '៧ ថ្ងៃ', '30 days': '៣០ ថ្ងៃ', '90 days': '៩០ ថ្ងៃ', 'Counts are grouped using Phnom Penh local dates.': 'ចំនួនត្រូវបានដាក់ក្រុមតាមកាលបរិច្ឆេទម៉ោងភ្នំពេញ។', 'Delivery Breakdown': 'សង្ខេបលទ្ធផលការផ្ញើ', 'Status Mix': 'សមាមាត្រស្ថានភាព', 'Recent Failed / Warning Schedules': 'កាលវិភាគបរាជ័យ/ព្រមានថ្មីៗ', 'Open failed': 'បើកការងារបរាជ័យ', '← Previous': '← មុន', 'This Month': 'ខែនេះ', 'Next →': 'បន្ទាប់ →', 'List View': 'ទិដ្ឋភាពបញ្ជី', 'Create Schedule': 'បង្កើតកាលវិភាគ', 'Mobile note': 'សម្គាល់សម្រាប់ទូរស័ព្ទ', 'On phone, swipe horizontally inside the calendar card. Tap any schedule card to open it in the list view.': 'លើទូរស័ព្ទ សូមអូសផ្ដេកនៅក្នុងកាតប្រតិទិន។ ចុចកាតកាលវិភាគណាមួយ ដើម្បីបើកក្នុងទិដ្ឋភាពបញ្ជី។', 'Search ID/text': 'ស្វែងរកលេខសម្គាល់/អត្ថបទ', 'Filter': 'តម្រង', 'Broadcast Phnom Penh time': 'ពេលវេលាផ្សាយសារតាមម៉ោងភ្នំពេញ', 'Mode': 'របៀប', 'Preview first': 'មើលជាមុនសិន', 'Confirm immediately': 'បញ្ជាក់ភ្លាមៗ', 'Format mode': 'ទម្រង់សារ', 'Supports Telegram HTML, MarkdownV2, Markdown, and plain text. First-line directives also work:': 'គាំទ្រ Telegram HTML, MarkdownV2, Markdown និងអត្ថបទធម្មតា។ ការកំណត់ទម្រង់នៅជួរទី១ក៏អាចប្រើបាន៖', 'Text message': 'សារអត្ថបទ', 'Telegram photo_file_id optional': 'Telegram photo_file_id (មិនចាំបាច់)', 'Photo caption optional': 'ចំណងជើងរូបភាព (មិនចាំបាច់)', 'Immediate text broadcast': 'ផ្សាយសារអត្ថបទភ្លាមៗ', 'Safer broadcast system: bounded workers, blocked-user skip, live progress, pause, resume, cancel, Telegram 403 auto-block, and Telegram formatting fallback.': 'ប្រព័ន្ធផ្សាយសារមានសុវត្ថិភាព៖ កំណត់ចំនួនការងារ រំលងអ្នកត្រូវបានបិទ បង្ហាញវឌ្ឍនភាព ផ្អាក បន្ត បោះបង់ បិទសិទ្ធិដោយស្វ័យប្រវត្តិពេល Telegram 403 និងប្ដូរទៅអត្ថបទធម្មតាបើទម្រង់មានបញ្ហា។', 'Supports Telegram HTML, MarkdownV2, Markdown, and plain text. You can also prefix the first line with': 'គាំទ្រ Telegram HTML, MarkdownV2, Markdown និងអត្ថបទធម្មតា។ អ្នកក៏អាចដាក់នៅជួរទី១៖', 'For scheduled sending, use the Schedules page instead. If formatting is malformed, the bot retries as plain text instead of failing the whole job.': 'សម្រាប់ការផ្ញើតាមពេលកំណត់ សូមប្រើទំព័រកាលវិភាគ។ ប្រសិនបើទម្រង់មិនត្រឹមត្រូវ បូតនឹងសាកល្បងជាអត្ថបទធម្មតា ជំនួសឱ្យធ្វើឱ្យការងារទាំងមូលបរាជ័យ។', 'Recent web broadcast jobs': 'ការងារផ្សាយសារតាមវេបថ្មីៗ', 'Auto-refresh every 5 seconds': 'ផ្ទុកឡើងវិញរៀងរាល់ ៥ វិនាទី', 'Use Telegram /admin → Settings → Performance Settings for quick mobile edits, or open Runtime for advanced web tuning.': 'ប្រើ Telegram /admin → ការកំណត់ → ការកំណត់ប្រសិទ្ធភាព សម្រាប់កែរហ័សលើទូរស័ព្ទ ឬបើកការដំណើរការបច្ចុប្បន្ន សម្រាប់ការកែសម្រួលកម្រិតខ្ពស់។', 'The raw key is shown once in the success message. Store it in your frontend/backend env immediately.': 'សោដើមនឹងបង្ហាញតែមួយលើកក្នុងសារជោគជ័យ។ សូមរក្សាទុកវាក្នុង Environment របស់ Frontend/Backend ភ្លាមៗ។', 'Create key': 'បង្កើតសោ', 'Prefix': 'បុព្វបទ', 'Created': 'បានបង្កើត', 'Distributed Scheduler Lock': 'សោ Scheduler ចែកចាយ', 'Required': 'ចាំបាច់', 'Current row': 'ជួរបច្ចុប្បន្ន', 'Force release scheduler lock': 'បង្ខំដោះសោ Scheduler', 'Only force release when the old owner is dead or Render restarted.': 'សូមបង្ខំដោះសោតែពេលម៉ាស៊ីនមេចាស់ឈប់ដំណើរការ ឬ Render បានចាប់ផ្ដើមឡើងវិញ។', 'Required / Recommended SQL': 'SQL ចាំបាច់/បានណែនាំ', 'Run in Supabase SQL Editor.': 'ដំណើរការក្នុង Supabase SQL Editor។', 'Admin V9 tables': 'តារាង Admin V9', 'Schedule indexes': 'Index សម្រាប់កាលវិភាគ', 'Optimization Score': 'ពិន្ទុប្រសិទ្ធភាព', 'Live score from web load, queues, caches, stores, and concurrency.': 'ពិន្ទុផ្ទាល់ពីបន្ទុកវេប ជួររង់ចាំ Cache កន្លែងរក្សាទុក និងការងារដំណើរការព្រមគ្នា។', 'Runtime Config Center': 'មជ្ឈមណ្ឌលកំណត់ពេលដំណើរការ', 'Use this page to move performance and runtime tuning out of your .env. Values save to Redis and restore after Render/Railway restarts. Keep only secrets and connection URLs in environment variables.': 'ប្រើទំព័រនេះដើម្បីផ្លាស់ការកំណត់ប្រសិទ្ធភាព និងពេលដំណើរការចេញពី .env។ តម្លៃត្រូវរក្សាទុកក្នុង Redis និងស្ដារឡើងវិញបន្ទាប់ពី Render/Railway ចាប់ផ្ដើមឡើងវិញ។ ទុកតែសោសម្ងាត់ និង URL តភ្ជាប់ក្នុង Environment។', 'Dashboard-controlled Settings': 'ការកំណត់គ្រប់គ្រងពីផ្ទាំង', 'Save Runtime Config': 'រក្សាទុកការកំណត់ពេលដំណើរការ', 'Rotate the webhook secret without editing env. If the bot is in WEBHOOK mode, Telegram is re-registered immediately.': 'ប្ដូរសោសម្ងាត់ Webhook ដោយមិនកែ Environment។ ប្រសិនបើបូតប្រើរបៀប WEBHOOK Telegram នឹងត្រូវចុះឈ្មោះឡើងវិញភ្លាមៗ។', 'Minimal env after using this page': 'Environment អប្បបរមាបន្ទាប់ពីប្រើទំព័រនេះ', 'Optimization Actions': 'សកម្មភាពបង្កើនប្រសិទ្ធភាព', 'Safe cleanup and admin-poll tuning without restarting the bot.': 'សម្អាត និងកែការផ្ទុកទិន្នន័យអ្នកគ្រប់គ្រងដោយសុវត្ថិភាព ដោយមិនចាប់ផ្ដើមបូតឡើងវិញ។', 'Current Runtime Core': 'ស្នូលដំណើរការបច្ចុប្បន្ន', 'Advanced runtime config': 'ការកំណត់ពេលដំណើរការកម្រិតខ្ពស់', 'JSON snapshot': 'ទិន្នន័យសង្ខេប JSON', 'Cache Snapshot': 'សង្ខេប Cache', 'Shows rebuildable in-memory cache sizes before you run cleanup.': 'បង្ហាញទំហំ Cache ក្នុងអង្គចងចាំដែលអាចបង្កើតឡើងវិញ មុនពេលសម្អាត។', 'Recent Slow Requests': 'សំណើយឺតថ្មីៗ', 'Useful for finding heavy admin pages or browser polling storms.': 'មានប្រយោជន៍សម្រាប់រកទំព័រគ្រប់គ្រងធ្ងន់ ឬការស្នើសុំញឹកញាប់ពី Browser។', 'Method': 'វិធីស្នើសុំ', 'Path': 'ផ្លូវ', 'Latency': 'រយៈពេលឆ្លើយតប', 'Full Performance Snapshot': 'ទិន្នន័យប្រសិទ្ធភាពពេញលេញ', 'Admin Control Actions': 'សកម្មភាពបញ្ជារបស់អ្នកគ្រប់គ្រង', 'High-impact actions are protected by CSRF and confirmation. They affect this running process immediately.': 'សកម្មភាពមានឥទ្ធិពលខ្ពស់ត្រូវបានការពារដោយ CSRF និងការបញ្ជាក់។ វាមានឥទ្ធិពលលើប្រព័ន្ធកំពុងដំណើរការភ្លាមៗ។', 'Performance Snapshot': 'សង្ខេបប្រសិទ្ធភាព', 'Open JSON': 'បើក JSON', 'Recent Admin Audit': 'សវនកម្មអ្នកគ្រប់គ្រងថ្មីៗ', 'Detail': 'ព័ត៌មានលម្អិត', 'Smart Error Inbox Pro': 'ប្រអប់កំហុសឆ្លាតវៃ Pro', 'Grouped recent ERROR/CRITICAL logs by fingerprint. Memory-based, safe, no database migration required.': 'ដាក់ក្រុមកំណត់ហេតុ ERROR/CRITICAL ថ្មីៗតាមស្នាមសម្គាល់។ ប្រើអង្គចងចាំ មានសុវត្ថិភាព និងមិនត្រូវការ Migration មូលដ្ឋានទិន្នន័យ។', 'Use Open for details, Copy for Claude/AI debugging, Mute for noisy known issues, Clear after fixing.': 'ប្រើ បើក សម្រាប់ព័ត៌មានលម្អិត ចម្លង សម្រាប់ដោះស្រាយជាមួយ Claude/AI បិទការជូនដំណឹង សម្រាប់បញ្ហាដែលស្គាល់ និងសម្អាត បន្ទាប់ពីជួសជុល។', 'Test Capture': 'សាកល្បងចាប់យកកំហុស', 'Unmute All': 'បើកការជូនដំណឹងទាំងអស់', 'Clear All': 'សម្អាតទាំងអស់', 'Required production env:': 'Environment ចាំបាច់សម្រាប់ Production៖', 'plus': 'បូក', '. Restart after changing deployment environment variables.': '។ សូមចាប់ផ្ដើមឡើងវិញ បន្ទាប់ពីកែ Environment របស់ការដាក់ប្រើប្រាស់។'})
+_KHMER_UI_PHRASES = tuple(sorted(KHMER_UI_TRANSLATIONS.items(), key=lambda item: len(item[0]), reverse=True))
+
+
+def _khmer_ui_text(value: Any, *, replace_phrases: bool = True) -> str:
+    text = str(value if value is not None else "")
+    if not text:
+        return text
+    exact = KHMER_UI_TRANSLATIONS.get(text)
+    if exact is not None:
+        return exact
+    if not replace_phrases:
+        return text
+    # Preserve technical identifiers while translating readable UI fragments.
+    # Longer phrases run first to avoid partial replacements such as
+    # "API Key" before "Create API Key".
+    translated = text
+    for source, target in _KHMER_UI_PHRASES:
+        if source not in translated:
+            continue
+        if re.fullmatch(r"[A-Za-z]+", source):
+            translated = re.sub(
+                rf"(?<![A-Za-z]){re.escape(source)}(?![A-Za-z])",
+                lambda _match, replacement=target: replacement,
+                translated,
+            )
+        else:
+            translated = translated.replace(source, target)
+    return translated
+
+
+_TELEGRAM_INLINE_KEYBOARD_BUTTON_CLASS = InlineKeyboardButton
+
+def InlineKeyboardButton(text: str, *args: Any, **kwargs: Any):
+    """Create a Telegram button with a Khmer label and unchanged callback data."""
+    return _TELEGRAM_INLINE_KEYBOARD_BUTTON_CLASS(
+        _khmer_ui_text(text, replace_phrases=True),
+        *args,
+        **kwargs,
+    )
+
+
 def _web_h(value: Any) -> str:
-    return html.escape(str(value if value is not None else ""))
+    return html.escape(_khmer_ui_text(value, replace_phrases=False))
 
 
 def _web_short(value: Any, limit: int = 140) -> str:
@@ -3870,6 +4182,7 @@ def _web_command_hero_html(counts: dict[str, Any]) -> str:
 
 
 def _web_render(title: str, body: str, *, active: str = "dashboard", status_code: int = 200):
+    title = _khmer_ui_text(title)
     if _backend_only_mode():
         return _legacy_dashboard_disabled_payload(title, status_code=status_code if status_code >= 400 else 410)
     csrf = _web_csrf_token() if session.get("web_admin_ok") else ""
@@ -3896,19 +4209,19 @@ def _web_render(title: str, body: str, *, active: str = "dashboard", status_code
     bottom_nav = [item for item in nav if item[0] in {"dashboard", "insights", "errors", "broadcast", "optimize"}]
     template = """
 <!doctype html>
-<html lang="en">
+<html lang="km">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0f172a">
-<title>{{ title }} - Bot Admin</title>
+<title>{{ title }} - ការគ្រប់គ្រងបូត</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script>
 tailwind.config = {
   darkMode: 'class',
   theme: {
     extend: {
-      fontFamily: { sans: ['Inter','ui-sans-serif','system-ui','-apple-system','Segoe UI','Roboto','Arial','Noto Sans Khmer','sans-serif'] },
+      fontFamily: { sans: ['Noto Sans Khmer','Khmer OS System','Khmer UI','Inter','ui-sans-serif','system-ui','-apple-system','Segoe UI','Roboto','Arial','sans-serif'] },
       boxShadow: { soft: '0 20px 60px rgba(15,23,42,.28)' }
     }
   }
@@ -4053,7 +4366,7 @@ tailwind.config = {
   <div class="footer"><div>Supabase: <b>{{ 'ON' if supabase_on else 'OFF' }}</b></div><div>Redis: <b>{{ 'ON' if redis_on else 'OFF' }}</b></div><div><a href="/ping">Ping</a> · <a href="/readyz">Ready</a></div><div class="muted">Tip: press <span class="kbd">Ctrl</span> + <span class="kbd">K</span> to search.</div></div>
 </aside>
 <main class="main">
-  <div class="top"><div><div class="h1">{{ title }}</div><div class="muted">Unified Admin Center V9 · error inbox · safer Telegram operations</div></div><div class="top-right"><div data-local-time>{{ now }}</div><div>{{ time_hint }}</div></div></div>
+  <div class="top"><div><div class="h1">{{ title }}</div><div class="muted">មជ្ឈមណ្ឌលគ្រប់គ្រង V9 · ប្រអប់កំហុស · ប្រតិបត្តិការ Telegram មានសុវត្ថិភាព</div></div><div class="top-right"><div data-local-time>{{ now }}</div><div>{{ time_hint }}</div></div></div>
   {% for cat,msg in messages %}<div class="flash {{ cat }}">{{ msg }}</div>{% endfor %}
   {{ body|safe }}
 </main>
@@ -4063,13 +4376,44 @@ tailwind.config = {
 <script>
 window.WEB_CSRF={{ csrf|tojson }};
 (function(){
+  var KM_UI={{ khmer_ui_map|safe }};
+  var KM_KEYS=Object.keys(KM_UI).sort(function(a,b){return b.length-a.length});
+  function kmRegExp(value){var slash=String.fromCharCode(92);return String(value).split('').map(function(ch){return '.*+?^${}()|[]'.indexOf(ch)>=0?slash+ch:ch}).join('')}
+  function kmText(value,allowPhrases){
+    var text=String(value==null?'':value);
+    var leading=(text.match(/^\\s*/)||[''])[0],trailing=(text.match(/\\s*$/)||[''])[0];
+    var core=text.slice(leading.length,text.length-trailing.length||text.length);
+    if(Object.prototype.hasOwnProperty.call(KM_UI,core))return leading+KM_UI[core]+trailing;
+    if(!allowPhrases)return text;
+    KM_KEYS.forEach(function(key){
+      if(core.indexOf(key)<0)return;
+      if(/^[A-Za-z]+$/.test(key)){core=core.replace(new RegExp('(^|[^A-Za-z])'+kmRegExp(key)+'(?=$|[^A-Za-z])','g'),function(match,prefix){return prefix+KM_UI[key]})}
+      else{core=core.split(key).join(KM_UI[key])}
+    });
+    return leading+core+trailing;
+  }
+  function localizeKhmer(root){
+    root=root||document.body;if(!root)return;
+    var skip={CODE:1,PRE:1,SCRIPT:1,STYLE:1,TEXTAREA:1,BLOCKQUOTE:1};
+    var phraseTags={A:1,BUTTON:1,LABEL:1,TH:1,H1:1,H2:1,H3:1,SUMMARY:1,OPTION:1,SMALL:1,EM:1};
+    var walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);
+    var nodes=[];while(walker.nextNode())nodes.push(walker.currentNode);
+    nodes.forEach(function(node){
+      var parent=node.parentElement;if(!parent||skip[parent.tagName]||parent.closest('code,pre,textarea,blockquote,[data-no-km]'))return;
+      var allow=!!phraseTags[parent.tagName]||parent.classList.contains('muted')||parent.classList.contains('help')||parent.classList.contains('badge')||parent.classList.contains('hero-kicker');
+      var next=kmText(node.nodeValue,allow);if(next!==node.nodeValue)node.nodeValue=next;
+    });
+    root.querySelectorAll('input[placeholder],textarea[placeholder],[aria-label],[title],[data-confirm]').forEach(function(el){
+      ['placeholder','aria-label','title','data-confirm'].forEach(function(attr){if(el.hasAttribute(attr))el.setAttribute(attr,kmText(el.getAttribute(attr),true));});
+    });
+  }
   function qs(sel,root){return (root||document).querySelector(sel)}
   function qsa(sel,root){return Array.from((root||document).querySelectorAll(sel))}
-  qsa('form[data-confirm]').forEach(function(form){form.addEventListener('submit',function(e){var msg=form.getAttribute('data-confirm')||'Are you sure?';if(!confirm(msg)){e.preventDefault();return false;}})});
-  qsa('form').forEach(function(form){form.addEventListener('submit',function(){var btn=form.querySelector('button[type="submit"],button:not([type]),input[type="submit"]');if(btn&&!form.dataset.noDisable){setTimeout(function(){btn.disabled=true;btn.dataset.oldText=btn.innerText;btn.innerText='Working…'},0)}})});
+  qsa('form[data-confirm]').forEach(function(form){form.addEventListener('submit',function(e){var msg=form.getAttribute('data-confirm')||'តើអ្នកប្រាកដទេ?';if(!confirm(kmText(msg,true))){e.preventDefault();return false;}})});
+  qsa('form').forEach(function(form){form.addEventListener('submit',function(){var btn=form.querySelector('button[type="submit"],button:not([type]),input[type="submit"]');if(btn&&!form.dataset.noDisable){setTimeout(function(){btn.disabled=true;btn.dataset.oldText=btn.innerText;btn.innerText='កំពុងដំណើរការ…'},0)}})});
   qsa('[data-count-target]').forEach(function(el){var target=qs(el.getAttribute('data-count-target'));function update(){if(target){el.textContent=target.value.length}};if(target){target.addEventListener('input',update);update();}});
   function toast(msg){var el=qs('[data-toast]');if(!el)return;el.textContent=msg;el.classList.add('show');clearTimeout(el._t);el._t=setTimeout(function(){el.classList.remove('show')},1800)}
-  qsa('[data-copy]').forEach(function(btn){btn.addEventListener('click',function(){var text=btn.getAttribute('data-copy')||'';navigator.clipboard&&navigator.clipboard.writeText(text).then(function(){btn.innerText='Copied';toast('Copied to clipboard')}).catch(function(){toast('Copy failed')})})});
+  qsa('[data-copy]').forEach(function(btn){btn.addEventListener('click',function(){var text=btn.getAttribute('data-copy')||'';navigator.clipboard&&navigator.clipboard.writeText(text).then(function(){btn.innerText=kmText('Copied',true);toast(kmText('Copied to clipboard',true))}).catch(function(){toast(kmText('Copy failed',true))})})});
   var navFilter=qs('[data-nav-filter]');
   if(navFilter){navFilter.addEventListener('input',function(){var q=navFilter.value.trim().toLowerCase();qsa('[data-nav-item]').forEach(function(a){var hay=(a.getAttribute('data-label')||a.textContent||'').toLowerCase();a.style.display=!q||hay.indexOf(q)>=0?'flex':'none';});});document.addEventListener('keydown',function(e){if((e.ctrlKey||e.metaKey)&&String(e.key).toLowerCase()==='k'){e.preventDefault();navFilter.focus();navFilter.select();}})}
   qsa('[data-nav-item],.bottom-nav a').forEach(function(a){a.addEventListener('click',function(){var t=qs('#menu-toggle');if(t)t.checked=false;})});
@@ -4095,14 +4439,16 @@ window.WEB_CSRF={{ csrf|tojson }};
     t.innerHTML=htmlText;
     scrub(t.content);
     target.replaceChildren(t.content.cloneNode(true));
+    localizeKhmer(target);
   }
   function refreshStatus(){fetch('/admin/status.json?light=1',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null}).then(applyStatus).catch(function(err){if(window.console)console.warn('status refresh failed',err);});}
-  function refreshLiveDashboard(){var root=qs('[data-realtime-dashboard]');if(!root)return;fetch('/admin/live.json',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null}).then(function(data){if(!data||!data.ok)return;applyStatus(data);if(data.counts){qsa('[data-count]').forEach(function(el){var k=el.getAttribute('data-count');if(Object.prototype.hasOwnProperty.call(data.counts,k)){el.textContent=data.counts[k]}})}var jobs=qs('[data-live-jobs]');safeAdminRows(jobs,data.jobs_html);var sch=qs('[data-live-schedules]');safeAdminRows(sch,data.schedules_html);var stamp=qs('[data-live-updated]');if(stamp&&data.local_time)stamp.textContent='Updated '+data.local_time;}).catch(function(err){if(window.console)console.warn('live dashboard refresh failed',err);});}
+  function refreshLiveDashboard(){var root=qs('[data-realtime-dashboard]');if(!root)return;fetch('/admin/live.json',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null}).then(function(data){if(!data||!data.ok)return;applyStatus(data);if(data.counts){qsa('[data-count]').forEach(function(el){var k=el.getAttribute('data-count');if(Object.prototype.hasOwnProperty.call(data.counts,k)){el.textContent=data.counts[k]}})}var jobs=qs('[data-live-jobs]');safeAdminRows(jobs,data.jobs_html);var sch=qs('[data-live-schedules]');safeAdminRows(sch,data.schedules_html);var stamp=qs('[data-live-updated]');if(stamp&&data.local_time)stamp.textContent=kmText('Updated',true)+' '+data.local_time;}).catch(function(err){if(window.console)console.warn('live dashboard refresh failed',err);});}
   function refreshBroadcastJobs(){var target=qs('[data-broadcast-jobs]');if(!target)return;fetch('/admin/broadcast/jobs.json',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.ok?r.json():null}).then(function(data){if(!data||!data.ok)return;safeAdminRows(target,data.rows_html);}).catch(function(err){if(window.console)console.warn('broadcast jobs refresh failed',err);});}
   var hasRealtime=!!qs('[data-realtime-dashboard]');
   if(live&&!hasRealtime){refreshStatus();setInterval(refreshStatus,{{ status_poll_ms }})}
   if(hasRealtime){refreshLiveDashboard();setInterval(refreshLiveDashboard,{{ live_poll_ms }})}
   if(qs('[data-broadcast-jobs]')){refreshBroadcastJobs();setInterval(refreshBroadcastJobs,5000)}
+  localizeKhmer(document.body);
 })();
 </script>
 </body>
@@ -4124,6 +4470,7 @@ window.WEB_CSRF={{ csrf|tojson }};
         redis_on=bool(redis_client),
         status_poll_ms=WEB_STATUS_POLL_SECONDS * 1000,
         live_poll_ms=WEB_LIVE_POLL_SECONDS * 1000,
+        khmer_ui_map=_json.dumps(KHMER_UI_TRANSLATIONS, ensure_ascii=False),
     ), status_code
 
 
@@ -4171,10 +4518,10 @@ def _web_login_page(error: str = ""):
     admin_hint = str(sorted(ADMIN_IDS)[0]) if ADMIN_IDS else ""
     error_html = f"<div class='flash danger'>{_web_h(error)}</div>" if error else ""
     template = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Admin Login</title>
-<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f172a;color:#e5e7eb;font-family:system-ui,-apple-system,Segoe UI,sans-serif}.card{width:min(440px,calc(100vw - 32px));background:#111827;border:1px solid #334155;border-radius:22px;padding:28px;box-shadow:0 24px 80px rgba(0,0,0,.35)}h1{margin:.2rem 0 1rem;font-size:1.6rem}.muted{color:#94a3b8;font-size:.94rem}label{display:block;margin-top:14px;color:#cbd5e1;font-weight:700}input{box-sizing:border-box;width:100%;margin-top:7px;border-radius:14px;border:1px solid #475569;background:#020617;color:#fff;padding:13px 14px;font-size:16px}button{width:100%;margin-top:20px;border:0;border-radius:14px;padding:13px 14px;background:#38bdf8;color:#082f49;font-weight:800;font-size:16px;cursor:pointer}.flash{margin:12px 0;padding:10px 12px;border-radius:12px}.danger{background:#7f1d1d;color:#fecaca}</style>
-</head><body><form class="card" method="post"><h1>🔐 Admin Login</h1><p class="muted">Protected dashboard. Enter your web admin password.</p>{{ error|safe }}<input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="next" value="{{ next_url }}"><label>Telegram Admin ID</label><input name="admin_id" value="{{ admin_hint }}" inputmode="numeric" autocomplete="username"><label>Password</label><input name="password" type="password" autocomplete="current-password" required autofocus><button>Login</button><p class="muted">Tip: set ADMIN_WEB_PASSWORD in Render/Railway environment.</p></form></body></html>"""
+<html lang="km"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ចូលផ្ទាំងគ្រប់គ្រង</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f172a;color:#e5e7eb;font-family:'Noto Sans Khmer','Khmer OS System',system-ui,-apple-system,Segoe UI,sans-serif}.card{width:min(440px,calc(100vw - 32px));background:#111827;border:1px solid #334155;border-radius:22px;padding:28px;box-shadow:0 24px 80px rgba(0,0,0,.35)}h1{margin:.2rem 0 1rem;font-size:1.6rem}.muted{color:#94a3b8;font-size:.94rem}label{display:block;margin-top:14px;color:#cbd5e1;font-weight:700}input{box-sizing:border-box;width:100%;margin-top:7px;border-radius:14px;border:1px solid #475569;background:#020617;color:#fff;padding:13px 14px;font-size:16px}button{width:100%;margin-top:20px;border:0;border-radius:14px;padding:13px 14px;background:#38bdf8;color:#082f49;font-weight:800;font-size:16px;cursor:pointer}.flash{margin:12px 0;padding:10px 12px;border-radius:12px}.danger{background:#7f1d1d;color:#fecaca}</style>
+</head><body><form class="card" method="post"><h1>🔐 ចូលផ្ទាំងគ្រប់គ្រង</h1><p class="muted">ផ្ទាំងនេះត្រូវបានការពារ។ សូមបញ្ចូលពាក្យសម្ងាត់អ្នកគ្រប់គ្រង។</p>{{ error|safe }}<input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="next" value="{{ next_url }}"><label>លេខសម្គាល់អ្នកគ្រប់គ្រង Telegram</label><input name="admin_id" value="{{ admin_hint }}" inputmode="numeric" autocomplete="username"><label>ពាក្យសម្ងាត់</label><input name="password" type="password" autocomplete="current-password" required autofocus><button>ចូលប្រើ</button><p class="muted">សម្គាល់៖ កំណត់ <code>ADMIN_WEB_PASSWORD</code> នៅក្នុង Environment របស់ Render/Railway។</p></form></body></html>"""
     return HTMLResponse(render_template_string(
         template,
         csrf=session.get("web_login_csrf"),
@@ -9473,7 +9820,7 @@ async def _runtime_admin_callback(update: Any, context: Any) -> None:
         with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
             ACTIVE_ADMIN_CONVERSATIONS.pop(admin_id, None)
         with suppress(Exception):
-            await query.answer("Closed")
+            await query.answer('បានបិទ')
         with suppress(Exception):
             await query.message.delete()
         return
@@ -9482,7 +9829,7 @@ async def _runtime_admin_callback(update: Any, context: Any) -> None:
         with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
             ACTIVE_ADMIN_CONVERSATIONS[admin_id] = {"state": "awaiting_rate_limit", "ts": time.monotonic()}
         with suppress(Exception):
-            await query.answer("Send a number", show_alert=False)
+            await query.answer('សូមផ្ញើជាលេខ', show_alert=False)
         await safe_send(lambda: query.message.edit_text(
             "⚡ <b>កែប្រែ Rate Limit</b>\n\n"
             f"តម្លៃបច្ចុប្បន្ន: <b>{_run_state_user_rate_limit()} req/{_run_state_user_rate_window():g}s</b>\n\n"
@@ -9497,7 +9844,7 @@ async def _runtime_admin_callback(update: Any, context: Any) -> None:
         with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
             ACTIVE_ADMIN_CONVERSATIONS.pop(admin_id, None)
         with suppress(Exception):
-            await query.answer("Cancelled")
+            await query.answer('បានបោះបង់')
         await safe_send(lambda: query.message.edit_text(
             _runtime_admin_text(),
             parse_mode="HTML",
@@ -9507,7 +9854,7 @@ async def _runtime_admin_callback(update: Any, context: Any) -> None:
 
     if data == "rtadmin_rotate_secret":
         with suppress(Exception):
-            await query.answer("Rotating secret…", show_alert=False)
+            await query.answer('កំពុងប្ដូរសោសម្ងាត់…', show_alert=False)
 
         async with _webhook_rotate_lock():
             remaining = _webhook_rotate_begin_or_remaining()
@@ -9569,7 +9916,7 @@ async def _runtime_admin_callback(update: Any, context: Any) -> None:
     if data.startswith("rtadmin_switch:"):
         target = data.split(":", 1)[1].strip().upper()
         with suppress(Exception):
-            await query.answer("Switching…", show_alert=False)
+            await query.answer('កំពុងប្ដូរ…', show_alert=False)
         try:
             mode = await _switch_telegram_runtime_mode(target, admin_id=admin_id)
             await safe_send(lambda: query.message.edit_text(
@@ -9606,21 +9953,20 @@ async def _handle_runtime_admin_text(update: Any, context: Any) -> bool:
         if raw.lower() in {"/cancel", "cancel", "បោះបង់"}:
             with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
                 ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
-            await safe_send(lambda: msg.reply_text("Cancelled.", reply_markup=get_admin_dashboard_kb()))
+            await safe_send(lambda: msg.reply_text('បានបោះបង់។', reply_markup=get_admin_dashboard_kb()))
             return True
         ok, info = await _apply_bot_performance_setting(key, raw, admin_id=user.id)
         with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
             ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
         if ok:
             await safe_send(lambda: msg.reply_text(
-                f"✅ <b>{html.escape(BOT_SETTING_LABELS.get(key, key))}</b> set to <code>{html.escape(str(raw))}</code>.\n"
-                "Open /admin → Settings → Performance Settings to review.",
+                f'✅ <b>{html.escape(BOT_SETTING_LABELS.get(key, key))}</b> ត្រូវបានកំណត់ជា <code>{html.escape(str(raw))}</code>។\nសូមបើក /admin → ការកំណត់ → ការកំណត់ប្រសិទ្ធភាព ដើម្បីពិនិត្យ។',
                 parse_mode="HTML",
                 reply_markup=get_admin_dashboard_kb(),
             ))
         else:
             await safe_send(lambda: msg.reply_text(
-                f"⚠️ Could not update <b>{html.escape(key)}</b>: <code>{html.escape(str(info)[:500])}</code>",
+                f'⚠️ មិនអាចកែសម្រួល <b>{html.escape(key)}</b>: <code>{html.escape(str(info)[:500])}</code>',
                 parse_mode="HTML",
                 reply_markup=get_admin_dashboard_kb(),
             ))
@@ -9644,7 +9990,7 @@ async def _handle_runtime_admin_text(update: Any, context: Any) -> bool:
     if http_match:
         value = int(http_match.group(1))
         if value < 10 or value > 1000:
-            await safe_send(lambda: msg.reply_text("⚠️ HTTP Max Connections ត្រូវនៅចន្លោះ 10 ដល់ 1000។"))
+            await safe_send(lambda: msg.reply_text('⚠️ ចំនួនការតភ្ជាប់ HTTP អតិបរមាត្រូវនៅចន្លោះ ១០ ដល់ ១០០០។'))
             return True
         await _update_run_state("HTTP_MAX_CONNECTIONS", value)
         with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
@@ -9660,7 +10006,7 @@ async def _handle_runtime_admin_text(update: Any, context: Any) -> bool:
 
     if not raw.isdigit():
         await safe_send(lambda: msg.reply_text(
-            "⚠️ សូមផ្ញើលេខគត់សម្រាប់ Rate Limit ឧទាហរណ៍ <code>3</code> ឬ <code>http 120</code> សម្រាប់ HTTP pool។",
+            '⚠️ សូមផ្ញើលេខគត់សម្រាប់កម្រិតសំណើ ឧទាហរណ៍ <code>3</code> ឬ <code>http 120</code> សម្រាប់ចំនួនការតភ្ជាប់ HTTP។',
             parse_mode="HTML",
         ))
         return True
@@ -10762,7 +11108,7 @@ async def _telegram_user_security_guard(update: Any, context: Any) -> None:
     admin_callback_prefixes = ("admin_", "needs_", "api_", "rtadmin_", "user_", "users_", "history_", "sched_", "bc_", "admin_report_")
     if _env_bool("ADMIN_CALLBACK_GUARD_ENABLED", True) and data.startswith(admin_callback_prefixes):
         _metric_inc("admin_denied")
-        await _security_notice_once(update, f"admin_cb:{user_id}", "⛔ Admin only.", alert=True)
+        await _security_notice_once(update, f"admin_cb:{user_id}", '⛔ សម្រាប់អ្នកគ្រប់គ្រងប៉ុណ្ណោះ។', alert=True)
         raise ApplicationHandlerStop
 
     cmd = _telegram_command_name(update)
@@ -15531,9 +15877,7 @@ async def _admin_generate_web_key(query, user_id: int, context: ContextTypes.DEF
     ok, store_message = await asyncio.to_thread(_web_secret_set_in_redis_sync, new_key, overwrite=True)
     if not ok:
         await safe_send(lambda: query.message.edit_text(
-            "⚠️ <b>WEB_KEY Redis save failed.</b>\n\n"
-            f"Reason: <code>{html.escape(str(store_message)[:500])}</code>\n\n"
-            "Set <code>REDIS_URL</code> first, restart the backend, then tap <b>WEB_KEY</b> again.",
+            f'⚠️ <b>រក្សាទុក WEB_KEY ក្នុង Redis មិនបានសម្រេច។</b>\n\nមូលហេតុ៖ <code>{html.escape(str(store_message)[:500])}</code>\n\nសូមកំណត់ <code>REDIS_URL</code> ជាមុន ចាប់ផ្ដើម Backend ឡើងវិញ ហើយចុច <b>WEB_KEY</b> ម្ដងទៀត។',
             parse_mode="HTML",
             reply_markup=get_admin_dashboard_kb(),
             disable_web_page_preview=True,
@@ -15548,9 +15892,7 @@ async def _admin_generate_web_key(query, user_id: int, context: ContextTypes.DEF
         )
     except Forbidden:
         await safe_send(lambda: query.message.edit_text(
-            "⚠️ <b>Cannot send WEB_KEY privately.</b>\n\n"
-            "Please open a private chat with this bot, press /start, then return to /admin and tap <b>WEB_KEY</b> again.\n\n"
-            "The key was already stored in Redis; restart all backend instances to apply it.",
+            '⚠️ <b>មិនអាចផ្ញើ WEB_KEY ជាឯកជនបានទេ។</b>\n\nសូមបើកការជជែកឯកជនជាមួយបូតនេះ ចុច /start បន្ទាប់មកត្រឡប់ទៅ /admin ហើយចុច <b>WEB_KEY</b> ម្ដងទៀត។\n\nសោត្រូវបានរក្សាទុកក្នុង Redis រួចហើយ។ សូមចាប់ផ្ដើមម៉ាស៊ីនមេ Backend ទាំងអស់ឡើងវិញ ដើម្បីអនុវត្តសោថ្មី។',
             parse_mode="HTML",
             reply_markup=get_admin_dashboard_kb(),
             disable_web_page_preview=True,
@@ -15560,9 +15902,7 @@ async def _admin_generate_web_key(query, user_id: int, context: ContextTypes.DEF
         logger.error("WEB_SECRET_KEY private delivery failed admin_id=%s fingerprint=%s: %s", user_id, fingerprint, exc, exc_info=True)
         error_text = html.escape(str(exc)[:300])
         await safe_send(lambda: query.message.edit_text(
-            "⚠️ <b>WEB_KEY generation failed to deliver.</b>\n\n"
-            f"Reason: <code>{error_text}</code>\n\n"
-            "The key was already stored in Redis; restart all backend instances to apply it.",
+            f'⚠️ <b>បានបង្កើត WEB_KEY ប៉ុន្តែមិនអាចផ្ញើបាន។</b>\n\nមូលហេតុ៖ <code>{error_text}</code>\n\nសោត្រូវបានរក្សាទុកក្នុង Redis រួចហើយ។ សូមចាប់ផ្ដើម Backend ទាំងអស់ឡើងវិញ ដើម្បីអនុវត្តសោនេះ។',
             parse_mode="HTML",
             reply_markup=get_admin_dashboard_kb(),
             disable_web_page_preview=True,
@@ -15571,11 +15911,7 @@ async def _admin_generate_web_key(query, user_id: int, context: ContextTypes.DEF
 
     logger.info("WEB_SECRET_KEY stored in Redis for admin_id=%s fingerprint=%s", user_id, fingerprint)
     await safe_send(lambda: query.message.edit_text(
-        "✅ <b>WEB_KEY stored in Redis.</b>\n\n"
-        "I sent the Redis status and restart guidance to your private Telegram chat.\n"
-        "No <code>WEB_SECRET_KEY</code> env value is needed now. Restart/deploy all backend instances to use the rotated Redis key.\n\n"
-        f"Redis key: <code>{html.escape(_web_secret_redis_key())}</code>\n"
-        f"Fingerprint: <code>{html.escape(fingerprint)}</code>",
+        f'✅ <b>បានរក្សាទុក WEB_KEY ក្នុង Redis រួចរាល់។</b>\n\nខ្ញុំបានផ្ញើស្ថានភាព Redis និងការណែនាំចាប់ផ្ដើមប្រព័ន្ធឡើងវិញ ទៅការជជែក Telegram ឯកជនរបស់អ្នក។\nឥឡូវនេះមិនចាំបាច់កំណត់ <code>WEB_SECRET_KEY</code> ក្នុង Environment ទេ។ សូមចាប់ផ្ដើម ឬដាក់ប្រើ Backend ទាំងអស់ឡើងវិញ ដើម្បីប្រើសោ Redis ថ្មី។\n\nសោ Redis៖ <code>{html.escape(_web_secret_redis_key())}</code>\nស្នាមសម្គាល់៖ <code>{html.escape(fingerprint)}</code>',
         parse_mode="HTML",
         reply_markup=get_admin_dashboard_kb(),
         disable_web_page_preview=True,
@@ -19658,17 +19994,7 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _pending_broadcast.pop(update.effective_user.id, None)
     context.user_data["bc_state"] = BROADCAST_WAIT_MESSAGE
     await safe_send(lambda: update.message.reply_text(
-        "🛡️ <b>Broadcast សុវត្ថិភាព V2</b>\n\n"
-        "📨 <b>របៀបប្រើ</b>\n"
-        "• ផ្ញើ <b>អត្ថបទ</b> ឬ <b>រូបភាព + Caption</b> ដែលចង់ Broadcast\n"
-        "• Bot នឹងបង្ហាញ Preview ចុងក្រោយ មុនពេលផ្ញើពិត\n"
-        "• គាំទ្រ Telegram formatting, HTML, MarkdownV2, Markdown និង Plain text\n"
-        "• បើចង់បង្ខំ Format សូមដាក់ <code>::html</code>, <code>::mdv2</code>, <code>::md</code>, ឬ <code>::plain</code> នៅជួរទី១\n\n"
-        "🔐 <b>ការពារ</b>\n"
-        "✅ Preview confirmation មុនផ្ញើ\n"
-        "✅ រំលងអ្នកដែល Block/Unreachable\n"
-        "✅ គ្រប់គ្រងល្បឿនផ្ញើ និង RetryAfter\n\n"
-        "វាយ /cancel ដើម្បីបោះបង់។",
+        '🛡️ <b>សុវត្ថិភាពការផ្សាយសារ V2</b>\n\n📨 <b>របៀបប្រើ</b>\n• ផ្ញើ <b>អត្ថបទ</b> ឬ <b>រូបភាព + ចំណងជើង</b> ដែលចង់ផ្សាយ\n• បូតនឹងបង្ហាញសារមើលជាមុនចុងក្រោយ មុនពេលផ្ញើពិត\n• គាំទ្រទម្រង់សារ Telegram, HTML, MarkdownV2, Markdown និងអត្ថបទធម្មតា\n• ដើម្បីបង្ខំទម្រង់ សូមដាក់ <code>::html</code>, <code>::mdv2</code>, <code>::md</code> ឬ <code>::plain</code> នៅជួរទី១\n\n🔐 <b>ការការពារ</b>\n✅ បញ្ជាក់សារមើលជាមុន មុនពេលផ្ញើ\n✅ រំលងអ្នកប្រើប្រាស់ដែលបានបិទបូត ឬមិនអាចទាក់ទងបាន\n✅ គ្រប់គ្រងល្បឿនផ្ញើ និង RetryAfter\n\nវាយ /cancel ដើម្បីបោះបង់។',
         parse_mode="HTML",
         reply_markup=get_broadcast_entry_kb(),
     ))
@@ -20799,10 +21125,7 @@ async def build_admin_report_pdf(admin_id: int, report_range: dict[str, Any] | N
 async def _admin_open_report_day_picker(query, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
     context.user_data.pop("admin_report_state", None)
     await safe_send(lambda: query.message.edit_text(
-        "📄 <b>PDF Report</b>\n\n"
-        "ជ្រើសរើសថ្ងៃ ឬ Range ដែលអ្នកចង់ទាញយក Report។\n"
-        "PDF នឹងមាន activity graph style ស្អាត សម្រាប់ schedules/sent/failed/blocked នៅក្នុងថ្ងៃដែលបានជ្រើស។\n\n"
-        "Custom: ចុច <b>Type Date</b> ហើយវាយជា <code>YYYY-MM-DD</code> ឧ. <code>2026-06-29</code>។",
+        '📄 <b>របាយការណ៍ PDF</b>\n\nសូមជ្រើសរើសថ្ងៃ ឬចន្លោះពេលដែលអ្នកចង់ទាញយករបាយការណ៍។\nឯកសារ PDF នឹងមានក្រាហ្វសកម្មភាពសម្រាប់កាលវិភាគ ការផ្ញើបានជោគជ័យ ការផ្ញើបរាជ័យ និងអ្នកប្រើប្រាស់ដែលត្រូវបានបិទ ក្នុងរយៈពេលដែលបានជ្រើស។\n\nកំណត់ថ្ងៃផ្ទាល់ខ្លួន៖ ចុច <b>បញ្ចូលកាលបរិច្ឆេទ</b> ហើយវាយជា <code>YYYY-MM-DD</code> ឧ. <code>2026-06-29</code>។',
         parse_mode="HTML",
         reply_markup=get_admin_report_day_kb(),
         disable_web_page_preview=True,
@@ -20816,7 +21139,7 @@ async def _admin_send_report_pdf_for_range(query, context: ContextTypes.DEFAULT_
     progress = None
     try:
         progress = await safe_send(lambda: query.message.reply_text(
-            f"⏳ Generating PDF report...\nRange: <b>{html.escape(label)}</b>",
+            f'⏳ កំពុងបង្កើតរបាយការណ៍ PDF...\nចន្លោះពេល៖ <b>{html.escape(label)}</b>',
             parse_mode="HTML",
         ))
         path = await build_admin_report_pdf(user_id, report_range)
@@ -20829,15 +21152,15 @@ async def _admin_send_report_pdf_for_range(query, context: ContextTypes.DEFAULT_
             )
         if progress:
             with suppress(Exception):
-                await progress.edit_text("✅ PDF report generated and sent.")
+                await progress.edit_text('✅ បានបង្កើត និងផ្ញើរបាយការណ៍ PDF រួចរាល់។')
     except Exception as exc:
         logger.error("admin_report_pdf failed: %s", exc, exc_info=True)
         error_text = html.escape(str(exc)[:300])
         if progress:
             with suppress(Exception):
-                await progress.edit_text(f"⚠️ Report generation failed: {error_text}")
+                await progress.edit_text(f'⚠️ ការបង្កើតរបាយការណ៍បរាជ័យ៖ {error_text}')
         else:
-            await safe_send(lambda: query.message.reply_text(f"⚠️ Report generation failed: {error_text}"))
+            await safe_send(lambda: query.message.reply_text(f'⚠️ ការបង្កើតរបាយការណ៍បរាជ័យ៖ {error_text}'))
     finally:
         if path:
             with suppress(Exception):
@@ -20856,8 +21179,7 @@ async def _handle_admin_report_day_text(update: Update, context: ContextTypes.DE
     report_range = _admin_report_parse_day_text(msg.text)
     if not report_range:
         await safe_send(lambda: msg.reply_text(
-            "⚠️ Date មិនត្រឹមត្រូវ។ សូមវាយជា <code>YYYY-MM-DD</code> ឧ. <code>2026-06-29</code>\n"
-            "ឬវាយ <code>today</code>, <code>yesterday</code>, <code>7</code>, <code>30</code>។",
+            '⚠️ កាលបរិច្ឆេទមិនត្រឹមត្រូវ។ សូមវាយជា <code>YYYY-MM-DD</code> ឧ. <code>2026-06-29</code>\nឬវាយ <code>today</code>, <code>yesterday</code>, <code>7</code>, <code>30</code>។',
             parse_mode="HTML",
             reply_markup=get_admin_action_kb(),
         ))
@@ -20869,7 +21191,7 @@ async def _handle_admin_report_day_text(update: Update, context: ContextTypes.DE
     progress = None
     try:
         progress = await safe_send(lambda: msg.reply_text(
-            f"⏳ Generating PDF report...\nRange: <b>{html.escape(label)}</b>",
+            f'⏳ កំពុងបង្កើតរបាយការណ៍ PDF...\nចន្លោះពេល៖ <b>{html.escape(label)}</b>',
             parse_mode="HTML",
         ))
         path = await build_admin_report_pdf(user_id, report_range)
@@ -20882,15 +21204,15 @@ async def _handle_admin_report_day_text(update: Update, context: ContextTypes.DE
             )
         if progress:
             with suppress(Exception):
-                await progress.edit_text("✅ PDF report generated and sent.")
+                await progress.edit_text('✅ បានបង្កើត និងផ្ញើរបាយការណ៍ PDF រួចរាល់។')
     except Exception as exc:
         logger.error("admin_report_pdf_text_date failed: %s", exc, exc_info=True)
         error_text = html.escape(str(exc)[:300])
         if progress:
             with suppress(Exception):
-                await progress.edit_text(f"⚠️ Report generation failed: {error_text}")
+                await progress.edit_text(f'⚠️ ការបង្កើតរបាយការណ៍បរាជ័យ៖ {error_text}')
         else:
-            await safe_send(lambda: msg.reply_text(f"⚠️ Report generation failed: {error_text}"))
+            await safe_send(lambda: msg.reply_text(f'⚠️ ការបង្កើតរបាយការណ៍បរាជ័យ៖ {error_text}'))
     finally:
         if path:
             with suppress(Exception):
@@ -21295,7 +21617,7 @@ def db_feature_request_update_status(request_id: str, status: str, *, admin_id: 
     if updated is None:
         updated = _feature_request_memory_update(request_id, status=status, updated_at=now)
     if updated is None:
-        return False, None, "Request not found."
+        return False, None, 'រកសំណើមិនឃើញ។'
     _feature_request_reset_counts_cache()
     return True, updated, "updated"
 
@@ -21317,7 +21639,7 @@ def db_feature_request_set_admin_note(request_id: str, note: str, *, admin_id: i
     if updated is None:
         updated = _feature_request_memory_update(request_id, admin_note=note, updated_at=now)
     if updated is None:
-        return False, None, "Request not found."
+        return False, None, 'រកសំណើមិនឃើញ។'
     return True, updated, "updated"
 
 def db_feature_request_mark_notified(request_id: str) -> None:
@@ -21493,7 +21815,7 @@ async def _open_feature_request_inbox(query, *, status: str | None = None, notic
 async def _open_feature_request_detail(query, request_id: str, *, notice: str = "") -> None:
     row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_feature_request_get(request_id))
     if not row:
-        await _open_feature_request_inbox(query, notice="⚠️ Request not found.")
+        await _open_feature_request_inbox(query, notice='⚠️ រកសំណើមិនឃើញ។')
         return
     status = str(row.get("status") or "new")
     user_id = int(row.get("user_id") or 0)
@@ -21530,14 +21852,12 @@ async def _open_feature_request_detail(query, request_id: str, *, notice: str = 
 async def _send_feature_request_sql(query) -> None:
     sql = _feature_request_sql_text()
     await safe_send(lambda: query.message.reply_text(
-        "🧩 <b>User Needs Center SQL</b>\n\n"
-        "Run this in Supabase SQL editor once. The bot also works in memory fallback before this table exists.\n\n"
-        f"<pre>{html.escape(sql)}</pre>",
+        f'🧩 <b>SQL សម្រាប់មជ្ឈមណ្ឌលតម្រូវការអ្នកប្រើប្រាស់</b>\n\nសូមដំណើរការកូដនេះម្ដងក្នុង Supabase SQL Editor។ មុនពេលមានតារាងនេះ បូតនៅតែអាចដំណើរការដោយប្រើអង្គចងចាំបណ្ដោះអាសន្ន។\n\n<pre>{html.escape(sql)}</pre>',
         parse_mode="HTML",
         disable_web_page_preview=True,
     ))
     await safe_send(lambda: query.message.edit_text(
-        "✅ SQL setup message sent. After running it in Supabase, feature requests will persist permanently.",
+        '✅ បានផ្ញើសារ SQL រួចរាល់។ បន្ទាប់ពីដំណើរការវានៅ Supabase សំណើមុខងារនឹងត្រូវរក្សាទុកជាអចិន្ត្រៃយ៍។',
         parse_mode="HTML",
         reply_markup=get_user_needs_home_kb(),
         disable_web_page_preview=True,
@@ -21641,7 +21961,7 @@ async def _handle_feature_request_user_text(update: Update, context: ContextType
     raw = str(msg.text or "").strip()
     if raw.lower() in {"cancel", "/cancel", "បោះបង់"}:
         context.user_data.pop(FEATURE_REQUEST_WAIT_TEXT, None)
-        await safe_send(lambda: msg.reply_text("បានបោះបង់ Feature Request។"))
+        await safe_send(lambda: msg.reply_text('បានបោះបង់សំណើមុខងារ។'))
         return True
     return await _save_user_feature_request(update, context, raw)
 
@@ -21660,14 +21980,14 @@ async def _handle_feature_request_admin_reply_text(update: Update, context: Cont
     if raw.lower() in {"cancel", "/cancel", "បោះបង់"}:
         with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
             ACTIVE_ADMIN_CONVERSATIONS.pop(int(user.id), None)
-        await safe_send(lambda: msg.reply_text("បានបោះបង់ Reply User។", reply_markup=get_admin_dashboard_kb()))
+        await safe_send(lambda: msg.reply_text('បានបោះបង់ការឆ្លើយតបអ្នកប្រើប្រាស់។', reply_markup=get_admin_dashboard_kb()))
         return True
     reply_text = raw[:FEATURE_REQUEST_ADMIN_REPLY_MAX]
     row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_feature_request_get(request_id))
     if not row:
         with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
             ACTIVE_ADMIN_CONVERSATIONS.pop(int(user.id), None)
-        await safe_send(lambda: msg.reply_text("⚠️ Request not found.", reply_markup=get_admin_dashboard_kb()))
+        await safe_send(lambda: msg.reply_text('⚠️ រកសំណើមិនឃើញ។', reply_markup=get_admin_dashboard_kb()))
         return True
     target_id = int(row.get("user_id") or 0)
     ok_send = False
@@ -21696,7 +22016,7 @@ async def _handle_feature_request_admin_reply_text(update: Update, context: Cont
         ACTIVE_ADMIN_CONVERSATIONS.pop(int(user.id), None)
     if ok_send:
         await safe_send(lambda: msg.reply_text(
-            f"✅ Reply sent to user <code>{target_id}</code>.",
+            f'✅ បានផ្ញើការឆ្លើយតបទៅអ្នកប្រើប្រាស់ <code>{target_id}</code>.',
             parse_mode="HTML",
             reply_markup=get_admin_dashboard_kb(),
         ))
@@ -21711,7 +22031,7 @@ async def _handle_feature_request_admin_reply_text(update: Update, context: Cont
 
 async def _cb_user_needs_admin(query, user_id: int, context: ContextTypes.DEFAULT_TYPE, data: str) -> None:
     if not _is_admin(user_id):
-        await query.answer("Admin only", show_alert=True)
+        await query.answer('សម្រាប់អ្នកគ្រប់គ្រងប៉ុណ្ណោះ', show_alert=True)
         return
     if data in {"admin_user_needs", "needs_inbox", "needs_open_answers", "needs_sql"} or data.startswith("needs_request:"):
         with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
@@ -21729,16 +22049,7 @@ async def _cb_user_needs_admin(query, user_id: int, context: ContextTypes.DEFAUL
         return
     if data == "needs_open_answers":
         await safe_send(lambda: query.message.edit_text(
-            "💬 <b>Open Answer Feature Request</b>\n\n"
-            "User អាចសរសេរតម្រូវការថ្មីដោយខ្លួនឯង៖\n"
-            "• <code>/need ចង់បានសង្ខេប PDF ជាខ្មែរ</code>\n"
-            "• <code>/feedback Khmer voice ត្រូវការសម្លេងធម្មជាតិជាងនេះ</code>\n"
-            "• <code>/request_feature OCR Khmer ពីរូបភាព</code>\n\n"
-            "Safety Rules:\n"
-            "✅ Max 500 chars\n"
-            "✅ Cooldown 5 minutes/user\n"
-            "✅ Blocked user cannot submit\n"
-            "✅ Admin can reply / change status / notify completed",
+            '💬 <b>សំណើមុខងារបែបមតិយោបល់បើកចំហ</b>\n\nអ្នកប្រើប្រាស់អាចសរសេរតម្រូវការថ្មីដោយខ្លួនឯង៖\n• <code>/need ចង់បានសង្ខេប PDF ជាខ្មែរ</code>\n• <code>/feedback សំឡេងខ្មែរត្រូវការធម្មជាតិជាងនេះ</code>\n• <code>/request_feature OCR ខ្មែរពីរូបភាព</code>\n\nច្បាប់សុវត្ថិភាព៖\n✅ អតិបរមា ៥០០ តួអក្សរ\n✅ រង់ចាំ ៥ នាទីក្នុងមួយអ្នកប្រើប្រាស់ មុនផ្ញើសំណើថ្មី\n✅ អ្នកប្រើប្រាស់ដែលត្រូវបានបិទ មិនអាចផ្ញើសំណើបាន\n✅ អ្នកគ្រប់គ្រងអាចឆ្លើយតប ប្ដូរស្ថានភាព និងជូនដំណឹងពេលបញ្ចប់',
             parse_mode="HTML",
             reply_markup=get_user_needs_home_kb(),
             disable_web_page_preview=True,
@@ -21756,7 +22067,7 @@ async def _cb_user_needs_admin(query, user_id: int, context: ContextTypes.DEFAUL
     if data.startswith("needs_status:"):
         parts = data.split(":")
         if len(parts) != 3:
-            await query.answer("Invalid status action", show_alert=True)
+            await query.answer('សកម្មភាពស្ថានភាពមិនត្រឹមត្រូវ', show_alert=True)
             return
         request_id, status = parts[1], parts[2]
         ok, _row, info = await asyncio.get_running_loop().run_in_executor(
@@ -21770,7 +22081,7 @@ async def _cb_user_needs_admin(query, user_id: int, context: ContextTypes.DEFAUL
         request_id = data.split(":", 1)[1]
         row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_feature_request_get(request_id))
         if not row:
-            await _open_feature_request_inbox(query, notice="⚠️ Request not found.")
+            await _open_feature_request_inbox(query, notice='⚠️ រកសំណើមិនឃើញ។')
             return
         with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
             ACTIVE_ADMIN_CONVERSATIONS[int(user_id)] = {
@@ -21780,11 +22091,7 @@ async def _cb_user_needs_admin(query, user_id: int, context: ContextTypes.DEFAUL
                 "ts": time.monotonic(),
             }
         await safe_send(lambda: query.message.edit_text(
-            "💬 <b>Reply User</b>\n\n"
-            f"Request ID: <code>{html.escape(_feature_request_clean_id(request_id))}</code>\n"
-            f"User: <code>{int(row.get('user_id') or 0)}</code>\n\n"
-            "សូមវាយសារដែលចង់ផ្ញើទៅ User។\n"
-            "វាយ <code>cancel</code> ដើម្បីបោះបង់។",
+            f"💬 <b>ឆ្លើយតបអ្នកប្រើប្រាស់</b>\n\nលេខសម្គាល់សំណើ៖ <code>{html.escape(_feature_request_clean_id(request_id))}</code>\nអ្នកប្រើប្រាស់៖ <code>{int(row.get('user_id') or 0)}</code>\n\nសូមវាយសារដែលចង់ផ្ញើទៅអ្នកប្រើប្រាស់។\nវាយ <code>cancel</code> ដើម្បីបោះបង់។",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"needs_request:{_feature_request_clean_id(request_id)}")]]),
             disable_web_page_preview=True,
@@ -21793,9 +22100,7 @@ async def _cb_user_needs_admin(query, user_id: int, context: ContextTypes.DEFAUL
     if data.startswith("needs_notify_ask:"):
         request_id = data.split(":", 1)[1]
         await safe_send(lambda: query.message.edit_text(
-            "🔔 <b>Notify User?</b>\n\n"
-            "Bot នឹងផ្ញើសារ​ទៅ User ថា Feature ដែលគាត់ស្នើបានរួចរាល់។\n"
-            "សូម confirm មុនផ្ញើ។",
+            '🔔 <b>ជូនដំណឹងអ្នកប្រើប្រាស់?</b>\n\nបូតនឹងផ្ញើសារទៅអ្នកប្រើប្រាស់ថា មុខងារដែលបានស្នើត្រូវបានបញ្ចប់រួចរាល់។\nសូមបញ្ជាក់មុនពេលផ្ញើ។',
             parse_mode="HTML",
             reply_markup=get_feature_notify_confirm_kb(request_id),
             disable_web_page_preview=True,
@@ -21805,7 +22110,7 @@ async def _cb_user_needs_admin(query, user_id: int, context: ContextTypes.DEFAUL
         request_id = data.split(":", 1)[1]
         row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_feature_request_get(request_id))
         if not row:
-            await _open_feature_request_inbox(query, notice="⚠️ Request not found.")
+            await _open_feature_request_inbox(query, notice='⚠️ រកសំណើមិនឃើញ។')
             return
         target_id = int(row.get("user_id") or 0)
         detail = str(row.get("title") or row.get("detail") or "Feature request")[:120]
@@ -22323,14 +22628,13 @@ async def _admin_open_users_panel(query) -> None:
     users = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, get_all_users_with_names)
     if not users:
         await safe_send(lambda: query.message.edit_text(
-            "👥 <b>Users</b>\n\n❌ គ្មានអ្នកប្រើប្រាស់ registered ទេ។",
+            '👥 <b>អ្នកប្រើប្រាស់</b>\n\n❌ មិនមានអ្នកប្រើប្រាស់ដែលបានចុះឈ្មោះទេ។',
             parse_mode="HTML",
             reply_markup=get_admin_dashboard_kb(),
         ))
         return
     await safe_send(lambda: query.message.edit_text(
-        f"👥 <b>User Management ({len(users)} users)</b>\n"
-        "Select a user, or press 🔎 Search User to find by ID/username.",
+        f'👥 <b>ការគ្រប់គ្រងអ្នកប្រើប្រាស់ ({len(users)} នាក់)</b>\nសូមជ្រើសរើសអ្នកប្រើប្រាស់ ឬចុច 🔎 ស្វែងរកអ្នកប្រើប្រាស់ ដើម្បីស្វែងរកតាមលេខសម្គាល់ ឬឈ្មោះអ្នកប្រើប្រាស់។',
         parse_mode="HTML",
         reply_markup=get_users_page_kb(users, page=0),
     ))
@@ -22342,7 +22646,7 @@ async def _admin_open_schedules_panel(query, admin_id: int) -> None:
     )
     if not rows:
         await safe_send(lambda: query.message.edit_text(
-            "📋 <b>Scheduled Broadcasts</b>\n\n📭 មិនមាន Scheduled Broadcast ណាមួយទេ។",
+            '📋 <b>ការផ្សាយតាមកាលវិភាគ</b>\n\n📭 មិនមានការផ្សាយតាមកាលវិភាគទេ។',
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📅 New Schedule", callback_data="admin_schedule_new")],
@@ -22352,9 +22656,7 @@ async def _admin_open_schedules_panel(query, admin_id: int) -> None:
         ))
         return
     await safe_send(lambda: query.message.edit_text(
-        f"📋 <b>Scheduled Broadcasts ({len(rows)} active/preview)</b>\n"
-        "🟡 Preview = មិនទាន់ Confirm, 🟢 Pending = រង់ចាំផ្ញើ។\n"
-        "ចុចលើ Schedule ដើម្បីមើលលម្អិត ឬ Cancel ។",
+        f'📋 <b>ការផ្សាយតាមកាលវិភាគ ({len(rows)} សកម្ម/មើលជាមុន)</b>\n🟡 មើលជាមុន = មិនទាន់បញ្ជាក់, 🟢 រង់ចាំ = រង់ចាំផ្ញើ។\nចុចលើកាលវិភាគ ដើម្បីមើលព័ត៌មានលម្អិត ឬបោះបង់។',
         parse_mode="HTML",
         reply_markup=get_schedules_list_kb(rows, page=0),
     ))
@@ -22472,23 +22774,7 @@ async def _admin_start_broadcast_from_button(query, context: ContextTypes.DEFAUL
     context.user_data["bc_state"] = BROADCAST_WAIT_MESSAGE
     estimate = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, _broadcast_recipient_estimate_sync)
     await safe_send(lambda: query.message.edit_text(
-        "🛡️ <b>Broadcast សុវត្ថិភាព V2</b>\n\n"
-        "📨 <b>របៀបប្រើ</b>\n"
-        "• ផ្ញើ <b>អត្ថបទ</b> ឬ <b>រូបភាព + Caption</b>\n"
-        "• Bot នឹងបង្ហាញ Preview ចុងក្រោយ មុនពេលផ្ញើពិត\n"
-        "• គាំទ្រ Telegram formatting, HTML, MarkdownV2, Markdown និង Plain text\n"
-        "• បើចង់បង្ខំ Format សូមដាក់ <code>::html</code>, <code>::mdv2</code>, <code>::md</code>, ឬ <code>::plain</code> នៅជួរទី១\n\n"
-        "📊 <b>អ្នកទទួល</b>\n"
-        f"👥 អ្នកប្រើបានចុះឈ្មោះ: <b>{int(estimate.get('registered') or 0)}</b>\n"
-        f"🎯 គោលដៅសកម្ម: <b>{int(estimate.get('active') or 0)}</b>\n"
-        f"🚫 រំលង Blocked/Unreachable: <b>{int(estimate.get('blocked') or 0)}</b>\n"
-        f"⚙️ Batch: <b>{_run_state_broadcast_batch_size()}</b> · ពន្យារ: <b>{_run_state_broadcast_delay():g}s</b>\n\n"
-        "🔐 <b>ការពារ</b>\n"
-        "✅ Preview confirmation មុនផ្ញើ\n"
-        "✅ រំលងអ្នកដែល Block/Unreachable\n"
-        "✅ គ្រប់គ្រងល្បឿនផ្ញើ និង RetryAfter\n"
-        "✅ Auto-block chat ដែលមិនអាចផ្ញើបាន\n\n"
-        "ចុច <b>បោះបង់</b> ឬវាយ /cancel ដើម្បីបញ្ឈប់។",
+        f"🛡️ <b>សុវត្ថិភាពការផ្សាយសារ V2</b>\n\n📨 <b>របៀបប្រើ</b>\n• ផ្ញើ <b>អត្ថបទ</b> ឬ <b>រូបភាព + ចំណងជើង</b>\n• បូតនឹងបង្ហាញសារមើលជាមុនចុងក្រោយ មុនពេលផ្ញើពិត\n• គាំទ្រទម្រង់សារ Telegram, HTML, MarkdownV2, Markdown និងអត្ថបទធម្មតា\n• ដើម្បីបង្ខំទម្រង់ សូមដាក់ <code>::html</code>, <code>::mdv2</code>, <code>::md</code> ឬ <code>::plain</code> នៅជួរទី១\n\n📊 <b>អ្នកទទួល</b>\n👥 អ្នកប្រើប្រាស់ដែលបានចុះឈ្មោះ៖ <b>{int(estimate.get('registered') or 0)}</b>\n🎯 អ្នកទទួលសកម្ម៖ <b>{int(estimate.get('active') or 0)}</b>\n🚫 រំលងអ្នកដែលត្រូវបានបិទ ឬមិនអាចទាក់ទងបាន៖ <b>{int(estimate.get('blocked') or 0)}</b>\n⚙️ ចំនួនក្នុងមួយក្រុម៖ <b>{_run_state_broadcast_batch_size()}</b> · ពន្យារពេល៖ <b>{_run_state_broadcast_delay():g} វិនាទី</b>\n\n🔐 <b>ការការពារ</b>\n✅ បញ្ជាក់សារមើលជាមុន មុនពេលផ្ញើ\n✅ រំលងអ្នកដែលត្រូវបានបិទ ឬមិនអាចទាក់ទងបាន\n✅ គ្រប់គ្រងល្បឿនផ្ញើ និង RetryAfter\n✅ បិទសិទ្ធិការជជែកដោយស្វ័យប្រវត្តិ ប្រសិនបើមិនអាចផ្ញើបាន\n\nចុច <b>បោះបង់</b> ឬវាយ /cancel ដើម្បីបញ្ឈប់។",
         parse_mode="HTML",
         reply_markup=get_broadcast_entry_kb(),
     ))
@@ -22548,11 +22834,7 @@ async def _admin_start_schedule_from_button(query, context: ContextTypes.DEFAULT
     _sched_payload.pop(user_id, None)
     context.user_data["sched_state"] = SCHED_WAIT_MSG
     await safe_send(lambda: query.message.edit_text(
-        "📅 <b>Scheduled Broadcast</b>\n\n"
-        "ផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + Caption</b> ដែលចង់ Schedule ។\n"
-        "បន្ទាប់មក Bot នឹងសួរពេលវេលា Phnom Penh local time (ICT, UTC+7)។\n"
-        "Formatting: Telegram native formatting, HTML, MarkdownV2, Markdown, or plain text. First-line directives: <code>::html</code>, <code>::mdv2</code>, <code>::md</code>, <code>::plain</code>.\n\n"
-        "ចុច Cancel ឬវាយ /cancel ដើម្បីបោះបង់។",
+        '📅 <b>ការផ្សាយតាមកាលវិភាគ</b>\n\nសូមផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + ចំណងជើង</b> ដែលចង់កំណត់ពេលផ្ញើ។\nបន្ទាប់មក បូតនឹងសួរពេលវេលាតាមម៉ោងភ្នំពេញ (ICT, UTC+7)។\nទម្រង់សារ៖ គាំទ្រទម្រង់ដើមរបស់ Telegram, HTML, MarkdownV2, Markdown និងអត្ថបទធម្មតា។ អាចដាក់ <code>::html</code>, <code>::mdv2</code>, <code>::md</code> ឬ <code>::plain</code> នៅជួរទី១។\n\nចុច បោះបង់ ឬវាយ /cancel ដើម្បីបញ្ឈប់។',
         parse_mode="HTML",
         reply_markup=get_admin_action_kb(),
     ))
@@ -22601,22 +22883,22 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: update.message.reply_text(_admin_optimize_text(), parse_mode="HTML", reply_markup=get_admin_optimize_kb(), disable_web_page_preview=True))
         return
     if arg in {"report", "pdf"}:
-        await safe_send(lambda: update.message.reply_text("📄 <b>PDF Report</b>\n\nChoose report range:", parse_mode="HTML", reply_markup=get_admin_report_day_kb(), disable_web_page_preview=True))
+        await safe_send(lambda: update.message.reply_text('📄 <b>របាយការណ៍ PDF</b>\n\nសូមជ្រើសរើសចន្លោះពេលរបាយការណ៍៖', parse_mode="HTML", reply_markup=get_admin_report_day_kb(), disable_web_page_preview=True))
         return
     if arg in {"users", "user"}:
-        await safe_send(lambda: update.message.reply_text("👥 Opening Users panel...", reply_markup=get_admin_dashboard_kb()))
+        await safe_send(lambda: update.message.reply_text('👥 កំពុងបើកផ្ទាំងអ្នកប្រើប្រាស់...', reply_markup=get_admin_dashboard_kb()))
         return
     if arg in {"broadcast", "bc"}:
         context.user_data["bc_state"] = BROADCAST_WAIT_MESSAGE
         await safe_send(lambda: update.message.reply_text(
-            "📢 <b>Broadcast Safety Flow</b>\n\nSend text or photo + caption now. The bot will show a preview before sending.\n\nUse /cancel to stop.",
+            '📢 <b>ដំណើរការផ្សាយសារដោយសុវត្ថិភាព</b>\n\nសូមផ្ញើអត្ថបទ ឬរូបភាព + ចំណងជើងឥឡូវនេះ។ បូតនឹងបង្ហាញសារមើលជាមុន មុនពេលផ្ញើពិត។\n\nប្រើ /cancel ដើម្បីបោះបង់។',
             parse_mode="HTML",
             reply_markup=get_admin_action_kb(),
         ))
         return
     if arg in {"settings", "setting"}:
         settings, _status = await get_bot_settings_async(force=True)
-        await safe_send(lambda: update.message.reply_text("⚙️ <b>Bot Settings</b>", parse_mode="HTML", reply_markup=get_bot_settings_kb(settings)))
+        await safe_send(lambda: update.message.reply_text('⚙️ <b>ការកំណត់បូត</b>', parse_mode="HTML", reply_markup=get_bot_settings_kb(settings)))
         return
     if arg in {"runtime", "run"}:
         await safe_send(lambda: update.message.reply_text(_runtime_admin_text(), parse_mode="HTML", reply_markup=get_runtime_admin_kb(), disable_web_page_preview=True))
@@ -22714,7 +22996,7 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         pending = _pending_broadcast.get(user_id)
         if not pending:
             await safe_send(lambda: query.message.reply_text(
-                "⚠️ មិនមាន Preview សម្រាប់ Save ទេ។ សូមផ្ញើ Broadcast មុនសិន។"
+                '⚠️ មិនមានសារមើលជាមុនសម្រាប់រក្សាទុកទេ។ សូមបង្កើតការផ្សាយសារជាមុនសិន។'
             ))
             return
         ok, info, tpl = await asyncio.get_running_loop().run_in_executor(
@@ -22740,7 +23022,7 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         with suppress(Exception):
             await query.message.edit_reply_markup(reply_markup=None)
         await safe_send(lambda: query.message.reply_text(
-            f"📚 បានជ្រើស Template: <b>{html.escape(_broadcast_template_button_title(tpl))}</b>",
+            f'📚 បានជ្រើសគំរូ៖ <b>{html.escape(_broadcast_template_button_title(tpl))}</b>',
             parse_mode="HTML",
         ))
         ok = await _admin_show_broadcast_preview_message(query.message, context.bot, user_id, pending)
@@ -22789,7 +23071,7 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         job = _broadcast_sent_delete_get(job_id, user_id, pop=True)
         if not job:
             await safe_send(lambda: query.message.reply_text(
-                "⚠️ Delete job មិនមានទៀតទេ។ វាអាចផុតកំណត់ ឬ server restart។"
+                '⚠️ ការងារលុបនេះមិនមានទៀតទេ។ វាអាចផុតកំណត់ ឬម៉ាស៊ីនមេបានចាប់ផ្ដើមឡើងវិញ។'
             ))
             return
         with suppress(Exception):
@@ -22801,7 +23083,7 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if data == "bc_del_sent_keep":
         with suppress(Exception):
             await query.message.edit_reply_markup(reply_markup=None)
-        await safe_send(lambda: query.message.reply_text("✅ ទុកសារ Broadcast នៅដដែល។"))
+        await safe_send(lambda: query.message.reply_text('✅ បានរក្សាទុកសារផ្សាយនៅដដែល។'))
         return
 
     if data == "bc_cancel":
@@ -22809,7 +23091,7 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data.pop("bc_state", None)
         with suppress(Exception):
             await query.message.edit_reply_markup(reply_markup=None)
-        await safe_send(lambda: query.message.reply_text("❌ Broadcast ត្រូវបានបោះបង់។"))
+        await safe_send(lambda: query.message.reply_text('❌ បានបោះបង់ការផ្សាយសារ។'))
         return
 
     if data == "bc_confirm":
@@ -22834,11 +23116,7 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _sched_payload.pop(admin_id, None)
     context.user_data["sched_state"] = SCHED_WAIT_MSG
     await safe_send(lambda: update.message.reply_text(
-        "📅 <b>Scheduled Broadcast</b>\n\n"
-        "ផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + Caption</b> ដែលចង់ Schedule ។\n"
-        "✅ Supports Telegram native formatting, HTML, MarkdownV2, Markdown, and plain text.\n"
-        "Prefix first line with <code>::html</code>, <code>::mdv2</code>, <code>::md</code>, or <code>::plain</code>.\n\n"
-        "វាយ /cancel ដើម្បីបោះបង់។",
+        '📅 <b>ការផ្សាយតាមកាលវិភាគ</b>\n\nសូមផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + ចំណងជើង</b> ដែលចង់កំណត់ពេលផ្ញើ។\n✅ គាំទ្រទម្រង់ដើមរបស់ Telegram, HTML, MarkdownV2, Markdown និងអត្ថបទធម្មតា។\nដើម្បីបង្ខំទម្រង់ សូមដាក់ <code>::html</code>, <code>::mdv2</code>, <code>::md</code> ឬ <code>::plain</code> នៅជួរទី១។\n\nវាយ /cancel ដើម្បីបោះបង់។',
         parse_mode="HTML",
     ))
 
@@ -22849,11 +23127,10 @@ async def cmd_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loop     = asyncio.get_running_loop()
     rows     = await loop.run_in_executor(None, db_sched_fetch_admin_pending, admin_id)
     if not rows:
-        await safe_send(lambda: update.message.reply_text("📭 មិនមាន Scheduled Broadcast ណាមួយទេ។"))
+        await safe_send(lambda: update.message.reply_text('📭 មិនមានការផ្សាយតាមកាលវិភាគទេ។'))
         return
     await safe_send(lambda: update.message.reply_text(
-        f"📋 <b>Scheduled Broadcasts ({len(rows)} pending)</b>\n"
-        "ចុចលើ Schedule ដើម្បីមើលលម្អិត ឬ Cancel ។",
+        f'📋 <b>ការផ្សាយតាមកាលវិភាគ ({len(rows)} កំពុងរង់ចាំ)</b>\nចុចលើកាលវិភាគ ដើម្បីមើលព័ត៌មានលម្អិត ឬបោះបង់។',
         parse_mode="HTML",
         reply_markup=get_schedules_list_kb(rows, page=0),
     ))
@@ -22865,7 +23142,7 @@ async def cmd_cancelschedule(update: Update, context: ContextTypes.DEFAULT_TYPE)
     args     = context.args or []
     if not args or not args[0].isdigit():
         await safe_send(lambda: update.message.reply_text(
-            "❌ Usage: /cancelschedule &lt;id&gt;\nឬប្រើ /schedules ដើម្បីជ្រើស។",
+            '❌ របៀបប្រើ៖ /cancelschedule &lt;id&gt;\nឬប្រើ /schedules ដើម្បីជ្រើស។',
             parse_mode="HTML",
         ))
         return
@@ -22887,7 +23164,7 @@ async def cmd_cancelschedule(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     await loop.run_in_executor(None, db_sched_set_status, row_id, "cancelled")
     await safe_send(lambda: update.message.reply_text(
-        f"✅ Schedule <b>#{row_id}</b> បានបោះបង់។", parse_mode="HTML"
+        f'✅ កាលវិភាគ <b>#{row_id}</b> បានបោះបង់។', parse_mode="HTML"
     ))
 
 
@@ -22924,11 +23201,7 @@ async def _handle_sched_content(update: Update, context: ContextTypes.DEFAULT_TY
     }
     context.user_data["sched_state"] = SCHED_WAIT_TIME
     await safe_send(lambda: msg.reply_text(
-        "🕐 <b>ពេលវេលា Broadcast — Phnom Penh local time</b>\n\n"
-        "វាយកាលបរិច្ឆេទ និងម៉ោង ។\n"
-        "ទម្រង់: <code>YYYY-MM-DD HH:MM AM/PM</code> ឬ <code>YYYY-MM-DD HH:MM</code>\n"
-        "ម៉ោង: Phnom Penh, Cambodia — ICT (UTC+7)\n"
-        "ឧទាហរណ៍: <code>2025-12-25 09:00 AM</code> ឬ <code>2025-12-25 21:00</code>",
+        '🕐 <b>ពេលវេលាផ្សាយសារ — ម៉ោងភ្នំពេញ</b>\n\nសូមវាយកាលបរិច្ឆេទ និងម៉ោង។\nទម្រង់៖ <code>YYYY-MM-DD HH:MM AM/PM</code> ឬ <code>YYYY-MM-DD HH:MM</code>\nតំបន់ម៉ោង៖ ភ្នំពេញ កម្ពុជា — ICT (UTC+7)\nឧទាហរណ៍៖ <code>2025-12-25 09:00 AM</code> ឬ <code>2025-12-25 21:00</code>',
         parse_mode="HTML",
     ))
     return True
@@ -22943,13 +23216,13 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
 
     msg = update.message
     if not msg.text:
-        await safe_send(lambda: msg.reply_text("⚠️ ផ្ញើ Text ពេលវេលា Phnom Penh local time (ICT, UTC+7)។"))
+        await safe_send(lambda: msg.reply_text('⚠️ សូមផ្ញើពេលវេលាជាអត្ថបទ តាមម៉ោងភ្នំពេញ (ICT, UTC+7)។'))
         return True
 
     broadcast_at = _parse_dt(msg.text)
     if broadcast_at is None:
         await safe_send(lambda: msg.reply_text(
-            "❌ ទម្រង់ពេលវេលាខុស។\nឧទាហរណ៍ត្រឹមត្រូវ: <code>2025-12-25 09:00 AM</code> ឬ <code>2025-12-25 21:00</code>",
+            '❌ ទម្រង់ពេលវេលាមិនត្រឹមត្រូវ។\nឧទាហរណ៍ត្រឹមត្រូវ៖ <code>2025-12-25 09:00 AM</code> ឬ <code>2025-12-25 21:00</code>',
             parse_mode="HTML",
         ))
         return True
@@ -22969,8 +23242,7 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
     if not payload:
         context.user_data.pop("sched_state", None)
         await safe_send(lambda: msg.reply_text(
-            "❌ រកទិន្នន័យ Schedule មិនឃើញ (session expired)។\n"
-            "សូមចាប់ផ្ដើម /schedule ម្តងទៀត។"
+            '❌ រកទិន្នន័យកាលវិភាគមិនឃើញ ដោយសារវគ្គបានផុតកំណត់។\nសូមចាប់ផ្ដើម /schedule ម្ដងទៀត។'
         ))
         return True
 
@@ -23002,11 +23274,7 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
     # broadcast content separately with its selected Telegram parse mode.
     # This prevents HTML/Markdown from showing as raw tags in the preview.
     await safe_send(lambda: msg.reply_text(
-        f"📅 <b>Preview Schedule #{row_id}</b>\n"
-        f"⏰ {dt_str}\n"
-        "ស្ថានភាព: <b>Preview — មិនទាន់បញ្ជាក់</b>\n"
-        f"{mode_line}\n"
-        "👁️ <b>Content preview is shown below.</b>",
+        f'📅 <b>មើលកាលវិភាគជាមុន #{row_id}</b>\n⏰ {dt_str}\nស្ថានភាព៖ <b>មើលជាមុន — មិនទាន់បញ្ជាក់</b>\n{mode_line}\n👁️ <b>ខាងក្រោមនេះជាសារមើលជាមុន។</b>',
         parse_mode="HTML",
         disable_web_page_preview=True,
     ))
@@ -23022,8 +23290,7 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as exc:
         error_text = html.escape(str(exc)[:300])
         await safe_send(lambda: msg.reply_text(
-            "❌ Schedule was saved, but the rendered preview failed. You can cancel it from /schedules.\n"
-            f"Reason: <code>{error_text}</code>",
+            f'❌ បានរក្សាទុកកាលវិភាគ ប៉ុន្តែការបង្ហាញសារមើលជាមុនបរាជ័យ។ អ្នកអាចបោះបង់វាពី /schedules។\nមូលហេតុ៖ <code>{error_text}</code>',
             parse_mode="HTML",
             reply_markup=get_sched_confirm_kb(row_id),
         ))
@@ -23058,15 +23325,15 @@ async def _handle_sched_edit_time(update: Update, context: ContextTypes.DEFAULT_
     row_id = int(context.user_data.get("sched_edit_row_id") or 0)
     if not row_id:
         _sched_clear_edit_state(context)
-        await safe_send(lambda: msg.reply_text("❌ Edit session expired. Open /schedules again."))
+        await safe_send(lambda: msg.reply_text('❌ វគ្គកែសម្រួលបានផុតកំណត់។ សូមបើក /schedules ម្ដងទៀត។'))
         return True
     if not msg.text:
-        await safe_send(lambda: msg.reply_text("⚠️ ផ្ញើ Text ពេលវេលា Phnom Penh local time (ICT, UTC+7)។"))
+        await safe_send(lambda: msg.reply_text('⚠️ សូមផ្ញើពេលវេលាជាអត្ថបទ តាមម៉ោងភ្នំពេញ (ICT, UTC+7)។'))
         return True
     new_dt = _parse_dt(msg.text)
     if new_dt is None:
         await safe_send(lambda: msg.reply_text(
-            "❌ ទម្រង់ពេលវេលាខុស។\nឧទាហរណ៍: <code>2026-12-25 09:00 AM</code> ឬ <code>2026-12-25 21:00</code>",
+            '❌ ទម្រង់ពេលវេលាមិនត្រឹមត្រូវ។\nឧទាហរណ៍៖ <code>2026-12-25 09:00 AM</code> ឬ <code>2026-12-25 21:00</code>',
             parse_mode="HTML",
         ))
         return True
@@ -23078,7 +23345,7 @@ async def _handle_sched_edit_time(update: Update, context: ContextTypes.DEFAULT_
         return True
     _sched_clear_edit_state(context)
     await safe_send(lambda: msg.reply_text(
-        f"✅ Schedule <b>#{row_id}</b> time updated.\n⏰ New time: <b>{_fmt_dt(_sched_to_utc(new_dt))}</b>",
+        f'✅ កាលវិភាគ <b>#{row_id}</b> បានកែម៉ោងរួចរាល់។\n⏰ ម៉ោងថ្មី៖ <b>{_fmt_dt(_sched_to_utc(new_dt))}</b>',
         parse_mode="HTML",
         reply_markup=get_sched_detail_kb(row),
     ))
@@ -23093,7 +23360,7 @@ async def _handle_sched_edit_text(update: Update, context: ContextTypes.DEFAULT_
     row_id = int(context.user_data.get("sched_edit_row_id") or 0)
     if not row_id:
         _sched_clear_edit_state(context)
-        await safe_send(lambda: msg.reply_text("❌ Edit session expired. Open /schedules again."))
+        await safe_send(lambda: msg.reply_text('❌ វគ្គកែសម្រួលបានផុតកំណត់។ សូមបើក /schedules ម្ដងទៀត។'))
         return True
     if not msg.text or not msg.text.strip():
         await safe_send(lambda: msg.reply_text("⚠️ ផ្ញើអត្ថបទថ្មី។"))
@@ -23106,7 +23373,7 @@ async def _handle_sched_edit_text(update: Update, context: ContextTypes.DEFAULT_
         return True
     _sched_clear_edit_state(context)
     await safe_send(lambda: msg.reply_text(
-        f"✅ Schedule <b>#{row_id}</b> text/caption updated.",
+        f'✅ កាលវិភាគ <b>#{row_id}</b> បានកែអត្ថបទ/ចំណងជើងរួចរាល់។',
         parse_mode="HTML",
         reply_markup=get_sched_detail_kb(row),
     ))
@@ -23121,10 +23388,10 @@ async def _handle_sched_edit_photo(update: Update, context: ContextTypes.DEFAULT
     row_id = int(context.user_data.get("sched_edit_row_id") or 0)
     if not row_id:
         _sched_clear_edit_state(context)
-        await safe_send(lambda: msg.reply_text("❌ Edit session expired. Open /schedules again."))
+        await safe_send(lambda: msg.reply_text('❌ វគ្គកែសម្រួលបានផុតកំណត់។ សូមបើក /schedules ម្ដងទៀត។'))
         return True
     if not msg.photo:
-        await safe_send(lambda: msg.reply_text("⚠️ សូមផ្ញើរូបភាពថ្មី + Caption (optional)។"))
+        await safe_send(lambda: msg.reply_text('⚠️ សូមផ្ញើរូបភាពថ្មី + ចំណងជើង (មិនចាំបាច់)។'))
         return True
     photo_file_id = msg.photo[-1].file_id
     caption = msg.caption or ""
@@ -23136,7 +23403,7 @@ async def _handle_sched_edit_photo(update: Update, context: ContextTypes.DEFAULT
         return True
     _sched_clear_edit_state(context)
     await safe_send(lambda: msg.reply_text(
-        f"✅ Schedule <b>#{row_id}</b> photo replaced.",
+        f'✅ កាលវិភាគ <b>#{row_id}</b> បានប្ដូររូបភាពរួចរាល់។',
         parse_mode="HTML",
         reply_markup=get_sched_detail_kb(row),
     ))
@@ -23145,7 +23412,7 @@ async def _handle_sched_edit_photo(update: Update, context: ContextTypes.DEFAULT
 
 async def _cb_admin_dashboard(query, user_id: int, context, data: str):
     if not _is_admin(user_id):
-        await safe_send(lambda: query.message.reply_text("⛔ Admin only."))
+        await safe_send(lambda: query.message.reply_text('⛔ សម្រាប់អ្នកគ្រប់គ្រងប៉ុណ្ណោះ។'))
         return
 
     if data == "admin_close":
@@ -23229,10 +23496,7 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         if range_key == "custom":
             context.user_data["admin_report_state"] = ADMIN_REPORT_WAIT_DAY
             await safe_send(lambda: query.message.edit_text(
-                "✍️ <b>Custom PDF Report Date</b>\n\n"
-                "វាយថ្ងៃដែលចង់បានជា <code>YYYY-MM-DD</code>។\n"
-                "Example: <code>2026-06-29</code>\n\n"
-                "You can also type: <code>today</code>, <code>yesterday</code>, <code>7</code>, or <code>30</code>.",
+                '✍️ <b>កាលបរិច្ឆេទរបាយការណ៍ PDF ផ្ទាល់ខ្លួន</b>\n\nសូមវាយកាលបរិច្ឆេទជា <code>YYYY-MM-DD</code>។\nឧទាហរណ៍៖ <code>2026-06-29</code>\n\nអ្នកក៏អាចវាយ <code>today</code>, <code>yesterday</code>, <code>7</code> ឬ <code>30</code>។',
                 parse_mode="HTML",
                 reply_markup=get_admin_action_kb(),
                 disable_web_page_preview=True,
@@ -23279,19 +23543,15 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
     if data.startswith("admin_perf_set:"):
         key = data.split(":", 1)[1].strip()
         if key not in BOT_PERFORMANCE_SETTING_SPECS:
-            await query.answer("Unknown setting", show_alert=True)
+            await query.answer('មិនស្គាល់ការកំណត់នេះ', show_alert=True)
             return
         with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
             ACTIVE_ADMIN_CONVERSATIONS[user_id] = {"state": "awaiting_bot_perf_value", "key": key, "ts": time.monotonic()}
         spec = BOT_PERFORMANCE_SETTING_SPECS[key]
         settings, _status = await get_bot_settings_async(force=True)
-        await query.answer("Send new value", show_alert=False)
+        await query.answer('ផ្ញើតម្លៃថ្មី', show_alert=False)
         await safe_send(lambda: query.message.edit_text(
-            f"⚡ <b>{html.escape(str(spec.get('label', key)))}</b>\n\n"
-            f"Current: <code>{html.escape(_setting_raw_from(settings, key, BOT_SETTING_DEFAULTS.get(key, '')))}</code>\n"
-            f"Allowed: <code>{html.escape(str(spec.get('min', 'off/on')))} - {html.escape(str(spec.get('max', '')))}</code>\n"
-            f"Help: {html.escape(str(spec.get('help', '')))}\n\n"
-            "Send new value now. Use <code>/cancel</code> to cancel.",
+            f"⚡ <b>{html.escape(str(spec.get('label', key)))}</b>\n\nតម្លៃបច្ចុប្បន្ន៖ <code>{html.escape(_setting_raw_from(settings, key, BOT_SETTING_DEFAULTS.get(key, '')))}</code>\nតម្លៃអនុញ្ញាត៖ <code>{html.escape(str(spec.get('min', 'off/on')))} - {html.escape(str(spec.get('max', '')))}</code>\nជំនួយ៖ {html.escape(str(spec.get('help', '')))}\n\nសូមផ្ញើតម្លៃថ្មីឥឡូវនេះ។ ប្រើ <code>/cancel</code> ដើម្បីបោះបង់។",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_perf")]]),
             disable_web_page_preview=True,
@@ -23301,7 +23561,7 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
     if data.startswith("admin_set:"):
         key = data.split(":", 1)[1].strip()
         if key not in BOT_FEATURE_SETTING_KEYS:
-            await query.answer("Use Performance Settings for this value.", show_alert=True)
+            await query.answer('សូមកែតម្លៃនេះក្នុងការកំណត់ប្រសិទ្ធភាព។', show_alert=True)
             return
         settings, _status = await get_bot_settings_async(force=True)
         current = _setting_bool_from(settings, key, True)
@@ -23376,7 +23636,7 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
 
     if data == "admin_errors_clear":
         await safe_send(lambda: query.message.edit_text(
-            "⚠️ <b>Clear Error Center?</b>\n\nThis removes all captured runtime error entries from memory. Use this only after reviewing repeated groups.",
+            '⚠️ <b>សម្អាតមជ្ឈមណ្ឌលកំហុស?</b>\n\nសកម្មភាពនេះនឹងលុបកំណត់ត្រាកំហុសពេលដំណើរការទាំងអស់ចេញពីអង្គចងចាំ។ សូមប្រើតែបន្ទាប់ពីពិនិត្យក្រុមកំហុសដដែលៗរួច។',
             parse_mode="HTML",
             reply_markup=get_admin_confirm_kb("clear_errors", back="admin_errors"),
             disable_web_page_preview=True,
@@ -23481,7 +23741,7 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("sched_ok:"):
         row_id = _callback_int_arg(data, "sched_ok:")
         if row_id is None:
-            await safe_send(lambda: query.message.reply_text("❌ Invalid schedule id."))
+            await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
             return
 
         ok, reason, row = await loop.run_in_executor(None, db_sched_confirm, row_id, user_id)
@@ -23507,7 +23767,7 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.edit_reply_markup(reply_markup=None)
         status_note = "បានបញ្ជាក់រួចហើយ" if reason == "already_confirmed" else "បានបញ្ជាក់"
         await safe_send(lambda: query.message.reply_text(
-            f"✅ <b>Schedule #{row_id} {status_note}!</b>\n⏰ នឹង Broadcast នៅ {dt_str}",
+            f'✅ <b>កាលវិភាគ #{row_id} {status_note}!</b>\n⏰ នឹងផ្សាយសារនៅ {dt_str}',
             parse_mode="HTML",
         ))
         return
@@ -23515,11 +23775,11 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("sched_no:"):
         row_id = _callback_int_arg(data, "sched_no:")
         if row_id is None:
-            await safe_send(lambda: query.message.reply_text("❌ Invalid schedule id."))
+            await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
             return
         row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
         if not row:
-            await safe_send(lambda: query.message.reply_text("❌ រកមិនឃើញ Schedule ។"))
+            await safe_send(lambda: query.message.reply_text('❌ រកកាលវិភាគមិនឃើញ។'))
             return
         if int(row.get("admin_id") or 0) != int(user_id):
             await safe_send(lambda: query.message.reply_text("⛔ Schedule នេះមិនមែនជារបស់អ្នកទេ។"))
@@ -23553,11 +23813,11 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("sched_view:"):
         row_id = _callback_int_arg(data, "sched_view:")
         if row_id is None:
-            await safe_send(lambda: query.message.reply_text("❌ Invalid schedule id."))
+            await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
             return
         row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
         if not row:
-            await safe_send(lambda: query.message.reply_text("❌ រកមិនឃើញ Schedule ។"))
+            await safe_send(lambda: query.message.reply_text('❌ រកកាលវិភាគមិនឃើញ។'))
             return
         if int(row.get("admin_id") or 0) != int(user_id):
             await safe_send(lambda: query.message.reply_text("⛔ Schedule នេះមិនមែនជារបស់អ្នកទេ។"))
@@ -23572,7 +23832,7 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("sched_edit_time:"):
         row_id = _callback_int_arg(data, "sched_edit_time:")
         if row_id is None:
-            await safe_send(lambda: query.message.reply_text("❌ Invalid schedule id."))
+            await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
             return
         row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
         ok, reason = _sched_can_edit(row, user_id)
@@ -23582,12 +23842,7 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["sched_state"] = SCHED_EDIT_WAIT_TIME
         context.user_data["sched_edit_row_id"] = row_id
         await safe_send(lambda: query.message.reply_text(
-            f"✏️ <b>Edit Schedule #{row_id} Time</b>\n\n"
-            "ផ្ញើពេលវេលាថ្មីតាមម៉ោង Phnom Penh (ICT, UTC+7)។\n"
-            "Format: <code>YYYY-MM-DD HH:MM AM/PM</code> or <code>YYYY-MM-DD HH:MM</code>\n"
-            "Timezone: Phnom Penh, Cambodia — ICT (UTC+7)\n"
-            "Example: <code>2026-12-25 09:00 AM</code> or <code>2026-12-25 21:00</code>\n\n"
-            "វាយ /cancel ដើម្បីបោះបង់ edit។",
+            f'✏️ <b>កែម៉ោងកាលវិភាគ #{row_id}</b>\n\nសូមផ្ញើពេលវេលាថ្មីតាមម៉ោងភ្នំពេញ (ICT, UTC+7)។\nទម្រង់៖ <code>YYYY-MM-DD HH:MM AM/PM</code> ឬ <code>YYYY-MM-DD HH:MM</code>\nតំបន់ម៉ោង៖ ភ្នំពេញ កម្ពុជា — ICT (UTC+7)\nឧទាហរណ៍៖ <code>2026-12-25 09:00 AM</code> ឬ <code>2026-12-25 21:00</code>\n\nវាយ /cancel ដើម្បីបោះបង់ការកែសម្រួល។',
             parse_mode="HTML",
         ))
         return
@@ -23595,7 +23850,7 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("sched_edit_text:"):
         row_id = _callback_int_arg(data, "sched_edit_text:")
         if row_id is None:
-            await safe_send(lambda: query.message.reply_text("❌ Invalid schedule id."))
+            await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
             return
         row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
         ok, reason = _sched_can_edit(row, user_id)
@@ -23615,7 +23870,7 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("sched_edit_photo:"):
         row_id = _callback_int_arg(data, "sched_edit_photo:")
         if row_id is None:
-            await safe_send(lambda: query.message.reply_text("❌ Invalid schedule id."))
+            await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
             return
         row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
         ok, reason = _sched_can_edit(row, user_id)
@@ -23625,8 +23880,7 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["sched_state"] = SCHED_EDIT_WAIT_PHOTO
         context.user_data["sched_edit_row_id"] = row_id
         await safe_send(lambda: query.message.reply_text(
-            f"🖼 <b>Replace Schedule #{row_id} Photo</b>\n\n"
-            "ផ្ញើរូបភាពថ្មី + Caption (optional)។ វាយ /cancel ដើម្បីបោះបង់ edit។",
+            f'🖼 <b>ប្ដូររូបភាពកាលវិភាគ #{row_id}</b>\n\nសូមផ្ញើរូបភាពថ្មី + ចំណងជើង (មិនចាំបាច់)។ វាយ /cancel ដើម្បីបោះបង់ការកែសម្រួល។',
             parse_mode="HTML",
         ))
         return
@@ -23634,11 +23888,11 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("sched_cancel_confirm:"):
         row_id = _callback_int_arg(data, "sched_cancel_confirm:")
         if row_id is None:
-            await safe_send(lambda: query.message.reply_text("❌ Invalid schedule id."))
+            await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
             return
         row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
         if not row or int(row.get("admin_id") or 0) != int(user_id):
-            await safe_send(lambda: query.message.reply_text("⛔ អ្នកមិនមានសិទ្ធិ cancel Schedule នេះ។"))
+            await safe_send(lambda: query.message.reply_text('⛔ អ្នកមិនមានសិទ្ធិបោះបង់កាលវិភាគនេះទេ។'))
             return
         if row.get("status") not in (SCHED_STATUS_DRAFT, SCHED_STATUS_PENDING):
             st = html.escape(str(row.get("status") or "?"))
@@ -23651,7 +23905,7 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with suppress(Exception):
             await query.message.edit_reply_markup(reply_markup=None)
         await safe_send(lambda: query.message.reply_text(
-            f"✅ Schedule <b>#{row_id}</b> បានបោះបង់។", parse_mode="HTML"
+            f'✅ កាលវិភាគ <b>#{row_id}</b> បានបោះបង់។', parse_mode="HTML"
         ))
 
 # ---------------------------------------------------------------------------
@@ -23767,11 +24021,11 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     filename = document.file_name or ""
 
     if _is_subtitle_file(filename):
-        status_msg = await safe_send(lambda: msg.reply_text("🎬 កំពុងអាន subtitle/text file..."))
+        status_msg = await safe_send(lambda: msg.reply_text('🎬 កំពុងអានឯកសារចំណងជើងរង/អត្ថបទ...'))
         try:
             if document.file_size and document.file_size > MAX_SUBTITLE_BYTES:
                 await safe_send(lambda: msg.reply_text(
-                    f"❌ File ធំពេក។ Max {MAX_SUBTITLE_BYTES // 1024 // 1024} MB."
+                    f'❌ ឯកសារធំពេក។ អតិបរមា {MAX_SUBTITLE_BYTES // 1024 // 1024} MB។'
                 ))
                 return
 
@@ -23786,11 +24040,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             preview = cleaned[:1200] + ("\n\n..." if len(cleaned) > 1200 else "")
             await safe_send(lambda: msg.reply_text(
-                "🎬 <b>Subtitle/Text detected</b>\n\n"
-                f"📄 File: <code>{html.escape(filename)}</code>\n"
-                f"🔤 Characters: <b>{len(cleaned)}</b>\n\n"
-                f"<blockquote>{html.escape(preview)}</blockquote>\n\n"
-                "ចុច ▶️ អាន ដើម្បីបំលែងទៅសំឡេង។",
+                f'🎬 <b>បានរកឃើញចំណងជើងរង/អត្ថបទ</b>\n\n📄 ឯកសារ៖ <code>{html.escape(filename)}</code>\n🔤 ចំនួនតួអក្សរ៖ <b>{len(cleaned)}</b>\n\n<blockquote>{html.escape(preview)}</blockquote>\n\nចុច ▶️ អាន ដើម្បីបំលែងទៅសំឡេង។',
                 parse_mode="HTML",
                 reply_markup=get_ocr_confirm_kb(msg.message_id),
             ))
@@ -23805,7 +24055,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         except Exception as e:
             logger.error(f"subtitle reader error: {e}", exc_info=True)
-            await safe_send(lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការអាន subtitle/text file។"))
+            await safe_send(lambda: msg.reply_text('❌ មានបញ្ហាក្នុងការអានឯកសារចំណងជើងរង/អត្ថបទ។'))
         finally:
             if status_msg:
                 with suppress(Exception):
@@ -23813,7 +24063,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await safe_send(lambda: msg.reply_text(
-        "❌ File នេះមិនទាន់ support ទេ។\n\nSupport subtitle/text:\n• .srt\n• .vtt\n• .txt"
+        '❌ ឯកសារប្រភេទនេះមិនទាន់ត្រូវបានគាំទ្រទេ។\n\nប្រភេទឯកសារចំណងជើងរង/អត្ថបទដែលគាំទ្រ៖\n• .srt\n• .vtt\n• .txt'
     ))
 
 
@@ -23824,7 +24074,7 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
     try:
         src_msg_id = int(data.split(":")[1])
     except Exception:
-        await safe_send(lambda: query.message.reply_text("❌ Invalid document cache id."))
+        await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់ឯកសារបណ្ដោះអាសន្នមិនត្រឹមត្រូវ។'))
         return
     if query.message is None:
         return
@@ -24027,17 +24277,13 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["users_search_results"] = results
         if not results:
             await safe_send(lambda: update.message.reply_text(
-                "🔎 <b>User Search</b>\n\n"
-                f"No users found for: <code>{html.escape(query_text)}</code>",
+                f'🔎 <b>ស្វែងរកអ្នកប្រើប្រាស់</b>\n\nរកមិនឃើញអ្នកប្រើប្រាស់សម្រាប់៖ <code>{html.escape(query_text)}</code>',
                 parse_mode="HTML",
                 reply_markup=get_user_search_prompt_kb(),
             ))
             return
         await safe_send(lambda: update.message.reply_text(
-            "🔎 <b>User Search Results</b>\n\n"
-            f"Query: <code>{html.escape(query_text)}</code>\n"
-            f"Found: <b>{len(results)}</b> user(s)\n\n"
-            "Select a user to view details.",
+            f'🔎 <b>លទ្ធផលស្វែងរកអ្នកប្រើប្រាស់</b>\n\nពាក្យស្វែងរក៖ <code>{html.escape(query_text)}</code>\nរកឃើញ៖ <b>{len(results)}</b> នាក់\n\nសូមជ្រើសរើសអ្នកប្រើប្រាស់ ដើម្បីមើលព័ត៌មានលម្អិត។',
             parse_mode="HTML",
             reply_markup=get_user_search_page_kb(results, page=0),
         ))
@@ -24060,14 +24306,14 @@ async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args     = context.args or []
     if not args or not args[0].isdigit():
         await safe_send(lambda: update.message.reply_text(
-            "❌ Usage: /chat <user_id>\nឬប្រើ /users ដើម្បីជ្រើស user ។"
+            '❌ របៀបប្រើ៖ /chat <user_id>\nឬប្រើ /users ដើម្បីជ្រើសអ្នកប្រើប្រាស់។'
         ))
         return
     target_id = int(args[0])
     exists    = await asyncio.get_running_loop().run_in_executor(None, user_exists_in_db, target_id)
     if not exists:
         await safe_send(lambda: update.message.reply_text(
-            f"❌ User <code>{target_id}</code> មិនមាននៅក្នុង Database ។", parse_mode="HTML"
+            f'❌ អ្នកប្រើប្រាស់ <code>{target_id}</code> មិនមាននៅក្នុងមូលដ្ឋានទិន្នន័យទេ។', parse_mode="HTML"
         ))
         return
     await _open_chat_session(context.bot, admin_id, target_id, context)
@@ -24087,7 +24333,7 @@ async def cmd_endchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: update.message.reply_text("ℹ️ អ្នកមិនទាន់ open Chat ណាមួយទេ។"))
         return
     await safe_send(lambda: update.message.reply_text(
-        f"✅ Chat ជាមួយ User <code>{target_id}</code> បានបញ្ចប់។", parse_mode="HTML"
+        f'✅ បានបញ្ចប់ការជជែកជាមួយអ្នកប្រើប្រាស់ <code>{target_id}</code>។', parse_mode="HTML"
     ))
     with suppress(Exception):
         await context.bot.send_message(chat_id=target_id, text="ℹ️ Admin បានបញ្ចប់ Session Chat ។")
@@ -24113,19 +24359,14 @@ async def _show_user_search_results(query, context: ContextTypes.DEFAULT_TYPE, p
     page = _clamp_users_page(results, page)
     if not results:
         await safe_send(lambda: query.message.edit_text(
-            "🔎 <b>User Search</b>\n\n"
-            f"No users found for: <code>{html.escape(search_query)}</code>\n\n"
-            "Press 🔎 New Search or return to all users.",
+            f'🔎 <b>ស្វែងរកអ្នកប្រើប្រាស់</b>\n\nរកមិនឃើញអ្នកប្រើប្រាស់សម្រាប់៖ <code>{html.escape(search_query)}</code>\n\nចុច 🔎 ស្វែងរកថ្មី ឬត្រឡប់ទៅអ្នកប្រើប្រាស់ទាំងអស់។',
             parse_mode="HTML",
             reply_markup=get_user_search_prompt_kb(),
         ))
         return
 
     await safe_send(lambda: query.message.edit_text(
-        "🔎 <b>User Search Results</b>\n\n"
-        f"Query: <code>{html.escape(search_query)}</code>\n"
-        f"Found: <b>{len(results)}</b> user(s)\n\n"
-        "Select a user to view details.",
+        f'🔎 <b>លទ្ធផលស្វែងរកអ្នកប្រើប្រាស់</b>\n\nពាក្យស្វែងរក៖ <code>{html.escape(search_query)}</code>\nរកឃើញ៖ <b>{len(results)}</b> នាក់\n\nសូមជ្រើសរើសអ្នកប្រើប្រាស់ ដើម្បីមើលព័ត៌មានលម្អិត។',
         parse_mode="HTML",
         reply_markup=get_user_search_page_kb(results, page=page),
     ))
@@ -24170,7 +24411,7 @@ async def _handle_user_search_text(update: Update, context: ContextTypes.DEFAULT
 
     if not query_text:
         await safe_send(lambda: msg.reply_text(
-            "⚠️ Search text is empty. Press /users and try again.",
+            '⚠️ ពាក្យស្វែងរកទទេ។ សូមចុច /users ហើយព្យាយាមម្ដងទៀត។',
             reply_markup=get_user_search_prompt_kb(),
         ))
         return True
@@ -24184,19 +24425,14 @@ async def _handle_user_search_text(update: Update, context: ContextTypes.DEFAULT
 
     if not results:
         await safe_send(lambda: msg.reply_text(
-            "🔎 <b>User Search</b>\n\n"
-            f"No users found for: <code>{html.escape(query_text)}</code>\n\n"
-            "Search supports Telegram user ID and username.",
+            f'🔎 <b>ស្វែងរកអ្នកប្រើប្រាស់</b>\n\nរកមិនឃើញអ្នកប្រើប្រាស់សម្រាប់៖ <code>{html.escape(query_text)}</code>\n\nការស្វែងរកគាំទ្រលេខសម្គាល់ និងឈ្មោះអ្នកប្រើប្រាស់ Telegram។',
             parse_mode="HTML",
             reply_markup=get_user_search_prompt_kb(),
         ))
         return True
 
     await safe_send(lambda: msg.reply_text(
-        "🔎 <b>User Search Results</b>\n\n"
-        f"Query: <code>{html.escape(query_text)}</code>\n"
-        f"Found: <b>{len(results)}</b> user(s)\n\n"
-        "Select a user to view details.",
+        f'🔎 <b>លទ្ធផលស្វែងរកអ្នកប្រើប្រាស់</b>\n\nពាក្យស្វែងរក៖ <code>{html.escape(query_text)}</code>\nរកឃើញ៖ <b>{len(results)}</b> នាក់\n\nសូមជ្រើសរើសអ្នកប្រើប្រាស់ ដើម្បីមើលព័ត៌មានលម្អិត។',
         parse_mode="HTML",
         reply_markup=get_user_search_page_kb(results, page=0),
     ))
@@ -24229,7 +24465,7 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             return int(default)
 
     async def _invalid_callback() -> None:
-        await safe_send(lambda: query.message.reply_text("⚠️ Invalid or expired button data. Please refresh this panel."))
+        await safe_send(lambda: query.message.reply_text('⚠️ ទិន្នន័យប៊ូតុងមិនត្រឹមត្រូវ ឬផុតកំណត់។ សូមផ្ទុកផ្ទាំងនេះឡើងវិញ។'))
 
     try:
         if data == "users_close":
@@ -24273,13 +24509,7 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if data == "users_search":
             context.user_data["user_search_state"] = USER_SEARCH_WAIT_QUERY
             await safe_send(lambda: query.message.edit_text(
-                "🔎 <b>Search User</b>\n\n"
-                "Send a Telegram user ID or username.\n\n"
-                "Examples:\n"
-                "<code>1272791365</code>\n"
-                "<code>heng</code>\n"
-                "<code>@username</code>\n\n"
-                "Use /cancel to stop search.",
+                '🔎 <b>ស្វែងរកអ្នកប្រើប្រាស់</b>\n\nសូមផ្ញើលេខសម្គាល់អ្នកប្រើប្រាស់ Telegram ឬឈ្មោះអ្នកប្រើប្រាស់។\n\nឧទាហរណ៍៖\n<code>1272791365</code>\n<code>heng</code>\n<code>@username</code>\n\nប្រើ /cancel ដើម្បីបញ្ឈប់ការស្វែងរក។',
                 parse_mode="HTML",
                 reply_markup=get_user_search_prompt_kb(),
             ))
@@ -24295,8 +24525,7 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             users = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, get_all_users_with_names)
             page = _clamp_users_page(users, page)
             await safe_send(lambda: query.message.edit_text(
-                f"👥 <b>User Management ({len(users)} users)</b>\n"
-                "Select a user, or press 🔎 Search User to find by ID/username.",
+                f'👥 <b>ការគ្រប់គ្រងអ្នកប្រើប្រាស់ ({len(users)} នាក់)</b>\nសូមជ្រើសរើសអ្នកប្រើប្រាស់ ឬចុច 🔎 ស្វែងរកអ្នកប្រើប្រាស់ ដើម្បីស្វែងរកតាមលេខសម្គាល់ ឬឈ្មោះអ្នកប្រើប្រាស់។',
                 parse_mode="HTML",
                 reply_markup=get_users_page_kb(users, page=page),
             ))
@@ -24336,7 +24565,7 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             exists = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: user_exists_in_db(target_id))
             if not exists:
                 await safe_send(lambda: query.message.edit_text(
-                    f"❌ User <code>{target_id}</code> មិនមាននៅក្នុង Database ។",
+                    f'❌ អ្នកប្រើប្រាស់ <code>{target_id}</code> មិនមាននៅក្នុងមូលដ្ឋានទិន្នន័យទេ។',
                     parse_mode="HTML",
                     reply_markup=get_admin_dashboard_kb(),
                 ))
@@ -24416,7 +24645,7 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as exc:
         logger.error("users_page_callback failed [data=%s]: %s", data, exc, exc_info=True)
         with suppress(Exception):
-            await safe_send(lambda: query.message.reply_text("⚠️ Admin user panel error. Please refresh and try again."))
+            await safe_send(lambda: query.message.reply_text('⚠️ ផ្ទាំងអ្នកប្រើប្រាស់មានបញ្ហា។ សូមផ្ទុកឡើងវិញ ហើយព្យាយាមម្ដងទៀត។'))
 
 async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
     async def _do():
@@ -24593,17 +24822,7 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         await safe_send(lambda: msg.reply_text(
-            "✅ <b>New AI API key created</b>\n\n"
-            "Copy it now. It will not be shown again.\n\n"
-            f"<code>{html.escape(raw_key)}</code>\n\n"
-            f"Prefix: <code>{html.escape(str(row.get('key_prefix') or _api_key_prefix(raw_key)))}</code>\n"
-            f"Storage: <b>{html.escape(storage)}</b>\n\n"
-            "Example:\n"
-            "<pre>curl -X POST https://YOUR-APP.onrender.com/ai-assistant \\\n"
-            "  -H 'Content-Type: application/json' \\\n"
-            f"  -H 'X-Api-Key: {html.escape(raw_key)}' \\\n"
-            "  -d '{\"message\":\"Hello\"}'</pre>"
-            f"{warning}",
+            f"""✅ <b>បានបង្កើតសោ API សម្រាប់ AI ថ្មី</b>\n\nសូមចម្លងសោនេះឥឡូវនេះ។ វានឹងមិនត្រូវបានបង្ហាញម្ដងទៀតទេ។\n\n<code>{html.escape(raw_key)}</code>\n\nបុព្វបទ៖ <code>{html.escape(str(row.get('key_prefix') or _api_key_prefix(raw_key)))}</code>\nកន្លែងរក្សាទុក៖ <b>{html.escape(storage)}</b>\n\nឧទាហរណ៍៖\n<pre>curl -X POST https://YOUR-APP.onrender.com/ai-assistant \\\n  -H 'Content-Type: application/json' \\\n  -H 'X-Api-Key: {html.escape(raw_key)}' \\\n  -d '{{"message":"Hello"}}'</pre>{warning}""",
             parse_mode="HTML",
             reply_markup=get_api_admin_kb(),
             disable_web_page_preview=True,
@@ -24617,7 +24836,7 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error("/api list failed: %s", exc, exc_info=True)
             error_text = html.escape(str(exc)[:3500])
             await safe_send(lambda: msg.reply_text(
-                f"❌ Cannot list API keys.\n<pre>{error_text}</pre>",
+                f'❌ មិនអាចបង្ហាញបញ្ជីសោ API បានទេ។\n<pre>{error_text}</pre>',
                 parse_mode="HTML",
                 reply_markup=get_api_admin_kb(),
             ))
@@ -24625,7 +24844,7 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not rows:
             await safe_send(lambda: msg.reply_text(
-                "ℹ️ No API keys found. Press <b>➕ Create API Key</b> or use <code>/api create</code>.",
+                'ℹ️ មិនមានសោ API ទេ។ សូមចុច <b>➕ បង្កើតសោ API</b> ឬប្រើ <code>/api create</code>។',
                 parse_mode="HTML",
                 reply_markup=get_api_admin_kb(),
             ))
@@ -24644,8 +24863,7 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "revoke":
         if len(args) < 2:
             await safe_send(lambda: msg.reply_text(
-                "⚠️ Usage: <code>/api revoke KEY_PREFIX_OR_ID</code>\n\n"
-                "Or press <b>📋 List Keys</b> and revoke with buttons.",
+                '⚠️ របៀបប្រើ៖ <code>/api revoke KEY_PREFIX_OR_ID</code>\n\nឬចុច <b>📋 បញ្ជីសោ API</b> ហើយដកសិទ្ធិតាមប៊ូតុង។',
                 parse_mode="HTML",
                 reply_markup=get_api_admin_kb(),
             ))
@@ -24661,7 +24879,7 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error("/api revoke failed: %s", exc, exc_info=True)
             error_text = html.escape(str(exc)[:3500])
             await safe_send(lambda: msg.reply_text(
-                f"❌ Cannot revoke API key.\n<pre>{error_text}</pre>",
+                f'❌ មិនអាចដកសិទ្ធិសោ API បានទេ។\n<pre>{error_text}</pre>',
                 parse_mode="HTML",
                 reply_markup=get_api_admin_kb(),
             ))
@@ -24669,7 +24887,7 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if ok:
             await safe_send(lambda: msg.reply_text(
-                f"✅ API key revoked: <code>{html.escape(info)}</code>",
+                f'✅ បានដកសិទ្ធិសោ API៖ <code>{html.escape(info)}</code>',
                 parse_mode="HTML",
                 reply_markup=get_api_admin_kb(),
             ))
@@ -24767,11 +24985,7 @@ async def _api_create_from_button(query, user_id: int) -> None:
         err = str(e)
         short_err = err[:1800]
         await safe_send(lambda: query.message.reply_text(
-            "❌ <b>Cannot create API key</b>\n\n"
-            "Usually this means the <code>ai_api_keys</code> table is not created yet, "
-            "or <code>SUPABASE_SERVICE_ROLE_KEY</code> is missing on the server.\n\n"
-            "Press <b>🧩 Setup SQL</b>, run it in Supabase, then redeploy/restart.\n\n"
-            f"<pre>{html.escape(short_err)}</pre>",
+            f'❌ <b>មិនអាចបង្កើតសោ API បានទេ</b>\n\nជាទូទៅ វាមានន័យថាតារាង <code>ai_api_keys</code> មិនទាន់ត្រូវបានបង្កើត ឬ <code>SUPABASE_SERVICE_ROLE_KEY</code> មិនមាននៅលើម៉ាស៊ីនមេ។\n\nចុច <b>🧩 ដំឡើង SQL</b> ដំណើរការវាក្នុង Supabase ហើយដាក់ប្រើ ឬចាប់ផ្ដើមប្រព័ន្ធឡើងវិញ។\n\n<pre>{html.escape(short_err)}</pre>',
             parse_mode="HTML",
             reply_markup=get_api_admin_kb(),
         ))
@@ -24785,17 +24999,7 @@ async def _api_create_from_button(query, user_id: int) -> None:
         )
 
     await safe_send(lambda: query.message.reply_text(
-        "✅ <b>New AI API key created</b>\n\n"
-        "Copy it now. It will not be shown again.\n\n"
-        f"<code>{html.escape(raw_key)}</code>\n\n"
-        f"Prefix: <code>{html.escape(str(row.get('key_prefix') or _api_key_prefix(raw_key)))}</code>\n"
-        f"Storage: <b>{html.escape(storage)}</b>\n\n"
-        "Use it like this:\n"
-        "<pre>curl -X POST https://YOUR-APP.onrender.com/ai-assistant \\\n"
-        "  -H 'Content-Type: application/json' \\\n"
-        f"  -H 'X-Api-Key: {html.escape(raw_key)}' \\\n"
-        "  -d '{\"message\":\"Hello\"}'</pre>"
-        f"{warning}",
+        f"""✅ <b>បានបង្កើតសោ API សម្រាប់ AI ថ្មី</b>\n\nសូមចម្លងសោនេះឥឡូវនេះ។ វានឹងមិនត្រូវបានបង្ហាញម្ដងទៀតទេ។\n\n<code>{html.escape(raw_key)}</code>\n\nបុព្វបទ៖ <code>{html.escape(str(row.get('key_prefix') or _api_key_prefix(raw_key)))}</code>\nកន្លែងរក្សាទុក៖ <b>{html.escape(storage)}</b>\n\nរបៀបប្រើ៖\n<pre>curl -X POST https://YOUR-APP.onrender.com/ai-assistant \\\n  -H 'Content-Type: application/json' \\\n  -H 'X-Api-Key: {html.escape(raw_key)}' \\\n  -d '{{"message":"Hello"}}'</pre>{warning}""",
         parse_mode="HTML",
         reply_markup=get_api_admin_kb(),
         disable_web_page_preview=True,
@@ -24813,9 +25017,7 @@ async def _api_list_from_button(query) -> None:
         logger.error("api_list button failed: %s", exc, exc_info=True)
         error_text = html.escape(str(exc)[:1800])
         await safe_send(lambda: query.message.edit_text(
-            "❌ <b>Cannot list API keys</b>\n\n"
-            "Run setup SQL first, then ensure <code>SUPABASE_SERVICE_ROLE_KEY</code> is set.\n\n"
-            f"<pre>{error_text}</pre>",
+            f'❌ <b>មិនអាចបង្ហាញបញ្ជីសោ API បានទេ</b>\n\nសូមដំណើរការ SQL សម្រាប់ដំឡើងជាមុន ហើយត្រូវប្រាកដថា <code>SUPABASE_SERVICE_ROLE_KEY</code> ត្រូវបានកំណត់។\n\n<pre>{error_text}</pre>',
             parse_mode="HTML",
             reply_markup=get_api_admin_kb(),
         ))
@@ -24823,8 +25025,7 @@ async def _api_list_from_button(query) -> None:
 
     if not rows:
         await safe_send(lambda: query.message.edit_text(
-            "📋 <b>AI API Keys</b>\n\n"
-            "No API keys found yet. Press <b>➕ Create API Key</b> after setup is ready.",
+            '📋 <b>សោ API សម្រាប់ AI</b>\n\nមិនទាន់មានសោ API ទេ។ បន្ទាប់ពីការដំឡើងរួច សូមចុច <b>➕ បង្កើតសោ API</b>។',
             parse_mode="HTML",
             reply_markup=get_api_admin_kb(),
         ))
@@ -24841,7 +25042,7 @@ async def _api_list_from_button(query) -> None:
 
 async def _cb_api_dashboard(query, user_id: int, context: ContextTypes.DEFAULT_TYPE, data: str):
     if not _is_admin(user_id):
-        await safe_send(lambda: query.message.reply_text("⛔ Admin only."))
+        await safe_send(lambda: query.message.reply_text('⛔ សម្រាប់អ្នកគ្រប់គ្រងប៉ុណ្ណោះ។'))
         return
 
     if data in ("api_menu", "admin_api"):
@@ -24892,9 +25093,7 @@ async def _cb_api_dashboard(query, user_id: int, context: ContextTypes.DEFAULT_T
     if data.startswith("api_revoke:"):
         identifier = data.split(":", 1)[1].strip()
         await safe_send(lambda: query.message.edit_text(
-            "⚠️ <b>Confirm revoke API key</b>\n\n"
-            f"Key ID: <code>{html.escape(identifier)}</code>\n\n"
-            "After revoke, apps using this key cannot access <code>/ai-assistant</code>.",
+            f'⚠️ <b>បញ្ជាក់ការដកសិទ្ធិសោ API</b>\n\nលេខសម្គាល់សោ៖ <code>{html.escape(identifier)}</code>\n\nបន្ទាប់ពីដកសិទ្ធិ កម្មវិធីដែលប្រើសោនេះនឹងមិនអាចចូលប្រើ <code>/ai-assistant</code> បានទេ។',
             parse_mode="HTML",
             reply_markup=get_api_revoke_confirm_kb(identifier),
         ))
@@ -24912,8 +25111,7 @@ async def _cb_api_dashboard(query, user_id: int, context: ContextTypes.DEFAULT_T
             logger.error("api_revoke button failed: %s", exc, exc_info=True)
             error_text = html.escape(str(exc)[:1800])
             await safe_send(lambda: query.message.edit_text(
-                "❌ <b>Cannot revoke API key</b>\n\n"
-                f"<pre>{error_text}</pre>",
+                f'❌ <b>មិនអាចដកសិទ្ធិសោ API បានទេ</b>\n\n<pre>{error_text}</pre>',
                 parse_mode="HTML",
                 reply_markup=get_api_admin_kb(),
             ))
@@ -24922,7 +25120,7 @@ async def _cb_api_dashboard(query, user_id: int, context: ContextTypes.DEFAULT_T
         if ok:
             await _api_list_from_button(query)
             await safe_send(lambda: query.message.reply_text(
-                f"✅ API key revoked: <code>{html.escape(info)}</code>",
+                f'✅ បានដកសិទ្ធិសោ API៖ <code>{html.escape(info)}</code>',
                 parse_mode="HTML",
             ))
         else:
@@ -24944,14 +25142,7 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop.run_in_executor(_DB_EXECUTOR, db_sched_fetch_admin_pending, update.effective_user.id),
     )
     await safe_send(lambda: update.message.reply_text(
-        f"📊 <b>Bot Statistics</b>\n\n"
-        f"👥 អ្នកប្រើប្រាស់សរុប: <b>{len(user_ids)}</b>\n"
-        f"💬 Active Admin Chats: <b>{len(_admin_chat_target)}</b>\n"
-        f"📅 Scheduled (pending): <b>{len(pending_scheds)}</b>\n"
-        f"🔒 Active user locks: <b>{len(_user_locks)}</b>\n"
-        f"💭 History cache entries: <b>{len(_hist_cache)}</b>\n"
-        f"🔑 Dynamic API auth: <b>{'ON' if _dynamic_ai_auth_configured() else 'OFF'}</b>\n"
-        f"🤗 HF Model: <b>{HF_MODEL}</b>\nOCR: <b>{HF_OCR_MODEL}</b>",
+        f"📊 <b>ស្ថិតិបូត</b>\n\n👥 អ្នកប្រើប្រាស់សរុប៖ <b>{len(user_ids)}</b>\n💬 ការជជែកសកម្មរបស់អ្នកគ្រប់គ្រង៖ <b>{len(_admin_chat_target)}</b>\n📅 កាលវិភាគកំពុងរង់ចាំ៖ <b>{len(pending_scheds)}</b>\n🔒 សោអ្នកប្រើប្រាស់សកម្ម៖ <b>{len(_user_locks)}</b>\n💭 ចំនួនធាតុប្រវត្តិក្នុង Cache៖ <b>{len(_hist_cache)}</b>\n🔑 ការផ្ទៀងផ្ទាត់ API បែប Dynamic៖ <b>{('ON' if _dynamic_ai_auth_configured() else 'OFF')}</b>\n🤗 ម៉ូដែល HF៖ <b>{HF_MODEL}</b>\nOCR៖ <b>{HF_OCR_MODEL}</b>",
         parse_mode="HTML",
     ))
 
@@ -25033,9 +25224,9 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vox_state = context.user_data.pop("voxcpm2_state", None)
     if not _is_admin(uid):
         if vox_state:
-            await safe_send(lambda: update.message.reply_text("✅ VoxCPM2 setup cancelled."))
+            await safe_send(lambda: update.message.reply_text('✅ បានបោះបង់ការដំឡើង VoxCPM2។'))
         else:
-            await safe_send(lambda: update.message.reply_text("ℹ️ No operation to cancel."))
+            await safe_send(lambda: update.message.reply_text('ℹ️ មិនមានប្រតិបត្តិការដែលត្រូវបោះបង់ទេ។'))
         return
 
     # Preserve the old admin-chat notification behavior while still using the
@@ -25063,7 +25254,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ))
         return
 
-    await safe_send(lambda: update.message.reply_text("ℹ️ មិនមាន operation ត្រូវ cancel ទេ។"))
+    await safe_send(lambda: update.message.reply_text('ℹ️ មិនមានប្រតិបត្តិការដែលត្រូវបោះបង់ទេ។'))
 
 
 # ===========================================================================
@@ -25106,14 +25297,7 @@ async def cmd_security(update: Update, context: ContextTypes.DEFAULT_TYPE):
     blocked = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_is_blocked(int(user.id)))
     status = "blocked" if blocked else "active"
     await safe_send(lambda: update.effective_message.reply_text(
-        "🔐 <b>Security & Privacy</b>\n\n"
-        f"User ID: <code>{int(user.id)}</code>\n"
-        f"Status: <b>{html.escape(status)}</b>\n\n"
-        "✅ Admin commands are protected.\n"
-        "✅ Spam/flood protection is enabled.\n"
-        "✅ API keys are accepted from headers, not URL query strings by default.\n"
-        "✅ Use /clear to clear chat context.\n"
-        "🗑️ Use /deleteme to delete your saved bot history and preferences.",
+        f'🔐 <b>សុវត្ថិភាព និងឯកជនភាព</b>\n\nលេខសម្គាល់អ្នកប្រើប្រាស់៖ <code>{int(user.id)}</code>\nស្ថានភាព៖ <b>{html.escape(status)}</b>\n\n✅ ពាក្យបញ្ជារបស់អ្នកគ្រប់គ្រងត្រូវបានការពារ។\n✅ ការការពារ Spam និងការផ្ញើសារច្រើនពេកត្រូវបានបើក។\n✅ តាមលំនាំដើម សោ API ត្រូវទទួលពី Header មិនមែនពី URL Query String ទេ។\n✅ ប្រើ /clear ដើម្បីសម្អាតបរិបទការជជែក។\n🗑️ ប្រើ /deleteme ដើម្បីលុបប្រវត្តិបូត និងចំណូលចិត្តដែលបានរក្សាទុក។',
         parse_mode="HTML",
     ))
 
@@ -25122,13 +25306,7 @@ async def cmd_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_message:
         return
     await safe_send(lambda: update.effective_message.reply_text(
-        "🔒 <b>Privacy</b>\n\n"
-        "This bot stores only what it needs for preferences, cached text/audio workflow, "
-        "conversation context, admin safety, delivery logs, and—when VoxCPM2 is configured—"
-        "the reusable Telegram reference-audio file identifier plus your optional style instruction. "
-        "Raw clone-reference bytes are downloaded to temporary storage and sent to the configured VoxCPM2 service only during generation.\n\n"
-        "You can use /clear to remove current conversation context, or /deleteme to delete "
-        "your saved bot history and preferences from cache/database where configured.",
+        '🔒 <b>ឯកជនភាព</b>\n\nបូតនេះរក្សាទុកតែទិន្នន័យដែលចាំបាច់សម្រាប់ចំណូលចិត្ត ដំណើរការ Cache អត្ថបទ/សំឡេង បរិបទការសន្ទនា សុវត្ថិភាពអ្នកគ្រប់គ្រង កំណត់ហេតុការផ្ញើ និង—នៅពេលបានកំណត់ VoxCPM2—លេខសម្គាល់ឯកសារសំឡេងគំរូ Telegram ដែលអាចប្រើឡើងវិញ រួមជាមួយការណែនាំរចនាប័ទ្មសំឡេងដែលអ្នកអាចបញ្ចូល។ ទិន្នន័យសំឡេងគំរូដើមត្រូវបានទាញយកទៅកន្លែងបណ្ដោះអាសន្ន និងផ្ញើទៅសេវា VoxCPM2 ដែលបានកំណត់ តែក្នុងពេលបង្កើតសំឡេងប៉ុណ្ណោះ។\n\nអ្នកអាចប្រើ /clear ដើម្បីលុបបរិបទការសន្ទនាបច្ចុប្បន្ន ឬ /deleteme ដើម្បីលុបប្រវត្តិបូត និងចំណូលចិត្តដែលបានរក្សាទុកពី Cache/មូលដ្ឋានទិន្នន័យ តាមការកំណត់របស់ប្រព័ន្ធ។',
         parse_mode="HTML",
     ))
 
@@ -25179,15 +25357,13 @@ async def cmd_delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     if _is_admin(int(user.id)) and "--confirm-admin" not in context.args:
         await safe_send(lambda: update.effective_message.reply_text(
-            "⚠️ Admin account detected. To delete your own admin-user data, run:\n"
-            "<code>/deleteme --confirm-admin</code>",
+            '⚠️ បានរកឃើញគណនីអ្នកគ្រប់គ្រង។ ដើម្បីលុបទិន្នន័យអ្នកប្រើប្រាស់របស់ខ្លួន សូមប្រើ៖\n<code>/deleteme --confirm-admin</code>',
             parse_mode="HTML",
         ))
         return
     await _delete_user_personal_data(int(user.id))
     await safe_send(lambda: update.effective_message.reply_text(
-        "✅ Your saved bot history, text cache, preferences, and VoxCPM2 reference profile were cleared.\n"
-        "Note: security block records and required delivery/audit logs may be retained by admins for abuse prevention."
+        '✅ បានសម្អាតប្រវត្តិបូត Cache អត្ថបទ ចំណូលចិត្ត និងទម្រង់សំឡេងគំរូ VoxCPM2 របស់អ្នក។\nសម្គាល់៖ កំណត់ត្រាបិទសិទ្ធិសុវត្ថិភាព និងកំណត់ហេតុការផ្ញើ/សវនកម្មចាំបាច់ អាចត្រូវរក្សាទុកដោយអ្នកគ្រប់គ្រង ដើម្បីការពារការប្រើប្រាស់ខុសគោលបំណង។'
     ))
 
 
@@ -25276,12 +25452,12 @@ async def _voxcpm2_accept_reference(
         return
     if file_size and file_size > VOXCPM2_MAX_REFERENCE_BYTES:
         await safe_send(lambda: msg.reply_text(
-            f"❌ Reference audio is too large. Max {VOXCPM2_MAX_REFERENCE_BYTES // 1024 // 1024}MB."
+            f'❌ ឯកសារសំឡេងគំរូធំពេក។ អតិបរមា {VOXCPM2_MAX_REFERENCE_BYTES // 1024 // 1024} MB។'
         ))
         return
     if duration and duration > VOXCPM2_MAX_REFERENCE_SECONDS:
         await safe_send(lambda: msg.reply_text(
-            f"❌ Reference audio is too long. Max {VOXCPM2_MAX_REFERENCE_SECONDS:g} seconds."
+            f'❌ សំឡេងគំរូវែងពេក។ អតិបរមា {VOXCPM2_MAX_REFERENCE_SECONDS:g} វិនាទី។'
         ))
         return
     profile = await _voxcpm2_profile_get(int(user.id))
@@ -25316,7 +25492,7 @@ async def _voxcpm2_save_control_text(update: Update, context: ContextTypes.DEFAU
         control = ""
     if len(control) > VOXCPM2_CONTROL_MAX_CHARS:
         await safe_send(lambda: msg.reply_text(
-            f"❌ Control Instruction is too long. Max {VOXCPM2_CONTROL_MAX_CHARS} characters."
+            f'❌ ការណែនាំសំឡេងវែងពេក។ អតិបរមា {VOXCPM2_CONTROL_MAX_CHARS} តួអក្សរ។'
         ))
         return
     profile = await _voxcpm2_profile_get(int(user.id))
@@ -25333,16 +25509,13 @@ async def _cb_voxcpm2(query, user_id: int, context, data: str) -> None:
     if action == "set_ref":
         context.user_data["voxcpm2_state"] = VOXCPM2_WAIT_REFERENCE
         await safe_send(lambda: query.message.reply_text(
-            "🎙 Send a Telegram voice message or upload WAV/MP3/OGG/FLAC audio.\n"
-            "Best result: one speaker, clean recording, 5–30 seconds. /cancel to stop."
+            '🎙 សូមផ្ញើសារជាសំឡេង Telegram ឬបញ្ចូលឯកសារ WAV/MP3/OGG/FLAC។\nដើម្បីបានលទ្ធផលល្អ សូមប្រើអ្នកនិយាយម្នាក់ សំឡេងច្បាស់ និងរយៈពេល ៥–៣០ វិនាទី។ ប្រើ /cancel ដើម្បីបោះបង់។'
         ))
         return
     if action == "set_control":
         context.user_data["voxcpm2_state"] = VOXCPM2_WAIT_CONTROL
         await safe_send(lambda: query.message.reply_text(
-            "🎛 Send the Control Instruction as text.\n"
-            "Examples: ‘warm and cheerful, slightly faster’ or ‘calm, slow, professional’.\n"
-            "Send ‘clear’ to remove it, or /cancel to stop."
+            '🎛 សូមផ្ញើការណែនាំសំឡេងជាអត្ថបទ។\nឧទាហរណ៍៖ “កក់ក្ដៅ រីករាយ និងលឿនបន្តិច” ឬ “ស្ងប់ស្ងាត់ យឺត និងមានវិជ្ជាជីវៈ”។\nផ្ញើ <code>clear</code> ដើម្បីលុប ឬប្រើ /cancel ដើម្បីបោះបង់។'
         ))
         return
     if action == "clear_control":
@@ -25429,11 +25602,7 @@ async def cmd_ttsmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     prefs = await get_user_prefs_async(user_id)
     await safe_send(lambda: update.message.reply_text(
-        "🤖 <b>ជ្រើសរើសម៉ូដែល TTS</b>\n\n"
-        "Auto: Khmer HF Space សម្រាប់ខ្មែរ និង Edge fallback\n"
-        "Khmer HF: ប្រើ mrrtmob/khmer-tts សម្រាប់អត្ថបទខ្មែរ\n"
-        "Edge: ប្រើ Microsoft Edge TTS គ្រប់ភាសា\n"
-        "VoxCPM2 Clone: Upload reference audio + optional style Control Instruction (/voxcpm2)",
+        '🤖 <b>ជ្រើសរើសម៉ូដែល TTS</b>\n\nស្វ័យប្រវត្តិ៖ ប្រើ Khmer HF Space សម្រាប់ភាសាខ្មែរ និងប្ដូរទៅ Edge ប្រសិនបើចាំបាច់\nKhmer HF៖ ប្រើ mrrtmob/khmer-tts សម្រាប់អត្ថបទខ្មែរ\nEdge៖ ប្រើ Microsoft Edge TTS សម្រាប់គ្រប់ភាសា\nVoxCPM2 Clone៖ បញ្ចូលសំឡេងគំរូ និងការណែនាំរចនាប័ទ្មសំឡេង (មិនចាំបាច់) តាម /voxcpm2',
         parse_mode="HTML",
         reply_markup=get_tts_model_kb(prefs.get("tts_model", "auto")),
     ))
@@ -25660,7 +25829,7 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not convert_enabled and not transcribe_enabled:
         _metric_inc("disabled_hits")
         await safe_send(lambda: msg.reply_text(
-            "⚠️ Audio → Voice និង Audio Transcribe ត្រូវបានបិទបណ្តោះអាសន្នដោយ Admin។"
+            '⚠️ មុខងារបម្លែងអូឌីយ៉ូទៅជាសំឡេង និងការបម្លែងអូឌីយ៉ូទៅជាអត្ថបទ ត្រូវបានបិទបណ្ដោះអាសន្នដោយអ្នកគ្រប់គ្រង។'
         ))
         return
 
@@ -25784,8 +25953,7 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif conversion_error:
             # Transcription succeeded, but make the requested conversion failure visible.
             await safe_send(lambda e=conversion_error: msg.reply_text(
-                "⚠️ Transcript បានជោគជ័យ ប៉ុន្តែ Audio → Voice បរាជ័យ។\n"
-                f"<code>{html.escape(str(e)[:700])}</code>",
+                f'⚠️ ការបម្លែងសំឡេងទៅជាអត្ថបទបានជោគជ័យ ប៉ុន្តែការបម្លែងអូឌីយ៉ូទៅជាសំឡេងបរាជ័យ។\n<code>{html.escape(str(e)[:700])}</code>',
                 parse_mode="HTML",
             ))
 
@@ -25831,7 +25999,7 @@ async def on_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if admin_id is not None:
         uname = user.username or user.first_name or str(user_id)
         await _fwd_user_to_admin(context.bot, admin_id, user_id, uname, msg)
-        await safe_send(lambda: msg.reply_text("✅ ផ្ញើដល់ Admin ។"))
+        await safe_send(lambda: msg.reply_text('✅ បានផ្ញើទៅអ្នកគ្រប់គ្រង។'))
 
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -25858,7 +26026,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if admin_id is not None:
         uname = user.username or user.first_name or str(user_id)
         await _fwd_user_to_admin(context.bot, admin_id, user_id, uname, msg)
-        await safe_send(lambda: msg.reply_text("✅ Voice ផ្ញើដល់ Admin ។"))
+        await safe_send(lambda: msg.reply_text('✅ បានផ្ញើសារជាសំឡេងទៅអ្នកគ្រប់គ្រង។'))
         return
 
     if context.user_data.get("voxcpm2_state") == VOXCPM2_WAIT_REFERENCE:
@@ -25879,7 +26047,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not _gemini:
-        await safe_send(lambda: msg.reply_text("❌ Gemini API មិន Activate ទេ។ សូម Set GEMINI_API_KEY ។"))
+        await safe_send(lambda: msg.reply_text('❌ Gemini API មិនទាន់បានបើកទេ។ សូមកំណត់ GEMINI_API_KEY។'))
         return
 
     if msg.voice.file_size and msg.voice.file_size > MAX_VOICE_BYTES:
@@ -25904,7 +26072,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         transcript = await transcribe_voice(ogg_path)
 
         if not transcript:
-            await safe_send(lambda: msg.reply_text("❌ រក Transcript មិនឃើញ។"))
+            await safe_send(lambda: msg.reply_text('❌ រកអត្ថបទដែលបានបម្លែងពីសំឡេងមិនឃើញ។'))
             return
 
         record_turn(user_id, "user", f"[Voice Transcript]: {transcript[:500]}")
@@ -25932,7 +26100,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"on_voice error: {e}")
         with suppress(Exception):
-            await safe_send(lambda: msg.reply_text("❌ មានបញ្ហាក្នុងការ Transcribe។"))
+            await safe_send(lambda: msg.reply_text('❌ មានបញ្ហាក្នុងការបម្លែងសំឡេងទៅជាអត្ថបទ។'))
     finally:
         await _stop_timer(stop_event, timer_task)
         _cleanup(ogg_path)
@@ -25986,11 +26154,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
                 if ok:
                     await safe_send(lambda: msg.reply_text(
-                        f"✅ ផ្ញើដល់ User <code>{target_id}</code> ។", parse_mode="HTML"
+                        f'✅ បានផ្ញើទៅអ្នកប្រើប្រាស់ <code>{target_id}</code> ។', parse_mode="HTML"
                     ))
                 else:
                     await safe_send(lambda: msg.reply_text(
-                        f"❌ User <code>{target_id}</code> blocked bot ។ Chat session បានបិទ។",
+                        f'❌ អ្នកប្រើប្រាស់ <code>{target_id}</code> បានបិទបូត។ វគ្គជជែកត្រូវបានបញ្ចប់។',
                         parse_mode="HTML",
                     ))
                     _close_session(user_id)
@@ -26429,7 +26597,7 @@ async def _cb_gender(query, user_id: int, context, data: str):
 async def _cb_tts_transcript(query, user_id: int, context, data: str):
     transcript_msg_id = _callback_int_arg(data, "tts_transcript:")
     if transcript_msg_id is None:
-        await safe_send(lambda: query.message.reply_text("❌ Invalid transcript id."))
+        await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់អត្ថបទសំឡេងមិនត្រឹមត្រូវ។'))
         return
     if query.message is None:
         return
@@ -26495,7 +26663,7 @@ async def _cb_audio_tts(query, user_id: int, context, data: str):
         return
     src_msg_id = _callback_int_arg(data, "audio_tts:")
     if src_msg_id is None:
-        await safe_send(lambda: query.message.reply_text("❌ Invalid audio transcript id."))
+        await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់អត្ថបទសំឡេងមិនត្រឹមត្រូវ។'))
         return
     chat_id    = query.message.chat.id
     full_text, prefs = await asyncio.gather(
@@ -26503,7 +26671,7 @@ async def _cb_audio_tts(query, user_id: int, context, data: str):
         get_user_prefs_async(user_id),
     )
     if not full_text:
-        await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទមិនឃើញ (cache expired)។"))
+        await safe_send(lambda: query.message.reply_text('❌ រកអត្ថបទមិនឃើញ ព្រោះ Cache បានផុតកំណត់។'))
         return
 
     if await _check_cooldown(query.message, user_id):
