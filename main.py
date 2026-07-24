@@ -71,10 +71,12 @@ from telegram.ext import (
 )
 try:
     from pydantic_settings import BaseSettings, SettingsConfigDict
+    _PYDANTIC_SETTINGS_AVAILABLE = True
 except Exception as exc:
     logging.getLogger(__name__).warning("Optional dependency pydantic-settings is not available; env fallback settings will be used: %s", exc)
     BaseSettings = object
     SettingsConfigDict = dict
+    _PYDANTIC_SETTINGS_AVAILABLE = False
 try:
     from supabase import create_client, Client
 except Exception as exc:
@@ -493,13 +495,37 @@ class AppSettings(BaseSettings):
     WEB_BROADCAST_QUEUE_MAXSIZE: int = 200
 
 try:
+    if not _PYDANTIC_SETTINGS_AVAILABLE:
+        raise RuntimeError("pydantic-settings is unavailable")
     SETTINGS = AppSettings()
 except Exception as exc:
-    # Keep the bot bootable even if pydantic-settings is not installed locally.
+    # Keep the bot bootable even if pydantic-settings is unavailable or an
+    # environment value cannot be parsed. The fallback preserves typed code
+    # defaults and applies simple type conversion to environment overrides.
     logging.getLogger(__name__).warning("Pydantic settings fallback activated: %s", exc)
+
     class _FallbackSettings:
-        def __getattr__(self, name):
-            return os.environ.get(name, "")
+        def __getattr__(self, name: str) -> Any:
+            default = getattr(AppSettings, name, "")
+            raw = os.environ.get(name)
+            if raw is None:
+                return default
+            if isinstance(default, bool):
+                return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+            if isinstance(default, int) and not isinstance(default, bool):
+                try:
+                    return int(str(raw).strip())
+                except Exception:
+                    return default
+            if isinstance(default, float):
+                try:
+                    return float(str(raw).strip())
+                except Exception:
+                    return default
+            if default is None:
+                return None if str(raw).strip().lower() in {"", "none", "null"} else str(raw).strip()
+            return str(raw)
+
     SETTINGS = _FallbackSettings()
 
 
@@ -1110,14 +1136,23 @@ class FastAPICompatApp:
                 target[key] = value
 
         if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
+            max_files = _env_int("WEB_MAX_FORM_FILES", 32, minimum=1, maximum=500)
+            max_fields = _env_int("WEB_MAX_FORM_FIELDS", 256, minimum=1, maximum=5000)
             try:
-                form = await req.form(max_part_size=max_body)
+                form = await req.form(
+                    max_files=max_files,
+                    max_fields=max_fields,
+                    max_part_size=max_body,
+                )
             except TypeError:
-                # Older Starlette versions do not expose max_part_size. The
-                # upfront Content-Length guard above still protects normal
-                # browser/API clients; the manual read guard below remains a
-                # second line of defense.
-                form = await req.form()
+                try:
+                    # Compatibility path for Starlette releases that support
+                    # field/file limits but not max_part_size.
+                    form = await req.form(max_files=max_files, max_fields=max_fields)
+                except TypeError:
+                    # Very old Starlette fallback. Content-Length and the
+                    # post-parse aggregate limit below still apply.
+                    form = await req.form()
             total_read = 0
             for key, value in form.multi_items():
                 if hasattr(value, "read") and hasattr(value, "filename"):
@@ -1138,6 +1173,12 @@ class FastAPICompatApp:
                         ),
                     )
                 else:
+                    total_read += len(str(value).encode("utf-8", errors="ignore"))
+                    if total_read > max_body:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"Form data too large. Max {max_body} bytes.",
+                        )
                     _store_multi(form_data, key, value)
         else:
             # Stream instead of await req.body() so requests without a trusted
@@ -1794,52 +1835,107 @@ def _telegram_allowed_updates() -> list[str]:
     return allowed or ["message", "callback_query"]
 
 
-_WEBHOOK_UPDATE_MEMORY: OrderedDict[int, float] = OrderedDict()
-_WEBHOOK_UPDATE_MEMORY_LOCK = asyncio.Lock()
+_WEBHOOK_UPDATE_MEMORY: OrderedDict[int, tuple[str, float]] = OrderedDict()
+_WEBHOOK_UPDATE_MEMORY_LOCK = threading.RLock()
 
 
 def _webhook_replay_ttl_seconds() -> int:
     return _env_int("WEBHOOK_REPLAY_TTL_S", 600, minimum=60, maximum=86400)
 
 
-async def _telegram_webhook_update_seen_or_mark(update_id: Any) -> bool:
-    """Return True if Telegram update_id was already accepted recently.
+def _webhook_processing_ttl_seconds() -> int:
+    return _env_int("WEBHOOK_PROCESSING_TTL_S", 120, minimum=15, maximum=_webhook_replay_ttl_seconds())
 
-    Telegram may retry webhooks after network errors.  This guard prevents
-    duplicate processing/sending while keeping a bounded TTL. Redis gives
-    cross-instance protection; memory fallback protects single-instance runs.
-    """
+
+def _telegram_webhook_update_id(update_id: Any) -> int | None:
     try:
-        uid = int(update_id)
+        return int(update_id)
     except Exception:
-        return False
+        return None
 
-    ttl = _webhook_replay_ttl_seconds()
+
+def _telegram_webhook_replay_key(uid: int) -> str:
+    return _redis_key("tg_update_seen", uid) if "_redis_key" in globals() else f"tg_update_seen:{uid}"
+
+
+def _trim_webhook_memory_locked(now: float, ttl: int) -> None:
+    stale_before = now - ttl
+    for old_uid, (_state, old_ts) in list(_WEBHOOK_UPDATE_MEMORY.items())[:5000]:
+        if old_ts < stale_before:
+            _WEBHOOK_UPDATE_MEMORY.pop(old_uid, None)
+    while len(_WEBHOOK_UPDATE_MEMORY) > 50_000:
+        _WEBHOOK_UPDATE_MEMORY.popitem(last=False)
+
+
+async def _telegram_webhook_update_claim(update_id: Any) -> str:
+    """Return claimed, processing, completed, or invalid for an update id."""
+    uid = _telegram_webhook_update_id(update_id)
+    if uid is None:
+        return "invalid"
+
     redis_obj = globals().get("redis_client")
     if redis_obj is not None:
-        key = _redis_key("tg_update_seen", uid) if "_redis_key" in globals() else f"tg_update_seen:{uid}"
+        key = _telegram_webhook_replay_key(uid)
+        processing_ttl = _webhook_processing_ttl_seconds()
         try:
-            ok = await asyncio.to_thread(lambda: redis_obj.set(key, "1", ex=ttl, nx=True))
-            return not bool(ok)
+            created = await asyncio.to_thread(lambda: redis_obj.set(key, "processing", ex=processing_ttl, nx=True))
+            if created:
+                return "claimed"
+            raw = await asyncio.to_thread(lambda: redis_obj.get(key))
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="ignore")
+            return "completed" if str(raw or "").lower() == "done" else "processing"
         except Exception as exc:
             _log_once(logging.WARNING, "webhook_replay_redis_fallback", "Webhook replay Redis fallback: %s", exc)
 
     now = time.monotonic()
-    async with _WEBHOOK_UPDATE_MEMORY_LOCK:
-        # Trim old entries opportunistically.
-        stale_before = now - ttl
-        for old_uid, old_ts in list(_WEBHOOK_UPDATE_MEMORY.items())[:5000]:
-            if old_ts < stale_before:
-                _WEBHOOK_UPDATE_MEMORY.pop(old_uid, None)
-            else:
-                break
-        if uid in _WEBHOOK_UPDATE_MEMORY:
+    ttl = _webhook_replay_ttl_seconds()
+    with _WEBHOOK_UPDATE_MEMORY_LOCK:
+        _trim_webhook_memory_locked(now, ttl)
+        existing = _WEBHOOK_UPDATE_MEMORY.get(uid)
+        if existing:
+            state, _ts = existing
             _WEBHOOK_UPDATE_MEMORY.move_to_end(uid)
-            return True
-        _WEBHOOK_UPDATE_MEMORY[uid] = now
-        while len(_WEBHOOK_UPDATE_MEMORY) > 50_000:
-            _WEBHOOK_UPDATE_MEMORY.popitem(last=False)
-        return False
+            return "completed" if state == "done" else "processing"
+        _WEBHOOK_UPDATE_MEMORY[uid] = ("processing", now)
+        _trim_webhook_memory_locked(now, ttl)
+        return "claimed"
+
+
+async def _telegram_webhook_update_complete(update_id: Any) -> None:
+    uid = _telegram_webhook_update_id(update_id)
+    if uid is None:
+        return
+    redis_obj = globals().get("redis_client")
+    if redis_obj is not None:
+        key = _telegram_webhook_replay_key(uid)
+        try:
+            await asyncio.to_thread(lambda: redis_obj.set(key, "done", ex=_webhook_replay_ttl_seconds()))
+        except Exception as exc:
+            _log_once(logging.WARNING, "webhook_replay_complete_fallback", "Webhook replay completion Redis fallback: %s", exc)
+    now = time.monotonic()
+    with _WEBHOOK_UPDATE_MEMORY_LOCK:
+        _WEBHOOK_UPDATE_MEMORY[uid] = ("done", now)
+        _WEBHOOK_UPDATE_MEMORY.move_to_end(uid)
+        _trim_webhook_memory_locked(now, _webhook_replay_ttl_seconds())
+
+
+async def _telegram_webhook_update_release(update_id: Any) -> None:
+    uid = _telegram_webhook_update_id(update_id)
+    if uid is None:
+        return
+    redis_obj = globals().get("redis_client")
+    if redis_obj is not None:
+        key = _telegram_webhook_replay_key(uid)
+        script = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end"
+        try:
+            await asyncio.to_thread(lambda: redis_obj.eval(script, 1, key, "processing"))
+        except Exception as exc:
+            _log_once(logging.WARNING, "webhook_replay_release_fallback", "Webhook replay release Redis fallback: %s", exc)
+    with _WEBHOOK_UPDATE_MEMORY_LOCK:
+        existing = _WEBHOOK_UPDATE_MEMORY.get(uid)
+        if existing and existing[0] == "processing":
+            _WEBHOOK_UPDATE_MEMORY.pop(uid, None)
 
 
 async def _read_limited_webhook_body(req: FastAPIRequest, max_body: int) -> bytes:
@@ -1869,12 +1965,7 @@ async def _read_limited_webhook_body(req: FastAPIRequest, max_body: int) -> byte
 
 
 async def _process_telegram_webhook_request(req: FastAPIRequest, path_secret_token: str | None = None):
-    """Validate, parse, and dispatch a Telegram webhook update.
-
-    Security errors intentionally return 403.  Internal parse/handler failures
-    are logged and acknowledged with HTTP 200 so Telegram does not repeatedly
-    redeliver a bad or already-accepted update forever.
-    """
+    """Validate, parse, claim, and process a Telegram webhook update safely."""
     if "_run_state_bot_mode" in globals() and _run_state_bot_mode() != "WEBHOOK":
         webhook_logger.info("Webhook update ignored because BOT_MODE=%s.", _run_state_bot_mode())
         return _FastJSONResponse({"status": "ignored", "reason": "not_webhook_mode"}, status_code=200)
@@ -1883,7 +1974,6 @@ async def _process_telegram_webhook_request(req: FastAPIRequest, path_secret_tok
     if not expected_secret:
         webhook_logger.error("Rejected Telegram webhook request because TELEGRAM_WEBHOOK_SECRET_TOKEN is not configured.")
         raise HTTPException(status_code=503, detail="Telegram webhook secret is not configured.")
-
     if path_secret_token is not None and not hmac.compare_digest(str(path_secret_token), expected_secret):
         webhook_logger.warning("Rejected Telegram webhook request with invalid path secret from %s", req.client.host if req.client else "unknown")
         raise HTTPException(status_code=403, detail="Invalid webhook path secret.")
@@ -1895,12 +1985,8 @@ async def _process_telegram_webhook_request(req: FastAPIRequest, path_secret_tok
 
     app_obj = globals().get("telegram_application") or globals().get("_TELEGRAM_APP")
     if app_obj is None or not bool(globals().get("_TELEGRAM_APP_READY", False)):
-        # Do NOT acknowledge startup-time updates. Returning 503 tells Telegram
-        # to retry instead of losing user messages while the Render service,
-        # Supabase, Redis, or python-telegram-bot application is still starting.
         webhook_logger.warning("Telegram webhook rejected with 503 because application is not ready yet.")
         raise HTTPException(status_code=503, detail="Telegram application is starting. Please retry.")
-
     if not _telegram_should_process_webhook_update():
         webhook_logger.info("Webhook update acknowledged by standby instance; active owner=%s", _telegram_leader_snapshot().get("owner"))
         return _FastJSONResponse({"status": "ignored", "reason": "standby_instance"}, status_code=200)
@@ -1909,17 +1995,61 @@ async def _process_telegram_webhook_request(req: FastAPIRequest, path_secret_tok
     try:
         raw = await _read_limited_webhook_body(req, max_body)
         data = _json_loads_fast(raw)
+        if not isinstance(data, dict):
+            raise ValueError("Telegram webhook JSON must be an object.")
         update = Update.de_json(data, app_obj.bot)
-        if await _telegram_webhook_update_seen_or_mark(getattr(update, "update_id", None)):
-            webhook_logger.info("Duplicate Telegram webhook update ignored update_id=%s", getattr(update, "update_id", None))
-            _metric_inc("replay_dropped")
-            return _FastJSONResponse({"status": "ok", "duplicate": True}, status_code=200)
-        await app_obj.process_update(update)
     except HTTPException:
         raise
     except Exception as exc:
-        webhook_logger.error("Telegram webhook ingestion failed but was acknowledged: %s", exc, exc_info=True)
-        return _FastJSONResponse({"status": "ok", "warning": "processing_failed"}, status_code=200)
+        # Telegram itself should never send malformed JSON. Acknowledge an
+        # invalid payload once so a permanently bad body cannot create a retry
+        # storm, while keeping real handler failures retryable below.
+        error_id = secrets.token_hex(6)
+        webhook_logger.warning(
+            "Invalid Telegram webhook payload ignored error_id=%s: %s",
+            error_id,
+            exc,
+            exc_info=True,
+        )
+        return _FastJSONResponse({
+            "status": "ignored",
+            "reason": "invalid_payload",
+            "reference": error_id,
+        }, status_code=200)
+
+    update_id = getattr(update, "update_id", None)
+    claimed = False
+    try:
+        claim_state = await _telegram_webhook_update_claim(update_id)
+        if claim_state == "completed":
+            webhook_logger.info("Completed Telegram webhook update ignored update_id=%s", update_id)
+            _metric_inc("replay_dropped")
+            return _FastJSONResponse({"status": "ok", "duplicate": True}, status_code=200)
+        if claim_state == "processing":
+            response = _FastJSONResponse({"status": "retry", "reason": "already_processing"}, status_code=503)
+            response.headers["Retry-After"] = "2"
+            return response
+        claimed = claim_state == "claimed"
+        await app_obj.process_update(update)
+        await _telegram_webhook_update_complete(update_id)
+    except Exception as exc:
+        if claimed:
+            await _telegram_webhook_update_release(update_id)
+        error_id = secrets.token_hex(6)
+        webhook_logger.error(
+            "Telegram webhook processing failed error_id=%s update_id=%s: %s",
+            error_id,
+            update_id,
+            exc,
+            exc_info=True,
+        )
+        response = _FastJSONResponse({
+            "status": "retry",
+            "reason": "processing_failed",
+            "reference": error_id,
+        }, status_code=503)
+        response.headers["Retry-After"] = "2"
+        return response
 
     return _FastJSONResponse({"status": "ok"}, status_code=200)
 
@@ -2140,6 +2270,8 @@ _AI_API_MAX_IMAGE_BYTES   = 10 * 1024 * 1024   # 10 MB
 _AI_API_MAX_AUDIO_BYTES   = 50 * 1024 * 1024   # 50 MB
 _AI_API_MAX_MESSAGE_CHARS = 32_000
 _AI_API_MAX_HISTORY_TURNS = 20
+_AI_API_MAX_HISTORY_TURN_CHARS = 8_000
+_AI_API_MAX_HISTORY_CHARS = 64_000
 
 _AI_ALLOWED_IMAGE_MIME = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 _AI_ALLOWED_AUDIO_MIME = {
@@ -2217,6 +2349,72 @@ def _ai_cors(response_or_tuple):
 
 def _ai_cors_preflight():
     return _apply_ai_cors_headers(Response("", status=204))
+
+
+def _ai_public_failure(message: str, exc: BaseException, status_code: int = 500, *, warning: bool = False):
+    """Log detailed provider failures while returning a non-sensitive error."""
+    error_id = secrets.token_hex(6)
+    log_fn = logging.getLogger(__name__).warning if warning else logging.getLogger(__name__).error
+    log_fn("AI API failure error_id=%s: %s", error_id, exc, exc_info=not warning)
+    return _ai_cors(_ai_error(f"{message} Reference: {error_id}", status_code))
+
+
+def _decode_base64_limited(value: Any, max_bytes: int, label: str) -> tuple[bytes | None, str | None]:
+    """Decode strict base64 without allowing oversized encoded payloads."""
+    if not isinstance(value, str) or not value.strip():
+        return None, f"Missing {label} base64 data."
+    encoded = "".join(value.split())
+    # Base64 expands binary data by roughly 4/3. Reject before decoding to
+    # avoid creating a large temporary allocation for obviously oversized data.
+    max_encoded = ((max(0, int(max_bytes)) + 2) // 3) * 4 + 8
+    if len(encoded) > max_encoded:
+        return None, f"{label.capitalize()} too large."
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except Exception:
+        return None, f"Invalid base64 {label} data."
+    if len(decoded) > max_bytes:
+        return None, f"{label.capitalize()} too large."
+    return decoded, None
+
+
+def _normalise_ai_history(value: Any) -> tuple[list[dict[str, str]], str | None]:
+    if value in (None, ""):
+        return [], None
+    if not isinstance(value, list):
+        return [], "History must be a JSON array."
+    if len(value) > _AI_API_MAX_HISTORY_TURNS:
+        return [], f"History has too many turns (max {_AI_API_MAX_HISTORY_TURNS})."
+
+    cleaned: list[dict[str, str]] = []
+    total_chars = 0
+    for index, turn in enumerate(value):
+        if not isinstance(turn, dict):
+            return [], f"History item {index + 1} must be an object."
+        role = str(turn.get("role") or "user").strip().lower()
+        if role not in {"user", "assistant", "model"}:
+            return [], f"History item {index + 1} has an invalid role."
+        content = turn.get("content", "")
+        if not isinstance(content, str):
+            return [], f"History item {index + 1} content must be text."
+        if len(content) > _AI_API_MAX_HISTORY_TURN_CHARS:
+            return [], f"History item {index + 1} is too long."
+        total_chars += len(content)
+        if total_chars > _AI_API_MAX_HISTORY_CHARS:
+            return [], f"History is too long (max {_AI_API_MAX_HISTORY_CHARS} chars)."
+        cleaned.append({"role": role, "content": content})
+    return cleaned, None
+
+
+def _normalise_ai_message(value: Any) -> tuple[str, str | None]:
+    if value is None:
+        return "", None
+    if not isinstance(value, str):
+        return "", "Message must be text."
+    message = value.strip()
+    if len(message) > _AI_API_MAX_MESSAGE_CHARS:
+        return "", f"Message too long (max {_AI_API_MAX_MESSAGE_CHARS} chars)."
+    return message, None
 
 
 _LANG_HINT_ALIASES = {
@@ -2790,20 +2988,9 @@ def db_ai_api_key_status() -> dict:
     return status
 
 
-def _check_ai_api_key() -> bool:
-    """Validate static AI_API_KEY or Telegram-admin generated /api keys.
-
-    Accepted auth methods:
-      - X-Api-Key: <key>
-      - Authorization: Bearer <key>
-      - ?api_key=<key> (kept for simple browser/testing tools)
-
-    Security:
-      - The API fails closed when no valid key is present.
-      - Generated keys are stored only as SHA-256 hashes.
-      - AI_API_KEY env remains supported for existing clients.
-    """
-    client_key = _extract_ai_request_key()
+def _check_ai_api_key(client_key: str | None = None) -> bool:
+    """Validate static AI_API_KEY or a generated API key without logging it."""
+    client_key = (client_key if client_key is not None else _extract_ai_request_key()).strip()
     if not client_key:
         return False
 
@@ -2812,6 +2999,41 @@ def _check_ai_api_key() -> bool:
         return True
 
     return _validate_dynamic_ai_api_key(client_key)
+
+
+def _get_ai_api_semaphore() -> asyncio.Semaphore:
+    """Return a semaphore owned by the currently running event loop."""
+    global _AI_SEMAPHORE, _AI_SEMAPHORE_LOOP, _AI_SEMAPHORE_CAPACITY
+    loop = asyncio.get_running_loop()
+    capacity = max(1, int(globals().get("MAX_CONCURRENT_AI", MAX_CONCURRENT_AI)))
+    if _AI_SEMAPHORE is None or _AI_SEMAPHORE_LOOP is not loop or _AI_SEMAPHORE_CAPACITY != capacity:
+        _AI_SEMAPHORE = asyncio.Semaphore(capacity)
+        _AI_SEMAPHORE_LOOP = loop
+        _AI_SEMAPHORE_CAPACITY = capacity
+    return _AI_SEMAPHORE
+
+
+async def _run_ai_api_blocking(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Run provider SDK work in the dedicated bounded AI executor."""
+    semaphore = _get_ai_api_semaphore()
+    async with semaphore:
+        loop = asyncio.get_running_loop()
+        call = functools.partial(fn, *args, **kwargs)
+        return await loop.run_in_executor(_AI_EXECUTOR, call)
+
+
+async def _authorize_ai_api_request() -> tuple[bool, Any | None]:
+    """Authenticate first, then enforce a second limit for the valid key."""
+    client_key = _extract_ai_request_key()
+    if not client_key:
+        return False, _ai_cors(_ai_error("Unauthorized — invalid or missing API key.", 401))
+    loop = asyncio.get_running_loop()
+    valid = await loop.run_in_executor(_DB_EXECUTOR, functools.partial(_check_ai_api_key, client_key))
+    if not valid:
+        return False, _ai_cors(_ai_error("Unauthorized — invalid or missing API key.", 401))
+    if not await _ai_authenticated_rate_limit_allowed(client_key):
+        return False, _ai_cors(_ai_error("Too many requests. Please slow down.", 429))
+    return True, None
 
 
 def _build_gemini_contents(
@@ -2863,133 +3085,126 @@ def _ai_gen_config():
 
 
 def _parse_multipart_ai_request():
-    message   = (request.form.get("message") or "").strip()
-    do_stream = request.form.get("stream", "").lower() == "true"
-    history   = []
+    message, message_error = _normalise_ai_message(request.form.get("message"))
+    if message_error:
+        return None, None, None, None, None, None, None, _ai_cors(_ai_error(message_error))
+
+    stream_value = str(request.form.get("stream", "") or "").strip().lower()
+    do_stream = stream_value in {"1", "true", "yes", "on"}
     raw_history = request.form.get("history", "")
+    parsed_history: Any = []
     if raw_history:
         try:
-            history = _json_loads_fast(raw_history)
+            parsed_history = _json_loads_fast(raw_history)
         except Exception:
-            pass
+            return None, None, None, None, None, None, None, _ai_cors(_ai_error("History must be valid JSON."))
+    history, history_error = _normalise_ai_history(parsed_history)
+    if history_error:
+        return None, None, None, None, None, None, None, _ai_cors(_ai_error(history_error))
 
     image_data = audio_data = None
     image_mime = audio_mime = ""
 
     img_file = request.files.get("image")
     if img_file:
-        image_mime = img_file.mimetype or "image/jpeg"
+        image_mime = str(img_file.mimetype or "image/jpeg").lower()
         if image_mime not in _AI_ALLOWED_IMAGE_MIME:
-            return None, None, None, None, None, None, None, \
-                _ai_cors(_ai_error(f"Unsupported image type: {image_mime}"))
+            return None, None, None, None, None, None, None, _ai_cors(_ai_error(f"Unsupported image type: {image_mime}"))
         image_data = img_file.read()
         if len(image_data) > _AI_API_MAX_IMAGE_BYTES:
-            return None, None, None, None, None, None, None, \
-                _ai_cors(_ai_error("Image file too large (max 10 MB)."))
+            return None, None, None, None, None, None, None, _ai_cors(_ai_error("Image file too large (max 10 MB)."))
 
     aud_file = request.files.get("audio")
     if aud_file:
-        audio_mime = aud_file.mimetype or "audio/mpeg"
+        audio_mime = str(aud_file.mimetype or "audio/mpeg").lower()
         if audio_mime not in _AI_ALLOWED_AUDIO_MIME:
-            return None, None, None, None, None, None, None, \
-                _ai_cors(_ai_error(f"Unsupported audio type: {audio_mime}"))
+            return None, None, None, None, None, None, None, _ai_cors(_ai_error(f"Unsupported audio type: {audio_mime}"))
         audio_data = aud_file.read()
         if len(audio_data) > _AI_API_MAX_AUDIO_BYTES:
-            return None, None, None, None, None, None, None, \
-                _ai_cors(_ai_error("Audio file too large (max 50 MB)."))
+            return None, None, None, None, None, None, None, _ai_cors(_ai_error("Audio file too large (max 50 MB)."))
 
     return message, history, image_data, audio_data, image_mime, audio_mime, do_stream, None
 
 
 def _parse_json_ai_request():
     try:
-        body = request.get_json(force=True) or {}
+        body = request.get_json(force=True)
     except Exception:
-        return None, None, None, None, None, None, None, \
-            _ai_cors(_ai_error("Invalid JSON body."))
+        return None, None, None, None, None, None, None, _ai_cors(_ai_error("Invalid JSON body."))
+    if not isinstance(body, dict):
+        return None, None, None, None, None, None, None, _ai_cors(_ai_error("JSON body must be an object."))
 
-    message   = (body.get("message") or "").strip()
-    do_stream = bool(body.get("stream", False))
-    history   = body.get("history") or []
+    message, message_error = _normalise_ai_message(body.get("message"))
+    if message_error:
+        return None, None, None, None, None, None, None, _ai_cors(_ai_error(message_error))
+    history, history_error = _normalise_ai_history(body.get("history"))
+    if history_error:
+        return None, None, None, None, None, None, None, _ai_cors(_ai_error(history_error))
+    do_stream = body.get("stream", False) is True
     image_data = audio_data = None
     image_mime = audio_mime = ""
 
-    if body.get("image_base64"):
-        image_mime = body.get("image_mime", "image/jpeg")
+    if body.get("image_base64") is not None:
+        image_mime = str(body.get("image_mime") or "image/jpeg").lower()
         if image_mime not in _AI_ALLOWED_IMAGE_MIME:
-            return None, None, None, None, None, None, None, \
-                _ai_cors(_ai_error(f"Unsupported image type: {image_mime}"))
-        try:
-            image_data = base64.b64decode(body["image_base64"])
-        except Exception:
-            return None, None, None, None, None, None, None, \
-                _ai_cors(_ai_error("Invalid base64 image data."))
-        if len(image_data) > _AI_API_MAX_IMAGE_BYTES:
-            return None, None, None, None, None, None, None, \
-                _ai_cors(_ai_error("Image too large (max 10 MB)."))
+            return None, None, None, None, None, None, None, _ai_cors(_ai_error(f"Unsupported image type: {image_mime}"))
+        image_data, decode_error = _decode_base64_limited(body.get("image_base64"), _AI_API_MAX_IMAGE_BYTES, "image")
+        if decode_error:
+            suffix = " (max 10 MB)." if "too large" in decode_error.lower() else ""
+            return None, None, None, None, None, None, None, _ai_cors(_ai_error(decode_error + suffix))
 
-    if body.get("audio_base64"):
-        audio_mime = body.get("audio_mime", "audio/mpeg")
+    if body.get("audio_base64") is not None:
+        audio_mime = str(body.get("audio_mime") or "audio/mpeg").lower()
         if audio_mime not in _AI_ALLOWED_AUDIO_MIME:
-            return None, None, None, None, None, None, None, \
-                _ai_cors(_ai_error(f"Unsupported audio type: {audio_mime}"))
-        try:
-            audio_data = base64.b64decode(body["audio_base64"])
-        except Exception:
-            return None, None, None, None, None, None, None, \
-                _ai_cors(_ai_error("Invalid base64 audio data."))
-        if len(audio_data) > _AI_API_MAX_AUDIO_BYTES:
-            return None, None, None, None, None, None, None, \
-                _ai_cors(_ai_error("Audio too large (max 50 MB)."))
+            return None, None, None, None, None, None, None, _ai_cors(_ai_error(f"Unsupported audio type: {audio_mime}"))
+        audio_data, decode_error = _decode_base64_limited(body.get("audio_base64"), _AI_API_MAX_AUDIO_BYTES, "audio")
+        if decode_error:
+            suffix = " (max 50 MB)." if "too large" in decode_error.lower() else ""
+            return None, None, None, None, None, None, None, _ai_cors(_ai_error(decode_error + suffix))
 
     return message, history, image_data, audio_data, image_mime, audio_mime, do_stream, None
 
 
 @app_flask.route("/ai-assistant", methods=["POST", "OPTIONS"])
-def ai_assistant():
+async def ai_assistant():
     if request.method == "OPTIONS":
         return _ai_cors_preflight()
 
-    if not _check_ai_api_key():
-        return _ai_cors(_ai_error("Unauthorized — invalid or missing API key.", 401))
+    authorized, auth_error = await _authorize_ai_api_request()
+    if not authorized:
+        return auth_error
 
     content_type = request.content_type or ""
     if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
-        message, history, image_data, audio_data, image_mime, audio_mime, do_stream, err = \
-            _parse_multipart_ai_request()
+        message, history, image_data, audio_data, image_mime, audio_mime, do_stream, err = _parse_multipart_ai_request()
     elif "application/json" in content_type:
-        message, history, image_data, audio_data, image_mime, audio_mime, do_stream, err = \
-            _parse_json_ai_request()
+        message, history, image_data, audio_data, image_mime, audio_mime, do_stream, err = _parse_json_ai_request()
     else:
         return _ai_cors(_ai_error("Content-Type must be multipart/form-data or application/json."))
 
     if err is not None:
         return err
-
     if not message and image_data is None and audio_data is None:
         return _ai_cors(_ai_error("Provide at least one of: message, image, or audio."))
-
-    if message and len(message) > _AI_API_MAX_MESSAGE_CHARS:
-        return _ai_cors(_ai_error(f"Message too long (max {_AI_API_MAX_MESSAGE_CHARS} chars)."))
-
     if do_stream:
-        return _ai_cors(_ai_error("Streaming is disabled for Hugging Face provider. Send stream=false.", 400))
+        return _ai_cors(_ai_error("Streaming is disabled for this endpoint. Send stream=false.", 400))
 
     try:
         if image_data is not None:
-            ocr_text, ocr_provider, ocr_model = ask_ocr_image(image_data, image_mime or "image/jpeg")
+            ocr_text, ocr_provider, ocr_model = await _run_ai_api_blocking(
+                ask_ocr_image, image_data, image_mime or "image/jpeg"
+            )
             if message:
                 prompt = (
                     f"User instruction: {message}\n\n"
                     f"OCR text extracted from image:\n{ocr_text}\n\n"
                     "Answer using the OCR text above."
                 )
-                reply_text, model_used, tokens_used = ai_text_reply(prompt, history)
+                reply_text, model_used, tokens_used = await _run_ai_api_blocking(ai_text_reply, prompt, history)
             else:
-                reply_text  = ocr_text
-                model_used  = ocr_model
+                reply_text = ocr_text
+                model_used = ocr_model
                 tokens_used = None
-
             return _ai_cors(jsonify({
                 "ok": True,
                 "reply": reply_text,
@@ -3007,14 +3222,16 @@ def ai_assistant():
                 return _ai_cors(_ai_error(
                     "Audio transcription requires Gemini. Set GEMINI_API_KEY; GEMINI_MODEL optional.", 503
                 ))
-            contents = _build_gemini_contents(
-                message, history, image_data, audio_data, image_mime, audio_mime
-            )
-            response = _gemini.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=contents,
-                config=_ai_gen_config(),
-            )
+            contents = _build_gemini_contents(message, history, image_data, audio_data, image_mime, audio_mime)
+
+            def _generate_audio_reply():
+                return _gemini.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=contents,
+                    config=_ai_gen_config(),
+                )
+
+            response = await _run_ai_api_blocking(_generate_audio_reply)
             reply_text = (response.text or "").strip()
             return _ai_cors(jsonify({
                 "ok": True,
@@ -3025,34 +3242,35 @@ def ai_assistant():
                 "provider": "gemini-legacy",
             }))
 
-        if _hf_client is None:
+        if _hf_client is None and (AI_PROVIDER or "hf").lower().strip() == "hf":
             return _ai_cors(_ai_error("Hugging Face is not configured. Set HF_TOKEN.", 503))
 
-        reply_text, model_used, tokens_used = ai_text_reply(message, history)
+        reply_text, model_used, tokens_used = await _run_ai_api_blocking(ai_text_reply, message, history)
         return _ai_cors(jsonify({
             "ok": True,
             "reply": reply_text,
             "detected_language": _detect_lang(reply_text or message or ""),
             "tokens_used": tokens_used,
             "model": model_used,
-            "provider": "hf",
+            "provider": (AI_PROVIDER or "hf").lower().strip(),
         }))
 
     except Exception as exc:
         if _is_expected_ocr_outage_error(exc):
-            logging.getLogger(__name__).warning("/ai-assistant OCR unavailable: %s", str(exc)[:700])
-            return _ai_cors(_ai_error(f"OCR unavailable: {exc}", _ocr_error_http_status(exc)))
-        logging.getLogger(__name__).error(f"/ai-assistant error: {exc}", exc_info=True)
-        return _ai_cors(_ai_error(f"AI generation failed: {exc}", 500))
+            return _ai_public_failure(
+                "OCR service is temporarily unavailable.", exc, _ocr_error_http_status(exc), warning=True
+            )
+        return _ai_public_failure("AI generation failed.", exc, 500)
 
 
 @app_flask.route("/ai-assistant/transcribe", methods=["POST", "OPTIONS"])
-def ai_transcribe():
+async def ai_transcribe():
     if request.method == "OPTIONS":
         return _ai_cors_preflight()
 
-    if not _check_ai_api_key():
-        return _ai_cors(_ai_error("Unauthorized.", 401))
+    authorized, auth_error = await _authorize_ai_api_request()
+    if not authorized:
+        return auth_error
     if _gemini is None:
         return _ai_cors(_ai_error("AI service not configured.", 503))
 
@@ -3060,10 +3278,9 @@ def ai_transcribe():
     if not aud_file:
         return _ai_cors(_ai_error("No audio file provided (field name: 'audio')."))
 
-    audio_mime = aud_file.mimetype or "audio/mpeg"
+    audio_mime = str(aud_file.mimetype or "audio/mpeg").lower()
     if audio_mime not in _AI_ALLOWED_AUDIO_MIME:
         return _ai_cors(_ai_error(f"Unsupported audio type: {audio_mime}"))
-
     audio_data = aud_file.read()
     if len(audio_data) > _AI_API_MAX_AUDIO_BYTES:
         return _ai_cors(_ai_error("Audio too large (max 50 MB)."))
@@ -3078,8 +3295,9 @@ def ai_transcribe():
     }.get(lang_hint, "")
 
     from google.genai import types as _gtypes
-    try:
-        response = _gemini.models.generate_content(
+
+    def _transcribe_audio():
+        return _gemini.models.generate_content(
             model=GEMINI_MODEL,
             contents=[
                 _gtypes.Part.from_bytes(data=audio_data, mime_type=audio_mime),
@@ -3090,6 +3308,9 @@ def ai_transcribe():
                 ),
             ],
         )
+
+    try:
+        response = await _run_ai_api_blocking(_transcribe_audio)
         transcript = (response.text or "").strip()
         return _ai_cors(jsonify({
             "ok": True,
@@ -3098,44 +3319,46 @@ def ai_transcribe():
             "model": GEMINI_MODEL,
         }))
     except Exception as exc:
-        logging.getLogger(__name__).error(f"/ai-assistant/transcribe error: {exc}")
-        return _ai_cors(_ai_error(f"Transcription failed: {exc}", 500))
+        return _ai_public_failure("Transcription failed.", exc, 500)
 
 
 @app_flask.route("/ai-assistant/vision", methods=["POST", "OPTIONS"])
-def ai_vision():
+async def ai_vision():
     if request.method == "OPTIONS":
         return _ai_cors_preflight()
 
-    if not _check_ai_api_key():
-        return _ai_cors(_ai_error("Unauthorized.", 401))
+    authorized, auth_error = await _authorize_ai_api_request()
+    if not authorized:
+        return auth_error
     if not _ocr_configured():
         return _ai_cors(_ai_error(_ocr_status_for_user(), 503))
 
     image_data = None
-    image_mime  = "image/jpeg"
+    image_mime = "image/jpeg"
     content_type = request.content_type or ""
 
     if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
         img_file = request.files.get("image")
         if not img_file:
             return _ai_cors(_ai_error("No image file provided (field name: 'image')."))
-        image_mime = img_file.mimetype or "image/jpeg"
+        image_mime = str(img_file.mimetype or "image/jpeg").lower()
         if image_mime not in _AI_ALLOWED_IMAGE_MIME:
             return _ai_cors(_ai_error(f"Unsupported image type: {image_mime}"))
         image_data = img_file.read()
     elif "application/json" in content_type:
         try:
-            body = request.get_json(force=True) or {}
+            body = request.get_json(force=True)
         except Exception:
             return _ai_cors(_ai_error("Invalid JSON."))
-        image_mime = body.get("image_mime", "image/jpeg")
+        if not isinstance(body, dict):
+            return _ai_cors(_ai_error("JSON body must be an object."))
+        image_mime = str(body.get("image_mime") or "image/jpeg").lower()
         if image_mime not in _AI_ALLOWED_IMAGE_MIME:
             return _ai_cors(_ai_error(f"Unsupported image type: {image_mime}"))
-        try:
-            image_data = base64.b64decode(body.get("image_base64", ""))
-        except Exception:
-            return _ai_cors(_ai_error("Invalid base64 image."))
+        image_data, decode_error = _decode_base64_limited(body.get("image_base64"), _AI_API_MAX_IMAGE_BYTES, "image")
+        if decode_error:
+            suffix = " (max 10 MB)." if "too large" in decode_error.lower() else ""
+            return _ai_cors(_ai_error(decode_error + suffix))
     else:
         return _ai_cors(_ai_error("Content-Type must be multipart/form-data or application/json."))
 
@@ -3145,7 +3368,7 @@ def ai_vision():
         return _ai_cors(_ai_error("Image too large (max 10 MB)."))
 
     try:
-        result_text, ocr_provider, ocr_model = ask_ocr_image(image_data, image_mime)
+        result_text, ocr_provider, ocr_model = await _run_ai_api_blocking(ask_ocr_image, image_data, image_mime)
         return _ai_cors(jsonify({
             "ok": True,
             "result": result_text,
@@ -3155,11 +3378,9 @@ def ai_vision():
             "ocr_provider": ocr_provider,
         }))
     except Exception as exc:
-        if _is_expected_ocr_outage_error(exc):
-            logging.getLogger(__name__).warning("/ai-assistant/vision OCR unavailable: %s", str(exc)[:700])
-        else:
-            logging.getLogger(__name__).error(f"/ai-assistant/vision OCR error: {exc}", exc_info=True)
-        return _ai_cors(_ai_error(f"Vision OCR failed: {exc}", _ocr_error_http_status(exc)))
+        return _ai_public_failure(
+            "Vision OCR failed.", exc, _ocr_error_http_status(exc), warning=_is_expected_ocr_outage_error(exc)
+        )
 
 
 @app_flask.route("/ai-assistant/info", methods=["GET"])
@@ -3985,9 +4206,13 @@ def _web_client_ip() -> str:
         return "unknown"
 
 
-def _admin_login_rate_limit_key(admin_id: int | None) -> str:
-    raw = f"{_web_client_ip()}:{admin_id or 0}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+def _admin_login_rate_limit_keys(admin_id: int | None) -> list[str]:
+    """Return an IP bucket plus an optional IP/account bucket."""
+    ip = _web_client_ip()
+    raw_keys = [f"ip:{ip}"]
+    if admin_id is not None:
+        raw_keys.append(f"ip_admin:{ip}:{int(admin_id)}")
+    return list(dict.fromkeys(hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32] for raw in raw_keys))
 
 
 def _admin_login_rate_limit_config() -> tuple[int, float]:
@@ -4000,74 +4225,84 @@ def _admin_login_redis_enabled() -> bool:
     return _env_bool("ADMIN_LOGIN_RATE_LIMIT_REDIS_ENABLED", True) and globals().get("redis_client") is not None
 
 
-def _admin_login_redis_key(admin_id: int | None) -> str:
-    key_hash = _admin_login_rate_limit_key(admin_id)
+def _admin_login_redis_keys(admin_id: int | None) -> list[str]:
     key_builder = globals().get("_redis_key")
-    if callable(key_builder):
-        with suppress(Exception):
-            return str(key_builder("admin_login_fail", key_hash))
-    return f"admin_login_fail:{key_hash}"
+    keys: list[str] = []
+    for key_hash in _admin_login_rate_limit_keys(admin_id):
+        if callable(key_builder):
+            try:
+                keys.append(str(key_builder("admin_login_fail", key_hash)))
+                continue
+            except Exception:
+                pass
+        keys.append(f"admin_login_fail:{key_hash}")
+    return keys
 
 
-def _admin_login_redis_count(admin_id: int | None) -> tuple[int | None, int | None]:
+def _admin_login_redis_counts(admin_id: int | None) -> list[tuple[int, int | None]] | None:
     if not _admin_login_redis_enabled():
-        return None, None
+        return None
     redis_obj = globals().get("redis_client")
-    key = _admin_login_redis_key(admin_id)
+    keys = _admin_login_redis_keys(admin_id)
     try:
-        raw = redis_obj.get(key)
-        count = int(raw or 0)
-        ttl = redis_obj.ttl(key)
-        ttl_i = int(ttl) if ttl is not None and int(ttl) > 0 else None
-        return count, ttl_i
+        pipe = redis_obj.pipeline(transaction=False)
+        for key in keys:
+            pipe.get(key)
+            pipe.ttl(key)
+        values = pipe.execute()
+        out: list[tuple[int, int | None]] = []
+        for index in range(0, len(values), 2):
+            count = int(values[index] or 0)
+            ttl_raw = values[index + 1]
+            ttl = int(ttl_raw) if ttl_raw is not None and int(ttl_raw) > 0 else None
+            out.append((count, ttl))
+        return out
     except Exception as exc:
         _log_once(logging.WARNING, "admin_login_redis_limit_fallback", "Admin login Redis rate-limit fallback: %s", exc)
-        return None, None
+        return None
 
 
 def _admin_login_is_limited(admin_id: int | None) -> tuple[bool, int]:
     limit, window_s = _admin_login_rate_limit_config()
-    redis_count, redis_ttl = _admin_login_redis_count(admin_id)
-    if redis_count is not None:
-        if redis_count >= limit:
-            return True, max(1, int(redis_ttl or window_s))
-        return False, 0
+    redis_counts = _admin_login_redis_counts(admin_id)
+    if redis_counts is not None:
+        retry_values = [max(1, int(ttl or window_s)) for count, ttl in redis_counts if count >= limit]
+        return (True, max(retry_values)) if retry_values else (False, 0)
 
-    key = _admin_login_rate_limit_key(admin_id)
     now = time.monotonic()
     with _ADMIN_LOGIN_ATTEMPTS_LOCK:
-        dq = _ADMIN_LOGIN_ATTEMPTS.setdefault(key, deque())
-        stale_before = now - window_s
-        while dq and dq[0] < stale_before:
-            dq.popleft()
-        if len(dq) >= limit:
-            retry_after = max(1, int(window_s - (now - dq[0])))
-            return True, retry_after
-        return False, 0
+        for key in _admin_login_rate_limit_keys(admin_id):
+            dq = _ADMIN_LOGIN_ATTEMPTS.setdefault(key, deque())
+            stale_before = now - window_s
+            while dq and dq[0] < stale_before:
+                dq.popleft()
+            if len(dq) >= limit:
+                return True, max(1, int(window_s - (now - dq[0])))
+    return False, 0
 
 
 def _admin_login_record_failure(admin_id: int | None) -> None:
     _limit, window_s = _admin_login_rate_limit_config()
     if _admin_login_redis_enabled():
         redis_obj = globals().get("redis_client")
-        key = _admin_login_redis_key(admin_id)
         try:
-            count = int(redis_obj.incr(key) or 1)
-            if count == 1 or int(redis_obj.ttl(key) or -1) < 0:
-                redis_obj.expire(key, int(window_s))
+            pipe = redis_obj.pipeline(transaction=True)
+            for key in _admin_login_redis_keys(admin_id):
+                pipe.incr(key)
+                pipe.expire(key, max(1, int(window_s)))
+            pipe.execute()
             return
         except Exception as exc:
             _log_once(logging.WARNING, "admin_login_redis_record_fallback", "Admin login Redis failure-record fallback: %s", exc)
 
-    key = _admin_login_rate_limit_key(admin_id)
     now = time.monotonic()
+    stale_before = now - window_s
     with _ADMIN_LOGIN_ATTEMPTS_LOCK:
-        dq = _ADMIN_LOGIN_ATTEMPTS.setdefault(key, deque())
-        stale_before = now - window_s
-        while dq and dq[0] < stale_before:
-            dq.popleft()
-        dq.append(now)
-        # Opportunistic cleanup to avoid unbounded memory growth under scans.
+        for key in _admin_login_rate_limit_keys(admin_id):
+            dq = _ADMIN_LOGIN_ATTEMPTS.setdefault(key, deque())
+            while dq and dq[0] < stale_before:
+                dq.popleft()
+            dq.append(now)
         if len(_ADMIN_LOGIN_ATTEMPTS) > 20_000:
             for old_key in list(_ADMIN_LOGIN_ATTEMPTS.keys())[:1000]:
                 old_dq = _ADMIN_LOGIN_ATTEMPTS.get(old_key)
@@ -4076,15 +4311,17 @@ def _admin_login_record_failure(admin_id: int | None) -> None:
 
 
 def _admin_login_clear_failures(admin_id: int | None) -> None:
+    redis_keys = _admin_login_redis_keys(admin_id)
     if _admin_login_redis_enabled():
         redis_obj = globals().get("redis_client")
         try:
-            redis_obj.delete(_admin_login_redis_key(admin_id))
+            if redis_keys:
+                redis_obj.delete(*redis_keys)
         except Exception:
             pass
-    key = _admin_login_rate_limit_key(admin_id)
     with _ADMIN_LOGIN_ATTEMPTS_LOCK:
-        _ADMIN_LOGIN_ATTEMPTS.pop(key, None)
+        for key in _admin_login_rate_limit_keys(admin_id):
+            _ADMIN_LOGIN_ATTEMPTS.pop(key, None)
 
 
 def _admin_cookie_policy_payload() -> dict[str, Any]:
@@ -4187,6 +4424,8 @@ def api_admin_auth_login():
         return _admin_api_error("No web admin password is configured. Set ADMIN_WEB_PASSWORD or WEB_ADMIN_PASSWORD.", 403, code="admin_password_missing")
 
     data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return _admin_api_error("JSON body must be an object.", 400, code="invalid_json_body")
     got_password = str(data.get("password") or request.form.get("password") or "")
     admin_id = _web_int(data.get("admin_id") or request.form.get("admin_id"), _web_current_admin_id())
 
@@ -4302,11 +4541,17 @@ def web_admin_login():
 
         got_password = str(request.form.get("password") or "")
         admin_id = _web_int(request.form.get("admin_id"), _web_current_admin_id())
-        if not hmac.compare_digest(got_password, expected_password):
-            return _web_login_page("Invalid password.")
-        if not _web_valid_admin_id(admin_id):
-            return _web_login_page("This Telegram Admin ID is not in ADMIN_IDS.")
+        limited, retry_after = _admin_login_is_limited(admin_id)
+        if limited:
+            return _web_login_page(f"Too many failed login attempts. Try again in {retry_after} seconds.")
 
+        valid_password = hmac.compare_digest(got_password, expected_password)
+        valid_admin = _web_valid_admin_id(admin_id)
+        if not (valid_password and valid_admin):
+            _admin_login_record_failure(admin_id)
+            return _web_login_page("Invalid admin credentials.")
+
+        _admin_login_clear_failures(admin_id)
         session.clear()
         session["web_admin_ok"] = True
         session["web_admin_id"] = int(admin_id or _web_current_admin_id())
@@ -8591,9 +8836,9 @@ RUN_STATE: dict[str, Any] = {
     "EDGE_TTS_PARALLEL_CHUNKS": int(globals().get("EDGE_TTS_PARALLEL_CHUNKS", _perf_default("EDGE_TTS_PARALLEL_CHUNKS", 1))),
     "PAGED_TTS_SEND_DELAY_S": float(globals().get("PAGED_TTS_SEND_DELAY_S", _perf_default("PAGED_TTS_SEND_DELAY_S", 0.10))),
 }
-RUN_STATE_LOCK = asyncio.Lock()
+RUN_STATE_LOCK = threading.RLock()
 ACTIVE_ADMIN_CONVERSATIONS: dict[int, dict[str, Any]] = {}
-ACTIVE_ADMIN_CONVERSATIONS_LOCK = asyncio.Lock()
+ACTIVE_ADMIN_CONVERSATIONS_LOCK = threading.RLock()
 _TELEGRAM_POLLING_ACTIVE = False
 _TELEGRAM_POLLING_LOCK: asyncio.Lock | None = None
 # Tracks the single active long-polling lifecycle guard.  It prevents duplicate
@@ -8947,20 +9192,29 @@ async def _update_run_state(key: str, value: Any, *, persist: bool = True) -> No
     clear text.
     """
     global HTTPX_HIGH_CONCURRENCY_LIMITS
-    global _AI_SEMAPHORE, _BROADCAST_SEMAPHORE, _TTS_CHUNK_SEMAPHORE, _DB_EXECUTOR
+    global _AI_SEMAPHORE, _AI_SEMAPHORE_LOOP, _AI_SEMAPHORE_CAPACITY
+    global _BROADCAST_SEMAPHORE, _TTS_CHUNK_SEMAPHORE, _DB_EXECUTOR, _AI_EXECUTOR
     global TTS_AUDIO_CACHE_MAX_BYTES, TTS_AUDIO_CACHE_ITEM_MAX_BYTES
 
     if key not in _RUN_STATE_REDIS_KEYS:
         raise ValueError(f"Unsupported runtime setting: {key}")
 
     persisted_value = _coerce_run_state_value(key, value)
-    async with RUN_STATE_LOCK:
+    with RUN_STATE_LOCK:
         RUN_STATE[key] = persisted_value
         globals()[key] = persisted_value
         if key in {"HTTP_MAX_CONNECTIONS", "HTTP_MAX_KEEPALIVE_CONNECTIONS"}:
             HTTPX_HIGH_CONCURRENCY_LIMITS = _make_httpx_limits_from_run_state()
-        elif key == "MAX_CONCURRENT_AI" and _AI_SEMAPHORE is not None:
-            _AI_SEMAPHORE = asyncio.Semaphore(int(persisted_value))
+        elif key == "MAX_CONCURRENT_AI":
+            _AI_SEMAPHORE = None
+            _AI_SEMAPHORE_LOOP = None
+            _AI_SEMAPHORE_CAPACITY = 0
+            old_executor = _AI_EXECUTOR
+            _AI_EXECUTOR = ThreadPoolExecutor(
+                max_workers=max(2, int(persisted_value)), thread_name_prefix="ai"
+            )
+            with suppress(Exception):
+                old_executor.shutdown(wait=False, cancel_futures=False)
         elif key == "MAX_CONCURRENT_BROADCAST" and _BROADCAST_SEMAPHORE is not None:
             _BROADCAST_SEMAPHORE = asyncio.Semaphore(int(persisted_value))
         elif key == "MAX_CONCURRENT_TTS_USERS" and _TTS_CHUNK_SEMAPHORE is not None:
@@ -9216,7 +9470,7 @@ async def _runtime_admin_callback(update: Any, context: Any) -> None:
         return
 
     if data == "rtadmin_close":
-        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+        with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
             ACTIVE_ADMIN_CONVERSATIONS.pop(admin_id, None)
         with suppress(Exception):
             await query.answer("Closed")
@@ -9225,7 +9479,7 @@ async def _runtime_admin_callback(update: Any, context: Any) -> None:
         return
 
     if data == "rtadmin_rate":
-        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+        with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
             ACTIVE_ADMIN_CONVERSATIONS[admin_id] = {"state": "awaiting_rate_limit", "ts": time.monotonic()}
         with suppress(Exception):
             await query.answer("Send a number", show_alert=False)
@@ -9240,7 +9494,7 @@ async def _runtime_admin_callback(update: Any, context: Any) -> None:
         return
 
     if data == "rtadmin_cancel":
-        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+        with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
             ACTIVE_ADMIN_CONVERSATIONS.pop(admin_id, None)
         with suppress(Exception):
             await query.answer("Cancelled")
@@ -9344,18 +9598,18 @@ async def _handle_runtime_admin_text(update: Any, context: Any) -> bool:
     user = update.effective_user
     if not msg or not user or not _is_admin(user.id):
         return False
-    async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+    with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
         state = dict(ACTIVE_ADMIN_CONVERSATIONS.get(user.id) or {})
     if state.get("state") == "awaiting_bot_perf_value":
         raw = (msg.text or "").strip()
         key = str(state.get("key") or "").strip()
         if raw.lower() in {"/cancel", "cancel", "បោះបង់"}:
-            async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+            with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
                 ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
             await safe_send(lambda: msg.reply_text("Cancelled.", reply_markup=get_admin_dashboard_kb()))
             return True
         ok, info = await _apply_bot_performance_setting(key, raw, admin_id=user.id)
-        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+        with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
             ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
         if ok:
             await safe_send(lambda: msg.reply_text(
@@ -9377,7 +9631,7 @@ async def _handle_runtime_admin_text(update: Any, context: Any) -> bool:
 
     raw = (msg.text or "").strip()
     if raw.lower() in {"/cancel", "cancel", "បោះបង់"}:
-        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+        with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
             ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
         await safe_send(lambda: msg.reply_text(
             _runtime_admin_text(),
@@ -9393,7 +9647,7 @@ async def _handle_runtime_admin_text(update: Any, context: Any) -> bool:
             await safe_send(lambda: msg.reply_text("⚠️ HTTP Max Connections ត្រូវនៅចន្លោះ 10 ដល់ 1000។"))
             return True
         await _update_run_state("HTTP_MAX_CONNECTIONS", value)
-        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+        with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
             ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
         _runtime_admin_log_state("update_http_max_connections", user.id, extra=f"new_http_max={value}")
         await safe_send(lambda: msg.reply_text(
@@ -9417,7 +9671,7 @@ async def _handle_runtime_admin_text(update: Any, context: Any) -> bool:
         return True
 
     await _update_run_state("USER_RATE_LIMIT_PER_SECOND", value)
-    async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+    with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
         ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
     _runtime_admin_log_state("update_rate_limit", user.id, extra=f"new_limit={value}")
     await safe_send(lambda: msg.reply_text(
@@ -9712,9 +9966,11 @@ def _executor_status(name: str, executor: Any) -> dict[str, Any]:
     }
 
 
-_AI_SEMAPHORE:         asyncio.Semaphore | None = None
-_BROADCAST_SEMAPHORE:  asyncio.Semaphore | None = None
-_TTS_CHUNK_SEMAPHORE:  asyncio.Semaphore | None = None
+_AI_SEMAPHORE: asyncio.Semaphore | None = None
+_AI_SEMAPHORE_LOOP: asyncio.AbstractEventLoop | None = None
+_AI_SEMAPHORE_CAPACITY: int = 0
+_BROADCAST_SEMAPHORE: asyncio.Semaphore | None = None
+_TTS_CHUNK_SEMAPHORE: asyncio.Semaphore | None = None
 
 # ---------------------------------------------------------------------------
 # Redis/Supabase safe retry + cache helpers
@@ -10278,7 +10534,7 @@ async def _redis_delete(key: str) -> None:
 # High-concurrency Redis cache-aside + rate limiting helpers
 # ---------------------------------------------------------------------------
 _RATE_LIMIT_MEMORY: dict[str, deque[float]] = {}
-_RATE_LIMIT_MEMORY_LOCK = asyncio.Lock()
+_RATE_LIMIT_MEMORY_LOCK = threading.RLock()
 # Thread guard is used by sync admin cleanup while async handlers use the
 # limiter. This prevents dictionary-size-change races during /admin/optimize.
 _RATE_LIMIT_MEMORY_THREAD_LOCK = threading.RLock()
@@ -10341,8 +10597,22 @@ async def _redis_cache_set_many_json(items: dict[str, Any], ttl: int) -> bool:
     return bool(await redis_call("pipeline_set_json", _run, default=False, timeout=3.0, attempts=1))
 
 
+_RATE_LIMIT_LUA = """
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[2])
+local count = redis.call('ZCARD', KEYS[1])
+local allowed = 0
+if count < tonumber(ARGV[3]) then
+    redis.call('ZADD', KEYS[1], ARGV[1], ARGV[4])
+    count = count + 1
+    allowed = 1
+end
+redis.call('EXPIRE', KEYS[1], ARGV[5])
+return {allowed, count}
+"""
+
+
 async def _rate_limit_check(key: str, limit: int, window_s: float) -> tuple[bool, int]:
-    """Sliding-window limiter with Redis ZSET backing and in-memory fallback."""
+    """Atomic sliding-window limiter with a bounded in-memory fallback."""
     if not RATE_LIMIT_ENABLED:
         return True, 0
     limit_i = max(1, int(limit or 1))
@@ -10353,27 +10623,30 @@ async def _rate_limit_check(key: str, limit: int, window_s: float) -> tuple[bool
     if redis_client is not None:
         cutoff = now - window
         member = f"{now:.6f}:{secrets.token_hex(4)}"
+        ttl = max(_run_state_rate_limit_redis_ttl(), int(window) + 2)
 
         def _run():
-            # One pipeline round trip; non-transactional for speed. Minor race is
-            # acceptable here because this is a protective throttle, not billing.
-            pipe = redis_client.pipeline(transaction=False)
-            pipe.zremrangebyscore(redis_key, 0, cutoff)
-            pipe.zcard(redis_key)
-            pipe.zadd(redis_key, {member: now})
-            pipe.expire(redis_key, max(_run_state_rate_limit_redis_ttl(), int(window) + 2))
-            results = pipe.execute()
-            return int(results[1] or 0)
+            result = redis_client.eval(
+                _RATE_LIMIT_LUA,
+                1,
+                redis_key,
+                now,
+                cutoff,
+                limit_i,
+                member,
+                ttl,
+            )
+            return int(result[0]), int(result[1])
 
         try:
-            count_before = await redis_call("rate_limit", _run, default=None, timeout=1.25, attempts=1)
-            if count_before is not None:
-                allowed = int(count_before) < limit_i
-                return allowed, max(0, limit_i - int(count_before) - (1 if allowed else 0))
+            result = await redis_call("rate_limit", _run, default=None, timeout=1.25, attempts=1)
+            if result is not None:
+                allowed_i, count_after = result
+                return bool(allowed_i), max(0, limit_i - int(count_after))
         except Exception as exc:
             _log_once(logging.WARNING, "rate_limit_redis_fallback", "Redis rate limiter fallback: %s", exc)
 
-    async with _RATE_LIMIT_MEMORY_LOCK:
+    with _RATE_LIMIT_MEMORY_LOCK:
         with _RATE_LIMIT_MEMORY_THREAD_LOCK:
             dq = _RATE_LIMIT_MEMORY.setdefault(key, deque())
             cutoff = now - window
@@ -10382,12 +10655,11 @@ async def _rate_limit_check(key: str, limit: int, window_s: float) -> tuple[bool
             allowed = len(dq) < limit_i
             if allowed:
                 dq.append(now)
-            # Opportunistic cleanup so offline Redis mode stays bounded.
             if len(_RATE_LIMIT_MEMORY) > 100_000:
                 stale_before = now - max(window * 4, 60.0)
                 for old_key in list(_RATE_LIMIT_MEMORY.keys())[:5000]:
                     old_dq = _RATE_LIMIT_MEMORY.get(old_key)
-                    if not old_dq or (old_dq and old_dq[-1] < stale_before):
+                    if not old_dq or old_dq[-1] < stale_before:
                         _RATE_LIMIT_MEMORY.pop(old_key, None)
             return allowed, max(0, limit_i - len(dq))
 
@@ -10516,14 +10788,28 @@ async def _telegram_user_security_guard(update: Any, context: Any) -> None:
 
 
 async def _api_rate_limit_allowed(req: FastAPIRequest) -> bool:
+    """Apply an IP bucket before authentication so fake keys cannot bypass it."""
     if not RATE_LIMIT_ENABLED:
         return True
     host = req.client.host if req.client else "unknown"
-    auth = (req.headers.get("authorization") or req.headers.get("x-api-key") or "").strip()
-    if auth.lower().startswith("bearer "):
-        auth = auth[7:].strip()
-    identity = hashlib.sha256(auth.encode("utf-8")).hexdigest()[:24] if auth else host
-    allowed, _remaining = await _rate_limit_check(f"api:{req.url.path}:{identity}", _run_state_api_rate_limit(), _run_state_api_rate_window())
+    allowed, _remaining = await _rate_limit_check(
+        f"api:ip:{req.url.path}:{host}",
+        _run_state_api_rate_limit(),
+        _run_state_api_rate_window(),
+    )
+    return allowed
+
+
+async def _ai_authenticated_rate_limit_allowed(client_key: str) -> bool:
+    if not RATE_LIMIT_ENABLED:
+        return True
+    identity = hashlib.sha256(client_key.encode("utf-8")).hexdigest()[:24]
+    path = str(getattr(request, "path", "") or "/ai-assistant")
+    allowed, _remaining = await _rate_limit_check(
+        f"api:key:{path}:{identity}",
+        _run_state_api_rate_limit(),
+        _run_state_api_rate_window(),
+    )
     return allowed
 
 
@@ -20491,11 +20777,19 @@ def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
 def build_admin_report_pdf_sync(admin_id: int, report_range: dict[str, Any] | None = None) -> str:
     report_range = report_range or _admin_report_range_from_key("today")
     data = _collect_admin_report_data_sync(admin_id, report_range)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     range_key = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(report_range.get("key") or "report")).strip("-") or "report"
-    path = os.path.join(tempfile.gettempdir(), f"bot-admin-report-{int(admin_id or 0)}-{range_key}-{stamp}.pdf")
-    _write_admin_report_pdf_sync(path, data)
-    return path
+    fd, path = tempfile.mkstemp(
+        prefix=f"bot-admin-report-{int(admin_id or 0)}-{range_key}-",
+        suffix=".pdf",
+    )
+    os.close(fd)
+    try:
+        _write_admin_report_pdf_sync(path, data)
+        return path
+    except Exception:
+        with suppress(Exception):
+            os.remove(path)
+        raise
 
 
 async def build_admin_report_pdf(admin_id: int, report_range: dict[str, Any] | None = None) -> str:
@@ -21357,21 +21651,21 @@ async def _handle_feature_request_admin_reply_text(update: Update, context: Cont
     user = update.effective_user
     if not msg or not user or not _is_admin(user.id):
         return False
-    async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+    with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
         state = dict(ACTIVE_ADMIN_CONVERSATIONS.get(int(user.id)) or {})
     if state.get("state") != "awaiting_feature_request_reply":
         return False
     request_id = _feature_request_clean_id(state.get("request_id"))
     raw = str(msg.text or "").strip()
     if raw.lower() in {"cancel", "/cancel", "បោះបង់"}:
-        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+        with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
             ACTIVE_ADMIN_CONVERSATIONS.pop(int(user.id), None)
         await safe_send(lambda: msg.reply_text("បានបោះបង់ Reply User។", reply_markup=get_admin_dashboard_kb()))
         return True
     reply_text = raw[:FEATURE_REQUEST_ADMIN_REPLY_MAX]
     row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_feature_request_get(request_id))
     if not row:
-        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+        with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
             ACTIVE_ADMIN_CONVERSATIONS.pop(int(user.id), None)
         await safe_send(lambda: msg.reply_text("⚠️ Request not found.", reply_markup=get_admin_dashboard_kb()))
         return True
@@ -21398,7 +21692,7 @@ async def _handle_feature_request_admin_reply_text(update: Update, context: Cont
         _DB_EXECUTOR,
         lambda: db_feature_request_set_admin_note(request_id, reply_text, admin_id=int(user.id)),
     )
-    async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+    with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
         ACTIVE_ADMIN_CONVERSATIONS.pop(int(user.id), None)
     if ok_send:
         await safe_send(lambda: msg.reply_text(
@@ -21420,7 +21714,7 @@ async def _cb_user_needs_admin(query, user_id: int, context: ContextTypes.DEFAUL
         await query.answer("Admin only", show_alert=True)
         return
     if data in {"admin_user_needs", "needs_inbox", "needs_open_answers", "needs_sql"} or data.startswith("needs_request:"):
-        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+        with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
             state = ACTIVE_ADMIN_CONVERSATIONS.get(int(user_id)) or {}
             if state.get("state") == "awaiting_feature_request_reply":
                 ACTIVE_ADMIN_CONVERSATIONS.pop(int(user_id), None)
@@ -21478,7 +21772,7 @@ async def _cb_user_needs_admin(query, user_id: int, context: ContextTypes.DEFAUL
         if not row:
             await _open_feature_request_inbox(query, notice="⚠️ Request not found.")
             return
-        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+        with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
             ACTIVE_ADMIN_CONVERSATIONS[int(user_id)] = {
                 "state": "awaiting_feature_request_reply",
                 "request_id": _feature_request_clean_id(request_id),
@@ -22987,7 +23281,7 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         if key not in BOT_PERFORMANCE_SETTING_SPECS:
             await query.answer("Unknown setting", show_alert=True)
             return
-        async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+        with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
             ACTIVE_ADMIN_CONVERSATIONS[user_id] = {"state": "awaiting_bot_perf_value", "key": key, "ts": time.monotonic()}
         spec = BOT_PERFORMANCE_SETTING_SPECS[key]
         settings, _status = await get_bot_settings_async(force=True)
@@ -24726,7 +25020,7 @@ async def _clear_admin_transient_state(context: Any, admin_id: int) -> list[str]
         _pop_state("chat_state", "admin-chat")
         _close_session(int(admin_id))
 
-    async with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+    with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
         if ACTIVE_ADMIN_CONVERSATIONS.pop(int(admin_id), None) is not None:
             cleared.append("runtime-input")
 
