@@ -16182,6 +16182,220 @@ _AUDIO_FILE_FRAMES = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Real Telegram progress + single-message workflow
+# ---------------------------------------------------------------------------
+_PROGRESS_BAR_WIDTH = 12
+_PROGRESS_EDIT_MIN_INTERVAL_S = 0.9
+_PROGRESS_PERCENT_STEP = 3
+
+
+def _progress_clamp(value: Any, default: int = 0) -> int:
+    try:
+        number = int(round(float(value)))
+    except Exception:
+        number = int(default)
+    return max(0, min(100, number))
+
+
+def _progress_bar(percent: int, width: int = _PROGRESS_BAR_WIDTH) -> str:
+    width = max(5, min(20, int(width or _PROGRESS_BAR_WIDTH)))
+    pct = _progress_clamp(percent)
+    filled = int(round((pct / 100.0) * width))
+    return "█" * filled + "░" * max(0, width - filled)
+
+
+def _progress_elapsed_text(started_at: float) -> str:
+    elapsed = max(0, int(time.monotonic() - float(started_at or time.monotonic())))
+    if elapsed < 60:
+        return f"{elapsed} វិនាទី"
+    minutes, seconds = divmod(elapsed, 60)
+    if minutes < 60:
+        return f"{minutes} នាទី {seconds} វិនាទី"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} ម៉ោង {minutes} នាទី"
+
+
+class TelegramProgress:
+    """One Telegram message that shows honest, rate-limited task progress.
+
+    Progress only changes when the caller reports a completed milestone or a
+    measurable count.  No fake timer increments are used.  This prevents chat
+    flooding while making slow TTS, OCR, transcription, reports, and broadcasts
+    understandable to Khmer-speaking users.
+    """
+
+    __slots__ = (
+        "bot", "chat_id", "message", "title", "started_at", "percent",
+        "stage", "detail", "last_text", "last_edit_at", "closed", "lock",
+    )
+
+    def __init__(self, bot: Any, chat_id: int, title: str, message: Any | None = None):
+        self.bot = bot
+        self.chat_id = int(chat_id)
+        self.message = message
+        self.title = str(title or "កំពុងដំណើរការ")
+        self.started_at = time.monotonic()
+        self.percent = 0
+        self.stage = "កំពុងចាប់ផ្ដើម"
+        self.detail = ""
+        self.last_text = ""
+        self.last_edit_at = 0.0
+        self.closed = False
+        self.lock = asyncio.Lock()
+
+    @property
+    def message_id(self) -> int | None:
+        try:
+            return int(getattr(self.message, "message_id", 0) or 0) or None
+        except Exception:
+            return None
+
+    @classmethod
+    async def start(
+        cls,
+        *,
+        bot: Any,
+        chat_id: int,
+        title: str,
+        reply_target: Any | None = None,
+        percent: int = 0,
+        stage: str = "កំពុងចាប់ផ្ដើម",
+        detail: str = "",
+    ) -> "TelegramProgress":
+        progress = cls(bot, chat_id, title)
+        progress.percent = _progress_clamp(percent)
+        progress.stage = str(stage or progress.stage)
+        progress.detail = str(detail or "")
+        initial_text = progress.render()
+        if reply_target is not None and callable(getattr(reply_target, "reply_text", None)):
+            progress.message = await safe_send(lambda: reply_target.reply_text(initial_text))
+        else:
+            progress.message = await safe_send(
+                lambda: bot.send_message(chat_id=int(chat_id), text=initial_text)
+            )
+        progress.last_text = initial_text
+        progress.last_edit_at = time.monotonic()
+        return progress
+
+    @classmethod
+    def attach(cls, *, bot: Any, message: Any, title: str) -> "TelegramProgress":
+        chat = getattr(message, "chat", None)
+        chat_id = int(getattr(chat, "id", 0) or 0)
+        progress = cls(bot, chat_id, title, message=message)
+        return progress
+
+    def render(self) -> str:
+        parts = [
+            f"⏳ {self.title}",
+            "",
+            f"{_progress_bar(self.percent)}  {self.percent}%",
+            f"📌 {self.stage}",
+        ]
+        if self.detail:
+            parts.append(f"ℹ️ {self.detail}")
+        parts.append(f"⏱ {_progress_elapsed_text(self.started_at)}")
+        return "\n".join(parts)
+
+    async def _edit_or_send(
+        self,
+        text: str,
+        *,
+        parse_mode: str | None = None,
+        reply_markup: Any | None = None,
+        disable_web_page_preview: bool = True,
+    ) -> Any | None:
+        payload = str(text or "")
+        if self.message is None:
+            self.message = await safe_send(lambda: self.bot.send_message(
+                chat_id=self.chat_id,
+                text=payload,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+                disable_web_page_preview=disable_web_page_preview,
+            ))
+            return self.message
+
+        await safe_send(lambda: self.message.edit_text(
+            payload,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+            disable_web_page_preview=disable_web_page_preview,
+        ))
+        return self.message
+
+    async def update(
+        self,
+        percent: int | float | None = None,
+        stage: str | None = None,
+        detail: str | None = None,
+        *,
+        done: int | None = None,
+        total: int | None = None,
+        force: bool = False,
+        reply_markup: Any | None = None,
+    ) -> None:
+        if self.closed:
+            return
+        async with self.lock:
+            old_percent = self.percent
+            if done is not None and total is not None and int(total) > 0:
+                percent = (max(0, int(done)) / max(1, int(total))) * 100.0
+            if percent is not None:
+                # Progress is monotonic so late concurrent updates cannot move it backwards.
+                self.percent = max(self.percent, _progress_clamp(percent, self.percent))
+            if stage is not None:
+                self.stage = str(stage)
+            if detail is not None:
+                self.detail = str(detail)
+
+            rendered = self.render()
+            now = time.monotonic()
+            meaningful_step = abs(self.percent - old_percent) >= _PROGRESS_PERCENT_STEP
+            if not force and not meaningful_step and (now - self.last_edit_at) < _PROGRESS_EDIT_MIN_INTERVAL_S:
+                return
+            if rendered == self.last_text:
+                return
+            await self._edit_or_send(rendered, reply_markup=reply_markup)
+            self.last_text = rendered
+            self.last_edit_at = now
+
+    async def finish(
+        self,
+        text: str,
+        *,
+        parse_mode: str | None = None,
+        reply_markup: Any | None = None,
+        delete_after_s: float | None = None,
+        disable_web_page_preview: bool = True,
+    ) -> Any | None:
+        async with self.lock:
+            if self.closed:
+                return self.message
+            self.percent = 100
+            await self._edit_or_send(
+                str(text or "✅ បានបញ្ចប់ដោយជោគជ័យ។"),
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+                disable_web_page_preview=disable_web_page_preview,
+            )
+            self.closed = True
+            if delete_after_s is not None and self.message is not None:
+                asyncio.create_task(_delete_message_later(self.message, delete_after_s))
+            return self.message
+
+    async def fail(
+        self,
+        text: str,
+        *,
+        parse_mode: str | None = None,
+        reply_markup: Any | None = None,
+    ) -> Any | None:
+        final_text = str(text or "❌ មិនអាចបញ្ចប់ការងារបានទេ។ សូមសាកម្ដងទៀត។")
+        if not final_text.startswith(("❌", "⚠️")):
+            final_text = "❌ " + final_text
+        return await self.finish(final_text, parse_mode=parse_mode, reply_markup=reply_markup)
+
 async def send_status_timer(
     chat_id: int,
     bot,
@@ -17989,11 +18203,12 @@ async def generate_user_voice_limited(
     bot,
     voxcpm2_session: dict[str, Any] | None = None,
     chat_id: int | None = None,
+    progress: TelegramProgress | None = None,
 ) -> bytes:
-    """Generate user TTS, resolving VoxCPM2 reference audio when selected.
+    """Generate user TTS and report only real provider milestones.
 
-    When the public VoxCPM2 queue is full, fall back automatically so the user
-    still receives a voice message instead of a hard failure.
+    VoxCPM2 queue fallback is shown inside the same progress message when one is
+    supplied, avoiding an extra notification message in normal user workflows.
     """
     model = _normalize_tts_model(tts_model)
     if model != "voxcpm2":
@@ -18002,6 +18217,12 @@ async def generate_user_voice_limited(
     owned_session = voxcpm2_session is None
     session_data = voxcpm2_session
     if session_data is None:
+        if progress is not None:
+            await progress.update(
+                stage="កំពុងរៀបចំសំឡេងគំរូ VoxCPM2",
+                detail="កំពុងទាញយក និងពិនិត្យសំឡេងគំរូរបស់អ្នក។",
+                force=True,
+            )
         session_data = await _prepare_voxcpm2_session(user_id, bot)
     try:
         try:
@@ -18016,11 +18237,20 @@ async def generate_user_voice_limited(
             if not VOXCPM2_AUTO_FALLBACK_ON_QUEUE or not _voxcpm2_is_fallbackable_queue_error(exc):
                 raise
 
-            # Queue-full means the public Space has no capacity.  Do not fail the
-            # user request; tell them in Khmer and generate with the best local
-            # fallback path for the text language.
             fallback_model = _voxcpm2_fallback_model_for_text(text)
-            if isinstance(session_data, dict) and not session_data.get("fallback_notice_sent"):
+            fallback_label = TTS_MODEL_OPTIONS.get(
+                fallback_model,
+                TTS_MODEL_OPTIONS.get("auto", (fallback_model, "")),
+            )[0]
+            if progress is not None:
+                await progress.update(
+                    stage="VoxCPM2 កំពុងរវល់ — កំពុងប្ដូរទៅសំឡេងបម្រុង",
+                    detail=f"ប្រើ {fallback_label} ដើម្បីបញ្ចប់ការងាររបស់អ្នក។",
+                    force=True,
+                )
+                if isinstance(session_data, dict):
+                    session_data["fallback_notice_sent"] = True
+            elif isinstance(session_data, dict) and not session_data.get("fallback_notice_sent"):
                 await _send_voxcpm2_fallback_notice(
                     bot,
                     chat_id if chat_id is not None else user_id,
@@ -18650,24 +18880,50 @@ async def _deliver_paged_tts(
     user_id: int,
     username: str,
     tts_model: str = "auto",
-) -> None:
+    *,
+    progress: TelegramProgress | None = None,
+    progress_start: int = 20,
+    progress_end: int = 94,
+) -> tuple[int, int]:
+    """Generate long TTS in measurable chunks and update one status message."""
     chunks = _split_text_chunks(text)
     if not chunks:
-        await safe_send(lambda: bot.send_message(chat_id=chat_id, text="❌ រកអត្ថបទមិនឃើញ។"))
-        return
+        raise ValueError("រកអត្ថបទមិនឃើញ។")
 
     set_last_tts_text(user_id, text)
     total = len(chunks)
     model = _normalize_tts_model(tts_model)
+    model_label = TTS_MODEL_OPTIONS.get(model, TTS_MODEL_OPTIONS["auto"])[0]
     voxcpm2_session: dict[str, Any] | None = None
+    sent_count = 0
+    failed_count = 0
+    first_error: Exception | None = None
+    start_pct = _progress_clamp(progress_start)
+    end_pct = max(start_pct, _progress_clamp(progress_end))
+    span = max(1, end_pct - start_pct)
 
     try:
-        # A long VoxCPM2 response can contain many Telegram pages. Download and
-        # validate the reference once, then reuse the same request-owned temp file.
         if model == "voxcpm2":
+            if progress is not None:
+                await progress.update(
+                    start_pct,
+                    "កំពុងរៀបចំសំឡេងគំរូ VoxCPM2",
+                    f"មាន {total} ផ្នែកត្រូវបង្កើត។",
+                    force=True,
+                )
             voxcpm2_session = await _prepare_voxcpm2_session(user_id, bot)
 
         for i, chunk in enumerate(chunks, 1):
+            before_pct = start_pct + int(((i - 1) / total) * span)
+            after_pct = start_pct + int((i / total) * span)
+            if progress is not None:
+                await progress.update(
+                    before_pct,
+                    f"កំពុងបង្កើតសំឡេង ផ្នែកទី {i} នៃ {total}",
+                    f"ម៉ូដែល៖ {model_label}",
+                    force=(i == 1),
+                )
+
             file_path = _make_temp_ogg()
             try:
                 audio_bytes = await generate_user_voice_limited(
@@ -18680,6 +18936,7 @@ async def _deliver_paged_tts(
                     bot=bot,
                     voxcpm2_session=voxcpm2_session,
                     chat_id=chat_id,
+                    progress=progress,
                 )
                 sent = await safe_send(
                     lambda ab=audio_bytes, ci=i, ct=total: bot.send_voice(
@@ -18689,16 +18946,27 @@ async def _deliver_paged_tts(
                         reply_markup=get_main_kb(gender, model),
                     )
                 )
-                if sent:
-                    save_text_cache(
-                        sent.message_id,
-                        chunk,
-                        chat_id=chat_id,
-                        user_id=user_id,
-                        username=username,
+                if sent is None:
+                    raise RuntimeError("Telegram មិនអាចផ្ញើសារសំឡេងបាន។")
+                sent_count += 1
+                save_text_cache(
+                    sent.message_id,
+                    chunk,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    username=username,
+                )
+                set_last_tts_text(user_id, chunk)
+                if progress is not None:
+                    await progress.update(
+                        after_pct,
+                        f"បានផ្ញើសំឡេង ផ្នែកទី {i} នៃ {total}",
+                        f"បានបញ្ចប់ {sent_count}/{total} ផ្នែក។",
                     )
-                    set_last_tts_text(user_id, chunk)
             except Exception as exc:
+                failed_count += 1
+                if first_error is None:
+                    first_error = exc
                 logger.error(
                     "paged TTS chunk %s/%s error: %s",
                     i,
@@ -18706,14 +18974,20 @@ async def _deliver_paged_tts(
                     exc,
                     exc_info=True,
                 )
-                await safe_send(
-                    lambda ci=i, ct=total, err=exc: bot.send_message(
-                        chat_id=chat_id,
-                        text=f"{_tts_user_error_message(err)}\nChunk {ci}/{ct}",
+                if progress is not None:
+                    await progress.update(
+                        after_pct,
+                        f"ផ្នែកទី {i} មិនបានជោគជ័យ",
+                        f"បានផ្ញើ {sent_count}/{total} ផ្នែក។ កំពុងបន្តផ្នែកបន្ទាប់ ប្រសិនបើអាច។",
+                        force=True,
                     )
-                )
-                # Provider/session failures are unlikely to recover for later
-                # pages in the same request. Stop to avoid repeated slow failures.
+                else:
+                    await safe_send(
+                        lambda ci=i, ct=total, err=exc: bot.send_message(
+                            chat_id=chat_id,
+                            text=f"{_tts_user_error_message(err)}\nផ្នែកទី {ci}/{ct}",
+                        )
+                    )
                 if model == "voxcpm2":
                     break
             finally:
@@ -18724,6 +18998,10 @@ async def _deliver_paged_tts(
     finally:
         _cleanup_voxcpm2_session(voxcpm2_session)
         _set_last_tts(user_id)
+
+    if sent_count == 0 and first_error is not None:
+        raise first_error
+    return sent_count, failed_count
 
 
 
@@ -19173,21 +19451,21 @@ def _broadcast_sent_delete_confirm_text(job: dict | None) -> str:
 async def _delete_broadcast_sent_messages(bot: Any, admin_id: int, delete_job: dict) -> tuple[int, int]:
     records = list(delete_job.get("records") or [])
     total = len(records)
-    label = str(delete_job.get("label") or "Broadcast")[:80]
+    label = str(delete_job.get("label") or "ការផ្សាយសារ")[:80]
+    progress = await TelegramProgress.start(
+        bot=bot,
+        chat_id=admin_id,
+        title="កំពុងលុបសារដែលបានផ្សាយ",
+        percent=2,
+        stage="កំពុងរៀបចំបញ្ជីសារ",
+        detail=f"ការផ្សាយ៖ {label}",
+    )
     if not records:
-        await safe_send(lambda: bot.send_message(
-            chat_id=admin_id,
-            text="⚠️ មិនមានសារសម្រាប់លុបទេ។",
-        ))
+        await progress.finish("⚠️ មិនមានសារសម្រាប់លុបទេ។")
         return (0, 0)
 
-    progress_msg = await safe_send(lambda: bot.send_message(
-        chat_id=admin_id,
-        text=f"🗑️ កំពុងលុបសារ {total} ពី {html.escape(label)}...",
-        parse_mode="HTML",
-    ))
-
     deleted = failed = 0
+    await progress.update(5, "បានរៀបចំបញ្ជីសារ", f"មានសារ {total} ត្រូវព្យាយាមលុប។", force=True)
     for idx, item in enumerate(records, start=1):
         try:
             await bot.delete_message(
@@ -19196,7 +19474,7 @@ async def _delete_broadcast_sent_messages(bot: Any, admin_id: int, delete_job: d
             )
             deleted += 1
         except RetryAfter as exc:
-            await asyncio.sleep(float(getattr(exc, "retry_after", 1) or 1) + 1)
+            await asyncio.sleep(_retry_after_seconds(exc))
             try:
                 await bot.delete_message(
                     chat_id=int(item.get("chat_id")),
@@ -19205,35 +19483,39 @@ async def _delete_broadcast_sent_messages(bot: Any, admin_id: int, delete_job: d
                 deleted += 1
             except Exception as retry_exc:
                 failed += 1
-                logger.info("broadcast sent-delete retry failed chat=%s msg=%s: %s", item.get("chat_id"), item.get("message_id"), retry_exc)
+                logger.info(
+                    "broadcast sent-delete retry failed chat=%s msg=%s: %s",
+                    item.get("chat_id"),
+                    item.get("message_id"),
+                    retry_exc,
+                )
         except Exception as exc:
             failed += 1
-            logger.info("broadcast sent-delete failed chat=%s msg=%s: %s", item.get("chat_id"), item.get("message_id"), exc)
+            logger.info(
+                "broadcast sent-delete failed chat=%s msg=%s: %s",
+                item.get("chat_id"),
+                item.get("message_id"),
+                exc,
+            )
 
-        if progress_msg and (idx == total or idx % max(10, BROADCAST_SENT_DELETE_BATCH_SIZE) == 0):
-            with suppress(Exception):
-                pct = int(idx / total * 100) if total else 100
-                await progress_msg.edit_text(
-                    f"🗑️ កំពុងលុប: {pct}% ({idx}/{total})\n"
-                    f"✅ លុបបាន: {deleted}  ❌ មិនបាន: {failed}"
-                )
+        pct = 5 + int((idx / total) * 90)
+        await progress.update(
+            pct,
+            f"កំពុងលុបសារ {idx}/{total}",
+            f"លុបបាន {deleted} • លុបមិនបាន {failed}",
+            force=(idx == total),
+        )
         if idx < total and BROADCAST_SENT_DELETE_DELAY_S:
             await asyncio.sleep(BROADCAST_SENT_DELETE_DELAY_S)
 
     report = (
-        "✅ <b>លុបសារ Broadcast រួចរាល់</b>\n\n"
-        f"Broadcast: <b>{html.escape(label)}</b>\n"
-        f"សរុប: <b>{total}</b>\n"
-        f"🗑️ លុបបាន: <b>{deleted}</b>\n"
-        f"❌ លុបមិនបាន: <b>{failed}</b>"
+        "✅ <b>បានលុបសារផ្សាយរួចរាល់</b>\n\n"
+        f"ការផ្សាយ៖ <b>{html.escape(label)}</b>\n"
+        f"សារសរុប៖ <b>{total}</b>\n"
+        f"🗑️ លុបបាន៖ <b>{deleted}</b>\n"
+        f"❌ លុបមិនបាន៖ <b>{failed}</b>"
     )
-    try:
-        if progress_msg:
-            await progress_msg.edit_text(report, parse_mode="HTML")
-        else:
-            await safe_send(lambda: bot.send_message(chat_id=admin_id, text=report, parse_mode="HTML"))
-    except Exception as exc:
-        logger.warning("broadcast sent-delete final report failed: %s", exc)
+    await progress.finish(report, parse_mode="HTML")
     return (deleted, failed)
 
 
@@ -19857,121 +20139,95 @@ async def _run_broadcast_to_all(
     bot,
     admin_id: int,
     pending: dict,
-    label: str = "Broadcast",
+    label: str = "ការផ្សាយសារ",
 ) -> tuple[int, int, int]:
+    """Broadcast with one editable message and real recipient-count progress."""
+    progress = await TelegramProgress.start(
+        bot=bot,
+        chat_id=admin_id,
+        title=f"កំពុងផ្សាយសារ — {label}",
+        percent=2,
+        stage="កំពុងរៀបចំការផ្សាយសារ",
+        detail="កំពុងពិនិត្យបញ្ជីអ្នកទទួល។",
+    )
     broadcast_semaphore = _BROADCAST_SEMAPHORE
     if broadcast_semaphore is None:
-        logger.error(f"{label}: _BROADCAST_SEMAPHORE not initialised.")
+        logger.error("%s: _BROADCAST_SEMAPHORE not initialised.", label)
+        await progress.fail("❌ ប្រព័ន្ធផ្សាយសារមិនទាន់រួចរាល់។ សូមព្យាយាមម្ដងទៀត។")
         return (0, 0, 0)
 
     loop = asyncio.get_running_loop()
-    raw_user_ids = await loop.run_in_executor(_DB_EXECUTOR, get_all_user_ids)
-
-    # Do not keep retrying users already known as unreachable/blocked.
-    # This prevents scheduled broadcasts from repeatedly logging "Chat not found"
-    # for the same invalid Telegram IDs.
-    existing_blocked_ids = await loop.run_in_executor(
-        _DB_EXECUTOR, functools.partial(_web_blocked_ids_for_users, raw_user_ids)
-    )
-    user_ids = [int(uid) for uid in raw_user_ids if int(uid) not in existing_blocked_ids]
-    total_registered = len(raw_user_ids)
-    total = len(user_ids)
-
-    if total_registered == 0:
-        await safe_send(lambda: bot.send_message(
-            chat_id=admin_id,
-            text=f"⚠️ {label}: មិនមានអ្នកប្រើប្រាស់ registered ណាមួយទេ។",
-        ))
-        return (0, 0, 0)
-
-    sent = failed = 0
-    sent_records: list[dict] = []
-    blocked = max(0, total_registered - total)
-
-    if total == 0:
-        await safe_send(lambda: bot.send_message(
-            chat_id=admin_id,
-            text=f"⚠️ {label}: អ្នកប្រើប្រាស់ទាំងអស់ស្ថិតក្នុង blocked/unreachable list។",
-        ))
-        return (0, 0, blocked)
-    photo_file_id = pending.get("photo_file_id")
-    default_parse_mode = pending.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO
     try:
-        if photo_file_id:
-            send_text, send_parse_mode = _broadcast_prepare_text(
-                pending.get("caption"),
-                default_parse_mode,
-                max_chars=1024,
-            )
-            send_text = send_text or ""
-        else:
-            send_text, send_parse_mode = _broadcast_prepare_text(
-                pending.get("text"),
-                default_parse_mode,
-                max_chars=TELE_MSG_LIMIT,
-            )
-    except ValueError as exc:
-        error_text = html.escape(str(exc))
-        await safe_send(lambda: bot.send_message(
-            chat_id=admin_id,
-            text=f"❌ {label}: {error_text}",
-            parse_mode="HTML",
-        ))
-        return (0, 0, 0)
-
-    if not photo_file_id and not send_text:
-        await safe_send(lambda: bot.send_message(
-            chat_id=admin_id, text=f"❌ {label}: Broadcast text is empty."
-        ))
-        return (0, 0, 0)
-
-    progress_msg = await safe_send(lambda: bot.send_message(
-        chat_id=admin_id,
-        text=(
-            f"📡 {label} — កំពុង Broadcast ទៅ {total} active user(s)...\n"
-            f"👥 Registered: {total_registered}  🚫 Skipped blocked: {blocked}"
+        await progress.update(5, "កំពុងទាញបញ្ជីអ្នកប្រើប្រាស់", "កំពុងអានទិន្នន័យពីមូលដ្ឋានទិន្នន័យ។", force=True)
+        raw_user_ids = await loop.run_in_executor(_DB_EXECUTOR, get_all_user_ids)
+        existing_blocked_ids = await loop.run_in_executor(
+            _DB_EXECUTOR,
+            functools.partial(_web_blocked_ids_for_users, raw_user_ids),
         )
-    ))
+        user_ids = [int(uid) for uid in raw_user_ids if int(uid) not in existing_blocked_ids]
+        total_registered = len(raw_user_ids)
+        total = len(user_ids)
+        blocked = max(0, total_registered - total)
 
-    async def _send_one(uid: int) -> tuple[str, dict | None]:
-        async with broadcast_semaphore:
-            for attempt in range(2):
-                try:
-                    sent_message = await _send_telegram_broadcast_message(
-                        bot,
-                        chat_id=uid,
-                        text=send_text or "",
-                        parse_mode=send_parse_mode,
-                        photo_file_id=photo_file_id,
-                    )
-                    message_id = int(getattr(sent_message, "message_id", 0) or 0)
-                    record = {"chat_id": int(uid), "message_id": message_id} if message_id else None
-                    return "sent", record
-                except Forbidden as e:
-                    await loop.run_in_executor(
-                        None,
-                        functools.partial(
-                            db_user_set_blocked,
-                            int(uid),
-                            int(admin_id),
-                            True,
-                            f"Telegram Forbidden during broadcast: {str(e)[:180]}",
-                        ),
-                    )
-                    return "blocked", None
-                except RetryAfter as e:
-                    await asyncio.sleep(e.retry_after + 1)
-                    if attempt == 1:
-                        return "failed", None
-                except BadRequest as e:
-                    low = str(e).lower()
-                    if (
-                        "chat not found" in low
-                        or "user is deactivated" in low
-                        or "bot can't initiate conversation" in low
-                        or "bot can’t initiate conversation" in low
-                    ):
-                        logger.info(f"{label}: marking unreachable uid={uid} as blocked: {e}")
+        if total_registered == 0:
+            await progress.finish(f"⚠️ {label}: មិនមានអ្នកប្រើប្រាស់សម្រាប់ផ្ញើសារទេ។")
+            return (0, 0, 0)
+        if total == 0:
+            await progress.finish(
+                f"⚠️ {label}: អ្នកប្រើប្រាស់ទាំងអស់បានបិទបូត ឬមិនអាចទាក់ទងបាន។"
+            )
+            return (0, 0, blocked)
+
+        photo_file_id = pending.get("photo_file_id")
+        default_parse_mode = pending.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO
+        try:
+            if photo_file_id:
+                send_text, send_parse_mode = _broadcast_prepare_text(
+                    pending.get("caption"),
+                    default_parse_mode,
+                    max_chars=1024,
+                )
+                send_text = send_text or ""
+            else:
+                send_text, send_parse_mode = _broadcast_prepare_text(
+                    pending.get("text"),
+                    default_parse_mode,
+                    max_chars=TELE_MSG_LIMIT,
+                )
+        except ValueError as exc:
+            logger.warning("%s invalid broadcast content: %s", label, exc)
+            await progress.fail("❌ មាតិកាផ្សាយសារវែងពេក ឬមានទម្រង់មិនត្រឹមត្រូវ។")
+            return (0, 0, 0)
+
+        if not photo_file_id and not send_text:
+            await progress.fail("❌ មិនមានអត្ថបទសម្រាប់ផ្សាយទេ។")
+            return (0, 0, 0)
+
+        await progress.update(
+            10,
+            "បានរៀបចំបញ្ជីអ្នកទទួល",
+            f"គោលដៅ {total} នាក់ • រំលង {blocked} នាក់ដែលមិនអាចទាក់ទងបាន។",
+            force=True,
+        )
+
+        sent = failed = 0
+        sent_records: list[dict] = []
+
+        async def _send_one(uid: int) -> tuple[str, dict | None]:
+            async with broadcast_semaphore:
+                for attempt in range(2):
+                    try:
+                        sent_message = await _send_telegram_broadcast_message(
+                            bot,
+                            chat_id=uid,
+                            text=send_text or "",
+                            parse_mode=send_parse_mode,
+                            photo_file_id=photo_file_id,
+                        )
+                        message_id = int(getattr(sent_message, "message_id", 0) or 0)
+                        record = {"chat_id": int(uid), "message_id": message_id} if message_id else None
+                        return "sent", record
+                    except Forbidden as exc:
                         await loop.run_in_executor(
                             None,
                             functools.partial(
@@ -19979,84 +20235,100 @@ async def _run_broadcast_to_all(
                                 int(uid),
                                 int(admin_id),
                                 True,
-                                f"Telegram unreachable during broadcast: {str(e)[:180]}",
+                                f"Telegram Forbidden during broadcast: {str(exc)[:180]}",
                             ),
                         )
                         return "blocked", None
-                    logger.error(f"{label} Telegram BadRequest uid={uid}: {e}")
-                    return "failed", None
-                except Exception as e:
-                    logger.error(f"{label} error uid={uid} attempt={attempt}: {e}")
-                    if attempt == 1:
+                    except RetryAfter as exc:
+                        await asyncio.sleep(_retry_after_seconds(exc))
+                        if attempt == 1:
+                            return "failed", None
+                    except BadRequest as exc:
+                        low = str(exc).lower()
+                        if any(token in low for token in (
+                            "chat not found",
+                            "user is deactivated",
+                            "bot can't initiate conversation",
+                            "bot can’t initiate conversation",
+                        )):
+                            await loop.run_in_executor(
+                                None,
+                                functools.partial(
+                                    db_user_set_blocked,
+                                    int(uid),
+                                    int(admin_id),
+                                    True,
+                                    f"Telegram unreachable during broadcast: {str(exc)[:180]}",
+                                ),
+                            )
+                            return "blocked", None
+                        logger.error("%s Telegram BadRequest uid=%s: %s", label, uid, exc)
                         return "failed", None
-                    await asyncio.sleep(0.5 * (attempt + 1))
-        return "failed", None
+                    except Exception as exc:
+                        logger.error("%s error uid=%s attempt=%s: %s", label, uid, attempt, exc)
+                        if attempt == 1:
+                            return "failed", None
+                        await asyncio.sleep(0.5 * (attempt + 1))
+            return "failed", None
 
-    batch_size = max(1, _run_state_broadcast_batch_size())
-    for start in range(0, total, batch_size):
-        batch = user_ids[start:start + batch_size]
-        results = await asyncio.gather(
-            *(_send_one(uid) for uid in batch),
-            return_exceptions=True,
+        batch_size = max(1, _run_state_broadcast_batch_size())
+        for start in range(0, total, batch_size):
+            batch = user_ids[start:start + batch_size]
+            results = await asyncio.gather(
+                *(_send_one(uid) for uid in batch),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error("%s batch task error: %s", label, result)
+                    failed += 1
+                    continue
+                status = result
+                record = None
+                if isinstance(result, tuple):
+                    status = result[0]
+                    record = result[1] if len(result) > 1 else None
+                if status == "sent":
+                    sent += 1
+                    if isinstance(record, dict):
+                        sent_records.append(record)
+                elif status == "blocked":
+                    blocked += 1
+                else:
+                    failed += 1
+
+            completed = min(start + len(batch), total)
+            pct = 10 + int((completed / total) * 85)
+            await progress.update(
+                pct,
+                f"កំពុងផ្ញើសារ {completed}/{total}",
+                f"បានផ្ញើ {sent} • មិនអាចទាក់ទង {blocked} • បរាជ័យ {failed}",
+                force=(completed == total),
+            )
+            if completed < total:
+                await asyncio.sleep(max(0.0, _run_state_broadcast_delay()))
+
+        delete_job_id = _broadcast_sent_delete_register(admin_id, label, sent_records)
+        delete_note = (
+            "\n\n🗑️ អ្នកអាចលុបសារដែលបានផ្ញើរួចពីអ្នកទទួល ដោយចុចប៊ូតុងខាងក្រោម។"
+            if delete_job_id else ""
         )
-
-        for result in results:
-            if isinstance(result, Exception):
-                logger.error(f"{label} batch task error: {result}")
-                failed += 1
-                continue
-
-            status = result
-            record = None
-            if isinstance(result, tuple):
-                status = result[0]
-                record = result[1] if len(result) > 1 else None
-
-            if status == "sent":
-                sent += 1
-                if isinstance(record, dict):
-                    sent_records.append(record)
-            elif status == "blocked":
-                blocked += 1
-            else:
-                failed += 1
-
-        completed = min(start + len(batch), total)
-        if progress_msg and (completed == total or completed % max(25, batch_size) == 0):
-            with suppress(Exception):
-                pct = int(completed / total * 100) if total else 0
-                await progress_msg.edit_text(
-                    f"📡 {label}: {pct}% ({completed}/{total})\n"
-                    f"✅ {sent}  🚫 {blocked}  ❌ {failed}"
-                )
-
-        if completed < total:
-            await asyncio.sleep(max(0.0, _run_state_broadcast_delay()))
-
-    delete_job_id = _broadcast_sent_delete_register(admin_id, label, sent_records)
-    delete_note = (
-        "\n\n🗑️ ចង់លុបសារដែលបានផ្ញើទៅអ្នកប្រើវិញ សូមចុចប៊ូតុងខាងក្រោម។"
-        if delete_job_id else ""
-    )
-    report = (
-        f"✅ <b>{html.escape(label)}</b> រួចរាល់!\n\n"
-        f"👥 Registered: {total_registered}\n"
-        f"🎯 Active target: {total}\n"
-        f"📨 បានផ្ញើ: {sent}\n"
-        f"🚫 Blocked/unreachable: {blocked}\n"
-        f"❌ Failed: {failed}"
-        f"{delete_note}"
-    )
-    reply_markup = get_broadcast_sent_delete_kb(delete_job_id) if delete_job_id else None
-    try:
-        if progress_msg:
-            await safe_send(lambda: progress_msg.edit_text(report, parse_mode="HTML", reply_markup=reply_markup))
-        else:
-            await safe_send(lambda: bot.send_message(chat_id=admin_id, text=report, parse_mode="HTML", reply_markup=reply_markup))
-    except Exception as e:
-        logger.error(f"{label} report error: {e}")
-
-    return (sent, failed, blocked)
+        report = (
+            f"✅ <b>{html.escape(label)}</b> បានបញ្ចប់\n\n"
+            f"👥 អ្នកប្រើប្រាស់សរុប៖ {total_registered}\n"
+            f"🎯 អ្នកទទួលគោលដៅ៖ {total}\n"
+            f"📨 ផ្ញើបានជោគជ័យ៖ {sent}\n"
+            f"🚫 មិនអាចទាក់ទង៖ {blocked}\n"
+            f"❌ បរាជ័យ៖ {failed}"
+            f"{delete_note}"
+        )
+        reply_markup = get_broadcast_sent_delete_kb(delete_job_id) if delete_job_id else None
+        await progress.finish(report, parse_mode="HTML", reply_markup=reply_markup)
+        return (sent, failed, blocked)
+    except Exception as exc:
+        logger.error("%s broadcast failed: %s", label, exc, exc_info=True)
+        await progress.fail("❌ ការផ្សាយសារមិនបានបញ្ចប់ទេ។ សូមពិនិត្យប្រព័ន្ធ ហើយសាកម្ដងទៀត។")
+        return (0, 0, 0)
 
 # ===========================================================================
 # BROADCAST (immediate)
@@ -21206,33 +21478,32 @@ async def _admin_open_report_day_picker(query, context: ContextTypes.DEFAULT_TYP
 
 async def _admin_send_report_pdf_for_range(query, context: ContextTypes.DEFAULT_TYPE, user_id: int, report_range: dict[str, Any]) -> None:
     context.user_data.pop("admin_report_state", None)
-    label = str((report_range or {}).get("label") or "Selected range")
+    label = _khmer_ui_text((report_range or {}).get("label") or "ចន្លោះពេលដែលបានជ្រើស")
     path = ""
-    progress = None
+    progress = TelegramProgress.attach(
+        bot=context.bot,
+        message=query.message,
+        title="កំពុងបង្កើតរបាយការណ៍ PDF",
+    )
     try:
-        progress = await safe_send(lambda: query.message.reply_text(
-            f'⏳ កំពុងបង្កើតរបាយការណ៍ PDF...\nចន្លោះពេល៖ <b>{html.escape(label)}</b>',
-            parse_mode="HTML",
-        ))
+        await progress.update(5, "កំពុងពិនិត្យចន្លោះពេល", label, force=True, reply_markup=None)
+        await progress.update(20, "កំពុងប្រមូលទិន្នន័យ", "កំពុងរៀបចំស្ថិតិ ក្រាហ្វ និងស្ថានភាពប្រព័ន្ធ។", force=True)
         path = await build_admin_report_pdf(user_id, report_range)
+
+        await progress.update(85, "បានបង្កើតឯកសារ PDF", "កំពុងផ្ញើឯកសារទៅ Telegram។", force=True)
         with open(path, "rb") as report_file:
-            await context.bot.send_document(
+            sent = await safe_send(lambda: context.bot.send_document(
                 chat_id=user_id,
                 document=report_file,
                 filename=os.path.basename(path),
-                caption=f"📄 Admin PDF report with activity graph\nRange: {label}",
-            )
-        if progress:
-            with suppress(Exception):
-                await progress.edit_text('✅ បានបង្កើត និងផ្ញើរបាយការណ៍ PDF រួចរាល់។')
+                caption=f"📄 របាយការណ៍ប្រព័ន្ធ\nចន្លោះពេល៖ {label}",
+            ))
+        if sent is None:
+            raise RuntimeError("Telegram មិនអាចផ្ញើឯកសារ PDF បាន។")
+        await progress.finish("✅ បានបង្កើត និងផ្ញើរបាយការណ៍ PDF រួចរាល់។", delete_after_s=5.0)
     except Exception as exc:
         logger.error("admin_report_pdf failed: %s", exc, exc_info=True)
-        error_text = html.escape(str(exc)[:300])
-        if progress:
-            with suppress(Exception):
-                await progress.edit_text(f'⚠️ ការបង្កើតរបាយការណ៍បរាជ័យ៖ {error_text}')
-        else:
-            await safe_send(lambda: query.message.reply_text(f'⚠️ ការបង្កើតរបាយការណ៍បរាជ័យ៖ {error_text}'))
+        await progress.fail("⚠️ មិនអាចបង្កើត ឬផ្ញើរបាយការណ៍ PDF បានទេ។ សូមសាកម្ដងទៀត។")
     finally:
         if path:
             with suppress(Exception):
@@ -21251,40 +21522,43 @@ async def _handle_admin_report_day_text(update: Update, context: ContextTypes.DE
     report_range = _admin_report_parse_day_text(msg.text)
     if not report_range:
         await safe_send(lambda: msg.reply_text(
-            '⚠️ កាលបរិច្ឆេទមិនត្រឹមត្រូវ។ សូមវាយជា <code>YYYY-MM-DD</code> ឧ. <code>2026-06-29</code>\nឬវាយ <code>today</code>, <code>yesterday</code>, <code>7</code>, <code>30</code>។',
+            "⚠️ កាលបរិច្ឆេទមិនត្រឹមត្រូវ។ សូមវាយជា <code>YYYY-MM-DD</code> "
+            "ឧ. <code>2026-06-29</code>\nឬវាយ <code>today</code>, "
+            "<code>yesterday</code>, <code>7</code>, <code>30</code>។",
             parse_mode="HTML",
             reply_markup=get_admin_action_kb(),
         ))
         return True
 
     context.user_data.pop("admin_report_state", None)
-    label = str(report_range.get("label") or "Selected day")
+    label = _khmer_ui_text(report_range.get("label") or "ចន្លោះពេលដែលបានជ្រើស")
     path = ""
-    progress = None
+    progress = await TelegramProgress.start(
+        bot=context.bot,
+        chat_id=user_id,
+        reply_target=msg,
+        title="កំពុងបង្កើតរបាយការណ៍ PDF",
+        percent=5,
+        stage="កំពុងពិនិត្យចន្លោះពេល",
+        detail=label,
+    )
     try:
-        progress = await safe_send(lambda: msg.reply_text(
-            f'⏳ កំពុងបង្កើតរបាយការណ៍ PDF...\nចន្លោះពេល៖ <b>{html.escape(label)}</b>',
-            parse_mode="HTML",
-        ))
+        await progress.update(20, "កំពុងប្រមូលទិន្នន័យ", "កំពុងរៀបចំស្ថិតិ ក្រាហ្វ និងស្ថានភាពប្រព័ន្ធ។", force=True)
         path = await build_admin_report_pdf(user_id, report_range)
+        await progress.update(85, "បានបង្កើតឯកសារ PDF", "កំពុងផ្ញើឯកសារទៅ Telegram។", force=True)
         with open(path, "rb") as report_file:
-            await context.bot.send_document(
+            sent = await safe_send(lambda: context.bot.send_document(
                 chat_id=user_id,
                 document=report_file,
                 filename=os.path.basename(path),
-                caption=f"📄 Admin PDF report with activity graph\nRange: {label}",
-            )
-        if progress:
-            with suppress(Exception):
-                await progress.edit_text('✅ បានបង្កើត និងផ្ញើរបាយការណ៍ PDF រួចរាល់។')
+                caption=f"📄 របាយការណ៍ប្រព័ន្ធ\nចន្លោះពេល៖ {label}",
+            ))
+        if sent is None:
+            raise RuntimeError("Telegram មិនអាចផ្ញើឯកសារ PDF បាន។")
+        await progress.finish("✅ បានបង្កើត និងផ្ញើរបាយការណ៍ PDF រួចរាល់។", delete_after_s=5.0)
     except Exception as exc:
         logger.error("admin_report_pdf_text_date failed: %s", exc, exc_info=True)
-        error_text = html.escape(str(exc)[:300])
-        if progress:
-            with suppress(Exception):
-                await progress.edit_text(f'⚠️ ការបង្កើតរបាយការណ៍បរាជ័យ៖ {error_text}')
-        else:
-            await safe_send(lambda: msg.reply_text(f'⚠️ ការបង្កើតរបាយការណ៍បរាជ័យ៖ {error_text}'))
+        await progress.fail("⚠️ មិនអាចបង្កើត ឬផ្ញើរបាយការណ៍ PDF បានទេ។ សូមសាកម្ដងទៀត។")
     finally:
         if path:
             with suppress(Exception):
@@ -23175,7 +23449,7 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await safe_send(lambda: query.message.reply_text("⚠️ រកទិន្នន័យ Broadcast មិនឃើញ។ សូមចាប់ផ្ដើមថ្មី។"))
             return
         context.application.create_task(
-            _run_broadcast_to_all(context.bot, user_id, pending, label="Broadcast")
+            _run_broadcast_to_all(context.bot, user_id, pending, label="ការផ្សាយសារ")
         )
 
 
@@ -24081,62 +24355,82 @@ async def _download_telegram_file_to_bytes(tg_file, max_bytes: int) -> bytes:
 # on_document — subtitle / text reader
 # ---------------------------------------------------------------------------
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg      = update.message
-    user     = update.effective_user
+    msg = update.message
+    user = update.effective_user
     if not msg or not user or not msg.document:
         return
 
     sync_user_data(user)
-    user_id  = user.id
-    chat_id  = msg.chat_id
+    user_id = int(user.id)
+    chat_id = int(msg.chat_id)
     document = msg.document
     filename = document.file_name or ""
 
-    if _is_subtitle_file(filename):
-        status_msg = await safe_send(lambda: msg.reply_text('🎬 កំពុងអានឯកសារចំណងជើងរង/អត្ថបទ...'))
-        try:
-            if document.file_size and document.file_size > MAX_SUBTITLE_BYTES:
-                await safe_send(lambda: msg.reply_text(
-                    f'❌ ឯកសារធំពេក។ អតិបរមា {MAX_SUBTITLE_BYTES // 1024 // 1024} MB។'
-                ))
-                return
-
-            tg_file    = await context.bot.get_file(document.file_id)
-            file_bytes = await _download_telegram_file_to_bytes(tg_file, MAX_SUBTITLE_BYTES)
-            raw_text   = _decode_text_bytes(file_bytes)
-            cleaned    = _clean_subtitle_text(raw_text)
-
-            if not cleaned:
-                await safe_send(lambda: msg.reply_text("❌ មិនមានអត្ថបទអាចអានបានក្នុង file នេះទេ។"))
-                return
-
-            preview = cleaned[:1200] + ("\n\n..." if len(cleaned) > 1200 else "")
-            await safe_send(lambda: msg.reply_text(
-                f'🎬 <b>បានរកឃើញចំណងជើងរង/អត្ថបទ</b>\n\n📄 ឯកសារ៖ <code>{html.escape(filename)}</code>\n🔤 ចំនួនតួអក្សរ៖ <b>{len(cleaned)}</b>\n\n<blockquote>{html.escape(preview)}</blockquote>\n\nចុច ▶️ អាន ដើម្បីបំលែងទៅសំឡេង។',
-                parse_mode="HTML",
-                reply_markup=get_ocr_confirm_kb(msg.message_id),
-            ))
-            save_text_cache(
-                msg.message_id, cleaned,
-                chat_id=chat_id, user_id=user_id,
-                username=user.username or user.first_name,
-            )
-            set_last_tts_text(user_id, cleaned)
-            record_turn(user_id, "user",      f"[subtitle file] {filename}")
-            record_turn(user_id, "assistant", cleaned[:CONV_CONTEXT_MAX_CHARS])
-
-        except Exception as e:
-            logger.error(f"subtitle reader error: {e}", exc_info=True)
-            await safe_send(lambda: msg.reply_text('❌ មានបញ្ហាក្នុងការអានឯកសារចំណងជើងរង/អត្ថបទ។'))
-        finally:
-            if status_msg:
-                with suppress(Exception):
-                    await status_msg.delete()
+    if not _is_subtitle_file(filename):
+        await safe_send(lambda: msg.reply_text(
+            "❌ ឯកសារប្រភេទនេះមិនទាន់ត្រូវបានគាំទ្រទេ។\n\n"
+            "ប្រភេទឯកសារដែលគាំទ្រ៖\n• .srt\n• .vtt\n• .txt"
+        ))
         return
 
-    await safe_send(lambda: msg.reply_text(
-        '❌ ឯកសារប្រភេទនេះមិនទាន់ត្រូវបានគាំទ្រទេ។\n\nប្រភេទឯកសារចំណងជើងរង/អត្ថបទដែលគាំទ្រ៖\n• .srt\n• .vtt\n• .txt'
-    ))
+    progress = await TelegramProgress.start(
+        bot=context.bot,
+        chat_id=chat_id,
+        reply_target=msg,
+        title="កំពុងអានឯកសារចំណងជើងរង/អត្ថបទ",
+        percent=5,
+        stage="កំពុងពិនិត្យឯកសារ",
+        detail=filename or "ឯកសារអត្ថបទ",
+    )
+    try:
+        if document.file_size and document.file_size > MAX_SUBTITLE_BYTES:
+            await progress.fail(
+                f"❌ ឯកសារធំពេក។ អតិបរមា {MAX_SUBTITLE_BYTES // 1024 // 1024} MB។"
+            )
+            return
+
+        await progress.update(15, "កំពុងទាញយកឯកសារ", "កំពុងទទួលទិន្នន័យពី Telegram។", force=True)
+        tg_file = await context.bot.get_file(document.file_id)
+        file_bytes = await _download_telegram_file_to_bytes(tg_file, MAX_SUBTITLE_BYTES)
+
+        await progress.update(45, "បានទាញយកឯកសារ", "កំពុងស្គាល់ការអ៊ិនកូដ និងបម្លែងទៅអត្ថបទ។", force=True)
+        raw_text = _decode_text_bytes(file_bytes)
+
+        await progress.update(70, "កំពុងសម្អាតអត្ថបទ", "កំពុងដកលេខពេលវេលា និងស្លាកចំណងជើងរង។", force=True)
+        cleaned = _clean_subtitle_text(raw_text)
+        if not cleaned:
+            await progress.fail("❌ មិនមានអត្ថបទដែលអាចអានបានក្នុងឯកសារនេះទេ។")
+            return
+
+        await progress.update(90, "កំពុងរៀបចំលទ្ធផល", f"រកឃើញ {len(cleaned)} តួអក្សរ។", force=True)
+        preview = cleaned[:1200] + ("\n\n..." if len(cleaned) > 1200 else "")
+        message_id = progress.message_id or int(msg.message_id)
+        save_text_cache(
+            message_id,
+            cleaned,
+            chat_id=chat_id,
+            user_id=user_id,
+            username=user.username or user.first_name,
+        )
+        set_last_tts_text(user_id, cleaned)
+        record_turn(user_id, "user", f"[subtitle file] {filename}")
+        record_turn(user_id, "assistant", cleaned[:CONV_CONTEXT_MAX_CHARS])
+
+        result = (
+            "🎬 <b>បានអានឯកសាររួចរាល់</b>\n\n"
+            f"📄 ឯកសារ៖ <code>{html.escape(filename)}</code>\n"
+            f"🔤 ចំនួនតួអក្សរ៖ <b>{len(cleaned)}</b>\n\n"
+            f"<blockquote>{html.escape(preview)}</blockquote>\n\n"
+            "ចុច ▶️ អាន ដើម្បីបម្លែងអត្ថបទនេះទៅជាសំឡេង។"
+        )
+        await progress.finish(
+            result,
+            parse_mode="HTML",
+            reply_markup=get_ocr_confirm_kb(message_id),
+        )
+    except Exception as exc:
+        logger.error("subtitle reader error: %s", exc, exc_info=True)
+        await progress.fail("❌ មានបញ្ហាក្នុងការអានឯកសារ។ សូមពិនិត្យឯកសារ ហើយសាកម្ដងទៀត។")
 
 
 # ---------------------------------------------------------------------------
@@ -24146,55 +24440,66 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
     try:
         src_msg_id = int(data.split(":")[1])
     except Exception:
-        await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់ឯកសារបណ្ដោះអាសន្នមិនត្រឹមត្រូវ។'))
+        await safe_send(lambda: query.message.reply_text("❌ លេខសម្គាល់ឯកសារបណ្ដោះអាសន្នមិនត្រឹមត្រូវ។"))
         return
     if query.message is None:
         return
 
-    chat_id = query.message.chat.id
+    chat_id = int(query.message.chat.id)
     full_text, prefs = await asyncio.gather(
         get_text_cache_async(src_msg_id, chat_id),
         get_user_prefs_async(user_id),
     )
-
     if not full_text:
         full_text = get_last_tts_text(user_id) or ""
-
     if not full_text:
-        await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទមិនឃើញ។ សូមផ្ញើ file ម្តងទៀត។"))
+        await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទមិនឃើញ។ សូមផ្ញើឯកសារម្តងទៀត។"))
         return
-
     if await _check_cooldown(query.message, user_id):
         return
 
+    progress = TelegramProgress.attach(
+        bot=context.bot,
+        message=query.message,
+        title="កំពុងបម្លែងឯកសារទៅជាសំឡេង",
+    )
+    await progress.update(5, "កំពុងរៀបចំអត្ថបទ", f"មាន {len(full_text)} តួអក្សរ។", force=True, reply_markup=None)
+
     gender = prefs["gender"]
-    speed  = prefs["speed"]
+    speed = prefs["speed"]
     tts_model = prefs.get("tts_model", "auto")
-    uname  = query.from_user.username or query.from_user.first_name or str(user_id)
-
-    with suppress(Exception):
-        await query.message.delete()
-
-    set_last_tts_text(user_id, full_text)
-    tts_stop  = asyncio.Event()
-    tts_timer = asyncio.create_task(send_status_timer(chat_id, context.bot, tts_stop))
-    lock      = _get_user_lock(user_id)
+    uname = query.from_user.username or query.from_user.first_name or str(user_id)
+    lock = _get_user_lock(user_id)
 
     try:
         async with lock:
-            await _deliver_paged_tts(
-                chat_id=chat_id, bot=context.bot,
-                text=full_text, gender=gender, speed=speed,
-                user_id=user_id, username=uname, tts_model=tts_model,
+            sent_count, failed_count = await _deliver_paged_tts(
+                chat_id=chat_id,
+                bot=context.bot,
+                text=full_text,
+                gender=gender,
+                speed=speed,
+                user_id=user_id,
+                username=uname,
+                tts_model=tts_model,
+                progress=progress,
+                progress_start=15,
+                progress_end=95,
             )
             record_turn(user_id, "assistant", full_text[:CONV_CONTEXT_MAX_CHARS])
             _set_last_tts(user_id)
-    except Exception as e:
-        logger.error(f"_cb_doc_read delivery error: {e}", exc_info=True)
-        with suppress(Exception):
-            await context.bot.send_message(chat_id=chat_id, text="❌ មានបញ្ហាក្នុងការបង្កើតសំឡេង។")
-    finally:
-        await _stop_timer(tts_stop, tts_timer)
+            if failed_count:
+                await progress.finish(
+                    f"⚠️ បានផ្ញើសំឡេង {sent_count} ផ្នែក ប៉ុន្តែមាន {failed_count} ផ្នែកមិនបានជោគជ័យ។"
+                )
+            else:
+                await progress.finish(
+                    f"✅ បានបង្កើត និងផ្ញើសំឡេងរួចរាល់ ({sent_count} ផ្នែក)។",
+                    delete_after_s=5.0,
+                )
+    except Exception as exc:
+        logger.error("_cb_doc_read delivery error: %s", exc, exc_info=True)
+        await progress.fail(_tts_user_error_message(exc))
 
 
 async def _fire_scheduled_broadcast(bot, row: dict, already_claimed: bool = False) -> None:
@@ -24220,7 +24525,7 @@ async def _fire_scheduled_broadcast(bot, row: dict, already_claimed: bool = Fals
             raise RuntimeError("Scheduled broadcast has no photo and no text.")
 
         sent, failed, blocked = await _run_broadcast_to_all(
-            bot, admin_id, pending, label=f"Scheduled #{row_id}"
+            bot, admin_id, pending, label=f"កាលវិភាគ #{row_id}"
         )
         await loop.run_in_executor(
             None,
@@ -25875,13 +26180,12 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg     = update.message
-    user    = update.effective_user
+    msg = update.message
+    user = update.effective_user
     user_id = user.id if user else None
-    if user_id is None:
+    if user_id is None or msg is None:
         return
 
-    # Admin flow intercepts
     if _is_admin(user_id):
         sched_state = context.user_data.get("sched_state")
         if sched_state == SCHED_EDIT_WAIT_PHOTO:
@@ -25896,11 +26200,11 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
             target_id = _admin_chat_target.get(user_id)
             if target_id:
-                ok    = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
+                ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
                 reply = (
-                    f"✅ Photo ផ្ញើដល់ User <code>{target_id}</code> ។"
+                    f"✅ បានផ្ញើរូបភាពទៅអ្នកប្រើប្រាស់ <code>{target_id}</code>។"
                     if ok else
-                    f"❌ User <code>{target_id}</code> blocked bot ។"
+                    f"❌ អ្នកប្រើប្រាស់ <code>{target_id}</code> បានបិទបូត។"
                 )
                 await safe_send(lambda: msg.reply_text(reply, parse_mode="HTML"))
                 if not ok:
@@ -25912,118 +26216,114 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if admin_id is not None:
         uname = user.username or user.first_name or str(user_id)
         await _fwd_user_to_admin(context.bot, admin_id, user_id, uname, msg)
-        await safe_send(lambda: msg.reply_text("✅ រូបភាពបានផ្ញើដល់ Admin ។"))
+        await safe_send(lambda: msg.reply_text("✅ បានផ្ញើរូបភាពទៅអ្នកគ្រប់គ្រង។"))
         return
 
     if not await _ensure_user_allowed(update, context, "ocr_enabled", "អានអត្ថបទពីរូបភាព"):
         return
-
     if not _ocr_configured():
         await safe_send(lambda: msg.reply_text(_ocr_status_for_user()))
         return
-
     if await _check_cooldown(msg, user_id):
         return
 
     _metric_inc("ocr")
     sync_user_data(user)
-    uname       = user.username or user.first_name or str(user_id)
-    stop_event  = asyncio.Event()
-    timer_task  = asyncio.create_task(
-        send_status_timer(msg.chat_id, context.bot, stop_event, frames=_OCR_FRAMES)
+    uname = user.username or user.first_name or str(user_id)
+    progress = await TelegramProgress.start(
+        bot=context.bot,
+        chat_id=msg.chat_id,
+        reply_target=msg,
+        title="កំពុងអានអត្ថបទពីរូបភាព",
+        percent=5,
+        stage="កំពុងពិនិត្យរូបភាព",
+        detail="កំពុងរៀបចំឯកសាររូបភាព។",
     )
-    img_path    = None
+    img_path: str | None = None
     try:
-        img_path  = _make_temp_img(suffix=".jpg")
-        tg_file   = await safe_send(lambda: context.bot.get_file(msg.photo[-1].file_id))
+        await progress.update(12, "កំពុងទាញយករូបភាព", "កំពុងទទួលរូបភាពគុណភាពខ្ពស់ពី Telegram។", force=True)
+        img_path = _make_temp_img(suffix=".jpg")
+        tg_file = await safe_send(lambda: context.bot.get_file(msg.photo[-1].file_id))
         if not tg_file:
             raise RuntimeError("Could not download photo.")
         await tg_file.download_to_drive(img_path)
-        mime_type = _detect_image_mime(img_path)
-        ocr_text  = await ocr_image(img_path, mime_type=mime_type)
 
+        await progress.update(35, "បានទាញយករូបភាព", "កំពុងស្គាល់ប្រភេទរូបភាព។", force=True)
+        mime_type = _detect_image_mime(img_path)
+
+        await progress.update(50, "កំពុងស្វែងរកអត្ថបទ", "រូបភាពកំពុងត្រូវបានផ្ញើទៅម៉ាស៊ីន OCR។", force=True)
+        ocr_text = await ocr_image(img_path, mime_type=mime_type)
         if not ocr_text or ocr_text.upper() == "NOTEXT":
-            await safe_send(lambda: msg.reply_text("🖼️ រូបភាពនេះមិនមានអត្ថបទដែលអាចអានបាន។"))
+            await progress.finish("🖼️ រូបភាពនេះមិនមានអត្ថបទដែលអាចអានបានទេ។")
             return
 
+        await progress.update(85, "បានអានអត្ថបទរួច", f"រកឃើញ {len(ocr_text)} តួអក្សរ។", force=True)
         record_turn(user_id, "user", f"[Image OCR]: {ocr_text[:500]}")
-
-        lang_key   = _detect_lang(ocr_text)
+        lang_key = _detect_lang(ocr_text)
         lang_flag, lang_name = _language_display(lang_key)
-        header     = f"🔍 <b>OCR {lang_flag} {html.escape(lang_name)}</b>\n\n"
-        plain_pages = _paginate_plain(ocr_text, limit=TELE_MSG_LIMIT - len(header))
-        sent_pages  = []
-        for idx, plain_page in enumerate(plain_pages):
-            page_body = (header if idx == 0 else "") + html.escape(plain_page)
-            sent      = await safe_send(lambda pb=page_body: msg.reply_text(pb, parse_mode="HTML"))
-            sent_pages.append(sent)
-            await asyncio.sleep(0.2)
+        header = f"🔍 <b>អត្ថបទពីរូបភាព {lang_flag} {html.escape(lang_name)}</b>\n\n"
+        plain_pages = _paginate_plain(ocr_text, limit=max(500, TELE_MSG_LIMIT - len(header) - 64))
+        if not plain_pages:
+            await progress.fail("❌ មិនអាចរៀបចំអត្ថបទដែលបានអានទេ។")
+            return
 
-        last_sent = sent_pages[-1] if sent_pages else None
-        if last_sent:
-            save_text_cache(
-                last_sent.message_id, ocr_text,
-                chat_id=msg.chat_id, user_id=user_id, username=uname,
-            )
-            await safe_send(lambda: last_sent.edit_reply_markup(
-                reply_markup=get_ocr_confirm_kb(last_sent.message_id)
+        first_page = header + html.escape(plain_pages[0])
+        await progress.finish(first_page, parse_mode="HTML")
+        result_id = progress.message_id or int(msg.message_id)
+        save_text_cache(
+            result_id,
+            ocr_text,
+            chat_id=msg.chat_id,
+            user_id=user_id,
+            username=uname,
+        )
+        if progress.message is not None:
+            await safe_send(lambda: progress.message.edit_reply_markup(
+                reply_markup=get_ocr_confirm_kb(result_id)
             ))
 
-    except Exception as e:
-        err_msg  = str(e) or repr(e)
-        expected_ocr_outage = _is_expected_ocr_outage_error(err_msg)
-        if expected_ocr_outage:
-            logger.warning("on_photo OCR unavailable: %s: %s", type(e).__name__, err_msg[:700])
+        total_pages = len(plain_pages)
+        for idx, plain_page in enumerate(plain_pages[1:], 2):
+            page_body = (
+                f"🔍 <b>អត្ថបទពីរូបភាព — ទំព័រ {idx}/{total_pages}</b>\n\n"
+                + html.escape(plain_page)
+            )
+            await safe_send(lambda pb=page_body: msg.reply_text(pb, parse_mode="HTML"))
+            await asyncio.sleep(0.15)
+    except Exception as exc:
+        err_msg = str(exc) or repr(exc)
+        if _is_expected_ocr_outage_error(err_msg):
+            logger.warning("on_photo OCR unavailable: %s: %s", type(exc).__name__, err_msg[:700])
         else:
-            logger.error(f"on_photo OCR error: {type(e).__name__}: {e!r}", exc_info=True)
-
+            logger.error("on_photo OCR error: %s: %r", type(exc).__name__, exc, exc_info=True)
         if _is_dns_or_network_error(err_msg):
-            user_msg = (
-                "❌ OCR network/DNS មានបញ្ហា។ Server មិនអាចភ្ជាប់ទៅ Provider OCR បាន។\n"
-                "✅ បើ Hugging Face ខូច DNS លើ Render សូម Set OCR_PROVIDER=gemini + GEMINI_API_KEY; GEMINI_MODEL optional។\n"
-                "ℹ️ បើ Gemini មិនទាន់ set ទេ fallback មិនអាចដំណើរការ។"
-            )
-        elif "not available for hosted inference" in err_msg or "model/provider is not available" in err_msg:
-            user_msg = (
-                "❌ Hugging Face OCR model មិន support hosted inference ឬ provider មិនទាន់រួចរាល់។\n"
-                "✅ សូមប្រើ OCR_PROVIDER=gemini ជាមួយ GEMINI_API_KEY; GEMINI_MODEL optional ឬប្ដូរ HF_OCR_MODEL។"
-            )
+            user_msg = "❌ មិនអាចភ្ជាប់ទៅសេវា OCR បានទេ។ សូមសាកម្ដងទៀតបន្តិចក្រោយ។"
         elif "temporarily disabled" in err_msg.lower():
-            user_msg = (
-                "❌ OCR provider ត្រូវបានបិទបណ្តោះអាសន្ន ព្រោះមាន error ជាប់គ្នា។\n"
-                "✅ សូមសាកម្ដងទៀតបន្ទាប់ពី cooldown ឬប្ដូរ OCR_PROVIDER=gemini។"
-            )
+            user_msg = "⚠️ សេវា OCR ត្រូវបានផ្អាកបណ្ដោះអាសន្ន។ សូមសាកម្ដងទៀតក្រោយពេលខ្លី។"
         else:
-            user_msg = f"❌ មានបញ្ហាក្នុងការ OCR រូបភាព។\n{html.escape(err_msg[:1000])}"
-        await safe_send(lambda: msg.reply_text(user_msg))
+            user_msg = "❌ មិនអាចអានអត្ថបទពីរូបភាពនេះបានទេ។ សូមប្រើរូបភាពច្បាស់ជាងនេះ ហើយសាកម្ដងទៀត។"
+        await progress.fail(user_msg)
     finally:
-        await _stop_timer(stop_event, timer_task)
         if img_path:
             _cleanup(img_path)
 
 
 async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle uploaded audio without requiring Gemini for voice conversion.
-
-    Every supported MP3/audio upload can be converted to a real Telegram voice
-    record (OGG/Opus). Existing audio transcription remains available and runs
-    from the same downloaded temp file when that feature and Gemini are enabled.
-    """
+    """Convert and/or transcribe audio using one progress message."""
     msg = update.message
     user = update.effective_user
     user_id = user.id if user else None
     if user_id is None or msg is None:
         return
 
-    # Admin chat-session forward
     if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
         target_id = _admin_chat_target.get(user_id)
         if target_id:
             ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
             reply = (
-                f"✅ ផ្ញើដល់ User <code>{target_id}</code> ។"
+                f"✅ បានផ្ញើឯកសារទៅអ្នកប្រើប្រាស់ <code>{target_id}</code>។"
                 if ok else
-                f"❌ User <code>{target_id}</code> blocked bot ។"
+                f"❌ អ្នកប្រើប្រាស់ <code>{target_id}</code> បានបិទបូត។"
             )
             await safe_send(lambda: msg.reply_text(reply, parse_mode="HTML"))
             if not ok:
@@ -26035,12 +26335,11 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if admin_id is not None:
         uname = user.username or user.first_name or str(user_id)
         await _fwd_user_to_admin(context.bot, admin_id, user_id, uname, msg)
-        await safe_send(lambda: msg.reply_text("✅ ឯកសារបានផ្ញើដល់ Admin ។"))
+        await safe_send(lambda: msg.reply_text("✅ បានផ្ញើឯកសារទៅអ្នកគ្រប់គ្រង។"))
         return
 
     doc = msg.document
     audio = msg.audio
-
     if doc is not None:
         filename = doc.file_name or ""
         mime_type = doc.mime_type or ""
@@ -26048,7 +26347,6 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_unique_id = doc.file_unique_id
         file_size = int(doc.file_size or 0)
         duration = 0.0
-        # Subtitle/text documents belong to the document reader, not FFmpeg.
         if _is_subtitle_file(filename) or not _is_audio_file(filename, mime_type):
             await on_document(update, context)
             return
@@ -26066,35 +26364,34 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await _ensure_user_allowed(update, context):
             return
         await _voxcpm2_accept_reference(
-            update, context, file_id=file_id, file_unique_id=file_unique_id,
-            filename=filename or "reference_audio", mime_type=mime_type or "audio/ogg",
-            file_size=file_size, duration=duration,
+            update,
+            context,
+            file_id=file_id,
+            file_unique_id=file_unique_id,
+            filename=filename or "reference_audio",
+            mime_type=mime_type or "audio/ogg",
+            file_size=file_size,
+            duration=duration,
         )
         return
 
-    # Check block/maintenance once. Feature flags are evaluated below so admins
-    # retain the existing bypass and conversion can still work without Gemini.
     if not await _ensure_user_allowed(update, context):
         return
-
     is_admin = _is_admin(user_id)
     settings, _settings_status = await get_bot_settings_async()
     convert_enabled = is_admin or _setting_bool_from(settings, "audio_to_voice_enabled", True)
     transcribe_enabled = is_admin or _setting_bool_from(settings, "audio_transcribe_enabled", True)
-
     if not convert_enabled and not transcribe_enabled:
         _metric_inc("disabled_hits")
         await safe_send(lambda: msg.reply_text(
-            '⚠️ មុខងារបម្លែងអូឌីយ៉ូទៅជាសំឡេង និងការបម្លែងអូឌីយ៉ូទៅជាអត្ថបទ ត្រូវបានបិទបណ្ដោះអាសន្នដោយអ្នកគ្រប់គ្រង។'
+            "⚠️ មុខងារបម្លែងឯកសារអូឌីយ៉ូត្រូវបានបិទបណ្ដោះអាសន្នដោយអ្នកគ្រប់គ្រង។"
         ))
         return
-
     if file_size > MAX_AUDIO_FILE_BYTES:
         await safe_send(lambda: msg.reply_text(
-            f"❌ ឯកសារអូឌីយ៉ូធំពេក (អតិបរមា {MAX_AUDIO_FILE_BYTES // 1024 // 1024}MB)។"
+            f"❌ ឯកសារអូឌីយ៉ូធំពេក។ អតិបរមា {MAX_AUDIO_FILE_BYTES // 1024 // 1024} MB។"
         ))
         return
-
     if await _check_cooldown(msg, user_id):
         return
 
@@ -26107,16 +26404,21 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     audio_path: str | None = None
     voice_path: str | None = None
     voice_sent = False
-    transcript_sent = False
+    transcript = ""
     conversion_error: Exception | None = None
     transcription_error: Exception | None = None
 
-    stop_event = asyncio.Event()
-    timer_task = asyncio.create_task(
-        send_status_timer(msg.chat_id, context.bot, stop_event, frames=_AUDIO_FILE_FRAMES)
+    progress = await TelegramProgress.start(
+        bot=context.bot,
+        chat_id=msg.chat_id,
+        reply_target=msg,
+        title="កំពុងដំណើរការឯកសារអូឌីយ៉ូ",
+        percent=5,
+        stage="កំពុងពិនិត្យឯកសារ",
+        detail=filename or "ឯកសារអូឌីយ៉ូ",
     )
-
     try:
+        await progress.update(12, "កំពុងទាញយកឯកសារ", "កំពុងទទួលទិន្នន័យពី Telegram។", force=True)
         tg_file = await safe_send(lambda: context.bot.get_file(file_id))
         if not tg_file:
             raise RuntimeError("Could not download audio file.")
@@ -26125,104 +26427,105 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             MAX_AUDIO_FILE_BYTES,
             suffix=ext,
         )
+        await progress.update(30, "បានទាញយកឯកសារ", "កំពុងរៀបចំប្រតិបត្តិការដែលបានបើក។", force=True)
 
         if convert_enabled:
             voice_path = _make_temp_ogg()
             try:
+                await progress.update(38, "កំពុងបម្លែងទៅសារសំឡេង", "កំពុងបម្លែងទៅទម្រង់ OGG/Opus។", force=True)
                 voice_bytes = await _convert_uploaded_audio_to_telegram_voice(audio_path, voice_path)
+                await progress.update(52, "បានបម្លែងសំឡេង", "កំពុងផ្ញើសារសំឡេង។", force=True)
                 display_name = html.escape((filename or "audio")[:80])
                 sent_voice = await safe_send(lambda vb=voice_bytes, dn=display_name: msg.reply_voice(
                     voice=vb,
-                    caption=f"🎙️ <b>Voice record</b> — <code>{dn}</code>",
+                    caption=f"🎙️ <b>សារសំឡេង</b> — <code>{dn}</code>",
                     parse_mode="HTML",
                 ))
                 voice_sent = sent_voice is not None
                 if voice_sent:
                     _metric_inc("audio_to_voice")
+                    await progress.update(60, "បានផ្ញើសារសំឡេង", "ការបម្លែងទៅសារសំឡេងបានជោគជ័យ។", force=True)
             except Exception as exc:
                 conversion_error = exc
                 logger.error("Audio-to-voice conversion failed: %s", exc, exc_info=True)
+                await progress.update(60, "មិនអាចបម្លែងទៅសារសំឡេង", "កំពុងព្យាយាមបម្លែងទៅអត្ថបទ ប្រសិនបើមុខងារនេះបានបើក។", force=True)
 
-        # Preserve the original transcription feature. It is independent from
-        # conversion and therefore still works when FFmpeg conversion fails.
         if transcribe_enabled:
             if _gemini is None:
-                if not voice_sent:
-                    transcription_error = RuntimeError(
-                        "Gemini API is not active. Set GEMINI_API_KEY for transcription."
-                    )
+                transcription_error = RuntimeError("Gemini API is not active.")
             else:
                 try:
+                    await progress.update(68, "កំពុងបម្លែងសំឡេងទៅជាអត្ថបទ", "កំពុងផ្ញើអូឌីយ៉ូទៅម៉ាស៊ីនស្គាល់សំឡេង។", force=True)
                     transcript = await transcribe_audio_file(audio_path, gemini_mime)
-                    if transcript:
-                        _metric_inc("audio")
-                        record_turn(user_id, "user", f"[Audio File Transcript]: {transcript[:500]}")
-                        is_khmer = bool(_KHMER_RE.search(transcript))
-                        lang_flag = "🇰🇭" if is_khmer else "🇺🇸"
-                        fname_display = html.escape(filename[:50]) if filename else "audio"
-                        header = f"🎵 <b>Transcript</b> {lang_flag} — <code>{fname_display}</code>\n\n"
-                        plain_pages = _paginate_plain(transcript, limit=TELE_MSG_LIMIT - len(header))
-                        sent_pages = []
-                        for idx, plain_page in enumerate(plain_pages):
-                            page_body = (header if idx == 0 else "") + html.escape(plain_page)
-                            sent = await safe_send(
-                                lambda pb=page_body: msg.reply_text(pb, parse_mode="HTML")
-                            )
-                            sent_pages.append(sent)
-                            await asyncio.sleep(0.2)
-
-                        last_sent = sent_pages[-1] if sent_pages else None
-                        if last_sent:
-                            save_text_cache(
-                                last_sent.message_id,
-                                transcript,
-                                chat_id=msg.chat_id,
-                                user_id=user_id,
-                                username=uname,
-                            )
-                            await safe_send(lambda: last_sent.edit_reply_markup(
-                                reply_markup=get_audio_file_kb(last_sent.message_id)
-                            ))
-                            transcript_sent = True
-                    else:
-                        transcription_error = RuntimeError(
-                            "No transcript was found; the file may be silent or unsupported."
-                        )
+                    if not transcript:
+                        raise RuntimeError("No transcript was found.")
+                    _metric_inc("audio")
+                    record_turn(user_id, "user", f"[Audio File Transcript]: {transcript[:500]}")
+                    await progress.update(88, "បានបម្លែងទៅអត្ថបទ", f"រកឃើញ {len(transcript)} តួអក្សរ។", force=True)
                 except Exception as exc:
                     transcription_error = exc
                     logger.error("Audio transcription failed: %s", exc, exc_info=True)
 
-        if not voice_sent and not transcript_sent:
-            if conversion_error and transcription_error:
-                detail = f"Voice conversion: {conversion_error}; transcription: {transcription_error}"
-            elif conversion_error:
-                detail = str(conversion_error)
-            elif transcription_error:
-                detail = str(transcription_error)
-            else:
-                detail = "No enabled audio operation completed."
-            await safe_send(lambda d=detail: msg.reply_text(
-                "❌ មិនអាចដំណើរការឯកសារអូឌីយ៉ូបានទេ។\n"
-                f"<code>{html.escape(d[:900])}</code>",
-                parse_mode="HTML",
-            ))
-        elif conversion_error:
-            # Transcription succeeded, but make the requested conversion failure visible.
-            await safe_send(lambda e=conversion_error: msg.reply_text(
-                f'⚠️ ការបម្លែងសំឡេងទៅជាអត្ថបទបានជោគជ័យ ប៉ុន្តែការបម្លែងអូឌីយ៉ូទៅជាសំឡេងបរាជ័យ។\n<code>{html.escape(str(e)[:700])}</code>',
-                parse_mode="HTML",
-            ))
+        if transcript:
+            is_khmer = bool(_KHMER_RE.search(transcript))
+            lang_flag = "🇰🇭" if is_khmer else "🌐"
+            fname_display = html.escape(filename[:50]) if filename else "audio"
+            conversion_note = (
+                "✅ បានបង្កើតសារសំឡេងរួចរាល់។"
+                if voice_sent else
+                "⚠️ មិនអាចបង្កើតសារសំឡេងបាន ប៉ុន្តែបានបម្លែងទៅអត្ថបទ។"
+            )
+            header = (
+                f"🎵 <b>អត្ថបទពីឯកសារអូឌីយ៉ូ</b> {lang_flag} — <code>{fname_display}</code>\n"
+                f"{conversion_note}\n\n"
+            )
+            pages = _paginate_plain(transcript, limit=max(500, TELE_MSG_LIMIT - len(header) - 64))
+            if not pages:
+                raise RuntimeError("Could not paginate transcript.")
+            await progress.finish(header + html.escape(pages[0]), parse_mode="HTML")
+            result_id = progress.message_id or int(msg.message_id)
+            save_text_cache(
+                result_id,
+                transcript,
+                chat_id=msg.chat_id,
+                user_id=user_id,
+                username=uname,
+            )
+            if progress.message is not None:
+                await safe_send(lambda: progress.message.edit_reply_markup(
+                    reply_markup=get_audio_file_kb(result_id)
+                ))
+            total_pages = len(pages)
+            for idx, page in enumerate(pages[1:], 2):
+                body = f"🎵 <b>អត្ថបទពីអូឌីយ៉ូ — ទំព័រ {idx}/{total_pages}</b>\n\n{html.escape(page)}"
+                await safe_send(lambda b=body: msg.reply_text(b, parse_mode="HTML"))
+                await asyncio.sleep(0.15)
+            return
 
+        if voice_sent:
+            if transcribe_enabled and transcription_error is not None:
+                await progress.finish(
+                    "⚠️ បានបង្កើតសារសំឡេងរួចរាល់ ប៉ុន្តែមិនអាចបម្លែងអូឌីយ៉ូទៅជាអត្ថបទបានទេ។"
+                )
+            else:
+                await progress.finish("✅ បានបម្លែង និងផ្ញើសារសំឡេងរួចរាល់។", delete_after_s=5.0)
+            return
+
+        logger.warning(
+            "Audio processing produced no output conversion_error=%s transcription_error=%s",
+            conversion_error,
+            transcription_error,
+        )
+        await progress.fail(
+            "❌ មិនអាចដំណើរការឯកសារអូឌីយ៉ូនេះបានទេ។ សូមពិនិត្យថាឯកសារមានសំឡេង និងប្រើទម្រង់ MP3, WAV, OGG ឬ FLAC។"
+        )
     except ValueError as exc:
         logger.warning("Audio upload rejected: %s", exc)
-        await safe_send(lambda err=str(exc): msg.reply_text(f"❌ {html.escape(err)}", parse_mode="HTML"))
+        await progress.fail("❌ ឯកសារអូឌីយ៉ូមិនត្រឹមត្រូវ ឬធំពេក។ សូមជ្រើសឯកសារថ្មី។")
     except Exception as exc:
         logger.error("on_audio_file error: %s", exc, exc_info=True)
-        await safe_send(lambda: msg.reply_text(
-            "❌ មានបញ្ហាក្នុងការទាញយក ឬដំណើរការឯកសារអូឌីយ៉ូ។"
-        ))
+        await progress.fail("❌ មានបញ្ហាក្នុងការទាញយក ឬដំណើរការឯកសារអូឌីយ៉ូ។ សូមសាកម្ដងទៀត។")
     finally:
-        await _stop_timer(stop_event, timer_task)
         if audio_path:
             _cleanup(audio_path)
         if voice_path:
@@ -26259,18 +26562,20 @@ async def on_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg     = update.message
-    user    = update.effective_user
-    user_id = user.id
+    msg = update.message
+    user = update.effective_user
+    if msg is None or user is None or msg.voice is None:
+        return
+    user_id = int(user.id)
 
     if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
         target_id = _admin_chat_target.get(user_id)
         if target_id:
-            ok    = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
+            ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
             reply = (
-                f"✅ Voice ផ្ញើដល់ User <code>{target_id}</code> ។"
+                f"✅ បានផ្ញើសារសំឡេងទៅអ្នកប្រើប្រាស់ <code>{target_id}</code>។"
                 if ok else
-                f"❌ User <code>{target_id}</code> blocked bot ។"
+                f"❌ អ្នកប្រើប្រាស់ <code>{target_id}</code> បានបិទបូត។"
             )
             await safe_send(lambda: msg.reply_text(reply, parse_mode="HTML"))
             if not ok:
@@ -26282,14 +26587,15 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if admin_id is not None:
         uname = user.username or user.first_name or str(user_id)
         await _fwd_user_to_admin(context.bot, admin_id, user_id, uname, msg)
-        await safe_send(lambda: msg.reply_text('✅ បានផ្ញើសារជាសំឡេងទៅអ្នកគ្រប់គ្រង។'))
+        await safe_send(lambda: msg.reply_text("✅ បានផ្ញើសារសំឡេងទៅអ្នកគ្រប់គ្រង។"))
         return
 
     if context.user_data.get("voxcpm2_state") == VOXCPM2_WAIT_REFERENCE:
         if not await _ensure_user_allowed(update, context):
             return
         await _voxcpm2_accept_reference(
-            update, context,
+            update,
+            context,
             file_id=msg.voice.file_id,
             file_unique_id=msg.voice.file_unique_id,
             filename="telegram_voice.ogg",
@@ -26301,80 +26607,83 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not await _ensure_user_allowed(update, context, "voice_transcribe_enabled", "បម្លែងសំឡេងទៅជាអត្ថបទ"):
         return
-
     if not _gemini:
-        await safe_send(lambda: msg.reply_text('❌ Gemini API មិនទាន់បានបើកទេ។ សូមកំណត់ GEMINI_API_KEY។'))
+        await safe_send(lambda: msg.reply_text("❌ សេវាបម្លែងសំឡេងទៅអត្ថបទមិនទាន់បានបើកទេ។"))
         return
-
     if msg.voice.file_size and msg.voice.file_size > MAX_VOICE_BYTES:
-        await safe_send(lambda: msg.reply_text("❌ ឯកសារសំឡេងធំពេក (អតិបរមា 20MB)។"))
+        await safe_send(lambda: msg.reply_text("❌ ឯកសារសំឡេងធំពេក។ អតិបរមា 20 MB។"))
         return
-
     if await _check_cooldown(msg, user_id):
         return
 
     _metric_inc("voice")
     sync_user_data(user)
-    ogg_path   = _make_temp_ogg()
-    stop_event = asyncio.Event()
-    timer_task = asyncio.create_task(
-        send_status_timer(msg.chat_id, context.bot, stop_event, frames=_TRANSCRIBE_FRAMES)
+    ogg_path = _make_temp_ogg()
+    progress = await TelegramProgress.start(
+        bot=context.bot,
+        chat_id=msg.chat_id,
+        reply_target=msg,
+        title="កំពុងបម្លែងសារសំឡេងទៅជាអត្ថបទ",
+        percent=5,
+        stage="កំពុងពិនិត្យសារសំឡេង",
+        detail=f"រយៈពេល {float(msg.voice.duration or 0):g} វិនាទី។",
     )
     try:
+        await progress.update(15, "កំពុងទាញយកសារសំឡេង", "កំពុងទទួលឯកសារពី Telegram។", force=True)
         voice_file = await safe_send(lambda: context.bot.get_file(msg.voice.file_id))
         if not voice_file:
             raise RuntimeError("Could not get voice file")
         await voice_file.download_to_drive(ogg_path)
-        transcript = await transcribe_voice(ogg_path)
 
+        await progress.update(40, "បានទាញយកសារសំឡេង", "កំពុងផ្ញើទៅម៉ាស៊ីនស្គាល់សំឡេង។", force=True)
+        transcript = await transcribe_voice(ogg_path)
         if not transcript:
-            await safe_send(lambda: msg.reply_text('❌ រកអត្ថបទដែលបានបម្លែងពីសំឡេងមិនឃើញ។'))
+            await progress.fail("❌ មិនអាចស្គាល់អត្ថបទនៅក្នុងសារសំឡេងនេះបានទេ។")
             return
 
+        await progress.update(85, "បានស្គាល់អត្ថបទ", f"រកឃើញ {len(transcript)} តួអក្សរ។", force=True)
         record_turn(user_id, "user", f"[Voice Transcript]: {transcript[:500]}")
-        is_khmer    = bool(_KHMER_RE.search(transcript))
-        lang_flag   = "🇰🇭" if is_khmer else "🇺🇸"
-        header      = f"📝 <b>Transcript</b> {lang_flag}\n\n"
-        plain_pages = _paginate_plain(transcript, limit=TELE_MSG_LIMIT - len(header))
-        sent_pages  = []
-        for idx, plain_page in enumerate(plain_pages):
-            page_body = (header if idx == 0 else "") + html.escape(plain_page)
-            sent      = await safe_send(lambda pb=page_body: msg.reply_text(pb, parse_mode="HTML"))
-            sent_pages.append(sent)
-            await asyncio.sleep(0.2)
-
-        last_sent = sent_pages[-1] if sent_pages else None
-        if last_sent:
-            save_text_cache(
-                last_sent.message_id, transcript,
-                chat_id=msg.chat_id, user_id=user_id,
-                username=user.username or user.first_name,
-            )
-            await safe_send(lambda: last_sent.edit_reply_markup(
-                reply_markup=get_transcription_kb(last_sent.message_id)
+        is_khmer = bool(_KHMER_RE.search(transcript))
+        lang_flag = "🇰🇭" if is_khmer else "🌐"
+        header = f"📝 <b>អត្ថបទពីសារសំឡេង</b> {lang_flag}\n\n"
+        pages = _paginate_plain(transcript, limit=max(500, TELE_MSG_LIMIT - len(header) - 64))
+        if not pages:
+            raise RuntimeError("Could not paginate transcript")
+        await progress.finish(header + html.escape(pages[0]), parse_mode="HTML")
+        result_id = progress.message_id or int(msg.message_id)
+        save_text_cache(
+            result_id,
+            transcript,
+            chat_id=msg.chat_id,
+            user_id=user_id,
+            username=user.username or user.first_name,
+        )
+        if progress.message is not None:
+            await safe_send(lambda: progress.message.edit_reply_markup(
+                reply_markup=get_transcription_kb(result_id)
             ))
-    except Exception as e:
-        logger.error(f"on_voice error: {e}")
-        with suppress(Exception):
-            await safe_send(lambda: msg.reply_text('❌ មានបញ្ហាក្នុងការបម្លែងសំឡេងទៅជាអត្ថបទ។'))
+        total_pages = len(pages)
+        for idx, page in enumerate(pages[1:], 2):
+            body = f"📝 <b>អត្ថបទពីសារសំឡេង — ទំព័រ {idx}/{total_pages}</b>\n\n{html.escape(page)}"
+            await safe_send(lambda b=body: msg.reply_text(b, parse_mode="HTML"))
+            await asyncio.sleep(0.15)
+    except Exception as exc:
+        logger.error("on_voice error: %s", exc, exc_info=True)
+        await progress.fail("❌ មិនអាចបម្លែងសារសំឡេងទៅជាអត្ថបទបានទេ។ សូមសាកម្ដងទៀត។")
     finally:
-        await _stop_timer(stop_event, timer_task)
         _cleanup(ogg_path)
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg  = update.message
+    msg = update.message
     if not msg or not msg.text:
         return
-
     text = msg.text
     user = update.effective_user
     if not user:
         return
+    user_id = int(user.id)
 
-    user_id = user.id
-
-    # Admin flow intercepts
     if _is_admin(user_id):
         if await _handle_feature_request_admin_reply_text(update, context):
             return
@@ -26384,7 +26693,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if await _handle_admin_report_day_text(update, context):
             return
-
         sched_state = context.user_data.get("sched_state")
         if sched_state == SCHED_WAIT_MSG:
             await _handle_sched_content(update, context)
@@ -26410,11 +26718,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
                 if ok:
                     await safe_send(lambda: msg.reply_text(
-                        f'✅ បានផ្ញើទៅអ្នកប្រើប្រាស់ <code>{target_id}</code> ។', parse_mode="HTML"
+                        f"✅ បានផ្ញើទៅអ្នកប្រើប្រាស់ <code>{target_id}</code>។",
+                        parse_mode="HTML",
                     ))
                 else:
                     await safe_send(lambda: msg.reply_text(
-                        f'❌ អ្នកប្រើប្រាស់ <code>{target_id}</code> បានបិទបូត។ វគ្គជជែកត្រូវបានបញ្ចប់។',
+                        f"❌ អ្នកប្រើប្រាស់ <code>{target_id}</code> បានបិទបូត។ វគ្គជជែកត្រូវបានបញ្ចប់។",
                         parse_mode="HTML",
                     ))
                     _close_session(user_id)
@@ -26426,7 +26735,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await _voxcpm2_save_control_text(update, context, text)
         return
-
     if await _handle_feature_request_user_text(update, context):
         return
 
@@ -26434,59 +26742,63 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if admin_id is not None:
         uname = user.username or user.first_name or str(user_id)
         await _fwd_user_to_admin(context.bot, admin_id, user_id, uname, msg)
-        await safe_send(lambda: msg.reply_text("✅ សាររបស់អ្នកបានផ្ញើដល់ Admin ។"))
+        await safe_send(lambda: msg.reply_text("✅ សាររបស់អ្នកបានផ្ញើទៅអ្នកគ្រប់គ្រង។"))
         return
 
     if not await _ensure_user_allowed(update, context, "tts_enabled", "បម្លែងអត្ថបទទៅជាសំឡេង"):
         return
-
     if text.strip() == "🎵 សួស្តី!":
         await on_start(update, context)
         return
-
     stripped = text.strip()
     if not stripped:
         return
-
     if len(stripped) > MAX_INPUT_CHARS:
         await safe_send(lambda: msg.reply_text(
             f"❌ អត្ថបទវែងពេក។ អតិបរមា {MAX_INPUT_CHARS} តួអក្សរ។\n"
-            f"(អ្នកបានផ្ញើ {len(stripped)} តួ)"
+            f"អ្នកបានផ្ញើ {len(stripped)} តួអក្សរ។"
         ))
         return
-
     if await _check_cooldown(msg, user_id):
         return
 
     _metric_inc("tts")
     sync_user_data(user)
-    loop = asyncio.get_running_loop()
-    prefs, tts_text = await asyncio.gather(
-        get_user_prefs_async(user_id),
-        resolve_tts_text(user_id, stripped, loop),
+    progress = await TelegramProgress.start(
+        bot=context.bot,
+        chat_id=msg.chat_id,
+        reply_target=msg,
+        title="កំពុងបម្លែងអត្ថបទទៅជាសំឡេង",
+        percent=5,
+        stage="កំពុងពិនិត្យអត្ថបទ",
+        detail=f"មាន {len(stripped)} តួអក្សរ។",
     )
+    file_path: str | None = None
+    try:
+        await progress.update(12, "កំពុងអានការកំណត់របស់អ្នក", "កំពុងជ្រើសសំឡេង ល្បឿន និងម៉ូដែល។", force=True)
+        loop = asyncio.get_running_loop()
+        prefs, tts_text = await asyncio.gather(
+            get_user_prefs_async(user_id),
+            resolve_tts_text(user_id, stripped, loop),
+        )
+        gender = prefs["gender"]
+        speed = prefs["speed"]
+        tts_model = prefs.get("tts_model", "auto")
+        tts_text = tts_text.strip() or stripped
+        model_key = _normalize_tts_model(tts_model)
+        model_label = TTS_MODEL_OPTIONS.get(model_key, TTS_MODEL_OPTIONS["auto"])[0]
+        await progress.update(
+            25,
+            "បានរៀបចំអត្ថបទ និងការកំណត់",
+            f"ម៉ូដែល៖ {model_label} • អត្ថបទ {len(tts_text)} តួអក្សរ។",
+            force=True,
+        )
 
-    gender    = prefs["gender"]
-    speed     = prefs["speed"]
-    tts_model = prefs.get("tts_model", "auto")
-    tts_text  = tts_text.strip() or stripped
-
-    file_path = _make_temp_ogg()
-    status_msg, stop_event, timer_task = await _start_editable_status(
-        update.effective_chat.id,
-        context.bot,
-        _STATUS_FRAMES,
-    )
-    status_finished = False
-    lock = _get_user_lock(user_id)
-
-    async with lock:
-        try:
-            # Long text is delivered in smaller voice messages, while the same
-            # processing message remains active and is edited on completion.
+        lock = _get_user_lock(user_id)
+        async with lock:
             if len(tts_text) > TTS_SINGLE_VOICE_MAX_CHARS:
                 uname = user.username or user.first_name or str(user_id)
-                await _deliver_paged_tts(
+                sent_count, failed_count = await _deliver_paged_tts(
                     chat_id=msg.chat_id,
                     bot=context.bot,
                     text=tts_text,
@@ -26495,20 +26807,26 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     user_id=user_id,
                     username=uname,
                     tts_model=tts_model,
+                    progress=progress,
+                    progress_start=25,
+                    progress_end=95,
                 )
                 record_turn(user_id, "user", stripped)
                 record_turn(user_id, "assistant", tts_text[:CONV_CONTEXT_MAX_CHARS])
                 _set_last_tts(user_id)
-                await _finish_editable_status(
-                    status_msg,
-                    stop_event,
-                    timer_task,
-                    "✅ បានបង្កើត និងផ្ញើសំឡេងរួចរាល់។",
-                    delete_after_s=4.0,
-                )
-                status_finished = True
+                if failed_count:
+                    await progress.finish(
+                        f"⚠️ បានផ្ញើសំឡេង {sent_count} ផ្នែក ប៉ុន្តែមាន {failed_count} ផ្នែកមិនបានជោគជ័យ។"
+                    )
+                else:
+                    await progress.finish(
+                        f"✅ បានបង្កើត និងផ្ញើសំឡេងរួចរាល់ ({sent_count} ផ្នែក)។",
+                        delete_after_s=5.0,
+                    )
                 return
 
+            file_path = _make_temp_ogg()
+            await progress.update(35, "កំពុងបង្កើតសំឡេង", f"កំពុងប្រើ {model_label}។", force=True)
             audio_bytes = await generate_user_voice_limited(
                 tts_text,
                 gender,
@@ -26518,48 +26836,33 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_id=user_id,
                 bot=context.bot,
                 chat_id=msg.chat_id,
+                progress=progress,
             )
-            sent_msg = await safe_send(
-                lambda ab=audio_bytes: msg.reply_voice(
-                    voice=io.BytesIO(ab),
-                    caption=f"🗣️ {BOT_TAG}",
-                    reply_markup=get_main_kb(gender, tts_model),
-                )
+            await progress.update(88, "បានបង្កើតសំឡេង", "កំពុងផ្ញើសារសំឡេងទៅអ្នក។", force=True)
+            sent_msg = await safe_send(lambda ab=audio_bytes: msg.reply_voice(
+                voice=io.BytesIO(ab),
+                caption=f"🗣️ {BOT_TAG}",
+                reply_markup=get_main_kb(gender, tts_model),
+            ))
+            if sent_msg is None:
+                raise RuntimeError("Telegram មិនអាចផ្ញើសារសំឡេងបាន។")
+            save_text_cache(
+                sent_msg.message_id,
+                tts_text,
+                chat_id=msg.chat_id,
+                user_id=user_id,
+                username=user.username or user.first_name,
             )
-            if sent_msg:
-                save_text_cache(
-                    sent_msg.message_id,
-                    tts_text,
-                    chat_id=msg.chat_id,
-                    user_id=user_id,
-                    username=user.username or user.first_name,
-                )
-                set_last_tts_text(user_id, tts_text)
-                record_turn(user_id, "user", stripped)
-                record_turn(user_id, "assistant", tts_text)
+            set_last_tts_text(user_id, tts_text)
+            record_turn(user_id, "user", stripped)
+            record_turn(user_id, "assistant", tts_text)
             _set_last_tts(user_id)
-            await _finish_editable_status(
-                status_msg,
-                stop_event,
-                timer_task,
-                "✅ បានបង្កើតសំឡេងរួចរាល់។",
-                delete_after_s=4.0,
-            )
-            status_finished = True
-
-        except Exception as e:
-            logger.error("on_text TTS error: %s", e, exc_info=True)
-            await _finish_editable_status(
-                status_msg,
-                stop_event,
-                timer_task,
-                _tts_user_error_message(e),
-            )
-            status_finished = True
-
-        finally:
-            if not status_finished:
-                await _stop_timer(stop_event, timer_task)
+            await progress.finish("✅ បានបង្កើត និងផ្ញើសំឡេងរួចរាល់។", delete_after_s=5.0)
+    except Exception as exc:
+        logger.error("on_text TTS error: %s", exc, exc_info=True)
+        await progress.fail(_tts_user_error_message(exc))
+    finally:
+        if file_path:
             _cleanup(file_path)
 
 
@@ -26594,41 +26897,103 @@ async def _cb_hide_tts_model(query, user_id: int, context):
     ))
 
 
-async def _cb_tts_model(query, user_id: int, context, data: str):
-    """Save the selected TTS model and regenerate the current voice message.
+async def _regenerate_tts_voice_with_progress(
+    *,
+    query: Any,
+    context: Any,
+    user_id: int,
+    original_text: str,
+    gender: str,
+    speed: float,
+    tts_model: str,
+    title: str,
+    final_text: str,
+    error_text: str,
+    delete_source: bool,
+) -> bool:
+    """Regenerate one voice while reusing one progress message."""
+    if query.message is None:
+        return False
+    chat_id = int(query.message.chat.id)
+    model_key = _normalize_tts_model(tts_model)
+    model_label = TTS_MODEL_OPTIONS.get(model_key, TTS_MODEL_OPTIONS["auto"])[0]
+    progress = await TelegramProgress.start(
+        bot=context.bot,
+        chat_id=chat_id,
+        reply_target=query.message,
+        title=title,
+        percent=5,
+        stage="កំពុងរៀបចំអត្ថបទដើម",
+        detail=f"ម៉ូដែល៖ {model_label}",
+    )
+    file_path = _make_temp_ogg()
+    lock = _get_user_lock(user_id)
+    try:
+        async with lock:
+            await progress.update(25, "កំពុងបង្កើតសំឡេងឡើងវិញ", f"កំពុងប្រើ {model_label}។", force=True)
+            audio_bytes = await generate_user_voice_limited(
+                original_text,
+                gender,
+                speed,
+                file_path,
+                tts_model,
+                user_id=user_id,
+                bot=context.bot,
+                chat_id=chat_id,
+                progress=progress,
+            )
+            await progress.update(88, "បានបង្កើតសំឡេង", "កំពុងផ្ញើសារសំឡេងថ្មី។", force=True)
+            new_msg = await safe_send(lambda ab=audio_bytes: context.bot.send_voice(
+                chat_id=chat_id,
+                voice=io.BytesIO(ab),
+                caption=f"🗣️ {BOT_TAG}",
+                reply_markup=get_main_kb(gender, tts_model),
+            ))
+            if new_msg is None:
+                raise RuntimeError("Telegram មិនអាចផ្ញើសារសំឡេងបាន។")
+            if delete_source:
+                with suppress(Exception):
+                    await query.message.delete()
+            else:
+                with suppress(Exception):
+                    await query.message.edit_reply_markup(reply_markup=None)
+            save_text_cache(
+                new_msg.message_id,
+                original_text,
+                chat_id=chat_id,
+                user_id=user_id,
+                username=query.from_user.username or query.from_user.first_name,
+            )
+            set_last_tts_text(user_id, original_text)
+            record_turn(user_id, "assistant", original_text)
+            _set_last_tts(user_id)
+            await progress.finish(final_text, delete_after_s=5.0)
+            return True
+    except Exception as exc:
+        logger.error("TTS regeneration failed: %s", exc, exc_info=True)
+        await progress.fail(error_text)
+        return False
+    finally:
+        _cleanup(file_path)
 
-    UX rule:
-      - When the user taps Auto / Khmer HF / Edge / VoxCPM2, save it.
-      - If the original text for this voice message can be resolved, immediately
-        regenerate the same text with the selected model.
-      - If the original text cannot be found, only save the preference and return
-        to the main keyboard.
-    """
+async def _cb_tts_model(query, user_id: int, context, data: str):
     if query.message is None:
         return
-
-    chat_id = query.message.chat.id
-    requested_model = data.replace("ttsmodel_", "", 1)
-    requested_key = _normalize_tts_model(requested_model)
+    requested_key = _normalize_tts_model(data.replace("ttsmodel_", "", 1))
     if requested_key == "voxcpm2":
         unavailable = _voxcpm2_unavailable_reason()
         if unavailable:
-            await _voxcpm2_send_panel(
-                query.message,
-                user_id,
-                f"មិនអាចជ្រើស VoxCPM2 បានទេ៖ {unavailable}",
-            )
+            await _voxcpm2_send_panel(query.message, user_id, f"មិនអាចជ្រើស VoxCPM2 បានទេ៖ {unavailable}")
             return
-    model = update_user_tts_model(user_id, requested_key)
 
+    model = update_user_tts_model(user_id, requested_key)
     original_text, prefs = await asyncio.gather(
         get_callback_original_text(query, user_id),
         get_user_prefs_async(user_id),
     )
     prefs["tts_model"] = model
-
     gender = prefs["gender"]
-    speed  = prefs["speed"]
+    speed = prefs["speed"]
 
     if model == "voxcpm2":
         profile = await _voxcpm2_profile_get(user_id)
@@ -26636,97 +27001,37 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
             with suppress(Exception):
                 await query.message.edit_reply_markup(reply_markup=get_main_kb(gender, model))
             await _voxcpm2_send_panel(
-                query.message, user_id,
+                query.message,
+                user_id,
                 "បានជ្រើស VoxCPM2។ សូមបញ្ចូលសំឡេងគំរូ មុនពេលបង្កើតសំឡេង។",
             )
             return
 
     if not original_text:
-        await safe_send(lambda: query.message.edit_reply_markup(
-            reply_markup=get_main_kb(gender, model)
-        ))
+        await safe_send(lambda: query.message.edit_reply_markup(reply_markup=get_main_kb(gender, model)))
         await safe_send(lambda: query.message.reply_text(
             "✅ បានប្តូរម៉ូដែល TTS រួច។\n"
-            "❌ រកអត្ថបទដើមមិនឃើញ ដូច្នេះមិនអាចបង្កើតសំឡេងឡើងវិញបានទេ។\n"
+            "⚠️ រកអត្ថបទដើមមិនឃើញ ដូច្នេះមិនអាចបង្កើតសំឡេងឡើងវិញបានទេ។\n"
             "សូមផ្ញើអត្ថបទម្តងទៀត។"
         ))
         return
 
-    # Model changes are an edit/regenerate action, not a new user message, so do
-    # not block them with the normal text-message cooldown. The per-user lock and
-    # global TTS semaphore still prevent duplicate concurrent generation.
     with suppress(Exception):
         await query.message.edit_reply_markup(reply_markup=get_main_kb(gender, model))
-
     model_label = TTS_MODEL_OPTIONS.get(model, TTS_MODEL_OPTIONS["auto"])[0]
-    model_frames = [
-        f"🔄 កំពុងប្តូរទៅ {model_label} និងបង្កើតសំឡេងឡើងវិញ ·",
-        f"🔄 កំពុងប្តូរទៅ {model_label} និងបង្កើតសំឡេងឡើងវិញ ··",
-        f"🔄 កំពុងប្តូរទៅ {model_label} និងបង្កើតសំឡេងឡើងវិញ ···",
-    ]
-    status_msg, stop_event, timer_task = await _start_editable_status(
-        chat_id,
-        context.bot,
-        model_frames,
+    await _regenerate_tts_voice_with_progress(
+        query=query,
+        context=context,
+        user_id=user_id,
+        original_text=original_text,
+        gender=gender,
+        speed=speed,
+        tts_model=model,
+        title=f"កំពុងប្តូរទៅ {model_label}",
+        final_text=f"✅ បានប្តូរទៅ {model_label} និងបង្កើតសំឡេងរួចរាល់។",
+        error_text="❌ មិនអាចប្តូរម៉ូដែល និងបង្កើតសំឡេងឡើងវិញបានទេ។ សូមសាកម្ដងទៀត។",
+        delete_source=True,
     )
-    status_finished = False
-    file_path = _make_temp_ogg()
-    lock = _get_user_lock(user_id)
-
-    try:
-        async with lock:
-            audio_bytes = await generate_user_voice_limited(
-                original_text,
-                gender,
-                speed,
-                file_path,
-                model,
-                user_id=user_id,
-                bot=context.bot,
-                chat_id=chat_id,
-            )
-            with suppress(Exception):
-                await query.message.delete()
-            new_msg = await safe_send(
-                lambda ab=audio_bytes: context.bot.send_voice(
-                    chat_id=chat_id,
-                    voice=io.BytesIO(ab),
-                    caption=f"🗣️ {BOT_TAG}",
-                    reply_markup=get_main_kb(gender, model),
-                )
-            )
-            if new_msg:
-                save_text_cache(
-                    new_msg.message_id,
-                    original_text,
-                    chat_id=chat_id,
-                    user_id=user_id,
-                    username=query.from_user.username or query.from_user.first_name,
-                )
-                set_last_tts_text(user_id, original_text)
-                record_turn(user_id, "assistant", original_text)
-            _set_last_tts(user_id)
-            await _finish_editable_status(
-                status_msg,
-                stop_event,
-                timer_task,
-                f"✅ បានប្តូរទៅ {model_label} និងបង្កើតសំឡេងរួចរាល់។",
-                delete_after_s=4.0,
-            )
-            status_finished = True
-    except Exception as e:
-        logger.error("tts model regenerate error: %s", e, exc_info=True)
-        await _finish_editable_status(
-            status_msg,
-            stop_event,
-            timer_task,
-            "❌ មិនអាចប្តូរម៉ូដែល និងបង្កើតសំឡេងឡើងវិញបានទេ។ សូមសាកម្ដងទៀត។",
-        )
-        status_finished = True
-    finally:
-        if not status_finished:
-            await _stop_timer(stop_event, timer_task)
-        _cleanup(file_path)
 
 
 async def get_callback_original_text(query, user_id: int) -> str | None:
@@ -26775,178 +27080,75 @@ async def _cb_speed(query, user_id: int, context, data: str):
     speed_label, new_speed = SPEED_OPTIONS[data]
     if query.message is None:
         return
-
-    chat_id = query.message.chat.id
     original_text, prefs = await asyncio.gather(
         get_callback_original_text(query, user_id),
         get_user_prefs_async(user_id),
     )
-
     if not original_text:
         await safe_send(lambda: query.message.reply_text(
-            "❌ រកអត្ថបទដើមមិនឃើញ។\nសូមផ្ញើអត្ថបទម្តងទៀត រួចប្តូរល្បឿន។"
+            "❌ រកអត្ថបទដើមមិនឃើញ។ សូមផ្ញើអត្ថបទម្តងទៀត រួចប្តូរល្បឿន។"
         ))
         return
-
     if await _check_cooldown(query.message, user_id):
         return
-
     gender = prefs["gender"]
     tts_model = prefs.get("tts_model", "auto")
     update_user_speed(user_id, new_speed)
-    status_msg, stop_event, timer_task = await _start_editable_status(chat_id, context.bot)
-    status_finished = False
-    file_path = _make_temp_ogg()
-    lock = _get_user_lock(user_id)
-
-    try:
-        async with lock:
-            audio_bytes = await generate_user_voice_limited(
-                original_text,
-                gender,
-                new_speed,
-                file_path,
-                tts_model,
-                user_id=user_id,
-                bot=context.bot,
-                chat_id=chat_id,
-            )
-            with suppress(Exception):
-                await query.message.delete()
-            new_msg = await safe_send(
-                lambda ab=audio_bytes, g=gender: context.bot.send_voice(
-                    chat_id=chat_id,
-                    voice=io.BytesIO(ab),
-                    caption=f"🗣️ {BOT_TAG}",
-                    reply_markup=get_main_kb(g, tts_model),
-                )
-            )
-            if new_msg:
-                save_text_cache(
-                    new_msg.message_id,
-                    original_text,
-                    chat_id=chat_id,
-                    user_id=user_id,
-                    username=query.from_user.username or query.from_user.first_name,
-                )
-                set_last_tts_text(user_id, original_text)
-                record_turn(user_id, "assistant", original_text)
-            _set_last_tts(user_id)
-            await _finish_editable_status(
-                status_msg,
-                stop_event,
-                timer_task,
-                f"✅ បានប្តូរល្បឿនទៅ {speed_label} និងបង្កើតសំឡេងរួចរាល់។",
-                delete_after_s=4.0,
-            )
-            status_finished = True
-    except Exception as e:
-        logger.error("speed regen error: %s", e, exc_info=True)
-        await _finish_editable_status(
-            status_msg,
-            stop_event,
-            timer_task,
-            "❌ មិនអាចប្តូរល្បឿន និងបង្កើតសំឡេងបានទេ។ សូមសាកម្ដងទៀត។",
-        )
-        status_finished = True
-    finally:
-        if not status_finished:
-            await _stop_timer(stop_event, timer_task)
-        _cleanup(file_path)
+    await _regenerate_tts_voice_with_progress(
+        query=query,
+        context=context,
+        user_id=user_id,
+        original_text=original_text,
+        gender=gender,
+        speed=new_speed,
+        tts_model=tts_model,
+        title=f"កំពុងប្តូរល្បឿនទៅ {speed_label}",
+        final_text=f"✅ បានប្តូរល្បឿនទៅ {speed_label} និងបង្កើតសំឡេងរួចរាល់។",
+        error_text="❌ មិនអាចប្តូរល្បឿន និងបង្កើតសំឡេងបានទេ។ សូមសាកម្ដងទៀត។",
+        delete_source=True,
+    )
 
 async def _cb_gender(query, user_id: int, context, data: str):
     new_gender = data.replace("tg_", "")
     if query.message is None:
         return
-
-    chat_id = query.message.chat.id
     original_text, prefs = await asyncio.gather(
         get_callback_original_text(query, user_id),
         get_user_prefs_async(user_id),
     )
-
     if not original_text:
         await safe_send(lambda: query.message.reply_text(
-            "❌ រកអត្ថបទដើមមិនឃើញ។\nសូមផ្ញើអត្ថបទម្តងទៀត រួចប្តូរសំឡេង។"
+            "❌ រកអត្ថបទដើមមិនឃើញ។ សូមផ្ញើអត្ថបទម្តងទៀត រួចប្តូរសំឡេង។"
         ))
         return
-
     if await _check_cooldown(query.message, user_id):
         return
-
     speed = prefs["speed"]
     tts_model = prefs.get("tts_model", "auto")
     update_user_gender(user_id, new_gender)
     gender_label = "ស្រី" if new_gender == "female" else "ប្រុស"
-    status_msg, stop_event, timer_task = await _start_editable_status(chat_id, context.bot)
-    status_finished = False
-    file_path = _make_temp_ogg()
-    lock = _get_user_lock(user_id)
-
-    try:
-        async with lock:
-            audio_bytes = await generate_user_voice_limited(
-                original_text,
-                new_gender,
-                speed,
-                file_path,
-                tts_model,
-                user_id=user_id,
-                bot=context.bot,
-                chat_id=chat_id,
-            )
-            with suppress(Exception):
-                await query.message.delete()
-            new_msg = await safe_send(
-                lambda ab=audio_bytes, ng=new_gender: context.bot.send_voice(
-                    chat_id=chat_id,
-                    voice=io.BytesIO(ab),
-                    caption=f"🗣️ {BOT_TAG}",
-                    reply_markup=get_main_kb(ng, tts_model),
-                )
-            )
-            if new_msg:
-                save_text_cache(
-                    new_msg.message_id,
-                    original_text,
-                    chat_id=chat_id,
-                    user_id=user_id,
-                    username=query.from_user.username or query.from_user.first_name,
-                )
-                set_last_tts_text(user_id, original_text)
-                record_turn(user_id, "assistant", original_text)
-            _set_last_tts(user_id)
-            await _finish_editable_status(
-                status_msg,
-                stop_event,
-                timer_task,
-                f"✅ បានប្តូរទៅសំឡេង{gender_label} និងបង្កើតសំឡេងរួចរាល់។",
-                delete_after_s=4.0,
-            )
-            status_finished = True
-    except Exception as e:
-        logger.error("gender regen error: %s", e, exc_info=True)
-        await _finish_editable_status(
-            status_msg,
-            stop_event,
-            timer_task,
-            "❌ មិនអាចប្តូរប្រភេទសំឡេង និងបង្កើតសំឡេងបានទេ។ សូមសាកម្ដងទៀត។",
-        )
-        status_finished = True
-    finally:
-        if not status_finished:
-            await _stop_timer(stop_event, timer_task)
-        _cleanup(file_path)
+    await _regenerate_tts_voice_with_progress(
+        query=query,
+        context=context,
+        user_id=user_id,
+        original_text=original_text,
+        gender=new_gender,
+        speed=speed,
+        tts_model=tts_model,
+        title=f"កំពុងប្តូរទៅសំឡេង{gender_label}",
+        final_text=f"✅ បានប្តូរទៅសំឡេង{gender_label} និងបង្កើតសំឡេងរួចរាល់។",
+        error_text="❌ មិនអាចប្តូរប្រភេទសំឡេង និងបង្កើតសំឡេងបានទេ។ សូមសាកម្ដងទៀត។",
+        delete_source=True,
+    )
 
 async def _cb_tts_transcript(query, user_id: int, context, data: str):
     transcript_msg_id = _callback_int_arg(data, "tts_transcript:")
     if transcript_msg_id is None:
-        await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់អត្ថបទសំឡេងមិនត្រឹមត្រូវ។'))
+        await safe_send(lambda: query.message.reply_text("❌ លេខសម្គាល់អត្ថបទសំឡេងមិនត្រឹមត្រូវ។"))
         return
     if query.message is None:
         return
-
-    chat_id = query.message.chat.id
+    chat_id = int(query.message.chat.id)
     original_text, prefs = await asyncio.gather(
         get_text_cache_async(transcript_msg_id, chat_id),
         get_user_prefs_async(user_id),
@@ -26956,82 +27158,34 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
         return
     if await _check_cooldown(query.message, user_id):
         return
-
-    gender = prefs["gender"]
-    speed = prefs["speed"]
-    tts_model = prefs.get("tts_model", "auto")
-    status_msg, stop_event, timer_task = await _start_editable_status(chat_id, context.bot)
-    status_finished = False
-    file_path = _make_temp_ogg()
-    lock = _get_user_lock(user_id)
-
-    try:
-        async with lock:
-            audio_bytes = await generate_user_voice_limited(
-                original_text,
-                gender,
-                speed,
-                file_path,
-                tts_model,
-                user_id=user_id,
-                bot=context.bot,
-                chat_id=chat_id,
-            )
-            new_msg = await safe_send(
-                lambda ab=audio_bytes, g=gender: context.bot.send_voice(
-                    chat_id=chat_id,
-                    voice=io.BytesIO(ab),
-                    caption=f"🗣️ {BOT_TAG}",
-                    reply_markup=get_main_kb(g, tts_model),
-                )
-            )
-            if new_msg:
-                save_text_cache(
-                    new_msg.message_id,
-                    original_text,
-                    chat_id=chat_id,
-                    user_id=user_id,
-                    username=query.from_user.username or query.from_user.first_name,
-                )
-                set_last_tts_text(user_id, original_text)
-                record_turn(user_id, "assistant", original_text)
-            _set_last_tts(user_id)
-            await _finish_editable_status(
-                status_msg,
-                stop_event,
-                timer_task,
-                "✅ បានបង្កើតសំឡេងពីអត្ថបទរួចរាល់។",
-                delete_after_s=4.0,
-            )
-            status_finished = True
-    except Exception as e:
-        logger.error("transcript TTS error: %s", e, exc_info=True)
-        await _finish_editable_status(
-            status_msg,
-            stop_event,
-            timer_task,
-            "❌ មិនអាចបង្កើតសំឡេងពីអត្ថបទនេះបានទេ។ សូមសាកម្ដងទៀត។",
-        )
-        status_finished = True
-    finally:
-        if not status_finished:
-            await _stop_timer(stop_event, timer_task)
-        _cleanup(file_path)
+    await _regenerate_tts_voice_with_progress(
+        query=query,
+        context=context,
+        user_id=user_id,
+        original_text=original_text,
+        gender=prefs["gender"],
+        speed=prefs["speed"],
+        tts_model=prefs.get("tts_model", "auto"),
+        title="កំពុងបង្កើតសំឡេងពីអត្ថបទ",
+        final_text="✅ បានបង្កើតសំឡេងពីអត្ថបទរួចរាល់។",
+        error_text="❌ មិនអាចបង្កើតសំឡេងពីអត្ថបទនេះបានទេ។ សូមសាកម្ដងទៀត។",
+        delete_source=False,
+    )
 
 async def _cb_audio_tts(query, user_id: int, context, data: str):
     if query.message is None:
         return
     src_msg_id = _callback_int_arg(data, "audio_tts:")
     if src_msg_id is None:
-        await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់អត្ថបទសំឡេងមិនត្រឹមត្រូវ។'))
+        await safe_send(lambda: query.message.reply_text("❌ លេខសម្គាល់អត្ថបទសំឡេងមិនត្រឹមត្រូវ។"))
         return
-    chat_id = query.message.chat.id
+    chat_id = int(query.message.chat.id)
     full_text, prefs = await asyncio.gather(
         get_text_cache_async(src_msg_id, chat_id),
         get_user_prefs_async(user_id),
     )
     if not full_text:
-        await safe_send(lambda: query.message.reply_text('❌ រកអត្ថបទមិនឃើញ ព្រោះ Cache បានផុតកំណត់។'))
+        await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទមិនឃើញ ព្រោះ Cache បានផុតកំណត់។"))
         return
     if await _check_cooldown(query.message, user_id):
         return
@@ -27040,13 +27194,19 @@ async def _cb_audio_tts(query, user_id: int, context, data: str):
     speed = prefs["speed"]
     tts_model = prefs.get("tts_model", "auto")
     uname = query.from_user.username or query.from_user.first_name or str(user_id)
-    status_msg, stop_event, timer_task = await _start_editable_status(chat_id, context.bot)
-    status_finished = False
+    progress = await TelegramProgress.start(
+        bot=context.bot,
+        chat_id=chat_id,
+        reply_target=query.message,
+        title="កំពុងបង្កើតសំឡេងពីអត្ថបទអូឌីយ៉ូ",
+        percent=5,
+        stage="កំពុងរៀបចំអត្ថបទ",
+        detail=f"មាន {len(full_text)} តួអក្សរ។",
+    )
     lock = _get_user_lock(user_id)
-
     try:
         async with lock:
-            await _deliver_paged_tts(
+            sent_count, failed_count = await _deliver_paged_tts(
                 chat_id=chat_id,
                 bot=context.bot,
                 text=full_text,
@@ -27055,30 +27215,25 @@ async def _cb_audio_tts(query, user_id: int, context, data: str):
                 user_id=user_id,
                 username=uname,
                 tts_model=tts_model,
+                progress=progress,
+                progress_start=15,
+                progress_end=95,
             )
             record_turn(user_id, "assistant", full_text[:CONV_CONTEXT_MAX_CHARS])
             with suppress(Exception):
                 await query.message.edit_reply_markup(reply_markup=None)
-            await _finish_editable_status(
-                status_msg,
-                stop_event,
-                timer_task,
-                "✅ បានបង្កើត និងផ្ញើសំឡេងរួចរាល់។",
-                delete_after_s=4.0,
-            )
-            status_finished = True
-    except Exception as e:
-        logger.error("_cb_audio_tts delivery error: %s", e, exc_info=True)
-        await _finish_editable_status(
-            status_msg,
-            stop_event,
-            timer_task,
-            "❌ មិនអាចបង្កើតសំឡេងបានទេ។ សូមសាកម្ដងទៀត។",
-        )
-        status_finished = True
-    finally:
-        if not status_finished:
-            await _stop_timer(stop_event, timer_task)
+            if failed_count:
+                await progress.finish(
+                    f"⚠️ បានផ្ញើសំឡេង {sent_count} ផ្នែក ប៉ុន្តែមាន {failed_count} ផ្នែកមិនបានជោគជ័យ។"
+                )
+            else:
+                await progress.finish(
+                    f"✅ បានបង្កើត និងផ្ញើសំឡេងរួចរាល់ ({sent_count} ផ្នែក)។",
+                    delete_after_s=5.0,
+                )
+    except Exception as exc:
+        logger.error("_cb_audio_tts delivery error: %s", exc, exc_info=True)
+        await progress.fail(_tts_user_error_message(exc))
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
