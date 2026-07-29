@@ -381,7 +381,7 @@ def _perf_default(name: str, fallback: Any = None) -> Any:
 # SameSite=None requires Secure=True in modern browsers.
 DEFAULT_WEB_COOKIE_SAMESITE = "none"
 DEFAULT_WEB_COOKIE_SECURE = True
-ADMIN_BACKEND_RELEASE = "v28-admin-bot-experience-v9"
+ADMIN_BACKEND_RELEASE = "v29-multilingual-tts"
 
 
 # ── FastAPI Web Server + typed settings ─────────────────────────────────────
@@ -2420,19 +2420,33 @@ def _normalise_ai_message(value: Any) -> tuple[str, str | None]:
 
 
 _LANG_HINT_ALIASES = {
+    # Existing languages
     "km": "km", "kh": "km", "khmer": "km", "ភាសាខ្មែរ": "km",
     "en": "en", "eng": "en", "english": "en",
     "zh": "zh", "cn": "zh", "chinese": "zh", "中文": "zh",
     "ko": "ko", "kr": "ko", "korean": "ko", "한국어": "ko",
     "ja": "ja", "jp": "ja", "japanese": "ja", "日本語": "ja",
+    # New languages. Country names are accepted as user-friendly aliases.
+    "hi": "hi", "hin": "hi", "hindi": "hi", "india": "hi", "हिंदी": "hi", "हिन्दी": "hi",
+    "ms": "ms", "malay": "ms", "malaysia": "ms", "melayu": "ms", "bahasa melayu": "ms",
+    "id": "id", "ind": "id", "indonesian": "id", "indonesia": "id", "bahasa indonesia": "id",
+    "fil": "fil", "tl": "fil", "tagalog": "fil", "filipino": "fil", "philippines": "fil", "pilipino": "fil",
+    "ar": "ar", "ara": "ar", "arabic": "ar", "العربية": "ar", "عربي": "ar",
 }
+
+# Build the hint regex from one source of truth. Long aliases are matched first,
+# so phrases such as "bahasa indonesia:" are not consumed as shorter tokens.
+_LANG_HINT_TOKEN_PATTERN = "|".join(
+    re.escape(alias)
+    for alias in sorted(_LANG_HINT_ALIASES, key=lambda item: (-len(item), item))
+)
 _LANG_HINT_PATTERN = re.compile(
-    r"^\s*(?:"
-    r"\[(?P<bracket>km|kh|khmer|en|eng|english|zh|cn|chinese|ko|kr|korean|ja|jp|japanese|中文|한국어|日本語)\]"
-    r"|/(?P<slash>km|kh|khmer|en|eng|english|zh|cn|chinese|ko|kr|korean|ja|jp|japanese)\b"
-    r"|(?:tts|lang|language)\s*[:=]\s*(?P<named>km|kh|khmer|en|eng|english|zh|cn|chinese|ko|kr|korean|ja|jp|japanese|中文|한국어|日本語)\b"
-    r"|(?P<prefix>km|kh|khmer|en|eng|english|zh|cn|chinese|ko|kr|korean|ja|jp|japanese|中文|한국어|日本語)\s*[:：]"
-    r")\s*",
+    rf"^\s*(?:"
+    rf"\[(?P<bracket>{_LANG_HINT_TOKEN_PATTERN})\]"
+    rf"|/(?P<slash>{_LANG_HINT_TOKEN_PATTERN})(?=\s|$)"
+    rf"|(?:tts|lang|language)\s*[:=]\s*(?P<named>{_LANG_HINT_TOKEN_PATTERN})(?=\s|$)"
+    rf"|(?P<prefix>{_LANG_HINT_TOKEN_PATTERN})\s*[:：]"
+    rf")\s*",
     re.IGNORECASE,
 )
 
@@ -2473,6 +2487,50 @@ def _looks_like_japanese_han_phrase(text: str) -> bool:
     return any(item in compact for item in japanese_han_hints)
 
 
+_DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+_ARABIC_SCRIPT_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
+_LATIN_WORD_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ']+")
+
+# Malay and Indonesian share much of their vocabulary, and Filipino also uses
+# the Latin alphabet. These weighted markers intentionally require a strong
+# signal; short or ambiguous text remains English unless the user chooses a
+# language button or adds a prefix such as `id:` or `ms:`.
+_LATIN_LANGUAGE_MARKERS: dict[str, dict[str, int]] = {
+    "id": {
+        "bahwa": 3, "karena": 2, "adalah": 2, "bisa": 2, "kalian": 2,
+        "nggak": 3, "tidak": 1, "saya": 1, "dari": 1, "kepada": 1,
+        "sedang": 1, "sudah": 1, "belum": 1, "juga": 1,
+    },
+    "ms": {
+        "bahawa": 3, "kerana": 2, "ialah": 3, "boleh": 2, "awak": 2,
+        "daripada": 2, "tak": 1, "tidak": 1, "saya": 1, "kepada": 1,
+        "sedang": 1, "sudah": 1, "belum": 1, "juga": 1,
+    },
+    "fil": {
+        "kumusta": 3, "salamat": 2, "mga": 3, "hindi": 2, "mayroon": 2,
+        "ngunit": 2, "ako": 1, "ikaw": 1, "natin": 1, "ninyo": 2,
+        "ito": 1, "iyon": 2, "opo": 3, "po": 1,
+    },
+}
+
+
+def _detect_latin_tts_language(text: str) -> str:
+    """Conservatively detect Indonesian, Malay, or Filipino Latin text."""
+    words = [word.lower() for word in _LATIN_WORD_RE.findall(str(text or ""))]
+    if not words:
+        return ""
+    scores = {
+        lang: sum(markers.get(word, 0) for word in words)
+        for lang, markers in _LATIN_LANGUAGE_MARKERS.items()
+    }
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    best_lang, best_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else 0
+    if best_score >= 3 and best_score - second_score >= 2:
+        return best_lang
+    return ""
+
+
 def _detect_lang(text: str) -> str:
     """Best-effort language hint for API responses and logs."""
     hint, text = _extract_leading_lang_hint(text or "")
@@ -2483,8 +2541,10 @@ def _detect_lang(text: str) -> str:
     korean = sum(1 for c in text if "\u1100" <= c <= "\u11FF" or "\u3130" <= c <= "\u318F" or "\uAC00" <= c <= "\uD7AF")
     japanese = sum(1 for c in text if "\u3040" <= c <= "\u30FF" or "\u31F0" <= c <= "\u31FF")
     chinese = sum(1 for c in text if "\u3400" <= c <= "\u4DBF" or "\u4E00" <= c <= "\u9FFF" or "\uF900" <= c <= "\uFAFF")
+    devanagari = len(_DEVANAGARI_RE.findall(text))
+    arabic = len(_ARABIC_SCRIPT_RE.findall(text))
     latin = sum(1 for c in text if ("A" <= c <= "Z") or ("a" <= c <= "z"))
-    signal_total = khmer + korean + japanese + chinese + latin
+    signal_total = khmer + korean + japanese + chinese + devanagari + arabic + latin
     if signal_total <= 0:
         return "en"
     if khmer and khmer / signal_total >= 0.15:
@@ -2497,7 +2557,11 @@ def _detect_lang(text: str) -> str:
         return "ja"
     if chinese and chinese / signal_total >= 0.15:
         return "zh"
-    return "en"
+    if devanagari and devanagari / signal_total >= 0.15:
+        return "hi"
+    if arabic and arabic / signal_total >= 0.15:
+        return "ar"
+    return _detect_latin_tts_language(text) or "en"
 
 
 _LANGUAGE_FLAGS = {
@@ -2506,6 +2570,11 @@ _LANGUAGE_FLAGS = {
     "zh": "🇨🇳",
     "ko": "🇰🇷",
     "ja": "🇯🇵",
+    "hi": "🇮🇳",
+    "ms": "🇲🇾",
+    "id": "🇮🇩",
+    "fil": "🇵🇭",
+    "ar": "🇸🇦",
 }
 _LANGUAGE_NAMES = {
     "km": "Khmer",
@@ -2513,6 +2582,11 @@ _LANGUAGE_NAMES = {
     "zh": "Chinese",
     "ko": "Korean",
     "ja": "Japanese",
+    "hi": "Hindi (India)",
+    "ms": "Malay (Malaysia)",
+    "id": "Indonesian",
+    "fil": "Filipino (Philippines)",
+    "ar": "Arabic",
 }
 
 
@@ -11966,7 +12040,7 @@ def _init_clients() -> None:
 VOICE_MAP = {
     # Khmer
     "km": {"female": "km-KH-SreymomNeural", "male": "km-KH-PisethNeural"},
-    # English
+    # English (United States)
     "en": {"female": "en-US-AriaNeural", "male": "en-US-GuyNeural"},
     # Chinese / Mandarin (Simplified + Traditional text detection routes here)
     "zh": {"female": "zh-CN-XiaoxiaoNeural", "male": "zh-CN-YunxiNeural"},
@@ -11974,6 +12048,16 @@ VOICE_MAP = {
     "ko": {"female": "ko-KR-SunHiNeural", "male": "ko-KR-InJoonNeural"},
     # Japanese
     "ja": {"female": "ja-JP-NanamiNeural", "male": "ja-JP-KeitaNeural"},
+    # Hindi (India)
+    "hi": {"female": "hi-IN-SwaraNeural", "male": "hi-IN-MadhurNeural"},
+    # Malay (Malaysia)
+    "ms": {"female": "ms-MY-YasminNeural", "male": "ms-MY-OsmanNeural"},
+    # Indonesian (Indonesia)
+    "id": {"female": "id-ID-GadisNeural", "male": "id-ID-ArdiNeural"},
+    # Filipino / Tagalog (Philippines)
+    "fil": {"female": "fil-PH-BlessicaNeural", "male": "fil-PH-AngeloNeural"},
+    # Arabic (Saudi Arabia). Explicit `ar:` hints also route other Arabic text here.
+    "ar": {"female": "ar-SA-ZariyahNeural", "male": "ar-SA-HamedNeural"},
 }
 TTS_LANGUAGE_LABELS = {
     "km": "Khmer",
@@ -11981,8 +12065,13 @@ TTS_LANGUAGE_LABELS = {
     "zh": "Chinese",
     "ko": "Korean",
     "ja": "Japanese",
+    "hi": "Hindi (India)",
+    "ms": "Malay (Malaysia)",
+    "id": "Indonesian",
+    "fil": "Filipino (Philippines)",
+    "ar": "Arabic",
 }
-TTS_SUPPORTED_LANG_ORDER = ("en", "km", "zh", "ja", "ko")
+TTS_SUPPORTED_LANG_ORDER = ("en", "km", "zh", "ja", "ko", "hi", "ms", "id", "fil", "ar")
 SPEED_OPTIONS = {
     "spd_0.5": ("x0.5", 0.5),
     "spd_1.0": ("Normal", 1.0),
@@ -11995,7 +12084,9 @@ WELCOME_TEXT = (
     "🎙️ អ្នកក៏អាចផ្ញើឯកសារ MP3 ឬឯកសារសំឡេង ដើម្បីបម្លែងទៅជាសារសំឡេង Telegram បានផងដែរ។\n\n"
     "🌍 ភាសាដែលគាំទ្រ៖\n"
     "🇰🇭 ខ្មែរ | 🇺🇸 អង់គ្លេស | 🇨🇳 ចិន | 🇰🇷 កូរ៉េ | 🇯🇵 ជប៉ុន\n"
-    "💡 សម្រាប់អក្សរជប៉ុន ឬចិនដែលអាចអានបានច្រើនរបៀប សូមដាក់ ja: ឬ zh: នៅខាងមុខអត្ថបទ។\n\n"
+    "🇮🇳 ហិណ្ឌី | 🇲🇾 ម៉ាឡេ | 🇮🇩 ឥណ្ឌូណេស៊ី | 🇵🇭 ហ្វីលីពីន | 🇸🇦 អារ៉ាប់\n"
+    "💡 បូតស្គាល់ភាសាដោយស្វ័យប្រវត្តិ។ សម្រាប់អត្ថបទ Latin ខ្លី ឬភាសាដែលស្រដៀងគ្នា "
+    "សូមប្រើប៊ូតុង 🌍 ឬដាក់ hi:, ms:, id:, fil:, ar: នៅខាងមុខអត្ថបទ។\n\n"
     "⚙️ ប្រើ /myprefs ដើម្បីមើលការកំណត់របស់អ្នក។\n"
     "🎙️ ប្រើ /voxcpm2 ដើម្បីចម្លងសំឡេង និងកំណត់អារម្មណ៍ ឬស្ទីលនៃការនិយាយ។\n"
     "📢 ចូលរួមឆានែល៖ https://t.me/m11mmm112"
@@ -16534,26 +16625,63 @@ _CHINESE_RE = re.compile(r"[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]")
 _JAPANESE_KANA_RE = re.compile(r"[\u3040-\u30FF\u31F0-\u31FF]")
 _KOREAN_RE = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
+_TTS_LANGUAGE_OVERRIDE: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "tts_language_override",
+    default="",
+)
+
+
+def _normalise_supported_tts_lang(value: Any) -> str:
+    lang = _normalise_lang_hint(value) or str(value or "").strip().lower()
+    return lang if lang in VOICE_MAP else ""
+
+
+def _active_tts_language_override() -> str:
+    return _normalise_supported_tts_lang(_TTS_LANGUAGE_OVERRIDE.get(""))
+
+
+def _with_tts_lang_hint(lang: str, text: str) -> str:
+    """Return text with one canonical language hint, without stacking hints."""
+    lang = _normalise_supported_tts_lang(lang)
+    _old_hint, clean_text = _extract_leading_lang_hint(str(text or ""))
+    clean_text = clean_text.strip()
+    if not clean_text:
+        return ""
+    return f"[{lang}] {clean_text}" if lang else clean_text
 
 
 def _detect_tts_lang_key(text: str) -> str:
-    """Detect the best Edge/HF TTS language bucket for a text chunk.
+    """Detect the Edge/HF TTS language bucket for a text chunk.
 
-    Supports Khmer, English, Chinese, Korean, and Japanese.  Korean Hangul and
-    Japanese Kana are detected before the Chinese Han fallback so CJK text does
-    not get routed to the wrong Edge voice.  For ambiguous Han/Kanji-only text,
-    users can force a voice with a leading hint such as `ja: 日本語`.
+    Explicit hints and the task-local language override win first. Script
+    detection handles Khmer, CJK, Hindi, and Arabic. Indonesian, Malay, and
+    Filipino use conservative word markers; ambiguous Latin text stays English
+    unless the user chooses a language or prefixes the message.
     """
     hint, text = _extract_leading_lang_hint(text or "")
     if hint:
         return hint
 
+    override = _active_tts_language_override()
+    if override:
+        return override
+
     khmer_chars = len(_KHMER_RE.findall(text))
     korean_chars = len(_KOREAN_RE.findall(text))
     japanese_kana_chars = len(_JAPANESE_KANA_RE.findall(text))
     chinese_chars = len(_CHINESE_RE.findall(text))
+    devanagari_chars = len(_DEVANAGARI_RE.findall(text))
+    arabic_chars = len(_ARABIC_SCRIPT_RE.findall(text))
     latin_chars = len(_LATIN_RE.findall(text))
-    signal_total = khmer_chars + korean_chars + japanese_kana_chars + chinese_chars + latin_chars
+    signal_total = (
+        khmer_chars
+        + korean_chars
+        + japanese_kana_chars
+        + chinese_chars
+        + devanagari_chars
+        + arabic_chars
+        + latin_chars
+    )
 
     if signal_total <= 0:
         return "en"
@@ -16569,7 +16697,12 @@ def _detect_tts_lang_key(text: str) -> str:
         return "ja"
     if chinese_chars and chinese_chars / signal_total >= 0.15:
         return "zh"
-    return "en"
+    if devanagari_chars and devanagari_chars / signal_total >= 0.15:
+        return "hi"
+    if arabic_chars and arabic_chars / signal_total >= 0.15:
+        return "ar"
+
+    return _detect_latin_tts_language(text) or "en"
 
 
 def _detect_voice(text: str, gender: str) -> str:
@@ -18378,7 +18511,7 @@ def _tts_audio_cache_key(
     cleaned = _clean_tts_text_for_edge(text)
     lang = _detect_tts_lang_key(cleaned)
     payload = {
-        "v": 4,
+        "v": 5,
         "lang": lang,
         "gender": gender if gender in ("female", "male") else "female",
         "speed": _rounded_speed(speed),
@@ -18607,28 +18740,41 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
 
 
 async def generate_voice_limited(text: str, gender: str, speed: float, output_path: str, tts_model: str = "auto") -> bytes:
-    cleaned = _clean_tts_text_for_edge(text)
-    cache_key = _tts_audio_cache_key(cleaned, gender, speed, tts_model)
-    cached = _tts_audio_cache_get(cache_key)
-    if cached is not None:
-        await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
-        logger.debug("TTS audio cache hit lang=%s bytes=%s", _detect_tts_lang_key(cleaned), len(cached))
-        return cached
+    # Preserve an explicit language choice after removing the visible prefix.
+    # ContextVar keeps the override isolated per async request, including when
+    # several TTS users are processed concurrently.
+    hint, raw_text = _extract_leading_lang_hint(str(text or ""))
+    cleaned = _clean_tts_text_for_edge(raw_text)
+    if not cleaned:
+        raise ValueError("generate_voice_limited: text must not be empty")
 
-    sem = _TTS_CHUNK_SEMAPHORE
-    if sem is None:
-        audio = await generate_voice(cleaned, gender, speed, output_path, tts_model)
-    else:
-        async with sem:
-            # Re-check after waiting; another request may have generated the same audio.
-            cached = _tts_audio_cache_get(cache_key)
-            if cached is not None:
-                await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
-                logger.debug("TTS audio cache hit after wait lang=%s bytes=%s", _detect_tts_lang_key(cleaned), len(cached))
-                return cached
+    override = _normalise_supported_tts_lang(hint)
+    override_token = _TTS_LANGUAGE_OVERRIDE.set(override) if override else None
+    try:
+        cache_key = _tts_audio_cache_key(cleaned, gender, speed, tts_model)
+        cached = _tts_audio_cache_get(cache_key)
+        if cached is not None:
+            await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
+            logger.debug("TTS audio cache hit lang=%s bytes=%s", _detect_tts_lang_key(cleaned), len(cached))
+            return cached
+
+        sem = _TTS_CHUNK_SEMAPHORE
+        if sem is None:
             audio = await generate_voice(cleaned, gender, speed, output_path, tts_model)
-    _tts_audio_cache_set(cache_key, audio)
-    return audio
+        else:
+            async with sem:
+                # Re-check after waiting; another request may have generated the same audio.
+                cached = _tts_audio_cache_get(cache_key)
+                if cached is not None:
+                    await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
+                    logger.debug("TTS audio cache hit after wait lang=%s bytes=%s", _detect_tts_lang_key(cleaned), len(cached))
+                    return cached
+                audio = await generate_voice(cleaned, gender, speed, output_path, tts_model)
+        _tts_audio_cache_set(cache_key, audio)
+        return audio
+    finally:
+        if override_token is not None:
+            _TTS_LANGUAGE_OVERRIDE.reset(override_token)
 
 
 # ---------------------------------------------------------------------------
@@ -18714,7 +18860,7 @@ async def transcribe_voice(ogg_path: str) -> str:
     prompt = (
         "Transcribe this audio exactly as spoken. "
         "Output ONLY the transcribed text — no labels, no explanation. "
-        "Support Khmer, English, Chinese, Korean, and Japanese."
+        "Support Khmer, English, Chinese, Korean, Japanese, Hindi, Malay, Indonesian, Filipino, and Arabic."
     )
     response = await _gemini_generate_with_retry(
         [
@@ -18738,7 +18884,7 @@ async def transcribe_audio_file(file_path: str, mime_type: str) -> str:
     prompt = (
         "Transcribe this audio exactly as spoken. "
         "Output ONLY the transcribed text — no labels, no explanation. "
-        "Support Khmer, English, Chinese, Korean, and Japanese."
+        "Support Khmer, English, Chinese, Korean, Japanese, Hindi, Malay, Indonesian, Filipino, and Arabic."
     )
     response = await _gemini_generate_with_retry(
         [
@@ -18886,11 +19032,14 @@ async def _deliver_paged_tts(
     progress_end: int = 94,
 ) -> tuple[int, int]:
     """Generate long TTS in measurable chunks and update one status message."""
-    chunks = _split_text_chunks(text)
+    forced_lang, clean_text = _extract_leading_lang_hint(str(text or ""))
+    forced_lang = _normalise_supported_tts_lang(forced_lang)
+    chunks = _split_text_chunks(clean_text)
     if not chunks:
         raise ValueError("រកអត្ថបទមិនឃើញ។")
 
-    set_last_tts_text(user_id, text)
+    remembered_text = _with_tts_lang_hint(forced_lang, clean_text)
+    set_last_tts_text(user_id, remembered_text)
     total = len(chunks)
     model = _normalize_tts_model(tts_model)
     model_label = TTS_MODEL_OPTIONS.get(model, TTS_MODEL_OPTIONS["auto"])[0]
@@ -18926,8 +19075,9 @@ async def _deliver_paged_tts(
 
             file_path = _make_temp_ogg()
             try:
+                request_chunk = _with_tts_lang_hint(forced_lang, chunk)
                 audio_bytes = await generate_user_voice_limited(
-                    chunk,
+                    request_chunk,
                     gender,
                     speed,
                     file_path,
@@ -18951,12 +19101,12 @@ async def _deliver_paged_tts(
                 sent_count += 1
                 save_text_cache(
                     sent.message_id,
-                    chunk,
+                    request_chunk,
                     chat_id=chat_id,
                     user_id=user_id,
                     username=username,
                 )
-                set_last_tts_text(user_id, chunk)
+                set_last_tts_text(user_id, request_chunk)
                 if progress is not None:
                     await progress.update(
                         after_pct,
@@ -19017,7 +19167,8 @@ def get_main_kb(gender: str, tts_model: str = "auto") -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f_btn, callback_data="tg_female"),
          InlineKeyboardButton(m_btn, callback_data="tg_male")],
         [InlineKeyboardButton("🎚️ ល្បឿនសំឡេង", callback_data="show_speed"),
-         InlineKeyboardButton(model_btn, callback_data="show_tts_model")],
+         InlineKeyboardButton("🌍 ភាសាសំឡេង", callback_data="show_tts_language")],
+        [InlineKeyboardButton(model_btn, callback_data="show_tts_model")],
     ])
 
 
@@ -19043,6 +19194,42 @@ def get_speed_kb(current_speed: float) -> InlineKeyboardMarkup:
         speed_row,
         [InlineKeyboardButton("🔙 ត្រឡប់", callback_data="hide_speed")],
     ])
+
+
+_TTS_LANGUAGE_BUTTON_LABELS = {
+    "en": "🇺🇸 English",
+    "km": "🇰🇭 ខ្មែរ",
+    "zh": "🇨🇳 中文",
+    "ja": "🇯🇵 日本語",
+    "ko": "🇰🇷 한국어",
+    "hi": "🇮🇳 हिन्दी",
+    "ms": "🇲🇾 Bahasa Melayu",
+    "id": "🇮🇩 Bahasa Indonesia",
+    "fil": "🇵🇭 Filipino",
+    "ar": "🇸🇦 العربية",
+}
+
+
+def get_tts_language_kb(current_lang: str = "auto") -> InlineKeyboardMarkup:
+    current = _normalise_supported_tts_lang(current_lang) or "auto"
+    buttons: list[InlineKeyboardButton] = [
+        InlineKeyboardButton(
+            "🌐 ស្វ័យប្រវត្តិ" + (" ✅" if current == "auto" else ""),
+            callback_data="ttslang_auto",
+        )
+    ]
+    for lang in TTS_SUPPORTED_LANG_ORDER:
+        label = _TTS_LANGUAGE_BUTTON_LABELS.get(lang, TTS_LANGUAGE_LABELS.get(lang, lang.upper()))
+        buttons.append(InlineKeyboardButton(
+            label + (" ✅" if current == lang else ""),
+            callback_data=f"ttslang_{lang}",
+        ))
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for index in range(0, len(buttons), 2):
+        rows.append(buttons[index:index + 2])
+    rows.append([InlineKeyboardButton("🔙 ត្រឡប់", callback_data="hide_tts_language")])
+    return InlineKeyboardMarkup(rows)
 
 
 def get_transcription_kb(transcript_msg_id: int) -> InlineKeyboardMarkup:
@@ -26153,7 +26340,7 @@ async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎚️ ល្បឿន: <b>{speed_label}</b>\n"
         f"🤖 ម៉ូដែល TTS: <b>{html.escape(model_label)}</b>\n"
         f"🎙️ ការកំណត់ VoxCPM2៖ <b>{'ប្រើ /voxcpm2 ដើម្បីកែប្រែ' if _normalize_tts_model(prefs.get('tts_model', 'auto')) == 'voxcpm2' else 'មិនចាំបាច់'}</b>\n\n"
-        "ផ្ញើអត្ថបទណាមួយ ហើយប្រើប៊ូតុងក្រោមសារសំឡេង ដើម្បីប្តូរម៉ូដែល ល្បឿន ឬប្រភេទសំឡេង។",
+        "ផ្ញើអត្ថបទណាមួយ ហើយប្រើប៊ូតុងក្រោមសារសំឡេង ដើម្បីប្តូរភាសា ម៉ូដែល ល្បឿន ឬប្រភេទសំឡេង។",
         parse_mode="HTML",
         reply_markup=get_main_kb(prefs["gender"], prefs.get("tts_model", "auto")),
     ))
@@ -26883,6 +27070,74 @@ async def _cb_hide_speed(query, user_id: int, context):
     ))
 
 
+async def _cb_show_tts_language(query, user_id: int, context):
+    if query.message is None:
+        return
+    original_text = await get_callback_original_text(query, user_id)
+    current_hint, _clean_text = _extract_leading_lang_hint(original_text or "")
+    await safe_send(lambda: query.message.edit_reply_markup(
+        reply_markup=get_tts_language_kb(current_hint or "auto")
+    ))
+
+
+async def _cb_hide_tts_language(query, user_id: int, context):
+    if query.message is None:
+        return
+    prefs = await get_user_prefs_async(user_id)
+    await safe_send(lambda: query.message.edit_reply_markup(
+        reply_markup=get_main_kb(prefs["gender"], prefs.get("tts_model", "auto"))
+    ))
+
+
+async def _cb_tts_language(query, user_id: int, context, data: str):
+    if query.message is None:
+        return
+    requested = data.replace("ttslang_", "", 1).strip().lower()
+    if requested != "auto":
+        requested = _normalise_supported_tts_lang(requested)
+        if not requested:
+            await safe_send(lambda: query.message.reply_text("❌ ភាសា TTS មិនត្រឹមត្រូវ។"))
+            return
+
+    original_text, prefs = await asyncio.gather(
+        get_callback_original_text(query, user_id),
+        get_user_prefs_async(user_id),
+    )
+    if not original_text:
+        await safe_send(lambda: query.message.reply_text(
+            "❌ រកអត្ថបទដើមមិនឃើញ។ សូមផ្ញើអត្ថបទម្តងទៀត រួចជ្រើសភាសា។"
+        ))
+        return
+    if await _check_cooldown(query.message, user_id):
+        return
+
+    _old_hint, clean_text = _extract_leading_lang_hint(original_text)
+    selected_text = clean_text.strip() if requested == "auto" else _with_tts_lang_hint(requested, clean_text)
+    if not selected_text:
+        await safe_send(lambda: query.message.reply_text("❌ អត្ថបទទទេ មិនអាចបង្កើតសំឡេងបានទេ។"))
+        return
+
+    if requested == "auto":
+        label = "ស្វ័យប្រវត្តិ"
+    else:
+        flag, name = _language_display(requested)
+        label = f"{flag} {name}"
+
+    await _regenerate_tts_voice_with_progress(
+        query=query,
+        context=context,
+        user_id=user_id,
+        original_text=selected_text,
+        gender=prefs["gender"],
+        speed=prefs["speed"],
+        tts_model=prefs.get("tts_model", "auto"),
+        title=f"កំពុងប្តូរភាសាទៅ {label}",
+        final_text=f"✅ បានប្តូរភាសាទៅ {label} និងបង្កើតសំឡេងរួចរាល់។",
+        error_text="❌ មិនអាចប្តូរភាសា និងបង្កើតសំឡេងបានទេ។ សូមសាកម្ដងទៀត។",
+        delete_source=True,
+    )
+
+
 async def _cb_show_tts_model(query, user_id: int, context):
     prefs = await get_user_prefs_async(user_id)
     await safe_send(lambda: query.message.edit_reply_markup(
@@ -27272,6 +27527,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cb_show_speed(query, user_id, context)
         elif data == "hide_speed":
             await _cb_hide_speed(query, user_id, context)
+        elif data == "show_tts_language":
+            await _cb_show_tts_language(query, user_id, context)
+        elif data == "hide_tts_language":
+            await _cb_hide_tts_language(query, user_id, context)
+        elif data.startswith("ttslang_"):
+            await _cb_tts_language(query, user_id, context, data)
         elif data == "show_tts_model":
             await _cb_show_tts_model(query, user_id, context)
         elif data == "hide_tts_model":
