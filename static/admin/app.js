@@ -69,6 +69,9 @@ async function api(path, options = {}) {
   }
   const headers = new Headers(options.headers || {});
   headers.set("X-Telegram-Init-Data", initData);
+  // Keep a standard authorization transport as a fallback for proxies that
+  // strip custom X-* headers on state-changing requests.
+  headers.set("Authorization", `Bearer ${initData}`);
   headers.set("Accept", "application/json");
   if (options.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
