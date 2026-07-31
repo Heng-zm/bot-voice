@@ -119,10 +119,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardRemove,
-<<<<<<< HEAD
     WebAppInfo,
-=======
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
 )
 from telegram.error import (
     NetworkError,
@@ -2487,73 +2484,11 @@ def _normalise_ai_message(value: Any) -> tuple[str, str | None]:
     return message, None
 
 
-<<<<<<< HEAD
-=======
-_LANG_HINT_ALIASES = {
-    # Existing languages
-    "km": "km", "kh": "km", "khmer": "km", "ភាសាខ្មែរ": "km",
-    "en": "en", "eng": "en", "english": "en",
-    "zh": "zh", "cn": "zh", "chinese": "zh", "中文": "zh",
-    "ko": "ko", "kr": "ko", "korean": "ko", "한국어": "ko",
-    "ja": "ja", "jp": "ja", "japanese": "ja", "日本語": "ja",
-    # New languages. Country names are accepted as user-friendly aliases.
-    "hi": "hi", "hin": "hi", "hindi": "hi", "india": "hi", "हिंदी": "hi", "हिन्दी": "hi",
-    "ms": "ms", "malay": "ms", "malaysia": "ms", "melayu": "ms", "bahasa melayu": "ms",
-    "id": "id", "ind": "id", "indonesian": "id", "indonesia": "id", "bahasa indonesia": "id",
-    "fil": "fil", "tl": "fil", "tagalog": "fil", "filipino": "fil", "philippines": "fil", "pilipino": "fil",
-    "ar": "ar", "ara": "ar", "arabic": "ar", "العربية": "ar", "عربي": "ar",
-}
-
-# Build the hint regex from one source of truth. Long aliases are matched first,
-# so phrases such as "bahasa indonesia:" are not consumed as shorter tokens.
-_LANG_HINT_TOKEN_PATTERN = "|".join(
-    re.escape(alias)
-    for alias in sorted(_LANG_HINT_ALIASES, key=lambda item: (-len(item), item))
-)
-_LANG_HINT_PATTERN = re.compile(
-    rf"^\s*(?:"
-    rf"\[(?P<bracket>{_LANG_HINT_TOKEN_PATTERN})\]"
-    rf"|/(?P<slash>{_LANG_HINT_TOKEN_PATTERN})(?=\s|$)"
-    rf"|(?:tts|lang|language)\s*[:=]\s*(?P<named>{_LANG_HINT_TOKEN_PATTERN})(?=\s|$)"
-    rf"|(?P<prefix>{_LANG_HINT_TOKEN_PATTERN})\s*[:：]"
-    rf")\s*",
-    re.IGNORECASE,
-)
-
-
-def _normalise_lang_hint(value: Any) -> str:
-    return _LANG_HINT_ALIASES.get(str(value or "").strip().lower(), "")
-
-
-def _extract_leading_lang_hint(text: str) -> tuple[str, str]:
-    """Return (language_key, text_without_hint) for explicit TTS language hints.
-
-    This fixes ambiguous CJK text.  For example, Kanji-only Japanese such as
-    `日本語` can look Chinese to a script detector, so users may send
-    `ja: 日本語` or `[ja] 日本語` to force the Japanese Edge voice.
-    """
-    text = str(text or "")
-    match = _LANG_HINT_PATTERN.match(text)
-    if not match:
-        return "", text
-    for group_name in ("bracket", "slash", "named", "prefix"):
-        lang = _normalise_lang_hint(match.group(group_name))
-        if lang:
-            return lang, text[match.end():].lstrip()
-    return "", text
-
-
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
 def _looks_like_japanese_han_phrase(text: str) -> bool:
     """Small dependency-free hint for common Japanese-only Han phrases.
 
     Han/Kanji-only CJK is inherently ambiguous, so this function is deliberately
-<<<<<<< HEAD
     conservative because words such as 東京 can be valid Chinese or Japanese.
-=======
-    conservative.  Explicit language hints still win for words like 東京 that
-    can be valid Chinese or Japanese.
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
     """
     compact = re.sub(r"\s+", "", str(text or ""))
     if not compact:
@@ -2568,12 +2503,7 @@ _LATIN_WORD_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ']+")
 
 # Malay and Indonesian share much of their vocabulary, and Filipino also uses
 # the Latin alphabet. These weighted markers intentionally require a strong
-<<<<<<< HEAD
 # signal; short or ambiguous Latin text safely falls back to English.
-=======
-# signal; short or ambiguous text remains English unless the user chooses a
-# language button or adds a prefix such as `id:` or `ms:`.
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
 _LATIN_LANGUAGE_MARKERS: dict[str, dict[str, int]] = {
     "id": {
         "bahwa": 3, "karena": 2, "adalah": 2, "bisa": 2, "kalian": 2,
@@ -2611,16 +2541,8 @@ def _detect_latin_tts_language(text: str) -> str:
 
 
 def _detect_lang(text: str) -> str:
-<<<<<<< HEAD
     """Detect the dominant writing system without accepting manual overrides."""
     text = str(text or "")
-=======
-    """Best-effort language hint for API responses and logs."""
-    hint, text = _extract_leading_lang_hint(text or "")
-    if hint:
-        return hint
-
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
     khmer = sum(1 for c in text if "\u1780" <= c <= "\u17FF")
     korean = sum(1 for c in text if "\u1100" <= c <= "\u11FF" or "\u3130" <= c <= "\u318F" or "\uAC00" <= c <= "\uD7AF")
     japanese = sum(1 for c in text if "\u3040" <= c <= "\u30FF" or "\u31F0" <= c <= "\u31FF")
@@ -3445,18 +3367,6 @@ async def ai_transcribe():
     if len(audio_data) > _AI_API_MAX_AUDIO_BYTES:
         return _ai_cors(_ai_error("Audio too large (max 50 MB)."))
 
-<<<<<<< HEAD
-=======
-    lang_hint = _normalise_lang_hint(request.form.get("language", "auto")) or "auto"
-    lang_instruction = {
-        "km": " The audio is in Khmer (ភាសាខ្មែរ).",
-        "en": " The audio is in English.",
-        "zh": " The audio is in Chinese (中文).",
-        "ko": " The audio is in Korean (한국어).",
-        "ja": " The audio is in Japanese (日本語).",
-    }.get(lang_hint, "")
-
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
     from google.genai import types as _gtypes
 
     def _transcribe_audio():
@@ -3467,12 +3377,8 @@ async def ai_transcribe():
                 (
                     "Transcribe this audio exactly as spoken. "
                     "Output ONLY the transcribed text — no labels, no explanation, "
-<<<<<<< HEAD
                     "no timestamps. Detect the spoken language automatically and "
                     "preserve its original script."
-=======
-                    "no timestamps." + lang_instruction
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
                 ),
             ],
         )
@@ -12195,11 +12101,7 @@ VOICE_MAP = {
     "id": {"female": "id-ID-GadisNeural", "male": "id-ID-ArdiNeural"},
     # Filipino / Tagalog (Philippines)
     "fil": {"female": "fil-PH-BlessicaNeural", "male": "fil-PH-AngeloNeural"},
-<<<<<<< HEAD
     # Arabic (Saudi Arabia)
-=======
-    # Arabic (Saudi Arabia). Explicit `ar:` hints also route other Arabic text here.
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
     "ar": {"female": "ar-SA-ZariyahNeural", "male": "ar-SA-HamedNeural"},
 }
 TTS_LANGUAGE_LABELS = {
@@ -12228,12 +12130,7 @@ WELCOME_TEXT = (
     "🌍 ភាសាដែលគាំទ្រ៖\n"
     "🇰🇭 ខ្មែរ | 🇺🇸 អង់គ្លេស | 🇨🇳 ចិន | 🇰🇷 កូរ៉េ | 🇯🇵 ជប៉ុន\n"
     "🇮🇳 ហិណ្ឌី | 🇲🇾 ម៉ាឡេ | 🇮🇩 ឥណ្ឌូណេស៊ី | 🇵🇭 ហ្វីលីពីន | 🇸🇦 អារ៉ាប់\n"
-<<<<<<< HEAD
     "💡 បូតស្គាល់ភាសា និងជ្រើសសំឡេងដែលសមស្របដោយស្វ័យប្រវត្តិ ១០០%។\n\n"
-=======
-    "💡 បូតស្គាល់ភាសាដោយស្វ័យប្រវត្តិ។ សម្រាប់អត្ថបទ Latin ខ្លី ឬភាសាដែលស្រដៀងគ្នា "
-    "សូមប្រើប៊ូតុង 🌍 ឬដាក់ hi:, ms:, id:, fil:, ar: នៅខាងមុខអត្ថបទ។\n\n"
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
     "⚙️ ប្រើ /myprefs ដើម្បីមើលការកំណត់របស់អ្នក។\n"
     "🎙️ ប្រើ /voxcpm2 ដើម្បីចម្លងសំឡេង និងកំណត់អារម្មណ៍ ឬស្ទីលនៃការនិយាយ។\n"
     "📢 ចូលរួមឆានែល៖ https://t.me/m11mmm112"
@@ -14906,7 +14803,6 @@ async def resolve_tts_text(
     if not context_block.strip():
         return raw_text
 
-<<<<<<< HEAD
     detected_input_lang = _detect_lang(raw_text)
     _language_flag, detected_input_name = _language_display(detected_input_lang)
     language_rule = {
@@ -14928,11 +14824,6 @@ async def resolve_tts_text(
         "You are a text pre-processor for a multilingual TTS bot. "
         "Output ONLY the exact text to be spoken — no labels, no explanation, no markdown.\n\n"
         f"Automatic language detection: {detected_input_lang}. {language_rule}\n\n"
-=======
-    system_prompt = (
-        "You are a text pre-processor for a multilingual TTS bot that supports Khmer, English, Chinese, Korean, and Japanese. "
-        "Output ONLY the exact text to be spoken — no labels, no explanation, no markdown.\n\n"
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
         "Rules:\n"
         "1. Normal sentence → output verbatim.\n"
         "2. 'read again' / 'អានម្តងទៀត' → output last Bot turn verbatim.\n"
@@ -14959,16 +14850,12 @@ async def resolve_tts_text(
         response = await asyncio.wait_for(_guarded_call(), timeout=CONV_RESOLVE_TIMEOUT_S)
         resolved = (response.text or "").strip()
         if resolved:
-<<<<<<< HEAD
             logger.info(
                 "resolve_tts_text Gemini resolved user=%s input_lang=%s output_lang=%s",
                 user_id,
                 detected_input_lang,
                 _detect_lang(resolved),
             )
-=======
-            logger.info(f"resolve_tts_text Gemini resolved for user {user_id}")
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
             return resolved
         return raw_text
     except asyncio.TimeoutError:
@@ -16047,11 +15934,7 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
     Keep the first screen small enough for phones while preserving every
     existing admin feature through grouped shortcuts.
     """
-<<<<<<< HEAD
     rows = [
-=======
-    return InlineKeyboardMarkup([
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
         [InlineKeyboardButton("🏠 Overview", callback_data="admin_home"),
          InlineKeyboardButton("🩺 Health", callback_data="admin_health")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
@@ -16073,7 +15956,6 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📱 Compact", callback_data="admin_compact"),
          InlineKeyboardButton("🔄 Refresh", callback_data="admin_home")],
         [InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
-<<<<<<< HEAD
     ]
     mini_app_url = f"{_runtime_webhook_base_url()}/miniapp/admin"
     if mini_app_url.startswith("https://"):
@@ -16084,9 +15966,6 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
             )
         ])
     return InlineKeyboardMarkup(rows)
-=======
-    ])
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
 
 
 def get_admin_compact_kb() -> InlineKeyboardMarkup:
@@ -16842,91 +16721,10 @@ _CHINESE_RE = re.compile(r"[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]")
 _JAPANESE_KANA_RE = re.compile(r"[\u3040-\u30FF\u31F0-\u31FF]")
 _KOREAN_RE = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
-<<<<<<< HEAD
 def _detect_tts_lang_key(text: str) -> str:
     """Return the Edge/HF language bucket selected from the text itself."""
     detected = _detect_lang(text)
     return detected if detected in VOICE_MAP else "en"
-=======
-_TTS_LANGUAGE_OVERRIDE: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "tts_language_override",
-    default="",
-)
-
-
-def _normalise_supported_tts_lang(value: Any) -> str:
-    lang = _normalise_lang_hint(value) or str(value or "").strip().lower()
-    return lang if lang in VOICE_MAP else ""
-
-
-def _active_tts_language_override() -> str:
-    return _normalise_supported_tts_lang(_TTS_LANGUAGE_OVERRIDE.get(""))
-
-
-def _with_tts_lang_hint(lang: str, text: str) -> str:
-    """Return text with one canonical language hint, without stacking hints."""
-    lang = _normalise_supported_tts_lang(lang)
-    _old_hint, clean_text = _extract_leading_lang_hint(str(text or ""))
-    clean_text = clean_text.strip()
-    if not clean_text:
-        return ""
-    return f"[{lang}] {clean_text}" if lang else clean_text
-
-
-def _detect_tts_lang_key(text: str) -> str:
-    """Detect the Edge/HF TTS language bucket for a text chunk.
-
-    Explicit hints and the task-local language override win first. Script
-    detection handles Khmer, CJK, Hindi, and Arabic. Indonesian, Malay, and
-    Filipino use conservative word markers; ambiguous Latin text stays English
-    unless the user chooses a language or prefixes the message.
-    """
-    hint, text = _extract_leading_lang_hint(text or "")
-    if hint:
-        return hint
-
-    override = _active_tts_language_override()
-    if override:
-        return override
-
-    khmer_chars = len(_KHMER_RE.findall(text))
-    korean_chars = len(_KOREAN_RE.findall(text))
-    japanese_kana_chars = len(_JAPANESE_KANA_RE.findall(text))
-    chinese_chars = len(_CHINESE_RE.findall(text))
-    devanagari_chars = len(_DEVANAGARI_RE.findall(text))
-    arabic_chars = len(_ARABIC_SCRIPT_RE.findall(text))
-    latin_chars = len(_LATIN_RE.findall(text))
-    signal_total = (
-        khmer_chars
-        + korean_chars
-        + japanese_kana_chars
-        + chinese_chars
-        + devanagari_chars
-        + arabic_chars
-        + latin_chars
-    )
-
-    if signal_total <= 0:
-        return "en"
-
-    # Prefer unambiguous non-Latin scripts when they have meaningful presence.
-    if khmer_chars and khmer_chars / signal_total >= 0.15:
-        return "km"
-    if korean_chars and korean_chars / signal_total >= 0.15:
-        return "ko"
-    if japanese_kana_chars and japanese_kana_chars / signal_total >= 0.08:
-        return "ja"
-    if _looks_like_japanese_han_phrase(text):
-        return "ja"
-    if chinese_chars and chinese_chars / signal_total >= 0.15:
-        return "zh"
-    if devanagari_chars and devanagari_chars / signal_total >= 0.15:
-        return "hi"
-    if arabic_chars and arabic_chars / signal_total >= 0.15:
-        return "ar"
-
-    return _detect_latin_tts_language(text) or "en"
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
 
 
 def _detect_voice(text: str, gender: str) -> str:
@@ -16936,18 +16734,10 @@ def _detect_voice(text: str, gender: str) -> str:
 
 
 def _clean_tts_text_for_edge(text: str) -> str:
-<<<<<<< HEAD
     """Remove hidden and control characters without rewriting user content."""
     text = (text or "")
     for ch in ("\ufeff", "\u200b", "\u200c", "\u200d"):
         text = text.replace(ch, "")
-=======
-    """Remove hidden/control chars and optional leading language hints."""
-    text = (text or "")
-    for ch in ("\ufeff", "\u200b", "\u200c", "\u200d"):
-        text = text.replace(ch, "")
-    _hint, text = _extract_leading_lang_hint(text)
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text)
     text = re.sub(r"[ \t\r\f\v]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -19035,7 +18825,6 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
 
 
 async def generate_voice_limited(text: str, gender: str, speed: float, output_path: str, tts_model: str = "auto") -> bytes:
-<<<<<<< HEAD
     """Generate cached TTS audio using language detected from ``text``."""
     cleaned = _clean_tts_text_for_edge(str(text or ""))
     if not cleaned:
@@ -19062,43 +18851,6 @@ async def generate_voice_limited(text: str, gender: str, speed: float, output_pa
             audio = await generate_voice(cleaned, gender, speed, output_path, tts_model)
     _tts_audio_cache_set(cache_key, audio)
     return audio
-=======
-    # Preserve an explicit language choice after removing the visible prefix.
-    # ContextVar keeps the override isolated per async request, including when
-    # several TTS users are processed concurrently.
-    hint, raw_text = _extract_leading_lang_hint(str(text or ""))
-    cleaned = _clean_tts_text_for_edge(raw_text)
-    if not cleaned:
-        raise ValueError("generate_voice_limited: text must not be empty")
-
-    override = _normalise_supported_tts_lang(hint)
-    override_token = _TTS_LANGUAGE_OVERRIDE.set(override) if override else None
-    try:
-        cache_key = _tts_audio_cache_key(cleaned, gender, speed, tts_model)
-        cached = _tts_audio_cache_get(cache_key)
-        if cached is not None:
-            await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
-            logger.debug("TTS audio cache hit lang=%s bytes=%s", _detect_tts_lang_key(cleaned), len(cached))
-            return cached
-
-        sem = _TTS_CHUNK_SEMAPHORE
-        if sem is None:
-            audio = await generate_voice(cleaned, gender, speed, output_path, tts_model)
-        else:
-            async with sem:
-                # Re-check after waiting; another request may have generated the same audio.
-                cached = _tts_audio_cache_get(cache_key)
-                if cached is not None:
-                    await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
-                    logger.debug("TTS audio cache hit after wait lang=%s bytes=%s", _detect_tts_lang_key(cleaned), len(cached))
-                    return cached
-                audio = await generate_voice(cleaned, gender, speed, output_path, tts_model)
-        _tts_audio_cache_set(cache_key, audio)
-        return audio
-    finally:
-        if override_token is not None:
-            _TTS_LANGUAGE_OVERRIDE.reset(override_token)
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
 
 
 # ---------------------------------------------------------------------------
@@ -19356,22 +19108,12 @@ async def _deliver_paged_tts(
     progress_end: int = 94,
 ) -> tuple[int, int]:
     """Generate long TTS in measurable chunks and update one status message."""
-<<<<<<< HEAD
     clean_text = _clean_tts_text_for_edge(str(text or ""))
-=======
-    forced_lang, clean_text = _extract_leading_lang_hint(str(text or ""))
-    forced_lang = _normalise_supported_tts_lang(forced_lang)
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
     chunks = _split_text_chunks(clean_text)
     if not chunks:
         raise ValueError("រកអត្ថបទមិនឃើញ។")
 
-<<<<<<< HEAD
     set_last_tts_text(user_id, clean_text)
-=======
-    remembered_text = _with_tts_lang_hint(forced_lang, clean_text)
-    set_last_tts_text(user_id, remembered_text)
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
     total = len(chunks)
     model = _normalize_tts_model(tts_model)
     model_label = TTS_MODEL_OPTIONS.get(model, TTS_MODEL_OPTIONS["auto"])[0]
@@ -19407,11 +19149,7 @@ async def _deliver_paged_tts(
 
             file_path = _make_temp_ogg()
             try:
-<<<<<<< HEAD
                 request_chunk = chunk
-=======
-                request_chunk = _with_tts_lang_hint(forced_lang, chunk)
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
                 audio_bytes = await generate_user_voice_limited(
                     request_chunk,
                     gender,
@@ -19502,12 +19240,7 @@ def get_main_kb(gender: str, tts_model: str = "auto") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f_btn, callback_data="tg_female"),
          InlineKeyboardButton(m_btn, callback_data="tg_male")],
-<<<<<<< HEAD
         [InlineKeyboardButton("🎚️ ល្បឿនសំឡេង", callback_data="show_speed")],
-=======
-        [InlineKeyboardButton("🎚️ ល្បឿនសំឡេង", callback_data="show_speed"),
-         InlineKeyboardButton("🌍 ភាសាសំឡេង", callback_data="show_tts_language")],
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
         [InlineKeyboardButton(model_btn, callback_data="show_tts_model")],
     ])
 
@@ -19536,45 +19269,6 @@ def get_speed_kb(current_speed: float) -> InlineKeyboardMarkup:
     ])
 
 
-<<<<<<< HEAD
-=======
-_TTS_LANGUAGE_BUTTON_LABELS = {
-    "en": "🇺🇸 English",
-    "km": "🇰🇭 ខ្មែរ",
-    "zh": "🇨🇳 中文",
-    "ja": "🇯🇵 日本語",
-    "ko": "🇰🇷 한국어",
-    "hi": "🇮🇳 हिन्दी",
-    "ms": "🇲🇾 Bahasa Melayu",
-    "id": "🇮🇩 Bahasa Indonesia",
-    "fil": "🇵🇭 Filipino",
-    "ar": "🇸🇦 العربية",
-}
-
-
-def get_tts_language_kb(current_lang: str = "auto") -> InlineKeyboardMarkup:
-    current = _normalise_supported_tts_lang(current_lang) or "auto"
-    buttons: list[InlineKeyboardButton] = [
-        InlineKeyboardButton(
-            "🌐 ស្វ័យប្រវត្តិ" + (" ✅" if current == "auto" else ""),
-            callback_data="ttslang_auto",
-        )
-    ]
-    for lang in TTS_SUPPORTED_LANG_ORDER:
-        label = _TTS_LANGUAGE_BUTTON_LABELS.get(lang, TTS_LANGUAGE_LABELS.get(lang, lang.upper()))
-        buttons.append(InlineKeyboardButton(
-            label + (" ✅" if current == lang else ""),
-            callback_data=f"ttslang_{lang}",
-        ))
-
-    rows: list[list[InlineKeyboardButton]] = []
-    for index in range(0, len(buttons), 2):
-        rows.append(buttons[index:index + 2])
-    rows.append([InlineKeyboardButton("🔙 ត្រឡប់", callback_data="hide_tts_language")])
-    return InlineKeyboardMarkup(rows)
-
-
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
 def get_transcription_kb(transcript_msg_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("📢 AI អាន",  callback_data=f"tts_transcript:{transcript_msg_id}"),
@@ -20348,11 +20042,7 @@ def admin_only(handler):
     @functools.wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id if update.effective_user else None
-<<<<<<< HEAD
         if uid is None or not _is_admin(uid):
-=======
-        if uid not in ADMIN_IDS:
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
             if update.message:
                 await safe_send(lambda: update.message.reply_text("⛔ អ្នកមិនមានសិទ្ធិប្រើពាក្យបញ្ជានេះទេ។"))
             return
@@ -20361,7 +20051,6 @@ def admin_only(handler):
 
 
 def _is_admin(user_id: int) -> bool:
-<<<<<<< HEAD
     try:
         user_id = int(user_id)
     except (TypeError, ValueError):
@@ -20375,9 +20064,6 @@ def _is_admin(user_id: int) -> bool:
     except Exception as exc:
         logger.warning("Redis admin authorization check failed user_id=%s: %s", user_id, exc)
         return False
-=======
-    return user_id in ADMIN_IDS
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
 
 
 # ---------------------------------------------------------------------------
@@ -26886,12 +26572,8 @@ async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎚️ ល្បឿន: <b>{speed_label}</b>\n"
         f"🤖 ម៉ូដែល TTS: <b>{html.escape(model_label)}</b>\n"
         f"🎙️ ការកំណត់ VoxCPM2៖ <b>{'ប្រើ /voxcpm2 ដើម្បីកែប្រែ' if _normalize_tts_model(prefs.get('tts_model', 'auto')) == 'voxcpm2' else 'មិនចាំបាច់'}</b>\n\n"
-<<<<<<< HEAD
         "ផ្ញើអត្ថបទណាមួយ។ បូតស្គាល់ភាសា និងជ្រើសសំឡេងដោយស្វ័យប្រវត្តិ; "
         "ប៊ូតុងក្រោមសារសំឡេងប្រើសម្រាប់ប្តូរម៉ូដែល ល្បឿន ឬប្រភេទសំឡេង។",
-=======
-        "ផ្ញើអត្ថបទណាមួយ ហើយប្រើប៊ូតុងក្រោមសារសំឡេង ដើម្បីប្តូរភាសា ម៉ូដែល ល្បឿន ឬប្រភេទសំឡេង។",
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
         parse_mode="HTML",
         reply_markup=get_main_kb(prefs["gender"], prefs.get("tts_model", "auto")),
     ))
@@ -27205,13 +26887,8 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.error("Audio transcription failed: %s", exc, exc_info=True)
 
         if transcript:
-<<<<<<< HEAD
             detected_lang = _detect_lang(transcript)
             lang_flag, lang_name = _language_display(detected_lang)
-=======
-            is_khmer = bool(_KHMER_RE.search(transcript))
-            lang_flag = "🇰🇭" if is_khmer else "🌐"
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
             fname_display = html.escape(filename[:50]) if filename else "audio"
             conversion_note = (
                 "✅ បានបង្កើតសារសំឡេងរួចរាល់។"
@@ -27219,12 +26896,8 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "⚠️ មិនអាចបង្កើតសារសំឡេងបាន ប៉ុន្តែបានបម្លែងទៅអត្ថបទ។"
             )
             header = (
-<<<<<<< HEAD
                 f"🎵 <b>អត្ថបទពីឯកសារអូឌីយ៉ូ</b> {lang_flag} "
                 f"{html.escape(lang_name)} — <code>{fname_display}</code>\n"
-=======
-                f"🎵 <b>អត្ថបទពីឯកសារអូឌីយ៉ូ</b> {lang_flag} — <code>{fname_display}</code>\n"
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
                 f"{conversion_note}\n\n"
             )
             pages = _paginate_plain(transcript, limit=max(500, TELE_MSG_LIMIT - len(header) - 64))
@@ -27391,18 +27064,12 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await progress.update(85, "បានស្គាល់អត្ថបទ", f"រកឃើញ {len(transcript)} តួអក្សរ។", force=True)
         record_turn(user_id, "user", f"[Voice Transcript]: {transcript[:500]}")
-<<<<<<< HEAD
         detected_lang = _detect_lang(transcript)
         lang_flag, lang_name = _language_display(detected_lang)
         header = (
             f"📝 <b>អត្ថបទពីសារសំឡេង</b> {lang_flag} "
             f"{html.escape(lang_name)}\n\n"
         )
-=======
-        is_khmer = bool(_KHMER_RE.search(transcript))
-        lang_flag = "🇰🇭" if is_khmer else "🌐"
-        header = f"📝 <b>អត្ថបទពីសារសំឡេង</b> {lang_flag}\n\n"
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
         pages = _paginate_plain(transcript, limit=max(500, TELE_MSG_LIMIT - len(header) - 64))
         if not pages:
             raise RuntimeError("Could not paginate transcript")
@@ -27656,77 +27323,6 @@ async def _cb_hide_speed(query, user_id: int, context):
     ))
 
 
-<<<<<<< HEAD
-=======
-async def _cb_show_tts_language(query, user_id: int, context):
-    if query.message is None:
-        return
-    original_text = await get_callback_original_text(query, user_id)
-    current_hint, _clean_text = _extract_leading_lang_hint(original_text or "")
-    await safe_send(lambda: query.message.edit_reply_markup(
-        reply_markup=get_tts_language_kb(current_hint or "auto")
-    ))
-
-
-async def _cb_hide_tts_language(query, user_id: int, context):
-    if query.message is None:
-        return
-    prefs = await get_user_prefs_async(user_id)
-    await safe_send(lambda: query.message.edit_reply_markup(
-        reply_markup=get_main_kb(prefs["gender"], prefs.get("tts_model", "auto"))
-    ))
-
-
-async def _cb_tts_language(query, user_id: int, context, data: str):
-    if query.message is None:
-        return
-    requested = data.replace("ttslang_", "", 1).strip().lower()
-    if requested != "auto":
-        requested = _normalise_supported_tts_lang(requested)
-        if not requested:
-            await safe_send(lambda: query.message.reply_text("❌ ភាសា TTS មិនត្រឹមត្រូវ។"))
-            return
-
-    original_text, prefs = await asyncio.gather(
-        get_callback_original_text(query, user_id),
-        get_user_prefs_async(user_id),
-    )
-    if not original_text:
-        await safe_send(lambda: query.message.reply_text(
-            "❌ រកអត្ថបទដើមមិនឃើញ។ សូមផ្ញើអត្ថបទម្តងទៀត រួចជ្រើសភាសា។"
-        ))
-        return
-    if await _check_cooldown(query.message, user_id):
-        return
-
-    _old_hint, clean_text = _extract_leading_lang_hint(original_text)
-    selected_text = clean_text.strip() if requested == "auto" else _with_tts_lang_hint(requested, clean_text)
-    if not selected_text:
-        await safe_send(lambda: query.message.reply_text("❌ អត្ថបទទទេ មិនអាចបង្កើតសំឡេងបានទេ។"))
-        return
-
-    if requested == "auto":
-        label = "ស្វ័យប្រវត្តិ"
-    else:
-        flag, name = _language_display(requested)
-        label = f"{flag} {name}"
-
-    await _regenerate_tts_voice_with_progress(
-        query=query,
-        context=context,
-        user_id=user_id,
-        original_text=selected_text,
-        gender=prefs["gender"],
-        speed=prefs["speed"],
-        tts_model=prefs.get("tts_model", "auto"),
-        title=f"កំពុងប្តូរភាសាទៅ {label}",
-        final_text=f"✅ បានប្តូរភាសាទៅ {label} និងបង្កើតសំឡេងរួចរាល់។",
-        error_text="❌ មិនអាចប្តូរភាសា និងបង្កើតសំឡេងបានទេ។ សូមសាកម្ដងទៀត។",
-        delete_source=True,
-    )
-
-
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
 async def _cb_show_tts_model(query, user_id: int, context):
     prefs = await get_user_prefs_async(user_id)
     await safe_send(lambda: query.message.edit_reply_markup(
@@ -28116,15 +27712,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cb_show_speed(query, user_id, context)
         elif data == "hide_speed":
             await _cb_hide_speed(query, user_id, context)
-<<<<<<< HEAD
-=======
-        elif data == "show_tts_language":
-            await _cb_show_tts_language(query, user_id, context)
-        elif data == "hide_tts_language":
-            await _cb_hide_tts_language(query, user_id, context)
-        elif data.startswith("ttslang_"):
-            await _cb_tts_language(query, user_id, context, data)
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
         elif data == "show_tts_model":
             await _cb_show_tts_model(query, user_id, context)
         elif data == "hide_tts_model":
@@ -28447,7 +28034,6 @@ async def _async_main_once():
     except Exception as rexc:
         webhook_logger.warning("Redis fallback triggered. Runtime state restore failed during boot: %s", rexc)
     await _bootstrap_runtime_security()
-<<<<<<< HEAD
     from app.core.telegram_auth import configure_telegram_admin_authorizer
 
     admin_authorizer = configure_telegram_admin_authorizer(
@@ -28455,19 +28041,12 @@ async def _async_main_once():
         fallback_admin_ids=ADMIN_IDS,
     )
     ADMIN_IDS.update(await admin_authorizer.load_ids(force=True))
-=======
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
     _runtime_admin_bootstrap_state()
 
     if not ADMIN_IDS:
         logger.warning(
-<<<<<<< HEAD
             "No Telegram administrators are authorized. Add at least one user ID "
             "to Redis set tgbot:security:admin_user_ids:v1."
-=======
-            "No ADMIN_IDS configured. "
-            "Set ADMIN_IDS=123456,789012 in your environment."
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
         )
 
     print(

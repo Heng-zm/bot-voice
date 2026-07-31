@@ -13,7 +13,6 @@ from typing import Annotated, Any
 from fastapi import Depends, HTTPException, Request, status
 
 from app._legacy_bridge import legacy_module
-<<<<<<< HEAD
 from app.core.telegram_auth import (
     TelegramAdminStoreError,
     TelegramInitDataError,
@@ -21,8 +20,6 @@ from app.core.telegram_auth import (
     get_telegram_admin_authorizer,
     telegram_init_data_from_request,
 )
-=======
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
 
 
 def get_settings() -> Any:
@@ -45,10 +42,7 @@ async def authorize_ai_request() -> tuple[bool, Any | None]:
 class AdminPrincipal:
     admin_id: int
     auth_method: str
-<<<<<<< HEAD
     telegram_user: TelegramMiniAppUser | None = None
-=======
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
 
 
 async def require_admin(request: Request) -> AdminPrincipal:
@@ -60,7 +54,6 @@ async def require_admin(request: Request) -> AdminPrincipal:
     """
 
     legacy = legacy_module()
-<<<<<<< HEAD
     telegram_init_data, telegram_credential_sent = telegram_init_data_from_request(request)
     if telegram_credential_sent:
         bot_token = str(
@@ -100,8 +93,6 @@ async def require_admin(request: Request) -> AdminPrincipal:
             session.user,
         )
 
-=======
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
     if not bool(legacy._web_admin_enabled()):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -120,11 +111,7 @@ async def require_admin(request: Request) -> AdminPrincipal:
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-<<<<<<< HEAD
     session = request.scope.get("session") or {}
-=======
-    session = request.session
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
     try:
         admin_id = int(session.get("web_admin_id") or 0)
     except (TypeError, ValueError):
@@ -150,12 +137,8 @@ async def require_admin_write(
     """
 
     if principal.auth_method == "cookie":
-<<<<<<< HEAD
         session = request.scope.get("session") or {}
         expected = str(session.get("web_csrf_token") or "")
-=======
-        expected = str(request.session.get("web_csrf_token") or "")
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
         received = str(request.headers.get("x-csrf-token") or "")
         if not expected or not received or not hmac.compare_digest(expected, received):
             raise HTTPException(

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-<<<<<<< HEAD
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -13,12 +12,6 @@ from fastapi.staticfiles import StaticFiles
 
 from app import legacy as _legacy
 from app.api.v1.admin import router as admin_router
-=======
-
-from fastapi import FastAPI
-
-from app import legacy as _legacy
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
 from app.api.v1.admin_cors import router as admin_cors_router
 from app.core.cors import (
     DynamicCORSMiddleware,
@@ -26,16 +19,12 @@ from app.core.cors import (
     get_dynamic_cors_store,
 )
 from app.core.security import get_runtime_secret_manager
-<<<<<<< HEAD
 from app.core.telegram_auth import configure_telegram_admin_authorizer
-=======
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
 
 # ASGI servers can use ``uvicorn app.main:app``.  The combined production
 # process still uses ``python -m app.main`` so Telegram and background workers
 # retain their existing lifecycle while the monolith is migrated in stages.
 app: FastAPI = _legacy.app
-<<<<<<< HEAD
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _ADMIN_STATIC_DIR = _PROJECT_ROOT / "static" / "admin"
 _ADMIN_INDEX_FILE = _ADMIN_STATIC_DIR / "index.html"
@@ -50,8 +39,6 @@ _ADMIN_CSP = (
     "img-src 'self' data: https:; "
     "connect-src 'self'"
 )
-=======
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
 
 
 async def _initialize_runtime_services(application: FastAPI) -> None:
@@ -82,7 +69,6 @@ async def _initialize_runtime_services(application: FastAPI) -> None:
         supabase_client=_legacy.supabase,
     )
     cors_snapshot = await cors_store.load(force=True)
-<<<<<<< HEAD
     admin_authorizer = configure_telegram_admin_authorizer(
         redis_client=_legacy.redis_client or secret_manager.redis_client,
         fallback_admin_ids=getattr(_legacy, "ADMIN_IDS", set()),
@@ -90,8 +76,6 @@ async def _initialize_runtime_services(application: FastAPI) -> None:
     redis_admin_ids = await admin_authorizer.load_ids(force=True)
     if redis_admin_ids:
         _legacy.ADMIN_IDS.update(redis_admin_ids)
-=======
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
     application.state.runtime_security = security_status
     application.state.dynamic_cors = cors_snapshot.as_dict()
 
@@ -113,7 +97,6 @@ async def application_lifespan(application: FastAPI) -> AsyncIterator[dict | Non
 
 
 if not getattr(app.state, "_dynamic_security_installed", False):
-<<<<<<< HEAD
     app.include_router(admin_router)
     app.include_router(admin_cors_router)
     app.mount(
@@ -140,9 +123,6 @@ if not getattr(app.state, "_dynamic_security_installed", False):
             },
         )
 
-=======
-    app.include_router(admin_cors_router)
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
     app.add_middleware(
         DynamicCORSMiddleware,
         store=get_dynamic_cors_store(),
