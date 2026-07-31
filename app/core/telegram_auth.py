@@ -255,6 +255,7 @@ class TelegramAdminAuthorizer:
         self._cached_ids: frozenset[int] = frozenset()
         self._cache_deadline = 0.0
         self._lock = threading.RLock()
+        self._load_lock = threading.Lock()
 
     def configure(
         self,
@@ -270,7 +271,7 @@ class TelegramAdminAuthorizer:
                 continue
             if user_id > 0:
                 clean_ids.add(user_id)
-        with self._lock:
+        with self._load_lock, self._lock:
             self._redis = redis_client
             self._fallback_ids = frozenset(clean_ids)
             self._cached_ids = frozenset()
@@ -288,47 +289,56 @@ class TelegramAdminAuthorizer:
         return user_id if user_id > 0 else None
 
     def _load_ids_sync(self, *, force: bool = False) -> frozenset[int]:
-        now = time.monotonic()
-        with self._lock:
-            if not force and now < self._cache_deadline:
-                return self._cached_ids
-            client = self._redis
-            fallback = self._fallback_ids
+        with self._load_lock:
+            now = time.monotonic()
+            with self._lock:
+                if not force and now < self._cache_deadline:
+                    return self._cached_ids
+                client = self._redis
+                fallback = self._fallback_ids
 
-        if client is None:
-            allowed = fallback
-        else:
-            try:
-                members = client.smembers(self.redis_key)
-                allowed = frozenset(
-                    user_id
-                    for user_id in (self._decode_id(value) for value in members or ())
-                    if user_id is not None
+            if client is None:
+                allowed = fallback
+            else:
+                try:
+                    members = client.smembers(self.redis_key)
+                    allowed = frozenset(
+                        user_id
+                        for user_id in (
+                            self._decode_id(value)
+                            for value in members or ()
+                        )
+                        if user_id is not None
+                    )
+                    if not allowed and fallback:
+                        client.sadd(
+                            self.redis_key,
+                            *[str(value) for value in sorted(fallback)],
+                        )
+                        allowed = fallback
+                        logger.warning(
+                            "Migrated %s configured Telegram admin id(s) to Redis key=%s.",
+                            len(fallback),
+                            self.redis_key,
+                        )
+                except Exception as exc:
+                    if fallback:
+                        logger.warning(
+                            "Redis admin allowlist unavailable; using configured fallback IDs: %s",
+                            exc,
+                        )
+                        allowed = fallback
+                    else:
+                        raise TelegramAdminStoreError(
+                            "The Telegram administrator allowlist is unavailable."
+                        ) from exc
+
+            with self._lock:
+                self._cached_ids = allowed
+                self._cache_deadline = (
+                    time.monotonic() + self.cache_ttl_seconds
                 )
-                if not allowed and fallback:
-                    client.sadd(self.redis_key, *[str(value) for value in sorted(fallback)])
-                    allowed = fallback
-                    logger.warning(
-                        "Migrated %s configured Telegram admin id(s) to Redis key=%s.",
-                        len(fallback),
-                        self.redis_key,
-                    )
-            except Exception as exc:
-                if fallback:
-                    logger.warning(
-                        "Redis admin allowlist unavailable; using configured fallback IDs: %s",
-                        exc,
-                    )
-                    allowed = fallback
-                else:
-                    raise TelegramAdminStoreError(
-                        "The Telegram administrator allowlist is unavailable."
-                    ) from exc
-
-        with self._lock:
-            self._cached_ids = allowed
-            self._cache_deadline = time.monotonic() + self.cache_ttl_seconds
-        return allowed
+            return allowed
 
     async def load_ids(self, *, force: bool = False) -> frozenset[int]:
         return await asyncio.to_thread(self._load_ids_sync, force=force)

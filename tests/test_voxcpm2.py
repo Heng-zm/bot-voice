@@ -173,6 +173,24 @@ class VoxCPM2ProfileCacheTests(unittest.TestCase):
         self.assertNotIn(user_id, legacy._VOXCPM2_PROFILE_MEMORY)
 
 
+class VoxCPM2CircuitBreakerTests(unittest.TestCase):
+    def test_admin_reset_clears_failures_and_cooldown(self) -> None:
+        with legacy._VOXCPM2_STATE_LOCK:
+            original_failures = legacy._VOXCPM2_FAILURES
+            original_disabled_until = legacy._VOXCPM2_DISABLED_UNTIL
+            legacy._VOXCPM2_FAILURES = 3
+            legacy._VOXCPM2_DISABLED_UNTIL = time.monotonic() + 300
+        try:
+            legacy._reset_voxcpm2_cooldown()
+
+            self.assertEqual(0, legacy._VOXCPM2_FAILURES)
+            self.assertEqual(0.0, legacy._VOXCPM2_DISABLED_UNTIL)
+        finally:
+            with legacy._VOXCPM2_STATE_LOCK:
+                legacy._VOXCPM2_FAILURES = original_failures
+                legacy._VOXCPM2_DISABLED_UNTIL = original_disabled_until
+
+
 class VoxCPM2SessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_carries_ultimate_mode_and_transcript_to_generation(self) -> None:
         profile = {

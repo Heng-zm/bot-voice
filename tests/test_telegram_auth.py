@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -64,8 +65,10 @@ class FakeRedis:
     def __init__(self, members: set[str] | None = None) -> None:
         self.members = set(members or ())
         self.sadd_calls: list[tuple[str, ...]] = []
+        self.smembers_calls = 0
 
     def smembers(self, _key: str) -> set[str]:
+        self.smembers_calls += 1
         return set(self.members)
 
     def sadd(self, _key: str, *values: str) -> int:
@@ -151,6 +154,22 @@ class TelegramAdminAuthorizerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(frozenset({7, 42}), await authorizer.load_ids(force=True))
         self.assertEqual({("7", "42")}, set(redis.sadd_calls))
+
+    async def test_concurrent_cache_misses_share_one_redis_lookup(self) -> None:
+        class SlowRedis(FakeRedis):
+            def smembers(self, key: str) -> set[str]:
+                time.sleep(0.02)
+                return super().smembers(key)
+
+        redis = SlowRedis({"42"})
+        authorizer = TelegramAdminAuthorizer().configure(redis_client=redis)
+
+        results = await asyncio.gather(
+            *(authorizer.load_ids() for _ in range(12))
+        )
+
+        self.assertEqual(1, redis.smembers_calls)
+        self.assertTrue(all(result == frozenset({42}) for result in results))
 
 
 if __name__ == "__main__":

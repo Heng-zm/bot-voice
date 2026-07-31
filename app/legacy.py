@@ -1826,7 +1826,10 @@ def _telegram_allowed_updates() -> list[str]:
     return allowed or ["message", "callback_query"]
 
 
-_WEBHOOK_UPDATE_MEMORY: OrderedDict[int, tuple[str, float]] = OrderedDict()
+_WEBHOOK_UPDATE_MEMORY: OrderedDict[
+    int,
+    tuple[str, float, str | None],
+] = OrderedDict()
 _WEBHOOK_UPDATE_MEMORY_LOCK = threading.RLock()
 
 
@@ -1851,31 +1854,61 @@ def _telegram_webhook_replay_key(uid: int) -> str:
 
 def _trim_webhook_memory_locked(now: float, ttl: int) -> None:
     stale_before = now - ttl
-    for old_uid, (_state, old_ts) in list(_WEBHOOK_UPDATE_MEMORY.items())[:5000]:
+    for old_uid, (_state, old_ts, _token) in list(
+        _WEBHOOK_UPDATE_MEMORY.items()
+    )[:5000]:
         if old_ts < stale_before:
             _WEBHOOK_UPDATE_MEMORY.pop(old_uid, None)
     while len(_WEBHOOK_UPDATE_MEMORY) > 50_000:
         _WEBHOOK_UPDATE_MEMORY.popitem(last=False)
 
 
-async def _telegram_webhook_update_claim(update_id: Any) -> str:
+async def _telegram_webhook_update_claim(
+    update_id: Any,
+    *,
+    include_token: bool = False,
+) -> str | tuple[str, str | None]:
     """Return claimed, processing, completed, or invalid for an update id."""
+
+    def result(
+        state: str,
+        token: str | None = None,
+    ) -> str | tuple[str, str | None]:
+        return (state, token) if include_token else state
+
     uid = _telegram_webhook_update_id(update_id)
     if uid is None:
-        return "invalid"
+        return result("invalid")
+
+    claim_token = secrets.token_urlsafe(18) if include_token else None
+    processing_value = (
+        f"processing:{claim_token}" if claim_token is not None else "processing"
+    )
 
     redis_obj = globals().get("redis_client")
     if redis_obj is not None:
         key = _telegram_webhook_replay_key(uid)
         processing_ttl = _webhook_processing_ttl_seconds()
         try:
-            created = await asyncio.to_thread(lambda: redis_obj.set(key, "processing", ex=processing_ttl, nx=True))
+            created = await asyncio.to_thread(
+                lambda: redis_obj.set(
+                    key,
+                    processing_value,
+                    ex=processing_ttl,
+                    nx=True,
+                )
+            )
             if created:
-                return "claimed"
+                return result("claimed", claim_token)
             raw = await asyncio.to_thread(lambda: redis_obj.get(key))
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8", errors="ignore")
-            return "completed" if str(raw or "").lower() == "done" else "processing"
+            state = (
+                "completed"
+                if str(raw or "").lower() == "done"
+                else "processing"
+            )
+            return result(state)
         except Exception as exc:
             _log_once(logging.WARNING, "webhook_replay_redis_fallback", "Webhook replay Redis fallback: %s", exc)
 
@@ -1885,48 +1918,107 @@ async def _telegram_webhook_update_claim(update_id: Any) -> str:
         _trim_webhook_memory_locked(now, ttl)
         existing = _WEBHOOK_UPDATE_MEMORY.get(uid)
         if existing:
-            state, _ts = existing
+            state, _ts, _token = existing
             _WEBHOOK_UPDATE_MEMORY.move_to_end(uid)
-            return "completed" if state == "done" else "processing"
-        _WEBHOOK_UPDATE_MEMORY[uid] = ("processing", now)
+            existing_state = "completed" if state == "done" else "processing"
+            return result(existing_state)
+        _WEBHOOK_UPDATE_MEMORY[uid] = ("processing", now, claim_token)
         _trim_webhook_memory_locked(now, ttl)
-        return "claimed"
+        return result("claimed", claim_token)
 
 
-async def _telegram_webhook_update_complete(update_id: Any) -> None:
+async def _telegram_webhook_update_complete(
+    update_id: Any,
+    *,
+    claim_token: str | None = None,
+) -> bool:
     uid = _telegram_webhook_update_id(update_id)
     if uid is None:
-        return
+        return False
     redis_obj = globals().get("redis_client")
     if redis_obj is not None:
         key = _telegram_webhook_replay_key(uid)
         try:
-            await asyncio.to_thread(lambda: redis_obj.set(key, "done", ex=_webhook_replay_ttl_seconds()))
+            if claim_token is None:
+                await asyncio.to_thread(
+                    lambda: redis_obj.set(
+                        key,
+                        "done",
+                        ex=_webhook_replay_ttl_seconds(),
+                    )
+                )
+            else:
+                script = (
+                    "if redis.call('GET', KEYS[1]) == ARGV[1] then "
+                    "redis.call('SET', KEYS[1], 'done', 'EX', ARGV[2]); "
+                    "return 1 else return 0 end"
+                )
+                completed = await asyncio.to_thread(
+                    lambda: redis_obj.eval(
+                        script,
+                        1,
+                        key,
+                        f"processing:{claim_token}",
+                        str(_webhook_replay_ttl_seconds()),
+                    )
+                )
+                if not completed:
+                    return False
         except Exception as exc:
             _log_once(logging.WARNING, "webhook_replay_complete_fallback", "Webhook replay completion Redis fallback: %s", exc)
     now = time.monotonic()
     with _WEBHOOK_UPDATE_MEMORY_LOCK:
-        _WEBHOOK_UPDATE_MEMORY[uid] = ("done", now)
+        existing = _WEBHOOK_UPDATE_MEMORY.get(uid)
+        if (
+            claim_token is not None
+            and existing is not None
+            and existing[2] not in {None, claim_token}
+        ):
+            return False
+        _WEBHOOK_UPDATE_MEMORY[uid] = ("done", now, None)
         _WEBHOOK_UPDATE_MEMORY.move_to_end(uid)
         _trim_webhook_memory_locked(now, _webhook_replay_ttl_seconds())
+    return True
 
 
-async def _telegram_webhook_update_release(update_id: Any) -> None:
+async def _telegram_webhook_update_release(
+    update_id: Any,
+    *,
+    claim_token: str | None = None,
+) -> bool:
     uid = _telegram_webhook_update_id(update_id)
     if uid is None:
-        return
+        return False
+    released = True
     redis_obj = globals().get("redis_client")
     if redis_obj is not None:
         key = _telegram_webhook_replay_key(uid)
         script = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end"
+        expected = (
+            f"processing:{claim_token}"
+            if claim_token is not None
+            else "processing"
+        )
         try:
-            await asyncio.to_thread(lambda: redis_obj.eval(script, 1, key, "processing"))
+            released = bool(
+                await asyncio.to_thread(
+                    lambda: redis_obj.eval(script, 1, key, expected)
+                )
+            )
         except Exception as exc:
             _log_once(logging.WARNING, "webhook_replay_release_fallback", "Webhook replay release Redis fallback: %s", exc)
     with _WEBHOOK_UPDATE_MEMORY_LOCK:
         existing = _WEBHOOK_UPDATE_MEMORY.get(uid)
-        if existing and existing[0] == "processing":
+        owned = (
+            existing
+            and existing[0] == "processing"
+            and (claim_token is None or existing[2] == claim_token)
+        )
+        if owned:
             _WEBHOOK_UPDATE_MEMORY.pop(uid, None)
+        elif existing is not None and claim_token is not None:
+            released = False
+    return released
 
 
 async def _read_limited_webhook_body(req: FastAPIRequest, max_body: int) -> bytes:
@@ -2010,8 +2102,12 @@ async def _process_telegram_webhook_request(req: FastAPIRequest, path_secret_tok
 
     update_id = getattr(update, "update_id", None)
     claimed = False
+    claim_token: str | None = None
     try:
-        claim_state = await _telegram_webhook_update_claim(update_id)
+        claim_state, claim_token = await _telegram_webhook_update_claim(
+            update_id,
+            include_token=True,
+        )
         if claim_state == "completed":
             webhook_logger.info("Completed Telegram webhook update ignored update_id=%s", update_id)
             _metric_inc("replay_dropped")
@@ -2022,10 +2118,16 @@ async def _process_telegram_webhook_request(req: FastAPIRequest, path_secret_tok
             return response
         claimed = claim_state == "claimed"
         await app_obj.process_update(update)
-        await _telegram_webhook_update_complete(update_id)
+        await _telegram_webhook_update_complete(
+            update_id,
+            claim_token=claim_token,
+        )
     except Exception as exc:
         if claimed:
-            await _telegram_webhook_update_release(update_id)
+            await _telegram_webhook_update_release(
+                update_id,
+                claim_token=claim_token,
+            )
         error_id = secrets.token_hex(6)
         webhook_logger.error(
             "Telegram webhook processing failed error_id=%s update_id=%s: %s",
@@ -17842,6 +17944,15 @@ def _voxcpm2_record_success() -> None:
         _VOXCPM2_FAILURES = 0
         _VOXCPM2_DISABLED_UNTIL = 0.0
         _VOXCPM2_LAST_SUCCESS_AT = time.monotonic()
+
+
+def _reset_voxcpm2_cooldown() -> None:
+    """Clear the circuit breaker without recording a synthetic success."""
+
+    global _VOXCPM2_FAILURES, _VOXCPM2_DISABLED_UNTIL
+    with _VOXCPM2_STATE_LOCK:
+        _VOXCPM2_FAILURES = 0
+        _VOXCPM2_DISABLED_UNTIL = 0.0
 
 
 def _voxcpm2_is_queue_full_error(exc: Exception | str) -> bool:
