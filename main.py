@@ -4,13 +4,19 @@ New code should import ``app.main`` or run ``python -m app.main``.
 """
 
 from __future__ import annotations
+<<<<<<< HEAD
 
 from app import legacy as _legacy
 from app.main import app, create_app, main
 
 __all__ = ["app", "create_app", "main"]
+=======
+>>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
 
+from app import legacy as _legacy
+from app.main import app, create_app, main
 
+<<<<<<< HEAD
 def __getattr__(name: str):
     return getattr(_legacy, name)
 
@@ -25210,6 +25216,17 @@ def main():
 def __dir__() -> list[str]:
     return sorted(set(globals()) | set(dir(_legacy)))
 >>>>>>> 1441bb6 (gf)
+=======
+__all__ = ["app", "create_app", "main"]
+
+
+def __getattr__(name: str):
+    return getattr(_legacy, name)
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(dir(_legacy)))
+>>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
 
 
 if __name__ == "__main__":
