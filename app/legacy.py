@@ -10189,6 +10189,15 @@ GEMINI_MODEL            = DEFAULT_GEMINI_MODEL
 HF_TOKEN                = ""
 HF_MODEL                = "Qwen/Qwen2.5-7B-Instruct"
 HF_OCR_MODEL            = "microsoft/trocr-base-printed"
+
+# Friendly/Ollama-style aliases accepted through HF_MODEL.  Hugging Face
+# Inference requires repository IDs, so normalize compact tags at startup.
+HF_MODEL_ALIASES = {
+    "qwen2.5:3b": "Qwen/Qwen2.5-3B-Instruct",
+    "qwen2.5-3b": "Qwen/Qwen2.5-3B-Instruct",
+    "llama3.2:3b": "meta-llama/Llama-3.2-3B-Instruct",
+    "llama3.2-3b": "meta-llama/Llama-3.2-3B-Instruct",
+}
 AI_PROVIDER             = "hf"
 OCR_PROVIDER            = DEFAULT_OCR_PROVIDER
 # Gemini is the safe default for OCR because Hugging Face hosted OCR can be
@@ -11984,7 +11993,8 @@ def _init_clients() -> None:
     # Code default: DEFAULT_GEMINI_MODEL. Env values are optional overrides only.
     GEMINI_MODEL       = (os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_GENAI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
     HF_TOKEN           = os.getenv("HF_TOKEN", "")
-    HF_MODEL           = os.getenv("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+    configured_hf_model = os.getenv("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct").strip()
+    HF_MODEL           = HF_MODEL_ALIASES.get(configured_hf_model.lower(), configured_hf_model)
     HF_OCR_MODEL       = os.getenv("HF_OCR_MODEL", "microsoft/trocr-base-printed")
 
     AI_PROVIDER = os.getenv("AI_PROVIDER", "hf").lower().strip()

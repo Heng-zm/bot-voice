@@ -142,6 +142,10 @@ signature, timestamp, user JSON, and Redis administrator membership are all
 checked server-side. The browser's `initDataUnsafe` object is never trusted for
 authorization.
 
+For Hugging Face chat models, `HF_MODEL` accepts repository IDs or compact
+aliases: `qwen2.5:3b` maps to `Qwen/Qwen2.5-3B-Instruct`, and `llama3.2:3b`
+maps to `meta-llama/Llama-3.2-3B-Instruct`.
+
 To launch the Mini App from a separate Bot 2 while keeping Bot 1 as the main
 bot, set `TELEGRAM_ADMIN_BOT_TOKEN` to Bot 2's token. Normal bot operations
 continue using `TELEGRAM_BOT_TOKEN`; if the admin token is omitted, it falls
