@@ -1,7 +1,6 @@
 "use strict";
 
 const telegram = window.Telegram?.WebApp ?? null;
-const initData = telegram?.initData ?? "";
 const state = {
   settings: null,
   corsOrigins: [],
@@ -61,6 +60,10 @@ function compactNumber(value) {
 }
 
 async function api(path, options = {}) {
+  // Read this at request time. Telegram can populate `initData` immediately
+  // after the WebApp bridge becomes ready; capturing it during script startup
+  // can otherwise retain an empty or stale value.
+  const initData = String(window.Telegram?.WebApp?.initData || "").trim();
   if (!initData) {
     throw new Error("Open this dashboard from the bot inside Telegram.");
   }
