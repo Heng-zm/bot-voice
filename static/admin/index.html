@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="Secure Telegram bot administration dashboard">
+  <title>Bot Control Center</title>
+  <link rel="stylesheet" href="/miniapp/admin/assets/styles.css">
+  <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
+  <script src="/miniapp/admin/assets/app.js" defer></script>
+</head>
+<body>
+  <div class="ambient ambient-one" aria-hidden="true"></div>
+  <div class="ambient ambient-two" aria-hidden="true"></div>
+
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">V</div>
+        <div>
+          <p class="eyebrow">Telegram Mini App</p>
+          <h1>Bot Control Center</h1>
+        </div>
+      </div>
+      <button id="refreshButton" class="icon-button" type="button" aria-label="Refresh dashboard">
+        <span aria-hidden="true">↻</span>
+      </button>
+    </header>
+
+    <section id="authState" class="auth-state" aria-live="polite">
+      <div class="spinner" aria-hidden="true"></div>
+      <div>
+        <strong>Verifying Telegram account</strong>
+        <p>Establishing a secure admin session…</p>
+      </div>
+    </section>
+
+    <div id="dashboard" class="dashboard is-hidden">
+      <section class="hero panel">
+        <div class="profile">
+          <div id="profileFallback" class="avatar avatar-fallback" aria-hidden="true">A</div>
+          <img id="profilePhoto" class="avatar is-hidden" alt="">
+          <div class="profile-copy">
+            <p class="eyebrow">Authorized administrator</p>
+            <h2 id="profileName">Administrator</h2>
+            <p id="profileHandle" class="muted">Telegram verified</p>
+          </div>
+        </div>
+        <div id="systemBadge" class="status-pill">
+          <span class="status-dot"></span>
+          <span>Checking system</span>
+        </div>
+      </section>
+
+      <section class="metric-grid" aria-label="Bot metrics">
+        <article class="metric panel">
+          <div class="metric-icon blue" aria-hidden="true">U</div>
+          <div><span>Total users</span><strong id="totalUsers">—</strong></div>
+        </article>
+        <article class="metric panel">
+          <div class="metric-icon violet" aria-hidden="true">M</div>
+          <div><span>Messages handled</span><strong id="messageCount">—</strong></div>
+        </article>
+        <article class="metric panel">
+          <div class="metric-icon green" aria-hidden="true">R</div>
+          <div><span>Redis latency</span><strong id="redisLatency">—</strong></div>
+        </article>
+        <article class="metric panel">
+          <div class="metric-icon amber" aria-hidden="true">T</div>
+          <div><span>Uptime</span><strong id="uptime">—</strong></div>
+        </article>
+      </section>
+
+      <section class="two-column">
+        <article class="panel health-panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Live status</p>
+              <h2>System health</h2>
+            </div>
+            <span id="lastUpdated" class="muted">Not updated</span>
+          </div>
+          <div class="health-list">
+            <div class="health-row">
+              <span>Bot service</span>
+              <span id="botHealth" class="health-value">Checking…</span>
+            </div>
+            <div class="health-row">
+              <span>Redis cache</span>
+              <span id="redisHealth" class="health-value">Checking…</span>
+            </div>
+            <div class="health-row">
+              <span>Settings database</span>
+              <span id="databaseHealth" class="health-value">Checking…</span>
+            </div>
+            <div class="health-row">
+              <span>Bot mode</span>
+              <span id="botMode" class="health-value">—</span>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel maintenance-panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Quick control</p>
+              <h2>Maintenance mode</h2>
+            </div>
+            <label class="switch">
+              <input id="maintenanceToggle" type="checkbox" aria-label="Toggle maintenance mode">
+              <span class="switch-track" aria-hidden="true"></span>
+            </label>
+          </div>
+          <p class="muted">Temporarily pause normal-user features while keeping admin controls available.</p>
+          <div id="maintenanceNotice" class="notice">Normal bot service is active.</div>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Network policy</p>
+            <h2>Allowed CORS origins</h2>
+          </div>
+          <span class="secure-label">Exact origins only</span>
+        </div>
+        <form id="corsForm" class="inline-form">
+          <label class="sr-only" for="corsOrigin">Allowed origin URL</label>
+          <input id="corsOrigin" name="origin" type="url" maxlength="2048"
+                 placeholder="https://dashboard.example.com" autocomplete="url" required>
+          <button class="button primary" type="submit">Add origin</button>
+        </form>
+        <div id="corsList" class="chip-list" aria-live="polite"></div>
+        <p id="corsEmpty" class="empty-state is-hidden">No browser origins are currently allowed.</p>
+      </section>
+
+      <section class="panel">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Redis-backed controls</p>
+            <h2>Runtime settings</h2>
+          </div>
+          <span class="secure-label">Validated limits</span>
+        </div>
+        <form id="runtimeForm">
+          <div id="runtimeFields" class="settings-grid"></div>
+          <div class="form-actions">
+            <span class="muted">Changes apply immediately and persist across restarts.</span>
+            <button id="saveRuntimeButton" class="button primary" type="submit">Save settings</button>
+          </div>
+        </form>
+      </section>
+    </div>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

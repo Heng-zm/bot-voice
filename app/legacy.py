@@ -1,21 +1,2734 @@
-"""Backward-compatible root entry point.
+import logging
+import os
+import re
+import asyncio
+import inspect
+import io
+import threading
+import time
+import contextvars
+import html
+import json as _json
+import functools
+import tempfile
+import gc
+import hashlib
+import hmac
+import secrets
+import socket
+import subprocess
+import atexit
+import base64
+import httpx
+import imageio_ffmpeg as _iio_ffmpeg
+from typing import Any, Callable
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
+from contextlib import suppress
+from datetime import datetime, timezone, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except Exception as exc:
+    logging.getLogger(__name__).warning("zoneinfo import failed; timezone fallback will be used: %s", exc)
+    ZoneInfo = None
+from urllib.parse import urlencode, quote
 
-New code should import ``app.main`` or run ``python -m app.main``.
+# Heavy optional SDKs are imported only when their configured services are
+# initialized. Importing them eagerly added several seconds to every health
+# check, test process, CLI command, and ASGI worker boot.
+genai = None
+genai_types = None
+create_client = None
+acreate_client = None
+Client = object
+AsyncClient = object
+_GENAI_IMPORT_ATTEMPTED = False
+_SUPABASE_IMPORT_ATTEMPTED = False
+_OPTIONAL_SDK_IMPORT_LOCK = threading.Lock()
+
+
+def _load_google_genai_sdk() -> bool:
+    """Load google-genai once and report whether it is available."""
+    global genai, genai_types, _GENAI_IMPORT_ATTEMPTED
+    if _GENAI_IMPORT_ATTEMPTED:
+        return genai is not None and genai_types is not None
+    with _OPTIONAL_SDK_IMPORT_LOCK:
+        if _GENAI_IMPORT_ATTEMPTED:
+            return genai is not None and genai_types is not None
+        _GENAI_IMPORT_ATTEMPTED = True
+        try:
+            from google import genai as imported_genai
+            from google.genai import types as imported_genai_types
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Optional dependency google-genai is not available; Gemini features disabled: %s",
+                exc,
+            )
+            return False
+        genai = imported_genai
+        genai_types = imported_genai_types
+        return True
+
+
+def _load_supabase_sdk() -> bool:
+    """Load synchronous and optional asynchronous Supabase clients once."""
+    global create_client, acreate_client, Client, AsyncClient
+    global _SUPABASE_IMPORT_ATTEMPTED
+    if _SUPABASE_IMPORT_ATTEMPTED:
+        return callable(create_client)
+    with _OPTIONAL_SDK_IMPORT_LOCK:
+        if _SUPABASE_IMPORT_ATTEMPTED:
+            return callable(create_client)
+        _SUPABASE_IMPORT_ATTEMPTED = True
+        try:
+            from supabase import Client as imported_client
+            from supabase import create_client as imported_create_client
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Dependency supabase is not available; Supabase-backed features disabled: %s",
+                exc,
+            )
+            return False
+
+        Client = imported_client
+        create_client = imported_create_client
+        try:
+            from supabase import AsyncClient as imported_async_client
+            from supabase import acreate_client as imported_acreate_client
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Async Supabase client import failed; async Supabase calls disabled: %s",
+                exc,
+            )
+            acreate_client = None
+            AsyncClient = object
+        else:
+            AsyncClient = imported_async_client
+            acreate_client = imported_acreate_client
+        return True
+
+
+from fastapi import FastAPI, Request as FastAPIRequest, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse, Response as StarletteResponse
+from fastapi.encoders import jsonable_encoder
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.concurrency import run_in_threadpool
+from jinja2 import Environment, Template, select_autoescape
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardRemove,
+    WebAppInfo,
+)
+from telegram.error import (
+    NetworkError,
+    TimedOut,
+    RetryAfter,
+    BadRequest,
+    TelegramError,
+    Forbidden,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    TypeHandler,
+    CallbackQueryHandler,
+    ApplicationHandlerStop,
+)
+try:
+    from pydantic_settings import BaseSettings, SettingsConfigDict
+    _PYDANTIC_SETTINGS_AVAILABLE = True
+except Exception as exc:
+    logging.getLogger(__name__).warning("Optional dependency pydantic-settings is not available; env fallback settings will be used: %s", exc)
+    BaseSettings = object
+    SettingsConfigDict = dict
+    _PYDANTIC_SETTINGS_AVAILABLE = False
+_ASYNC_RESOLVER_LOOP: asyncio.AbstractEventLoop | None = None
+_ASYNC_RESOLVER_THREAD: threading.Thread | None = None
+_ASYNC_RESOLVER_LOCK = threading.Lock()
+
+
+def _async_resolver_loop_worker(loop: asyncio.AbstractEventLoop) -> None:
+    """Own exactly one background event loop for sync worker awaitables."""
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+
+def _get_async_resolver_loop() -> asyncio.AbstractEventLoop:
+    """Return a process-wide resolver loop instead of creating per-call loops.
+
+    This is used only from sync worker threads when a library unexpectedly
+    returns an awaitable.  It avoids asyncio.run(...) inside ThreadPoolExecutor
+    workers, which repeatedly creates/destroys event loops under load.
+    """
+    global _ASYNC_RESOLVER_LOOP, _ASYNC_RESOLVER_THREAD
+    loop = _ASYNC_RESOLVER_LOOP
+    if loop is not None and loop.is_running():
+        return loop
+
+    with _ASYNC_RESOLVER_LOCK:
+        loop = _ASYNC_RESOLVER_LOOP
+        if loop is not None and loop.is_running():
+            return loop
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(
+            target=_async_resolver_loop_worker,
+            args=(loop,),
+            name="async-awaitable-resolver",
+            daemon=True,
+        )
+        thread.start()
+        _ASYNC_RESOLVER_LOOP = loop
+        _ASYNC_RESOLVER_THREAD = thread
+        return loop
+
+
+def _shutdown_async_resolver_loop() -> None:
+    """Stop the background resolver loop cleanly during process shutdown."""
+    loop = _ASYNC_RESOLVER_LOOP
+    thread = _ASYNC_RESOLVER_THREAD
+    if loop is not None and loop.is_running():
+        loop.call_soon_threadsafe(loop.stop)
+    if thread is not None and thread.is_alive():
+        with suppress(Exception):
+            thread.join(timeout=2.0)
+
+
+atexit.register(_shutdown_async_resolver_loop)
+
+
+def _close_unawaited(value: Any) -> None:
+    """Best-effort coroutine cleanup when sync resolution cannot continue."""
+    close = getattr(value, "close", None)
+    if callable(close):
+        with suppress(Exception):
+            close()
+
+
+async def _await_sync_value(value: Any) -> Any:
+    return await value
+
+
+def _resolve_maybe_awaitable_sync(value: Any) -> Any:
+    """Resolve sync or async SDK return values from worker/sync code paths.
+
+    ThreadPoolExecutor workers must not call asyncio.run() for every Supabase
+    awaitable.  Instead, submit the awaitable to one dedicated resolver event
+    loop with asyncio.run_coroutine_threadsafe().  If this function is called
+    from an already-running event loop, fail loudly so the async caller awaits
+    the value directly instead of blocking its own loop.
+    """
+    if not inspect.isawaitable(value):
+        return value
+
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+
+    if running_loop is not None and running_loop.is_running():
+        _close_unawaited(value)
+        raise RuntimeError(
+            "Async Supabase result returned inside a running event loop. "
+            "Await it explicitly or move the call to db_call/db_call_sync."
+        )
+
+    resolver_loop = _get_async_resolver_loop()
+    future = asyncio.run_coroutine_threadsafe(_await_sync_value(value), resolver_loop)
+    timeout_s = 60.0
+    try:
+        env_float = globals().get("_env_float")
+        if callable(env_float):
+            timeout_s = float(env_float("ASYNC_RESOLVER_TIMEOUT_S", 60.0, minimum=1.0, maximum=300.0))
+    except Exception:
+        timeout_s = 60.0
+    try:
+        return future.result(timeout=timeout_s)
+    except Exception:
+        future.cancel()
+        raise
+
+
+class _SyncExecuteProxy:
+    """Proxy query builders so .execute() works with sync or async Supabase clients."""
+
+    __slots__ = ("_obj",)
+
+    def __init__(self, obj: Any):
+        object.__setattr__(self, "_obj", obj)
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(object.__getattribute__(self, "_obj"), name)
+        if not callable(attr):
+            return attr
+
+        def _wrapped(*args: Any, **kwargs: Any) -> Any:
+            result = attr(*args, **kwargs)
+            if name == "execute":
+                return _resolve_maybe_awaitable_sync(result)
+            return _wrap_supabase_object(result)
+
+        return _wrapped
+
+
+def _wrap_supabase_object(obj: Any) -> Any:
+    if obj is None or isinstance(obj, (str, bytes, bytearray, int, float, bool, list, tuple, dict, set)):
+        return obj
+    if isinstance(obj, _SyncExecuteProxy):
+        return obj
+    if hasattr(obj, "execute"):
+        return _SyncExecuteProxy(obj)
+    return obj
+
+
+class _SupabaseClientV2Compat:
+    """Small compatibility wrapper for existing sync-style Supabase call sites."""
+
+    __slots__ = ("_client",)
+
+    def __init__(self, client: Any):
+        object.__setattr__(self, "_client", client)
+
+    def table(self, *args: Any, **kwargs: Any) -> Any:
+        return _wrap_supabase_object(object.__getattribute__(self, "_client").table(*args, **kwargs))
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(object.__getattribute__(self, "_client"), name)
+        if not callable(attr):
+            return attr
+
+        def _wrapped(*args: Any, **kwargs: Any) -> Any:
+            return _wrap_supabase_object(attr(*args, **kwargs))
+
+        return _wrapped
+
+
+def _supabase_v2_compat_client(client: Any) -> Any:
+    return None if client is None else _SupabaseClientV2Compat(client)
+
+
+# ── Fast JSON codec helpers ────────────────────────────────────────────────
+# Prefer binary JSON parsers to avoid raw_body.decode(...) copies on hot paths.
+# The fallback is the stdlib json module, so the app still boots without extras.
+try:
+    import orjson as _orjson
+except Exception:
+    _orjson = None
+try:
+    import ujson as _ujson
+except Exception:
+    _ujson = None
+
+
+def _json_loads_fast(data: bytes | bytearray | memoryview | str | None) -> Any:
+    if data is None:
+        return None
+    if _orjson is not None:
+        return _orjson.loads(data)
+    if _ujson is not None:
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            data = bytes(data).decode("utf-8")
+        return _ujson.loads(data)
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        data = bytes(data).decode("utf-8")
+    return _json.loads(data)
+
+
+def _json_dumps_fast(content: Any) -> bytes:
+    if _orjson is not None:
+        return _orjson.dumps(content)
+    if _ujson is not None:
+        return _ujson.dumps(content, ensure_ascii=False).encode("utf-8")
+    return _json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+class _FastJSONResponse(StarletteResponse):
+    media_type = "application/json"
+
+    def render(self, content: Any) -> bytes:
+        return _json_dumps_fast(content)
+
+
+def _read_file_bytes_sync(path: str, *, max_bytes: int | None = None) -> bytes:
+    """Read a file with deterministic handle cleanup and an optional hard limit."""
+    limit = None if max_bytes is None else max(0, int(max_bytes))
+    with open(path, "rb") as handle:
+        if limit is None:
+            return handle.read()
+        data = handle.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f"File too large. Max {limit} bytes.")
+    return data
+
+
+def _write_file_bytes_sync(path: str, data: bytes) -> None:
+    """Atomically replace a binary file using a temporary sibling file."""
+    if not path:
+        raise ValueError("Output path is required.")
+    payload = bytes(data or b"")
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path) or 'output'}.",
+        suffix=".tmp",
+        dir=parent or None,
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except BaseException:
+        with suppress(OSError):
+            os.close(fd)
+        with suppress(OSError):
+            os.unlink(temporary_path)
+        raise
+
+
+async def _read_file_bytes_async(path: str, *, max_bytes: int | None = None) -> bytes:
+    """Move blocking disk reads off the event loop."""
+    return await asyncio.to_thread(_read_file_bytes_sync, path, max_bytes=max_bytes)
+
+
+# Load local .env before any environment-driven config is read.
+# This keeps local/dev runs consistent with Render environment variables.
+try:
+    from dotenv import load_dotenv as _early_load_dotenv
+    _early_load_dotenv()
+except Exception as exc:
+    logging.getLogger(__name__).warning("Optional dependency python-dotenv is not available; .env file was not loaded: %s", exc)
+
+    def _early_load_dotenv(*args: Any, **kwargs: Any) -> bool:
+        return False
+
+try:
+    import redis as redis_lib
+except Exception as exc:
+    logging.getLogger(__name__).warning("Optional dependency redis is not available; Redis cache/locks disabled: %s", exc)
+    redis_lib = None
+
+
+# ── Built-in smooth performance defaults ───────────────────────────────────
+# These values are now code defaults, so the bot runs smoothly without adding
+# performance knobs to Render/Railway env. Environment variables still override
+# them for emergency deployments, and /admin settings can change the hot-safe
+# values at runtime.
+PERFORMANCE_CODE_DEFAULTS: dict[str, Any] = {
+    "BOT_MODE": "WEBHOOK",
+    "TELEGRAM_CONCURRENT_UPDATES": 4,
+    "TELEGRAM_CONNECTION_POOL_SIZE": 24,
+    "HTTP_MAX_CONNECTIONS": 100,
+    "HTTP_MAX_KEEPALIVE_CONNECTIONS": 20,
+    "DB_EXECUTOR_MAX_WORKERS": 3,
+    "MAX_CONCURRENT_TTS_USERS": 2,
+    "USER_SYNC_TTL_S": 1800.0,
+    "PREFS_CACHE_TTL_S": 600.0,
+    "TTS_AUDIO_CACHE_ENABLED": True,
+    "TTS_AUDIO_CACHE_MAX_MB": 64,
+    "TTS_AUDIO_CACHE_ITEM_MAX_MB": 8,
+    "TTS_AUDIO_CACHE_TTL_S": 1200.0,
+    "EDGE_TTS_PARALLEL_CHUNKS": 1,
+    "PAGED_TTS_SEND_DELAY_S": 0.10,
+    "WEB_STATUS_POLL_SECONDS": 30,
+    "WEB_LIVE_POLL_SECONDS": 30,
+}
+
+
+def _perf_default(name: str, fallback: Any = None) -> Any:
+    return PERFORMANCE_CODE_DEFAULTS.get(name, fallback)
+
+
+# ── Admin cookie defaults ──────────────────────────────────────────────────
+# Default cookie mode for separated frontend/backend deployments.
+# SameSite=None requires Secure=True in modern browsers.
+DEFAULT_WEB_COOKIE_SAMESITE = "none"
+DEFAULT_WEB_COOKIE_SECURE = True
+ADMIN_BACKEND_RELEASE = "v29-multilingual-tts"
+
+
+# ── FastAPI Web Server + typed settings ─────────────────────────────────────
+class AppSettings(BaseSettings):
+    """Centralised environment configuration.
+
+    The old helper functions (_env_bool/_env_int/_env_float) remain as safe
+    compatibility wrappers, but critical web/server values now come from this
+    typed settings object so bad env values fail predictably instead of being
+    spread through the file.
+    """
+    if hasattr(BaseSettings, "model_config") or BaseSettings is not object:
+        model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
+
+    # The only deployment secrets/connection values that belong in .env.
+    REDIS_URL: str = ""
+    SUPABASE_URL: str = ""
+    SUPABASE_KEY: str = ""
+    TELEGRAM_BOT_TOKEN: str = ""
+    GEMINI_API_KEY: str = ""
+    PORT: int = 8080
+    RENDER: bool = False
+    RENDER_EXTERNAL_URL: str = ""
+    WEB_TRUST_PROXY: bool = False
+    WEB_SESSION_COOKIE_NAME: str = "bot_admin_session"
+    WEB_COOKIE_SAMESITE: str = DEFAULT_WEB_COOKIE_SAMESITE
+    WEB_COOKIE_SECURE: bool = DEFAULT_WEB_COOKIE_SECURE
+    WEB_ADMIN_SESSION_DAYS: int = 14
+    WEB_MAX_CONTENT_LENGTH: int = 64 * 1024 * 1024
+    # Backend/API-only mode: HTML admin dashboard pages are disabled by default.
+    # Build/deploy the frontend separately and point it to this backend API.
+    BACKEND_ONLY: bool = True
+    WEB_ADMIN_FRONTEND_ENABLED: bool = False
+    # Keep the backend API-only by default. Dynamic frontend origins are stored
+    # in Redis/Supabase and edited through /api/admin/cors.
+    ADMIN_FRONTEND_URL: str = ""
+    ADMIN_LOGIN_RATE_LIMIT_ATTEMPTS: int = 5
+    ADMIN_LOGIN_RATE_LIMIT_WINDOW_S: float = 300.0
+    ADMIN_LOGIN_RATE_LIMIT_REDIS_ENABLED: bool = True
+    ADMIN_ORIGIN_GUARD_ENABLED: bool = True
+    # Optional bearer fallback for separated frontends when browser cookies are
+    # blocked by local dev, preview domains, or missing credentials: include.
+    # The token is short-lived, HMAC-signed with WEB_SECRET_KEY, and accepted
+    # only for explicitly configured ADMIN_IDS.
+    ADMIN_API_TOKEN_FALLBACK_ENABLED: bool = True
+    # Keep the separated-frontend bearer fallback short-lived by default.
+    # Set ADMIN_API_TOKEN_FALLBACK_ENABLED=false after cookie auth is verified.
+    ADMIN_API_TOKEN_TTL_SECONDS: int = 3600
+    WEB_REQUIRE_STABLE_SECRET_IN_PRODUCTION: bool = True
+    MAX_CONCURRENT_TTS_USERS: int = int(_perf_default("MAX_CONCURRENT_TTS_USERS", 2))
+    MAX_CONCURRENT_AI: int = 3
+    MAX_CONCURRENT_GEMINI: int = 3
+    MAX_CONCURRENT_BROADCAST: int = 3
+    BROADCAST_BATCH_SIZE: int = 3
+    BROADCAST_INTER_BATCH_DELAY: float = 0.20
+    TTS_RESOLVER_AI_ENABLED: bool = False
+    APP_TIMEZONE: str = "Asia/Phnom_Penh"
+    WEB_ADMIN_TIMEZONE: str = ""
+    APP_TIMEZONE_ALIAS: str = "ICT"
+    APP_TIMEZONE_UTC_LABEL: str = "UTC+7"
+    BOT_SETTINGS_CACHE_TTL_S: float = 30.0
+    WEB_BROADCAST_JOBS_MAX: int = 50
+    WEB_BROADCAST_WORKERS: int = 3
+    WEB_BROADCAST_DELAY_S: float = 0.05
+    WEB_TABLE_PAGE_SIZE: int = 50
+    WEB_COUNTS_CACHE_TTL_S: float = 30.0
+    WEB_STATUS_POLL_SECONDS: int = int(_perf_default("WEB_STATUS_POLL_SECONDS", 30))
+    WEB_LIVE_POLL_SECONDS: int = int(_perf_default("WEB_LIVE_POLL_SECONDS", 30))
+    WEB_LIVE_SCHEDULES_CACHE_TTL_S: float = 30.0
+    AI_API_KEY_CACHE_TTL_S: float = 60.0
+    AI_API_KEY_TOUCH_INTERVAL_S: float = 60.0
+    WEB_SLOW_REQUEST_MS: float = 1500.0
+    WEB_ADMIN_AUDIT_MAX: int = 300
+    TELEGRAM_CONCURRENT_UPDATES: int = int(_perf_default("TELEGRAM_CONCURRENT_UPDATES", 4))
+    TELEGRAM_CONNECTION_POOL_SIZE: int = int(_perf_default("TELEGRAM_CONNECTION_POOL_SIZE", 24))
+    DB_EXECUTOR_MAX_WORKERS: int = int(_perf_default("DB_EXECUTOR_MAX_WORKERS", 3))
+    USER_SYNC_TTL_S: float = float(_perf_default("USER_SYNC_TTL_S", 1800.0))
+    PREFS_CACHE_TTL_S: float = float(_perf_default("PREFS_CACHE_TTL_S", 600.0))
+    TTS_AUDIO_CACHE_ENABLED: bool = bool(_perf_default("TTS_AUDIO_CACHE_ENABLED", True))
+    TTS_AUDIO_CACHE_MAX_MB: int = int(_perf_default("TTS_AUDIO_CACHE_MAX_MB", 64))
+    TTS_AUDIO_CACHE_ITEM_MAX_MB: int = int(_perf_default("TTS_AUDIO_CACHE_ITEM_MAX_MB", 8))
+    TTS_AUDIO_CACHE_TTL_S: float = float(_perf_default("TTS_AUDIO_CACHE_TTL_S", 1200.0))
+    EDGE_TTS_PARALLEL_CHUNKS: int = int(_perf_default("EDGE_TTS_PARALLEL_CHUNKS", 1))
+    PAGED_TTS_SEND_DELAY_S: float = float(_perf_default("PAGED_TTS_SEND_DELAY_S", 0.10))
+    # Webhook mode is automatic on platforms that expose a public service URL;
+    # local/minimal .env deployments safely default to polling.
+    BOT_MODE: str = (
+        "WEBHOOK"
+        if os.environ.get("TELEGRAM_WEBHOOK_URL")
+        or os.environ.get("RENDER_EXTERNAL_URL")
+        else "POLLING"
+    )
+    TELEGRAM_WEBHOOK_URL: str | None = None
+    TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES: bool = False
+    TELEGRAM_ALLOWED_UPDATES: str = "message,callback_query"
+    HTTP_MAX_CONNECTIONS: int = int(_perf_default("HTTP_MAX_CONNECTIONS", 100))
+    HTTP_MAX_KEEPALIVE_CONNECTIONS: int = int(_perf_default("HTTP_MAX_KEEPALIVE_CONNECTIONS", 20))
+    REDIS_MAX_CONNECTIONS: int = 100
+    USER_RATE_LIMIT_PER_SECOND: int = 3
+    USER_RATE_LIMIT_WINDOW_S: float = 1.0
+    API_RATE_LIMIT_PER_SECOND: int = 20
+    API_RATE_LIMIT_WINDOW_S: float = 1.0
+    # Security defaults: keep public surfaces tight unless explicitly opened.
+    AI_API_ALLOWED_ORIGINS: str = ""
+    AI_API_QUERY_KEY_ENABLED: bool = False
+    WEBHOOK_REPLAY_TTL_S: int = 600
+    ADMIN_CALLBACK_GUARD_ENABLED: bool = True
+    RATE_LIMIT_REDIS_TTL_S: int = 30
+    CACHE_ASIDE_DEFAULT_TTL_S: int = 3600
+    WEB_BROADCAST_QUEUE_MAXSIZE: int = 200
+
+try:
+    if not _PYDANTIC_SETTINGS_AVAILABLE:
+        raise RuntimeError("pydantic-settings is unavailable")
+    SETTINGS = AppSettings()
+except Exception as exc:
+    # Keep the bot bootable even if pydantic-settings is unavailable or an
+    # environment value cannot be parsed. The fallback preserves typed code
+    # defaults and applies simple type conversion to environment overrides.
+    logging.getLogger(__name__).warning("Pydantic settings fallback activated: %s", exc)
+
+    class _FallbackSettings:
+        def __getattr__(self, name: str) -> Any:
+            default = getattr(AppSettings, name, "")
+            raw = os.environ.get(name)
+            if raw is None:
+                return default
+            if isinstance(default, bool):
+                return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+            if isinstance(default, int) and not isinstance(default, bool):
+                try:
+                    return int(str(raw).strip())
+                except Exception:
+                    return default
+            if isinstance(default, float):
+                try:
+                    return float(str(raw).strip())
+                except Exception:
+                    return default
+            if default is None:
+                return None if str(raw).strip().lower() in {"", "none", "null"} else str(raw).strip()
+            return str(raw)
+
+    SETTINGS = _FallbackSettings()
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        raw = getattr(SETTINGS, name, default)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _env_int(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
+    raw = os.environ.get(name, getattr(SETTINGS, name, default))
+    try:
+        value = int(str(raw).strip())
+    except Exception:
+        value = int(default)
+    if minimum is not None:
+        value = max(int(minimum), value)
+    if maximum is not None:
+        value = min(int(maximum), value)
+    return value
+
+
+def _env_float(name: str, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
+    raw = os.environ.get(name, getattr(SETTINGS, name, default))
+    try:
+        value = float(str(raw).strip())
+    except Exception:
+        value = float(default)
+    if minimum is not None:
+        value = max(float(minimum), value)
+    if maximum is not None:
+        value = min(float(maximum), value)
+    return value
+
+
+def _default_cookie_secure() -> bool:
+    """Return a safe default for admin session cookies.
+
+    - Explicit WEB_COOKIE_SECURE always wins.
+    - SameSite=None requires Secure cookies in modern browsers.
+    - Render/proxy HTTPS deployments should default to Secure.
+    - Local development can stay non-secure unless configured otherwise.
+    """
+    explicit = os.environ.get("WEB_COOKIE_SECURE")
+    if explicit is not None:
+        return _env_bool("WEB_COOKIE_SECURE", DEFAULT_WEB_COOKIE_SECURE)
+    same_site = str(os.environ.get("WEB_COOKIE_SAMESITE") or getattr(SETTINGS, "WEB_COOKIE_SAMESITE", DEFAULT_WEB_COOKIE_SAMESITE) or DEFAULT_WEB_COOKIE_SAMESITE).strip().lower()
+    if same_site == "none":
+        return True
+    if _env_bool("WEB_TRUST_PROXY", _env_bool("RENDER", False)):
+        return True
+    return bool(getattr(SETTINGS, "WEB_COOKIE_SECURE", DEFAULT_WEB_COOKIE_SECURE))
+
+
+def _cookie_samesite() -> str:
+    """Return a Starlette-safe SameSite value.
+
+    A mistyped WEB_COOKIE_SAMESITE used to make the dashboard fail during
+    startup. Keep bad env values safe by falling back to lax, while the normal code default is SameSite=None.
+    """
+    value = str(getattr(SETTINGS, "WEB_COOKIE_SAMESITE", DEFAULT_WEB_COOKIE_SAMESITE) or DEFAULT_WEB_COOKIE_SAMESITE).strip().lower()
+    return value if value in {"lax", "strict", "none"} else "lax"
+
+
+def _web_max_content_length() -> int:
+    return _env_int(
+        "WEB_MAX_CONTENT_LENGTH",
+        64 * 1024 * 1024,
+        minimum=1 * 1024 * 1024,
+        maximum=256 * 1024 * 1024,
+    )
+
+
+def _is_production_runtime() -> bool:
+    env_name = str(os.environ.get("ENV") or os.environ.get("APP_ENV") or os.environ.get("PYTHON_ENV") or "").strip().lower()
+    return _env_bool("RENDER", False) or env_name in {"prod", "production"}
+
+
+_WEB_SESSION_SECRET_CACHE: str | None = None
+_WEB_SESSION_SECRET_SOURCE_CACHE: str = ""
+_WEB_SESSION_SECRET_REDIS_CLIENT: Any | None = None
+_WEB_SESSION_SECRET_REDIS_LOCK = threading.RLock()
+_WEB_SESSION_SECRET_REDIS_LAST_ERROR: str = ""
+
+
+def _generate_web_secret_value() -> str:
+    """Generate a strong Starlette/FastAPI session signing secret."""
+    return secrets.token_urlsafe(48)
+
+
+def _web_secret_fingerprint(secret_value: str) -> str:
+    value = str(secret_value or "")
+    if not value:
+        return "not-set"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def _web_secret_redis_key() -> str:
+    """Redis key that stores the stable WEB_SECRET_KEY replacement."""
+    prefix = str(os.environ.get("REDIS_CACHE_PREFIX") or "tgbot").strip() or "tgbot"
+    return f"{prefix}:web_secret_key:v1"
+
+
+def _web_secret_redis_url() -> str:
+    return str(
+        os.environ.get("REDIS_URL")
+        or getattr(SETTINGS, "REDIS_URL", "")
+        or ""
+    ).strip()
+
+
+def _web_secret_redis_client() -> Any | None:
+    """Return a Redis client usable before the normal app Redis init runs.
+
+    FastAPI SessionMiddleware is created during module import, before load_env()
+    initializes the shared redis_client.  This small early client exists only so
+    the web session secret can be read/generated from Redis at startup.  After
+    the normal redis_client exists, this helper reuses it.
+    """
+    global _WEB_SESSION_SECRET_REDIS_CLIENT, _WEB_SESSION_SECRET_REDIS_LAST_ERROR
+
+    shared_client = globals().get("redis_client")
+    if shared_client is not None:
+        return shared_client
+
+    if redis_lib is None:
+        _WEB_SESSION_SECRET_REDIS_LAST_ERROR = "redis package is not installed"
+        return None
+
+    redis_url = _web_secret_redis_url()
+    if not redis_url:
+        _WEB_SESSION_SECRET_REDIS_LAST_ERROR = "REDIS_URL is not configured"
+        return None
+
+    with _WEB_SESSION_SECRET_REDIS_LOCK:
+        if _WEB_SESSION_SECRET_REDIS_CLIENT is not None:
+            return _WEB_SESSION_SECRET_REDIS_CLIENT
+        try:
+            timeout = _env_float("WEB_SECRET_REDIS_SOCKET_TIMEOUT_S", 3.0, minimum=0.2, maximum=30.0)
+            max_connections = _env_int("WEB_SECRET_REDIS_MAX_CONNECTIONS", 3, minimum=1, maximum=20)
+            client = redis_lib.from_url(
+                redis_url,
+                decode_responses=True,
+                socket_timeout=timeout,
+                socket_connect_timeout=timeout,
+                health_check_interval=30,
+                retry_on_timeout=True,
+                max_connections=max_connections,
+            )
+            client.ping()
+            _WEB_SESSION_SECRET_REDIS_CLIENT = client
+            _WEB_SESSION_SECRET_REDIS_LAST_ERROR = ""
+            logging.getLogger(__name__).info(
+                "Redis web session secret client initialised key=%s max_connections=%s.",
+                _web_secret_redis_key(),
+                max_connections,
+            )
+            return client
+        except Exception as exc:
+            _WEB_SESSION_SECRET_REDIS_LAST_ERROR = str(exc)[:300]
+            logging.getLogger(__name__).warning(
+                "Redis web session secret client failed; falling back if possible: %s",
+                _WEB_SESSION_SECRET_REDIS_LAST_ERROR,
+            )
+            return None
+
+
+def _web_secret_get_from_redis() -> tuple[str, str]:
+    client = _web_secret_redis_client()
+    if client is None:
+        return "", "redis-unavailable"
+    key = _web_secret_redis_key()
+    try:
+        raw = client.get(key)
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="ignore")
+        value = str(raw or "").strip()
+        if len(value) >= 32:
+            return value, f"redis:{key}"
+        if value:
+            logging.getLogger(__name__).warning(
+                "Ignoring too-short Redis WEB_SECRET_KEY value key=%s fingerprint=%s.",
+                key,
+                _web_secret_fingerprint(value),
+            )
+        return "", f"redis:{key}:missing"
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Redis WEB_SECRET_KEY read failed key=%s: %s", key, exc)
+        return "", f"redis:{key}:error"
+
+
+def _web_secret_set_in_redis_sync(secret_value: str, *, overwrite: bool = True) -> tuple[bool, str]:
+    secret_value = str(secret_value or "").strip()
+    if len(secret_value) < 32:
+        return False, "Generated secret is too short; refusing to store it."
+    client = _web_secret_redis_client()
+    if client is None:
+        detail = _WEB_SESSION_SECRET_REDIS_LAST_ERROR or "Redis is not available"
+        return False, f"Cannot store WEB_SECRET_KEY in Redis: {detail}"
+    key = _web_secret_redis_key()
+    try:
+        if overwrite:
+            ok = client.set(key, secret_value)
+        else:
+            ok = client.set(key, secret_value, nx=True)
+        if not ok and not overwrite:
+            return False, f"Redis key already exists: {key}"
+        return True, f"Stored in Redis key {key}"
+    except Exception as exc:
+        logging.getLogger(__name__).error("Redis WEB_SECRET_KEY write failed key=%s: %s", key, exc, exc_info=True)
+        return False, f"Redis WEB_SECRET_KEY write failed: {str(exc)[:300]}"
+
+
+def _web_secret_get_or_create_from_redis() -> tuple[str, str]:
+    existing, source = _web_secret_get_from_redis()
+    if existing:
+        return existing, source
+
+    client = _web_secret_redis_client()
+    if client is None:
+        return "", source
+
+    key = _web_secret_redis_key()
+    generated = _generate_web_secret_value()
+    try:
+        # NX makes first boot safe in two-server mode: one instance creates the
+        # shared secret, the other reads the winning value immediately after.
+        created = bool(client.set(key, generated, nx=True))
+        if created:
+            logging.getLogger(__name__).warning(
+                "Generated and stored new Redis WEB_SECRET_KEY replacement key=%s fingerprint=%s. Restart all backend instances after manual rotations only.",
+                key,
+                _web_secret_fingerprint(generated),
+            )
+            return generated, f"redis:{key}:generated"
+        winner, winner_source = _web_secret_get_from_redis()
+        if winner:
+            return winner, winner_source
+        return "", f"redis:{key}:race-empty"
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Redis WEB_SECRET_KEY auto-create failed key=%s: %s", key, exc)
+        return "", f"redis:{key}:create-error"
+
+
+def _web_session_secret_source() -> str:
+    return _WEB_SESSION_SECRET_SOURCE_CACHE or "unknown"
+
+
+def _web_session_secret_fingerprint() -> str:
+    return _web_secret_fingerprint(_WEB_SESSION_SECRET_CACHE or "")
+
+
+def _web_stable_secret_configured() -> bool:
+    if _WEB_SESSION_SECRET_CACHE and _WEB_SESSION_SECRET_SOURCE_CACHE in {
+        "redis",
+        "redis-generated",
+        "redis-race-winner",
+    }:
+        return True
+    redis_value, _redis_source = _web_secret_get_from_redis()
+    return bool(redis_value)
+
+
+def _web_session_secret_key() -> str:
+    global _WEB_SESSION_SECRET_CACHE, _WEB_SESSION_SECRET_SOURCE_CACHE
+
+    if _WEB_SESSION_SECRET_CACHE:
+        return _WEB_SESSION_SECRET_CACHE
+
+    from app.core.security import bootstrap_runtime_secrets_sync
+
+    state = bootstrap_runtime_secrets_sync(
+        redis_client=globals().get("redis_client"),
+        redis_url=_web_secret_redis_url(),
+        redis_prefix=str(os.environ.get("REDIS_CACHE_PREFIX") or "tgbot"),
+        strict=True,
+    )
+    record = state.records["WEB_SECRET_KEY"]
+    _WEB_SESSION_SECRET_CACHE = record.value
+    _WEB_SESSION_SECRET_SOURCE_CACHE = record.source
+    return _WEB_SESSION_SECRET_CACHE
+
+
+def _flask_secret_key() -> str:
+    from app.core.security import get_runtime_secret_manager
+
+    state = get_runtime_secret_manager().current()
+    if state is None:
+        _web_session_secret_key()
+        state = get_runtime_secret_manager().current()
+    if state is None:
+        raise RuntimeError("Runtime secret manager was not initialized.")
+    return state.value("FLASK_SECRET_KEY")
+
+
+_request_ctx: contextvars.ContextVar[Any] = contextvars.ContextVar("fastapi_request_ctx")
+_session_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar("fastapi_session_ctx")
+
+
+class _LocalProxy:
+    def __init__(self, ctx: contextvars.ContextVar):
+        object.__setattr__(self, "_ctx", ctx)
+
+    def _get_current_object(self):
+        return object.__getattribute__(self, "_ctx").get()
+
+    def __getattr__(self, name):
+        return getattr(self._get_current_object(), name)
+
+    def __setattr__(self, name, value):
+        setattr(self._get_current_object(), name, value)
+
+    def __getitem__(self, key):
+        return self._get_current_object()[key]
+
+    def __setitem__(self, key, value):
+        self._get_current_object()[key] = value
+
+    def __delitem__(self, key):
+        del self._get_current_object()[key]
+
+    def get(self, *args, **kwargs):
+        return self._get_current_object().get(*args, **kwargs)
+
+    def pop(self, *args, **kwargs):
+        return self._get_current_object().pop(*args, **kwargs)
+
+    def clear(self):
+        return self._get_current_object().clear()
+
+    def setdefault(self, *args, **kwargs):
+        return self._get_current_object().setdefault(*args, **kwargs)
+
+    def __contains__(self, item):
+        return item in self._get_current_object()
+
+
+class _MultiDictCompat(dict):
+    def get(self, key, default=None, type=None):
+        value = super().get(key, default)
+        if isinstance(value, list):
+            value = value[-1] if value else default
+        if type is not None and value is not None:
+            try:
+                return type(value)
+            except Exception:
+                return default
+        return value
+
+    def getlist(self, key):
+        value = super().get(key, [])
+        if isinstance(value, list):
+            return list(value)
+        if value is None:
+            return []
+        return [value]
+
+
+class _UploadFileCompat:
+    def __init__(self, filename: str, content_type: str, data: bytes):
+        self.filename = filename or "upload.bin"
+        self.content_type = content_type or "application/octet-stream"
+        self.mimetype = self.content_type
+        self._data = data or b""
+
+    def read(self) -> bytes:
+        return self._data
+
+
+class _RequestCompat:
+    def __init__(self, req: FastAPIRequest, form: dict, files: dict, raw_body: bytes, json_body: Any):
+        self._req = req
+        self.method = req.method
+        self.headers = req.headers
+        self.args = _MultiDictCompat(dict(req.query_params))
+        self.form = _MultiDictCompat(form)
+        self.files = _MultiDictCompat(files)
+        self.content_type = req.headers.get("content-type", "")
+        self.referrer = req.headers.get("referer", "")
+        self.path = req.url.path
+        self.full_path = req.url.path + (("?" + req.url.query) if req.url.query else "")
+        self._raw_body = raw_body or b""
+        self._json_body = json_body
+
+    def get_json(self, force: bool = False, silent: bool = False):
+        if self._json_body is not None:
+            return self._json_body
+        if not self._raw_body:
+            return None if silent else {}
+        try:
+            return _json_loads_fast(self._raw_body)
+        except Exception:
+            if silent:
+                return None
+            raise
+
+
+request = _LocalProxy(_request_ctx)
+session = _LocalProxy(_session_ctx)
+
+
+def jsonify(obj: Any = None, **kwargs: Any):
+    # FastAPI/Starlette JSONResponse cannot serialize datetime, Decimal, UUID,
+    # or Pydantic objects directly. jsonable_encoder keeps dashboard/API JSON
+    # responses safe even when Supabase/client libraries return richer types.
+    # _FastJSONResponse uses orjson/ujson when installed and falls back safely.
+    return _FastJSONResponse(jsonable_encoder(obj if obj is not None else kwargs))
+
+
+def Response(content: Any = "", status: int = 200, status_code: int | None = None, mimetype: str | None = None, media_type: str | None = None, headers: dict | None = None):
+    return StarletteResponse(content=content, status_code=status_code or status, media_type=media_type or mimetype, headers=headers)
+
+
+def redirect(location: str, code: int = 302):
+    checker = globals().get("_should_return_backend_json_redirect")
+    if callable(checker):
+        try:
+            if checker(location):
+                return _admin_api_success({"redirect": location}, status_code=200)
+        except Exception:
+            pass
+    return RedirectResponse(url=location, status_code=code)
+
+
+def stream_with_context(generator):
+    return generator
+
+
+def abort(status_code: int = 400):
+    raise HTTPException(status_code=status_code)
+
+
+_JINJA_TEMPLATE_CACHE_MAX = 256
+_JINJA_TEMPLATE_CACHE: OrderedDict[str, Any] = OrderedDict()
+_JINJA_TEMPLATE_CACHE_LOCK = threading.RLock()
+_JINJA_ENV = Environment(autoescape=select_autoescape(["html", "xml"]), enable_async=False)
+
+
+def render_template_string(template: str, **context: Any) -> str:
+    # Python caches a string's hash after the first use. Keying directly by the
+    # immutable template avoids a full SHA-256 pass over large inline templates
+    # on every render while retaining exact collision-safe dictionary matching.
+    template = str(template or "")
+    compiled = None
+    with _JINJA_TEMPLATE_CACHE_LOCK:
+        compiled = _JINJA_TEMPLATE_CACHE.get(template)
+        if compiled is not None:
+            _JINJA_TEMPLATE_CACHE.move_to_end(template)
+    if compiled is None:
+        try:
+            compiled = _JINJA_ENV.from_string(template)
+        except Exception:
+            # Preserve old fallback behavior if a third-party Jinja extension or
+            # unusual template edge case is not accepted by the shared env.
+            return Template(template, autoescape=select_autoescape(["html", "xml"])).render(**context)
+        with _JINJA_TEMPLATE_CACHE_LOCK:
+            _JINJA_TEMPLATE_CACHE[template] = compiled
+            while len(_JINJA_TEMPLATE_CACHE) > _JINJA_TEMPLATE_CACHE_MAX:
+                _JINJA_TEMPLATE_CACHE.popitem(last=False)
+    return compiled.render(**context)
+
+
+def flask_flash(message: str, category: str = "message") -> None:
+    flashes = list(session.get("_flashes", []))
+    translator = globals().get("_khmer_ui_text")
+    visible_message = translator(message) if callable(translator) else str(message)
+    flashes.append((category, visible_message))
+    session["_flashes"] = flashes
+
+
+def get_flashed_messages(with_categories: bool = False):
+    flashes = list(session.pop("_flashes", []))
+    if with_categories:
+        return flashes
+    return [msg for _cat, msg in flashes]
+
+
+def url_for(endpoint: str, **params: Any) -> str:
+    try:
+        clean = {k: str(v) for k, v in params.items() if v is not None}
+        return str(app_flask.fastapi.url_path_for(endpoint, **clean))
+    except Exception:
+        return "/" + endpoint.replace("web_admin_", "admin/").replace("_", "-")
+
+
+class _DeferredWebSessionSecret:
+    """Resolve the persistent signer key when Starlette starts its stack."""
+
+    def __str__(self) -> str:
+        return _web_session_secret_key()
+
+
+class FastAPICompatApp:
+    """Small Flask-style compatibility layer over FastAPI.
+
+    This lets the existing admin/AI route bodies keep working while the actual
+    ASGI server, sessions, CORS/security headers, and lifecycle run on FastAPI.
+    It removes the old separate Flask thread and makes future route migrations
+    incremental instead of risky all-at-once rewrites.
+    """
+    def __init__(self):
+        self.config: dict[str, Any] = {}
+        self.after_request_funcs: list[Callable[[Any], Any]] = []
+        api_docs_enabled = _env_bool("API_DOCS_ENABLED", False)
+        self.fastapi = FastAPI(
+            title="Telegram Bot Admin",
+            docs_url="/docs" if api_docs_enabled else None,
+            redoc_url="/redoc" if api_docs_enabled else None,
+            openapi_url="/openapi.json" if api_docs_enabled else None,
+        )
+        self.fastapi.add_middleware(
+            SessionMiddleware,
+            # Starlette stringifies this value when it builds the ASGI
+            # middleware stack at startup. That defers Redis I/O until startup
+            # while still giving SessionMiddleware one stable signing key.
+            secret_key=_DeferredWebSessionSecret(),
+            session_cookie=str(getattr(SETTINGS, "WEB_SESSION_COOKIE_NAME", "bot_admin_session") or "bot_admin_session"),
+            https_only=_default_cookie_secure(),
+            same_site=_cookie_samesite(),
+            max_age=max(3600, _env_int("WEB_ADMIN_SESSION_DAYS", 14, minimum=1, maximum=365) * 86400),
+        )
+
+    def after_request(self, fn: Callable[[Any], Any]):
+        self.after_request_funcs.append(fn)
+        return fn
+
+    @staticmethod
+    def _convert_path(path: str) -> str:
+        path = re.sub(r"<int:(\w+)>", r"{\1}", path)
+        path = re.sub(r"<str:(\w+)>", r"{\1}", path)
+        path = re.sub(r"<(\w+)>", r"{\1}", path)
+        return path
+
+    @staticmethod
+    def _path_converters(path: str) -> dict[str, str]:
+        converters: dict[str, str] = {}
+        for kind, name in re.findall(r"<(?:(int|str):)?(\w+)>", path):
+            converters[name] = kind or "str"
+        return converters
+
+    @staticmethod
+    def _cast_path_params(params: dict[str, Any], converters: dict[str, str]) -> dict[str, Any]:
+        casted = dict(params)
+        for name, kind in converters.items():
+            if name not in casted:
+                continue
+            if kind == "int":
+                try:
+                    casted[name] = int(casted[name])
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=404)
+            else:
+                casted[name] = str(casted[name])
+        return casted
+
+    async def _prepare_context(self, req: FastAPIRequest):
+        raw_body = b""
+        json_body = None
+        form_data: dict[str, Any] = {}
+        files_data: dict[str, Any] = {}
+        content_type = req.headers.get("content-type", "")
+        max_body = _web_max_content_length()
+
+        # Do the hard limit check before Starlette reads/parses the request
+        # body. This prevents obvious memory-flood uploads from ever reaching
+        # req.body(), req.form(), or UploadFile.read().
+        content_length = req.headers.get("content-length")
+        if content_length:
+            try:
+                content_length_i = int(str(content_length).strip())
+                if content_length_i < 0:
+                    raise ValueError
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid Content-Length header.")
+            if content_length_i > max_body:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Request body too large. Max {max_body} bytes.",
+                )
+
+        def _store_multi(target: dict[str, Any], key: str, value: Any) -> None:
+            if key in target:
+                current = target[key]
+                if isinstance(current, list):
+                    current.append(value)
+                else:
+                    target[key] = [current, value]
+            else:
+                target[key] = value
+
+        if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
+            max_files = _env_int("WEB_MAX_FORM_FILES", 32, minimum=1, maximum=500)
+            max_fields = _env_int("WEB_MAX_FORM_FIELDS", 256, minimum=1, maximum=5000)
+            try:
+                form = await req.form(
+                    max_files=max_files,
+                    max_fields=max_fields,
+                    max_part_size=max_body,
+                )
+            except TypeError:
+                try:
+                    # Compatibility path for Starlette releases that support
+                    # field/file limits but not max_part_size.
+                    form = await req.form(max_files=max_files, max_fields=max_fields)
+                except TypeError:
+                    # Very old Starlette fallback. Content-Length and the
+                    # post-parse aggregate limit below still apply.
+                    form = await req.form()
+            total_read = 0
+            for key, value in form.multi_items():
+                if hasattr(value, "read") and hasattr(value, "filename"):
+                    data = await value.read()
+                    total_read += len(data)
+                    if total_read > max_body:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"Uploaded data too large. Max {max_body} bytes.",
+                        )
+                    _store_multi(
+                        files_data,
+                        key,
+                        _UploadFileCompat(
+                            value.filename,
+                            getattr(value, "content_type", "") or "application/octet-stream",
+                            data,
+                        ),
+                    )
+                else:
+                    total_read += len(str(value).encode("utf-8", errors="ignore"))
+                    if total_read > max_body:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"Form data too large. Max {max_body} bytes.",
+                        )
+                    _store_multi(form_data, key, value)
+        else:
+            # Stream instead of await req.body() so requests without a trusted
+            # Content-Length cannot allocate unbounded memory before rejection.
+            chunks: list[bytes] = []
+            total_read = 0
+            async for chunk in req.stream():
+                if not chunk:
+                    continue
+                total_read += len(chunk)
+                if total_read > max_body:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Request body too large. Max {max_body} bytes.",
+                    )
+                chunks.append(chunk)
+            raw_body = b"".join(chunks)
+            if raw_body and "application/json" in content_type:
+                try:
+                    json_body = _json_loads_fast(raw_body)
+                except Exception:
+                    json_body = None
+        compat = _RequestCompat(req, form_data, files_data, raw_body, json_body)
+        req_token = _request_ctx.set(compat)
+        sess_token = _session_ctx.set(req.session)
+        return req_token, sess_token
+
+    def _finalize_response(self, result: Any):
+        status_code = None
+        if isinstance(result, tuple):
+            if len(result) >= 2:
+                result, status_code = result[0], int(result[1])
+        if isinstance(result, StarletteResponse):
+            resp = result
+            if status_code is not None:
+                resp.status_code = status_code
+        elif isinstance(result, (dict, list)):
+            resp = _FastJSONResponse(jsonable_encoder(result), status_code=status_code or 200)
+        elif isinstance(result, bytes):
+            resp = Response(result, status=status_code or 200)
+        elif result is None:
+            resp = Response("", status=status_code or 204)
+        else:
+            resp = HTMLResponse(str(result), status_code=status_code or 200)
+        for fn in self.after_request_funcs:
+            maybe_resp = fn(resp)
+            if maybe_resp is not None:
+                resp = maybe_resp
+        return resp
+
+    def route(self, path: str, methods: list[str] | tuple[str, ...] | None = None):
+        route_methods = list(dict.fromkeys(str(method).strip().upper() for method in (methods or ["GET"])))
+        fastapi_path = self._convert_path(path)
+        converters = self._path_converters(path)
+        def decorator(func: Callable):
+            async def endpoint(starlette_request: FastAPIRequest):
+                req_token = sess_token = None
+                try:
+                    req_token, sess_token = await self._prepare_context(starlette_request)
+                    kwargs = self._cast_path_params(dict(starlette_request.path_params), converters)
+                    if inspect.iscoroutinefunction(func):
+                        result = await func(**kwargs)
+                    else:
+                        result = await run_in_threadpool(lambda: func(**kwargs))
+                    return self._finalize_response(result)
+                finally:
+                    if sess_token is not None:
+                        _session_ctx.reset(sess_token)
+                    if req_token is not None:
+                        _request_ctx.reset(req_token)
+            endpoint.__name__ = func.__name__ + "_asgi"
+            include_compat_routes = _env_bool("API_DOCS_INCLUDE_COMPAT_ROUTES", True)
+            # FastAPI assigns one operation ID to an APIRoute. Registering
+            # GET/POST/OPTIONS together therefore produced duplicate OpenAPI
+            # operation IDs. One APIRoute per method keeps the schema valid,
+            # while OPTIONS remains available but intentionally undocumented.
+            for method in route_methods:
+                include_in_schema = include_compat_routes and method != "OPTIONS"
+                self.fastapi.add_api_route(
+                    fastapi_path,
+                    endpoint,
+                    methods=[method],
+                    name=func.__name__,
+                    include_in_schema=include_in_schema,
+                    operation_id=f"{func.__name__}_{method.lower()}" if include_in_schema else None,
+                )
+            return func
+        return decorator
+
+    def run(self, host: str = "0.0.0.0", port: int = 8080, **kwargs: Any):
+        import uvicorn
+        uvicorn.run(self.fastapi, host=host, port=port, **kwargs)
+
+
+app_flask = FastAPICompatApp()
+app = app_flask.fastapi
+
+
+# ── Backend/API-only mode + separated frontend CORS ────────────────────────
+def _env_str(name: str, default: str = "") -> str:
+    return str(os.environ.get(name, getattr(SETTINGS, name, default)) or default).strip()
+
+
+def _admin_frontend_url() -> str:
+    value = _env_str("ADMIN_FRONTEND_URL", "").rstrip("/")
+    # "*" is valid for an origin allowlist, but never for a concrete frontend URL.
+    return "" if value == "*" else value
+
+
+def _backend_only_mode() -> bool:
+    # Default is API-only so the Python service no longer serves dashboard UI.
+    # To temporarily restore old inline dashboard pages, set:
+    #   BACKEND_ONLY=false
+    #   WEB_ADMIN_FRONTEND_ENABLED=true
+    return _env_bool("BACKEND_ONLY", True) or not _env_bool("WEB_ADMIN_FRONTEND_ENABLED", False)
+
+
+def _frontend_allowed_origins() -> list[str]:
+    # Native middleware refreshes this cache from Redis/Supabase before the
+    # compatibility origin guard executes. There is deliberately no .env
+    # fallback: administrators edit the policy through /api/admin/cors.
+    try:
+        from app.core.cors import get_dynamic_cors_store
+
+        return get_dynamic_cors_store().cached_origins()
+    except Exception:
+        return []
+
+
+def _normalise_origin(value: str) -> str:
+    return str(value or "").strip().rstrip("/")
+
+
+def _admin_origin_guard_enabled() -> bool:
+    return _env_bool("ADMIN_ORIGIN_GUARD_ENABLED", True)
+
+
+def _admin_origin_allowed(origin: str) -> bool:
+    origin = _normalise_origin(origin)
+    if not origin:
+        return True
+    allowed = [_normalise_origin(item) for item in _frontend_allowed_origins()]
+    return origin in allowed
+
+
+def _admin_origin_guard_payload(origin: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "code": "admin_origin_forbidden",
+        "error": "This admin API origin is not allowed. Add it through /api/admin/cors.",
+        "origin": _normalise_origin(origin),
+        "frontend_url": _admin_frontend_url(),
+        "frontend_allowed_origins": _frontend_allowed_origins(),
+        "backend_only": _backend_only_mode(),
+    }
+
+
+def _request_wants_json() -> bool:
+    try:
+        accept = str(request.headers.get("accept") or "").lower()
+        content_type = str(request.headers.get("content-type") or "").lower()
+        requested_with = str(request.headers.get("x-requested-with") or "").lower()
+        return (
+            "application/json" in accept
+            or "application/json" in content_type
+            or requested_with in {"fetch", "xmlhttprequest"}
+            or str(getattr(request, "path", "")).startswith("/api/")
+            or str(getattr(request, "path", "")).endswith(".json")
+        )
+    except Exception:
+        return False
+
+
+def _admin_api_error(message: str, status_code: int = 400, *, code: str = "admin_error", **extra: Any):
+    payload = {
+        "ok": False,
+        "error": _khmer_ui_text(message),
+        "code": code,
+        "backend_only": _backend_only_mode(),
+        "frontend_url": _admin_frontend_url(),
+    }
+    payload.update(extra)
+    resp = jsonify(payload)
+    resp.status_code = int(status_code)
+    resp.headers.setdefault("Cache-Control", "no-store")
+    return resp
+
+
+def _admin_api_success(payload: dict | None = None, *, status_code: int = 200):
+    data = {"ok": True, "backend_only": _backend_only_mode(), "frontend_url": _admin_frontend_url()}
+    if payload:
+        data.update(payload)
+    resp = jsonify(data)
+    resp.status_code = int(status_code)
+    resp.headers.setdefault("Cache-Control", "no-store")
+    return resp
+
+
+def _legacy_dashboard_disabled_payload(title: str = "Admin dashboard disabled", *, status_code: int = 410):
+    return _admin_api_error(
+        "HTML admin dashboard pages are disabled. Deploy the frontend as a separate app and call this backend API.",
+        status_code,
+        code="admin_frontend_disabled",
+        title=title,
+        auth={
+            "login": "/api/admin/auth/login",
+            "me": "/api/admin/auth/me",
+            "logout": "/api/admin/auth/logout",
+        },
+        endpoints={
+            "health": "/readyz",
+            "status": "/admin/status.json",
+            "live": "/admin/live.json",
+            "performance": "/admin/performance.json",
+            "errors": "/admin/errors.json",
+            "broadcast_jobs": "/admin/broadcast/jobs.json",
+            "report_pdf": "/admin/report.pdf",
+        },
+    )
+
+
+def _should_return_backend_json_redirect(location: str) -> bool:
+    try:
+        path = str(getattr(request, "path", "") or "")
+    except Exception:
+        path = ""
+    return _backend_only_mode() and (path == "/dashboard" or path.startswith("/admin"))
+
+
+@app.middleware("http")
+async def _admin_origin_guard_middleware(req: FastAPIRequest, call_next):
+    """Reject browser state-changing admin API calls from unknown origins.
+
+    CORS controls what browsers can read, but this guard also prevents
+    credentialed writes from untrusted sites when cookies are enabled.  Requests
+    with no Origin header (curl/server-to-server/same-origin form posts) are
+    allowed. Configure separated frontend origins through /api/admin/cors.
+    """
+    method = str(req.method or "GET").upper()
+    path = str(req.url.path or "")
+    if (
+        _admin_origin_guard_enabled()
+        and method in {"POST", "PUT", "PATCH", "DELETE"}
+        and (path.startswith("/api/admin") or path.startswith("/admin/"))
+    ):
+        origin = _normalise_origin(req.headers.get("origin") or "")
+        if origin and not _admin_origin_allowed(origin):
+            logging.getLogger(__name__).warning(
+                "Blocked admin API request from disallowed origin origin=%s method=%s path=%s",
+                origin,
+                method,
+                path,
+            )
+            return _FastJSONResponse(_admin_origin_guard_payload(origin), status_code=403)
+    return await call_next(req)
+
+
+def _is_legacy_admin_frontend_request(path: str, method: str) -> bool:
+    path = str(path or "")
+    method = str(method or "GET").upper()
+    if path == "/dashboard":
+        return True
+    if path in {"/admin", "/admin/", "/admin/login"}:
+        return True
+    if not path.startswith("/admin/"):
+        return False
+    # Backend resources remain available to the separated frontend.
+    if path.endswith((".json", ".pdf", ".csv")):
+        return False
+    # Keep write/action endpoints callable; they return JSON redirects in API-only mode.
+    if method != "GET" or path.endswith("/action"):
+        return False
+    return True
+
+
+@app.middleware("http")
+async def _backend_only_legacy_dashboard_guard(req: FastAPIRequest, call_next):
+    if _backend_only_mode() and _is_legacy_admin_frontend_request(req.url.path, req.method):
+        return _FastJSONResponse({
+            "ok": False,
+            "code": "admin_frontend_disabled",
+            "error": "HTML admin dashboard pages are disabled. Deploy the frontend separately and call this backend API.",
+            "backend_only": True,
+            "frontend_url": _admin_frontend_url(),
+            "auth": {
+                "login": "/api/admin/auth/login",
+                "me": "/api/admin/auth/me",
+                "logout": "/api/admin/auth/logout",
+            },
+            "endpoints": {
+                "health": "/readyz",
+                "bootstrap": "/api/admin/bootstrap",
+                "status": "/admin/status.json",
+                "live": "/admin/live.json",
+                "performance": "/admin/performance.json",
+                "errors": "/admin/errors.json",
+                "broadcast_jobs": "/admin/broadcast/jobs.json",
+                "report_pdf": "/admin/report.pdf",
+            },
+        }, status_code=410)
+    return await call_next(req)
+# Populated from Redis by _bootstrap_runtime_security before requests are
+# accepted. The compatibility layer itself does not sign cookies.
+app_flask.config["SECRET_KEY"] = ""
+app_flask.config["SESSION_COOKIE_NAME"] = getattr(SETTINGS, "WEB_SESSION_COOKIE_NAME", "bot_admin_session")
+app_flask.config["SESSION_COOKIE_HTTPONLY"] = True
+app_flask.config["SESSION_COOKIE_SAMESITE"] = _cookie_samesite().capitalize()
+app_flask.config["SESSION_COOKIE_SECURE"] = _default_cookie_secure()
+app_flask.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=_env_int("WEB_ADMIN_SESSION_DAYS", 14, minimum=1))
+app_flask.config["SESSION_REFRESH_EACH_REQUEST"] = True
+app_flask.config["MAX_CONTENT_LENGTH"] = _web_max_content_length()
+
+# ── Admin Performance V5 runtime knobs ──────────────────────────────────────
+# These are intentionally env-tunable so Render small instances can stay stable.
+WEB_SLOW_REQUEST_MS = _env_float("WEB_SLOW_REQUEST_MS", 1500.0, minimum=100.0, maximum=60_000.0)
+WEB_ADMIN_AUDIT_MAX = _env_int("WEB_ADMIN_AUDIT_MAX", 300, minimum=50, maximum=5_000)
+TELEGRAM_CONCURRENT_UPDATES = _env_int("TELEGRAM_CONCURRENT_UPDATES", int(_perf_default("TELEGRAM_CONCURRENT_UPDATES", 4)), minimum=1, maximum=64)
+TELEGRAM_CONNECTION_POOL_SIZE = _env_int("TELEGRAM_CONNECTION_POOL_SIZE", int(_perf_default("TELEGRAM_CONNECTION_POOL_SIZE", 24)), minimum=4, maximum=256)
+_WEB_ACTIVE_REQUESTS = 0
+_WEB_ACTIVE_REQUESTS_LOCK = threading.Lock()
+_WEB_SLOW_REQUESTS = deque(maxlen=200)
+_WEB_ADMIN_AUDIT = deque(maxlen=WEB_ADMIN_AUDIT_MAX)
+
+
+@app.middleware("http")
+async def _web_request_id_and_timing(req: FastAPIRequest, call_next):
+    """Attach request id, latency, active-request count, and slow-request logs.
+
+    Admin V9 adds lightweight performance telemetry without exposing secrets.
+    It helps identify slow dashboard endpoints, Supabase pressure, and browser
+    polling storms while keeping the response body unchanged.
+    """
+    global _WEB_ACTIVE_REQUESTS
+    request_id = (req.headers.get("X-Request-ID") or secrets.token_hex(8)).strip()[:64]
+    started = time.monotonic()
+    with _WEB_ACTIVE_REQUESTS_LOCK:
+        _WEB_ACTIVE_REQUESTS += 1
+        active_now = _WEB_ACTIVE_REQUESTS
+    try:
+        resp = await call_next(req)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Unhandled web request error request_id=%s method=%s path=%s active=%s",
+            request_id,
+            req.method,
+            req.url.path,
+            active_now,
+        )
+        raise
+    finally:
+        with _WEB_ACTIVE_REQUESTS_LOCK:
+            _WEB_ACTIVE_REQUESTS = max(0, _WEB_ACTIVE_REQUESTS - 1)
+
+    elapsed_ms = (time.monotonic() - started) * 1000.0
+    resp.headers.setdefault("X-Request-ID", request_id)
+    resp.headers.setdefault("X-Response-Time-ms", f"{elapsed_ms:.1f}")
+    resp.headers.setdefault("X-Active-Requests", str(active_now))
+
+    # Telegram webhook updates can legitimately wait for handler processing.
+    # Keep dashboard/API slow logs sensitive, but avoid noisy webhook warnings
+    # unless the request is truly stuck.
+    slow_threshold_ms = WEB_SLOW_REQUEST_MS
+    if req.url.path.startswith("/tg-webhook-") or req.url.path == "/telegram-webhook":
+        slow_threshold_ms = max(WEB_SLOW_REQUEST_MS, _env_float("WEBHOOK_SLOW_REQUEST_MS", 10_000.0, minimum=1000.0, maximum=120_000.0))
+
+    if elapsed_ms >= slow_threshold_ms:
+        item = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "request_id": request_id,
+            "method": req.method,
+            "path": req.url.path,
+            "status": int(getattr(resp, "status_code", 0) or 0),
+            "elapsed_ms": round(elapsed_ms, 1),
+            "active": int(active_now),
+        }
+        _WEB_SLOW_REQUESTS.appendleft(item)
+        logging.getLogger(__name__).warning(
+            "Slow web request request_id=%s method=%s path=%s status=%s elapsed_ms=%.1f active=%s",
+            request_id,
+            req.method,
+            req.url.path,
+            item["status"],
+            elapsed_ms,
+            active_now,
+        )
+    return resp
+
+
+@app.middleware("http")
+async def _hot_api_rate_limit_middleware(req: FastAPIRequest, call_next):
+    # Protect expensive public AI endpoints without touching admin dashboard or
+    # Telegram webhook traffic. Telegram updates are throttled per chat/user in
+    # the Telegram handler pipeline, not by shared Telegram source IP.
+    if req.url.path.startswith("/ai-assistant"):
+        if not await _api_rate_limit_allowed(req):
+            return _FastJSONResponse({"ok": False, "error": "Too many requests. Please slow down.", "code": 429}, status_code=429)
+    return await call_next(req)
+
+
+@app_flask.after_request
+def _web_security_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    )
+    if _default_cookie_secure():
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    try:
+        if str(getattr(request, "path", "")).startswith("/admin"):
+            resp.headers.setdefault("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            resp.headers.setdefault("Pragma", "no-cache")
+    except Exception:
+        pass
+    return resp
+
+@app_flask.route("/")
+def health_check():
+    return "បូតកំពុងដំណើរការ!", 200
+
+@app_flask.route("/ping")
+def ping():
+    return "pong", 200
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(status_code=204)
+
+
+@app_flask.route("/readyz")
+def readyz():
+    """Public deployment health endpoint.
+
+    Keep this intentionally minimal for Render/UptimeRobot. Detailed runtime,
+    secret-source, CORS, cookie, Redis, webhook, and leader data is available
+    only to authenticated admins at /api/admin/diagnostics.
+    """
+    return jsonify({
+        "ok": True,
+        "web": True,
+        "status": "ready",
+        "ts": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+def _admin_diagnostics_payload() -> dict[str, Any]:
+    """Authenticated admin diagnostics; never expose this data on /readyz."""
+    ffmpeg_path = globals().get("_FFMPEG_EXE", "")
+    payload = {
+        "web": True,
+        "telegram_token_configured": bool(globals().get("TELEGRAM_BOT_TOKEN")),
+        "supabase_configured": bool(globals().get("supabase")),
+        "redis_configured": bool(globals().get("redis_client")),
+        "ffmpeg_ok": bool(ffmpeg_path and os.path.exists(str(ffmpeg_path))),
+        "web_secret_configured": _web_stable_secret_configured(),
+        "web_secret_source": _web_session_secret_source(),
+        "web_secret_redis_key": _web_secret_redis_key(),
+        "frontend_allowed_origins": _frontend_allowed_origins(),
+        "origin_guard_enabled": _admin_origin_guard_enabled(),
+        "release": ADMIN_BACKEND_RELEASE,
+        "bot_mode": _run_state_bot_mode() if "_run_state_bot_mode" in globals() else globals().get("BOT_MODE", "POLLING"),
+        "webhook_ready": bool(globals().get("_TELEGRAM_APP")),
+        "telegram_leader": _telegram_leader_snapshot() if "_telegram_leader_snapshot" in globals() else {},
+    }
+    cookie_policy = globals().get("_admin_cookie_policy_payload")
+    if callable(cookie_policy):
+        with suppress(Exception):
+            payload["cookie_policy"] = cookie_policy()
+    fmt = globals().get("_format_uptime")
+    if callable(fmt):
+        with suppress(Exception):
+            payload["uptime"] = fmt()
+    return payload
+
+
+@app.get("/api-docs", include_in_schema=False)
+async def api_docs_redirect():
+    """Convenience alias for Swagger UI."""
+    if not _env_bool("API_DOCS_ENABLED", False):
+        return _FastJSONResponse({
+            "ok": False,
+            "error": "API docs are disabled. Set API_DOCS_ENABLED=true and restart.",
+            "docs": "/docs",
+            "redoc": "/redoc",
+            "openapi": "/openapi.json",
+        }, status_code=404)
+    return RedirectResponse(url="/docs", status_code=302)
+
+
+@app.get("/swagger", include_in_schema=False)
+async def swagger_redirect():
+    """Convenience alias for Swagger UI."""
+    return await api_docs_redirect()
+
+
+def _runtime_webhook_secret_token() -> str:
+    """Return the active Telegram webhook secret without exposing it in logs.
+
+    RUN_STATE is authoritative so in-bot secret rotation takes effect
+    immediately for webhook path validation and setWebhook registration.
+    """
+    run_state = globals().get("RUN_STATE")
+    if isinstance(run_state, dict):
+        value = run_state.get("TELEGRAM_WEBHOOK_SECRET_TOKEN")
+        if value:
+            return str(value).strip()
+    return str(
+        globals().get("TELEGRAM_WEBHOOK_SECRET_TOKEN")
+        or getattr(SETTINGS, "TELEGRAM_WEBHOOK_SECRET_TOKEN", "")
+        or ""
+    ).strip()
+
+
+def generate_new_webhook_token() -> str:
+    """Generate the same 64-character token format used at startup."""
+    return secrets.token_urlsafe(48)
+
+
+def _runtime_webhook_base_url() -> str:
+    """Return this Render service's public webhook base URL.
+
+    In two-server mode, TELEGRAM_WEBHOOK_URL / RENDER_EXTERNAL_URL is
+    intentionally treated as service-local.  Redis RUN_STATE may contain the
+    other Render service's URL, so local env must win before persisted state.
+    """
+    env_value = str(
+        os.environ.get("TELEGRAM_WEBHOOK_URL")
+        or getattr(SETTINGS, "TELEGRAM_WEBHOOK_URL", "")
+        or os.environ.get("RENDER_EXTERNAL_URL")
+        or getattr(SETTINGS, "RENDER_EXTERNAL_URL", "")
+        or ""
+    ).strip().rstrip("/")
+    if bool(globals().get("TELEGRAM_MULTI_SERVER_ENABLED", False)) and env_value:
+        return env_value
+
+    run_state = globals().get("RUN_STATE")
+    if isinstance(run_state, dict):
+        value = run_state.get("TELEGRAM_WEBHOOK_URL")
+        if value:
+            return str(value).strip().rstrip("/")
+    return env_value or str(globals().get("TELEGRAM_WEBHOOK_URL") or "").strip().rstrip("/")
+
+
+def _telegram_webhook_target_url_for_secret(secret_token: str) -> str:
+    """Return the canonical webhook URL for an explicit secret token.
+
+    This helper is intentionally separate from _runtime_webhook_secret_token()
+    so secret rotation can safely call Telegram setWebhook with a new token
+    before persisting that token into Redis/runtime state.  That prevents a
+    failed setWebhook call from making the app reject Telegram's still-active
+    old webhook path with 403 Invalid path secret.
+    """
+    base_url = _runtime_webhook_base_url()
+    secret_token = str(secret_token or "").strip()
+    if not base_url:
+        raise RuntimeError("BOT_MODE=WEBHOOK requires TELEGRAM_WEBHOOK_URL.")
+    if not secret_token:
+        raise RuntimeError("BOT_MODE=WEBHOOK requires TELEGRAM_WEBHOOK_SECRET_TOKEN.")
+    return f"{base_url}/tg-webhook-{quote(secret_token, safe='')}"
+
+
+def _telegram_webhook_target_url() -> str:
+    """Canonical public Telegram webhook URL registered with setWebhook.
+
+    Telegram calls this exact route.  The token is URL-escaped for path safety
+    while the Bot API secret header still carries the raw token value.
+    """
+    return _telegram_webhook_target_url_for_secret(_runtime_webhook_secret_token())
+
+
+def _telegram_allowed_updates() -> list[str]:
+    """Return setWebhook allowed_updates from env/runtime safely.
+
+    Defaults to the update types this bot actually handles. Operators can add
+    edited_message, my_chat_member, etc. with TELEGRAM_ALLOWED_UPDATES without
+    touching code.
+    """
+    raw = str(
+        os.environ.get("TELEGRAM_ALLOWED_UPDATES")
+        or getattr(SETTINGS, "TELEGRAM_ALLOWED_UPDATES", "message,callback_query")
+        or "message,callback_query"
+    )
+    allowed = []
+    for item in raw.split(","):
+        item = item.strip()
+        if item and re.fullmatch(r"[a-z_]+", item) and item not in allowed:
+            allowed.append(item)
+    return allowed or ["message", "callback_query"]
+
+
+_WEBHOOK_UPDATE_MEMORY: OrderedDict[int, tuple[str, float]] = OrderedDict()
+_WEBHOOK_UPDATE_MEMORY_LOCK = threading.RLock()
+
+
+def _webhook_replay_ttl_seconds() -> int:
+    return _env_int("WEBHOOK_REPLAY_TTL_S", 600, minimum=60, maximum=86400)
+
+
+def _webhook_processing_ttl_seconds() -> int:
+    return _env_int("WEBHOOK_PROCESSING_TTL_S", 120, minimum=15, maximum=_webhook_replay_ttl_seconds())
+
+
+def _telegram_webhook_update_id(update_id: Any) -> int | None:
+    try:
+        return int(update_id)
+    except Exception:
+        return None
+
+
+def _telegram_webhook_replay_key(uid: int) -> str:
+    return _redis_key("tg_update_seen", uid) if "_redis_key" in globals() else f"tg_update_seen:{uid}"
+
+
+def _trim_webhook_memory_locked(now: float, ttl: int) -> None:
+    stale_before = now - ttl
+    for old_uid, (_state, old_ts) in list(_WEBHOOK_UPDATE_MEMORY.items())[:5000]:
+        if old_ts < stale_before:
+            _WEBHOOK_UPDATE_MEMORY.pop(old_uid, None)
+    while len(_WEBHOOK_UPDATE_MEMORY) > 50_000:
+        _WEBHOOK_UPDATE_MEMORY.popitem(last=False)
+
+
+async def _telegram_webhook_update_claim(update_id: Any) -> str:
+    """Return claimed, processing, completed, or invalid for an update id."""
+    uid = _telegram_webhook_update_id(update_id)
+    if uid is None:
+        return "invalid"
+
+    redis_obj = globals().get("redis_client")
+    if redis_obj is not None:
+        key = _telegram_webhook_replay_key(uid)
+        processing_ttl = _webhook_processing_ttl_seconds()
+        try:
+            created = await asyncio.to_thread(lambda: redis_obj.set(key, "processing", ex=processing_ttl, nx=True))
+            if created:
+                return "claimed"
+            raw = await asyncio.to_thread(lambda: redis_obj.get(key))
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="ignore")
+            return "completed" if str(raw or "").lower() == "done" else "processing"
+        except Exception as exc:
+            _log_once(logging.WARNING, "webhook_replay_redis_fallback", "Webhook replay Redis fallback: %s", exc)
+
+    now = time.monotonic()
+    ttl = _webhook_replay_ttl_seconds()
+    with _WEBHOOK_UPDATE_MEMORY_LOCK:
+        _trim_webhook_memory_locked(now, ttl)
+        existing = _WEBHOOK_UPDATE_MEMORY.get(uid)
+        if existing:
+            state, _ts = existing
+            _WEBHOOK_UPDATE_MEMORY.move_to_end(uid)
+            return "completed" if state == "done" else "processing"
+        _WEBHOOK_UPDATE_MEMORY[uid] = ("processing", now)
+        _trim_webhook_memory_locked(now, ttl)
+        return "claimed"
+
+
+async def _telegram_webhook_update_complete(update_id: Any) -> None:
+    uid = _telegram_webhook_update_id(update_id)
+    if uid is None:
+        return
+    redis_obj = globals().get("redis_client")
+    if redis_obj is not None:
+        key = _telegram_webhook_replay_key(uid)
+        try:
+            await asyncio.to_thread(lambda: redis_obj.set(key, "done", ex=_webhook_replay_ttl_seconds()))
+        except Exception as exc:
+            _log_once(logging.WARNING, "webhook_replay_complete_fallback", "Webhook replay completion Redis fallback: %s", exc)
+    now = time.monotonic()
+    with _WEBHOOK_UPDATE_MEMORY_LOCK:
+        _WEBHOOK_UPDATE_MEMORY[uid] = ("done", now)
+        _WEBHOOK_UPDATE_MEMORY.move_to_end(uid)
+        _trim_webhook_memory_locked(now, _webhook_replay_ttl_seconds())
+
+
+async def _telegram_webhook_update_release(update_id: Any) -> None:
+    uid = _telegram_webhook_update_id(update_id)
+    if uid is None:
+        return
+    redis_obj = globals().get("redis_client")
+    if redis_obj is not None:
+        key = _telegram_webhook_replay_key(uid)
+        script = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end"
+        try:
+            await asyncio.to_thread(lambda: redis_obj.eval(script, 1, key, "processing"))
+        except Exception as exc:
+            _log_once(logging.WARNING, "webhook_replay_release_fallback", "Webhook replay release Redis fallback: %s", exc)
+    with _WEBHOOK_UPDATE_MEMORY_LOCK:
+        existing = _WEBHOOK_UPDATE_MEMORY.get(uid)
+        if existing and existing[0] == "processing":
+            _WEBHOOK_UPDATE_MEMORY.pop(uid, None)
+
+
+async def _read_limited_webhook_body(req: FastAPIRequest, max_body: int) -> bytes:
+    """Read Telegram webhook payloads with a hard body cap.
+
+    Content-Length is rejected before body streaming.  The chunked stream path
+    also enforces the cap so a missing/lying header cannot flood memory.
+    """
+    content_length = req.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > max_body:
+                raise HTTPException(status_code=413, detail=f"Request body too large. Max {max_body} bytes.")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length header.")
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in req.stream():
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > max_body:
+            raise HTTPException(status_code=413, detail=f"Request body too large. Max {max_body} bytes.")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _process_telegram_webhook_request(req: FastAPIRequest, path_secret_token: str | None = None):
+    """Validate, parse, claim, and process a Telegram webhook update safely."""
+    if "_run_state_bot_mode" in globals() and _run_state_bot_mode() != "WEBHOOK":
+        webhook_logger.info("Webhook update ignored because BOT_MODE=%s.", _run_state_bot_mode())
+        return _FastJSONResponse({"status": "ignored", "reason": "not_webhook_mode"}, status_code=200)
+
+    expected_secret = _runtime_webhook_secret_token()
+    if not expected_secret:
+        webhook_logger.error("Rejected Telegram webhook request because TELEGRAM_WEBHOOK_SECRET_TOKEN is not configured.")
+        raise HTTPException(status_code=503, detail="Telegram webhook secret is not configured.")
+    if path_secret_token is not None and not hmac.compare_digest(str(path_secret_token), expected_secret):
+        webhook_logger.warning("Rejected Telegram webhook request with invalid path secret from %s", req.client.host if req.client else "unknown")
+        raise HTTPException(status_code=403, detail="Invalid webhook path secret.")
+
+    got_secret = (req.headers.get("X-Telegram-Bot-Api-Secret-Token") or "").strip()
+    if not hmac.compare_digest(got_secret, expected_secret):
+        webhook_logger.warning("Rejected Telegram webhook request with invalid secret header from %s", req.client.host if req.client else "unknown")
+        raise HTTPException(status_code=403, detail="Invalid webhook secret.")
+
+    app_obj = globals().get("telegram_application") or globals().get("_TELEGRAM_APP")
+    if app_obj is None or not bool(globals().get("_TELEGRAM_APP_READY", False)):
+        webhook_logger.warning("Telegram webhook rejected with 503 because application is not ready yet.")
+        raise HTTPException(status_code=503, detail="Telegram application is starting. Please retry.")
+    if not _telegram_should_process_webhook_update():
+        webhook_logger.info("Webhook update acknowledged by standby instance; active owner=%s", _telegram_leader_snapshot().get("owner"))
+        return _FastJSONResponse({"status": "ignored", "reason": "standby_instance"}, status_code=200)
+
+    max_body = min(_web_max_content_length(), 2 * 1024 * 1024)
+    try:
+        raw = await _read_limited_webhook_body(req, max_body)
+        data = _json_loads_fast(raw)
+        if not isinstance(data, dict):
+            raise ValueError("Telegram webhook JSON must be an object.")
+        update = Update.de_json(data, app_obj.bot)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Telegram itself should never send malformed JSON. Acknowledge an
+        # invalid payload once so a permanently bad body cannot create a retry
+        # storm, while keeping real handler failures retryable below.
+        error_id = secrets.token_hex(6)
+        webhook_logger.warning(
+            "Invalid Telegram webhook payload ignored error_id=%s: %s",
+            error_id,
+            exc,
+            exc_info=True,
+        )
+        return _FastJSONResponse({
+            "status": "ignored",
+            "reason": "invalid_payload",
+            "reference": error_id,
+        }, status_code=200)
+
+    update_id = getattr(update, "update_id", None)
+    claimed = False
+    try:
+        claim_state = await _telegram_webhook_update_claim(update_id)
+        if claim_state == "completed":
+            webhook_logger.info("Completed Telegram webhook update ignored update_id=%s", update_id)
+            _metric_inc("replay_dropped")
+            return _FastJSONResponse({"status": "ok", "duplicate": True}, status_code=200)
+        if claim_state == "processing":
+            response = _FastJSONResponse({"status": "retry", "reason": "already_processing"}, status_code=503)
+            response.headers["Retry-After"] = "2"
+            return response
+        claimed = claim_state == "claimed"
+        await app_obj.process_update(update)
+        await _telegram_webhook_update_complete(update_id)
+    except Exception as exc:
+        if claimed:
+            await _telegram_webhook_update_release(update_id)
+        error_id = secrets.token_hex(6)
+        webhook_logger.error(
+            "Telegram webhook processing failed error_id=%s update_id=%s: %s",
+            error_id,
+            update_id,
+            exc,
+            exc_info=True,
+        )
+        response = _FastJSONResponse({
+            "status": "retry",
+            "reason": "processing_failed",
+            "reference": error_id,
+        }, status_code=503)
+        response.headers["Retry-After"] = "2"
+        return response
+
+    return _FastJSONResponse({"status": "ok"}, status_code=200)
+
+
+@app.post("/tg-webhook-{secret_token}", include_in_schema=False)
+async def telegram_webhook_ingest(secret_token: str, req: FastAPIRequest):
+    return await _process_telegram_webhook_request(req, secret_token)
+
+
+@app.post("/telegram/webhook", include_in_schema=False)
+@app.post("/telegram-webhook", include_in_schema=False)
+async def telegram_webhook(req: FastAPIRequest):
+    """Backward-compatible webhook route kept for older deployments.
+
+    New deployments should use /tg-webhook-{secret_token}; setWebhook now
+    registers that canonical route automatically.
+    """
+    return await _process_telegram_webhook_request(req, None)
+
+
+async def _configure_telegram_webhook_via_http_for_secret(secret_token: str) -> None:
+    """Configure Telegram webhook for an explicit secret token with 429 retry.
+
+    Used by rotation so the remote Telegram webhook is updated first.  Only
+    after this function succeeds should the new token be saved to RUN_STATE.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
+
+    secret_token = str(secret_token or "").strip()
+    target_url = _telegram_webhook_target_url_for_secret(secret_token)
+
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+    payload = {
+        "url": target_url,
+        "allowed_updates": _telegram_allowed_updates(),
+        # Keep pending updates by default so a Render restart/deploy does not
+        # silently lose user messages. Set TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES=true
+        # only when intentionally clearing a broken backlog.
+        "drop_pending_updates": _env_bool("TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES", False),
+        "secret_token": secret_token,
+    }
+    timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
+    max_attempts = _env_int("TELEGRAM_SETWEBHOOK_MAX_RETRIES", 3, minimum=1, maximum=10)
+    last_error: str | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        async with httpx.AsyncClient(timeout=timeout, limits=_make_httpx_limits_from_run_state()) as client:
+            resp = await client.post(api_url, json=payload)
+        try:
+            data = _json_loads_fast(resp.content)
+        except Exception:
+            data = {"ok": False, "description": resp.text[:500]}
+
+        if resp.status_code == 429:
+            retry_after = 1
+            try:
+                retry_after = int((data.get("parameters") or {}).get("retry_after") or 1)
+            except Exception:
+                retry_after = 1
+            last_error = f"Telegram setWebhook rate-limited status=429 response={str(data)[:500]}"
+            if attempt < max_attempts:
+                webhook_logger.warning(
+                    "Telegram setWebhook rate-limited; retrying after %ss attempt=%s/%s",
+                    retry_after,
+                    attempt,
+                    max_attempts,
+                )
+                await asyncio.sleep(max(1, retry_after))
+                continue
+
+        if resp.status_code >= 400 or not bool(data.get("ok")):
+            raise RuntimeError(f"Telegram setWebhook failed status={resp.status_code} response={str(data)[:500]}")
+
+        webhook_logger.info(
+            "Telegram webhook configured via HTTPX url=%s max_connections=%s keepalive=%s",
+            target_url,
+            _run_state_http_max_connections(),
+            min(max(2, int(HTTP_MAX_KEEPALIVE_CONNECTIONS or 20)), _run_state_http_max_connections()),
+        )
+        return
+
+    raise RuntimeError(last_error or "Telegram setWebhook rate-limited after retries.")
+
+
+async def _configure_telegram_webhook_via_http() -> None:
+    """Configure Telegram webhook using the currently persisted runtime token."""
+    await _configure_telegram_webhook_via_http_for_secret(_runtime_webhook_secret_token())
+
+
+async def set_telegram_webhook() -> None:
+    """Public compatibility wrapper used by runtime admin orchestration."""
+    await _configure_telegram_webhook_via_http()
+
+
+async def _bootstrap_runtime_security() -> dict[str, Any]:
+    """Load persistent secrets and synchronize webhook state before serving."""
+
+    global TELEGRAM_WEBHOOK_SECRET_TOKEN
+    global _WEB_SESSION_SECRET_CACHE, _WEB_SESSION_SECRET_SOURCE_CACHE
+
+    from app.core.security import (
+        bootstrap_runtime_secrets,
+        get_runtime_secret_manager,
+    )
+
+    state = await bootstrap_runtime_secrets(
+        redis_client=globals().get("redis_client"),
+        redis_url=str(
+            globals().get("REDIS_URL")
+            or os.environ.get("REDIS_URL")
+            or getattr(SETTINGS, "REDIS_URL", "")
+            or ""
+        ),
+        redis_prefix=str(os.environ.get("REDIS_CACHE_PREFIX") or "tgbot"),
+        strict=True,
+    )
+    persistent_web_secret = state.value("WEB_SECRET_KEY")
+    if (
+        _WEB_SESSION_SECRET_CACHE
+        and not hmac.compare_digest(_WEB_SESSION_SECRET_CACHE, persistent_web_secret)
+    ):
+        raise RuntimeError(
+            "The FastAPI session middleware was created before persistent Redis "
+            "secrets were available. Ensure REDIS_URL is present in .env before "
+            "the process imports app.main, then restart."
+        )
+
+    _WEB_SESSION_SECRET_CACHE = persistent_web_secret
+    _WEB_SESSION_SECRET_SOURCE_CACHE = state.records["WEB_SECRET_KEY"].source
+    globals()["WEB_SECRET_KEY"] = persistent_web_secret
+    globals()["FLASK_SECRET_KEY"] = state.value("FLASK_SECRET_KEY")
+    app_flask.config["SECRET_KEY"] = state.value("FLASK_SECRET_KEY")
+
+    TELEGRAM_WEBHOOK_SECRET_TOKEN = state.value("TELEGRAM_WEBHOOK_SECRET_TOKEN")
+    if isinstance(globals().get("RUN_STATE"), dict):
+        RUN_STATE["TELEGRAM_WEBHOOK_SECRET_TOKEN"] = TELEGRAM_WEBHOOK_SECRET_TOKEN
+
+    webhook_registered = False
+    if _run_state_bot_mode() == "WEBHOOK" and state.webhook_registration_required:
+        webhook_registered = await get_runtime_secret_manager().ensure_webhook_registered(
+            _configure_telegram_webhook_via_http_for_secret
+        )
+    current_state = get_runtime_secret_manager().current() or state
+
+    return {
+        "secrets": current_state.redacted_status(),
+        "webhook_registration_required": current_state.webhook_registration_required,
+        "webhook_registered": webhook_registered,
+    }
+
+
+# Webhook secret rotation guard.  Telegram rate-limits setWebhook calls, and
+# rapid repeated rotation can desynchronise Telegram's registered path from the
+# app's Redis RUN_STATE secret.  Keep rotation serialized and cooled down.
+_WEBHOOK_ROTATE_ASYNC_LOCK: asyncio.Lock | None = None
+_WEBHOOK_ROTATE_SYNC_LOCK = threading.Lock()
+_WEBHOOK_ROTATE_IN_PROGRESS = False
+_WEBHOOK_LAST_ROTATE_AT = 0.0
+
+
+def _webhook_rotate_cooldown_seconds() -> float:
+    return _env_float("WEBHOOK_ROTATE_COOLDOWN_S", 60.0, minimum=5.0, maximum=3600.0)
+
+
+def _webhook_rotate_lock() -> asyncio.Lock:
+    global _WEBHOOK_ROTATE_ASYNC_LOCK
+    if _WEBHOOK_ROTATE_ASYNC_LOCK is None:
+        _WEBHOOK_ROTATE_ASYNC_LOCK = asyncio.Lock()
+    return _WEBHOOK_ROTATE_ASYNC_LOCK
+
+
+def _webhook_rotate_cooldown_remaining() -> float:
+    elapsed = time.monotonic() - float(globals().get("_WEBHOOK_LAST_ROTATE_AT", 0.0) or 0.0)
+    return max(0.0, _webhook_rotate_cooldown_seconds() - elapsed)
+
+
+def _webhook_rotate_begin_or_remaining() -> float:
+    """Reserve one rotation attempt.
+
+    Returns:
+      0.0  -> reservation acquired
+      >0.0 -> cooldown seconds remaining
+      -1.0 -> another rotation is already running
+    """
+    global _WEBHOOK_ROTATE_IN_PROGRESS
+    with _WEBHOOK_ROTATE_SYNC_LOCK:
+        if _WEBHOOK_ROTATE_IN_PROGRESS:
+            return -1.0
+        remaining = _webhook_rotate_cooldown_remaining()
+        if remaining > 0:
+            return remaining
+        _WEBHOOK_ROTATE_IN_PROGRESS = True
+        return 0.0
+
+
+def _webhook_rotate_finish(success: bool) -> None:
+    global _WEBHOOK_ROTATE_IN_PROGRESS, _WEBHOOK_LAST_ROTATE_AT
+    with _WEBHOOK_ROTATE_SYNC_LOCK:
+        if success:
+            _WEBHOOK_LAST_ROTATE_AT = time.monotonic()
+        _WEBHOOK_ROTATE_IN_PROGRESS = False
+
+
+async def run_fastapi():
+    """Run the FastAPI dashboard inside the main asyncio runtime."""
+    import uvicorn
+    port = _env_int("PORT", 8080, minimum=1, maximum=65535)
+    config = uvicorn.Config(
+        app,
+        host="0.0.0.0",
+        port=port,
+        log_level=os.environ.get("UVICORN_LOG_LEVEL", "info").lower(),
+        proxy_headers=_env_bool("WEB_TRUST_PROXY", _env_bool("RENDER", False)),
+        forwarded_allow_ips="*" if _env_bool("WEB_TRUST_PROXY", _env_bool("RENDER", False)) else None,
+    )
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
+async def keep_alive_async(stop_event: asyncio.Event | None = None):
+    """Self-ping every 4 min with non-blocking HTTPX instead of requests."""
+    logger_ka = logging.getLogger("keep_alive")
+    render_url = (os.environ.get("RENDER_EXTERNAL_URL") or getattr(SETTINGS, "RENDER_EXTERNAL_URL", "") or "").strip().rstrip("/")
+    if not render_url:
+        logger_ka.warning("RENDER_EXTERNAL_URL not set — self-ping disabled.")
+        return
+
+    await asyncio.sleep(10)
+    headers = {"User-Agent": "Mozilla/5.0 (AsyncKeepAlive/2.0)", "Accept": "text/plain,*/*"}
+
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True, limits=_make_httpx_limits_from_run_state()) as client:
+        while stop_event is None or not stop_event.is_set():
+            urls = [render_url]
+            if not render_url.endswith("/ping"):
+                urls.append(f"{render_url}/ping")
+
+            ok = False
+            for url in urls:
+                try:
+                    r = await client.get(url, headers=headers)
+                    if 200 <= r.status_code < 400:
+                        logger_ka.info(f"Keep-alive OK -> {r.status_code} {url}")
+                        ok = True
+                        break
+                    logger_ka.warning(f"Keep-alive non-OK -> {r.status_code} {url}")
+                except Exception as e:
+                    logger_ka.warning(f"Keep-alive failed for {url}: {e}")
+
+            if not ok:
+                logger_ka.warning("Keep-alive failed for all URLs. Check RENDER_EXTERNAL_URL.")
+
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=240) if stop_event else await asyncio.sleep(240)
+            except asyncio.TimeoutError:
+                pass
+
+
+def run_flask():
+    """Backward-compatible alias. Prefer run_fastapi()."""
+    asyncio.run(run_fastapi())
+
+def keep_alive():
+    """Backward-compatible alias. Prefer keep_alive_async()."""
+    asyncio.run(keep_alive_async())
+
+# ── AI Assistant REST API ──────────────────────────────────────────────────
+
+InferenceClient = None
+_HUGGINGFACE_IMPORT_ATTEMPTED = False
+
+
+def _load_huggingface_sdk() -> bool:
+    """Load huggingface_hub only when a configured provider needs it."""
+    global InferenceClient, _HUGGINGFACE_IMPORT_ATTEMPTED
+    if _HUGGINGFACE_IMPORT_ATTEMPTED:
+        return InferenceClient is not None
+    with _OPTIONAL_SDK_IMPORT_LOCK:
+        if _HUGGINGFACE_IMPORT_ATTEMPTED:
+            return InferenceClient is not None
+        _HUGGINGFACE_IMPORT_ATTEMPTED = True
+        try:
+            from huggingface_hub import InferenceClient as imported_inference_client
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Optional dependency huggingface_hub is not available; Hugging Face inference disabled: %s",
+                exc,
+            )
+            return False
+        InferenceClient = imported_inference_client
+        return True
+
+_AI_API_MAX_IMAGE_BYTES   = 10 * 1024 * 1024   # 10 MB
+_AI_API_MAX_AUDIO_BYTES   = 50 * 1024 * 1024   # 50 MB
+_AI_API_MAX_MESSAGE_CHARS = 32_000
+_AI_API_MAX_HISTORY_TURNS = 20
+_AI_API_MAX_HISTORY_TURN_CHARS = 8_000
+_AI_API_MAX_HISTORY_CHARS = 64_000
+
+_AI_ALLOWED_IMAGE_MIME = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+_AI_ALLOWED_AUDIO_MIME = {
+    "audio/mpeg", "audio/mp3", "audio/wav", "audio/ogg", "audio/flac",
+    "audio/aac", "audio/opus", "audio/webm", "audio/mp4", "audio/x-m4a",
+    "video/mp4", "video/webm",
+}
+
+_AI_SYSTEM_PROMPT = (
+    "You are a helpful AI assistant that supports Khmer, English, Chinese, Korean, and Japanese. "
+    "Always reply in the same language the user uses. "
+    "If the user sends an image, describe and analyse it fully. "
+    "If the user sends audio, provide an accurate transcription then answer any follow-up. "
+    "Be concise, accurate, and friendly. "
+    "Never refuse reasonable requests. "
+    "Format answers clearly using plain text (no markdown unless the user asks for it)."
+)
+
+# ---------------------------------------------------------------------------
+# Concurrency limits
+# ---------------------------------------------------------------------------
+MAX_CONCURRENT_TTS_USERS   = _env_int("MAX_CONCURRENT_TTS_USERS", int(_perf_default("MAX_CONCURRENT_TTS_USERS", 2)), minimum=1, maximum=50)
+MAX_CONCURRENT_AI          = _env_int("MAX_CONCURRENT_AI", _env_int("MAX_CONCURRENT_GEMINI", 3, minimum=1), minimum=1, maximum=50)
+MAX_CONCURRENT_BROADCAST   = _env_int("MAX_CONCURRENT_BROADCAST", 3, minimum=1, maximum=50)
+BROADCAST_BATCH_SIZE       = _env_int("BROADCAST_BATCH_SIZE", MAX_CONCURRENT_BROADCAST, minimum=1, maximum=500)
+BROADCAST_INTER_BATCH_DELAY = _env_float("BROADCAST_INTER_BATCH_DELAY", 0.20, minimum=0.0, maximum=30.0)
+TTS_RESOLVER_AI_ENABLED    = _env_bool("TTS_RESOLVER_AI_ENABLED", False)
+
+# ---------------------------------------------------------------------------
+# Subtitle/Text document support
+# ---------------------------------------------------------------------------
+SUBTITLE_EXTENSIONS = {".srt", ".vtt", ".txt"}
+MAX_SUBTITLE_BYTES  = 2 * 1024 * 1024
+MAX_SUBTITLE_CHARS  = 20_000
+
+
+def _ai_error(msg: str, code: int = 400):
+    return jsonify({"ok": False, "error": msg, "code": code}), code
+
+
+def _ai_allowed_origin() -> str:
+    """Return a safe CORS origin for public AI API responses.
+
+    Default is same-origin only (no wildcard).  Set AI_API_ALLOWED_ORIGINS to a
+    comma-separated allowlist, or to * only if you intentionally expose the API
+    to browser clients from any origin.
+    """
+    origin = (request.headers.get("Origin") or "").strip()
+    raw = str(os.environ.get("AI_API_ALLOWED_ORIGINS") or getattr(SETTINGS, "AI_API_ALLOWED_ORIGINS", "") or "").strip()
+    if not raw or not origin:
+        return ""
+    allowed = {item.strip() for item in raw.split(",") if item.strip()}
+    if "*" in allowed:
+        return "*"
+    return origin if origin in allowed else ""
+
+
+def _apply_ai_cors_headers(resp):
+    allowed_origin = _ai_allowed_origin()
+    if allowed_origin:
+        resp.headers["Access-Control-Allow-Origin"] = allowed_origin
+        resp.headers["Vary"] = "Origin"
+    resp.headers.setdefault("Access-Control-Allow-Methods", "POST, OPTIONS")
+    resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key")
+    resp.headers.setdefault("Access-Control-Max-Age", "600")
+    return resp
+
+
+def _ai_cors(response_or_tuple):
+    if isinstance(response_or_tuple, tuple):
+        resp, code = response_or_tuple
+        return _apply_ai_cors_headers(resp), code
+    return _apply_ai_cors_headers(response_or_tuple)
+
+
+def _ai_cors_preflight():
+    return _apply_ai_cors_headers(Response("", status=204))
+
+
+def _ai_public_failure(message: str, exc: BaseException, status_code: int = 500, *, warning: bool = False):
+    """Log detailed provider failures while returning a non-sensitive error."""
+    error_id = secrets.token_hex(6)
+    log_fn = logging.getLogger(__name__).warning if warning else logging.getLogger(__name__).error
+    log_fn("AI API failure error_id=%s: %s", error_id, exc, exc_info=not warning)
+    return _ai_cors(_ai_error(f"{message} Reference: {error_id}", status_code))
+
+
+def _decode_base64_limited(value: Any, max_bytes: int, label: str) -> tuple[bytes | None, str | None]:
+    """Decode strict base64 without allowing oversized encoded payloads."""
+    if not isinstance(value, str) or not value.strip():
+        return None, f"Missing {label} base64 data."
+    encoded = "".join(value.split())
+    # Base64 expands binary data by roughly 4/3. Reject before decoding to
+    # avoid creating a large temporary allocation for obviously oversized data.
+    max_encoded = ((max(0, int(max_bytes)) + 2) // 3) * 4 + 8
+    if len(encoded) > max_encoded:
+        return None, f"{label.capitalize()} too large."
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except Exception:
+        return None, f"Invalid base64 {label} data."
+    if len(decoded) > max_bytes:
+        return None, f"{label.capitalize()} too large."
+    return decoded, None
+
+
+def _normalise_ai_history(value: Any) -> tuple[list[dict[str, str]], str | None]:
+    if value in (None, ""):
+        return [], None
+    if not isinstance(value, list):
+        return [], "History must be a JSON array."
+    if len(value) > _AI_API_MAX_HISTORY_TURNS:
+        return [], f"History has too many turns (max {_AI_API_MAX_HISTORY_TURNS})."
+
+    cleaned: list[dict[str, str]] = []
+    total_chars = 0
+    for index, turn in enumerate(value):
+        if not isinstance(turn, dict):
+            return [], f"History item {index + 1} must be an object."
+        role = str(turn.get("role") or "user").strip().lower()
+        if role not in {"user", "assistant", "model"}:
+            return [], f"History item {index + 1} has an invalid role."
+        content = turn.get("content", "")
+        if not isinstance(content, str):
+            return [], f"History item {index + 1} content must be text."
+        if len(content) > _AI_API_MAX_HISTORY_TURN_CHARS:
+            return [], f"History item {index + 1} is too long."
+        total_chars += len(content)
+        if total_chars > _AI_API_MAX_HISTORY_CHARS:
+            return [], f"History is too long (max {_AI_API_MAX_HISTORY_CHARS} chars)."
+        cleaned.append({"role": role, "content": content})
+    return cleaned, None
+
+
+def _normalise_ai_message(value: Any) -> tuple[str, str | None]:
+    if value is None:
+        return "", None
+    if not isinstance(value, str):
+        return "", "Message must be text."
+    message = value.strip()
+    if len(message) > _AI_API_MAX_MESSAGE_CHARS:
+        return "", f"Message too long (max {_AI_API_MAX_MESSAGE_CHARS} chars)."
+    return message, None
+
+
+def _looks_like_japanese_han_phrase(text: str) -> bool:
+    """Small dependency-free hint for common Japanese-only Han phrases.
+
+    Han/Kanji-only CJK is inherently ambiguous, so this function is deliberately
+    conservative because words such as 東京 can be valid Chinese or Japanese.
+    """
+    compact = re.sub(r"\s+", "", str(text or ""))
+    if not compact:
+        return False
+    japanese_han_hints = ("日本語", "仮名", "片仮名", "平仮名")
+    return any(item in compact for item in japanese_han_hints)
+
+
+_DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+_ARABIC_SCRIPT_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
+_LATIN_WORD_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ']+")
+
+# Malay and Indonesian share much of their vocabulary, and Filipino also uses
+# the Latin alphabet. These weighted markers intentionally require a strong
+# signal; short or ambiguous Latin text safely falls back to English.
+_LATIN_LANGUAGE_MARKERS: dict[str, dict[str, int]] = {
+    "id": {
+        "bahwa": 3, "karena": 2, "adalah": 2, "bisa": 2, "kalian": 2,
+        "nggak": 3, "tidak": 1, "saya": 1, "dari": 1, "kepada": 1,
+        "sedang": 1, "sudah": 1, "belum": 1, "juga": 1,
+    },
+    "ms": {
+        "bahawa": 3, "kerana": 2, "ialah": 3, "boleh": 2, "awak": 2,
+        "daripada": 2, "tak": 1, "tidak": 1, "saya": 1, "kepada": 1,
+        "sedang": 1, "sudah": 1, "belum": 1, "juga": 1,
+    },
+    "fil": {
+        "kumusta": 3, "salamat": 2, "mga": 3, "hindi": 2, "mayroon": 2,
+        "ngunit": 2, "ako": 1, "ikaw": 1, "natin": 1, "ninyo": 2,
+        "ito": 1, "iyon": 2, "opo": 3, "po": 1,
+    },
+}
+
+
+def _detect_latin_tts_language(text: str) -> str:
+    """Conservatively detect Indonesian, Malay, or Filipino Latin text."""
+    words = [word.lower() for word in _LATIN_WORD_RE.findall(str(text or ""))]
+    if not words:
+        return ""
+    scores = {
+        lang: sum(markers.get(word, 0) for word in words)
+        for lang, markers in _LATIN_LANGUAGE_MARKERS.items()
+    }
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    best_lang, best_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else 0
+    if best_score >= 3 and best_score - second_score >= 2:
+        return best_lang
+    return ""
+
+
+def _detect_lang(text: str) -> str:
+    """Detect the dominant writing system without accepting manual overrides."""
+    text = str(text or "")
+    khmer = sum(1 for c in text if "\u1780" <= c <= "\u17FF")
+    korean = sum(1 for c in text if "\u1100" <= c <= "\u11FF" or "\u3130" <= c <= "\u318F" or "\uAC00" <= c <= "\uD7AF")
+    japanese = sum(1 for c in text if "\u3040" <= c <= "\u30FF" or "\u31F0" <= c <= "\u31FF")
+    chinese = sum(1 for c in text if "\u3400" <= c <= "\u4DBF" or "\u4E00" <= c <= "\u9FFF" or "\uF900" <= c <= "\uFAFF")
+    devanagari = len(_DEVANAGARI_RE.findall(text))
+    arabic = len(_ARABIC_SCRIPT_RE.findall(text))
+    latin = sum(1 for c in text if ("A" <= c <= "Z") or ("a" <= c <= "z"))
+    signal_total = khmer + korean + japanese + chinese + devanagari + arabic + latin
+    if signal_total <= 0:
+        return "en"
+    if khmer and khmer / signal_total >= 0.15:
+        return "km"
+    if korean and korean / signal_total >= 0.15:
+        return "ko"
+    if japanese and japanese / signal_total >= 0.08:
+        return "ja"
+    if _looks_like_japanese_han_phrase(text):
+        return "ja"
+    if chinese and chinese / signal_total >= 0.15:
+        return "zh"
+    if devanagari and devanagari / signal_total >= 0.15:
+        return "hi"
+    if arabic and arabic / signal_total >= 0.15:
+        return "ar"
+    return _detect_latin_tts_language(text) or "en"
+
+
+_LANGUAGE_FLAGS = {
+    "km": "🇰🇭",
+    "en": "🇺🇸",
+    "zh": "🇨🇳",
+    "ko": "🇰🇷",
+    "ja": "🇯🇵",
+    "hi": "🇮🇳",
+    "ms": "🇲🇾",
+    "id": "🇮🇩",
+    "fil": "🇵🇭",
+    "ar": "🇸🇦",
+}
+_LANGUAGE_NAMES = {
+    "km": "Khmer",
+    "en": "English",
+    "zh": "Chinese",
+    "ko": "Korean",
+    "ja": "Japanese",
+    "hi": "Hindi (India)",
+    "ms": "Malay (Malaysia)",
+    "id": "Indonesian",
+    "fil": "Filipino (Philippines)",
+    "ar": "Arabic",
+}
+
+
+def _language_display(lang_key: str) -> tuple[str, str]:
+    lang_key = str(lang_key or "en").lower().strip()
+    return _LANGUAGE_FLAGS.get(lang_key, "🌐"), _LANGUAGE_NAMES.get(lang_key, lang_key.upper() or "Unknown")
+
+
+# ---------------------------------------------------------------------------
+# Local time display / schedule input
+# ---------------------------------------------------------------------------
+# Keep database/scheduler timestamps in UTC, but show and accept admin-facing
+# times in Phnom Penh local time by default: ICT, UTC+7, AM/PM format.
+APP_TIMEZONE_NAME = (
+    os.environ.get("APP_TIMEZONE")
+    or os.environ.get("WEB_ADMIN_TIMEZONE")
+    or "Asia/Phnom_Penh"
+).strip() or "Asia/Phnom_Penh"
+APP_TIMEZONE_ALIAS = (os.environ.get("APP_TIMEZONE_ALIAS") or "ICT").strip() or "ICT"
+APP_TIMEZONE_UTC_LABEL = (os.environ.get("APP_TIMEZONE_UTC_LABEL") or "UTC+7").strip() or "UTC+7"
+
+
+def _load_app_timezone():
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(APP_TIMEZONE_NAME)
+        except Exception:
+            pass
+    # Safe fallback for Phnom Penh / Cambodia ICT if tzdata is unavailable.
+    return timezone(timedelta(hours=7), APP_TIMEZONE_ALIAS)
+
+
+APP_TIMEZONE = _load_app_timezone()
+
+
+def _local_now() -> datetime:
+    return datetime.now(APP_TIMEZONE)
+
+
+def _to_local_time(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        # Database values should normally be timezone-aware UTC. If a raw/naive
+        # datetime reaches the UI, treat it as UTC to avoid double-shifting.
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(APP_TIMEZONE)
+
+
+def _local_to_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=APP_TIMEZONE)
+    return dt.astimezone(timezone.utc)
+
+
+def _fmt_local_dt(dt: datetime | None = None) -> str:
+    local_dt = _to_local_time(dt or datetime.now(timezone.utc))
+    return f"{local_dt.strftime('%Y-%m-%d %I:%M %p')} {APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})"
+
+
+def _fmt_local_time_hint() -> str:
+    return f"Phnom Penh local time — AM/PM, {APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})"
+
+
+# ---------------------------------------------------------------------------
+# Dynamic AI API keys
+# ---------------------------------------------------------------------------
+# Admins can create AI access keys from Telegram with:
+#   /api create optional-name
+#
+# The raw key is shown only once. The bot stores only SHA-256 hashes in
+# Supabase table `ai_api_keys`, so a database leak does not expose usable keys.
+# Static AI_API_KEY is still supported for backwards compatibility.
+_AI_API_KEY_PREFIX = "sk-ai-"
+_AI_API_KEY_RANDOM_BYTES = 32
+_AI_API_KEY_DISPLAY_CHARS = 18
+_AI_API_KEY_VALIDATION_CACHE_TTL_S = _env_float("AI_API_KEY_CACHE_TTL_S", 60.0, minimum=1.0, maximum=3600.0)
+_AI_API_KEY_TOUCH_INTERVAL_S = _env_float("AI_API_KEY_TOUCH_INTERVAL_S", 60.0, minimum=1.0, maximum=3600.0)
+_AI_API_KEY_CACHE_MAX = 10_000
+
+_api_key_validation_cache: OrderedDict[str, tuple[bool, int | None, float]] = OrderedDict()
+_api_key_validation_cache_lock = threading.Lock()
+_api_key_touch_last: dict[int, float] = {}
+_api_key_touch_lock = threading.Lock()
+
+# Used only when Supabase is not configured. Keys created in this mode work
+# until the process restarts. Production should use Supabase.
+_api_keys_memory_by_hash: OrderedDict[str, dict] = OrderedDict()
+
+AI_API_KEYS_TABLE_SQL = """-- Required table for /api generated AI access keys
+-- Use your Supabase SQL editor. For production, set SUPABASE_SERVICE_ROLE_KEY
+-- on the bot server instead of a publishable/anon key.
+create table if not exists public.ai_api_keys (
+  id bigint generated by default as identity primary key,
+  key_prefix text not null,
+  key_hash text not null unique,
+  admin_id bigint not null,
+  note text,
+  active boolean not null default true,
+  created_at timestamptz not null default now(),
+  revoked_at timestamptz,
+  last_used_at timestamptz
+);
+
+create index if not exists ai_api_keys_key_hash_idx
+  on public.ai_api_keys (key_hash);
+
+create index if not exists ai_api_keys_active_idx
+  on public.ai_api_keys (active);
+
+alter table public.ai_api_keys enable row level security;
+
+drop policy if exists "service_role_ai_api_keys_all" on public.ai_api_keys;
+create policy "service_role_ai_api_keys_all"
+on public.ai_api_keys
+for all
+to service_role
+using (true)
+with check (true);
 """
 
-from __future__ import annotations
-
-from app import legacy as _legacy
-from app.main import app, create_app, main
-
-__all__ = ["app", "create_app", "main"]
 
 
-def __getattr__(name: str):
-    return getattr(_legacy, name)
+ADMIN_V2_TABLES_SQL = AI_API_KEYS_TABLE_SQL + """
 
+-- Optional but recommended tables for Admin Dashboard V2
+create table if not exists public.blocked_users (
+  user_id bigint primary key,
+  admin_id bigint,
+  reason text,
+  blocked_at timestamptz not null default now()
+);
 
-<<<<<<< HEAD
+create index if not exists blocked_users_blocked_at_idx
+  on public.blocked_users (blocked_at desc);
+
+alter table public.blocked_users enable row level security;
+
 drop policy if exists "service_role_blocked_users_all" on public.blocked_users;
 create policy "service_role_blocked_users_all"
 on public.blocked_users
@@ -654,15 +3367,6 @@ async def ai_transcribe():
     if len(audio_data) > _AI_API_MAX_AUDIO_BYTES:
         return _ai_cors(_ai_error("Audio too large (max 50 MB)."))
 
-    lang_hint = _normalise_lang_hint(request.form.get("language", "auto")) or "auto"
-    lang_instruction = {
-        "km": " The audio is in Khmer (ភាសាខ្មែរ).",
-        "en": " The audio is in English.",
-        "zh": " The audio is in Chinese (中文).",
-        "ko": " The audio is in Korean (한국어).",
-        "ja": " The audio is in Japanese (日本語).",
-    }.get(lang_hint, "")
-
     from google.genai import types as _gtypes
 
     def _transcribe_audio():
@@ -673,7 +3377,8 @@ async def ai_transcribe():
                 (
                     "Transcribe this audio exactly as spoken. "
                     "Output ONLY the transcribed text — no labels, no explanation, "
-                    "no timestamps." + lang_instruction
+                    "no timestamps. Detect the spoken language automatically and "
+                    "preserve its original script."
                 ),
             ],
         )
@@ -6463,7 +9168,7 @@ TELEGRAM_WEBHOOK_URL = (
     or getattr(SETTINGS, "RENDER_EXTERNAL_URL", "")
     or ""
 ).strip().rstrip("/")
-TELEGRAM_WEBHOOK_SECRET_TOKEN = (os.environ.get("TELEGRAM_WEBHOOK_SECRET_TOKEN") or getattr(SETTINGS, "TELEGRAM_WEBHOOK_SECRET_TOKEN", None) or "").strip()
+TELEGRAM_WEBHOOK_SECRET_TOKEN = ""
 
 # ── Render two-web-service safety ─────────────────────────────────────────
 # Telegram allows only one active webhook URL per bot token.  When the same
@@ -6765,7 +9470,13 @@ def _coerce_run_state_value(key: str, value: Any) -> Any:
         return str(value or "").strip().rstrip("/")
     if kind == "secret":
         token = str(value or "").strip()
-        if not token:
+        if key == "TELEGRAM_WEBHOOK_SECRET_TOKEN":
+            if not re.fullmatch(r"[A-Za-z0-9_-]{64}", token):
+                raise ValueError(
+                    "TELEGRAM_WEBHOOK_SECRET_TOKEN must contain exactly "
+                    "64 URL-safe characters."
+                )
+        elif not token:
             raise ValueError(f"{key} cannot be empty")
         return token
     return str(value if value is not None else "").strip()
@@ -6914,6 +9625,13 @@ async def _update_run_state(key: str, value: Any, *, persist: bool = True) -> No
         raise ValueError(f"Unsupported runtime setting: {key}")
 
     persisted_value = _coerce_run_state_value(key, value)
+    if key == "TELEGRAM_WEBHOOK_SECRET_TOKEN" and persist:
+        from app.core.security import get_runtime_secret_manager
+
+        await asyncio.to_thread(
+            get_runtime_secret_manager().persist_registered_webhook_secret_sync,
+            str(persisted_value),
+        )
     with RUN_STATE_LOCK:
         RUN_STATE[key] = persisted_value
         globals()[key] = persisted_value
@@ -7444,7 +10162,11 @@ def _refresh_arch_runtime_settings() -> None:
         or getattr(SETTINGS, "RENDER_EXTERNAL_URL", "")
         or ""
     ).strip().rstrip("/")
-    TELEGRAM_WEBHOOK_SECRET_TOKEN = (os.environ.get("TELEGRAM_WEBHOOK_SECRET_TOKEN") or getattr(SETTINGS, "TELEGRAM_WEBHOOK_SECRET_TOKEN", None) or "").strip()
+    # Runtime secret bootstrap populates this from Redis immediately after
+    # clients and persisted runtime state are loaded.
+    TELEGRAM_WEBHOOK_SECRET_TOKEN = str(
+        globals().get("TELEGRAM_WEBHOOK_SECRET_TOKEN") or ""
+    ).strip()
     USER_RATE_LIMIT_PER_SECOND = _env_int("USER_RATE_LIMIT_PER_SECOND", 3, minimum=1, maximum=100)
     USER_RATE_LIMIT_WINDOW_S = _env_float("USER_RATE_LIMIT_WINDOW_S", 1.0, minimum=0.25, maximum=60.0)
     API_RATE_LIMIT_PER_SECOND = _env_int("API_RATE_LIMIT_PER_SECOND", 20, minimum=1, maximum=1000)
@@ -7465,7 +10187,7 @@ DEFAULT_OCR_AUTO_PREFER_PROVIDER = "gemini"            # gemini | hf
 
 GEMINI_MODEL            = DEFAULT_GEMINI_MODEL
 HF_TOKEN                = ""
-HF_MODEL                = "Qwen/Qwen2.5-7B"
+HF_MODEL                = "Qwen/Qwen2.5-7B-Instruct"
 HF_OCR_MODEL            = "microsoft/trocr-base-printed"
 AI_PROVIDER             = "hf"
 OCR_PROVIDER            = DEFAULT_OCR_PROVIDER
@@ -7533,16 +10255,17 @@ HF_TTS_NO_AUDIO_COOLDOWN_S = _env_float("HF_TTS_NO_AUDIO_COOLDOWN_S", 600.0, min
 HF_TTS_CLIENT_CACHE      = _env_bool("HF_TTS_CLIENT_CACHE", True)
 HF_TTS_SERIALIZE_CALLS   = _env_bool("HF_TTS_SERIALIZE_CALLS", True)
 
-# VoxCPM2 — controllable voice cloning through the official openbmb Gradio demo.
+# VoxCPM2 — voice cloning through the official openbmb Gradio demo.
 # The public Space exposes api_name="generate" with the inputs:
 # text, control instruction, reference audio, ultimate-mode flag, prompt text,
-# CFG, normalize-text flag, and denoise-reference flag. This integration uses
-# Controllable Cloning: reference audio + optional Control Instruction.
+# CFG, normalize-text flag, denoise-reference flag, and inference timesteps.
+# Both Controllable Cloning and transcript-guided Ultimate Cloning are supported.
 VOXCPM2_ENABLED             = _env_bool("VOXCPM2_ENABLED", True)
 VOXCPM2_SPACE               = (os.environ.get("VOXCPM2_SPACE") or "openbmb/VoxCPM-Demo").strip()
 VOXCPM2_API_NAME            = (os.environ.get("VOXCPM2_API_NAME") or "/generate").strip()
 VOXCPM2_TOKEN               = (os.environ.get("VOXCPM2_TOKEN") or os.environ.get("HF_TOKEN") or "").strip()
 VOXCPM2_CFG_VALUE           = _env_float("VOXCPM2_CFG_VALUE", 2.0, minimum=1.0, maximum=3.0)
+VOXCPM2_INFERENCE_TIMESTEPS = _env_int("VOXCPM2_INFERENCE_TIMESTEPS", 10, minimum=1, maximum=50)
 VOXCPM2_NORMALIZE_TEXT      = _env_bool("VOXCPM2_NORMALIZE_TEXT", False)
 VOXCPM2_DENOISE_REFERENCE   = _env_bool("VOXCPM2_DENOISE_REFERENCE", False)
 VOXCPM2_TIMEOUT_S           = _env_float("VOXCPM2_TIMEOUT_S", 180.0, minimum=30.0, maximum=900.0)
@@ -7563,6 +10286,7 @@ VOXCPM2_MAX_REFERENCE_SECONDS = _env_float("VOXCPM2_MAX_REFERENCE_SECONDS", 50.0
 VOXCPM2_PROFILE_TTL_S       = _env_int("VOXCPM2_PROFILE_TTL_S", 30 * 86400, minimum=3600, maximum=365 * 86400)
 VOXCPM2_PROFILE_MEMORY_TTL_S = _env_float("VOXCPM2_PROFILE_MEMORY_TTL_S", 300.0, minimum=10.0, maximum=86400.0)
 VOXCPM2_CONTROL_MAX_CHARS   = _env_int("VOXCPM2_CONTROL_MAX_CHARS", 300, minimum=20, maximum=1000)
+VOXCPM2_PROMPT_MAX_CHARS    = _env_int("VOXCPM2_PROMPT_MAX_CHARS", 2000, minimum=100, maximum=8000)
 VOXCPM2_SERIALIZE_CALLS     = _env_bool("VOXCPM2_SERIALIZE_CALLS", True)
 VOXCPM2_CLIENT_CACHE        = _env_bool("VOXCPM2_CLIENT_CACHE", True)
 VOXCPM2_FAILURE_LIMIT       = _env_int("VOXCPM2_FAILURE_LIMIT", 3, minimum=1, maximum=20)
@@ -7733,16 +10457,26 @@ redis_breaker = CircuitBreaker(
 )
 
 _LOG_ONCE_TTL_S = _env_float("LOG_ONCE_TTL_S", 60.0, minimum=1.0, maximum=3600.0)
+_LOG_ONCE_MAX_ENTRIES = _env_int("LOG_ONCE_MAX_ENTRIES", 4096, minimum=128, maximum=100_000)
 _log_once_seen: dict[str, float] = {}
+_LOG_ONCE_LOCK = threading.Lock()
 
 
 def _log_once(level: int, key: str, message: str, *args, exc_info=False) -> None:
     """Log repeated outage errors once per TTL so callbacks don't flood logs."""
     now = time.monotonic()
-    last = _log_once_seen.get(key, 0.0)
-    if now - last < _LOG_ONCE_TTL_S:
-        return
-    _log_once_seen[key] = now
+    with _LOG_ONCE_LOCK:
+        last = _log_once_seen.get(key, 0.0)
+        if now - last < _LOG_ONCE_TTL_S:
+            return
+        _log_once_seen[key] = now
+        if len(_log_once_seen) > _LOG_ONCE_MAX_ENTRIES:
+            stale_before = now - _LOG_ONCE_TTL_S
+            for old_key, old_timestamp in list(_log_once_seen.items()):
+                if old_timestamp < stale_before:
+                    _log_once_seen.pop(old_key, None)
+            while len(_log_once_seen) > _LOG_ONCE_MAX_ENTRIES:
+                _log_once_seen.pop(next(iter(_log_once_seen)))
     logger.log(level, message, *args, exc_info=exc_info)
 
 
@@ -7890,6 +10624,21 @@ async def retry_call(
             if breaker:
                 breaker.record_success()
             return result
+        except asyncio.TimeoutError as exc:
+            # asyncio cannot stop work that is already running in a worker
+            # thread. Retrying here can duplicate writes and multiply stuck
+            # workers, so a timed-out operation is never started again.
+            last_exc = exc
+            if breaker:
+                breaker.record_failure(exc)
+            _log_once(
+                logging.WARNING,
+                f"{name}:timeout",
+                "%s timed out after %.2fs; not retrying because the worker may still be running",
+                name,
+                timeout,
+            )
+            break
         except Exception as exc:
             last_exc = exc
             retryable = _is_retryable_store_error(exc)
@@ -8783,12 +11532,12 @@ def _mark_ocr_provider_failure(provider: str, exc: Exception | str) -> None:
 
 def _init_hf_client() -> None:
     global _hf_client
-    if InferenceClient is None:
-        logger.error("huggingface_hub not installed. Run: pip install -U huggingface_hub")
-        _hf_client = None
-        return
     if not HF_TOKEN:
         logger.error("HF_TOKEN not set — Hugging Face disabled.")
+        _hf_client = None
+        return
+    if not _load_huggingface_sdk():
+        logger.error("huggingface_hub not installed. Run: pip install -U huggingface_hub")
         _hf_client = None
         return
     try:
@@ -9235,7 +11984,7 @@ def _init_clients() -> None:
     # Code default: DEFAULT_GEMINI_MODEL. Env values are optional overrides only.
     GEMINI_MODEL       = (os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_GENAI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
     HF_TOKEN           = os.getenv("HF_TOKEN", "")
-    HF_MODEL           = os.getenv("HF_MODEL", "Qwen/Qwen2.5-7B")
+    HF_MODEL           = os.getenv("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
     HF_OCR_MODEL       = os.getenv("HF_OCR_MODEL", "microsoft/trocr-base-printed")
 
     AI_PROVIDER = os.getenv("AI_PROVIDER", "hf").lower().strip()
@@ -9268,7 +12017,7 @@ def _init_clients() -> None:
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN is not set. Telegram polling will not start until the env var is configured.")
 
-    if SB_URL and SB_KEY:
+    if SB_URL and SB_KEY and _load_supabase_sdk():
         try:
             if SB_KEY.startswith("sb_publishable_") or "publishable" in SB_KEY.lower():
                 logger.warning("SUPABASE_KEY looks like a publishable key. Admin tables such as ai_api_keys should use SUPABASE_SERVICE_ROLE_KEY on the server.")
@@ -9280,8 +12029,10 @@ def _init_clients() -> None:
         except Exception as e:
             logger.error(f"Supabase init failed: {e}")
             supabase = None
-    else:
+    elif not SB_URL or not SB_KEY:
         logger.warning("Supabase env vars missing — DB features disabled.")
+    else:
+        supabase = None
 
     redis_client = None
     if REDIS_URL:
@@ -9306,7 +12057,8 @@ def _init_clients() -> None:
     else:
         logger.info("REDIS_URL not set — Redis cache disabled; using memory + Supabase fallback.")
 
-    if GEMINI_API_KEY and GEMINI_MODEL and genai is not None:
+    gemini_sdk_available = bool(GEMINI_API_KEY and GEMINI_MODEL and _load_google_genai_sdk())
+    if GEMINI_API_KEY and GEMINI_MODEL and gemini_sdk_available:
         try:
             _gemini = genai.Client(api_key=GEMINI_API_KEY)
             logger.info(f"Gemini legacy fallback initialised (model: {GEMINI_MODEL}).")
@@ -9320,7 +12072,7 @@ def _init_clients() -> None:
             missing.append("GEMINI_API_KEY")
         if not GEMINI_MODEL:
             GEMINI_MODEL = DEFAULT_GEMINI_MODEL
-        if genai is None:
+        if GEMINI_API_KEY and not gemini_sdk_available:
             missing.append("google-genai package")
         logger.info("Gemini disabled (%s). Using Hugging Face for chat/OCR when available.", ", ".join(missing) or "not configured")
 
@@ -9349,7 +12101,7 @@ VOICE_MAP = {
     "id": {"female": "id-ID-GadisNeural", "male": "id-ID-ArdiNeural"},
     # Filipino / Tagalog (Philippines)
     "fil": {"female": "fil-PH-BlessicaNeural", "male": "fil-PH-AngeloNeural"},
-    # Arabic (Saudi Arabia). Explicit `ar:` hints also route other Arabic text here.
+    # Arabic (Saudi Arabia)
     "ar": {"female": "ar-SA-ZariyahNeural", "male": "ar-SA-HamedNeural"},
 }
 TTS_LANGUAGE_LABELS = {
@@ -9378,8 +12130,7 @@ WELCOME_TEXT = (
     "🌍 ភាសាដែលគាំទ្រ៖\n"
     "🇰🇭 ខ្មែរ | 🇺🇸 អង់គ្លេស | 🇨🇳 ចិន | 🇰🇷 កូរ៉េ | 🇯🇵 ជប៉ុន\n"
     "🇮🇳 ហិណ្ឌី | 🇲🇾 ម៉ាឡេ | 🇮🇩 ឥណ្ឌូណេស៊ី | 🇵🇭 ហ្វីលីពីន | 🇸🇦 អារ៉ាប់\n"
-    "💡 បូតស្គាល់ភាសាដោយស្វ័យប្រវត្តិ។ សម្រាប់អត្ថបទ Latin ខ្លី ឬភាសាដែលស្រដៀងគ្នា "
-    "សូមប្រើប៊ូតុង 🌍 ឬដាក់ hi:, ms:, id:, fil:, ar: នៅខាងមុខអត្ថបទ។\n\n"
+    "💡 បូតស្គាល់ភាសា និងជ្រើសសំឡេងដែលសមស្របដោយស្វ័យប្រវត្តិ ១០០%។\n\n"
     "⚙️ ប្រើ /myprefs ដើម្បីមើលការកំណត់របស់អ្នក។\n"
     "🎙️ ប្រើ /voxcpm2 ដើម្បីចម្លងសំឡេង និងកំណត់អារម្មណ៍ ឬស្ទីលនៃការនិយាយ។\n"
     "📢 ចូលរួមឆានែល៖ https://t.me/m11mmm112"
@@ -9468,11 +12219,14 @@ def _tts_model_label(value: Any) -> str:
 DEFAULT_USER_PREFS: dict = {"gender": "female", "speed": DEFAULT_SPEED, "tts_model": _normalize_tts_model(DEFAULT_TTS_MODEL)}
 
 
-# VoxCPM2 profile data stores only reusable Telegram file identifiers and the
-# optional style instruction. Raw reference-audio bytes are downloaded to a
-# temporary file only while a generation request is running.
+# VoxCPM2 profile data stores reusable Telegram file identifiers, clone mode,
+# optional style instruction, and optional Ultimate-mode transcript. Raw
+# reference-audio bytes exist only during validation or generation.
 VOXCPM2_WAIT_REFERENCE = "await_reference"
 VOXCPM2_WAIT_CONTROL = "await_control"
+VOXCPM2_WAIT_PROMPT_TEXT = "await_prompt_text"
+VOXCPM2_MODE_CONTROLLABLE = "controllable"
+VOXCPM2_MODE_ULTIMATE = "ultimate"
 _VOXCPM2_PROFILE_MEMORY: OrderedDict[int, tuple[dict[str, Any], float]] = OrderedDict()
 _VOXCPM2_PROFILE_MEMORY_LOCK = threading.RLock()
 _VOXCPM2_PROFILE_MEMORY_MAX = _env_int("VOXCPM2_PROFILE_MEMORY_MAX", 5000, minimum=100, maximum=50000)
@@ -9480,6 +12234,13 @@ _VOXCPM2_PROFILE_MEMORY_MAX = _env_int("VOXCPM2_PROFILE_MEMORY_MAX", 5000, minim
 
 def _voxcpm2_profile_redis_key(user_id: int) -> str:
     return _redis_key("voxcpm2", "profile", int(user_id))
+
+
+def _voxcpm2_normalize_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower().replace("-", "_")
+    if mode in {"ultimate", "continuation", "prompt", "prompt_text", "transcript"}:
+        return VOXCPM2_MODE_ULTIMATE
+    return VOXCPM2_MODE_CONTROLLABLE
 
 
 def _voxcpm2_normalize_profile(value: Any) -> dict[str, Any]:
@@ -9493,6 +12254,8 @@ def _voxcpm2_normalize_profile(value: Any) -> dict[str, Any]:
         "duration": float(raw.get("duration") or 0.0),
         "file_size": int(raw.get("file_size") or 0),
         "control": str(raw.get("control") or "").strip()[:VOXCPM2_CONTROL_MAX_CHARS],
+        "mode": _voxcpm2_normalize_mode(raw.get("mode")),
+        "prompt_text": str(raw.get("prompt_text") or raw.get("transcript") or "").strip()[:VOXCPM2_PROMPT_MAX_CHARS],
         "updated_at": str(raw.get("updated_at") or "").strip(),
     }
     if not profile["suffix"].startswith(".") or not re.fullmatch(r"\.[a-z0-9]{1,8}", profile["suffix"], re.I):
@@ -9508,7 +12271,10 @@ def _voxcpm2_profile_memory_get(user_id: int) -> dict[str, Any] | None:
         if not item:
             return None
         profile, created = item
-        if now - float(created or 0.0) > VOXCPM2_PROFILE_MEMORY_TTL_S:
+        # Without Redis this LRU is the only profile store, so expiring it after
+        # five minutes made a configured clone unexpectedly disappear. Apply
+        # the short cache TTL only when a persistent Redis copy can be reloaded.
+        if redis_client is not None and now - float(created or 0.0) > VOXCPM2_PROFILE_MEMORY_TTL_S:
             _VOXCPM2_PROFILE_MEMORY.pop(user_id, None)
             return None
         _VOXCPM2_PROFILE_MEMORY.move_to_end(user_id)
@@ -9578,6 +12344,23 @@ async def _voxcpm2_profile_delete(user_id: int) -> None:
 
 def _voxcpm2_reference_ready(profile: dict[str, Any] | None) -> bool:
     return bool(isinstance(profile, dict) and str(profile.get("file_id") or "").strip())
+
+
+def _voxcpm2_profile_missing(profile: dict[str, Any] | None) -> list[str]:
+    normalized = _voxcpm2_normalize_profile(profile)
+    missing: list[str] = []
+    if not _voxcpm2_reference_ready(normalized):
+        missing.append("reference")
+    if (
+        normalized["mode"] == VOXCPM2_MODE_ULTIMATE
+        and not str(normalized.get("prompt_text") or "").strip()
+    ):
+        missing.append("prompt_text")
+    return missing
+
+
+def _voxcpm2_profile_ready(profile: dict[str, Any] | None) -> bool:
+    return not _voxcpm2_profile_missing(profile)
 
 
 def _voxcpm2_unavailable_reason(*, include_cooldown: bool = True) -> str:
@@ -10993,7 +13776,7 @@ def startup_self_check() -> None:
     if _should_try_hf_khmer_tts("សាកល្បង", "hf_space") and not HF_TTS_SPACE:
         checks.append("HF_TTS_SPACE is empty; Khmer HF Space TTS is disabled")
     if VOXCPM2_ENABLED and (GradioClient is None or GradioHandleFile is None):
-        checks.append("VoxCPM2 requires a recent gradio_client with handle_file. Add `gradio_client>=1.8` to requirements.txt")
+        checks.append("VoxCPM2 requires a Gradio 6-compatible client with handle_file. Add `gradio_client>=2,<3` to requirements.txt")
     if VOXCPM2_ENABLED and not VOXCPM2_SPACE:
         checks.append("VOXCPM2_SPACE is empty; VoxCPM2 controllable cloning is unavailable")
     if not REDIS_URL:
@@ -11933,7 +14716,7 @@ async def _init_async_clients() -> None:
     when the installed supabase-py version exposes acreate_client().
     """
     global supabase_async
-    if not SB_URL or not SB_KEY or acreate_client is None:
+    if not SB_URL or not SB_KEY or not _load_supabase_sdk() or acreate_client is None:
         supabase_async = None
         return
     try:
@@ -12020,9 +14803,27 @@ async def resolve_tts_text(
     if not context_block.strip():
         return raw_text
 
+    detected_input_lang = _detect_lang(raw_text)
+    _language_flag, detected_input_name = _language_display(detected_input_lang)
+    language_rule = {
+        "km": "The input uses Khmer. Keep natural Khmer script, spelling, and punctuation.",
+        "en": "The input uses English or an unknown Latin script. Keep natural English unless translation is explicitly requested.",
+        "zh": "The input uses Chinese. Preserve Chinese characters and natural Mandarin phrasing.",
+        "ja": "The input uses Japanese. Preserve kana/kanji and natural Japanese phrasing.",
+        "ko": "The input uses Korean. Preserve Hangul and natural Korean phrasing.",
+        "hi": "The input uses Hindi. Preserve Devanagari and natural Hindi phrasing.",
+        "ar": "The input uses Arabic. Preserve Arabic script and natural phrasing.",
+        "ms": "The input is detected as Malay. Preserve natural Malay phrasing.",
+        "id": "The input is detected as Indonesian. Preserve natural Indonesian phrasing.",
+        "fil": "The input is detected as Filipino. Preserve natural Filipino phrasing.",
+    }.get(
+        detected_input_lang,
+        f"The input language is detected as {detected_input_name}. Preserve that language.",
+    )
     system_prompt = (
-        "You are a text pre-processor for a multilingual TTS bot that supports Khmer, English, Chinese, Korean, and Japanese. "
+        "You are a text pre-processor for a multilingual TTS bot. "
         "Output ONLY the exact text to be spoken — no labels, no explanation, no markdown.\n\n"
+        f"Automatic language detection: {detected_input_lang}. {language_rule}\n\n"
         "Rules:\n"
         "1. Normal sentence → output verbatim.\n"
         "2. 'read again' / 'អានម្តងទៀត' → output last Bot turn verbatim.\n"
@@ -12049,7 +14850,12 @@ async def resolve_tts_text(
         response = await asyncio.wait_for(_guarded_call(), timeout=CONV_RESOLVE_TIMEOUT_S)
         resolved = (response.text or "").strip()
         if resolved:
-            logger.info(f"resolve_tts_text Gemini resolved for user {user_id}")
+            logger.info(
+                "resolve_tts_text Gemini resolved user=%s input_lang=%s output_lang=%s",
+                user_id,
+                detected_input_lang,
+                _detect_lang(resolved),
+            )
             return resolved
         return raw_text
     except asyncio.TimeoutError:
@@ -13128,7 +15934,7 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
     Keep the first screen small enough for phones while preserving every
     existing admin feature through grouped shortcuts.
     """
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("🏠 Overview", callback_data="admin_home"),
          InlineKeyboardButton("🩺 Health", callback_data="admin_health")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
@@ -13150,7 +15956,16 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📱 Compact", callback_data="admin_compact"),
          InlineKeyboardButton("🔄 Refresh", callback_data="admin_home")],
         [InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
-    ])
+    ]
+    mini_app_url = f"{_runtime_webhook_base_url()}/miniapp/admin"
+    if mini_app_url.startswith("https://"):
+        rows.insert(0, [
+            InlineKeyboardButton(
+                "📊 Open Admin Mini App",
+                web_app=WebAppInfo(url=mini_app_url),
+            )
+        ])
+    return InlineKeyboardMarkup(rows)
 
 
 def get_admin_compact_kb() -> InlineKeyboardMarkup:
@@ -13202,24 +16017,12 @@ def _web_secret_key_fingerprint(secret_value: str) -> str:
 def _configured_web_secret_source() -> tuple[str, str]:
     """Return (source, value) for the configured web session secret.
 
-    Redis is primary.  Env values are kept only as compatibility fallback.
-    This never exposes the secret to logs or public API responses.
+    Redis is the only persistent source. This never exposes the secret to logs
+    or public API responses.
     """
     redis_value, redis_source = _web_secret_get_from_redis()
     if redis_value:
         return redis_source, redis_value
-    web_key = os.environ.get("WEB_SECRET_KEY", "").strip()
-    if web_key:
-        return "env:WEB_SECRET_KEY:fallback", web_key
-    flask_key = os.environ.get("FLASK_SECRET_KEY", "").strip()
-    if flask_key:
-        return "env:FLASK_SECRET_KEY:fallback", flask_key
-    settings_key = str(getattr(SETTINGS, "WEB_SECRET_KEY", "") or "").strip()
-    if settings_key:
-        return "settings:WEB_SECRET_KEY:fallback", settings_key
-    settings_flask_key = str(getattr(SETTINGS, "FLASK_SECRET_KEY", "") or "").strip()
-    if settings_flask_key:
-        return "settings:FLASK_SECRET_KEY:fallback", settings_flask_key
     if _WEB_SESSION_SECRET_CACHE:
         return _web_session_secret_source(), _WEB_SESSION_SECRET_CACHE
     return "missing", ""
@@ -13918,84 +16721,10 @@ _CHINESE_RE = re.compile(r"[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]")
 _JAPANESE_KANA_RE = re.compile(r"[\u3040-\u30FF\u31F0-\u31FF]")
 _KOREAN_RE = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
-_TTS_LANGUAGE_OVERRIDE: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "tts_language_override",
-    default="",
-)
-
-
-def _normalise_supported_tts_lang(value: Any) -> str:
-    lang = _normalise_lang_hint(value) or str(value or "").strip().lower()
-    return lang if lang in VOICE_MAP else ""
-
-
-def _active_tts_language_override() -> str:
-    return _normalise_supported_tts_lang(_TTS_LANGUAGE_OVERRIDE.get(""))
-
-
-def _with_tts_lang_hint(lang: str, text: str) -> str:
-    """Return text with one canonical language hint, without stacking hints."""
-    lang = _normalise_supported_tts_lang(lang)
-    _old_hint, clean_text = _extract_leading_lang_hint(str(text or ""))
-    clean_text = clean_text.strip()
-    if not clean_text:
-        return ""
-    return f"[{lang}] {clean_text}" if lang else clean_text
-
-
 def _detect_tts_lang_key(text: str) -> str:
-    """Detect the Edge/HF TTS language bucket for a text chunk.
-
-    Explicit hints and the task-local language override win first. Script
-    detection handles Khmer, CJK, Hindi, and Arabic. Indonesian, Malay, and
-    Filipino use conservative word markers; ambiguous Latin text stays English
-    unless the user chooses a language or prefixes the message.
-    """
-    hint, text = _extract_leading_lang_hint(text or "")
-    if hint:
-        return hint
-
-    override = _active_tts_language_override()
-    if override:
-        return override
-
-    khmer_chars = len(_KHMER_RE.findall(text))
-    korean_chars = len(_KOREAN_RE.findall(text))
-    japanese_kana_chars = len(_JAPANESE_KANA_RE.findall(text))
-    chinese_chars = len(_CHINESE_RE.findall(text))
-    devanagari_chars = len(_DEVANAGARI_RE.findall(text))
-    arabic_chars = len(_ARABIC_SCRIPT_RE.findall(text))
-    latin_chars = len(_LATIN_RE.findall(text))
-    signal_total = (
-        khmer_chars
-        + korean_chars
-        + japanese_kana_chars
-        + chinese_chars
-        + devanagari_chars
-        + arabic_chars
-        + latin_chars
-    )
-
-    if signal_total <= 0:
-        return "en"
-
-    # Prefer unambiguous non-Latin scripts when they have meaningful presence.
-    if khmer_chars and khmer_chars / signal_total >= 0.15:
-        return "km"
-    if korean_chars and korean_chars / signal_total >= 0.15:
-        return "ko"
-    if japanese_kana_chars and japanese_kana_chars / signal_total >= 0.08:
-        return "ja"
-    if _looks_like_japanese_han_phrase(text):
-        return "ja"
-    if chinese_chars and chinese_chars / signal_total >= 0.15:
-        return "zh"
-    if devanagari_chars and devanagari_chars / signal_total >= 0.15:
-        return "hi"
-    if arabic_chars and arabic_chars / signal_total >= 0.15:
-        return "ar"
-
-    return _detect_latin_tts_language(text) or "en"
+    """Return the Edge/HF language bucket selected from the text itself."""
+    detected = _detect_lang(text)
+    return detected if detected in VOICE_MAP else "en"
 
 
 def _detect_voice(text: str, gender: str) -> str:
@@ -14005,11 +16734,10 @@ def _detect_voice(text: str, gender: str) -> str:
 
 
 def _clean_tts_text_for_edge(text: str) -> str:
-    """Remove hidden/control chars and optional leading language hints."""
+    """Remove hidden and control characters without rewriting user content."""
     text = (text or "")
     for ch in ("\ufeff", "\u200b", "\u200c", "\u200d"):
         text = text.replace(ch, "")
-    _hint, text = _extract_leading_lang_hint(text)
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text)
     text = re.sub(r"[ \t\r\f\v]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -15315,6 +18043,8 @@ def _probe_audio_duration_seconds_sync(path: str) -> float:
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("Timed out while probing reference-audio duration.") from exc
     detail = (completed.stderr or b"").decode(errors="replace")
+    if not re.search(r"\bAudio:\s", detail, re.IGNORECASE):
+        raise RuntimeError("Reference file is not a readable audio stream.")
     match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", detail)
     if not match:
         return 0.0
@@ -15344,7 +18074,40 @@ async def _validate_voxcpm2_reference_path(reference_path: str) -> float:
     return duration
 
 
-def _voxcpm2_predict_sync(text: str, control: str, reference_path: str) -> bytes:
+def _voxcpm2_api_inputs(
+    text: str,
+    control: str,
+    reference_upload: Any,
+    mode: str,
+    prompt_text: str,
+) -> tuple[Any, ...]:
+    """Build the official nine-input VoxCPM2 Gradio payload."""
+    normalized_mode = _voxcpm2_normalize_mode(mode)
+    use_prompt_text = normalized_mode == VOXCPM2_MODE_ULTIMATE
+    clean_prompt = str(prompt_text or "").strip() if use_prompt_text else ""
+    if use_prompt_text and not clean_prompt:
+        raise ValueError("Ultimate Cloning requires the reference-audio transcript.")
+    effective_control = "" if use_prompt_text else str(control or "").strip()
+    return (
+        str(text or "").strip(),
+        effective_control,
+        reference_upload,
+        use_prompt_text,
+        clean_prompt,
+        VOXCPM2_CFG_VALUE,
+        VOXCPM2_NORMALIZE_TEXT,
+        VOXCPM2_DENOISE_REFERENCE,
+        VOXCPM2_INFERENCE_TIMESTEPS,
+    )
+
+
+def _voxcpm2_predict_sync(
+    text: str,
+    control: str,
+    reference_path: str,
+    mode: str = VOXCPM2_MODE_CONTROLLABLE,
+    prompt_text: str = "",
+) -> bytes:
     if not reference_path or not os.path.isfile(reference_path):
         raise RuntimeError("VoxCPM2 reference audio is missing. Use /voxcpm2 to upload it again.")
     remaining = _voxcpm2_disabled_remaining_s()
@@ -15358,17 +18121,18 @@ def _voxcpm2_predict_sync(text: str, control: str, reference_path: str) -> bytes
 
     def _predict_once() -> bytes:
         reference_upload = GradioHandleFile(reference_path)
+        api_inputs = _voxcpm2_api_inputs(
+            text,
+            control,
+            reference_upload,
+            mode,
+            prompt_text,
+        )
+
         def _call():
             return _gradio_predict_with_timeout_sync(
                 client,
-                text,
-                control,
-                reference_upload,
-                False,   # Controllable Cloning, not Ultimate Cloning
-                "",      # no prompt transcript in controllable mode
-                VOXCPM2_CFG_VALUE,
-                VOXCPM2_NORMALIZE_TEXT,
-                VOXCPM2_DENOISE_REFERENCE,
+                *api_inputs,
                 api_name=VOXCPM2_API_NAME,
                 timeout_s=VOXCPM2_TIMEOUT_S,
                 label="VoxCPM2",
@@ -15438,6 +18202,8 @@ async def _generate_voice_voxcpm2(
     speed: float,
     output_path: str,
     *,
+    mode: str = VOXCPM2_MODE_CONTROLLABLE,
+    prompt_text: str = "",
     validate_reference: bool = True,
 ) -> bytes:
     text = _clean_tts_text_for_edge(text)
@@ -15461,6 +18227,8 @@ async def _generate_voice_voxcpm2(
                         chunk,
                         str(control or "").strip(),
                         reference_path,
+                        _voxcpm2_normalize_mode(mode),
+                        str(prompt_text or "").strip(),
                     ),
                     timeout=timeout_budget,
                 )
@@ -15477,8 +18245,13 @@ async def _generate_voice_voxcpm2(
         if not converted:
             raise RuntimeError("VoxCPM2 produced empty converted audio.")
         logger.info(
-            "VoxCPM2 controllable cloning generated %s chunk(s) via %s%s control=%s",
-            len(chunks), VOXCPM2_SPACE, VOXCPM2_API_NAME, bool(str(control or "").strip()),
+            "VoxCPM2 %s cloning generated %s chunk(s) via %s%s control=%s transcript=%s",
+            _voxcpm2_normalize_mode(mode),
+            len(chunks),
+            VOXCPM2_SPACE,
+            VOXCPM2_API_NAME,
+            bool(str(control or "").strip()),
+            bool(str(prompt_text or "").strip()),
         )
         return converted
 
@@ -15491,14 +18264,19 @@ def _voxcpm2_provider_context(profile: dict[str, Any]) -> str:
         or ""
     )
     control = str(profile.get("control") or "").strip()
+    mode = _voxcpm2_normalize_mode(profile.get("mode"))
+    prompt_text = str(profile.get("prompt_text") or "").strip()
     payload = {
         "reference": reference_id,
         "control": control,
+        "mode": mode,
+        "prompt_text": prompt_text,
         "space": VOXCPM2_SPACE,
         "api": VOXCPM2_API_NAME,
         "cfg": VOXCPM2_CFG_VALUE,
         "normalize": VOXCPM2_NORMALIZE_TEXT,
         "denoise": VOXCPM2_DENOISE_REFERENCE,
+        "inference_timesteps": VOXCPM2_INFERENCE_TIMESTEPS,
     }
     return hashlib.sha256(
         _json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -15514,10 +18292,16 @@ async def _prepare_voxcpm2_session(user_id: int, bot) -> dict[str, Any]:
         raise RuntimeError(f"VoxCPM2 cooldown active ({remaining}s remaining).")
 
     profile = await _voxcpm2_profile_get(user_id)
-    if not _voxcpm2_reference_ready(profile):
+    missing = _voxcpm2_profile_missing(profile)
+    if "reference" in missing:
         raise RuntimeError(
             "VoxCPM2 reference audio is not configured. "
             "Use /voxcpm2 and upload a 5-30 second clean voice clip."
+        )
+    if "prompt_text" in missing:
+        raise RuntimeError(
+            "VoxCPM2 Ultimate Cloning requires the exact reference-audio transcript. "
+            "Use /voxcpm2 and add the transcript."
         )
 
     telegram_file = await safe_send(lambda: bot.get_file(str(profile.get("file_id"))))
@@ -15545,6 +18329,8 @@ async def _prepare_voxcpm2_session(user_id: int, bot) -> dict[str, Any]:
             "profile": profile,
             "reference_path": reference_path,
             "control": str(profile.get("control") or "").strip(),
+            "mode": _voxcpm2_normalize_mode(profile.get("mode")),
+            "prompt_text": str(profile.get("prompt_text") or "").strip(),
             "provider_context": _voxcpm2_provider_context(profile),
         }
     except Exception:
@@ -15578,6 +18364,8 @@ async def _generate_user_voice_voxcpm2_session(
 
     provider_context = str(session_data.get("provider_context") or "")
     control = str(session_data.get("control") or "").strip()
+    mode = _voxcpm2_normalize_mode(session_data.get("mode"))
+    prompt_text = str(session_data.get("prompt_text") or "").strip()
     cache_key = _tts_audio_cache_key(
         cleaned,
         gender,
@@ -15598,6 +18386,8 @@ async def _generate_user_voice_voxcpm2_session(
             reference_path,
             speed,
             output_path,
+            mode=mode,
+            prompt_text=prompt_text,
             validate_reference=False,
         )
     else:
@@ -15612,6 +18402,8 @@ async def _generate_user_voice_voxcpm2_session(
                 reference_path,
                 speed,
                 output_path,
+                mode=mode,
+                prompt_text=prompt_text,
                 validate_reference=False,
             )
     _tts_audio_cache_set(cache_key, audio)
@@ -16033,41 +18825,32 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
 
 
 async def generate_voice_limited(text: str, gender: str, speed: float, output_path: str, tts_model: str = "auto") -> bytes:
-    # Preserve an explicit language choice after removing the visible prefix.
-    # ContextVar keeps the override isolated per async request, including when
-    # several TTS users are processed concurrently.
-    hint, raw_text = _extract_leading_lang_hint(str(text or ""))
-    cleaned = _clean_tts_text_for_edge(raw_text)
+    """Generate cached TTS audio using language detected from ``text``."""
+    cleaned = _clean_tts_text_for_edge(str(text or ""))
     if not cleaned:
         raise ValueError("generate_voice_limited: text must not be empty")
 
-    override = _normalise_supported_tts_lang(hint)
-    override_token = _TTS_LANGUAGE_OVERRIDE.set(override) if override else None
-    try:
-        cache_key = _tts_audio_cache_key(cleaned, gender, speed, tts_model)
-        cached = _tts_audio_cache_get(cache_key)
-        if cached is not None:
-            await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
-            logger.debug("TTS audio cache hit lang=%s bytes=%s", _detect_tts_lang_key(cleaned), len(cached))
-            return cached
+    cache_key = _tts_audio_cache_key(cleaned, gender, speed, tts_model)
+    cached = _tts_audio_cache_get(cache_key)
+    if cached is not None:
+        await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
+        logger.debug("TTS audio cache hit lang=%s bytes=%s", _detect_tts_lang_key(cleaned), len(cached))
+        return cached
 
-        sem = _TTS_CHUNK_SEMAPHORE
-        if sem is None:
+    sem = _TTS_CHUNK_SEMAPHORE
+    if sem is None:
+        audio = await generate_voice(cleaned, gender, speed, output_path, tts_model)
+    else:
+        async with sem:
+            # Re-check after waiting; another request may have generated the same audio.
+            cached = _tts_audio_cache_get(cache_key)
+            if cached is not None:
+                await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
+                logger.debug("TTS audio cache hit after wait lang=%s bytes=%s", _detect_tts_lang_key(cleaned), len(cached))
+                return cached
             audio = await generate_voice(cleaned, gender, speed, output_path, tts_model)
-        else:
-            async with sem:
-                # Re-check after waiting; another request may have generated the same audio.
-                cached = _tts_audio_cache_get(cache_key)
-                if cached is not None:
-                    await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
-                    logger.debug("TTS audio cache hit after wait lang=%s bytes=%s", _detect_tts_lang_key(cleaned), len(cached))
-                    return cached
-                audio = await generate_voice(cleaned, gender, speed, output_path, tts_model)
-        _tts_audio_cache_set(cache_key, audio)
-        return audio
-    finally:
-        if override_token is not None:
-            _TTS_LANGUAGE_OVERRIDE.reset(override_token)
+    _tts_audio_cache_set(cache_key, audio)
+    return audio
 
 
 # ---------------------------------------------------------------------------
@@ -16325,14 +19108,12 @@ async def _deliver_paged_tts(
     progress_end: int = 94,
 ) -> tuple[int, int]:
     """Generate long TTS in measurable chunks and update one status message."""
-    forced_lang, clean_text = _extract_leading_lang_hint(str(text or ""))
-    forced_lang = _normalise_supported_tts_lang(forced_lang)
+    clean_text = _clean_tts_text_for_edge(str(text or ""))
     chunks = _split_text_chunks(clean_text)
     if not chunks:
         raise ValueError("រកអត្ថបទមិនឃើញ។")
 
-    remembered_text = _with_tts_lang_hint(forced_lang, clean_text)
-    set_last_tts_text(user_id, remembered_text)
+    set_last_tts_text(user_id, clean_text)
     total = len(chunks)
     model = _normalize_tts_model(tts_model)
     model_label = TTS_MODEL_OPTIONS.get(model, TTS_MODEL_OPTIONS["auto"])[0]
@@ -16368,7 +19149,7 @@ async def _deliver_paged_tts(
 
             file_path = _make_temp_ogg()
             try:
-                request_chunk = _with_tts_lang_hint(forced_lang, chunk)
+                request_chunk = chunk
                 audio_bytes = await generate_user_voice_limited(
                     request_chunk,
                     gender,
@@ -16459,8 +19240,7 @@ def get_main_kb(gender: str, tts_model: str = "auto") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f_btn, callback_data="tg_female"),
          InlineKeyboardButton(m_btn, callback_data="tg_male")],
-        [InlineKeyboardButton("🎚️ ល្បឿនសំឡេង", callback_data="show_speed"),
-         InlineKeyboardButton("🌍 ភាសាសំឡេង", callback_data="show_tts_language")],
+        [InlineKeyboardButton("🎚️ ល្បឿនសំឡេង", callback_data="show_speed")],
         [InlineKeyboardButton(model_btn, callback_data="show_tts_model")],
     ])
 
@@ -16487,42 +19267,6 @@ def get_speed_kb(current_speed: float) -> InlineKeyboardMarkup:
         speed_row,
         [InlineKeyboardButton("🔙 ត្រឡប់", callback_data="hide_speed")],
     ])
-
-
-_TTS_LANGUAGE_BUTTON_LABELS = {
-    "en": "🇺🇸 English",
-    "km": "🇰🇭 ខ្មែរ",
-    "zh": "🇨🇳 中文",
-    "ja": "🇯🇵 日本語",
-    "ko": "🇰🇷 한국어",
-    "hi": "🇮🇳 हिन्दी",
-    "ms": "🇲🇾 Bahasa Melayu",
-    "id": "🇮🇩 Bahasa Indonesia",
-    "fil": "🇵🇭 Filipino",
-    "ar": "🇸🇦 العربية",
-}
-
-
-def get_tts_language_kb(current_lang: str = "auto") -> InlineKeyboardMarkup:
-    current = _normalise_supported_tts_lang(current_lang) or "auto"
-    buttons: list[InlineKeyboardButton] = [
-        InlineKeyboardButton(
-            "🌐 ស្វ័យប្រវត្តិ" + (" ✅" if current == "auto" else ""),
-            callback_data="ttslang_auto",
-        )
-    ]
-    for lang in TTS_SUPPORTED_LANG_ORDER:
-        label = _TTS_LANGUAGE_BUTTON_LABELS.get(lang, TTS_LANGUAGE_LABELS.get(lang, lang.upper()))
-        buttons.append(InlineKeyboardButton(
-            label + (" ✅" if current == lang else ""),
-            callback_data=f"ttslang_{lang}",
-        ))
-
-    rows: list[list[InlineKeyboardButton]] = []
-    for index in range(0, len(buttons), 2):
-        rows.append(buttons[index:index + 2])
-    rows.append([InlineKeyboardButton("🔙 ត្រឡប់", callback_data="hide_tts_language")])
-    return InlineKeyboardMarkup(rows)
 
 
 def get_transcription_kb(transcript_msg_id: int) -> InlineKeyboardMarkup:
@@ -17298,7 +20042,7 @@ def admin_only(handler):
     @functools.wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id if update.effective_user else None
-        if uid not in ADMIN_IDS:
+        if uid is None or not _is_admin(uid):
             if update.message:
                 await safe_send(lambda: update.message.reply_text("⛔ អ្នកមិនមានសិទ្ធិប្រើពាក្យបញ្ជានេះទេ។"))
             return
@@ -17307,7 +20051,19 @@ def admin_only(handler):
 
 
 def _is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        return False
+    if user_id in ADMIN_IDS:
+        return True
+    try:
+        from app.core.telegram_auth import get_telegram_admin_authorizer
+
+        return get_telegram_admin_authorizer().is_admin_sync(user_id)
+    except Exception as exc:
+        logger.warning("Redis admin authorization check failed user_id=%s: %s", user_id, exc)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -23230,13 +25986,25 @@ async def cmd_delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
     ))
 
 
-def _voxcpm2_panel_kb(selected: bool = False) -> InlineKeyboardMarkup:
+def _voxcpm2_panel_kb(profile: dict[str, Any], selected: bool = False) -> InlineKeyboardMarkup:
+    mode = _voxcpm2_normalize_mode(profile.get("mode"))
+    control_label = "✅ ក្លូនអាចកំណត់ស្ទីល" if mode == VOXCPM2_MODE_CONTROLLABLE else "🎛 ក្លូនអាចកំណត់ស្ទីល"
+    ultimate_label = "✅ ក្លូនដូចដើមបំផុត" if mode == VOXCPM2_MODE_ULTIMATE else "🎙 ក្លូនដូចដើមបំផុត"
     select_label = "✅ បានជ្រើស VoxCPM2" if selected else "✅ ជ្រើស VoxCPM2"
+    mode_action = (
+        [InlineKeyboardButton("📝 បញ្ចូលអត្ថបទសំឡេងគំរូ", callback_data="voxcpm2:set_prompt"),
+         InlineKeyboardButton("🧹 លុបអត្ថបទគំរូ", callback_data="voxcpm2:clear_prompt")]
+        if mode == VOXCPM2_MODE_ULTIMATE
+        else
+        [InlineKeyboardButton("🎚 កំណត់អារម្មណ៍/ស្ទីល", callback_data="voxcpm2:set_control"),
+         InlineKeyboardButton("🧹 លុបការណែនាំ", callback_data="voxcpm2:clear_control")]
+    )
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎙 បញ្ចូលសំឡេងគំរូ", callback_data="voxcpm2:set_ref"),
-         InlineKeyboardButton("🎛 កំណត់អារម្មណ៍/ស្ទីល", callback_data="voxcpm2:set_control")],
-        [InlineKeyboardButton("🧹 លុបការណែនាំ", callback_data="voxcpm2:clear_control"),
+        [InlineKeyboardButton(control_label, callback_data="voxcpm2:mode_control"),
+         InlineKeyboardButton(ultimate_label, callback_data="voxcpm2:mode_ultimate")],
+        [InlineKeyboardButton("🎤 បញ្ចូលសំឡេងគំរូ", callback_data="voxcpm2:set_ref"),
          InlineKeyboardButton("🗑 លុបសំឡេងគំរូ", callback_data="voxcpm2:clear_ref")],
+        mode_action,
         [InlineKeyboardButton(select_label, callback_data="voxcpm2:select"),
          InlineKeyboardButton("🔄 ផ្ទុកឡើងវិញ", callback_data="voxcpm2:refresh")],
         [InlineKeyboardButton("🤖 ជ្រើសម៉ូដែលសំឡេង", callback_data="show_tts_model"),
@@ -23275,15 +26043,40 @@ def _voxcpm2_forget_panel(context: Any) -> None:
 
 
 def _voxcpm2_panel_text(profile: dict[str, Any], selected: bool, notice: str = "") -> str:
-    ready = _voxcpm2_reference_ready(profile)
+    profile = _voxcpm2_normalize_profile(profile)
+    reference_ready = _voxcpm2_reference_ready(profile)
+    ready = _voxcpm2_profile_ready(profile)
+    mode = _voxcpm2_normalize_mode(profile.get("mode"))
     duration = float(profile.get("duration") or 0.0)
     ref_name = html.escape(str(profile.get("filename") or "សំឡេងគំរូ")[:80])
-    reference_line = f"✅ <code>{ref_name}</code>" if ready else "❌ មិនទាន់បញ្ចូល"
-    if ready and duration > 0:
+    reference_line = f"✅ <code>{ref_name}</code>" if reference_ready else "❌ មិនទាន់បញ្ចូល"
+    if reference_ready and duration > 0:
         reference_line += f" · {duration:g} វិនាទី"
 
     control = str(profile.get("control") or "").strip()
     control_line = html.escape(control[:220]) if control else "ប្រើអារម្មណ៍ និងស្ទីលដើមពីសំឡេងគំរូ"
+    prompt_text = str(profile.get("prompt_text") or "").strip()
+    prompt_line = html.escape(prompt_text[:260]) if prompt_text else "❌ មិនទាន់បញ្ចូលអត្ថបទដែលនិយាយក្នុងសំឡេងគំរូ"
+    if mode == VOXCPM2_MODE_ULTIMATE:
+        mode_line = "🎙 <b>ក្លូនដូចដើមបំផុត (Ultimate)</b>"
+        mode_detail = (
+            f"អត្ថបទសំឡេងគំរូ៖ <i>{prompt_line}</i>\n"
+            "ការណែនាំស្ទីល៖ <i>មិនប្រើក្នុង Ultimate mode</i>"
+        )
+    else:
+        mode_line = "🎛 <b>ក្លូនអាចកំណត់ស្ទីល (Controllable)</b>"
+        mode_detail = f"អារម្មណ៍/ស្ទីល៖ <i>{control_line}</i>"
+
+    missing = _voxcpm2_profile_missing(profile)
+    missing_labels = {
+        "reference": "សំឡេងគំរូ",
+        "prompt_text": "អត្ថបទសំឡេងគំរូ",
+    }
+    setup_line = (
+        "✅ រួចរាល់សម្រាប់បង្កើតសំឡេង"
+        if ready
+        else "⏳ ត្រូវបំពេញ៖ " + ", ".join(missing_labels[item] for item in missing)
+    )
     unavailable = _voxcpm2_unavailable_reason()
     status_line = f"⚠️ {html.escape(unavailable)}" if unavailable else "✅ រួចរាល់"
     selected_line = "បានជ្រើស" if selected else "មិនទាន់ជ្រើស"
@@ -23291,14 +26084,16 @@ def _voxcpm2_panel_text(profile: dict[str, Any], selected: bool, notice: str = "
 
     return (
         prefix
-        + "🎙 <b>VoxCPM2 — ចម្លងសំឡេង និងកំណត់ស្ទីល</b>\n\n"
+        + "🎙 <b>VoxCPM2 — ក្លូនសំឡេង</b>\n\n"
         + f"សេវាកម្ម៖ {status_line}\n"
+        + f"របៀប៖ {mode_line}\n"
         + f"សំឡេងគំរូ៖ {reference_line}\n"
-        + f"អារម្មណ៍/ស្ទីល៖ <i>{control_line}</i>\n"
+        + mode_detail + "\n"
+        + f"ការរៀបចំ៖ {setup_line}\n"
         + f"ម៉ូដែលដែលបានជ្រើស៖ <b>{selected_line}</b>\n\n"
-        + "សូមបញ្ចូលសំឡេងគំរូដែលច្បាស់។ បន្ទាប់មក អ្នកអាចកំណត់អារម្មណ៍ ល្បឿននិយាយ សូរសំឡេង ឬស្ទីលនៃការនិយាយបន្ថែមបាន។ "
-          "សំឡេងដែលបង្កើតនឹងរក្សាលក្ខណៈសំឡេងគំរូ និងអនុវត្តតាមការណែនាំរបស់អ្នក។\n\n"
-        + f"💡 ដើម្បីបានលទ្ធផលល្អ៖ ប្រើអ្នកនិយាយម្នាក់ សំឡេងស្អាត គ្មានតន្ត្រីខាងក្រោយ និងមានរយៈពេលប្រហែល ៥–៣០ វិនាទី "
+        + "• Controllable៖ រក្សាសូរសំឡេង ហើយអាចកំណត់អារម្មណ៍ ល្បឿន និងស្ទីលថ្មី។\n"
+        + "• Ultimate៖ បន្តពីសំឡេងគំរូ ដើម្បីរក្សាលម្អិតសំឡេងឱ្យដូចដើមបំផុត; ត្រូវការអត្ថបទត្រឹមត្រូវនៃសំឡេងគំរូ។\n\n"
+        + f"💡 ប្រើអ្នកនិយាយម្នាក់ សំឡេងច្បាស់ គ្មានតន្ត្រីខាងក្រោយ និងប្រហែល ៥–៣០ វិនាទី "
           f"(អតិបរមា {VOXCPM2_MAX_REFERENCE_SECONDS:g} វិនាទី)។\n"
         + "⚠️ សូមប្រើតែសំឡេងរបស់ខ្លួនឯង ឬសំឡេងដែលអ្នកមានការអនុញ្ញាតឱ្យចម្លង។ សំឡេងគំរូនឹងត្រូវផ្ញើទៅសេវា VoxCPM2 ដែលបានកំណត់ ដើម្បីបង្កើតសំឡេង។"
     )
@@ -23324,7 +26119,7 @@ async def _voxcpm2_send_panel(
     )
     selected = _normalize_tts_model(prefs.get("tts_model", "auto")) == "voxcpm2"
     text = _voxcpm2_panel_text(profile, selected, notice)
-    reply_markup = _voxcpm2_panel_kb(selected)
+    reply_markup = _voxcpm2_panel_kb(profile, selected)
 
     if context is not None and (prefer_saved or edit):
         chat_id = context.user_data.get(_VOXCPM2_PANEL_CHAT_KEY)
@@ -23432,13 +26227,41 @@ async def _voxcpm2_accept_reference(
         )
         return
 
+    suffix = _voxcpm2_reference_suffix(filename, mime_type)
+    validation_path = ""
+    try:
+        telegram_file = await safe_send(lambda: context.bot.get_file(str(file_id)))
+        if not telegram_file:
+            raise RuntimeError("Telegram could not retrieve the reference audio.")
+        validation_path = await _download_telegram_file_to_temp_path(
+            telegram_file,
+            VOXCPM2_MAX_REFERENCE_BYTES,
+            suffix=suffix,
+        )
+        actual_duration = await _validate_voxcpm2_reference_path(validation_path)
+        if actual_duration > 0:
+            duration = round(actual_duration, 3)
+        file_size = int(await asyncio.to_thread(os.path.getsize, validation_path))
+    except Exception as exc:
+        await _voxcpm2_send_panel(
+            msg,
+            user_id,
+            f"មិនអាចប្រើសំឡេងគំរូនេះបានទេ៖ {str(exc)[:220]}",
+            context=context,
+            prefer_saved=True,
+        )
+        return
+    finally:
+        if validation_path:
+            _cleanup(validation_path)
+
     profile = await _voxcpm2_profile_get(user_id)
     profile.update({
         "file_id": str(file_id),
         "file_unique_id": str(file_unique_id or ""),
         "filename": str(filename or "reference_audio")[:160],
         "mime_type": str(mime_type or "audio/ogg")[:100],
-        "suffix": _voxcpm2_reference_suffix(filename, mime_type),
+        "suffix": suffix,
         "duration": float(duration or 0.0),
         "file_size": int(file_size or 0),
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -23447,8 +26270,11 @@ async def _voxcpm2_accept_reference(
     context.user_data.pop("voxcpm2_state", None)
 
     unavailable = _voxcpm2_unavailable_reason()
+    missing = _voxcpm2_profile_missing(profile)
     if unavailable:
         notice = f"បានរក្សាទុកសំឡេងគំរូ។ ប៉ុន្តែមិនទាន់អាចជ្រើស VoxCPM2 បានទេ៖ {unavailable}"
+    elif "prompt_text" in missing:
+        notice = "បានរក្សាទុកសំឡេងគំរូ។ សូមបញ្ចូលអត្ថបទដែលបាននិយាយក្នុងសំឡេងគំរូ ដើម្បីបញ្ចប់ Ultimate Clone។"
     else:
         update_user_tts_model(user_id, "voxcpm2")
         notice = "បានរក្សាទុកសំឡេងគំរូ និងជ្រើស VoxCPM2 រួចរាល់។"
@@ -23483,6 +26309,7 @@ async def _voxcpm2_save_control_text(update: Update, context: ContextTypes.DEFAU
 
     profile = await _voxcpm2_profile_get(user_id)
     profile["control"] = control
+    profile["mode"] = VOXCPM2_MODE_CONTROLLABLE
     profile["updated_at"] = datetime.now(timezone.utc).isoformat()
     await _voxcpm2_profile_set(user_id, profile)
     context.user_data.pop("voxcpm2_state", None)
@@ -23496,9 +26323,75 @@ async def _voxcpm2_save_control_text(update: Update, context: ContextTypes.DEFAU
     )
 
 
+async def _voxcpm2_save_prompt_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    user_id = int(user.id)
+    prompt_text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if prompt_text.lower() in {"clear", "none", "default", "-", "លុប", "សម្អាត"}:
+        prompt_text = ""
+    if len(prompt_text) > VOXCPM2_PROMPT_MAX_CHARS:
+        await _voxcpm2_send_panel(
+            msg,
+            user_id,
+            f"អត្ថបទសំឡេងគំរូវែងពេក។ អតិបរមា {VOXCPM2_PROMPT_MAX_CHARS} តួអក្សរ។",
+            context=context,
+            prefer_saved=True,
+        )
+        return
+
+    profile = await _voxcpm2_profile_get(user_id)
+    profile["prompt_text"] = prompt_text
+    profile["mode"] = VOXCPM2_MODE_ULTIMATE
+    profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+    profile = await _voxcpm2_profile_set(user_id, profile)
+    context.user_data.pop("voxcpm2_state", None)
+
+    if prompt_text and _voxcpm2_profile_ready(profile) and not _voxcpm2_unavailable_reason():
+        update_user_tts_model(user_id, "voxcpm2")
+        notice = "បានរក្សាទុកអត្ថបទសំឡេងគំរូ និងជ្រើស Ultimate Clone រួចរាល់។"
+    elif prompt_text:
+        notice = "បានរក្សាទុកអត្ថបទសំឡេងគំរូ។ សូមបញ្ចូលសំឡេងគំរូ ដើម្បីបញ្ចប់ Ultimate Clone។"
+    else:
+        notice = "បានលុបអត្ថបទសំឡេងគំរូ។ Ultimate Clone មិនទាន់រួចរាល់ទេ។"
+    await _voxcpm2_send_panel(
+        msg,
+        user_id,
+        notice,
+        context=context,
+        prefer_saved=True,
+    )
+
+
 async def _cb_voxcpm2(query, user_id: int, context, data: str) -> None:
     action = data.split(":", 1)[1] if ":" in data else "refresh"
     _voxcpm2_remember_panel(context, query.message)
+
+    if action in {"mode_control", "mode_ultimate"}:
+        context.user_data.pop("voxcpm2_state", None)
+        profile = await _voxcpm2_profile_get(user_id)
+        profile["mode"] = (
+            VOXCPM2_MODE_ULTIMATE
+            if action == "mode_ultimate"
+            else VOXCPM2_MODE_CONTROLLABLE
+        )
+        profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+        profile = await _voxcpm2_profile_set(user_id, profile)
+        notice = (
+            "បានជ្រើស Ultimate Clone។ សូមបញ្ចូលសំឡេងគំរូ និងអត្ថបទត្រឹមត្រូវដែលបាននិយាយក្នុងសំឡេងនោះ។"
+            if profile["mode"] == VOXCPM2_MODE_ULTIMATE
+            else "បានជ្រើស Controllable Clone។ អ្នកអាចកំណត់អារម្មណ៍ និងស្ទីលថ្មីបាន។"
+        )
+        await _voxcpm2_send_panel(
+            query.message,
+            user_id,
+            notice,
+            edit=True,
+            context=context,
+        )
+        return
 
     if action == "set_ref":
         context.user_data["voxcpm2_state"] = VOXCPM2_WAIT_REFERENCE
@@ -23513,6 +26406,10 @@ async def _cb_voxcpm2(query, user_id: int, context, data: str) -> None:
         return
 
     if action == "set_control":
+        profile = await _voxcpm2_profile_get(user_id)
+        profile["mode"] = VOXCPM2_MODE_CONTROLLABLE
+        profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await _voxcpm2_profile_set(user_id, profile)
         context.user_data["voxcpm2_state"] = VOXCPM2_WAIT_CONTROL
         await _voxcpm2_edit_prompt(
             query,
@@ -23527,6 +26424,23 @@ async def _cb_voxcpm2(query, user_id: int, context, data: str) -> None:
         )
         return
 
+    if action == "set_prompt":
+        profile = await _voxcpm2_profile_get(user_id)
+        profile["mode"] = VOXCPM2_MODE_ULTIMATE
+        profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await _voxcpm2_profile_set(user_id, profile)
+        context.user_data["voxcpm2_state"] = VOXCPM2_WAIT_PROMPT_TEXT
+        await _voxcpm2_edit_prompt(
+            query,
+            context,
+            "📝 <b>បញ្ចូលអត្ថបទសំឡេងគំរូ</b>\n\n"
+            "សូមសរសេរអត្ថបទត្រឹមត្រូវដែលអ្នកនិយាយនៅក្នុងសំឡេងគំរូ។ "
+            "Ultimate Clone ប្រើអត្ថបទនេះដើម្បីបន្តសំឡេង និងរក្សាលម្អិតសំឡេងឱ្យដូចដើមបំផុត។\n\n"
+            "អត្ថបទត្រូវតែស្របតាមសំឡេងគំរូ។ ផ្ញើ <code>clear</code> ឬ <code>លុប</code> ដើម្បីលុប។ "
+            "ប្រើ /cancel ដើម្បីបោះបង់។",
+        )
+        return
+
     context.user_data.pop("voxcpm2_state", None)
 
     if action == "clear_control":
@@ -23538,6 +26452,20 @@ async def _cb_voxcpm2(query, user_id: int, context, data: str) -> None:
             query.message,
             user_id,
             "បានលុបការណែនាំអារម្មណ៍/ស្ទីលសំឡេង។",
+            edit=True,
+            context=context,
+        )
+        return
+
+    if action == "clear_prompt":
+        profile = await _voxcpm2_profile_get(user_id)
+        profile["prompt_text"] = ""
+        profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await _voxcpm2_profile_set(user_id, profile)
+        await _voxcpm2_send_panel(
+            query.message,
+            user_id,
+            "បានលុបអត្ថបទសំឡេងគំរូ។ Ultimate Clone ត្រូវការអត្ថបទនេះមុនពេលប្រើ។",
             edit=True,
             context=context,
         )
@@ -23569,13 +26497,24 @@ async def _cb_voxcpm2(query, user_id: int, context, data: str) -> None:
                 context=context,
             )
             return
-        update_user_tts_model(user_id, "voxcpm2")
         profile = await _voxcpm2_profile_get(user_id)
-        notice = (
-            "បានជ្រើស VoxCPM2 រួចរាល់។"
-            if _voxcpm2_reference_ready(profile)
-            else "បានជ្រើស VoxCPM2។ សូមបញ្ចូលសំឡេងគំរូ មុនពេលបង្កើតសំឡេង។"
-        )
+        missing = _voxcpm2_profile_missing(profile)
+        if missing:
+            labels = {
+                "reference": "សំឡេងគំរូ",
+                "prompt_text": "អត្ថបទសំឡេងគំរូ",
+            }
+            await _voxcpm2_send_panel(
+                query.message,
+                user_id,
+                "មិនទាន់អាចជ្រើស VoxCPM2 បានទេ។ សូមបំពេញ៖ "
+                + ", ".join(labels[item] for item in missing),
+                edit=True,
+                context=context,
+            )
+            return
+        update_user_tts_model(user_id, "voxcpm2")
+        notice = "បានជ្រើស VoxCPM2 រួចរាល់។"
         await _voxcpm2_send_panel(
             query.message,
             user_id,
@@ -23633,7 +26572,8 @@ async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎚️ ល្បឿន: <b>{speed_label}</b>\n"
         f"🤖 ម៉ូដែល TTS: <b>{html.escape(model_label)}</b>\n"
         f"🎙️ ការកំណត់ VoxCPM2៖ <b>{'ប្រើ /voxcpm2 ដើម្បីកែប្រែ' if _normalize_tts_model(prefs.get('tts_model', 'auto')) == 'voxcpm2' else 'មិនចាំបាច់'}</b>\n\n"
-        "ផ្ញើអត្ថបទណាមួយ ហើយប្រើប៊ូតុងក្រោមសារសំឡេង ដើម្បីប្តូរភាសា ម៉ូដែល ល្បឿន ឬប្រភេទសំឡេង។",
+        "ផ្ញើអត្ថបទណាមួយ។ បូតស្គាល់ភាសា និងជ្រើសសំឡេងដោយស្វ័យប្រវត្តិ; "
+        "ប៊ូតុងក្រោមសារសំឡេងប្រើសម្រាប់ប្តូរម៉ូដែល ល្បឿន ឬប្រភេទសំឡេង។",
         parse_mode="HTML",
         reply_markup=get_main_kb(prefs["gender"], prefs.get("tts_model", "auto")),
     ))
@@ -23947,8 +26887,8 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.error("Audio transcription failed: %s", exc, exc_info=True)
 
         if transcript:
-            is_khmer = bool(_KHMER_RE.search(transcript))
-            lang_flag = "🇰🇭" if is_khmer else "🌐"
+            detected_lang = _detect_lang(transcript)
+            lang_flag, lang_name = _language_display(detected_lang)
             fname_display = html.escape(filename[:50]) if filename else "audio"
             conversion_note = (
                 "✅ បានបង្កើតសារសំឡេងរួចរាល់។"
@@ -23956,7 +26896,8 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "⚠️ មិនអាចបង្កើតសារសំឡេងបាន ប៉ុន្តែបានបម្លែងទៅអត្ថបទ។"
             )
             header = (
-                f"🎵 <b>អត្ថបទពីឯកសារអូឌីយ៉ូ</b> {lang_flag} — <code>{fname_display}</code>\n"
+                f"🎵 <b>អត្ថបទពីឯកសារអូឌីយ៉ូ</b> {lang_flag} "
+                f"{html.escape(lang_name)} — <code>{fname_display}</code>\n"
                 f"{conversion_note}\n\n"
             )
             pages = _paginate_plain(transcript, limit=max(500, TELE_MSG_LIMIT - len(header) - 64))
@@ -24123,9 +27064,12 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await progress.update(85, "បានស្គាល់អត្ថបទ", f"រកឃើញ {len(transcript)} តួអក្សរ។", force=True)
         record_turn(user_id, "user", f"[Voice Transcript]: {transcript[:500]}")
-        is_khmer = bool(_KHMER_RE.search(transcript))
-        lang_flag = "🇰🇭" if is_khmer else "🌐"
-        header = f"📝 <b>អត្ថបទពីសារសំឡេង</b> {lang_flag}\n\n"
+        detected_lang = _detect_lang(transcript)
+        lang_flag, lang_name = _language_display(detected_lang)
+        header = (
+            f"📝 <b>អត្ថបទពីសារសំឡេង</b> {lang_flag} "
+            f"{html.escape(lang_name)}\n\n"
+        )
         pages = _paginate_plain(transcript, limit=max(500, TELE_MSG_LIMIT - len(header) - 64))
         if not pages:
             raise RuntimeError("Could not paginate transcript")
@@ -24210,10 +27154,26 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     context.user_data.pop("chat_state", None)
             return
 
+    if context.user_data.get("voxcpm2_state") == VOXCPM2_WAIT_REFERENCE:
+        if not await _ensure_user_allowed(update, context):
+            return
+        await _voxcpm2_send_panel(
+            msg,
+            user_id,
+            "សូមផ្ញើសារជាសំឡេង Telegram ឬឯកសារអូឌីយ៉ូ។ អត្ថបទមិនអាចប្រើជាសំឡេងគំរូបានទេ។",
+            context=context,
+            prefer_saved=True,
+        )
+        return
     if context.user_data.get("voxcpm2_state") == VOXCPM2_WAIT_CONTROL:
         if not await _ensure_user_allowed(update, context):
             return
         await _voxcpm2_save_control_text(update, context, text)
+        return
+    if context.user_data.get("voxcpm2_state") == VOXCPM2_WAIT_PROMPT_TEXT:
+        if not await _ensure_user_allowed(update, context):
+            return
+        await _voxcpm2_save_prompt_text(update, context, text)
         return
     if await _handle_feature_request_user_text(update, context):
         return
@@ -24361,74 +27321,6 @@ async def _cb_hide_speed(query, user_id: int, context):
     await safe_send(lambda: query.message.edit_reply_markup(
         reply_markup=get_main_kb(prefs["gender"], prefs.get("tts_model", "auto"))
     ))
-
-
-async def _cb_show_tts_language(query, user_id: int, context):
-    if query.message is None:
-        return
-    original_text = await get_callback_original_text(query, user_id)
-    current_hint, _clean_text = _extract_leading_lang_hint(original_text or "")
-    await safe_send(lambda: query.message.edit_reply_markup(
-        reply_markup=get_tts_language_kb(current_hint or "auto")
-    ))
-
-
-async def _cb_hide_tts_language(query, user_id: int, context):
-    if query.message is None:
-        return
-    prefs = await get_user_prefs_async(user_id)
-    await safe_send(lambda: query.message.edit_reply_markup(
-        reply_markup=get_main_kb(prefs["gender"], prefs.get("tts_model", "auto"))
-    ))
-
-
-async def _cb_tts_language(query, user_id: int, context, data: str):
-    if query.message is None:
-        return
-    requested = data.replace("ttslang_", "", 1).strip().lower()
-    if requested != "auto":
-        requested = _normalise_supported_tts_lang(requested)
-        if not requested:
-            await safe_send(lambda: query.message.reply_text("❌ ភាសា TTS មិនត្រឹមត្រូវ។"))
-            return
-
-    original_text, prefs = await asyncio.gather(
-        get_callback_original_text(query, user_id),
-        get_user_prefs_async(user_id),
-    )
-    if not original_text:
-        await safe_send(lambda: query.message.reply_text(
-            "❌ រកអត្ថបទដើមមិនឃើញ។ សូមផ្ញើអត្ថបទម្តងទៀត រួចជ្រើសភាសា។"
-        ))
-        return
-    if await _check_cooldown(query.message, user_id):
-        return
-
-    _old_hint, clean_text = _extract_leading_lang_hint(original_text)
-    selected_text = clean_text.strip() if requested == "auto" else _with_tts_lang_hint(requested, clean_text)
-    if not selected_text:
-        await safe_send(lambda: query.message.reply_text("❌ អត្ថបទទទេ មិនអាចបង្កើតសំឡេងបានទេ។"))
-        return
-
-    if requested == "auto":
-        label = "ស្វ័យប្រវត្តិ"
-    else:
-        flag, name = _language_display(requested)
-        label = f"{flag} {name}"
-
-    await _regenerate_tts_voice_with_progress(
-        query=query,
-        context=context,
-        user_id=user_id,
-        original_text=selected_text,
-        gender=prefs["gender"],
-        speed=prefs["speed"],
-        tts_model=prefs.get("tts_model", "auto"),
-        title=f"កំពុងប្តូរភាសាទៅ {label}",
-        final_text=f"✅ បានប្តូរភាសាទៅ {label} និងបង្កើតសំឡេងរួចរាល់។",
-        error_text="❌ មិនអាចប្តូរភាសា និងបង្កើតសំឡេងបានទេ។ សូមសាកម្ដងទៀត។",
-        delete_source=True,
-    )
 
 
 async def _cb_show_tts_model(query, user_id: int, context):
@@ -24820,12 +27712,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cb_show_speed(query, user_id, context)
         elif data == "hide_speed":
             await _cb_hide_speed(query, user_id, context)
-        elif data == "show_tts_language":
-            await _cb_show_tts_language(query, user_id, context)
-        elif data == "hide_tts_language":
-            await _cb_hide_tts_language(query, user_id, context)
-        elif data.startswith("ttslang_"):
-            await _cb_tts_language(query, user_id, context, data)
         elif data == "show_tts_model":
             await _cb_show_tts_model(query, user_id, context)
         elif data == "hide_tts_model":
@@ -25147,12 +28033,20 @@ async def _async_main_once():
         await _restore_run_state_from_redis()
     except Exception as rexc:
         webhook_logger.warning("Redis fallback triggered. Runtime state restore failed during boot: %s", rexc)
+    await _bootstrap_runtime_security()
+    from app.core.telegram_auth import configure_telegram_admin_authorizer
+
+    admin_authorizer = configure_telegram_admin_authorizer(
+        redis_client=redis_client,
+        fallback_admin_ids=ADMIN_IDS,
+    )
+    ADMIN_IDS.update(await admin_authorizer.load_ids(force=True))
     _runtime_admin_bootstrap_state()
 
     if not ADMIN_IDS:
         logger.warning(
-            "No ADMIN_IDS configured. "
-            "Set ADMIN_IDS=123456,789012 in your environment."
+            "No Telegram administrators are authorized. Add at least one user ID "
+            "to Redis set tgbot:security:admin_user_ids:v1."
         )
 
     print(
@@ -25206,10 +28100,6 @@ def main():
         else:
             logger.warning("Runtime stopped — restarting in 5s...")
             time.sleep(5)
-=======
-def __dir__() -> list[str]:
-    return sorted(set(globals()) | set(dir(_legacy)))
->>>>>>> 1441bb6 (gf)
 
 
 if __name__ == "__main__":
