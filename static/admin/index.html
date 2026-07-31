@@ -37,7 +37,7 @@
     </section>
 
     <div id="dashboard" class="dashboard is-hidden">
-      <section class="hero panel">
+      <section id="overview" class="hero panel dashboard-section">
         <div class="profile">
           <div id="profileFallback" class="avatar avatar-fallback" aria-hidden="true">A</div>
           <img id="profilePhoto" class="avatar is-hidden" alt="">
@@ -72,7 +72,7 @@
         </article>
       </section>
 
-      <section class="two-column">
+      <section id="health" class="two-column dashboard-section">
         <article class="panel health-panel">
           <div class="section-heading">
             <div>
@@ -117,7 +117,7 @@
         </article>
       </section>
 
-      <section class="panel">
+      <section id="security" class="panel dashboard-section">
         <div class="section-heading">
           <div>
             <p class="eyebrow">Network policy</p>
@@ -135,7 +135,7 @@
         <p id="corsEmpty" class="empty-state is-hidden">No browser origins are currently allowed.</p>
       </section>
 
-      <section class="panel">
+      <section id="settings" class="panel dashboard-section">
         <div class="section-heading">
           <div>
             <p class="eyebrow">Redis-backed controls</p>
@@ -153,6 +153,13 @@
       </section>
     </div>
   </main>
+
+  <nav class="mobile-nav" aria-label="Admin sections">
+    <a class="mobile-nav-item active" href="#overview" data-nav-target="overview">⌂<span>Overview</span></a>
+    <a class="mobile-nav-item" href="#health" data-nav-target="health">◉<span>Health</span></a>
+    <a class="mobile-nav-item" href="#security" data-nav-target="security">⌘<span>Security</span></a>
+    <a class="mobile-nav-item" href="#settings" data-nav-target="settings">⚙<span>Settings</span></a>
+  </nav>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 </body>

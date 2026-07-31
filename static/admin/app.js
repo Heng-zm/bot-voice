@@ -38,6 +38,14 @@ const elements = {
   toast: document.getElementById("toast"),
 };
 
+document.querySelectorAll("[data-nav-target]").forEach((item) => {
+  item.addEventListener("click", () => {
+    document.querySelectorAll("[data-nav-target]").forEach((candidate) => {
+      candidate.classList.toggle("active", candidate === item);
+    });
+  });
+});
+
 function haptic(type = "light") {
   try {
     telegram?.HapticFeedback?.impactOccurred(type);
@@ -389,12 +397,49 @@ function initializeTelegram() {
   if (!telegram) return;
   telegram.ready();
   telegram.expand();
+  applyTelegramTheme();
+  bindTelegramEvents();
   try {
     telegram.setHeaderColor("secondary_bg_color");
     telegram.setBackgroundColor("bg_color");
   } catch {
     // Older Telegram clients may not support these methods.
   }
+}
+
+function applyTelegramTheme() {
+  const root = document.documentElement;
+  const params = telegram?.themeParams || {};
+  const colors = {
+    "--tg-bg": params.bg_color,
+    "--tg-secondary-bg": params.secondary_bg_color,
+    "--tg-text": params.text_color,
+    "--tg-hint": params.hint_color,
+    "--tg-link": params.link_color,
+    "--tg-button": params.button_color,
+    "--tg-button-text": params.button_text_color,
+  };
+  Object.entries(colors).forEach(([name, value]) => {
+    if (value) root.style.setProperty(name, value);
+  });
+  if (telegram?.colorScheme) root.dataset.telegramTheme = telegram.colorScheme;
+  updateViewportVars();
+}
+
+function updateViewportVars() {
+  const root = document.documentElement;
+  const viewportHeight = telegram?.viewportHeight || window.innerHeight;
+  const stableHeight = telegram?.viewportStableHeight || viewportHeight;
+  root.style.setProperty("--tg-viewport-height", `${viewportHeight}px`);
+  root.style.setProperty("--tg-viewport-stable-height", `${stableHeight}px`);
+}
+
+function bindTelegramEvents() {
+  if (!telegram?.onEvent) return;
+  telegram.onEvent("themeChanged", applyTelegramTheme);
+  telegram.onEvent("viewportChanged", updateViewportVars);
+  telegram.onEvent("fullscreenChanged", updateViewportVars);
+  window.addEventListener("resize", updateViewportVars, { passive: true });
 }
 
 elements.refreshButton.addEventListener("click", () => refreshAll());

@@ -1,12 +1,14 @@
 :root {
-  --bg: #08101f;
+  --tg-bg: #08101f;
+  --tg-text: #f7f9ff;
+  --bg: var(--tg-bg);
   --surface: rgba(17, 28, 48, 0.82);
   --surface-strong: #15213a;
   --surface-soft: rgba(255, 255, 255, 0.055);
   --panel-start: rgba(24, 38, 63, 0.9);
   --panel-end: rgba(17, 28, 48, 0.82);
   --border: rgba(255, 255, 255, 0.1);
-  --text: #f7f9ff;
+  --text: var(--tg-text);
   --muted: #9eabc2;
   --accent: #57a5ff;
   --accent-strong: #347ce9;
@@ -37,6 +39,14 @@ body {
   overflow-x: hidden;
 }
 
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
+
 button, input { font: inherit; }
 
 button { -webkit-tap-highlight-color: transparent; }
@@ -57,10 +67,14 @@ button { -webkit-tap-highlight-color: transparent; }
 
 .shell {
   width: min(1180px, 100%);
+  min-height: var(--tg-viewport-stable-height, 100svh);
   margin: 0 auto;
   padding: max(18px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right))
     max(36px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
 }
+
+.dashboard-section { scroll-margin-top: 18px; }
+.mobile-nav { display: none; }
 
 .topbar, .brand, .profile, .section-heading, .health-row, .form-actions {
   display: flex;
@@ -417,6 +431,34 @@ input::placeholder { color: #6f7f99; }
 }
 
 @media (max-width: 520px) {
+  body { padding-bottom: 76px; }
+  .mobile-nav {
+    position: fixed;
+    z-index: 20;
+    right: 12px;
+    bottom: max(10px, env(safe-area-inset-bottom));
+    left: 12px;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    padding: 8px 6px;
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    background: color-mix(in srgb, var(--surface-strong) 92%, transparent);
+    box-shadow: var(--shadow);
+    backdrop-filter: blur(18px);
+  }
+  .mobile-nav-item {
+    display: grid;
+    justify-items: center;
+    gap: 2px;
+    padding: 6px 2px;
+    border-radius: 14px;
+    color: var(--muted);
+    font-size: 18px;
+    text-decoration: none;
+  }
+  .mobile-nav-item span { font-size: 10px; font-weight: 700; }
+  .mobile-nav-item.active { color: var(--accent); background: var(--surface-soft); }
   .shell { padding-top: max(12px, env(safe-area-inset-top)); }
   .topbar { margin-bottom: 14px; }
   .brand-mark { width: 40px; height: 40px; border-radius: 12px; }
