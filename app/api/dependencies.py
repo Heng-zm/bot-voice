@@ -7,6 +7,7 @@ runtime initializes external clients after importing the ASGI application.
 from __future__ import annotations
 
 import hmac
+import os
 from dataclasses import dataclass
 from typing import Annotated, Any
 
@@ -56,8 +57,13 @@ async def require_admin(request: Request) -> AdminPrincipal:
     legacy = legacy_module()
     telegram_init_data, telegram_credential_sent = telegram_init_data_from_request(request)
     if telegram_credential_sent:
+        # A separate launcher bot may own the Mini App while the primary bot
+        # handles normal messages. Keep the admin token optional for backward
+        # compatibility; otherwise fall back to the primary bot token.
         bot_token = str(
-            getattr(legacy, "TELEGRAM_BOT_TOKEN", "")
+            os.getenv("TELEGRAM_ADMIN_BOT_TOKEN", "")
+            or getattr(legacy, "TELEGRAM_ADMIN_BOT_TOKEN", "")
+            or getattr(legacy, "TELEGRAM_BOT_TOKEN", "")
             or getattr(legacy.SETTINGS, "TELEGRAM_BOT_TOKEN", "")
             or ""
         ).strip()

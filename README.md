@@ -142,6 +142,11 @@ signature, timestamp, user JSON, and Redis administrator membership are all
 checked server-side. The browser's `initDataUnsafe` object is never trusted for
 authorization.
 
+To launch the Mini App from a separate Bot 2 while keeping Bot 1 as the main
+bot, set `TELEGRAM_ADMIN_BOT_TOKEN` to Bot 2's token. Normal bot operations
+continue using `TELEGRAM_BOT_TOKEN`; if the admin token is omitted, it falls
+back to the main bot token.
+
 Administrator IDs are stored in this Redis set, not `.env`:
 
 ```text

@@ -145,6 +145,11 @@ def validate_telegram_init_data(
     if len(init_data.encode("utf-8")) > _MAX_INIT_DATA_BYTES:
         raise TelegramInitDataError("Telegram Mini App init data is too large.")
     token = str(bot_token or "").strip()
+    # Render and some dotenv loaders preserve literal surrounding quotes when
+    # a secret is entered as `"123:ABC"`; Telegram tokens never contain quote
+    # characters, so normalize that common deployment mistake safely.
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"}:
+        token = token[1:-1].strip()
     if not token:
         raise TelegramInitDataError("Telegram bot token is not configured.")
 
