@@ -15,18 +15,12 @@ app/
 │       ├── health.py
 │       ├── telegram.py
 │       ├── ai.py
-<<<<<<< HEAD
 │       ├── admin.py
-=======
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
 │       └── admin_cors.py
 ├── core/
 │   ├── async_loop.py
 │   ├── security.py
-<<<<<<< HEAD
 │   ├── telegram_auth.py
-=======
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
 │   ├── cors.py
 │   ├── middleware.py
 │   └── json.py
@@ -54,7 +48,6 @@ tests/
 ├── test_ai.py
 ├── test_voxcpm2.py
 ├── test_runtime_security.py
-<<<<<<< HEAD
 ├── test_dynamic_cors.py
 ├── test_telegram_auth.py
 └── test_admin_api.py
@@ -63,9 +56,6 @@ static/
     ├── index.html
     ├── styles.css
     └── app.js
-=======
-└── test_dynamic_cors.py
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
 ```
 
 The runtime was previously a single 28k-line root module. `app/legacy.py`
@@ -127,7 +117,6 @@ send the `X-CSRF-Token` returned by the admin login/bootstrap API. Each process
 caches the Redis policy for five seconds and updates its local cache
 immediately after an edit.
 
-<<<<<<< HEAD
 ## Telegram Admin Mini App
 
 The dashboard is served at:
@@ -185,8 +174,6 @@ DELETE /api/admin/cors
 controls and maintenance mode. Deployment-level settings and secrets are not
 editable from the Mini App.
 
-=======
->>>>>>> 3be07e4c7a87b422088d3d1c52ed3dff709a67b8
 ## VoxCPM2 voice cloning
 
 In Telegram, run `/voxcpm2` and follow the setup panel:

@@ -33,6 +33,7 @@ ALLOWED_CORS_HEADERS = (
     "x-api-key",
     "x-csrf-token",
     "x-requested-with",
+    "x-telegram-init-data",
 )
 EXPOSED_CORS_HEADERS = ("X-Request-ID", "X-Response-Time-ms")
 STATE_CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -138,6 +139,8 @@ class DynamicCorsStore:
         self._owns_redis = False
         self._snapshot = CorsSnapshot((), "not-loaded", 0.0)
         self._cache_lock = threading.RLock()
+        self._client_lock = threading.RLock()
+        self._load_lock = threading.Lock()
 
     @property
     def redis_origins_key(self) -> str:
@@ -154,39 +157,67 @@ class DynamicCorsStore:
         redis_url: str = "",
         supabase_client: Any | None = None,
     ) -> DynamicCorsStore:
-        if redis_client is not None:
-            self.redis_client = redis_client
-            self._owns_redis = False
-        if redis_url:
-            self.redis_url = str(redis_url).strip()
-        if supabase_client is not None:
-            self.supabase_client = supabase_client
+        requested_url = str(redis_url).strip()
+        with self._load_lock, self._client_lock:
+            changed = False
+            if redis_client is not None:
+                if redis_client is not self.redis_client:
+                    self._close_owned_redis_locked()
+                    self.redis_client = redis_client
+                    changed = True
+                # An explicitly supplied client is caller-owned, even when it
+                # happens to be the same object this store created earlier.
+                self._owns_redis = False
+            if requested_url and requested_url != self.redis_url:
+                if self._owns_redis:
+                    self._close_owned_redis_locked()
+                self.redis_url = requested_url
+                changed = True
+            if (
+                supabase_client is not None
+                and supabase_client is not self.supabase_client
+            ):
+                self.supabase_client = supabase_client
+                changed = True
+            if changed:
+                with self._cache_lock:
+                    self._snapshot = CorsSnapshot((), "not-loaded", 0.0)
         return self
 
-    def _connect_redis_sync(self) -> Any | None:
-        if self.redis_client is not None:
-            return self.redis_client
-        if not self.redis_url:
-            return None
-        try:
-            import redis
+    def _close_owned_redis_locked(self) -> None:
+        if self._owns_redis and self.redis_client is not None:
+            try:
+                self.redis_client.close()
+            except Exception:
+                logger.debug("Dynamic CORS Redis close failed.", exc_info=True)
+        self.redis_client = None
+        self._owns_redis = False
 
-            client = redis.from_url(
-                self.redis_url,
-                decode_responses=True,
-                socket_connect_timeout=5,
-                socket_timeout=5,
-                health_check_interval=30,
-                retry_on_timeout=True,
-                max_connections=8,
-            )
-            client.ping()
-        except Exception as exc:  # noqa: BLE001 - Redis client boundary
-            logger.warning("Dynamic CORS Redis connection failed: %s", exc)
-            return None
-        self.redis_client = client
-        self._owns_redis = True
-        return client
+    def _connect_redis_sync(self) -> Any | None:
+        with self._client_lock:
+            if self.redis_client is not None:
+                return self.redis_client
+            if not self.redis_url:
+                return None
+            try:
+                import redis
+
+                client = redis.from_url(
+                    self.redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=5,
+                    socket_timeout=5,
+                    health_check_interval=30,
+                    retry_on_timeout=True,
+                    max_connections=8,
+                )
+                client.ping()
+            except Exception as exc:  # noqa: BLE001 - Redis client boundary
+                logger.warning("Dynamic CORS Redis connection failed: %s", exc)
+                return None
+            self.redis_client = client
+            self._owns_redis = True
+            return client
 
     @staticmethod
     def _decode(value: Any) -> str:
@@ -328,6 +359,52 @@ class DynamicCorsStore:
     def cached_origins(self) -> list[str]:
         return list(self.cached_snapshot().origins)
 
+    def _load_sync(
+        self,
+        *,
+        force: bool,
+        observed_loaded_at: float,
+    ) -> CorsSnapshot:
+        """Load once when concurrent requests observe the same stale snapshot."""
+
+        with self._load_lock:
+            snapshot = self.cached_snapshot()
+            refreshed_by_another_request = (
+                snapshot.source != "not-loaded"
+                and snapshot.loaded_at_monotonic != observed_loaded_at
+            )
+            if refreshed_by_another_request or (
+                not force
+                and snapshot.source != "not-loaded"
+                and time.monotonic() - snapshot.loaded_at_monotonic
+                < self.cache_ttl_seconds
+            ):
+                return snapshot
+
+            redis_origins, redis_source = self._redis_read_sync()
+            if redis_origins is not None:
+                return self._set_snapshot(redis_origins, redis_source)
+
+            supabase_origins, supabase_source = self._supabase_read_sync()
+            if supabase_origins is not None:
+                mirrored = self._redis_replace_sync(supabase_origins)
+                source = "supabase+redis" if mirrored else supabase_source
+                return self._set_snapshot(supabase_origins, source)
+
+            # An empty list is the secure first-boot policy. Persist its
+            # initialized marker so Redis remains authoritative instead of
+            # querying Supabase on every cache refresh.
+            initialized = self._redis_replace_sync([])
+            if initialized:
+                return self._set_snapshot([], "redis-initialized-empty")
+            if self.supabase_client is not None:
+                saved = self._supabase_replace_sync([], 0)
+                if saved:
+                    return self._set_snapshot([], "supabase-initialized-empty")
+            raise DynamicCorsUnavailable(
+                "Dynamic CORS requires an available Redis or Supabase connection."
+            )
+
     async def load(self, *, force: bool = False) -> CorsSnapshot:
         snapshot = self.cached_snapshot()
         if (
@@ -337,28 +414,10 @@ class DynamicCorsStore:
         ):
             return snapshot
 
-        redis_origins, redis_source = await asyncio.to_thread(self._redis_read_sync)
-        if redis_origins is not None:
-            return self._set_snapshot(redis_origins, redis_source)
-
-        supabase_origins, supabase_source = await asyncio.to_thread(self._supabase_read_sync)
-        if supabase_origins is not None:
-            mirrored = await asyncio.to_thread(self._redis_replace_sync, supabase_origins)
-            source = "supabase+redis" if mirrored else supabase_source
-            return self._set_snapshot(supabase_origins, source)
-
-        # An empty list is the secure first-boot policy. Persist its initialized
-        # marker so Redis remains authoritative instead of querying Supabase on
-        # every cache refresh.
-        initialized = await asyncio.to_thread(self._redis_replace_sync, [])
-        if initialized:
-            return self._set_snapshot([], "redis-initialized-empty")
-        if self.supabase_client is not None:
-            saved = await asyncio.to_thread(self._supabase_replace_sync, [], 0)
-            if saved:
-                return self._set_snapshot([], "supabase-initialized-empty")
-        raise DynamicCorsUnavailable(
-            "Dynamic CORS requires an available Redis or Supabase connection."
+        return await asyncio.to_thread(
+            self._load_sync,
+            force=force,
+            observed_loaded_at=snapshot.loaded_at_monotonic,
         )
 
     async def replace(self, origins: list[str], *, admin_id: int) -> CorsSnapshot:
@@ -435,13 +494,10 @@ class DynamicCorsStore:
         return normalized in snapshot.origins
 
     def close(self) -> None:
-        if self._owns_redis and self.redis_client is not None:
-            try:
-                self.redis_client.close()
-            except Exception:
-                logger.debug("Dynamic CORS Redis close failed.", exc_info=True)
-        self.redis_client = None
-        self._owns_redis = False
+        with self._load_lock, self._client_lock:
+            self._close_owned_redis_locked()
+            with self._cache_lock:
+                self._snapshot = CorsSnapshot((), "not-loaded", 0.0)
 
 
 class DynamicCORSMiddleware:

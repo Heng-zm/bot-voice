@@ -17,6 +17,7 @@ from app.api.dependencies import (
 )
 from app.api.v1 import admin_cors
 from app.core.cors import (
+    CorsSnapshot,
     DynamicCORSMiddleware,
     DynamicCorsStore,
     InvalidOriginError,
@@ -56,6 +57,7 @@ class FakeRedis:
     def __init__(self) -> None:
         self.values: dict[str, str] = {}
         self.sets: dict[str, set[str]] = {}
+        self.smembers_calls = 0
 
     def get(self, key: str):
         return self.values.get(key)
@@ -84,6 +86,7 @@ class FakeRedis:
         return before - len(target)
 
     def smembers(self, key: str):
+        self.smembers_calls += 1
         return set(self.sets.get(key, set()))
 
     def pipeline(self, transaction: bool = True):
@@ -125,6 +128,36 @@ class DynamicCorsStoreTests(unittest.IsolatedAsyncioTestCase):
             admin_id=7,
         )
         self.assertFalse(changed)
+
+    async def test_concurrent_cache_misses_share_one_backend_read(self) -> None:
+        current = self.store.cached_snapshot()
+        with self.store._cache_lock:
+            self.store._snapshot = CorsSnapshot(
+                current.origins,
+                current.source,
+                0.0,
+            )
+        calls_before = self.redis.smembers_calls
+
+        snapshots = await asyncio.gather(
+            *(self.store.load() for _ in range(12))
+        )
+
+        self.assertEqual(self.redis.smembers_calls - calls_before, 1)
+        self.assertTrue(all(snapshot == snapshots[0] for snapshot in snapshots))
+
+    async def test_reconfigure_invalidates_cached_policy(self) -> None:
+        await self.store.add("https://old.example", admin_id=7)
+        replacement = FakeRedis()
+        replacement.values[self.store.redis_initialized_key] = "1"
+        replacement.sets[self.store.redis_origins_key] = {
+            "https://new.example"
+        }
+
+        self.store.configure(redis_client=replacement)
+
+        self.assertFalse(await self.store.is_allowed("https://old.example"))
+        self.assertTrue(await self.store.is_allowed("https://new.example"))
 
     def test_invalid_origins_are_rejected(self) -> None:
         invalid = (
@@ -187,7 +220,9 @@ class DynamicCorsMiddlewareTests(unittest.TestCase):
                 headers={
                     "Origin": "https://admin.example",
                     "Access-Control-Request-Method": "POST",
-                    "Access-Control-Request-Headers": "Content-Type, X-CSRF-Token",
+                    "Access-Control-Request-Headers": (
+                        "Content-Type, X-CSRF-Token, X-Telegram-Init-Data"
+                    ),
                 },
             )
             response = client.post(
