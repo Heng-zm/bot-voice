@@ -10172,7 +10172,7 @@ DEFAULT_OCR_AUTO_PREFER_PROVIDER = "gemini"            # gemini | hf
 
 GEMINI_MODEL            = DEFAULT_GEMINI_MODEL
 HF_TOKEN                = ""
-HF_MODEL                = "Qwen/Qwen2.5-7B-Instruct"
+HF_MODEL                = "Qwen/Qwen2.5-7B"
 HF_OCR_MODEL            = "microsoft/trocr-base-printed"
 AI_PROVIDER             = "hf"
 OCR_PROVIDER            = DEFAULT_OCR_PROVIDER
@@ -11942,7 +11942,7 @@ def _init_clients() -> None:
     # Code default: DEFAULT_GEMINI_MODEL. Env values are optional overrides only.
     GEMINI_MODEL       = (os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_GENAI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
     HF_TOKEN           = os.getenv("HF_TOKEN", "")
-    HF_MODEL           = os.getenv("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+    HF_MODEL           = os.getenv("HF_MODEL", "Qwen/Qwen2.5-7B")
     HF_OCR_MODEL       = os.getenv("HF_OCR_MODEL", "microsoft/trocr-base-printed")
 
     AI_PROVIDER = os.getenv("AI_PROVIDER", "hf").lower().strip()
