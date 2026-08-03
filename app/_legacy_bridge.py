@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from importlib import import_module
 from types import ModuleType
-from typing import Any, Callable, Iterable
+from typing import Any
 
 
 def legacy_module() -> ModuleType:

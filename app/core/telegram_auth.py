@@ -343,6 +343,12 @@ class TelegramAdminAuthorizer:
     async def load_ids(self, *, force: bool = False) -> frozenset[int]:
         return await asyncio.to_thread(self._load_ids_sync, force=force)
 
+    def invalidate(self) -> None:
+        """Expire the local allowlist after an administrator mutation."""
+
+        with self._lock:
+            self._cache_deadline = 0.0
+
     def is_admin_sync(self, user_id: int) -> bool:
         try:
             candidate = int(user_id)

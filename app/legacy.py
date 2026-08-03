@@ -139,6 +139,10 @@ from telegram.ext import (
     CallbackQueryHandler,
     ApplicationHandlerStop,
 )
+from app.services.telegram.flow import (
+    callback_requires_tts_access,
+    classify_callback,
+)
 try:
     from pydantic_settings import BaseSettings, SettingsConfigDict
     _PYDANTIC_SETTINGS_AVAILABLE = True
@@ -12002,7 +12006,26 @@ def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tuple[str
     provider = _normalise_ocr_provider(OCR_PROVIDER, default=DEFAULT_OCR_PROVIDER)
 
     errors: list[str] = []
-    order = _ocr_provider_order(provider)
+    from app.services.ai.providers import get_provider_manager
+
+    provider_manager = get_provider_manager()
+    configured_order = _ocr_provider_order(provider)
+    manager_names = [
+        "huggingface" if name == "hf" else name
+        for name in configured_order
+    ]
+    if provider == "auto":
+        routed_names = provider_manager.ordered(
+            "ocr",
+            preferred=manager_names,
+        )
+        order = [
+            "hf" if name == "huggingface" else name
+            for name in routed_names
+            if name in {"gemini", "huggingface"}
+        ]
+    else:
+        order = configured_order
 
     for item in order:
         if item == "gemini":
@@ -12013,12 +12036,18 @@ def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tuple[str
                 errors.append("gemini=temporarily disabled after recent OCR failures")
                 continue
             try:
+                started = time.perf_counter()
                 text = ask_gemini_ocr(image_data, mime_type)
                 _mark_ocr_provider_success("gemini")
+                provider_manager.record_success(
+                    "gemini",
+                    (time.perf_counter() - started) * 1_000,
+                )
                 return text, "gemini", GEMINI_MODEL
             except Exception as e:
                 errors.append(f"gemini={type(e).__name__}: {e!r}")
                 _mark_ocr_provider_failure("gemini", e)
+                provider_manager.record_failure("gemini", e)
                 if provider == "gemini":
                     raise _friendly_ocr_error(errors)
                 logger.warning("Gemini OCR failed; fallback provider will be tried if available: %s", str(e)[:300])
@@ -12033,12 +12062,18 @@ def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tuple[str
                 errors.append("hf=temporarily disabled after recent OCR failures")
                 continue
             try:
+                started = time.perf_counter()
                 text = ask_huggingface_ocr(image_data)
                 _mark_ocr_provider_success("hf")
+                provider_manager.record_success(
+                    "huggingface",
+                    (time.perf_counter() - started) * 1_000,
+                )
                 return text, "hf", HF_OCR_MODEL
             except Exception as e:
                 errors.append(f"hf={type(e).__name__}: {e!r}")
                 _mark_ocr_provider_failure("hf", e)
+                provider_manager.record_failure("huggingface", e)
                 if provider == "hf":
                     raise _friendly_ocr_error(errors)
                 if _gemini is not None and not _ocr_provider_is_temporarily_disabled("gemini"):
@@ -12057,29 +12092,46 @@ def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tuple[str
 
 def ai_text_reply(prompt: str, history: list[dict] | None = None) -> tuple[str, str, int | None]:
     """Return (reply, model_used, tokens_used) for text-only chat."""
-    provider = (AI_PROVIDER or "hf").lower().strip()
+    from app.services.ai.providers import get_provider_manager
 
-    if provider == "hf":
-        reply = ask_huggingface(prompt, history)
-        return reply, HF_MODEL, None
+    configured = (AI_PROVIDER or "hf").lower().strip()
+    preferred = ["huggingface" if configured == "hf" else "gemini"]
 
-    if _gemini is None:
-        raise RuntimeError("Gemini client is not configured.")
+    def execute(provider_name: str) -> tuple[str, str, int | None]:
+        if provider_name == "huggingface":
+            reply = ask_huggingface(prompt, history)
+            return reply, HF_MODEL, None
+        if provider_name != "gemini":
+            raise RuntimeError(f"Unsupported AI provider: {provider_name}")
+        if _gemini is None:
+            raise RuntimeError("Gemini client is not configured.")
+        contents = _build_gemini_contents(
+            message=prompt,
+            history=history or [],
+            image_data=None,
+            audio_data=None,
+            image_mime="",
+            audio_mime="",
+        )
+        response = _gemini.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=_ai_gen_config(),
+        )
+        tokens_used = None
+        with suppress(Exception):
+            tokens_used = response.usage_metadata.total_token_count
+        reply = (response.text or "").strip()
+        if not reply:
+            raise RuntimeError("Gemini returned an empty response.")
+        return reply, GEMINI_MODEL, tokens_used
 
-    contents = _build_gemini_contents(
-        message=prompt, history=history or [],
-        image_data=None, audio_data=None,
-        image_mime="", audio_mime="",
+    result, _provider_name = get_provider_manager().execute_sync(
+        "ai",
+        execute,
+        preferred=preferred,
     )
-    response = _gemini.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=contents,
-        config=_ai_gen_config(),
-    )
-    tokens_used = None
-    with suppress(Exception):
-        tokens_used = response.usage_metadata.total_token_count
-    return (response.text or "").strip(), GEMINI_MODEL, tokens_used
+    return result
 
 
 def _init_clients() -> None:
@@ -12760,6 +12812,30 @@ async def get_user_prefs_async(user_id: int) -> dict:
 _USER_LOCK_MAX = 5_000
 _user_locks: OrderedDict[int, asyncio.Lock] = OrderedDict()
 _user_locks_guard = threading.RLock()
+_tts_request_reservations: set[int] = set()
+_tts_request_reservations_guard = threading.RLock()
+
+
+def _reserve_tts_request(user_id: int) -> bool:
+    """Reserve the preparation window before the per-user async lock is held."""
+
+    user_id = int(user_id)
+    lock = _get_user_lock(user_id)
+    with _tts_request_reservations_guard:
+        if lock.locked() or user_id in _tts_request_reservations:
+            return False
+        _tts_request_reservations.add(user_id)
+        return True
+
+
+def _release_tts_request(user_id: int) -> None:
+    with _tts_request_reservations_guard:
+        _tts_request_reservations.discard(int(user_id))
+
+
+def _tts_request_reserved(user_id: int) -> bool:
+    with _tts_request_reservations_guard:
+        return int(user_id) in _tts_request_reservations
 
 
 def _evict_idle_user_locks() -> int:
@@ -18499,25 +18575,14 @@ async def _generate_user_voice_voxcpm2_session(
         await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
         return cached
 
-    sem = _TTS_CHUNK_SEMAPHORE
-    if sem is None:
-        audio = await _generate_voice_voxcpm2(
-            cleaned,
-            control,
-            reference_path,
-            speed,
-            output_path,
-            mode=mode,
-            prompt_text=prompt_text,
-            validate_reference=False,
-        )
-    else:
-        async with sem:
-            cached = _tts_audio_cache_get(cache_key)
-            if cached is not None:
-                await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
-                return cached
-            audio = await _generate_voice_voxcpm2(
+    from app.services.ai.providers import get_provider_manager
+
+    provider_manager = get_provider_manager()
+
+    async def render() -> bytes:
+        started = time.perf_counter()
+        try:
+            generated = await _generate_voice_voxcpm2(
                 cleaned,
                 control,
                 reference_path,
@@ -18527,6 +18592,25 @@ async def _generate_user_voice_voxcpm2_session(
                 prompt_text=prompt_text,
                 validate_reference=False,
             )
+        except Exception as exc:
+            provider_manager.record_failure("voxcpm2", exc)
+            raise
+        provider_manager.record_success(
+            "voxcpm2",
+            (time.perf_counter() - started) * 1_000,
+        )
+        return generated
+
+    sem = _TTS_CHUNK_SEMAPHORE
+    if sem is None:
+        audio = await render()
+    else:
+        async with sem:
+            cached = _tts_audio_cache_get(cache_key)
+            if cached is not None:
+                await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
+                return cached
+            audio = await render()
     _tts_audio_cache_set(cache_key, audio)
     return audio
 
@@ -18916,11 +19000,21 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
     if not text:
         raise ValueError("generate_voice: text must not be empty")
 
+    from app.services.ai.providers import get_provider_manager
+
+    provider_manager = get_provider_manager()
     user_model = _normalize_tts_model(tts_model)
     if _should_try_hf_khmer_tts(text, user_model):
+        started = time.perf_counter()
         try:
-            return await _generate_voice_hf_space(text, speed, output_path)
+            audio = await _generate_voice_hf_space(text, speed, output_path)
+            provider_manager.record_success(
+                "huggingface",
+                (time.perf_counter() - started) * 1_000,
+            )
+            return audio
         except Exception as exc:
+            provider_manager.record_failure("huggingface", exc)
             low = str(exc).lower()
             cooldown_only = "cooldown active" in low
             if not cooldown_only:
@@ -18942,7 +19036,17 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
             if not HF_TTS_EDGE_FALLBACK:
                 raise RuntimeError(f"HF Khmer TTS failed and Edge fallback is disabled: {exc}") from exc
 
-    return await _generate_voice_edge(text, gender, speed, output_path)
+    started = time.perf_counter()
+    try:
+        audio = await _generate_voice_edge(text, gender, speed, output_path)
+    except Exception as exc:
+        provider_manager.record_failure("edge_tts", exc)
+        raise
+    provider_manager.record_success(
+        "edge_tts",
+        (time.perf_counter() - started) * 1_000,
+    )
+    return audio
 
 
 async def generate_voice_limited(text: str, gender: str, speed: float, output_path: str, tts_model: str = "auto") -> bytes:
@@ -19199,7 +19303,7 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
 # ---------------------------------------------------------------------------
 async def _check_cooldown(reply_target, user_id: int) -> bool:
     lock = _get_user_lock(user_id)
-    if lock.locked():
+    if lock.locked() or _tts_request_reserved(user_id):
         await safe_send(lambda: reply_target.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
         return True
     now  = time.monotonic()
@@ -22637,6 +22741,8 @@ async def cmd_feature_request(update: Update, context: ContextTypes.DEFAULT_TYPE
     msg = update.message
     if not user or not msg:
         return
+    if not await _ensure_user_allowed(update, context):
+        return
     detail = " ".join(context.args or []).strip()
     if detail:
         await _save_user_feature_request(update, context, detail)
@@ -22665,6 +22771,9 @@ async def _handle_feature_request_user_text(update: Update, context: ContextType
     if raw.lower() in {"cancel", "/cancel", "បោះបង់"}:
         context.user_data.pop(FEATURE_REQUEST_WAIT_TEXT, None)
         await safe_send(lambda: msg.reply_text('បានបោះបង់សំណើមុខងារ។'))
+        return True
+    if not await _ensure_user_allowed(update, context):
+        context.user_data.pop(FEATURE_REQUEST_WAIT_TEXT, None)
         return True
     return await _save_user_feature_request(update, context, raw)
 
@@ -24812,21 +24921,27 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
     if not full_text:
         await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទមិនឃើញ។ សូមផ្ញើឯកសារម្តងទៀត។"))
         return
-    if await _check_cooldown(query.message, user_id):
-        return
-
-    progress = TelegramProgress.attach(
-        bot=context.bot,
-        message=query.message,
-        title="កំពុងបម្លែងឯកសារទៅជាសំឡេង",
-    )
-    await progress.update(5, "កំពុងរៀបចំអត្ថបទ", f"មាន {len(full_text)} តួអក្សរ។", force=True, reply_markup=None)
-
     gender = prefs["gender"]
     speed = prefs["speed"]
     tts_model = prefs.get("tts_model", "auto")
     uname = query.from_user.username or query.from_user.first_name or str(user_id)
     lock = _get_user_lock(user_id)
+    if await _check_cooldown(query.message, user_id):
+        return
+    if not _reserve_tts_request(user_id):
+        await safe_send(lambda: query.message.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
+        return
+
+    try:
+        progress = TelegramProgress.attach(
+            bot=context.bot,
+            message=query.message,
+            title="កំពុងបម្លែងឯកសារទៅជាសំឡេង",
+        )
+        await progress.update(5, "កំពុងរៀបចំអត្ថបទ", f"មាន {len(full_text)} តួអក្សរ។", force=True, reply_markup=None)
+    except BaseException:
+        _release_tts_request(user_id)
+        raise
 
     try:
         async with lock:
@@ -24857,6 +24972,8 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
     except Exception as exc:
         logger.error("_cb_doc_read delivery error: %s", exc, exc_info=True)
         await progress.fail(_tts_user_error_message(exc))
+    finally:
+        _release_tts_request(user_id)
 
 
 async def _fire_scheduled_broadcast(bot, row: dict, already_claimed: bool = False) -> None:
@@ -27322,18 +27439,25 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if await _check_cooldown(msg, user_id):
         return
+    if not _reserve_tts_request(user_id):
+        await safe_send(lambda: msg.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
+        return
 
-    _metric_inc("tts")
-    sync_user_data(user)
-    progress = await TelegramProgress.start(
-        bot=context.bot,
-        chat_id=msg.chat_id,
-        reply_target=msg,
-        title="កំពុងបម្លែងអត្ថបទទៅជាសំឡេង",
-        percent=5,
-        stage="កំពុងពិនិត្យអត្ថបទ",
-        detail=f"មាន {len(stripped)} តួអក្សរ។",
-    )
+    try:
+        _metric_inc("tts")
+        sync_user_data(user)
+        progress = await TelegramProgress.start(
+            bot=context.bot,
+            chat_id=msg.chat_id,
+            reply_target=msg,
+            title="កំពុងបម្លែងអត្ថបទទៅជាសំឡេង",
+            percent=5,
+            stage="កំពុងពិនិត្យអត្ថបទ",
+            detail=f"មាន {len(stripped)} តួអក្សរ។",
+        )
+    except BaseException:
+        _release_tts_request(user_id)
+        raise
     file_path: str | None = None
     try:
         await progress.update(12, "កំពុងអានការកំណត់របស់អ្នក", "កំពុងជ្រើសសំឡេង ល្បឿន និងម៉ូដែល។", force=True)
@@ -27423,6 +27547,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error("on_text TTS error: %s", exc, exc_info=True)
         await progress.fail(_tts_user_error_message(exc))
     finally:
+        _release_tts_request(user_id)
         if file_path:
             _cleanup(file_path)
 
@@ -27475,21 +27600,31 @@ async def _regenerate_tts_voice_with_progress(
     """Regenerate one voice while reusing one progress message."""
     if query.message is None:
         return False
+    if await _check_cooldown(query.message, user_id):
+        return False
+    if not _reserve_tts_request(user_id):
+        await safe_send(lambda: query.message.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
+        return False
     chat_id = int(query.message.chat.id)
     model_key = _normalize_tts_model(tts_model)
     model_label = TTS_MODEL_OPTIONS.get(model_key, TTS_MODEL_OPTIONS["auto"])[0]
-    progress = await TelegramProgress.start(
-        bot=context.bot,
-        chat_id=chat_id,
-        reply_target=query.message,
-        title=title,
-        percent=5,
-        stage="កំពុងរៀបចំអត្ថបទដើម",
-        detail=f"ម៉ូដែល៖ {model_label}",
-    )
-    file_path = _make_temp_ogg()
+    try:
+        progress = await TelegramProgress.start(
+            bot=context.bot,
+            chat_id=chat_id,
+            reply_target=query.message,
+            title=title,
+            percent=5,
+            stage="កំពុងរៀបចំអត្ថបទដើម",
+            detail=f"ម៉ូដែល៖ {model_label}",
+        )
+    except BaseException:
+        _release_tts_request(user_id)
+        raise
+    file_path: str | None = None
     lock = _get_user_lock(user_id)
     try:
+        file_path = _make_temp_ogg()
         async with lock:
             await progress.update(25, "កំពុងបង្កើតសំឡេងឡើងវិញ", f"កំពុងប្រើ {model_label}។", force=True)
             audio_bytes = await generate_user_voice_limited(
@@ -27535,6 +27670,7 @@ async def _regenerate_tts_voice_with_progress(
         await progress.fail(error_text)
         return False
     finally:
+        _release_tts_request(user_id)
         _cleanup(file_path)
 
 async def _cb_tts_model(query, user_id: int, context, data: str):
@@ -27650,8 +27786,6 @@ async def _cb_speed(query, user_id: int, context, data: str):
             "❌ រកអត្ថបទដើមមិនឃើញ។ សូមផ្ញើអត្ថបទម្តងទៀត រួចប្តូរល្បឿន។"
         ))
         return
-    if await _check_cooldown(query.message, user_id):
-        return
     gender = prefs["gender"]
     tts_model = prefs.get("tts_model", "auto")
     update_user_speed(user_id, new_speed)
@@ -27681,8 +27815,6 @@ async def _cb_gender(query, user_id: int, context, data: str):
         await safe_send(lambda: query.message.reply_text(
             "❌ រកអត្ថបទដើមមិនឃើញ។ សូមផ្ញើអត្ថបទម្តងទៀត រួចប្តូរសំឡេង។"
         ))
-        return
-    if await _check_cooldown(query.message, user_id):
         return
     speed = prefs["speed"]
     tts_model = prefs.get("tts_model", "auto")
@@ -27717,8 +27849,6 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
     if not original_text:
         await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទមិនឃើញ។"))
         return
-    if await _check_cooldown(query.message, user_id):
-        return
     await _regenerate_tts_voice_with_progress(
         query=query,
         context=context,
@@ -27748,23 +27878,30 @@ async def _cb_audio_tts(query, user_id: int, context, data: str):
     if not full_text:
         await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទមិនឃើញ ព្រោះ Cache បានផុតកំណត់។"))
         return
-    if await _check_cooldown(query.message, user_id):
-        return
-
     gender = prefs["gender"]
     speed = prefs["speed"]
     tts_model = prefs.get("tts_model", "auto")
     uname = query.from_user.username or query.from_user.first_name or str(user_id)
-    progress = await TelegramProgress.start(
-        bot=context.bot,
-        chat_id=chat_id,
-        reply_target=query.message,
-        title="កំពុងបង្កើតសំឡេងពីអត្ថបទអូឌីយ៉ូ",
-        percent=5,
-        stage="កំពុងរៀបចំអត្ថបទ",
-        detail=f"មាន {len(full_text)} តួអក្សរ។",
-    )
     lock = _get_user_lock(user_id)
+    if await _check_cooldown(query.message, user_id):
+        return
+    if not _reserve_tts_request(user_id):
+        await safe_send(lambda: query.message.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
+        return
+
+    try:
+        progress = await TelegramProgress.start(
+            bot=context.bot,
+            chat_id=chat_id,
+            reply_target=query.message,
+            title="កំពុងបង្កើតសំឡេងពីអត្ថបទអូឌីយ៉ូ",
+            percent=5,
+            stage="កំពុងរៀបចំអត្ថបទ",
+            detail=f"មាន {len(full_text)} តួអក្សរ។",
+        )
+    except BaseException:
+        _release_tts_request(user_id)
+        raise
     try:
         async with lock:
             sent_count, failed_count = await _deliver_paged_tts(
@@ -27795,6 +27932,8 @@ async def _cb_audio_tts(query, user_id: int, context, data: str):
     except Exception as exc:
         logger.error("_cb_audio_tts delivery error: %s", exc, exc_info=True)
         await progress.fail(_tts_user_error_message(exc))
+    finally:
+        _release_tts_request(user_id)
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -27811,59 +27950,69 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.message is None:
         logger.debug(f"on_callback: no message for data={data!r}")
-        # FIX: Still answer the query to prevent Telegram showing a loading spinner
         with suppress(Exception):
             await query.answer()
         return
 
-    # FIX: These patterns are handled by dedicated CallbackQueryHandlers that
-    # already call query.answer(). Do NOT answer here — it would cause a
-    # "query is too old" double-answer error on Telegram's side.
-    _HANDLED_EXACT = {"users_close", "noop"}
-    _HANDLED_PREFIX = ("bc_", "sched_", "users_page:", "users_search", "user_", "history_", "rtadmin_")
-    if data in _HANDLED_EXACT or any(data.startswith(p) for p in _HANDLED_PREFIX):
+    action = classify_callback(data, speed_callbacks=SPEED_OPTIONS)
+    if action is None:
+        logger.info("Ignored unknown or expired callback data=%r user=%s", data, user_id)
+        with suppress(Exception):
+            await query.answer(
+                "This button is no longer available. Please reopen the menu.",
+                show_alert=False,
+            )
         return
 
-    # Answer all other callbacks here (only once)
     with suppress(Exception):
         await query.answer()
 
     try:
-        if data == "show_speed":
+        if callback_requires_tts_access(action, data) and not await _ensure_user_allowed(
+            update,
+            context,
+            "tts_enabled",
+            "បម្លែងអត្ថបទទៅជាសំឡេង",
+        ):
+            return
+
+        if action == "show_speed":
             await _cb_show_speed(query, user_id, context)
-        elif data == "hide_speed":
+        elif action == "hide_speed":
             await _cb_hide_speed(query, user_id, context)
-        elif data == "show_tts_model":
+        elif action == "show_tts_model":
             await _cb_show_tts_model(query, user_id, context)
-        elif data == "hide_tts_model":
+        elif action == "hide_tts_model":
             await _cb_hide_tts_model(query, user_id, context)
-        elif data.startswith("voxcpm2:"):
+        elif action == "voxcpm2":
             await _cb_voxcpm2(query, user_id, context, data)
-        elif data.startswith("ttsmodel_"):
+        elif action == "tts_model":
             await _cb_tts_model(query, user_id, context, data)
-        elif data in SPEED_OPTIONS:
+        elif action == "speed":
             await _cb_speed(query, user_id, context, data)
-        elif data in ("tg_female", "tg_male"):
+        elif action == "gender":
             await _cb_gender(query, user_id, context, data)
-        elif data.startswith("tts_transcript:"):
+        elif action == "tts_transcript":
             await _cb_tts_transcript(query, user_id, context, data)
-        elif data.startswith(("del_transcript:", "doc_del:", "audio_del:")):
+        elif action == "delete":
             with suppress(Exception):
                 await query.message.delete()
-        elif data.startswith("doc_read:"):
+        elif action == "doc_read":
             await _cb_doc_read(query, user_id, context, data)
-        elif data.startswith("audio_tts:"):
+        elif action == "audio_tts":
             await _cb_audio_tts(query, user_id, context, data)
-        elif data.startswith("needs_"):
+        elif action == "needs_admin":
             await _cb_user_needs_admin(query, user_id, context, data)
-        elif data.startswith("api_"):
+        elif action == "api_admin":
             await _cb_api_dashboard(query, user_id, context, data)
-        elif data.startswith("admin_"):
+        elif action == "admin":
             await _cb_admin_dashboard(query, user_id, context, data)
-        else:
-            logger.debug(f"on_callback: unhandled data={data!r}")
-    except Exception as e:
-        logger.error(f"on_callback unhandled [data={data}]: {e}", exc_info=True)
+    except Exception as exc:
+        _metric_inc("errors")
+        logger.error("on_callback failed action=%s data=%r: %s", action, data, exc, exc_info=True)
+        await safe_send(lambda: query.message.reply_text(
+            "⚠️ Something went wrong while processing this button. Please try again."
+        ))
 
 
 # ---------------------------------------------------------------------------
@@ -27928,6 +28077,8 @@ async def _run_bot():
         _last_tts_text, _text_cache_memory, _VOXCPM2_PROFILE_MEMORY,
     ):
         store.clear()
+    with _tts_request_reservations_guard:
+        _tts_request_reservations.clear()
     _api_key_cache_clear()
     _api_key_touch_last.clear()
     if not supabase:

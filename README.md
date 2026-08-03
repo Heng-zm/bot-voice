@@ -68,8 +68,31 @@ boundaries for incremental extraction. Avoid adding new features to
 Copy `.env.example` to `.env`, configure the required values, then:
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.lock
 python -m app.main
+```
+
+For local development, use an isolated virtual environment and install the
+quality tools as well:
+
+```bash
+python -m venv .venv
+.venv\\Scripts\\activate  # Windows PowerShell
+python -m pip install --upgrade pip
+python -m pip install -r requirements.lock -r requirements-dev.txt
+python -m ruff check .
+python -m unittest discover -s tests -v
+```
+
+The lint baseline intentionally excludes `app/legacy.py` during the staged
+extraction. New or extracted modules remain checked in CI.
+
+`requirements.lock` is the pinned runtime dependency set used by Docker and
+CI. Regenerate it only when intentionally updating dependencies:
+
+```bash
+python -m pip install pip-tools
+pip-compile --output-file requirements.lock requirements.txt
 ```
 
 Never commit `.env`. If a populated `.env` was committed previously, remove it

@@ -1,0 +1,10 @@
+[tool.ruff]
+target-version = "py312"
+extend-exclude = ["app/legacy.py"]
+
+[tool.ruff.lint]
+# Keep a reliable baseline while the legacy runtime is extracted in stages.
+select = ["E4", "E7", "E9", "F", "I"]
+# Lazy PEP 562 compatibility modules expose their public names through
+# module-level __getattr__, which Ruff cannot resolve statically.
+ignore = ["F822"]

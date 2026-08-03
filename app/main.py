@@ -13,6 +13,8 @@ from fastapi.staticfiles import StaticFiles
 from app import legacy as _legacy
 from app.api.v1.admin import router as admin_router
 from app.api.v1.admin_cors import router as admin_cors_router
+from app.api.v1.admin_runtime import router as admin_runtime_router
+from app.api.v1.admin_users import router as admin_users_router
 from app.core.cors import (
     DynamicCORSMiddleware,
     configure_dynamic_cors_store,
@@ -20,6 +22,7 @@ from app.core.cors import (
 )
 from app.core.security import get_runtime_secret_manager
 from app.core.telegram_auth import configure_telegram_admin_authorizer
+from app.services.jobs.runtime import configure_job_queue
 
 # ASGI servers can use ``uvicorn app.main:app``.  The combined production
 # process still uses ``python -m app.main`` so Telegram and background workers
@@ -78,6 +81,13 @@ async def _initialize_runtime_services(application: FastAPI) -> None:
         _legacy.ADMIN_IDS.update(redis_admin_ids)
     application.state.runtime_security = security_status
     application.state.dynamic_cors = cors_snapshot.as_dict()
+    application.state.job_queue = configure_job_queue(
+        _legacy.redis_client or secret_manager.redis_client,
+        redis_prefix=str(
+            getattr(_legacy, "REDIS_CACHE_PREFIX", "")
+            or "tgbot"
+        ),
+    )
 
 
 _original_lifespan_context = app.router.lifespan_context
@@ -92,6 +102,7 @@ async def application_lifespan(application: FastAPI) -> AsyncIterator[dict | Non
         try:
             yield lifespan_state
         finally:
+            configure_job_queue(None)
             get_dynamic_cors_store().close()
             get_runtime_secret_manager().close()
 
@@ -99,6 +110,8 @@ async def application_lifespan(application: FastAPI) -> AsyncIterator[dict | Non
 if not getattr(app.state, "_dynamic_security_installed", False):
     app.include_router(admin_router)
     app.include_router(admin_cors_router)
+    app.include_router(admin_runtime_router)
+    app.include_router(admin_users_router)
     app.mount(
         "/miniapp/admin/assets",
         StaticFiles(directory=str(_ADMIN_STATIC_DIR), check_dir=False),
