@@ -5355,8 +5355,9 @@ def _web_broadcast_job_rows_html(csrf: str | None = None, *, include_actions: bo
                 controls += f"<form class='inline-form' method='post' action='/admin/broadcast/action'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='job_id' value='{_web_h(jid)}'><input type='hidden' name='action' value='pause'><button class='warn'>Pause</button></form>"
             controls += f"<form class='inline-form' method='post' action='/admin/broadcast/action' data-confirm='Cancel this running broadcast job?'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='job_id' value='{_web_h(jid)}'><input type='hidden' name='action' value='cancel'><button class='danger'>Cancel</button></form>"
         mode_label = _broadcast_parse_mode_label(row.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO)
+        link_preview = _broadcast_normalize_link_preview(row.get("link_preview"), True)
         rows.append(
-            f"<tr><td><code>{_web_h(jid)}</code><br><span class='muted'>{_web_h(row.get('error') or row.get('note') or '')}</span><br>{_web_badge(mode_label, 'info')}</td>"
+            f"<tr><td><code>{_web_h(jid)}</code><br><span class='muted'>{_web_h(row.get('error') or row.get('note') or '')}</span><br>{_web_badge(mode_label, 'info')} {_web_badge('URL preview' if link_preview else 'No URL preview', 'ok' if link_preview else 'muted')}</td>"
             f"<td>{_web_status_badge(status)}</td>"
             f"<td><span class='nowrap'>{sent}/{total}</span><br>{_web_progress_bar(processed, total)}</td>"
             f"<td>{blocked}</td><td>{failed}</td>"
@@ -5372,9 +5373,14 @@ def _web_schedule_rows_html(rows: list[dict], csrf: str | None = None, return_in
     for row in rows:
         rid = _web_int(row.get("id"), 0)
         content = row.get("caption") or row.get("plain_text") or ""
-        preview_content, preview_mode = _broadcast_strip_format_directive(content, _BROADCAST_PARSE_MODE_AUTO)
+        preview_content, preview_mode, preview_link = _broadcast_strip_directives(
+            content,
+            _BROADCAST_PARSE_MODE_AUTO,
+            True,
+        )
         preview_mode_label = _broadcast_parse_mode_label(preview_mode)
         edit_parse_options = _broadcast_parse_mode_select_html("parse_mode", preview_mode)
+        preview_checked = " checked" if preview_link else ""
         can_edit, edit_reason = _sched_can_edit(row, _web_current_admin_id())
         is_pending = str(row.get("status") or "").lower() == SCHED_STATUS_PENDING
         confirm_btn = ""
@@ -5390,8 +5396,8 @@ def _web_schedule_rows_html(rows: list[dict], csrf: str | None = None, return_in
             edit_block = f"""
             <details><summary>Edit schedule</summary>
               <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_time'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>Phnom Penh time</label><input type='datetime-local' name='broadcast_at' value='{_web_h(_web_dt_input_value(row.get('broadcast_at')))}' required><div class='help'>Local {APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL}); stored as UTC automatically.</div></div><button>Save Time</button></form>
-              <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_text'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>Format mode</label><select name='parse_mode'>{edit_parse_options}</select></div><div class='field'><label>{'Caption' if row.get('photo_file_id') else 'Text message'}</label><textarea name='text' required>{_web_h(preview_content)}</textarea></div><button>Save Text</button></form>
-              <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_photo'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>Format mode</label><select name='parse_mode'>{edit_parse_options}</select></div><div class='row'><div class='field'><label>Photo file ID</label><input name='photo_file_id' value='{_web_h(row.get('photo_file_id') or '')}' required></div><div class='field'><label>Caption</label><input name='caption' value='{_web_h(_broadcast_strip_format_directive(row.get('caption') or '', preview_mode)[0])}' maxlength='1024'></div></div><button class='secondary'>Save / Replace Photo</button></form>
+              <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_text'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>Format mode</label><select name='parse_mode'>{edit_parse_options}</select></div><div class='field'><label><input type='checkbox' name='link_preview' value='1'{preview_checked}> Show URL link preview</label></div><div class='field'><label>{'Caption' if row.get('photo_file_id') else 'Text message'}</label><textarea name='text' required>{_web_h(preview_content)}</textarea></div><button>Save Text</button></form>
+              <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_photo'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>Format mode</label><select name='parse_mode'>{edit_parse_options}</select></div><div class='field'><label><input type='checkbox' name='link_preview' value='1'{preview_checked}> Show URL link preview</label></div><div class='row'><div class='field'><label>Photo file ID</label><input name='photo_file_id' value='{_web_h(row.get('photo_file_id') or '')}' required></div><div class='field'><label>Caption</label><input name='caption' value='{_web_h(preview_content if row.get('photo_file_id') else '')}' maxlength='1024'></div></div><button class='secondary'>Save / Replace Photo</button></form>
               <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='duplicate'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>Duplicate to Phnom Penh time</label><input type='datetime-local' name='broadcast_at' value='{duplicate_at}' required><div class='help'>Creates a preview copy so you can confirm it after checking.</div></div><button class='secondary'>Duplicate Preview</button></form>
             </details>
             """
@@ -5401,7 +5407,7 @@ def _web_schedule_rows_html(rows: list[dict], csrf: str | None = None, return_in
             f"<tr><td><code>#{rid}</code><br><span class='muted'>admin {_web_h(row.get('admin_id'))}</span></td>"
             f"<td>{_web_status_badge(row.get('status'), row)}<br><span class='muted'>{_web_h(row.get('error_msg') or '')}</span></td>"
             f"<td>{_web_h(_web_dt(row.get('broadcast_at')))}</td>"
-            f"<td>{_web_h(_web_short(preview_content, 180))}<br>{_web_badge('photo' if row.get('photo_file_id') else 'text', 'info' if row.get('photo_file_id') else 'muted')} {_web_badge(preview_mode_label, 'info')}</td>"
+            f"<td>{_web_h(_web_short(preview_content, 180))}<br>{_web_badge('photo' if row.get('photo_file_id') else 'text', 'info' if row.get('photo_file_id') else 'muted')} {_web_badge(preview_mode_label, 'info')} {_web_badge('URL preview' if preview_link else 'No URL preview', 'ok' if preview_link else 'muted')}</td>"
             f"<td><div class='actions'>{confirm_btn}{cancel_btn}{duplicate_btn}</div>{edit_block}</td></tr>"
         )
     return "".join(table_rows) or '<tr><td colspan=5><div class="empty">No schedules found.</div></td></tr>'
@@ -6326,15 +6332,17 @@ def _web_send_telegram_message(
     admin_id: int | None = None,
     client: httpx.Client | None = None,
     parse_mode: str | None = "plain",
+    link_preview: bool = True,
 ) -> tuple[bool, str]:
     if not TELEGRAM_BOT_TOKEN:
         return False, "TELEGRAM_BOT_TOKEN missing."
 
     try:
-        prepared_text, prepared_mode = _broadcast_prepare_text(
+        prepared_text, prepared_mode, prepared_link_preview = _broadcast_prepare_text(
             text,
             parse_mode,
             max_chars=TELE_MSG_LIMIT,
+            default_link_preview=link_preview,
         )
     except ValueError as exc:
         return False, str(exc)
@@ -6354,7 +6362,7 @@ def _web_send_telegram_message(
             payload = {
                 "chat_id": int(chat_id),
                 "text": prepared_text,
-                "disable_web_page_preview": True,
+                "disable_web_page_preview": not prepared_link_preview,
             }
             if telegram_parse_mode:
                 payload["parse_mode"] = telegram_parse_mode
@@ -6756,6 +6764,7 @@ def _web_sched_create(
     caption: str = "",
     confirmed: bool = False,
     parse_mode: str | None = "auto",
+    link_preview: bool = True,
 ) -> tuple[bool, str]:
     if not supabase:
         return False, "Supabase is not configured."
@@ -6763,18 +6772,30 @@ def _web_sched_create(
     photo_file_id = (photo_file_id or "").strip()
     caption = (caption or "").strip()
     parse_mode = _broadcast_normalize_parse_mode(parse_mode)
+    link_preview = _broadcast_normalize_link_preview(link_preview, True)
     if photo_file_id and not caption and text:
         caption = text
-    if photo_file_id and caption:
-        caption = _broadcast_apply_format_directive(caption, parse_mode)
-    elif not photo_file_id and text:
-        text = _broadcast_apply_format_directive(text, parse_mode)
-    if not photo_file_id and not text:
-        return False, "Broadcast text is required when no photo_file_id is provided."
-    if photo_file_id and len(caption) > 1024:
-        return False, "Caption too long for Telegram photo."
-    if not photo_file_id and len(text) > TELE_MSG_LIMIT:
-        return False, "Text too long for Telegram."
+    try:
+        if photo_file_id and caption:
+            clean_caption, parse_mode, link_preview = _broadcast_prepare_text(
+                caption,
+                parse_mode,
+                max_chars=1024,
+                default_link_preview=link_preview,
+            )
+            caption = _broadcast_apply_option_directives(clean_caption, parse_mode, link_preview)
+        elif not photo_file_id:
+            clean_text, parse_mode, link_preview = _broadcast_prepare_text(
+                text,
+                parse_mode,
+                max_chars=TELE_MSG_LIMIT,
+                default_link_preview=link_preview,
+            )
+            if not clean_text:
+                return False, "Broadcast text is required when no photo_file_id is provided."
+            text = _broadcast_apply_option_directives(clean_text, parse_mode, link_preview)
+    except ValueError as exc:
+        return False, str(exc)
     if _sched_to_utc(broadcast_at) <= datetime.now(timezone.utc):
         return False, "Broadcast time must be in the future."
     row = {"admin_id": int(admin_id), "photo_file_id": photo_file_id or None, "caption": caption if photo_file_id else None, "plain_text": None if photo_file_id else text, "broadcast_at": _sched_iso(broadcast_at), "status": SCHED_STATUS_PENDING, "error_msg": None if confirmed else SCHED_DRAFT_MARKER}
@@ -7442,7 +7463,7 @@ def web_admin_schedules():
         <div class='field'><label>&nbsp;</label><div class='actions'><button>Filter</button><a class='btn secondary' href='/admin/schedules'>Reset</a></div></div>
       </form>
     </div>
-    <div class='card'><h2>Create Schedule</h2><p class='muted'>Use Phnom Penh local time in AM/PM style ({APP_TIMEZONE_ALIAS}, {APP_TIMEZONE_UTC_LABEL}). The bot stores the final timestamp in UTC automatically. Use Preview first for safer broadcasts.</p><form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='create'><div class='row'><div class='field'><label>Broadcast Phnom Penh time</label><input type='datetime-local' name='broadcast_at' value='{now_plus}' required><div class='help'>Example: 2026-12-25 09:00 AM {APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})</div></div><div class='field'><label>Mode</label><select name='confirmed'><option value='0'>Preview first</option><option value='1'>Confirm immediately</option></select></div></div><div class='field'><label>Format mode</label><select name='parse_mode'>{parse_options}</select><div class='help'>Supports Telegram HTML, MarkdownV2, Markdown, and plain text. First-line directives also work: <code>::html</code>, <code>::mdv2</code>, <code>::md</code>, <code>::plain</code>.</div></div><div class='field'><label>Text message <span><span data-count-target='#schedule-text'>0</span>/{TELE_MSG_LIMIT}</span></label><textarea id='schedule-text' name='text' maxlength='{TELE_MSG_LIMIT}' placeholder='Required for text-only schedule; used as photo caption when caption is empty'></textarea></div><div class='row'><div class='field'><label>Telegram photo_file_id optional</label><input name='photo_file_id'></div><div class='field'><label>Photo caption optional</label><input name='caption' maxlength='1024'></div></div><button>Create Schedule</button></form></div>
+    <div class='card'><h2>Create Schedule</h2><p class='muted'>Use Phnom Penh local time in AM/PM style ({APP_TIMEZONE_ALIAS}, {APP_TIMEZONE_UTC_LABEL}). The bot stores the final timestamp in UTC automatically. Use Preview first for safer broadcasts.</p><form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='create'><div class='row'><div class='field'><label>Broadcast Phnom Penh time</label><input type='datetime-local' name='broadcast_at' value='{now_plus}' required><div class='help'>Example: 2026-12-25 09:00 AM {APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})</div></div><div class='field'><label>Mode</label><select name='confirmed'><option value='0'>Preview first</option><option value='1'>Confirm immediately</option></select></div></div><div class='field'><label>Format mode</label><select name='parse_mode'>{parse_options}</select><div class='help'>Supports Telegram HTML, MarkdownV2, Markdown links such as <code>[Open site](https://example.com)</code>, and plain text. First-line directives also work: <code>::html</code>, <code>::mdv2</code>, <code>::md</code>, <code>::plain</code>.</div></div><div class='field'><label><input type='checkbox' name='link_preview' value='1' checked> Show URL link preview</label><div class='help'>Enabled by default; use <code>::nopreview</code> in Telegram composer text to disable it.</div></div><div class='field'><label>Text message <span><span data-count-target='#schedule-text'>0</span>/{TELE_MSG_LIMIT}</span></label><textarea id='schedule-text' name='text' maxlength='{TELE_MSG_LIMIT}' placeholder='Required for text-only schedule; used as photo caption when caption is empty'></textarea></div><div class='row'><div class='field'><label>Telegram photo_file_id optional</label><input name='photo_file_id'></div><div class='field'><label>Photo caption optional</label><input name='caption' maxlength='1024'></div></div><button>Create Schedule</button></form></div>
     <div class='card'><div class='actions' style='justify-content:space-between'><h2>Schedules</h2><span class='muted'>{len(rows)} shown</span></div><div class='table-wrap'><table class='table'><thead><tr><th>ID</th><th>Status</th><th>Time</th><th>Content</th><th>Actions</th></tr></thead><tbody>{table_rows}</tbody></table></div></div>
     """
     return _web_render("Schedules", body, active="schedules")
@@ -7469,6 +7490,7 @@ def web_admin_schedules_action():
                     request.form.get("caption") or "",
                     str(request.form.get("confirmed") or "0") == "1",
                     request.form.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO,
+                    str(request.form.get("link_preview") or "") == "1",
                 )
         elif not row_id:
             ok, msg = False, "Missing schedule ID."
@@ -7490,16 +7512,18 @@ def web_admin_schedules_action():
                 ok, reason, _row = db_sched_update_time(row_id, _web_current_admin_id(), dt)
                 msg = "time updated" if ok else f"time not updated: {reason}"
         elif action == "edit_text":
-            edit_text = _broadcast_apply_format_directive(
+            edit_text = _broadcast_apply_option_directives(
                 request.form.get("text") or "",
                 request.form.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO,
+                str(request.form.get("link_preview") or "") == "1",
             )
             ok, reason, _row = db_sched_update_text(row_id, _web_current_admin_id(), edit_text)
             msg = "text updated" if ok else f"text not updated: {reason}"
         elif action == "edit_photo":
-            edit_caption = _broadcast_apply_format_directive(
+            edit_caption = _broadcast_apply_option_directives(
                 request.form.get("caption") or "",
                 request.form.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO,
+                str(request.form.get("link_preview") or "") == "1",
             )
             ok, reason, _row = db_sched_update_photo(row_id, _web_current_admin_id(), request.form.get("photo_file_id") or "", edit_caption)
             msg = "photo updated" if ok else f"photo not updated: {reason}"
@@ -7666,6 +7690,7 @@ def web_admin_broadcast():
         _web_check_csrf()
         text = (request.form.get("text") or "").strip()
         parse_mode = _broadcast_normalize_parse_mode(request.form.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO)
+        link_preview = str(request.form.get("link_preview") or "") == "1"
         if not text:
             flask_flash("Broadcast text is empty.", "error")
         elif len(text) > TELE_MSG_LIMIT:
@@ -7678,6 +7703,11 @@ def web_admin_broadcast():
                     "error",
                 )
             else:
+                prepared_broadcast_text = _broadcast_apply_option_directives(
+                    text,
+                    parse_mode,
+                    link_preview,
+                )
                 job_id = secrets.token_hex(6)
                 _web_broadcast_job_set(
                     job_id,
@@ -7689,16 +7719,22 @@ def web_admin_broadcast():
                     blocked=0,
                     skipped=0,
                     parse_mode=parse_mode,
+                    link_preview=link_preview,
                     created_at=_sched_iso(),
                 )
-                _submit_web_broadcast_job(job_id, _web_current_admin_id(), text, parse_mode)
+                _submit_web_broadcast_job(
+                    job_id,
+                    _web_current_admin_id(),
+                    prepared_broadcast_text,
+                    parse_mode,
+                )
                 flask_flash(f"Broadcast job {job_id} started.", "success")
                 return redirect(url_for("web_admin_broadcast"))
     csrf = _web_csrf_token()
     job_rows = _web_broadcast_job_rows_html(csrf, include_actions=True)
     parse_options = _broadcast_parse_mode_select_html("parse_mode", _BROADCAST_PARSE_MODE_AUTO)
     body = f"""
-    <div class='card danger-zone'><h2>Immediate text broadcast</h2><p class='muted'>Safer broadcast system: bounded workers, blocked-user skip, live progress, pause, resume, cancel, Telegram 403 auto-block, and Telegram formatting fallback.</p><form method='post' data-confirm='Start this broadcast now? This sends to all users.'><input type='hidden' name='csrf_token' value='{csrf}'><div class='field'><label>Format mode</label><select name='parse_mode'>{parse_options}</select><div class='help'>Supports Telegram HTML, MarkdownV2, Markdown, and plain text. You can also prefix the first line with <code>::html</code>, <code>::mdv2</code>, <code>::md</code>, or <code>::plain</code>.</div></div><div class='field'><label>Message <span><span data-count-target='#broadcast-text'>0</span>/{TELE_MSG_LIMIT}</span></label><textarea id='broadcast-text' name='text' maxlength='{TELE_MSG_LIMIT}' required></textarea><div class='help'>For scheduled sending, use the Schedules page instead. If formatting is malformed, the bot retries as plain text instead of failing the whole job.</div></div><button class='danger'>Start Broadcast</button></form></div>
+    <div class='card danger-zone'><h2>Immediate text broadcast</h2><p class='muted'>Safer broadcast system: bounded workers, blocked-user skip, live progress, pause, resume, cancel, Telegram 403 auto-block, and Telegram formatting fallback.</p><form method='post' data-confirm='Start this broadcast now? This sends to all users.'><input type='hidden' name='csrf_token' value='{csrf}'><div class='field'><label>Format mode</label><select name='parse_mode'>{parse_options}</select><div class='help'>Supports Telegram HTML, MarkdownV2, Markdown links such as <code>[Open site](https://example.com)</code>, and plain text. First-line directives: <code>::html</code>, <code>::mdv2</code>, <code>::md</code>, or <code>::plain</code>.</div></div><div class='field'><label><input type='checkbox' name='link_preview' value='1' checked> Show URL link preview</label><div class='help'>Enabled by default. In Telegram composer text, use <code>::nopreview</code> to disable or <code>::preview</code> to enable.</div></div><div class='field'><label>Message <span><span data-count-target='#broadcast-text'>0</span>/{TELE_MSG_LIMIT}</span></label><textarea id='broadcast-text' name='text' maxlength='{TELE_MSG_LIMIT}' required></textarea><div class='help'>For scheduled sending, use the Schedules page instead. If formatting is malformed, the bot retries as plain text instead of failing the whole job.</div></div><button class='danger'>Start Broadcast</button></form></div>
     <div class='card'><div class='actions' style='justify-content:space-between'><h2>Recent web broadcast jobs</h2><span class='live-note'><span class='v3-live-dot'></span>Auto-refresh every 5 seconds</span></div><div class='table-wrap'><table class='table'><thead><tr><th>Job</th><th>Status</th><th>Progress</th><th>Blocked</th><th>Failed</th><th>Started</th><th>Action</th></tr></thead><tbody data-broadcast-jobs>{job_rows}</tbody></table></div></div>
     """
     return _web_render("Broadcast", body, active="broadcast")
@@ -15713,12 +15749,13 @@ def db_sched_insert(payload: dict, admin_id: int, broadcast_at: datetime) -> dic
         raise RuntimeError("Supabase not configured.")
 
     parse_mode = _broadcast_normalize_parse_mode(payload.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO)
+    link_preview = _broadcast_normalize_link_preview(payload.get("link_preview"), True)
     caption = payload.get("caption")
     plain_text = payload.get("text")
     if payload.get("photo_file_id"):
-        caption = _broadcast_apply_format_directive(caption, parse_mode) if caption else caption
+        caption = _broadcast_apply_option_directives(caption, parse_mode, link_preview) if caption else caption
     elif plain_text:
-        plain_text = _broadcast_apply_format_directive(plain_text, parse_mode)
+        plain_text = _broadcast_apply_option_directives(plain_text, parse_mode, link_preview)
 
     row = {
         "admin_id":      int(admin_id),
@@ -16045,14 +16082,19 @@ def db_sched_update_text(row_id: int, admin_id: int, text: str) -> tuple[bool, s
     ok, reason = _sched_can_edit(row, admin_id)
     if not ok:
         return False, reason, row
-    if not text:
+    max_chars = 1024 if bool(row.get("photo_file_id")) else TELE_MSG_LIMIT
+    try:
+        prepared_text, _mode, _link_preview = _broadcast_prepare_text(
+            text,
+            _BROADCAST_PARSE_MODE_AUTO,
+            max_chars=max_chars,
+        )
+    except ValueError:
+        return False, "caption_too_long" if max_chars == 1024 else "text_too_long", row
+    if not prepared_text:
         return False, "empty_text", row
 
     has_photo = bool(row.get("photo_file_id"))
-    if has_photo and len(text) > 1024:
-        return False, "caption_too_long", row
-    if not has_photo and len(text) > TELE_MSG_LIMIT:
-        return False, "text_too_long", row
 
     update = {"caption": text, "plain_text": None} if has_photo else {"plain_text": text, "caption": None}
     res = db_call_sync(
@@ -16080,7 +16122,13 @@ def db_sched_update_photo(row_id: int, admin_id: int, photo_file_id: str, captio
         return False, reason, row
     if not photo_file_id:
         return False, "empty_photo", row
-    if len(caption) > 1024:
+    try:
+        _prepared_caption, _mode, _link_preview = _broadcast_prepare_text(
+            caption,
+            _BROADCAST_PARSE_MODE_AUTO,
+            max_chars=1024,
+        )
+    except ValueError:
         return False, "caption_too_long", row
 
     res = db_call_sync(
@@ -19665,7 +19713,11 @@ def _broadcast_template_content(payload: dict) -> str:
 
 def _broadcast_template_clean_preview(text: Any, *, max_len: int = BROADCAST_TEMPLATE_TITLE_MAX) -> str:
     clean = str(text or "").strip()
-    clean = re.sub(r"^::(?:html|mdv2|md|plain)\s*\n", "", clean, flags=re.IGNORECASE)
+    clean, _mode, _link_preview = _broadcast_strip_directives(
+        clean,
+        _BROADCAST_PARSE_MODE_AUTO,
+        True,
+    )
     clean = re.sub(r"<[^>]+>", " ", clean)
     clean = html.unescape(clean)
     clean = re.sub(r"\s+", " ", clean).strip()
@@ -19694,6 +19746,7 @@ def _broadcast_template_payload_from_template(tpl: dict) -> dict:
         "caption": str(tpl.get("caption") or "") if tpl.get("photo_file_id") else None,
         "text": None if tpl.get("photo_file_id") else str(tpl.get("text") or ""),
         "parse_mode": _broadcast_normalize_parse_mode(tpl.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO),
+        "link_preview": _broadcast_normalize_link_preview(tpl.get("link_preview"), True),
     }
 
 
@@ -19703,6 +19756,7 @@ def _broadcast_template_fingerprint(payload: dict) -> str:
         "caption": str(payload.get("caption") or ""),
         "text": str(payload.get("text") or ""),
         "parse_mode": _broadcast_normalize_parse_mode(payload.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO),
+        "link_preview": _broadcast_normalize_link_preview(payload.get("link_preview"), True),
     }
     raw = _json.dumps(clean, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
@@ -19715,6 +19769,7 @@ def _broadcast_template_normalize(tpl: dict, *, fallback_id: str | None = None) 
     caption = str(tpl.get("caption") or "")[:1024]
     text = str(tpl.get("text") or "")[:TELE_MSG_LIMIT]
     parse_mode = _broadcast_normalize_parse_mode(tpl.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO)
+    link_preview = _broadcast_normalize_link_preview(tpl.get("link_preview"), True)
     if not photo_file_id and not text.strip():
         return None
     if photo_file_id:
@@ -19730,6 +19785,7 @@ def _broadcast_template_normalize(tpl: dict, *, fallback_id: str | None = None) 
         "caption": caption if photo_file_id else None,
         "text": None if photo_file_id else text,
         "parse_mode": parse_mode,
+        "link_preview": link_preview,
         "created_at": str(tpl.get("created_at") or now_iso),
         "updated_at": str(tpl.get("updated_at") or now_iso),
         "created_by": _broadcast_template_safe_int(tpl.get("created_by"), 0),
@@ -20041,11 +20097,13 @@ def _broadcast_template_delete_confirm_text(tpl: dict) -> str:
     title = html.escape(_broadcast_template_button_title(tpl))
     kind = "🖼️ Photo" if tpl.get("photo_file_id") else "📝 Text"
     mode = html.escape(_broadcast_parse_mode_label(tpl.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO))
+    link_preview = _broadcast_normalize_link_preview(tpl.get("link_preview"), True)
     preview = html.escape(_broadcast_template_clean_preview(_broadcast_template_content(tpl), max_len=180))
     return (
         "⚠️ <b>បញ្ជាក់ការលុប Template</b>\n\n"
         f"ឈ្មោះ: <b>{title}</b>\n"
         f"ប្រភេទ: <b>{kind}</b> · Format: <b>{mode}</b>\n"
+        f"URL preview: <b>{'ON' if link_preview else 'OFF'}</b>\n"
         f"Preview: <code>{preview}</code>\n\n"
         "ការលុបនេះមិនអាច Undo បានទេ។"
     )
@@ -20076,6 +20134,9 @@ def _broadcast_templates_panel_text(templates: list[dict], notice: str = "") -> 
             ))
             lines.append(f"{idx}. <b>{title}</b> — {kind} · {mode}")
             lines.append(f"   <code>{preview}</code>")
+            lines.append(
+                f"   URL preview: <b>{'ON' if _broadcast_normalize_link_preview(tpl.get('link_preview'), True) else 'OFF'}</b>"
+            )
     lines.extend([
         "",
         "▶️ ចុច Template ដើម្បី Preview មុនផ្ញើ។",
@@ -20098,9 +20159,10 @@ def _broadcast_recipient_estimate_sync() -> dict[str, int]:
 def _broadcast_preview_summary(payload: dict, estimate: dict[str, int]) -> str:
     kind = "រូបភាព + Caption" if payload.get("photo_file_id") else "អត្ថបទ"
     content = payload.get("caption") if payload.get("photo_file_id") else payload.get("text")
-    content, mode = _broadcast_strip_format_directive(
+    content, mode, link_preview = _broadcast_strip_directives(
         content,
         payload.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO,
+        _broadcast_normalize_link_preview(payload.get("link_preview"), True),
     )
     content = str(content or "").strip()
     chars = len(content)
@@ -20109,6 +20171,7 @@ def _broadcast_preview_summary(payload: dict, estimate: dict[str, int]) -> str:
         "📦 <b>មាតិកា</b>\n"
         f"ប្រភេទ: <b>{html.escape(kind)}</b>\n"
         f"Format: <b>{html.escape(_broadcast_parse_mode_label(mode))}</b>\n"
+        f"URL preview: <b>{'ON' if link_preview else 'OFF'}</b>\n"
         f"ចំនួនតួអក្សរ: <b>{chars}</b>\n\n"
         "📊 <b>អ្នកទទួល</b>\n"
         f"👥 អ្នកប្រើបានចុះឈ្មោះ: <b>{int(estimate.get('registered') or 0)}</b>\n"
@@ -20436,6 +20499,13 @@ _BROADCAST_FORMAT_DIRECTIVE_RE = re.compile(
     r")\s*(?:-->)?\s*(?:\r?\n|$)",
     re.IGNORECASE,
 )
+_BROADCAST_PREVIEW_DIRECTIVE_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:(?:::|//|#)\s*(?P<short>preview|link[_ -]?preview|url[_ -]?preview|nopreview|no[_ -]?preview))"
+    r"|(?:(?:link[_ -]?preview|url[_ -]?preview|preview)\s*[:=]\s*(?P<long>on|off|true|false|yes|no|1|0))"
+    r")\s*(?:\r?\n|$)",
+    re.IGNORECASE,
+)
 
 _BROADCAST_HTML_HINT_RE = re.compile(
     r"</?(?:b|strong|i|em|u|ins|s|strike|del|a|code|pre|tg-spoiler|blockquote|tg-emoji)\b",
@@ -20452,16 +20522,52 @@ def _broadcast_normalize_parse_mode(mode: str | None, default: str = _BROADCAST_
     return _BROADCAST_PARSE_MODE_ALIASES.get(str(default or "").strip().lower(), _BROADCAST_PARSE_MODE_AUTO)
 
 
+def _broadcast_normalize_link_preview(value: Any, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value if value is not None else "").strip().lower()
+    if text in {"1", "true", "yes", "on", "enabled", "preview", "link_preview", "url_preview"}:
+        return True
+    if text in {"0", "false", "no", "off", "disabled", "nopreview", "no_preview", "no-preview"}:
+        return False
+    return bool(default)
+
+
+def _broadcast_strip_directives(
+    text: str | None,
+    default_mode: str | None = _BROADCAST_PARSE_MODE_AUTO,
+    default_link_preview: bool = True,
+) -> tuple[str, str, bool]:
+    raw = str(text or "")
+    mode = _broadcast_normalize_parse_mode(default_mode)
+    link_preview = _broadcast_normalize_link_preview(default_link_preview, True)
+    for _ in range(4):
+        format_match = _BROADCAST_FORMAT_DIRECTIVE_RE.match(raw)
+        if format_match:
+            mode = _broadcast_normalize_parse_mode(
+                format_match.group("short") or format_match.group("long"),
+                mode,
+            )
+            raw = raw[format_match.end():]
+            continue
+        preview_match = _BROADCAST_PREVIEW_DIRECTIVE_RE.match(raw)
+        if preview_match:
+            token = preview_match.group("short") or preview_match.group("long") or ""
+            normalized = token.strip().lower().replace("-", "_").replace(" ", "_")
+            link_preview = not normalized.startswith("no")
+            if preview_match.group("long") is not None:
+                link_preview = _broadcast_normalize_link_preview(token, link_preview)
+            raw = raw[preview_match.end():]
+            continue
+        break
+    return raw, mode, link_preview
+
+
 def _broadcast_strip_format_directive(
     text: str | None,
     default_mode: str | None = _BROADCAST_PARSE_MODE_AUTO,
 ) -> tuple[str, str]:
-    raw = str(text or "")
-    mode = _broadcast_normalize_parse_mode(default_mode)
-    match = _BROADCAST_FORMAT_DIRECTIVE_RE.match(raw)
-    if match:
-        mode = _broadcast_normalize_parse_mode(match.group("short") or match.group("long"), mode)
-        raw = raw[match.end():]
+    raw, mode, _link_preview = _broadcast_strip_directives(text, default_mode, True)
     return raw, mode
 
 
@@ -20485,6 +20591,35 @@ def _broadcast_apply_format_directive(text: str | None, parse_mode: str | None) 
         _BROADCAST_PARSE_MODE_MARKDOWN_V2: "::mdv2",
     }.get(mode)
     return f"{directive}\n{raw}" if directive else raw
+
+
+def _broadcast_apply_option_directives(
+    text: str | None,
+    parse_mode: str | None,
+    link_preview: bool = True,
+) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return raw
+    clean, embedded_mode, embedded_preview = _broadcast_strip_directives(
+        raw,
+        parse_mode,
+        link_preview,
+    )
+    mode = _broadcast_normalize_parse_mode(embedded_mode)
+    preview = _broadcast_normalize_link_preview(embedded_preview, True)
+    directives: list[str] = []
+    format_directive = {
+        _BROADCAST_PARSE_MODE_PLAIN: "::plain",
+        _BROADCAST_PARSE_MODE_HTML: "::html",
+        _BROADCAST_PARSE_MODE_MARKDOWN: "::md",
+        _BROADCAST_PARSE_MODE_MARKDOWN_V2: "::mdv2",
+    }.get(mode)
+    if format_directive:
+        directives.append(format_directive)
+    if not preview:
+        directives.append("::nopreview")
+    return "\n".join([*directives, clean.strip()])
 
 
 def _broadcast_parse_mode_label(mode: str | None) -> str:
@@ -20569,17 +20704,22 @@ def _broadcast_prepare_text(
     default_parse_mode: str | None = "auto",
     *,
     max_chars: int,
-) -> tuple[str | None, str]:
-    raw, mode = _broadcast_strip_format_directive(text, default_parse_mode)
+    default_link_preview: bool = True,
+) -> tuple[str | None, str, bool]:
+    raw, mode, link_preview = _broadcast_strip_directives(
+        text,
+        default_parse_mode,
+        default_link_preview,
+    )
     raw = raw.strip()
     if not raw:
-        return None, mode
+        return None, mode, link_preview
     if _broadcast_visible_len(raw, mode) > max_chars:
         raise ValueError(f"Broadcast content too long. Max {max_chars} Telegram-visible characters.")
-    return raw, mode
+    return raw, mode, link_preview
 
 
-def _broadcast_message_text_and_mode(msg: Any, *, caption: bool = False) -> tuple[str, str]:
+def _broadcast_message_text_and_mode(msg: Any, *, caption: bool = False) -> tuple[str, str, bool]:
     """Read admin Telegram message content while preserving native formatting.
 
     Telegram native formatting arrives as entities, not literal markdown.  PTB's
@@ -20593,11 +20733,14 @@ def _broadcast_message_text_and_mode(msg: Any, *, caption: bool = False) -> tupl
         try:
             html_text = getattr(msg, prop_name, None)
             if html_text:
-                return str(html_text), _BROADCAST_PARSE_MODE_HTML
+                return _broadcast_strip_directives(
+                    str(html_text),
+                    _BROADCAST_PARSE_MODE_HTML,
+                    True,
+                )
         except Exception as exc:
             logger.warning("Could not convert Telegram entities to HTML for broadcast: %s", exc)
-    clean, mode = _broadcast_strip_format_directive(raw, _BROADCAST_PARSE_MODE_AUTO)
-    return clean, mode
+    return _broadcast_strip_directives(raw, _BROADCAST_PARSE_MODE_AUTO, True)
 
 
 async def _send_telegram_broadcast_message(
@@ -20608,6 +20751,7 @@ async def _send_telegram_broadcast_message(
     parse_mode: str | None,
     photo_file_id: str | None = None,
     reply_markup: Any | None = None,
+    link_preview: bool = True,
 ) -> Any:
     """Send a text/photo broadcast with parse-mode fallback and return Telegram Message."""
     parse_candidates = _broadcast_candidate_parse_modes(text, parse_mode)
@@ -20630,7 +20774,7 @@ async def _send_telegram_broadcast_message(
                 kwargs = {
                     "chat_id": int(chat_id),
                     "text": text or " ",
-                    "disable_web_page_preview": True,
+                    "disable_web_page_preview": not _broadcast_normalize_link_preview(link_preview, True),
                 }
                 if telegram_parse_mode:
                     kwargs["parse_mode"] = telegram_parse_mode
@@ -20710,19 +20854,25 @@ async def _run_broadcast_to_all(
 
         photo_file_id = pending.get("photo_file_id")
         default_parse_mode = pending.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO
+        default_link_preview = _broadcast_normalize_link_preview(
+            pending.get("link_preview"),
+            True,
+        )
         try:
             if photo_file_id:
-                send_text, send_parse_mode = _broadcast_prepare_text(
+                send_text, send_parse_mode, send_link_preview = _broadcast_prepare_text(
                     pending.get("caption"),
                     default_parse_mode,
                     max_chars=1024,
+                    default_link_preview=default_link_preview,
                 )
                 send_text = send_text or ""
             else:
-                send_text, send_parse_mode = _broadcast_prepare_text(
+                send_text, send_parse_mode, send_link_preview = _broadcast_prepare_text(
                     pending.get("text"),
                     default_parse_mode,
                     max_chars=TELE_MSG_LIMIT,
+                    default_link_preview=default_link_preview,
                 )
         except ValueError as exc:
             logger.warning("%s invalid broadcast content: %s", label, exc)
@@ -20753,6 +20903,7 @@ async def _run_broadcast_to_all(
                             text=send_text or "",
                             parse_mode=send_parse_mode,
                             photo_file_id=photo_file_id,
+                            link_preview=send_link_preview,
                         )
                         message_id = int(getattr(sent_message, "message_id", 0) or 0)
                         record = {"chat_id": int(uid), "message_id": message_id} if message_id else None
@@ -23679,9 +23830,10 @@ async def _admin_show_broadcast_preview_message(message, bot, user_id: int, payl
     plain_text = payload.get("text")
     parse_mode = payload.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO
 
-    preview_content, preview_mode = _broadcast_strip_format_directive(
+    preview_content, preview_mode, preview_link_preview = _broadcast_strip_directives(
         caption_text if photo_file_id else plain_text,
         parse_mode,
+        _broadcast_normalize_link_preview(payload.get("link_preview"), True),
     )
 
     await safe_send(lambda: message.reply_text(
@@ -23699,6 +23851,7 @@ async def _admin_show_broadcast_preview_message(message, bot, user_id: int, payl
             parse_mode=preview_mode,
             photo_file_id=photo_file_id,
             reply_markup=get_broadcast_confirm_kb(),
+            link_preview=preview_link_preview,
         ))
         return True
     except Exception as exc:
@@ -23832,11 +23985,12 @@ async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     plain_text:    str | None = None
 
     parse_mode = _BROADCAST_PARSE_MODE_AUTO
+    link_preview = True
     if msg.photo:
         photo_file_id = msg.photo[-1].file_id
-        caption_text, parse_mode = _broadcast_message_text_and_mode(msg, caption=True)
+        caption_text, parse_mode, link_preview = _broadcast_message_text_and_mode(msg, caption=True)
     elif msg.text:
-        plain_text, parse_mode = _broadcast_message_text_and_mode(msg, caption=False)
+        plain_text, parse_mode, link_preview = _broadcast_message_text_and_mode(msg, caption=False)
         if not plain_text.strip():
             await safe_send(lambda: msg.reply_text("⚠️ អត្ថបទមិនអាចទទេបាន។ សូមវាយសារ។"))
             return
@@ -23849,6 +24003,7 @@ async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "caption":       caption_text,
         "text":          plain_text,
         "parse_mode":    parse_mode,
+        "link_preview":  link_preview,
     }
 
     ok = await _admin_show_broadcast_preview_message(msg, context.bot, user_id, _pending_broadcast[user_id])
@@ -24067,11 +24222,12 @@ async def _handle_sched_content(update: Update, context: ContextTypes.DEFAULT_TY
     plain_text:    str | None = None
 
     parse_mode = _BROADCAST_PARSE_MODE_AUTO
+    link_preview = True
     if msg.photo:
         photo_file_id = msg.photo[-1].file_id
-        caption_text, parse_mode = _broadcast_message_text_and_mode(msg, caption=True)
+        caption_text, parse_mode, link_preview = _broadcast_message_text_and_mode(msg, caption=True)
     elif msg.text:
-        plain_text, parse_mode = _broadcast_message_text_and_mode(msg, caption=False)
+        plain_text, parse_mode, link_preview = _broadcast_message_text_and_mode(msg, caption=False)
         if not plain_text.strip():
             await safe_send(lambda: msg.reply_text("⚠️ អត្ថបទមិនអាចទទេបាន។ សូមវាយសារ ឬ ផ្ញើរូបភាព។"))
             return True
@@ -24084,6 +24240,7 @@ async def _handle_sched_content(update: Update, context: ContextTypes.DEFAULT_TY
         "caption": caption_text,
         "text": plain_text,
         "parse_mode": parse_mode,
+        "link_preview": link_preview,
     }
     context.user_data["sched_state"] = SCHED_WAIT_TIME
     await safe_send(lambda: msg.reply_text(
@@ -24150,17 +24307,19 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
     row_id = row["id"]
     dt_str = _fmt_dt(broadcast_at)
 
-    preview_content, preview_mode = _broadcast_strip_format_directive(
+    preview_content, preview_mode, preview_link_preview = _broadcast_strip_directives(
         payload.get("caption") if payload.get("photo_file_id") else payload.get("text"),
         payload.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO,
+        _broadcast_normalize_link_preview(payload.get("link_preview"), True),
     )
     mode_line = f"Format: <b>{html.escape(_broadcast_parse_mode_label(preview_mode))}</b>\n"
+    preview_line = f"URL preview: <b>{'ON' if preview_link_preview else 'OFF'}</b>\n"
 
     # Keep schedule details in a safe HTML message and render the actual
     # broadcast content separately with its selected Telegram parse mode.
     # This prevents HTML/Markdown from showing as raw tags in the preview.
     await safe_send(lambda: msg.reply_text(
-        f'📅 <b>មើលកាលវិភាគជាមុន #{row_id}</b>\n⏰ {dt_str}\nស្ថានភាព៖ <b>មើលជាមុន — មិនទាន់បញ្ជាក់</b>\n{mode_line}\n👁️ <b>ខាងក្រោមនេះជាសារមើលជាមុន។</b>',
+        f'📅 <b>មើលកាលវិភាគជាមុន #{row_id}</b>\n⏰ {dt_str}\nស្ថានភាព៖ <b>មើលជាមុន — មិនទាន់បញ្ជាក់</b>\n{mode_line}{preview_line}\n👁️ <b>ខាងក្រោមនេះជាសារមើលជាមុន។</b>',
         parse_mode="HTML",
         disable_web_page_preview=True,
     ))
@@ -24172,6 +24331,7 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
             parse_mode=preview_mode,
             photo_file_id=payload.get("photo_file_id"),
             reply_markup=get_sched_confirm_kb(row_id),
+            link_preview=preview_link_preview,
         ))
     except Exception as exc:
         error_text = html.escape(str(exc)[:300])

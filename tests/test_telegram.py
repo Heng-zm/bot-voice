@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 import warnings
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import FastAPI
 
@@ -192,6 +192,64 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             callback_requires_tts_access("voxcpm2", "voxcpm2:refresh")
         )
+
+    def test_broadcast_markdown_link_and_preview_directives(self) -> None:
+        stored = legacy._broadcast_apply_option_directives(
+            "[Open site](https://example.com)",
+            "markdown",
+            False,
+        )
+        text, mode, link_preview = legacy._broadcast_prepare_text(
+            stored,
+            "auto",
+            max_chars=legacy.TELE_MSG_LIMIT,
+        )
+
+        self.assertEqual(
+            "::md\n::nopreview\n[Open site](https://example.com)",
+            stored,
+        )
+        self.assertEqual("[Open site](https://example.com)", text)
+        self.assertEqual("markdown", mode)
+        self.assertFalse(link_preview)
+
+    async def test_broadcast_markdown_link_enables_url_preview(self) -> None:
+        bot = SimpleNamespace(
+            send_message=AsyncMock(return_value=SimpleNamespace(message_id=1)),
+        )
+
+        await legacy._send_telegram_broadcast_message(
+            bot,
+            chat_id=42,
+            text="[Open site](https://example.com)",
+            parse_mode="markdown",
+            link_preview=True,
+        )
+
+        bot.send_message.assert_awaited_once_with(
+            chat_id=42,
+            text="[Open site](https://example.com)",
+            disable_web_page_preview=False,
+            parse_mode="Markdown",
+        )
+
+    def test_web_broadcast_markdown_link_enables_url_preview(self) -> None:
+        response = SimpleNamespace(status_code=200, json=lambda: {"ok": True})
+        client = SimpleNamespace(post=Mock(return_value=response))
+
+        with patch.object(legacy, "TELEGRAM_BOT_TOKEN", "test-token"):
+            ok, result = legacy._web_send_telegram_message(
+                42,
+                "[Open site](https://example.com)",
+                client=client,
+                parse_mode="markdown",
+                link_preview=True,
+            )
+
+        self.assertTrue(ok, result)
+        payload = client.post.call_args.kwargs["json"]
+        self.assertEqual("Markdown", payload["parse_mode"])
+        self.assertFalse(payload["disable_web_page_preview"])
 
     async def test_unknown_callback_is_answered_instead_of_swallowed(self) -> None:
         query = SimpleNamespace(
