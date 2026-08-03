@@ -10128,7 +10128,10 @@ async def _runtime_admin_callback(update: Any, context: Any) -> None:
         return
 
     with suppress(Exception):
-        await query.answer()
+        await query.answer(
+            "This runtime button is no longer available. Please reopen the menu.",
+            show_alert=False,
+        )
 
 
 async def _handle_runtime_admin_text(update: Any, context: Any) -> bool:
@@ -12619,23 +12622,48 @@ def _user_prefs_select_sync(user_id: int, include_tts_model: bool):
     )
 
 
-def _cache_user_tts_model_preference_sync(user_id: int, model: str) -> None:
-    """Save the chosen TTS model immediately in local/Redis cache.
+def _cache_user_preferences_sync(user_id: int, **changes: Any) -> dict:
+    """Apply preference changes to memory/Redis before background DB writes.
 
-    This keeps the UI responsive and prevents missing optional Supabase columns
-    from resetting the user's choice during the current session.
+    Callback handlers must be able to read their own writes immediately.  If we
+    only invalidate memory and queue a Supabase update, the next read can race
+    that update and cache the old row for the full preference TTL.  This local
+    write-through layer also keeps preferences functional in deployments that
+    intentionally run without Supabase.
     """
     user_id = int(user_id)
-    model = _normalize_tts_model(model)
     prefs = _get_cached_prefs_sync(user_id)
     if prefs is None and redis_client is not None:
-        cached = _redis_get_json_sync(_prefs_redis_key(user_id), default=None)
-        prefs = cached if isinstance(cached, dict) else None
+        try:
+            cached = _redis_get_json_sync(_prefs_redis_key(user_id), default=None)
+            prefs = cached if isinstance(cached, dict) else None
+        except Exception as exc:
+            _log_once(
+                logging.WARNING,
+                f"prefs:redis-read:{type(exc).__name__}",
+                "Preference Redis read failed; keeping local preferences: %s",
+                exc,
+            )
     prefs = _normalize_user_prefs(prefs)
-    prefs["tts_model"] = model
+    prefs.update(changes)
+    prefs = _normalize_user_prefs(prefs)
     _cache_prefs_sync(user_id, prefs)
     if redis_client is not None:
-        _redis_set_json_sync(_prefs_redis_key(user_id), prefs, REDIS_PREFS_TTL_S)
+        try:
+            _redis_set_json_sync(_prefs_redis_key(user_id), prefs, REDIS_PREFS_TTL_S)
+        except Exception as exc:
+            _log_once(
+                logging.WARNING,
+                f"prefs:redis-write:{type(exc).__name__}",
+                "Preference Redis write failed; keeping local preferences: %s",
+                exc,
+            )
+    return prefs
+
+
+def _cache_user_tts_model_preference_sync(user_id: int, model: str) -> None:
+    """Save the chosen TTS model immediately in local/Redis cache."""
+    _cache_user_preferences_sync(user_id, tts_model=_normalize_tts_model(model))
 
 
 def _prefs_redis_key(user_id: int) -> str:
@@ -13500,7 +13528,7 @@ def user_exists_in_db(user_id: int) -> bool:
 
 def update_user_gender(user_id: int, gender: str) -> None:
     gender = gender if gender in ("female", "male") else "female"
-    _invalidate_prefs(user_id)
+    _cache_user_preferences_sync(user_id, gender=gender)
     if not supabase:
         return
 
@@ -13518,7 +13546,7 @@ def update_user_gender(user_id: int, gender: str) -> None:
 
 def update_user_speed(user_id: int, speed: float) -> None:
     speed = round(max(_SPEED_MIN, min(_SPEED_MAX, speed)), 4)
-    _invalidate_prefs(user_id)
+    _cache_user_preferences_sync(user_id, speed=speed)
     if not supabase:
         return
 
@@ -14202,14 +14230,34 @@ async def get_bot_settings_async(force: bool = False) -> tuple[dict[str, str], d
     return data, status
 
 
+def _cache_bot_setting_runtime_value(key: str, value: str) -> None:
+    """Make a successful setting write visible to handlers immediately."""
+    data = dict(BOT_SETTING_DEFAULTS)
+    data.update(_bot_settings_cache.get("data") or {})
+    data[key] = str(value)
+    _bot_settings_cache["data"] = data
+    _bot_settings_cache["ts"] = time.monotonic()
+
+
+def _write_bot_settings_redis_sync() -> bool:
+    if redis_client is None:
+        return False
+    payload = _cache_payload(dict(_bot_settings_cache.get("data") or BOT_SETTING_DEFAULTS))
+    return _redis_set_json_sync(
+        _bot_settings_redis_key(),
+        payload,
+        CACHE_ASIDE_DEFAULT_TTL_S,
+    )
+
+
 def db_bot_setting_value_set(key: str, value: Any, admin_id: int) -> tuple[bool, str]:
     if key not in BOT_SETTING_DEFAULTS:
         return False, f"Unknown setting: {key}"
     value = str(value).strip()
-    _bot_settings_memory[key] = value
     if not supabase:
-        _bot_settings_cache["ts"] = 0.0
-        _submit_db(lambda: _redis_delete_sync(_bot_settings_redis_key()))
+        _bot_settings_memory[key] = value
+        _cache_bot_setting_runtime_value(key, value)
+        _submit_db(_write_bot_settings_redis_sync)
         return True, "saved in memory only"
     try:
         supabase.table("bot_settings").upsert({
@@ -14218,12 +14266,19 @@ def db_bot_setting_value_set(key: str, value: Any, admin_id: int) -> tuple[bool,
             "updated_by": int(admin_id),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }, on_conflict="key").execute()
-        _bot_settings_cache["ts"] = 0.0
-        _redis_delete_sync(_bot_settings_redis_key())
+        _bot_settings_memory[key] = value
+        _cache_bot_setting_runtime_value(key, value)
+        try:
+            _write_bot_settings_redis_sync()
+        except Exception as exc:
+            _log_once(
+                logging.WARNING,
+                f"bot-settings:redis-write:{type(exc).__name__}",
+                "Bot setting saved, but Redis write-through failed: %s",
+                exc,
+            )
         return True, "saved"
     except Exception as e:
-        _bot_settings_cache["ts"] = 0.0
-        _redis_delete_sync(_bot_settings_redis_key())
         return False, str(e)
 
 
@@ -14419,17 +14474,19 @@ async def _ensure_user_allowed(update: Update, context: ContextTypes.DEFAULT_TYP
     msg = update.effective_message
     if not user or not msg:
         return False
-    if _is_admin(user.id):
+    is_admin = _is_admin(user.id)
+    if is_admin and feature_key is None:
         return True
 
-    blocked = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_is_blocked(user.id))
-    if blocked:
-        _metric_inc("blocked_hits")
-        await safe_send(lambda: msg.reply_text("⛔ អ្នកត្រូវបាន Block មិនអាចប្រើ Bot នេះបានទេ។"))
-        return False
+    if not is_admin:
+        blocked = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_is_blocked(user.id))
+        if blocked:
+            _metric_inc("blocked_hits")
+            await safe_send(lambda: msg.reply_text("⛔ អ្នកត្រូវបាន Block មិនអាចប្រើ Bot នេះបានទេ។"))
+            return False
 
     settings, _status = await get_bot_settings_async()
-    if _setting_bool_from(settings, "maintenance_mode", False):
+    if not is_admin and _setting_bool_from(settings, "maintenance_mode", False):
         _metric_inc("disabled_hits")
         await safe_send(lambda: msg.reply_text("🛠️ Bot កំពុង Maintenance។ សូមព្យាយាមម្តងទៀតពេលក្រោយ។"))
         return False
@@ -19315,6 +19372,18 @@ async def _check_cooldown(reply_target, user_id: int) -> bool:
     return False
 
 
+async def _claim_tts_request(reply_target: Any, user_id: int) -> bool:
+    """Claim the pre-generation window after enforcing cooldown."""
+    if await _check_cooldown(reply_target, user_id):
+        return False
+    if _reserve_tts_request(user_id):
+        return True
+    await safe_send(lambda: reply_target.reply_text(
+        "A TTS request is already in progress. Please wait."
+    ))
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Paged TTS delivery
 # ---------------------------------------------------------------------------
@@ -23917,6 +23986,11 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.application.create_task(
             _run_broadcast_to_all(context.bot, user_id, pending, label="ការផ្សាយសារ")
         )
+        return
+
+    await safe_send(lambda: query.message.reply_text(
+        "This broadcast button is no longer available. Please reopen the menu."
+    ))
 
 
 # ===========================================================================
@@ -24719,6 +24793,11 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: query.message.reply_text(
             f'✅ កាលវិភាគ <b>#{row_id}</b> បានបោះបង់។', parse_mode="HTML"
         ))
+        return
+
+    await safe_send(lambda: query.message.reply_text(
+        "This schedule button is no longer available. Please reopen the menu."
+    ))
 
 # ---------------------------------------------------------------------------
 # Subtitle/text document helpers
@@ -26416,10 +26495,17 @@ async def _voxcpm2_edit_prompt(query, context: Any, text: str) -> None:
     ))
 
 
+async def _ensure_voxcpm2_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    allowed = await _ensure_user_allowed(update, context, "tts_enabled", "VoxCPM2 TTS")
+    if not allowed:
+        context.user_data.pop("voxcpm2_state", None)
+    return allowed
+
+
 async def cmd_voxcpm2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.effective_message:
         return
-    if not await _ensure_user_allowed(update, context):
+    if not await _ensure_voxcpm2_allowed(update, context):
         return
     context.user_data.pop("voxcpm2_state", None)
     await _voxcpm2_send_panel(
@@ -26818,6 +26904,8 @@ async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_ttsmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _ensure_user_allowed(update, context, "tts_enabled", "Text to voice"):
+        return
     user_id = update.effective_user.id
     prefs = await get_user_prefs_async(user_id)
     await safe_send(lambda: update.message.reply_text(
@@ -27019,7 +27107,7 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if context.user_data.get("voxcpm2_state") == VOXCPM2_WAIT_REFERENCE:
-        if not await _ensure_user_allowed(update, context):
+        if not await _ensure_voxcpm2_allowed(update, context):
             return
         await _voxcpm2_accept_reference(
             update,
@@ -27035,10 +27123,9 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not await _ensure_user_allowed(update, context):
         return
-    is_admin = _is_admin(user_id)
     settings, _settings_status = await get_bot_settings_async()
-    convert_enabled = is_admin or _setting_bool_from(settings, "audio_to_voice_enabled", True)
-    transcribe_enabled = is_admin or _setting_bool_from(settings, "audio_transcribe_enabled", True)
+    convert_enabled = _setting_bool_from(settings, "audio_to_voice_enabled", True)
+    transcribe_enabled = _setting_bool_from(settings, "audio_transcribe_enabled", True)
     if not convert_enabled and not transcribe_enabled:
         _metric_inc("disabled_hits")
         await safe_send(lambda: msg.reply_text(
@@ -27250,7 +27337,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if context.user_data.get("voxcpm2_state") == VOXCPM2_WAIT_REFERENCE:
-        if not await _ensure_user_allowed(update, context):
+        if not await _ensure_voxcpm2_allowed(update, context):
             return
         await _voxcpm2_accept_reference(
             update,
@@ -27393,7 +27480,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if context.user_data.get("voxcpm2_state") == VOXCPM2_WAIT_REFERENCE:
-        if not await _ensure_user_allowed(update, context):
+        if not await _ensure_voxcpm2_allowed(update, context):
             return
         await _voxcpm2_send_panel(
             msg,
@@ -27404,12 +27491,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     if context.user_data.get("voxcpm2_state") == VOXCPM2_WAIT_CONTROL:
-        if not await _ensure_user_allowed(update, context):
+        if not await _ensure_voxcpm2_allowed(update, context):
             return
         await _voxcpm2_save_control_text(update, context, text)
         return
     if context.user_data.get("voxcpm2_state") == VOXCPM2_WAIT_PROMPT_TEXT:
-        if not await _ensure_user_allowed(update, context):
+        if not await _ensure_voxcpm2_allowed(update, context):
             return
         await _voxcpm2_save_prompt_text(update, context, text)
         return
@@ -27596,13 +27683,16 @@ async def _regenerate_tts_voice_with_progress(
     final_text: str,
     error_text: str,
     delete_source: bool,
+    reservation_held: bool = False,
 ) -> bool:
     """Regenerate one voice while reusing one progress message."""
     if query.message is None:
+        if reservation_held:
+            _release_tts_request(user_id)
         return False
-    if await _check_cooldown(query.message, user_id):
+    if not reservation_held and not await _claim_tts_request(query.message, user_id):
         return False
-    if not _reserve_tts_request(user_id):
+    if not _tts_request_reserved(user_id):
         await safe_send(lambda: query.message.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
         return False
     chat_id = int(query.message.chat.id)
@@ -27683,18 +27773,18 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
             await _voxcpm2_send_panel(query.message, user_id, f"មិនអាចជ្រើស VoxCPM2 បានទេ៖ {unavailable}")
             return
 
-    model = update_user_tts_model(user_id, requested_key)
     original_text, prefs = await asyncio.gather(
         get_callback_original_text(query, user_id),
         get_user_prefs_async(user_id),
     )
-    prefs["tts_model"] = model
+    model = requested_key
     gender = prefs["gender"]
     speed = prefs["speed"]
 
     if model == "voxcpm2":
         profile = await _voxcpm2_profile_get(user_id)
         if not _voxcpm2_reference_ready(profile):
+            model = update_user_tts_model(user_id, model)
             with suppress(Exception):
                 await query.message.edit_reply_markup(reply_markup=get_main_kb(gender, model))
             await _voxcpm2_send_panel(
@@ -27705,6 +27795,7 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
             return
 
     if not original_text:
+        model = update_user_tts_model(user_id, model)
         await safe_send(lambda: query.message.edit_reply_markup(reply_markup=get_main_kb(gender, model)))
         await safe_send(lambda: query.message.reply_text(
             "✅ បានប្តូរម៉ូដែល TTS រួច។\n"
@@ -27713,8 +27804,14 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
         ))
         return
 
-    with suppress(Exception):
-        await query.message.edit_reply_markup(reply_markup=get_main_kb(gender, model))
+    if not await _claim_tts_request(query.message, user_id):
+        return
+    try:
+        model = update_user_tts_model(user_id, model)
+        await safe_send(lambda: query.message.edit_reply_markup(reply_markup=get_main_kb(gender, model)))
+    except BaseException:
+        _release_tts_request(user_id)
+        raise
     model_label = TTS_MODEL_OPTIONS.get(model, TTS_MODEL_OPTIONS["auto"])[0]
     await _regenerate_tts_voice_with_progress(
         query=query,
@@ -27728,6 +27825,7 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
         final_text=f"✅ បានប្តូរទៅ {model_label} និងបង្កើតសំឡេងរួចរាល់។",
         error_text="❌ មិនអាចប្តូរម៉ូដែល និងបង្កើតសំឡេងឡើងវិញបានទេ។ សូមសាកម្ដងទៀត។",
         delete_source=True,
+        reservation_held=True,
     )
 
 
@@ -27788,7 +27886,13 @@ async def _cb_speed(query, user_id: int, context, data: str):
         return
     gender = prefs["gender"]
     tts_model = prefs.get("tts_model", "auto")
-    update_user_speed(user_id, new_speed)
+    if not await _claim_tts_request(query.message, user_id):
+        return
+    try:
+        update_user_speed(user_id, new_speed)
+    except BaseException:
+        _release_tts_request(user_id)
+        raise
     await _regenerate_tts_voice_with_progress(
         query=query,
         context=context,
@@ -27801,6 +27905,7 @@ async def _cb_speed(query, user_id: int, context, data: str):
         final_text=f"✅ បានប្តូរល្បឿនទៅ {speed_label} និងបង្កើតសំឡេងរួចរាល់។",
         error_text="❌ មិនអាចប្តូរល្បឿន និងបង្កើតសំឡេងបានទេ។ សូមសាកម្ដងទៀត។",
         delete_source=True,
+        reservation_held=True,
     )
 
 async def _cb_gender(query, user_id: int, context, data: str):
@@ -27818,7 +27923,13 @@ async def _cb_gender(query, user_id: int, context, data: str):
         return
     speed = prefs["speed"]
     tts_model = prefs.get("tts_model", "auto")
-    update_user_gender(user_id, new_gender)
+    if not await _claim_tts_request(query.message, user_id):
+        return
+    try:
+        update_user_gender(user_id, new_gender)
+    except BaseException:
+        _release_tts_request(user_id)
+        raise
     gender_label = "ស្រី" if new_gender == "female" else "ប្រុស"
     await _regenerate_tts_voice_with_progress(
         query=query,
@@ -27832,6 +27943,7 @@ async def _cb_gender(query, user_id: int, context, data: str):
         final_text=f"✅ បានប្តូរទៅសំឡេង{gender_label} និងបង្កើតសំឡេងរួចរាល់។",
         error_text="❌ មិនអាចប្តូរប្រភេទសំឡេង និងបង្កើតសំឡេងបានទេ។ សូមសាកម្ដងទៀត។",
         delete_source=True,
+        reservation_held=True,
     )
 
 async def _cb_tts_transcript(query, user_id: int, context, data: str):

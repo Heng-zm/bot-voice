@@ -233,6 +233,120 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
         allowed.assert_awaited_once()
         callback.assert_not_awaited()
 
+    async def test_disabled_feature_also_blocks_admin_usage(self) -> None:
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=42),
+            effective_message=message,
+        )
+        settings = dict(legacy.BOT_SETTING_DEFAULTS)
+        settings["tts_enabled"] = "0"
+
+        with (
+            patch.object(legacy, "_is_admin", return_value=True),
+            patch.object(
+                legacy,
+                "get_bot_settings_async",
+                AsyncMock(return_value=(settings, {})),
+            ),
+        ):
+            allowed = await legacy._ensure_user_allowed(
+                update,
+                SimpleNamespace(),
+                "tts_enabled",
+                "Text to voice",
+            )
+
+        self.assertFalse(allowed)
+        message.reply_text.assert_awaited_once()
+
+    async def test_disabling_tts_clears_pending_voxcpm2_input(self) -> None:
+        context = SimpleNamespace(
+            user_data={"voxcpm2_state": legacy.VOXCPM2_WAIT_CONTROL},
+        )
+        with patch.object(
+            legacy,
+            "_ensure_user_allowed",
+            AsyncMock(return_value=False),
+        ):
+            allowed = await legacy._ensure_voxcpm2_allowed(
+                SimpleNamespace(),
+                context,
+            )
+
+        self.assertFalse(allowed)
+        self.assertNotIn("voxcpm2_state", context.user_data)
+
+    async def test_setting_toggle_updates_runtime_cache_immediately(self) -> None:
+        old_memory = dict(legacy._bot_settings_memory)
+        old_cache = {
+            "data": dict(legacy._bot_settings_cache["data"]),
+            "status": dict(legacy._bot_settings_cache["status"]),
+            "ts": legacy._bot_settings_cache["ts"],
+        }
+        try:
+            legacy._bot_settings_memory["tts_enabled"] = "1"
+            legacy._bot_settings_cache.update(
+                data={**legacy.BOT_SETTING_DEFAULTS, "tts_enabled": "1"},
+                status={"memory": True},
+                ts=9.0,
+            )
+            with (
+                patch.object(legacy, "supabase", None),
+                patch.object(legacy, "_submit_db"),
+                patch.object(legacy.time, "monotonic", return_value=10.0),
+            ):
+                ok, _info = legacy.db_bot_setting_set("tts_enabled", False, 42)
+                settings, _status = await legacy.get_bot_settings_async()
+
+            self.assertTrue(ok)
+            self.assertFalse(legacy._setting_bool_from(settings, "tts_enabled", True))
+        finally:
+            legacy._bot_settings_memory.clear()
+            legacy._bot_settings_memory.update(old_memory)
+            legacy._bot_settings_cache.clear()
+            legacy._bot_settings_cache.update(old_cache)
+
+    async def test_disabled_audio_features_do_not_bypass_for_admin(self) -> None:
+        message = SimpleNamespace(
+            chat_id=100,
+            document=None,
+            audio=SimpleNamespace(
+                file_name="sample.mp3",
+                mime_type="audio/mpeg",
+                file_id="file-id",
+                file_unique_id="unique-id",
+                file_size=100,
+                duration=1.0,
+            ),
+            reply_text=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            message=message,
+            effective_user=SimpleNamespace(id=42, username="admin", first_name="Admin"),
+        )
+        context = SimpleNamespace(user_data={}, bot=SimpleNamespace())
+        settings = dict(legacy.BOT_SETTING_DEFAULTS)
+        settings["audio_to_voice_enabled"] = "0"
+        settings["audio_transcribe_enabled"] = "0"
+
+        with (
+            patch.object(legacy, "_is_admin", return_value=True),
+            patch.object(legacy, "_get_admin_for_user", return_value=None),
+            patch.object(legacy, "_ensure_user_allowed", AsyncMock(return_value=True)),
+            patch.object(
+                legacy,
+                "get_bot_settings_async",
+                AsyncMock(return_value=(settings, {})),
+            ),
+            patch.object(legacy, "_check_cooldown", AsyncMock(return_value=False)),
+            patch.object(legacy.TelegramProgress, "start", AsyncMock()) as progress,
+        ):
+            await legacy.on_audio_file(update, context)
+
+        progress.assert_not_awaited()
+        message.reply_text.assert_awaited_once()
+
     async def test_callback_failure_is_recorded_and_reported(self) -> None:
         message = SimpleNamespace(reply_text=AsyncMock())
         query = SimpleNamespace(
@@ -300,6 +414,93 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
 
         legacy._release_tts_request(user_id)
         self.assertFalse(legacy._tts_request_reserved(user_id))
+
+    async def test_gender_and_speed_updates_remain_in_local_preferences(self) -> None:
+        user_id = 9_999_003
+        with (
+            patch.object(legacy, "supabase", None),
+            patch.object(legacy, "redis_client", None),
+        ):
+            legacy._cache_prefs_sync(
+                user_id,
+                {"gender": "female", "speed": 1.0, "tts_model": "auto"},
+            )
+            legacy.update_user_gender(user_id, "male")
+            self.assertEqual("male", (await legacy.get_user_prefs_async(user_id))["gender"])
+
+            legacy.update_user_speed(user_id, 1.25)
+            self.assertEqual(1.25, (await legacy.get_user_prefs_async(user_id))["speed"])
+
+    async def test_preference_update_survives_redis_failure(self) -> None:
+        user_id = 9_999_004
+        with legacy._prefs_cache_thread_lock:
+            legacy._prefs_cache.pop(user_id, None)
+
+        with (
+            patch.object(legacy, "supabase", None),
+            patch.object(legacy, "redis_client", object()),
+            patch.object(
+                legacy,
+                "_redis_get_json_sync",
+                side_effect=RuntimeError("redis read failed"),
+            ),
+            patch.object(
+                legacy,
+                "_redis_set_json_sync",
+                side_effect=RuntimeError("redis write failed"),
+            ),
+        ):
+            legacy.update_user_gender(user_id, "male")
+            self.assertEqual("male", legacy._get_cached_prefs_sync(user_id)["gender"])
+
+    async def test_rejected_speed_callback_does_not_change_preference(self) -> None:
+        data, (_label, new_speed) = next(iter(legacy.SPEED_OPTIONS.items()))
+        query = SimpleNamespace(
+            message=SimpleNamespace(
+                chat=SimpleNamespace(id=100),
+                reply_text=AsyncMock(),
+            ),
+        )
+        prefs = {"gender": "female", "speed": 1.0, "tts_model": "auto"}
+
+        with (
+            patch.object(
+                legacy,
+                "get_callback_original_text",
+                AsyncMock(return_value="hello"),
+            ),
+            patch.object(
+                legacy,
+                "get_user_prefs_async",
+                AsyncMock(return_value=prefs),
+            ),
+            patch.object(
+                legacy,
+                "_check_cooldown",
+                AsyncMock(return_value=True),
+            ),
+            patch.object(legacy, "update_user_speed") as update_speed,
+        ):
+            await legacy._cb_speed(query, 42, SimpleNamespace(), data)
+
+        update_speed.assert_not_called()
+        self.assertNotEqual(prefs["speed"], new_speed)
+
+    async def test_expired_broadcast_callback_reports_itself(self) -> None:
+        message = SimpleNamespace(reply_text=AsyncMock())
+        query = SimpleNamespace(
+            data="bc_removed_feature",
+            from_user=SimpleNamespace(id=42),
+            message=message,
+            answer=AsyncMock(),
+        )
+        update = SimpleNamespace(callback_query=query)
+
+        with patch.object(legacy, "_is_admin", return_value=True):
+            await legacy.broadcast_callback(update, SimpleNamespace())
+
+        query.answer.assert_awaited_once_with()
+        message.reply_text.assert_awaited_once()
 
     async def test_regeneration_releases_reservation_if_progress_start_fails(self) -> None:
         user_id = 9_999_002
