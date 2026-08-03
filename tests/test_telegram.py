@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 import warnings
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -250,6 +251,67 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
         payload = client.post.call_args.kwargs["json"]
         self.assertEqual("Markdown", payload["parse_mode"])
         self.assertFalse(payload["disable_web_page_preview"])
+
+    def test_daily_schedule_time_uses_next_phnom_penh_occurrence(self) -> None:
+        before_eight = datetime(2026, 8, 3, 0, 30, tzinfo=timezone.utc)
+        after_eight = datetime(2026, 8, 3, 2, 0, tzinfo=timezone.utc)
+
+        first_run, recurrence = legacy._parse_schedule_request(
+            "daily 08:00",
+            before_eight,
+        )
+        next_day, next_recurrence = legacy._parse_schedule_request(
+            "every morning 8 AM",
+            after_eight,
+        )
+
+        self.assertEqual("daily", recurrence)
+        self.assertEqual("daily", next_recurrence)
+        self.assertEqual(datetime(2026, 8, 3, 1, 0, tzinfo=timezone.utc), first_run)
+        self.assertEqual(datetime(2026, 8, 4, 1, 0, tzinfo=timezone.utc), next_day)
+
+    def test_daily_schedule_marker_round_trip_preserves_broadcast_format(self) -> None:
+        stored = legacy._sched_apply_recurrence_directive(
+            "::md\n::nopreview\n[Morning news](https://example.com)",
+            "daily",
+        )
+        broadcast_content, recurrence = legacy._sched_strip_recurrence_directive(stored)
+        text, mode, link_preview = legacy._broadcast_prepare_text(
+            broadcast_content,
+            "auto",
+            max_chars=legacy.TELE_MSG_LIMIT,
+        )
+
+        self.assertTrue(stored.startswith("::schedule_daily\n"))
+        self.assertEqual("daily", recurrence)
+        self.assertEqual("[Morning news](https://example.com)", text)
+        self.assertEqual("markdown", mode)
+        self.assertFalse(link_preview)
+
+    async def test_daily_schedule_reschedules_instead_of_finishing(self) -> None:
+        next_run = datetime(2026, 8, 4, 1, 0, tzinfo=timezone.utc)
+        bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=1)))
+        row = {
+            "id": 77,
+            "admin_id": 42,
+            "photo_file_id": None,
+            "caption": None,
+            "plain_text": "::schedule_daily\n::md\nGood *morning*",
+            "broadcast_at": "2026-08-03T01:00:00+00:00",
+        }
+
+        with (
+            patch.object(legacy, "_run_broadcast_to_all", AsyncMock(return_value=(10, 1, 2))) as run,
+            patch.object(legacy, "db_sched_reschedule_daily", return_value=next_run) as reschedule,
+            patch.object(legacy, "db_sched_set_status") as set_status,
+        ):
+            await legacy._fire_scheduled_broadcast(bot, row, already_claimed=True)
+
+        pending = run.await_args.args[2]
+        self.assertEqual("::md\nGood *morning*", pending["text"])
+        reschedule.assert_called_once()
+        set_status.assert_not_called()
+        bot.send_message.assert_awaited_once()
 
     async def test_unknown_callback_is_answered_instead_of_swallowed(self) -> None:
         query = SimpleNamespace(

@@ -5373,6 +5373,7 @@ def _web_schedule_rows_html(rows: list[dict], csrf: str | None = None, return_in
     for row in rows:
         rid = _web_int(row.get("id"), 0)
         content = row.get("caption") or row.get("plain_text") or ""
+        content, recurrence = _sched_strip_recurrence_directive(content)
         preview_content, preview_mode, preview_link = _broadcast_strip_directives(
             content,
             _BROADCAST_PARSE_MODE_AUTO,
@@ -5381,6 +5382,13 @@ def _web_schedule_rows_html(rows: list[dict], csrf: str | None = None, return_in
         preview_mode_label = _broadcast_parse_mode_label(preview_mode)
         edit_parse_options = _broadcast_parse_mode_select_html("parse_mode", preview_mode)
         preview_checked = " checked" if preview_link else ""
+        recurrence_options = "".join(
+            f"<option value='{value}' {'selected' if recurrence == value else ''}>{label}</option>"
+            for value, label in (
+                (SCHED_RECURRENCE_ONCE, "One time"),
+                (SCHED_RECURRENCE_DAILY, f"Daily at this {APP_TIMEZONE_ALIAS} time"),
+            )
+        )
         can_edit, edit_reason = _sched_can_edit(row, _web_current_admin_id())
         is_pending = str(row.get("status") or "").lower() == SCHED_STATUS_PENDING
         confirm_btn = ""
@@ -5396,6 +5404,7 @@ def _web_schedule_rows_html(rows: list[dict], csrf: str | None = None, return_in
             edit_block = f"""
             <details><summary>Edit schedule</summary>
               <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_time'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>Phnom Penh time</label><input type='datetime-local' name='broadcast_at' value='{_web_h(_web_dt_input_value(row.get('broadcast_at')))}' required><div class='help'>Local {APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL}); stored as UTC automatically.</div></div><button>Save Time</button></form>
+              <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_recurrence'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>Repeat</label><select name='recurrence'>{recurrence_options}</select><div class='help'>Daily schedules automatically advance to tomorrow after each send.</div></div><button class='secondary'>Save Repeat</button></form>
               <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_text'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>Format mode</label><select name='parse_mode'>{edit_parse_options}</select></div><div class='field'><label><input type='checkbox' name='link_preview' value='1'{preview_checked}> Show URL link preview</label></div><div class='field'><label>{'Caption' if row.get('photo_file_id') else 'Text message'}</label><textarea name='text' required>{_web_h(preview_content)}</textarea></div><button>Save Text</button></form>
               <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='edit_photo'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>Format mode</label><select name='parse_mode'>{edit_parse_options}</select></div><div class='field'><label><input type='checkbox' name='link_preview' value='1'{preview_checked}> Show URL link preview</label></div><div class='row'><div class='field'><label>Photo file ID</label><input name='photo_file_id' value='{_web_h(row.get('photo_file_id') or '')}' required></div><div class='field'><label>Caption</label><input name='caption' value='{_web_h(preview_content if row.get('photo_file_id') else '')}' maxlength='1024'></div></div><button class='secondary'>Save / Replace Photo</button></form>
               <form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='duplicate'><input type='hidden' name='row_id' value='{rid}'><div class='field'><label>Duplicate to Phnom Penh time</label><input type='datetime-local' name='broadcast_at' value='{duplicate_at}' required><div class='help'>Creates a preview copy so you can confirm it after checking.</div></div><button class='secondary'>Duplicate Preview</button></form>
@@ -5407,7 +5416,7 @@ def _web_schedule_rows_html(rows: list[dict], csrf: str | None = None, return_in
             f"<tr><td><code>#{rid}</code><br><span class='muted'>admin {_web_h(row.get('admin_id'))}</span></td>"
             f"<td>{_web_status_badge(row.get('status'), row)}<br><span class='muted'>{_web_h(row.get('error_msg') or '')}</span></td>"
             f"<td>{_web_h(_web_dt(row.get('broadcast_at')))}</td>"
-            f"<td>{_web_h(_web_short(preview_content, 180))}<br>{_web_badge('photo' if row.get('photo_file_id') else 'text', 'info' if row.get('photo_file_id') else 'muted')} {_web_badge(preview_mode_label, 'info')} {_web_badge('URL preview' if preview_link else 'No URL preview', 'ok' if preview_link else 'muted')}</td>"
+            f"<td>{_web_h(_web_short(preview_content, 180))}<br>{_web_badge('photo' if row.get('photo_file_id') else 'text', 'info' if row.get('photo_file_id') else 'muted')} {_web_badge(preview_mode_label, 'info')} {_web_badge(_sched_recurrence_label(recurrence), 'ok' if recurrence == SCHED_RECURRENCE_DAILY else 'muted')} {_web_badge('URL preview' if preview_link else 'No URL preview', 'ok' if preview_link else 'muted')}</td>"
             f"<td><div class='actions'>{confirm_btn}{cancel_btn}{duplicate_btn}</div>{edit_block}</td></tr>"
         )
     return "".join(table_rows) or '<tr><td colspan=5><div class="empty">No schedules found.</div></td></tr>'
@@ -6765,6 +6774,7 @@ def _web_sched_create(
     confirmed: bool = False,
     parse_mode: str | None = "auto",
     link_preview: bool = True,
+    recurrence: str | None = "once",
 ) -> tuple[bool, str]:
     if not supabase:
         return False, "Supabase is not configured."
@@ -6773,18 +6783,23 @@ def _web_sched_create(
     caption = (caption or "").strip()
     parse_mode = _broadcast_normalize_parse_mode(parse_mode)
     link_preview = _broadcast_normalize_link_preview(link_preview, True)
+    recurrence = _sched_normalize_recurrence(recurrence)
     if photo_file_id and not caption and text:
         caption = text
     try:
-        if photo_file_id and caption:
-            clean_caption, parse_mode, link_preview = _broadcast_prepare_text(
-                caption,
-                parse_mode,
-                max_chars=1024,
-                default_link_preview=link_preview,
-            )
-            caption = _broadcast_apply_option_directives(clean_caption, parse_mode, link_preview)
+        if photo_file_id:
+            caption, recurrence = _sched_strip_recurrence_directive(caption, recurrence)
+            if caption:
+                clean_caption, parse_mode, link_preview = _broadcast_prepare_text(
+                    caption,
+                    parse_mode,
+                    max_chars=1024,
+                    default_link_preview=link_preview,
+                )
+                caption = _broadcast_apply_option_directives(clean_caption, parse_mode, link_preview)
+            caption = _sched_apply_recurrence_directive(caption, recurrence)
         elif not photo_file_id:
+            text, recurrence = _sched_strip_recurrence_directive(text, recurrence)
             clean_text, parse_mode, link_preview = _broadcast_prepare_text(
                 text,
                 parse_mode,
@@ -6794,6 +6809,7 @@ def _web_sched_create(
             if not clean_text:
                 return False, "Broadcast text is required when no photo_file_id is provided."
             text = _broadcast_apply_option_directives(clean_text, parse_mode, link_preview)
+            text = _sched_apply_recurrence_directive(text, recurrence)
     except ValueError as exc:
         return False, str(exc)
     if _sched_to_utc(broadcast_at) <= datetime.now(timezone.utc):
@@ -7455,6 +7471,10 @@ def web_admin_schedules():
     now_plus = (_local_now() + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M")
     table_rows = _web_schedule_rows_html(rows, csrf, return_input)
     parse_options = _broadcast_parse_mode_select_html("parse_mode", _BROADCAST_PARSE_MODE_AUTO)
+    recurrence_options = (
+        f"<option value='{SCHED_RECURRENCE_ONCE}'>One time</option>"
+        f"<option value='{SCHED_RECURRENCE_DAILY}'>Daily at this {APP_TIMEZONE_ALIAS} time</option>"
+    )
     body = f"""
     <div class='card'>
       <form method='get' class='row3'>
@@ -7463,7 +7483,23 @@ def web_admin_schedules():
         <div class='field'><label>&nbsp;</label><div class='actions'><button>Filter</button><a class='btn secondary' href='/admin/schedules'>Reset</a></div></div>
       </form>
     </div>
-    <div class='card'><h2>Create Schedule</h2><p class='muted'>Use Phnom Penh local time in AM/PM style ({APP_TIMEZONE_ALIAS}, {APP_TIMEZONE_UTC_LABEL}). The bot stores the final timestamp in UTC automatically. Use Preview first for safer broadcasts.</p><form method='post' action='/admin/schedules/action'><input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='create'><div class='row'><div class='field'><label>Broadcast Phnom Penh time</label><input type='datetime-local' name='broadcast_at' value='{now_plus}' required><div class='help'>Example: 2026-12-25 09:00 AM {APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})</div></div><div class='field'><label>Mode</label><select name='confirmed'><option value='0'>Preview first</option><option value='1'>Confirm immediately</option></select></div></div><div class='field'><label>Format mode</label><select name='parse_mode'>{parse_options}</select><div class='help'>Supports Telegram HTML, MarkdownV2, Markdown links such as <code>[Open site](https://example.com)</code>, and plain text. First-line directives also work: <code>::html</code>, <code>::mdv2</code>, <code>::md</code>, <code>::plain</code>.</div></div><div class='field'><label><input type='checkbox' name='link_preview' value='1' checked> Show URL link preview</label><div class='help'>Enabled by default; use <code>::nopreview</code> in Telegram composer text to disable it.</div></div><div class='field'><label>Text message <span><span data-count-target='#schedule-text'>0</span>/{TELE_MSG_LIMIT}</span></label><textarea id='schedule-text' name='text' maxlength='{TELE_MSG_LIMIT}' placeholder='Required for text-only schedule; used as photo caption when caption is empty'></textarea></div><div class='row'><div class='field'><label>Telegram photo_file_id optional</label><input name='photo_file_id'></div><div class='field'><label>Photo caption optional</label><input name='caption' maxlength='1024'></div></div><button>Create Schedule</button></form></div>
+    <div class='card'>
+      <h2>Create Schedule</h2>
+      <p class='muted'>Use Phnom Penh local time ({APP_TIMEZONE_ALIAS}, {APP_TIMEZONE_UTC_LABEL}). Daily schedules send every day at the selected local time and automatically move to tomorrow after delivery.</p>
+      <form method='post' action='/admin/schedules/action'>
+        <input type='hidden' name='csrf_token' value='{csrf}'>{return_input}<input type='hidden' name='action' value='create'>
+        <div class='row'>
+          <div class='field'><label>Broadcast Phnom Penh time</label><input type='datetime-local' name='broadcast_at' value='{now_plus}' required><div class='help'>The first run must be in the future.</div></div>
+          <div class='field'><label>Repeat</label><select name='recurrence'>{recurrence_options}</select><div class='help'>Choose Daily for an every-morning or every-day broadcast.</div></div>
+          <div class='field'><label>Mode</label><select name='confirmed'><option value='0'>Preview first</option><option value='1'>Confirm immediately</option></select></div>
+        </div>
+        <div class='field'><label>Format mode</label><select name='parse_mode'>{parse_options}</select><div class='help'>Supports Telegram HTML, MarkdownV2, Markdown links such as <code>[Open site](https://example.com)</code>, and plain text. First-line directives also work: <code>::html</code>, <code>::mdv2</code>, <code>::md</code>, <code>::plain</code>.</div></div>
+        <div class='field'><label><input type='checkbox' name='link_preview' value='1' checked> Show URL link preview</label><div class='help'>Enabled by default; use <code>::nopreview</code> in Telegram composer text to disable it.</div></div>
+        <div class='field'><label>Text message <span><span data-count-target='#schedule-text'>0</span>/{TELE_MSG_LIMIT}</span></label><textarea id='schedule-text' name='text' maxlength='{TELE_MSG_LIMIT}' placeholder='Required for text-only schedule; used as photo caption when caption is empty'></textarea></div>
+        <div class='row'><div class='field'><label>Telegram photo_file_id optional</label><input name='photo_file_id'></div><div class='field'><label>Photo caption optional</label><input name='caption' maxlength='1024'></div></div>
+        <button>Create Schedule</button>
+      </form>
+    </div>
     <div class='card'><div class='actions' style='justify-content:space-between'><h2>Schedules</h2><span class='muted'>{len(rows)} shown</span></div><div class='table-wrap'><table class='table'><thead><tr><th>ID</th><th>Status</th><th>Time</th><th>Content</th><th>Actions</th></tr></thead><tbody>{table_rows}</tbody></table></div></div>
     """
     return _web_render("Schedules", body, active="schedules")
@@ -7491,6 +7527,7 @@ def web_admin_schedules_action():
                     str(request.form.get("confirmed") or "0") == "1",
                     request.form.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO,
                     str(request.form.get("link_preview") or "") == "1",
+                    request.form.get("recurrence") or SCHED_RECURRENCE_ONCE,
                 )
         elif not row_id:
             ok, msg = False, "Missing schedule ID."
@@ -7511,6 +7548,13 @@ def web_admin_schedules_action():
             else:
                 ok, reason, _row = db_sched_update_time(row_id, _web_current_admin_id(), dt)
                 msg = "time updated" if ok else f"time not updated: {reason}"
+        elif action == "edit_recurrence":
+            ok, reason, _row = db_sched_update_recurrence(
+                row_id,
+                _web_current_admin_id(),
+                request.form.get("recurrence") or SCHED_RECURRENCE_ONCE,
+            )
+            msg = "repeat setting updated" if ok else f"repeat setting not updated: {reason}"
         elif action == "edit_text":
             edit_text = _broadcast_apply_option_directives(
                 request.form.get("text") or "",
@@ -15654,8 +15698,14 @@ SCHED_STATUS_DONE      = "done"
 SCHED_STATUS_FAILED    = "failed"
 SCHED_STATUS_CANCELLED = "cancelled"
 SCHED_DRAFT_MARKER     = "__awaiting_admin_confirmation__"
+SCHED_RECURRENCE_ONCE  = "once"
+SCHED_RECURRENCE_DAILY = "daily"
 
 _SCHED_CLAIM_RE = re.compile(r"sending_started_at=([^\s]+)")
+_SCHED_RECURRENCE_RE = re.compile(
+    r"^\s*::(?:schedule[_ -]?)?(?P<value>daily|everyday|once)\s*(?:\r?\n|$)",
+    re.IGNORECASE,
+)
 
 
 def _sched_to_utc(dt: datetime) -> datetime:
@@ -15692,6 +15742,63 @@ def _sched_claim_time(row: dict) -> datetime | None:
     # Backward-compatible fallback for old rows that were already in "sending"
     # before this fix. Do not use this for newly claimed rows.
     return _sched_parse_iso(row.get("broadcast_at"))
+
+
+def _sched_normalize_recurrence(value: Any, default: str = SCHED_RECURRENCE_ONCE) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {"daily", "everyday", "every_day", "every_morning"}:
+        return SCHED_RECURRENCE_DAILY
+    if normalized in {"once", "one_time", "single", "never"}:
+        return SCHED_RECURRENCE_ONCE
+    return SCHED_RECURRENCE_DAILY if str(default).lower() == SCHED_RECURRENCE_DAILY else SCHED_RECURRENCE_ONCE
+
+
+def _sched_strip_recurrence_directive(
+    text: str | None,
+    default: str = SCHED_RECURRENCE_ONCE,
+) -> tuple[str, str]:
+    raw = str(text or "")
+    recurrence = _sched_normalize_recurrence(default)
+    match = _SCHED_RECURRENCE_RE.match(raw)
+    if match:
+        recurrence = _sched_normalize_recurrence(match.group("value"), recurrence)
+        raw = raw[match.end():]
+    return raw, recurrence
+
+
+def _sched_apply_recurrence_directive(text: str | None, recurrence: str | None) -> str:
+    clean, embedded = _sched_strip_recurrence_directive(text, recurrence or SCHED_RECURRENCE_ONCE)
+    if embedded == SCHED_RECURRENCE_DAILY:
+        return f"::schedule_daily\n{clean.strip()}".rstrip()
+    return clean.strip()
+
+
+def _sched_row_content(row: dict | None) -> str:
+    if not row:
+        return ""
+    value = row.get("caption") if row.get("photo_file_id") else row.get("plain_text")
+    return str(value or "")
+
+
+def _sched_row_recurrence(row: dict | None) -> str:
+    _clean, recurrence = _sched_strip_recurrence_directive(_sched_row_content(row))
+    return recurrence
+
+
+def _sched_recurrence_label(value: Any) -> str:
+    return "Daily" if _sched_normalize_recurrence(value) == SCHED_RECURRENCE_DAILY else "One time"
+
+
+def _sched_next_daily_at(scheduled_at: datetime, now: datetime | None = None) -> datetime:
+    """Return the next future run at the same local wall-clock time."""
+    scheduled_local = _to_local_time(_sched_to_utc(scheduled_at))
+    now_local = _to_local_time(_sched_to_utc(now or datetime.now(timezone.utc)))
+    next_date = scheduled_local.date() + timedelta(days=1)
+    candidate = datetime.combine(next_date, scheduled_local.timetz().replace(tzinfo=None), tzinfo=APP_TIMEZONE)
+    while candidate <= now_local:
+        next_date += timedelta(days=1)
+        candidate = datetime.combine(next_date, scheduled_local.timetz().replace(tzinfo=None), tzinfo=APP_TIMEZONE)
+    return candidate.astimezone(timezone.utc)
 
 
 def _sched_is_draft(row: dict | None) -> bool:
@@ -15750,12 +15857,18 @@ def db_sched_insert(payload: dict, admin_id: int, broadcast_at: datetime) -> dic
 
     parse_mode = _broadcast_normalize_parse_mode(payload.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO)
     link_preview = _broadcast_normalize_link_preview(payload.get("link_preview"), True)
+    recurrence = _sched_normalize_recurrence(payload.get("recurrence"))
     caption = payload.get("caption")
     plain_text = payload.get("text")
     if payload.get("photo_file_id"):
-        caption = _broadcast_apply_option_directives(caption, parse_mode, link_preview) if caption else caption
-    elif plain_text:
-        plain_text = _broadcast_apply_option_directives(plain_text, parse_mode, link_preview)
+        caption, recurrence = _sched_strip_recurrence_directive(caption, recurrence)
+        caption = _broadcast_apply_option_directives(caption, parse_mode, link_preview) if caption else ""
+        caption = _sched_apply_recurrence_directive(caption, recurrence)
+    else:
+        plain_text, recurrence = _sched_strip_recurrence_directive(plain_text, recurrence)
+        if plain_text:
+            plain_text = _broadcast_apply_option_directives(plain_text, parse_mode, link_preview)
+        plain_text = _sched_apply_recurrence_directive(plain_text, recurrence)
 
     row = {
         "admin_id":      int(admin_id),
@@ -15942,7 +16055,7 @@ def db_sched_mark_stale_sending_failed() -> int:
         "sched_fetch_sending_for_stale_check",
         lambda: (
             supabase.table("scheduled_broadcasts")
-            .select("id, broadcast_at, error_msg, status")
+            .select("id, admin_id, photo_file_id, caption, plain_text, broadcast_at, error_msg, status")
             .eq("status", SCHED_STATUS_SENDING)
             .limit(100)
             .execute()
@@ -15952,11 +16065,31 @@ def db_sched_mark_stale_sending_failed() -> int:
     for row in list(getattr(sending_res, "data", None) or []):
         started_at = _sched_claim_time(row)
         if started_at and started_at.timestamp() <= cutoff:
-            db_sched_set_status(
-                int(row["id"]),
-                SCHED_STATUS_FAILED,
-                error_msg=f"Marked failed: stuck in sending for more than {_SCHED_SENDING_STALE_SECONDS}s",
-            )
+            scheduled_at = _sched_parse_iso(row.get("broadcast_at"))
+            if _sched_row_recurrence(row) == SCHED_RECURRENCE_DAILY and scheduled_at:
+                try:
+                    db_sched_reschedule_daily(
+                        int(row["id"]),
+                        int(row.get("admin_id") or 0),
+                        scheduled_at,
+                        failed_count=1,
+                    )
+                    logger.warning(
+                        "Recovered stale daily schedule #%s by advancing it to the next run.",
+                        row.get("id"),
+                    )
+                except Exception:
+                    db_sched_set_status(
+                        int(row["id"]),
+                        SCHED_STATUS_FAILED,
+                        error_msg=f"Marked failed: stuck in sending for more than {_SCHED_SENDING_STALE_SECONDS}s",
+                    )
+            else:
+                db_sched_set_status(
+                    int(row["id"]),
+                    SCHED_STATUS_FAILED,
+                    error_msg=f"Marked failed: stuck in sending for more than {_SCHED_SENDING_STALE_SECONDS}s",
+                )
             changed += 1
 
     # Draft rows are previews that were never confirmed. They must never fire.
@@ -16082,6 +16215,8 @@ def db_sched_update_text(row_id: int, admin_id: int, text: str) -> tuple[bool, s
     ok, reason = _sched_can_edit(row, admin_id)
     if not ok:
         return False, reason, row
+    recurrence = _sched_row_recurrence(row)
+    text, recurrence = _sched_strip_recurrence_directive(text, recurrence)
     max_chars = 1024 if bool(row.get("photo_file_id")) else TELE_MSG_LIMIT
     try:
         prepared_text, _mode, _link_preview = _broadcast_prepare_text(
@@ -16095,6 +16230,7 @@ def db_sched_update_text(row_id: int, admin_id: int, text: str) -> tuple[bool, s
         return False, "empty_text", row
 
     has_photo = bool(row.get("photo_file_id"))
+    text = _sched_apply_recurrence_directive(text, recurrence)
 
     update = {"caption": text, "plain_text": None} if has_photo else {"plain_text": text, "caption": None}
     res = db_call_sync(
@@ -16122,6 +16258,8 @@ def db_sched_update_photo(row_id: int, admin_id: int, photo_file_id: str, captio
         return False, reason, row
     if not photo_file_id:
         return False, "empty_photo", row
+    recurrence = _sched_row_recurrence(row)
+    caption, recurrence = _sched_strip_recurrence_directive(caption, recurrence)
     try:
         _prepared_caption, _mode, _link_preview = _broadcast_prepare_text(
             caption,
@@ -16130,6 +16268,7 @@ def db_sched_update_photo(row_id: int, admin_id: int, photo_file_id: str, captio
         )
     except ValueError:
         return False, "caption_too_long", row
+    caption = _sched_apply_recurrence_directive(caption, recurrence)
 
     res = db_call_sync(
         f"sched_update_photo:{row_id}",
@@ -16145,6 +16284,78 @@ def db_sched_update_photo(row_id: int, admin_id: int, photo_file_id: str, captio
     )
     saved = (getattr(res, "data", None) or [None])[0]
     return (True, "updated", saved) if saved else (False, "race_lost", db_sched_fetch_one(row_id))
+
+
+def db_sched_update_recurrence(
+    row_id: int,
+    admin_id: int,
+    recurrence: str,
+) -> tuple[bool, str, dict | None]:
+    row = db_sched_fetch_one(row_id)
+    ok, reason = _sched_can_edit(row, admin_id)
+    if not ok:
+        return False, reason, row
+    recurrence = _sched_normalize_recurrence(recurrence)
+    content, _old_recurrence = _sched_strip_recurrence_directive(_sched_row_content(row))
+    stored_content = _sched_apply_recurrence_directive(content, recurrence)
+    update = {"caption": stored_content} if row.get("photo_file_id") else {"plain_text": stored_content}
+    res = db_call_sync(
+        f"sched_update_recurrence:{row_id}",
+        lambda: (
+            supabase.table("scheduled_broadcasts")
+            .update(update)
+            .eq("id", int(row_id))
+            .eq("admin_id", int(admin_id))
+            .eq("status", SCHED_STATUS_PENDING)
+            .execute()
+        ),
+        default=None,
+    )
+    saved = (getattr(res, "data", None) or [None])[0]
+    if saved:
+        _sched_admin_pending_cache_clear(admin_id)
+        return True, "updated", saved
+    return False, "race_lost", db_sched_fetch_one(row_id)
+
+
+def db_sched_reschedule_daily(
+    row_id: int,
+    admin_id: int,
+    scheduled_at: datetime,
+    *,
+    sent_count: int = 0,
+    failed_count: int = 0,
+    blocked_count: int = 0,
+) -> datetime:
+    """Atomically return a completed daily schedule to pending for its next run."""
+    if not supabase:
+        raise RuntimeError("Supabase not configured.")
+    next_at = _sched_next_daily_at(scheduled_at)
+    update = {
+        "broadcast_at": _sched_iso(next_at),
+        "status": SCHED_STATUS_PENDING,
+        "error_msg": None,
+        "sent_count": int(sent_count),
+        "failed_count": int(failed_count),
+        "blocked_count": int(blocked_count),
+    }
+    res = db_call_sync(
+        f"sched_reschedule_daily:{row_id}",
+        lambda: (
+            supabase.table("scheduled_broadcasts")
+            .update(update)
+            .eq("id", int(row_id))
+            .eq("admin_id", int(admin_id))
+            .eq("status", SCHED_STATUS_SENDING)
+            .execute()
+        ),
+        default=None,
+        critical=True,
+    )
+    if not getattr(res, "data", None):
+        raise RuntimeError(f"Daily schedule #{row_id} could not advance to its next run.")
+    _sched_admin_pending_cache_clear(admin_id)
+    return next_at
 
 
 # ---------------------------------------------------------------------------
@@ -16180,6 +16391,41 @@ def _parse_dt(text: str) -> datetime | None:
         return None
 
 
+_SCHED_DAILY_INPUT_RE = re.compile(
+    r"^\s*(?:daily|every\s*day|everyday|every\s+morning|morning)\s+(?P<time>.+?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_daily_schedule_time(text: str, now: datetime | None = None) -> datetime | None:
+    match = _SCHED_DAILY_INPUT_RE.match(str(text or ""))
+    if not match:
+        return None
+    raw_time = re.sub(r"\s+", " ", match.group("time").strip()).upper()
+    parsed_time = None
+    for fmt in ("%H:%M", "%H:%M:%S", "%H", "%I:%M %p", "%I %p"):
+        try:
+            parsed_time = datetime.strptime(raw_time, fmt).time()
+            break
+        except ValueError:
+            continue
+    if parsed_time is None:
+        return None
+
+    now_local = _to_local_time(_sched_to_utc(now or datetime.now(timezone.utc)))
+    candidate = datetime.combine(now_local.date(), parsed_time, tzinfo=APP_TIMEZONE)
+    if candidate <= now_local:
+        candidate = datetime.combine(now_local.date() + timedelta(days=1), parsed_time, tzinfo=APP_TIMEZONE)
+    return candidate.astimezone(timezone.utc)
+
+
+def _parse_schedule_request(text: str, now: datetime | None = None) -> tuple[datetime | None, str]:
+    raw = str(text or "").strip()
+    if _SCHED_DAILY_INPUT_RE.match(raw):
+        return _parse_daily_schedule_time(raw, now), SCHED_RECURRENCE_DAILY
+    return _parse_dt(raw), SCHED_RECURRENCE_ONCE
+
+
 def _fmt_dt(dt: datetime) -> str:
     return _fmt_local_dt(dt)
 
@@ -16196,6 +16442,8 @@ def get_sched_confirm_kb(row_id: int) -> InlineKeyboardMarkup:
          InlineKeyboardButton("❌ បោះបង់",           callback_data=f"sched_no:{row_id}")],
         [InlineKeyboardButton("✏️ Edit Time", callback_data=f"sched_edit_time:{row_id}"),
          InlineKeyboardButton("📝 Edit Text", callback_data=f"sched_edit_text:{row_id}")],
+        [InlineKeyboardButton("1️⃣ One time", callback_data=f"sched_repeat_once:{row_id}"),
+         InlineKeyboardButton("🔁 Daily", callback_data=f"sched_repeat_daily:{row_id}")],
         [InlineKeyboardButton("🖼 Replace Photo", callback_data=f"sched_edit_photo:{row_id}")],
     ])
 
@@ -16210,11 +16458,15 @@ def get_sched_detail_kb(row: dict) -> InlineKeyboardMarkup:
             InlineKeyboardButton("❌ Cancel", callback_data=f"sched_no:{row_id}"),
         ])
     if editable:
+        recurrence = _sched_row_recurrence(row)
+        next_recurrence = SCHED_RECURRENCE_ONCE if recurrence == SCHED_RECURRENCE_DAILY else SCHED_RECURRENCE_DAILY
+        repeat_label = "1️⃣ Change to one time" if next_recurrence == SCHED_RECURRENCE_ONCE else "🔁 Change to daily"
         rows.extend([
             [InlineKeyboardButton("✏️ Edit Time", callback_data=f"sched_edit_time:{row_id}"),
              InlineKeyboardButton("📝 Edit Text", callback_data=f"sched_edit_text:{row_id}")],
             [InlineKeyboardButton("🖼 Replace Photo", callback_data=f"sched_edit_photo:{row_id}"),
              InlineKeyboardButton("🗑️ Cancel Schedule", callback_data=f"sched_cancel_confirm:{row_id}")],
+            [InlineKeyboardButton(repeat_label, callback_data=f"sched_repeat_{next_recurrence}:{row_id}")],
         ])
     rows.append([InlineKeyboardButton("⬅️ Schedules", callback_data="admin_schedules"),
                  InlineKeyboardButton("❌ បិទ", callback_data="sched_close")])
@@ -16614,7 +16866,8 @@ def _sched_content_preview(row: dict, limit: int = 500) -> str:
         base = row.get("caption") or "(photo, no caption)"
     else:
         base = row.get("plain_text") or "(empty)"
-    base, mode = _broadcast_strip_format_directive(str(base), _BROADCAST_PARSE_MODE_AUTO)
+    base, _recurrence = _sched_strip_recurrence_directive(str(base))
+    base, mode = _broadcast_strip_format_directive(base, _BROADCAST_PARSE_MODE_AUTO)
     base = str(base).strip()
     if len(base) > limit:
         base = base[:limit] + "…"
@@ -16632,6 +16885,10 @@ def _sched_detail_text(row: dict) -> str:
     media = "Photo + caption" if row.get("photo_file_id") else "Text"
     status = _sched_status_label(row)
     content = html.escape(_sched_content_preview(row))
+    content = (
+        f"Repeat: <b>{html.escape(_sched_recurrence_label(_sched_row_recurrence(row)))}</b>\n\n"
+        f"{content}"
+    )
     return (
         f"📋 <b>Schedule #{int(row.get('id') or 0)}</b>\n"
         f"⏰ {html.escape(dt_str)}\n"
@@ -24247,6 +24504,11 @@ async def _handle_sched_content(update: Update, context: ContextTypes.DEFAULT_TY
         '🕐 <b>ពេលវេលាផ្សាយសារ — ម៉ោងភ្នំពេញ</b>\n\nសូមវាយកាលបរិច្ឆេទ និងម៉ោង។\nទម្រង់៖ <code>YYYY-MM-DD HH:MM AM/PM</code> ឬ <code>YYYY-MM-DD HH:MM</code>\nតំបន់ម៉ោង៖ ភ្នំពេញ កម្ពុជា — ICT (UTC+7)\nឧទាហរណ៍៖ <code>2025-12-25 09:00 AM</code> ឬ <code>2025-12-25 21:00</code>',
         parse_mode="HTML",
     ))
+    await safe_send(lambda: msg.reply_text(
+        "🔁 <b>Daily repeat:</b> send <code>daily 08:00</code> or "
+        "<code>every morning 8 AM</code>. The first run uses the next matching Phnom Penh time.",
+        parse_mode="HTML",
+    ))
     return True
 
 
@@ -24262,7 +24524,7 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
         await safe_send(lambda: msg.reply_text('⚠️ សូមផ្ញើពេលវេលាជាអត្ថបទ តាមម៉ោងភ្នំពេញ (ICT, UTC+7)។'))
         return True
 
-    broadcast_at = _parse_dt(msg.text)
+    broadcast_at, recurrence = _parse_schedule_request(msg.text)
     if broadcast_at is None:
         await safe_send(lambda: msg.reply_text(
             '❌ ទម្រង់ពេលវេលាមិនត្រឹមត្រូវ។\nឧទាហរណ៍ត្រឹមត្រូវ៖ <code>2025-12-25 09:00 AM</code> ឬ <code>2025-12-25 21:00</code>',
@@ -24289,6 +24551,8 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
         ))
         return True
 
+    payload["recurrence"] = recurrence
+
     loop = asyncio.get_running_loop()
     try:
         row = await loop.run_in_executor(None, db_sched_insert, payload, user_id, broadcast_at)
@@ -24314,6 +24578,7 @@ async def _handle_sched_datetime(update: Update, context: ContextTypes.DEFAULT_T
     )
     mode_line = f"Format: <b>{html.escape(_broadcast_parse_mode_label(preview_mode))}</b>\n"
     preview_line = f"URL preview: <b>{'ON' if preview_link_preview else 'OFF'}</b>\n"
+    preview_line += f"Repeat: <b>{html.escape(_sched_recurrence_label(recurrence))}</b>\n"
 
     # Keep schedule details in a safe HTML message and render the actual
     # broadcast content separately with its selected Telegram parse mode.
@@ -24784,6 +25049,38 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     loop = asyncio.get_running_loop()
 
+    if data.startswith(("sched_repeat_once:", "sched_repeat_daily:")):
+        recurrence = (
+            SCHED_RECURRENCE_DAILY
+            if data.startswith("sched_repeat_daily:")
+            else SCHED_RECURRENCE_ONCE
+        )
+        try:
+            row_id = int(data.rsplit(":", 1)[1])
+        except (TypeError, ValueError, IndexError):
+            await safe_send(lambda: query.message.reply_text("❌ Invalid schedule ID."))
+            return
+        ok, reason, saved = await loop.run_in_executor(
+            None,
+            db_sched_update_recurrence,
+            row_id,
+            user_id,
+            recurrence,
+        )
+        if not ok:
+            await safe_send(lambda: query.message.reply_text(
+                _sched_edit_error_text(row_id, reason),
+                parse_mode="HTML",
+            ))
+            return
+        await safe_send(lambda: query.message.reply_text(
+            f"🔁 Schedule <b>#{row_id}</b> repeat changed to "
+            f"<b>{html.escape(_sched_recurrence_label(_sched_row_recurrence(saved)))}</b>.",
+            parse_mode="HTML",
+            reply_markup=get_sched_detail_kb(saved or {}),
+        ))
+        return
+
     if data.startswith("sched_ok:"):
         row_id = _callback_int_arg(data, "sched_ok:")
         if row_id is None:
@@ -24813,7 +25110,9 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.edit_reply_markup(reply_markup=None)
         status_note = "បានបញ្ជាក់រួចហើយ" if reason == "already_confirmed" else "បានបញ្ជាក់"
         await safe_send(lambda: query.message.reply_text(
-            f'✅ <b>កាលវិភាគ #{row_id} {status_note}!</b>\n⏰ នឹងផ្សាយសារនៅ {dt_str}',
+            f'✅ <b>កាលវិភាគ #{row_id} {status_note}!</b>\n'
+            f'⏰ នឹងផ្សាយសារនៅ {dt_str}\n'
+            f'🔁 Repeat: <b>{html.escape(_sched_recurrence_label(_sched_row_recurrence(row)))}</b>',
             parse_mode="HTML",
         ))
         return
@@ -25229,10 +25528,12 @@ async def _fire_scheduled_broadcast(bot, row: dict, already_claimed: bool = Fals
 
     sent = failed = blocked = 0
     try:
+        stored_content = _sched_row_content(row)
+        clean_content, recurrence = _sched_strip_recurrence_directive(stored_content)
         pending = {
             "photo_file_id": row.get("photo_file_id"),
-            "caption": row.get("caption") or "",
-            "text": row.get("plain_text") or "",
+            "caption": clean_content if row.get("photo_file_id") else "",
+            "text": "" if row.get("photo_file_id") else clean_content,
         }
         if not pending["photo_file_id"] and not pending["text"]:
             raise RuntimeError("Scheduled broadcast has no photo and no text.")
@@ -25240,19 +25541,45 @@ async def _fire_scheduled_broadcast(bot, row: dict, already_claimed: bool = Fals
         sent, failed, blocked = await _run_broadcast_to_all(
             bot, admin_id, pending, label=f"កាលវិភាគ #{row_id}"
         )
-        await loop.run_in_executor(
-            None,
-            functools.partial(
-                db_sched_set_status,
-                row_id,
-                SCHED_STATUS_DONE,
-                critical=True,
-                sent_count=sent,
-                failed_count=failed,
-                blocked_count=blocked,
-                error_msg=None,
-            ),
-        )
+        if recurrence == SCHED_RECURRENCE_DAILY:
+            scheduled_at = _sched_parse_iso(row.get("broadcast_at"))
+            if not scheduled_at:
+                raise RuntimeError("Daily schedule has an invalid broadcast_at value.")
+            next_at = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    db_sched_reschedule_daily,
+                    row_id,
+                    admin_id,
+                    scheduled_at,
+                    sent_count=sent,
+                    failed_count=failed,
+                    blocked_count=blocked,
+                ),
+            )
+            await safe_send(lambda: bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    f"🔁 <b>Daily schedule #{row_id} is ready for tomorrow.</b>\n"
+                    f"Next send: <b>{html.escape(_fmt_dt(next_at))}</b>"
+                ),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            ))
+        else:
+            await loop.run_in_executor(
+                None,
+                functools.partial(
+                    db_sched_set_status,
+                    row_id,
+                    SCHED_STATUS_DONE,
+                    critical=True,
+                    sent_count=sent,
+                    failed_count=failed,
+                    blocked_count=blocked,
+                    error_msg=None,
+                ),
+            )
     except Exception as e:
         logger.error(f"Scheduled broadcast #{row_id} failed: {e}", exc_info=True)
         await loop.run_in_executor(
