@@ -217,3 +217,9 @@ Only clone a voice you own or have permission to use.
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+## Runtime reliability update
+
+See [`UPDATE_NOTES.md`](UPDATE_NOTES.md) for the durable worker lifecycle,
+provider timeout consistency, unified `RuntimeContext`, queue backpressure,
+admin operations UI, and staged migration instructions.

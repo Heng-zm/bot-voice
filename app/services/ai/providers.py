@@ -1,12 +1,25 @@
-"""Unified health-aware routing for AI and speech providers."""
+"""Health-aware routing for AI and speech providers.
+
+Provider health is intentionally process-local.  The administrative API exposes
+``scope=process`` and an instance identifier so a multi-instance deployment does
+not accidentally present one worker's circuit-breaker state as cluster-wide.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import inspect
+import os
+import socket
 import threading
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Iterable
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+)
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
@@ -16,6 +29,14 @@ ProviderOperation = Callable[[str], T | Awaitable[T]]
 
 class ProviderManagerError(RuntimeError):
     """Base provider routing error."""
+
+
+class ProviderTimeout(ProviderManagerError):
+    """Raised when a synchronous provider exceeds its configured timeout."""
+
+
+class ProviderBusy(ProviderManagerError):
+    """Raised when the bounded synchronous provider executor is saturated."""
 
 
 class NoProviderAvailable(ProviderManagerError):
@@ -60,12 +81,47 @@ class _ProviderEntry:
     state: ProviderState = field(default_factory=ProviderState)
 
 
-class ProviderManager:
-    """Route capabilities using priority, circuit breakers, and health."""
+def _default_instance_id() -> str:
+    configured = str(os.getenv("INSTANCE_ID") or os.getenv("RENDER_INSTANCE_ID") or "").strip()
+    if configured:
+        return configured[:128]
+    return f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
-    def __init__(self) -> None:
+
+class ProviderManager:
+    """Route capabilities using priority, timeouts, circuit breakers, and health.
+
+    Async calls are bounded with :func:`asyncio.wait_for`.  Synchronous calls
+    run in a bounded executor and use ``Future.result(timeout=...)``.  Python
+    cannot forcibly terminate a thread already executing foreign SDK code, so a
+    timed-out call may finish in the background; the bounded in-flight semaphore
+    prevents those calls from growing without limit.
+    """
+
+    def __init__(
+        self,
+        *,
+        sync_max_workers: int = 4,
+        sync_max_inflight: int | None = None,
+        instance_id: str = "",
+    ) -> None:
+        workers = max(1, min(32, int(sync_max_workers)))
+        inflight = (
+            max(workers, min(128, int(sync_max_inflight)))
+            if sync_max_inflight is not None
+            else workers * 2
+        )
         self._providers: dict[str, _ProviderEntry] = {}
         self._lock = threading.RLock()
+        self._sync_executor = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="provider-sync",
+        )
+        self._sync_slots = threading.BoundedSemaphore(inflight)
+        self._sync_max_workers = workers
+        self._sync_max_inflight = inflight
+        self._closed = False
+        self.instance_id = str(instance_id or _default_instance_id())[:128]
 
     @staticmethod
     def _name(value: str) -> str:
@@ -224,6 +280,7 @@ class ProviderManager:
                 timeout = entry.policy.timeout_seconds
             started = time.perf_counter()
             try:
+
                 async def invoke(selected: str = provider_name) -> T:
                     if inspect.iscoroutinefunction(operation):
                         return await operation(selected)
@@ -243,6 +300,28 @@ class ProviderManager:
                 errors[provider_name] = f"{type(exc).__name__}: {exc}"[:500]
         raise NoProviderAvailable(self._capability(capability), errors)
 
+    def _submit_sync(
+        self,
+        operation: Callable[[str], T],
+        provider_name: str,
+        timeout: float,
+    ) -> Future[T]:
+        with self._lock:
+            if self._closed:
+                raise ProviderManagerError("Provider manager is closed.")
+        acquired = self._sync_slots.acquire(timeout=min(1.0, timeout))
+        if not acquired:
+            raise ProviderBusy(
+                "The bounded synchronous provider executor is saturated."
+            )
+        try:
+            future = self._sync_executor.submit(operation, provider_name)
+        except BaseException:
+            self._sync_slots.release()
+            raise
+        future.add_done_callback(lambda _future: self._sync_slots.release())
+        return future
+
     def execute_sync(
         self,
         capability: str,
@@ -250,13 +329,17 @@ class ProviderManager:
         *,
         preferred: Iterable[str] = (),
     ) -> tuple[T, str]:
-        """Synchronous routing for operations already running in worker threads."""
+        """Run synchronous providers with the same policy timeout as async calls."""
 
         errors: dict[str, str] = {}
         for provider_name in self.ordered(capability, preferred=preferred):
+            with self._lock:
+                timeout = self._providers[provider_name].policy.timeout_seconds
             started = time.perf_counter()
+            future: Future[T] | None = None
             try:
-                result = operation(provider_name)
+                future = self._submit_sync(operation, provider_name, timeout)
+                result = future.result(timeout=timeout)
                 if inspect.isawaitable(result):
                     close = getattr(result, "close", None)
                     if callable(close):
@@ -267,6 +350,14 @@ class ProviderManager:
                 latency_ms = (time.perf_counter() - started) * 1_000
                 self.record_success(provider_name, latency_ms)
                 return result, provider_name
+            except FutureTimeoutError as exc:
+                if future is not None:
+                    future.cancel()
+                error = ProviderTimeout(
+                    f"Provider {provider_name!r} timed out after {timeout:g} seconds."
+                )
+                self.record_failure(provider_name, error)
+                errors[provider_name] = f"ProviderTimeout: {error}"[:500]
             except Exception as exc:  # noqa: BLE001 - provider boundary
                 self.record_failure(provider_name, exc)
                 errors[provider_name] = f"{type(exc).__name__}: {exc}"[:500]
@@ -277,6 +368,8 @@ class ProviderManager:
         with self._lock:
             return {
                 name: {
+                    "scope": "process",
+                    "instance_id": self.instance_id,
                     "capabilities": sorted(entry.policy.capabilities),
                     "priority": entry.policy.priority,
                     "failure_threshold": entry.policy.failure_threshold,
@@ -308,8 +401,26 @@ class ProviderManager:
                 for name, entry in sorted(self._providers.items())
             }
 
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "scope": "process",
+            "instance_id": self.instance_id,
+            "sync_max_workers": self._sync_max_workers,
+            "sync_max_inflight": self._sync_max_inflight,
+        }
 
-_PROVIDER_MANAGER = ProviderManager()
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._sync_executor.shutdown(wait=False, cancel_futures=True)
+
+
+_PROVIDER_MANAGER = ProviderManager(
+    sync_max_workers=int(os.getenv("PROVIDER_SYNC_MAX_WORKERS", "4") or 4),
+    sync_max_inflight=int(os.getenv("PROVIDER_SYNC_MAX_INFLIGHT", "8") or 8),
+)
 
 
 def configure_default_providers() -> ProviderManager:
@@ -340,10 +451,12 @@ configure_default_providers()
 
 __all__ = [
     "NoProviderAvailable",
+    "ProviderBusy",
     "ProviderManager",
     "ProviderManagerError",
     "ProviderPolicy",
     "ProviderState",
+    "ProviderTimeout",
     "configure_default_providers",
     "get_provider_manager",
 ]

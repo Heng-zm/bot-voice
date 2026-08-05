@@ -1,16 +1,17 @@
-"""Administrative visibility and controls for jobs and providers."""
+"""Administrative visibility and controls for jobs, workers, and providers."""
 
 from __future__ import annotations
 
-from typing import Annotated
+import asyncio
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.dependencies import AdminPrincipal, require_admin, require_admin_write
 from app.services.ai.providers import get_provider_manager
 from app.services.jobs.queue import JobNotFound, JobQueueError
-from app.services.jobs.runtime import get_job_queue
+from app.services.jobs.runtime import get_job_queue, job_worker_snapshot
 
 router = APIRouter(prefix="/api/admin/runtime", tags=["admin-runtime"])
 
@@ -19,6 +20,12 @@ class ProviderResetPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     provider: str = Field(min_length=1, max_length=64)
+
+
+class JobRetrySelectedPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_ids: list[str] = Field(min_length=1, max_length=100)
 
 
 def _safe_job(job) -> dict:
@@ -46,8 +53,14 @@ async def provider_health(
     principal: Annotated[AdminPrincipal, Depends(require_admin)],
 ) -> dict:
     del principal
-    providers = get_provider_manager().snapshot()
-    return {"ok": True, "providers": providers, "count": len(providers)}
+    manager = get_provider_manager()
+    providers = manager.snapshot()
+    return {
+        "ok": True,
+        "providers": providers,
+        "count": len(providers),
+        **manager.metadata(),
+    }
 
 
 @router.post("/providers/reset")
@@ -63,7 +76,19 @@ async def reset_provider(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         ) from exc
-    return {"ok": True, "provider": payload.provider.strip().lower()}
+    return {
+        "ok": True,
+        "provider": payload.provider.strip().lower(),
+        **get_provider_manager().metadata(),
+    }
+
+
+@router.get("/workers")
+async def worker_health(
+    principal: Annotated[AdminPrincipal, Depends(require_admin)],
+) -> dict:
+    del principal
+    return {"ok": True, **job_worker_snapshot()}
 
 
 @router.get("/jobs")
@@ -78,7 +103,76 @@ async def job_stats(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
         ) from exc
-    return {"ok": True, "jobs": counts}
+    return {"ok": True, "jobs": counts, "workers": job_worker_snapshot()}
+
+
+@router.get("/jobs/list")
+async def job_list(
+    principal: Annotated[AdminPrincipal, Depends(require_admin)],
+    state: Annotated[
+        Literal["queued", "running", "dead"],
+        Query(),
+    ] = "dead",
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    cursor: Annotated[str, Query(max_length=32)] = "",
+) -> dict:
+    del principal
+    try:
+        jobs, next_cursor = await get_job_queue().list_jobs(
+            state=state,
+            limit=limit,
+            cursor=cursor,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    except JobQueueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+    return {
+        "ok": True,
+        "state": state,
+        "jobs": [_safe_job(job) for job in jobs],
+        "count": len(jobs),
+        "next_cursor": next_cursor,
+    }
+
+
+@router.post("/jobs/retry-selected")
+async def retry_selected_jobs(
+    payload: JobRetrySelectedPayload,
+    principal: Annotated[AdminPrincipal, Depends(require_admin_write)],
+) -> dict:
+    del principal
+    unique_ids = list(dict.fromkeys(job_id.strip() for job_id in payload.job_ids))
+    if any(not job_id or len(job_id) > 128 for job_id in unique_ids):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Every job ID must contain 1-128 characters.",
+        )
+
+    async def retry_one(job_id: str) -> tuple[str, str]:
+        try:
+            changed = await get_job_queue().retry(job_id)
+            return job_id, "queued" if changed else "unchanged"
+        except JobNotFound:
+            return job_id, "not_found"
+        except JobQueueError:
+            return job_id, "unavailable"
+
+    results = await asyncio.gather(*(retry_one(job_id) for job_id in unique_ids))
+    return {
+        "ok": True,
+        "results": [
+            {"job_id": job_id, "state": result_state}
+            for job_id, result_state in results
+        ],
+        "retried": sum(1 for _job_id, result_state in results if result_state == "queued"),
+    }
 
 
 @router.get("/jobs/{job_id}")
@@ -149,4 +243,8 @@ async def retry_job(
     return {"ok": True, "job_id": job_id, "state": "queued"}
 
 
-__all__ = ["ProviderResetPayload", "router"]
+__all__ = [
+    "JobRetrySelectedPayload",
+    "ProviderResetPayload",
+    "router",
+]

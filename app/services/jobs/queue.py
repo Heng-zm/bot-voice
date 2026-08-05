@@ -25,6 +25,9 @@ end
 if redis.call('EXISTS', KEYS[2]) == 1 then
   return {ARGV[1], 0}
 end
+if tonumber(ARGV[11]) > 0 and redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[11]) then
+  return {'', -1}
+end
 redis.call(
   'HSET', KEYS[2],
   'id', ARGV[1],
@@ -291,6 +294,10 @@ class JobNotFound(JobQueueError):
     """Raised when a requested job does not exist."""
 
 
+class QueueFull(JobQueueError):
+    """Raised when queue backpressure rejects a new job."""
+
+
 @dataclass(frozen=True, slots=True)
 class Job:
     id: str
@@ -339,6 +346,7 @@ class RedisJobQueue:
         retention_seconds: int = 86_400,
         max_payload_bytes: int = 1_048_576,
         max_result_bytes: int = 262_144,
+        max_queued_jobs: int = 1_000,
     ) -> None:
         if redis_client is None:
             raise JobQueueError("Redis is required for the durable job queue.")
@@ -354,6 +362,7 @@ class RedisJobQueue:
         self.retention_seconds = max(300, min(2_592_000, int(retention_seconds)))
         self.max_payload_bytes = max(1_024, int(max_payload_bytes))
         self.max_result_bytes = max(1_024, int(max_result_bytes))
+        self.max_queued_jobs = max(1, min(1_000_000, int(max_queued_jobs)))
 
     def _job_key(self, job_id: str) -> str:
         return f"{self.job_prefix}{job_id}"
@@ -439,12 +448,18 @@ class RedisJobQueue:
             str(max(0.1, min(86_400.0, float(timeout_seconds)))),
             "1" if use_idempotency else "0",
             str(max(60, min(2_592_000, int(idempotency_ttl_seconds)))),
+            str(self.max_queued_jobs),
         )
         values = list(raw or ())
         if len(values) != 2:
             raise JobQueueError("Redis returned an invalid enqueue result.")
         resolved_id = self._decode(values[0])
-        created = bool(int(values[1]))
+        status_code = int(values[1])
+        if status_code == -1:
+            raise QueueFull(
+                f"The durable job queue reached its {self.max_queued_jobs}-job limit."
+            )
+        created = bool(status_code)
         return await self.get(resolved_id), created
 
     async def claim(self, worker_id: str) -> Job | None:
@@ -622,16 +637,71 @@ class RedisJobQueue:
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise JobQueueError(f"Job {job_id!r} contains invalid Redis data.") from exc
 
+    async def list_jobs(
+        self,
+        *,
+        state: str = "dead",
+        limit: int = 50,
+        cursor: str = "",
+    ) -> tuple[list[Job], str | None]:
+        """Return one cursor page from queued, running, or dead indexes.
+
+        The cursor is an opaque decimal offset.  It is intentionally simple: the
+        admin surface is operational visibility, not a transactional export.
+        Missing/expired job hashes are skipped safely.
+        """
+
+        clean_state = str(state or "").strip().lower()
+        keys = {
+            "queued": self.ready_key,
+            "running": self.leased_key,
+            "dead": self.dead_key,
+        }
+        redis_key = keys.get(clean_state)
+        if redis_key is None:
+            raise ValueError("state must be queued, running, or dead.")
+        page_size = max(1, min(200, int(limit)))
+        try:
+            offset = max(0, int(str(cursor or "0")))
+        except ValueError as exc:
+            raise ValueError("Invalid job-list cursor.") from exc
+
+        raw_ids = await self._redis_call(
+            "zrevrange",
+            redis_key,
+            offset,
+            offset + page_size,
+        )
+        ids = [self._decode(value) for value in list(raw_ids or ())]
+        has_more = len(ids) > page_size
+        ids = ids[:page_size]
+        jobs: list[Job] = []
+        if ids:
+            results = await asyncio.gather(
+                *(self.get(job_id) for job_id in ids),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, Job):
+                    jobs.append(result)
+                elif not isinstance(result, JobNotFound):
+                    raise result
+        next_cursor = str(offset + page_size) if has_more else None
+        return jobs, next_cursor
+
     async def stats(self) -> dict[str, int]:
         ready, running, dead = await asyncio.gather(
             self._redis_call("zcard", self.ready_key),
             self._redis_call("zcard", self.leased_key),
             self._redis_call("zcard", self.dead_key),
         )
+        queued = int(ready or 0)
         return {
-            "queued": int(ready or 0),
+            "queued": queued,
             "running": int(running or 0),
             "dead": int(dead or 0),
+            "queue_limit": self.max_queued_jobs,
+            "queue_available": max(0, self.max_queued_jobs - queued),
         }
 
 
@@ -788,6 +858,7 @@ __all__ = [
     "JobHandler",
     "JobNotFound",
     "JobQueueError",
+    "QueueFull",
     "RedisJobQueue",
     "RedisJobWorker",
 ]

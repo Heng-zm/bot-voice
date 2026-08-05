@@ -174,11 +174,14 @@ class FakeRedis:
             timeout_seconds,
             use_idempotency,
             _idempotency_ttl,
+            max_queued_jobs,
         ) = args
         if use_idempotency == "1" and idempotency_key in self.strings:
             return [self.strings[idempotency_key], 0]
         if job_key in self.hashes:
             return [job_id, 0]
+        if len(self.zsets.get(ready_key, {})) >= int(max_queued_jobs):
+            return ["", -1]
         self.hashes[job_key] = {
             "id": job_id,
             "type": job_type,
