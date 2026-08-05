@@ -48,7 +48,7 @@ async def application_lifespan(application: FastAPI) -> AsyncIterator[dict | Non
 
     runtime = get_runtime_context()
     async with _original_lifespan_context(application) as lifespan_state:
-        await runtime.start(application, owner="asgi")
+        await runtime.start(application, owner="asgi", role="web")
         try:
             yield lifespan_state
         finally:
@@ -65,7 +65,9 @@ async def _runtime_ready_middleware(request: Request, call_next):
         and snapshot["redis"]
         and snapshot["security"]
         and snapshot["job_queue"]
-        and workers.get("healthy")
+        and snapshot["artifacts"].get("configured")
+        and snapshot["delivery"]
+        and (not snapshot["expects_workers"] or workers.get("healthy"))
     )
     return JSONResponse(
         {
@@ -75,10 +77,14 @@ async def _runtime_ready_middleware(request: Request, call_next):
             "runtime_started": snapshot["started"],
             "redis": snapshot["redis"],
             "job_queue": snapshot["job_queue"],
+            "role": snapshot.get("role"),
+            "artifact_storage": snapshot.get("artifacts"),
+            "delivery": snapshot.get("delivery"),
             "workers": {
                 "count": workers.get("count", 0),
                 "alive": workers.get("alive", 0),
                 "healthy": workers.get("healthy", False),
+                "accepting": workers.get("accepting", False),
             },
         },
         status_code=200 if ready else 503,
@@ -135,7 +141,7 @@ async def _combined_main_once() -> None:
     """Run web, Telegram, schedulers, and workers under one RuntimeContext."""
 
     runtime = get_runtime_context()
-    await runtime.start(app, owner="combined")
+    await runtime.start(app, owner="combined", role="combined")
 
     _legacy.logger.info(
         "Combined runtime starting provider=%s bot_mode=%s durable_workers=%s",

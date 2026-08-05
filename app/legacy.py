@@ -357,48 +357,12 @@ class _FastJSONResponse(StarletteResponse):
         return _json_dumps_fast(content)
 
 
-def _read_file_bytes_sync(path: str, *, max_bytes: int | None = None) -> bytes:
-    """Read a file with deterministic handle cleanup and an optional hard limit."""
-    limit = None if max_bytes is None else max(0, int(max_bytes))
-    with open(path, "rb") as handle:
-        if limit is None:
-            return handle.read()
-        data = handle.read(limit + 1)
-    if len(data) > limit:
-        raise ValueError(f"File too large. Max {limit} bytes.")
-    return data
-
-
-def _write_file_bytes_sync(path: str, data: bytes) -> None:
-    """Atomically replace a binary file using a temporary sibling file."""
-    if not path:
-        raise ValueError("Output path is required.")
-    payload = bytes(data or b"")
-    parent = os.path.dirname(os.path.abspath(path))
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    fd, temporary_path = tempfile.mkstemp(
-        prefix=f".{os.path.basename(path) or 'output'}.",
-        suffix=".tmp",
-        dir=parent or None,
-    )
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
-    except BaseException:
-        with suppress(OSError):
-            os.close(fd)
-        with suppress(OSError):
-            os.unlink(temporary_path)
-        raise
-
-
-async def _read_file_bytes_async(path: str, *, max_bytes: int | None = None) -> bytes:
-    """Move blocking disk reads off the event loop."""
-    return await asyncio.to_thread(_read_file_bytes_sync, path, max_bytes=max_bytes)
+# Extracted low-level file helpers. Keep imported names stable for legacy callers.
+from app.utils.file_io import (
+    _read_file_bytes_async,
+    _read_file_bytes_sync,
+    _write_file_bytes_sync,
+)
 
 
 # Load local .env before any environment-driven config is read.
@@ -2590,175 +2554,25 @@ def _normalise_ai_message(value: Any) -> tuple[str, str | None]:
     return message, None
 
 
-def _looks_like_japanese_han_phrase(text: str) -> bool:
-    """Small dependency-free hint for common Japanese-only Han phrases.
-
-    Han/Kanji-only CJK is inherently ambiguous, so this function is deliberately
-    conservative because words such as 東京 can be valid Chinese or Japanese.
-    """
-    compact = re.sub(r"\s+", "", str(text or ""))
-    if not compact:
-        return False
-    japanese_han_hints = ("日本語", "仮名", "片仮名", "平仮名")
-    return any(item in compact for item in japanese_han_hints)
-
-
-_DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
-_ARABIC_SCRIPT_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
-_LATIN_WORD_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ']+")
-
-# Malay and Indonesian share much of their vocabulary, and Filipino also uses
-# the Latin alphabet. These weighted markers intentionally require a strong
-# signal; short or ambiguous Latin text safely falls back to English.
-_LATIN_LANGUAGE_MARKERS: dict[str, dict[str, int]] = {
-    "id": {
-        "bahwa": 3, "karena": 2, "adalah": 2, "bisa": 2, "kalian": 2,
-        "nggak": 3, "tidak": 1, "saya": 1, "dari": 1, "kepada": 1,
-        "sedang": 1, "sudah": 1, "belum": 1, "juga": 1,
-    },
-    "ms": {
-        "bahawa": 3, "kerana": 2, "ialah": 3, "boleh": 2, "awak": 2,
-        "daripada": 2, "tak": 1, "tidak": 1, "saya": 1, "kepada": 1,
-        "sedang": 1, "sudah": 1, "belum": 1, "juga": 1,
-    },
-    "fil": {
-        "kumusta": 3, "salamat": 2, "mga": 3, "hindi": 2, "mayroon": 2,
-        "ngunit": 2, "ako": 1, "ikaw": 1, "natin": 1, "ninyo": 2,
-        "ito": 1, "iyon": 2, "opo": 3, "po": 1,
-    },
-}
-
-
-def _detect_latin_tts_language(text: str) -> str:
-    """Conservatively detect Indonesian, Malay, or Filipino Latin text."""
-    words = [word.lower() for word in _LATIN_WORD_RE.findall(str(text or ""))]
-    if not words:
-        return ""
-    scores = {
-        lang: sum(markers.get(word, 0) for word in words)
-        for lang, markers in _LATIN_LANGUAGE_MARKERS.items()
-    }
-    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-    best_lang, best_score = ranked[0]
-    second_score = ranked[1][1] if len(ranked) > 1 else 0
-    if best_score >= 3 and best_score - second_score >= 2:
-        return best_lang
-    return ""
-
-
-def _detect_lang(text: str) -> str:
-    """Detect the dominant writing system without accepting manual overrides."""
-    text = str(text or "")
-    khmer = sum(1 for c in text if "\u1780" <= c <= "\u17FF")
-    korean = sum(1 for c in text if "\u1100" <= c <= "\u11FF" or "\u3130" <= c <= "\u318F" or "\uAC00" <= c <= "\uD7AF")
-    japanese = sum(1 for c in text if "\u3040" <= c <= "\u30FF" or "\u31F0" <= c <= "\u31FF")
-    chinese = sum(1 for c in text if "\u3400" <= c <= "\u4DBF" or "\u4E00" <= c <= "\u9FFF" or "\uF900" <= c <= "\uFAFF")
-    devanagari = len(_DEVANAGARI_RE.findall(text))
-    arabic = len(_ARABIC_SCRIPT_RE.findall(text))
-    latin = sum(1 for c in text if ("A" <= c <= "Z") or ("a" <= c <= "z"))
-    signal_total = khmer + korean + japanese + chinese + devanagari + arabic + latin
-    if signal_total <= 0:
-        return "en"
-    if khmer and khmer / signal_total >= 0.15:
-        return "km"
-    if korean and korean / signal_total >= 0.15:
-        return "ko"
-    if japanese and japanese / signal_total >= 0.08:
-        return "ja"
-    if _looks_like_japanese_han_phrase(text):
-        return "ja"
-    if chinese and chinese / signal_total >= 0.15:
-        return "zh"
-    if devanagari and devanagari / signal_total >= 0.15:
-        return "hi"
-    if arabic and arabic / signal_total >= 0.15:
-        return "ar"
-    return _detect_latin_tts_language(text) or "en"
-
-
-_LANGUAGE_FLAGS = {
-    "km": "🇰🇭",
-    "en": "🇺🇸",
-    "zh": "🇨🇳",
-    "ko": "🇰🇷",
-    "ja": "🇯🇵",
-    "hi": "🇮🇳",
-    "ms": "🇲🇾",
-    "id": "🇮🇩",
-    "fil": "🇵🇭",
-    "ar": "🇸🇦",
-}
-_LANGUAGE_NAMES = {
-    "km": "Khmer",
-    "en": "English",
-    "zh": "Chinese",
-    "ko": "Korean",
-    "ja": "Japanese",
-    "hi": "Hindi (India)",
-    "ms": "Malay (Malaysia)",
-    "id": "Indonesian",
-    "fil": "Filipino (Philippines)",
-    "ar": "Arabic",
-}
-
-
-def _language_display(lang_key: str) -> tuple[str, str]:
-    lang_key = str(lang_key or "en").lower().strip()
-    return _LANGUAGE_FLAGS.get(lang_key, "🌐"), _LANGUAGE_NAMES.get(lang_key, lang_key.upper() or "Unknown")
-
-
-# ---------------------------------------------------------------------------
-# Local time display / schedule input
-# ---------------------------------------------------------------------------
-# Keep database/scheduler timestamps in UTC, but show and accept admin-facing
-# times in Phnom Penh local time by default: ICT, UTC+7, AM/PM format.
-APP_TIMEZONE_NAME = (
-    os.environ.get("APP_TIMEZONE")
-    or os.environ.get("WEB_ADMIN_TIMEZONE")
-    or "Asia/Phnom_Penh"
-).strip() or "Asia/Phnom_Penh"
-APP_TIMEZONE_ALIAS = (os.environ.get("APP_TIMEZONE_ALIAS") or "ICT").strip() or "ICT"
-APP_TIMEZONE_UTC_LABEL = (os.environ.get("APP_TIMEZONE_UTC_LABEL") or "UTC+7").strip() or "UTC+7"
-
-
-def _load_app_timezone():
-    if ZoneInfo is not None:
-        try:
-            return ZoneInfo(APP_TIMEZONE_NAME)
-        except Exception:
-            pass
-    # Safe fallback for Phnom Penh / Cambodia ICT if tzdata is unavailable.
-    return timezone(timedelta(hours=7), APP_TIMEZONE_ALIAS)
-
-
-APP_TIMEZONE = _load_app_timezone()
-
-
-def _local_now() -> datetime:
-    return datetime.now(APP_TIMEZONE)
-
-
-def _to_local_time(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        # Database values should normally be timezone-aware UTC. If a raw/naive
-        # datetime reaches the UI, treat it as UTC to avoid double-shifting.
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(APP_TIMEZONE)
-
-
-def _local_to_utc(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=APP_TIMEZONE)
-    return dt.astimezone(timezone.utc)
-
-
-def _fmt_local_dt(dt: datetime | None = None) -> str:
-    local_dt = _to_local_time(dt or datetime.now(timezone.utc))
-    return f"{local_dt.strftime('%Y-%m-%d %I:%M %p')} {APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})"
-
-
-def _fmt_local_time_hint() -> str:
-    return f"Phnom Penh local time — AM/PM, {APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})"
+# Extracted language and timezone helpers. Legacy callers retain the same names.
+from app.services.ai.language import (
+    _detect_lang,
+    _detect_latin_tts_language,
+    _language_display,
+    _looks_like_japanese_han_phrase,
+)
+from app.utils.time import (
+    APP_TIMEZONE,
+    APP_TIMEZONE_ALIAS,
+    APP_TIMEZONE_NAME,
+    APP_TIMEZONE_UTC_LABEL,
+    _fmt_local_dt,
+    _fmt_local_time_hint,
+    _load_app_timezone,
+    _local_now,
+    _local_to_utc,
+    _to_local_time,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -27472,6 +27286,36 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stage="កំពុងពិនិត្យរូបភាព",
         detail="កំពុងរៀបចំឯកសាររូបភាព។",
     )
+    if _env_bool("DURABLE_OCR_ENABLED", True):
+        try:
+            from app.services.jobs.submission import submit_ocr_job
+
+            job, created = await submit_ocr_job(
+                chat_id=msg.chat_id,
+                user_id=user_id,
+                username=uname,
+                file_id=msg.photo[-1].file_id,
+                mime_type="image/jpeg",
+                suffix=".jpg",
+                progress_message_id=progress.message_id,
+                reply_to_message_id=int(msg.message_id),
+                idempotency_key=(
+                    f"telegram:ocr:{int(getattr(update, 'update_id', 0) or 0)}:"
+                    f"{msg.photo[-1].file_unique_id}"
+                ),
+            )
+            await progress.update(
+                10,
+                "បានដាក់ចូលជួររង់ចាំ",
+                f"Job {job.id[:12]} · {'ថ្មី' if created else 'មានរួចហើយ'}",
+                force=True,
+            )
+        except Exception as exc:
+            logger.error("Could not enqueue durable OCR job: %s", exc, exc_info=True)
+            await progress.fail(
+                "❌ មិនអាចដាក់ការងារ OCR ចូលជួររង់ចាំបានទេ។ សូមសាកម្ដងទៀត។"
+            )
+        return
     img_path: str | None = None
     try:
         await progress.update(12, "កំពុងទាញយករូបភាព", "កំពុងទទួលរូបភាពគុណភាពខ្ពស់ពី Telegram។", force=True)
@@ -27649,6 +27493,46 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stage="កំពុងពិនិត្យឯកសារ",
         detail=filename or "ឯកសារអូឌីយ៉ូ",
     )
+    if (
+        transcribe_enabled
+        and not convert_enabled
+        and _env_bool("DURABLE_TRANSCRIPTION_ENABLED", True)
+    ):
+        try:
+            from app.services.jobs.submission import submit_transcription_job
+
+            job, created = await submit_transcription_job(
+                chat_id=msg.chat_id,
+                user_id=user_id,
+                username=uname,
+                file_id=file_id,
+                mime_type=gemini_mime,
+                suffix=ext,
+                source_kind="audio_file",
+                filename=filename,
+                progress_message_id=progress.message_id,
+                reply_to_message_id=int(msg.message_id),
+                idempotency_key=(
+                    f"telegram:transcription:{int(getattr(update, 'update_id', 0) or 0)}:"
+                    f"{file_unique_id}"
+                ),
+            )
+            await progress.update(
+                10,
+                "បានដាក់ចូលជួររង់ចាំ",
+                f"Job {job.id[:12]} · {'ថ្មី' if created else 'មានរួចហើយ'}",
+                force=True,
+            )
+        except Exception as exc:
+            logger.error(
+                "Could not enqueue durable audio transcription job: %s",
+                exc,
+                exc_info=True,
+            )
+            await progress.fail(
+                "❌ មិនអាចដាក់ការងារបម្លែងអូឌីយ៉ូចូលជួររង់ចាំបានទេ។"
+            )
+        return
     try:
         await progress.update(12, "កំពុងទាញយកឯកសារ", "កំពុងទទួលទិន្នន័យពី Telegram។", force=True)
         tg_file = await safe_send(lambda: context.bot.get_file(file_id))
@@ -27681,6 +27565,48 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 conversion_error = exc
                 logger.error("Audio-to-voice conversion failed: %s", exc, exc_info=True)
                 await progress.update(60, "មិនអាចបម្លែងទៅសារសំឡេង", "កំពុងព្យាយាមបម្លែងទៅអត្ថបទ ប្រសិនបើមុខងារនេះបានបើក។", force=True)
+
+        if transcribe_enabled and _env_bool("DURABLE_TRANSCRIPTION_ENABLED", True):
+            try:
+                from app.services.jobs.submission import submit_transcription_job
+
+                job, created = await submit_transcription_job(
+                    chat_id=msg.chat_id,
+                    user_id=user_id,
+                    username=uname,
+                    file_id=file_id,
+                    mime_type=gemini_mime,
+                    suffix=ext,
+                    source_kind="audio_file",
+                    filename=filename,
+                    progress_message_id=progress.message_id,
+                    reply_to_message_id=int(msg.message_id),
+                    idempotency_key=(
+                        f"telegram:transcription:{int(getattr(update, 'update_id', 0) or 0)}:"
+                        f"{file_unique_id}"
+                    ),
+                )
+                await progress.update(
+                    68,
+                    "ការបម្លែងសំឡេងទៅអត្ថបទស្ថិតក្នុងជួររង់ចាំ",
+                    f"Job {job.id[:12]} · {'ថ្មី' if created else 'មានរួចហើយ'}",
+                    force=True,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Could not enqueue durable audio transcription job: %s",
+                    exc,
+                    exc_info=True,
+                )
+                if voice_sent:
+                    await progress.finish(
+                        "⚠️ បានបង្កើតសារសំឡេងរួច ប៉ុន្តែមិនអាចដាក់ការបម្លែងអត្ថបទចូលជួររង់ចាំបានទេ។"
+                    )
+                else:
+                    await progress.fail(
+                        "❌ មិនអាចដាក់ការងារបម្លែងអូឌីយ៉ូចូលជួររង់ចាំបានទេ។"
+                    )
+            return
 
         if transcribe_enabled:
             if _gemini is None:
@@ -27851,7 +27777,6 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     _metric_inc("voice")
     sync_user_data(user)
-    ogg_path = _make_temp_ogg()
     progress = await TelegramProgress.start(
         bot=context.bot,
         chat_id=msg.chat_id,
@@ -27861,6 +27786,42 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stage="កំពុងពិនិត្យសារសំឡេង",
         detail=f"រយៈពេល {float(msg.voice.duration or 0):g} វិនាទី។",
     )
+    if _env_bool("DURABLE_TRANSCRIPTION_ENABLED", True):
+        try:
+            from app.services.jobs.submission import submit_transcription_job
+
+            job, created = await submit_transcription_job(
+                chat_id=msg.chat_id,
+                user_id=user_id,
+                username=user.username or user.first_name or str(user_id),
+                file_id=msg.voice.file_id,
+                mime_type=msg.voice.mime_type or "audio/ogg",
+                suffix=".ogg",
+                source_kind="voice",
+                progress_message_id=progress.message_id,
+                reply_to_message_id=int(msg.message_id),
+                idempotency_key=(
+                    f"telegram:transcription:{int(getattr(update, 'update_id', 0) or 0)}:"
+                    f"{msg.voice.file_unique_id}"
+                ),
+            )
+            await progress.update(
+                10,
+                "បានដាក់ចូលជួររង់ចាំ",
+                f"Job {job.id[:12]} · {'ថ្មី' if created else 'មានរួចហើយ'}",
+                force=True,
+            )
+        except Exception as exc:
+            logger.error(
+                "Could not enqueue durable voice transcription job: %s",
+                exc,
+                exc_info=True,
+            )
+            await progress.fail(
+                "❌ មិនអាចដាក់ការងារបម្លែងសំឡេងចូលជួររង់ចាំបានទេ។ សូមសាកម្ដងទៀត។"
+            )
+        return
+    ogg_path = _make_temp_ogg()
     try:
         await progress.update(15, "កំពុងទាញយកសារសំឡេង", "កំពុងទទួលឯកសារពី Telegram។", force=True)
         voice_file = await safe_send(lambda: context.bot.get_file(msg.voice.file_id))

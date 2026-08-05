@@ -223,3 +223,59 @@ python -m unittest discover -s tests -v
 See [`UPDATE_NOTES.md`](UPDATE_NOTES.md) for the durable worker lifecycle,
 provider timeout consistency, unified `RuntimeContext`, queue backpressure,
 admin operations UI, and staged migration instructions.
+
+## Runtime reliability update v2
+
+See [`UPDATE_V2_NOTES.md`](UPDATE_V2_NOTES.md) for job progress, terminal job
+history, worker drain/resume, extracted utility modules, CI, and Docker health
+checks.
+
+## Runtime reliability update v3
+
+V3 migrates the real Telegram OCR and transcription entry points to the
+Redis queue. The web process now validates the request, creates one editable
+progress message, and enqueues durable Telegram `file_id` references. A worker
+downloads the source, runs OCR/transcription, stores the full text as an
+artifact, and edits the same progress message through Redis-backed idempotent
+delivery.
+
+### Separate web and worker services
+
+Production deployments should run both commands from the same release:
+
+```bash
+# Web/API + Telegram webhook ingestion. Does not consume jobs.
+PROCESS_ROLE=web uvicorn app.main:app --host 0.0.0.0 --port 8080
+
+# Background OCR/transcription/TTS/broadcast workers. Does not bind a port.
+PROCESS_ROLE=worker python -m app.worker
+```
+
+`python -m app.main` remains the backward-compatible combined process for local
+runs and one-service deployments.
+
+### Artifact storage
+
+Supabase Storage is selected automatically when a Supabase client is
+configured. Create a private bucket named `bot-job-artifacts`, or set
+`BOT_ARTIFACT_STORAGE_BUCKET` to an existing private bucket. The server key
+must have upload, download, and delete access to that bucket.
+
+Optional deployment controls:
+
+```text
+BOT_ARTIFACT_STORAGE_MODE=auto     # auto | supabase | local
+BOT_ARTIFACT_STORAGE_BUCKET=bot-job-artifacts
+BOT_ARTIFACT_LOCAL_DIRECTORY=data/job-artifacts
+BOT_ARTIFACT_MAX_BYTES=52428800
+BOT_JOB_WORKERS=2
+BOT_JOB_QUEUE_MAX=1000
+DURABLE_OCR_ENABLED=true
+DURABLE_TRANSCRIPTION_ENABLED=true
+```
+
+Local artifact storage is for development or a single shared host. Use
+Supabase mode when workers can run on different machines or containers.
+
+See [`UPDATE_V3_NOTES.md`](UPDATE_V3_NOTES.md) for migration and rollback
+instructions.

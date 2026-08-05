@@ -86,7 +86,18 @@
       <section id="jobs" class="panel dashboard-section">
         <div class="section-heading">
           <div><p class="eyebrow" data-i18n="durableRuntime">Durable runtime</p><h2 data-i18n="jobQueue">Job queue</h2></div>
-          <div class="section-actions"><select id="jobState" class="select"><option value="dead">Dead</option><option value="running">Running</option><option value="queued">Queued</option></select><button id="refreshJobsButton" class="button" type="button" data-i18n="refresh">Refresh</button></div>
+          <div class="section-actions">
+            <select id="jobState" class="select">
+              <option value="dead">Dead</option>
+              <option value="running">Running</option>
+              <option value="queued">Queued</option>
+              <option value="succeeded">Succeeded</option>
+              <option value="cancelled">Cancelled</option>
+            </select>
+            <button id="drainWorkersButton" class="button danger" type="button" data-i18n="drainWorkers">Drain workers</button>
+            <button id="resumeWorkersButton" class="button" type="button" data-i18n="resumeWorkers">Resume workers</button>
+            <button id="refreshJobsButton" class="button" type="button" data-i18n="refresh">Refresh</button>
+          </div>
         </div>
         <div id="jobSummary" class="summary-strip"></div>
         <div id="jobsList" class="data-list"></div>

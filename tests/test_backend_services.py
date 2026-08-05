@@ -44,6 +44,32 @@ class FakeRedis:
     def hgetall(self, key: str) -> dict[str, str]:
         return dict(self.hashes.get(key, {}))
 
+    def hset(self, key: str, *, mapping: dict[str, str]) -> int:
+        self.hashes.setdefault(key, {}).update(
+            {str(name): str(value) for name, value in mapping.items()}
+        )
+        return len(mapping)
+
+    def zrevrange(self, key: str, start: int, end: int):
+        ordered = [
+            member
+            for member, _score in sorted(
+                self.zsets.get(key, {}).items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+        ]
+        return ordered[start : end + 1]
+
+    def zremrangebyscore(self, key: str, minimum, maximum) -> int:
+        del minimum
+        cutoff = float(maximum)
+        members = self.zsets.setdefault(key, {})
+        removed = [member for member, score in members.items() if score <= cutoff]
+        for member in removed:
+            members.pop(member, None)
+        return len(removed)
+
     def zcard(self, key: str) -> int:
         return len(self.zsets.get(key, {}))
 
@@ -194,6 +220,10 @@ class FakeRedis:
             "max_attempts": max_attempts,
             "timeout_seconds": timeout_seconds,
             "cancel_requested": "0",
+            "progress_percent": "0",
+            "progress_stage": "queued",
+            "progress_detail": "",
+            "updated_at": created_at,
         }
         self._zadd(ready_key, float(available_at), job_id)
         if use_idempotency == "1":
@@ -201,7 +231,7 @@ class FakeRedis:
         return [job_id, 1]
 
     def _claim(self, keys: list[str], args: list[str]):
-        ready_key, leased_key, dead_key = keys
+        ready_key, leased_key, dead_key, cancelled_key = keys
         now, worker, token, deadline, _retention, job_prefix = args
         now_value = float(now)
         expired = [
@@ -217,12 +247,17 @@ class FakeRedis:
                         state="cancelled",
                         completed_at=now,
                         last_error="cancelled while worker lease was unavailable",
+                        progress_stage="cancelled",
+                        updated_at=now,
                     )
+                    self._zadd(cancelled_key, now_value, job_id)
                 elif int(data["attempts"]) >= int(data["max_attempts"]):
                     data.update(
                         state="dead",
                         completed_at=now,
                         last_error="worker lease expired",
+                        progress_stage="dead",
+                        updated_at=now,
                     )
                     self._zadd(dead_key, now_value, job_id)
                 else:
@@ -230,6 +265,8 @@ class FakeRedis:
                         state="queued",
                         available_at=now,
                         last_error="worker lease expired",
+                        progress_stage="retrying",
+                        updated_at=now,
                     )
                     for field in ("lease_token", "lease_deadline", "worker_id"):
                         data.pop(field, None)
@@ -259,6 +296,8 @@ class FakeRedis:
             lease_deadline=deadline,
             started_at=now,
             cancel_requested="0",
+            progress_stage="running",
+            updated_at=now,
         )
         self._zrem(ready_key, selected)
         self._zadd(leased_key, float(deadline), selected)
@@ -266,18 +305,19 @@ class FakeRedis:
 
     def _renew(self, keys: list[str], args: list[str]) -> int:
         leased_key, job_key = keys
-        token, deadline, job_id = args
+        token, deadline, job_id, updated_at = args
         data = self.hashes[job_key]
         if data.get("state") != "running" or data.get("lease_token") != token:
             return 0
         if data.get("cancel_requested") == "1":
             return -1
         data["lease_deadline"] = deadline
+        data["updated_at"] = updated_at
         self._zadd(leased_key, float(deadline), job_id)
         return 1
 
     def _complete(self, keys: list[str], args: list[str]) -> int:
-        leased_key, job_key = keys
+        leased_key, job_key, succeeded_key, cancelled_key = keys
         token, job_id, completed_at, result, _retention = args
         data = self.hashes[job_key]
         if data.get("state") != "running" or data.get("lease_token") != token:
@@ -288,46 +328,68 @@ class FakeRedis:
                 state="cancelled",
                 completed_at=completed_at,
                 last_error="cancelled",
+                progress_stage="cancelled",
+                updated_at=completed_at,
             )
+            self._zadd(cancelled_key, float(completed_at), job_id)
         else:
             data.update(
                 state="succeeded",
                 completed_at=completed_at,
                 result=result,
                 last_error="",
+                progress_percent="100",
+                progress_stage="succeeded",
+                updated_at=completed_at,
             )
+            self._zadd(succeeded_key, float(completed_at), job_id)
         for field in ("lease_token", "lease_deadline", "worker_id"):
             data.pop(field, None)
         return 1
 
     def _fail(self, keys: list[str], args: list[str]) -> int:
-        ready_key, leased_key, job_key, dead_key = keys
+        ready_key, leased_key, job_key, dead_key, cancelled_key = keys
         token, job_id, now, error, available_at, retryable, _retention = args
         data = self.hashes[job_key]
         if data.get("state") != "running" or data.get("lease_token") != token:
             return 0
         self._zrem(leased_key, job_id)
         if data.get("cancel_requested") == "1":
-            data.update(state="cancelled", completed_at=now, last_error="cancelled")
+            data.update(
+                state="cancelled",
+                completed_at=now,
+                last_error="cancelled",
+                progress_stage="cancelled",
+                updated_at=now,
+            )
+            self._zadd(cancelled_key, float(now), job_id)
             return 2
         if retryable == "1" and int(data["attempts"]) < int(data["max_attempts"]):
             data.update(
                 state="queued",
                 available_at=available_at,
                 last_error=error,
+                progress_stage="retrying",
+                updated_at=now,
             )
             for field in ("lease_token", "lease_deadline", "worker_id"):
                 data.pop(field, None)
             self._zadd(ready_key, float(available_at), job_id)
             return 1
-        data.update(state="dead", completed_at=now, last_error=error)
+        data.update(
+            state="dead",
+            completed_at=now,
+            last_error=error,
+            progress_stage="dead",
+            updated_at=now,
+        )
         for field in ("lease_token", "lease_deadline", "worker_id"):
             data.pop(field, None)
         self._zadd(dead_key, float(now), job_id)
         return 3
 
     def _cancel(self, keys: list[str], args: list[str]) -> int:
-        ready_key, _leased_key, job_key = keys
+        ready_key, _leased_key, job_key, cancelled_key = keys
         job_id, now, _retention = args
         data = self.hashes.get(job_key)
         if data is None:
@@ -339,15 +401,22 @@ class FakeRedis:
                 cancel_requested="1",
                 completed_at=now,
                 last_error="cancelled",
+                progress_stage="cancelled",
+                updated_at=now,
             )
+            self._zadd(cancelled_key, float(now), job_id)
             return 1
         if data["state"] == "running":
-            data["cancel_requested"] = "1"
+            data.update(
+                cancel_requested="1",
+                progress_stage="cancelling",
+                updated_at=now,
+            )
             return 2
         return 0
 
     def _retry(self, keys: list[str], args: list[str]) -> int:
-        ready_key, dead_key, job_key = keys
+        ready_key, dead_key, cancelled_key, job_key = keys
         job_id, now = args
         data = self.hashes.get(job_key)
         if data is None:
@@ -355,12 +424,17 @@ class FakeRedis:
         if data["state"] not in {"dead", "cancelled"}:
             return 0
         self._zrem(dead_key, job_id)
+        self._zrem(cancelled_key, job_id)
         data.update(
             state="queued",
             available_at=now,
             attempts="0",
             cancel_requested="0",
             last_error="",
+            progress_percent="0",
+            progress_stage="queued",
+            progress_detail="",
+            updated_at=now,
         )
         data.pop("completed_at", None)
         data.pop("result", None)

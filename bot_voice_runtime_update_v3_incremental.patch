@@ -1,0 +1,2211 @@
+diff -ruN '--exclude=bot_voice_runtime_update_v2_full.patch' '--exclude=__pycache__' a/Dockerfile b/Dockerfile
+--- a/Dockerfile	2026-08-05 05:06:10.000000000 +0000
++++ b/Dockerfile	2026-08-05 06:27:03.351922649 +0000
+@@ -23,6 +23,6 @@
+ STOPSIGNAL SIGTERM
+ 
+ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+-    CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.getenv('PORT', '8080') + '/readyz', timeout=4).read()"
++    CMD python -m app.healthcheck
+ 
+ CMD ["python", "-m", "app.main"]
+diff -ruN '--exclude=bot_voice_runtime_update_v2_full.patch' '--exclude=__pycache__' a/README.md b/README.md
+--- a/README.md	2026-08-05 05:01:30.000000000 +0000
++++ b/README.md	2026-08-05 06:24:45.144801736 +0000
+@@ -229,3 +229,53 @@
+ See [`UPDATE_V2_NOTES.md`](UPDATE_V2_NOTES.md) for job progress, terminal job
+ history, worker drain/resume, extracted utility modules, CI, and Docker health
+ checks.
++
++## Runtime reliability update v3
++
++V3 migrates the real Telegram OCR and transcription entry points to the
++Redis queue. The web process now validates the request, creates one editable
++progress message, and enqueues durable Telegram `file_id` references. A worker
++downloads the source, runs OCR/transcription, stores the full text as an
++artifact, and edits the same progress message through Redis-backed idempotent
++delivery.
++
++### Separate web and worker services
++
++Production deployments should run both commands from the same release:
++
++```bash
++# Web/API + Telegram webhook ingestion. Does not consume jobs.
++PROCESS_ROLE=web uvicorn app.main:app --host 0.0.0.0 --port 8080
++
++# Background OCR/transcription/TTS/broadcast workers. Does not bind a port.
++PROCESS_ROLE=worker python -m app.worker
++```
++
++`python -m app.main` remains the backward-compatible combined process for local
++runs and one-service deployments.
++
++### Artifact storage
++
++Supabase Storage is selected automatically when a Supabase client is
++configured. Create a private bucket named `bot-job-artifacts`, or set
++`BOT_ARTIFACT_STORAGE_BUCKET` to an existing private bucket. The server key
++must have upload, download, and delete access to that bucket.
++
++Optional deployment controls:
++
++```text
++BOT_ARTIFACT_STORAGE_MODE=auto     # auto | supabase | local
++BOT_ARTIFACT_STORAGE_BUCKET=bot-job-artifacts
++BOT_ARTIFACT_LOCAL_DIRECTORY=data/job-artifacts
++BOT_ARTIFACT_MAX_BYTES=52428800
++BOT_JOB_WORKERS=2
++BOT_JOB_QUEUE_MAX=1000
++DURABLE_OCR_ENABLED=true
++DURABLE_TRANSCRIPTION_ENABLED=true
++```
++
++Local artifact storage is for development or a single shared host. Use
++Supabase mode when workers can run on different machines or containers.
++
++See [`UPDATE_V3_NOTES.md`](UPDATE_V3_NOTES.md) for migration and rollback
++instructions.
+diff -ruN '--exclude=bot_voice_runtime_update_v2_full.patch' '--exclude=__pycache__' a/UPDATE_V3_NOTES.md b/UPDATE_V3_NOTES.md
+--- a/UPDATE_V3_NOTES.md	1970-01-01 00:00:00.000000000 +0000
++++ b/UPDATE_V3_NOTES.md	2026-08-05 06:24:45.148801736 +0000
+@@ -0,0 +1,89 @@
++# Runtime Reliability Update v3
++
++V3 intentionally contains four production deliverables only.
++
++## 1. Actual OCR and transcription call-site migration
++
++The existing Telegram handlers now enqueue durable jobs by default:
++
++- Photo messages use `submit_ocr_job()`.
++- Telegram voice messages use `submit_transcription_job()`.
++- Audio documents and Telegram audio messages use the transcription queue.
++- When audio-to-voice conversion is also enabled, conversion finishes first and
++  the same progress message is handed to the transcription worker.
++
++Each request uses a deterministic idempotency key containing the Telegram
++`update_id` and `file_unique_id`. A repeated webhook/update therefore resolves
++to the existing job instead of creating another workload.
++
++Emergency rollback flags:
++
++```text
++DURABLE_OCR_ENABLED=false
++DURABLE_TRANSCRIPTION_ENABLED=false
++```
++
++Setting either flag to false restores the preserved inline legacy path for that
++workload.
++
++## 2. Idempotent Telegram result delivery
++
++`app/services/telegram/delivery.py` stores delivery state in Redis. Result
++workers claim a short lease and retain the successful Telegram message ID.
++Retries return the stored result without calling Telegram again.
++
++Migrated handlers pass the processing-message ID. Delivery edits that message
++in place, which closes the most important crash window: a retry converges on
++one known Telegram message instead of sending a new result message.
++
++Delivery keys contain only a SHA-256 digest of the logical idempotency key and
++expire after seven days by default. Raw user text and Telegram credentials are
++not written to delivery keys.
++
++## 3. Durable artifact storage
++
++Full OCR/transcription text is stored outside Redis job hashes. Redis receives
++only JSON-safe metadata:
++
++- backend and private bucket/path
++- content type and size
++- SHA-256 digest
++- creation and expiry timestamps
++
++Supabase Storage is the production backend. Local atomic storage is retained
++for tests and one-process development. Reads verify both byte length and
++SHA-256 before returning content.
++
++Create a private Supabase bucket named `bot-job-artifacts` before production
++rollout. Do not make this bucket public. Configure a storage lifecycle policy
++or scheduled cleanup for objects after the application retention window.
++
++## 4. Separate `app.worker` process
++
++Run the HTTP/Telegram-ingestion process and queue consumer independently:
++
++```bash
++PROCESS_ROLE=web uvicorn app.main:app --host 0.0.0.0 --port 8080
++PROCESS_ROLE=worker python -m app.worker
++```
++
++The worker process initializes Redis, Supabase, runtime security, artifact
++storage, delivery leases, and the registered job handlers. It does not bind an
++HTTP port and does not start Telegram polling or webhook ingestion.
++
++The Docker health check is role-aware. Web containers call `/readyz`; worker
++containers ping Redis. The combined `python -m app.main` command remains
++available for local development.
++
++## Rollout order
++
++1. Create the private Supabase artifact bucket.
++2. Deploy the worker service with durable flags still disabled.
++3. Verify worker logs show healthy workers and shared Supabase artifacts.
++4. Deploy the web service from the same commit.
++5. Enable `DURABLE_OCR_ENABLED=true`.
++6. Test repeated delivery of the same Telegram update.
++7. Enable `DURABLE_TRANSCRIPTION_ENABLED=true`.
++8. Monitor queue depth, dead jobs, provider failures, and storage usage.
++
++Do not enable durable call sites until at least one worker service is running.
+diff -ruN '--exclude=bot_voice_runtime_update_v2_full.patch' '--exclude=__pycache__' a/VALIDATION_V3.md b/VALIDATION_V3.md
+--- a/VALIDATION_V3.md	1970-01-01 00:00:00.000000000 +0000
++++ b/VALIDATION_V3.md	2026-08-05 06:24:45.152337824 +0000
+@@ -0,0 +1,35 @@
++# Validation v3
++
++Performed against the complete v2 update bundle plus v3 changes.
++
++## Passed
++
++- Python bytecode compilation for all `app/` and `tests/` files.
++- 15 targeted unit tests:
++  - queue backpressure and dead-job listing
++  - queue progress and terminal transitions
++  - synchronous provider timeout
++  - atomic local artifact storage, size limits, and integrity verification
++  - delivery lease contention and retry-safe single Telegram edit
++  - OCR/transcription submission payloads
++  - static verification of real legacy call-site migration
++  - dedicated worker entry point verification
++- Archive integrity check for generated ZIP bundles.
++- Incremental patch dry-run against the v2 full bundle.
++
++## Not completed in this environment
++
++- Ruff was not installed in the execution environment, so `ruff check` could
++  not be executed here.
++- Full repository tests require source modules and third-party dependencies not
++  included in the uploaded subset.
++- Live Supabase Storage, Redis, Telegram, and provider integration tests require
++  deployment credentials and were not attempted.
++
++## Required production checks
++
++- Create and permission the private Supabase artifact bucket.
++- Start at least one `app.worker` instance before enabling durable call sites.
++- Confirm `/readyz` is healthy on the web service.
++- Submit one photo and one voice message, then replay the same Telegram update
++  and confirm only one result message is edited.
+diff -ruN '--exclude=bot_voice_runtime_update_v2_full.patch' '--exclude=__pycache__' a/app/healthcheck.py b/app/healthcheck.py
+--- a/app/healthcheck.py	1970-01-01 00:00:00.000000000 +0000
++++ b/app/healthcheck.py	2026-08-05 06:23:56.109920038 +0000
+@@ -0,0 +1,63 @@
++"""Role-aware container health check for web and worker processes."""
++
++from __future__ import annotations
++
++import os
++import sys
++import urllib.request
++from pathlib import Path
++
++
++def _role() -> str:
++    configured = str(os.getenv("PROCESS_ROLE", "") or "").strip().lower()
++    if configured:
++        return configured
++    try:
++        command = Path("/proc/1/cmdline").read_bytes().replace(b"\0", b" ").decode()
++    except OSError:
++        command = ""
++    return "worker" if "app.worker" in command else "web"
++
++
++def _check_worker() -> None:
++    redis_url = str(os.getenv("REDIS_URL", "") or "").strip()
++    if not redis_url:
++        raise RuntimeError("REDIS_URL is not configured.")
++    import redis
++
++    client = redis.from_url(
++        redis_url,
++        socket_connect_timeout=3,
++        socket_timeout=3,
++        max_connections=1,
++    )
++    try:
++        if not client.ping():
++            raise RuntimeError("Redis ping failed.")
++    finally:
++        client.close()
++
++
++def _check_web() -> None:
++    port = str(os.getenv("PORT", "8080") or "8080")
++    with urllib.request.urlopen(
++        f"http://127.0.0.1:{port}/readyz",
++        timeout=4,
++    ) as response:
++        if response.status != 200:
++            raise RuntimeError(f"Readiness returned HTTP {response.status}.")
++
++
++def main() -> None:
++    try:
++        if _role() == "worker":
++            _check_worker()
++        else:
++            _check_web()
++    except Exception as exc:
++        print(f"healthcheck failed: {exc}", file=sys.stderr)
++        raise SystemExit(1) from exc
++
++
++if __name__ == "__main__":
++    main()
+diff -ruN '--exclude=bot_voice_runtime_update_v2_full.patch' '--exclude=__pycache__' a/app/legacy.py b/app/legacy.py
+--- a/app/legacy.py	2026-08-05 05:06:10.000000000 +0000
++++ b/app/legacy.py	2026-08-05 06:27:03.351259443 +0000
+@@ -27286,6 +27286,36 @@
+         stage="កំពុងពិនិត្យរូបភាព",
+         detail="កំពុងរៀបចំឯកសាររូបភាព។",
+     )
++    if _env_bool("DURABLE_OCR_ENABLED", True):
++        try:
++            from app.services.jobs.submission import submit_ocr_job
++
++            job, created = await submit_ocr_job(
++                chat_id=msg.chat_id,
++                user_id=user_id,
++                username=uname,
++                file_id=msg.photo[-1].file_id,
++                mime_type="image/jpeg",
++                suffix=".jpg",
++                progress_message_id=progress.message_id,
++                reply_to_message_id=int(msg.message_id),
++                idempotency_key=(
++                    f"telegram:ocr:{int(getattr(update, 'update_id', 0) or 0)}:"
++                    f"{msg.photo[-1].file_unique_id}"
++                ),
++            )
++            await progress.update(
++                10,
++                "បានដាក់ចូលជួររង់ចាំ",
++                f"Job {job.id[:12]} · {'ថ្មី' if created else 'មានរួចហើយ'}",
++                force=True,
++            )
++        except Exception as exc:
++            logger.error("Could not enqueue durable OCR job: %s", exc, exc_info=True)
++            await progress.fail(
++                "❌ មិនអាចដាក់ការងារ OCR ចូលជួររង់ចាំបានទេ។ សូមសាកម្ដងទៀត។"
++            )
++        return
+     img_path: str | None = None
+     try:
+         await progress.update(12, "កំពុងទាញយករូបភាព", "កំពុងទទួលរូបភាពគុណភាពខ្ពស់ពី Telegram។", force=True)
+@@ -27463,6 +27493,46 @@
+         stage="កំពុងពិនិត្យឯកសារ",
+         detail=filename or "ឯកសារអូឌីយ៉ូ",
+     )
++    if (
++        transcribe_enabled
++        and not convert_enabled
++        and _env_bool("DURABLE_TRANSCRIPTION_ENABLED", True)
++    ):
++        try:
++            from app.services.jobs.submission import submit_transcription_job
++
++            job, created = await submit_transcription_job(
++                chat_id=msg.chat_id,
++                user_id=user_id,
++                username=uname,
++                file_id=file_id,
++                mime_type=gemini_mime,
++                suffix=ext,
++                source_kind="audio_file",
++                filename=filename,
++                progress_message_id=progress.message_id,
++                reply_to_message_id=int(msg.message_id),
++                idempotency_key=(
++                    f"telegram:transcription:{int(getattr(update, 'update_id', 0) or 0)}:"
++                    f"{file_unique_id}"
++                ),
++            )
++            await progress.update(
++                10,
++                "បានដាក់ចូលជួររង់ចាំ",
++                f"Job {job.id[:12]} · {'ថ្មី' if created else 'មានរួចហើយ'}",
++                force=True,
++            )
++        except Exception as exc:
++            logger.error(
++                "Could not enqueue durable audio transcription job: %s",
++                exc,
++                exc_info=True,
++            )
++            await progress.fail(
++                "❌ មិនអាចដាក់ការងារបម្លែងអូឌីយ៉ូចូលជួររង់ចាំបានទេ។"
++            )
++        return
+     try:
+         await progress.update(12, "កំពុងទាញយកឯកសារ", "កំពុងទទួលទិន្នន័យពី Telegram។", force=True)
+         tg_file = await safe_send(lambda: context.bot.get_file(file_id))
+@@ -27496,6 +27566,48 @@
+                 logger.error("Audio-to-voice conversion failed: %s", exc, exc_info=True)
+                 await progress.update(60, "មិនអាចបម្លែងទៅសារសំឡេង", "កំពុងព្យាយាមបម្លែងទៅអត្ថបទ ប្រសិនបើមុខងារនេះបានបើក។", force=True)
+ 
++        if transcribe_enabled and _env_bool("DURABLE_TRANSCRIPTION_ENABLED", True):
++            try:
++                from app.services.jobs.submission import submit_transcription_job
++
++                job, created = await submit_transcription_job(
++                    chat_id=msg.chat_id,
++                    user_id=user_id,
++                    username=uname,
++                    file_id=file_id,
++                    mime_type=gemini_mime,
++                    suffix=ext,
++                    source_kind="audio_file",
++                    filename=filename,
++                    progress_message_id=progress.message_id,
++                    reply_to_message_id=int(msg.message_id),
++                    idempotency_key=(
++                        f"telegram:transcription:{int(getattr(update, 'update_id', 0) or 0)}:"
++                        f"{file_unique_id}"
++                    ),
++                )
++                await progress.update(
++                    68,
++                    "ការបម្លែងសំឡេងទៅអត្ថបទស្ថិតក្នុងជួររង់ចាំ",
++                    f"Job {job.id[:12]} · {'ថ្មី' if created else 'មានរួចហើយ'}",
++                    force=True,
++                )
++            except Exception as exc:
++                logger.error(
++                    "Could not enqueue durable audio transcription job: %s",
++                    exc,
++                    exc_info=True,
++                )
++                if voice_sent:
++                    await progress.finish(
++                        "⚠️ បានបង្កើតសារសំឡេងរួច ប៉ុន្តែមិនអាចដាក់ការបម្លែងអត្ថបទចូលជួររង់ចាំបានទេ។"
++                    )
++                else:
++                    await progress.fail(
++                        "❌ មិនអាចដាក់ការងារបម្លែងអូឌីយ៉ូចូលជួររង់ចាំបានទេ។"
++                    )
++            return
++
+         if transcribe_enabled:
+             if _gemini is None:
+                 transcription_error = RuntimeError("Gemini API is not active.")
+@@ -27665,7 +27777,6 @@
+ 
+     _metric_inc("voice")
+     sync_user_data(user)
+-    ogg_path = _make_temp_ogg()
+     progress = await TelegramProgress.start(
+         bot=context.bot,
+         chat_id=msg.chat_id,
+@@ -27675,6 +27786,42 @@
+         stage="កំពុងពិនិត្យសារសំឡេង",
+         detail=f"រយៈពេល {float(msg.voice.duration or 0):g} វិនាទី។",
+     )
++    if _env_bool("DURABLE_TRANSCRIPTION_ENABLED", True):
++        try:
++            from app.services.jobs.submission import submit_transcription_job
++
++            job, created = await submit_transcription_job(
++                chat_id=msg.chat_id,
++                user_id=user_id,
++                username=user.username or user.first_name or str(user_id),
++                file_id=msg.voice.file_id,
++                mime_type=msg.voice.mime_type or "audio/ogg",
++                suffix=".ogg",
++                source_kind="voice",
++                progress_message_id=progress.message_id,
++                reply_to_message_id=int(msg.message_id),
++                idempotency_key=(
++                    f"telegram:transcription:{int(getattr(update, 'update_id', 0) or 0)}:"
++                    f"{msg.voice.file_unique_id}"
++                ),
++            )
++            await progress.update(
++                10,
++                "បានដាក់ចូលជួររង់ចាំ",
++                f"Job {job.id[:12]} · {'ថ្មី' if created else 'មានរួចហើយ'}",
++                force=True,
++            )
++        except Exception as exc:
++            logger.error(
++                "Could not enqueue durable voice transcription job: %s",
++                exc,
++                exc_info=True,
++            )
++            await progress.fail(
++                "❌ មិនអាចដាក់ការងារបម្លែងសំឡេងចូលជួររង់ចាំបានទេ។ សូមសាកម្ដងទៀត។"
++            )
++        return
++    ogg_path = _make_temp_ogg()
+     try:
+         await progress.update(15, "កំពុងទាញយកសារសំឡេង", "កំពុងទទួលឯកសារពី Telegram។", force=True)
+         voice_file = await safe_send(lambda: context.bot.get_file(msg.voice.file_id))
+diff -ruN '--exclude=bot_voice_runtime_update_v2_full.patch' '--exclude=__pycache__' a/app/main.py b/app/main.py
+--- a/app/main.py	2026-08-05 05:02:46.000000000 +0000
++++ b/app/main.py	2026-08-05 06:17:38.063249123 +0000
+@@ -48,7 +48,7 @@
+ 
+     runtime = get_runtime_context()
+     async with _original_lifespan_context(application) as lifespan_state:
+-        await runtime.start(application, owner="asgi")
++        await runtime.start(application, owner="asgi", role="web")
+         try:
+             yield lifespan_state
+         finally:
+@@ -65,7 +65,9 @@
+         and snapshot["redis"]
+         and snapshot["security"]
+         and snapshot["job_queue"]
+-        and workers.get("healthy")
++        and snapshot["artifacts"].get("configured")
++        and snapshot["delivery"]
++        and (not snapshot["expects_workers"] or workers.get("healthy"))
+     )
+     return JSONResponse(
+         {
+@@ -75,6 +77,9 @@
+             "runtime_started": snapshot["started"],
+             "redis": snapshot["redis"],
+             "job_queue": snapshot["job_queue"],
++            "role": snapshot.get("role"),
++            "artifact_storage": snapshot.get("artifacts"),
++            "delivery": snapshot.get("delivery"),
+             "workers": {
+                 "count": workers.get("count", 0),
+                 "alive": workers.get("alive", 0),
+@@ -136,7 +141,7 @@
+     """Run web, Telegram, schedulers, and workers under one RuntimeContext."""
+ 
+     runtime = get_runtime_context()
+-    await runtime.start(app, owner="combined")
++    await runtime.start(app, owner="combined", role="combined")
+ 
+     _legacy.logger.info(
+         "Combined runtime starting provider=%s bot_mode=%s durable_workers=%s",
+diff -ruN '--exclude=bot_voice_runtime_update_v2_full.patch' '--exclude=__pycache__' a/app/runtime.py b/app/runtime.py
+--- a/app/runtime.py	2026-08-05 04:54:08.000000000 +0000
++++ b/app/runtime.py	2026-08-05 06:17:29.028441755 +0000
+@@ -1,4 +1,4 @@
+-"""Single idempotent startup/shutdown boundary for the combined application."""
++"""Single idempotent startup/shutdown boundary for web and worker roles."""
+ 
+ from __future__ import annotations
+ 
+@@ -7,7 +7,7 @@
+ import os
+ import time
+ from contextlib import suppress
+-from typing import Any
++from typing import Any, Literal
+ 
+ from fastapi import FastAPI
+ 
+@@ -16,6 +16,11 @@
+ from app.core.security import get_runtime_secret_manager
+ from app.core.telegram_auth import configure_telegram_admin_authorizer
+ from app.services.ai.providers import get_provider_manager
++from app.services.artifacts.storage import (
++    ArtifactService,
++    configure_artifact_service,
++    reset_artifact_service,
++)
+ from app.services.jobs.handlers import BotJobHandlers, build_bot_job_handlers
+ from app.services.jobs.runtime import (
+     configure_job_queue,
+@@ -23,12 +28,32 @@
+     start_job_workers,
+     stop_job_workers,
+ )
++from app.services.telegram.delivery import (
++    IdempotentTelegramDelivery,
++    configure_telegram_delivery,
++)
+ 
+ logger = logging.getLogger(__name__)
++RuntimeRole = Literal["web", "worker", "combined"]
++
++
++def _clean_role(value: str) -> RuntimeRole:
++    role = str(value or "combined").strip().lower()
++    if role not in {"web", "worker", "combined"}:
++        raise ValueError("Runtime role must be web, worker, or combined.")
++    return role  # type: ignore[return-value]
++
++
++def _role_has_workers(role: RuntimeRole) -> bool:
++    return role in {"worker", "combined"}
++
++
++def _role_has_web(role: RuntimeRole) -> bool:
++    return role in {"web", "combined"}
+ 
+ 
+ class RuntimeContext:
+-    """Own external clients, security stores, queues, and workers once per process."""
++    """Own external clients, queues, artifacts, delivery, and workers once."""
+ 
+     def __init__(self, legacy: Any = _legacy) -> None:
+         self.legacy = legacy
+@@ -39,19 +64,36 @@
+         self.cors_store: Any | None = None
+         self.admin_authorizer: Any | None = None
+         self.job_queue: Any | None = None
++        self.artifacts: ArtifactService | None = None
++        self.delivery: IdempotentTelegramDelivery | None = None
+         self.job_handlers: BotJobHandlers | None = None
++        self.role: RuntimeRole | None = None
+         self.started = False
+         self.started_at = 0.0
+-        self._owners: set[str] = set()
++        self._owners: dict[str, RuntimeRole] = {}
+         self._lock = asyncio.Lock()
+ 
+-    async def start(self, application: FastAPI, *, owner: str) -> None:
++    async def start(
++        self,
++        application: FastAPI | None = None,
++        *,
++        owner: str,
++        role: str | None = None,
++    ) -> None:
+         clean_owner = str(owner or "runtime").strip()[:64] or "runtime"
++        requested_role = _clean_role(
++            role or os.getenv("PROCESS_ROLE", "combined") or "combined"
++        )
+         async with self._lock:
+             if clean_owner in self._owners:
+                 return
+             if self.started:
+-                self._owners.add(clean_owner)
++                self._owners[clean_owner] = requested_role
++                if _role_has_workers(requested_role):
++                    await self._ensure_workers()
++                if _role_has_web(requested_role) and application is not None:
++                    await self._ensure_web_services(application)
++                self.role = self._effective_role()
+                 return
+ 
+             try:
+@@ -70,86 +112,123 @@
+                 security_status = await self.legacy._bootstrap_runtime_security()
+                 secret_manager = get_runtime_secret_manager()
+                 redis_client = self.legacy.redis_client or secret_manager.redis_client
+-                redis_url = str(
+-                    getattr(self.legacy, "REDIS_URL", "")
+-                    or getattr(self.legacy.SETTINGS, "REDIS_URL", "")
+-                    or ""
+-                )
++                if redis_client is None:
++                    raise RuntimeError("Redis is required for the durable runtime.")
+                 redis_prefix = str(
+                     getattr(self.legacy, "REDIS_CACHE_PREFIX", "") or "tgbot"
+                 )
+ 
+-                cors_store = configure_dynamic_cors_store(
+-                    redis_client=redis_client,
+-                    redis_url=redis_url,
+-                    supabase_client=self.legacy.supabase,
+-                )
+-                cors_snapshot = await cors_store.load(force=True)
+-
+-                admin_authorizer = configure_telegram_admin_authorizer(
+-                    redis_client=redis_client,
+-                    fallback_admin_ids=getattr(self.legacy, "ADMIN_IDS", set()),
+-                )
+-                redis_admin_ids = await admin_authorizer.load_ids(force=True)
+-                if redis_admin_ids:
+-                    self.legacy.ADMIN_IDS.update(redis_admin_ids)
+-                bootstrap_admin = getattr(
+-                    self.legacy,
+-                    "_runtime_admin_bootstrap_state",
+-                    None,
+-                )
+-                if callable(bootstrap_admin):
+-                    bootstrap_admin()
+-
+                 self.settings = self.legacy.SETTINGS
+                 self.redis = redis_client
+                 self.supabase = self.legacy.supabase
+                 self.security = dict(security_status or {})
+-                self.cors_store = cors_store
+-                self.admin_authorizer = admin_authorizer
+-
+-                queue = configure_job_queue(
++                self.job_queue = configure_job_queue(
+                     redis_client,
+                     redis_prefix=redis_prefix,
+                     max_queued_jobs=int(
+                         os.getenv("BOT_JOB_QUEUE_MAX", "1000") or 1000
+                     ),
+                 )
+-                if queue is None:
+-                    raise RuntimeError(
+-                        "Redis is required for the durable production job queue."
+-                    )
+-                self.job_queue = queue
+-
+-                handlers = build_bot_job_handlers(self.legacy)
+-                self.job_handlers = handlers
+-                await start_job_workers(
+-                    handlers.mapping(),
+-                    worker_count=int(os.getenv("BOT_JOB_WORKERS", "2") or 2),
++                if self.job_queue is None:
++                    raise RuntimeError("Could not configure the durable job queue.")
++                self.artifacts = configure_artifact_service(
++                    supabase_client=self.supabase,
++                    role=requested_role,
++                )
++                self.delivery = configure_telegram_delivery(
++                    redis_client,
++                    redis_prefix=redis_prefix,
+                 )
++                if self.delivery is None:
++                    raise RuntimeError("Could not configure Telegram delivery.")
++
+                 self.started_at = time.time()
+                 self.started = True
+-                self._owners.add(clean_owner)
++                self._owners[clean_owner] = requested_role
++                self.role = requested_role
++
++                if _role_has_web(requested_role) and application is not None:
++                    await self._ensure_web_services(application)
++                if _role_has_workers(requested_role):
++                    await self._ensure_workers()
+ 
+-                application.state.runtime = self
+-                application.state.runtime_security = self.security
+-                application.state.dynamic_cors = cors_snapshot.as_dict()
+-                application.state.job_queue = queue
+-                application.state.provider_scope = get_provider_manager().metadata()
+                 logger.info(
+-                    "Runtime started owner=%s workers=%s provider_scope=process",
++                    "Runtime started owner=%s role=%s workers=%s artifact_backend=%s",
+                     clean_owner,
++                    requested_role,
+                     job_worker_snapshot().get("count"),
++                    self.artifacts.backend,
+                 )
+             except BaseException:
+                 await self._stop_unlocked()
+                 raise
+ 
++    def _effective_role(self) -> RuntimeRole:
++        roles = set(self._owners.values())
++        if "combined" in roles or {"web", "worker"}.issubset(roles):
++            return "combined"
++        if "worker" in roles:
++            return "worker"
++        return "web"
++
++    async def _ensure_web_services(self, application: FastAPI) -> None:
++        if self.redis is None:
++            raise RuntimeError("Runtime Redis is unavailable.")
++        if self.cors_store is None:
++            redis_url = str(
++                getattr(self.legacy, "REDIS_URL", "")
++                or getattr(self.legacy.SETTINGS, "REDIS_URL", "")
++                or ""
++            )
++            self.cors_store = configure_dynamic_cors_store(
++                redis_client=self.redis,
++                redis_url=redis_url,
++                supabase_client=self.supabase,
++            )
++            cors_snapshot = await self.cors_store.load(force=True)
++            self.admin_authorizer = configure_telegram_admin_authorizer(
++                redis_client=self.redis,
++                fallback_admin_ids=getattr(self.legacy, "ADMIN_IDS", set()),
++            )
++            redis_admin_ids = await self.admin_authorizer.load_ids(force=True)
++            if redis_admin_ids:
++                self.legacy.ADMIN_IDS.update(redis_admin_ids)
++            bootstrap_admin = getattr(self.legacy, "_runtime_admin_bootstrap_state", None)
++            if callable(bootstrap_admin):
++                bootstrap_admin()
++            application.state.dynamic_cors = cors_snapshot.as_dict()
++
++        application.state.runtime = self
++        application.state.runtime_security = self.security
++        application.state.job_queue = self.job_queue
++        application.state.provider_scope = get_provider_manager().metadata()
++        application.state.artifact_storage = {
++            "backend": self.artifacts.backend if self.artifacts else "unconfigured",
++            "shared": self.artifacts.shared if self.artifacts else False,
++        }
++
++    async def _ensure_workers(self) -> None:
++        if self.job_handlers is not None and job_worker_snapshot().get("count", 0):
++            return
++        if self.artifacts is None or self.delivery is None:
++            raise RuntimeError("Worker dependencies are not configured.")
++        handlers = build_bot_job_handlers(
++            self.legacy,
++            artifacts=self.artifacts,
++            delivery=self.delivery,
++        )
++        self.job_handlers = handlers
++        await start_job_workers(
++            handlers.mapping(),
++            worker_count=int(os.getenv("BOT_JOB_WORKERS", "2") or 2),
++        )
++
+     async def stop(self, *, owner: str) -> None:
+         clean_owner = str(owner or "runtime").strip()[:64] or "runtime"
+         async with self._lock:
+-            self._owners.discard(clean_owner)
++            self._owners.pop(clean_owner, None)
+             if self._owners:
++                self.role = self._effective_role()
+                 return
+             await self._stop_unlocked()
+ 
+@@ -159,6 +238,8 @@
+         if handlers is not None:
+             await handlers.close()
+         configure_job_queue(None)
++        configure_telegram_delivery(None)
++        reset_artifact_service()
+ 
+         if self.cors_store is not None:
+             with suppress(Exception):
+@@ -185,20 +266,32 @@
+         self.cors_store = None
+         self.admin_authorizer = None
+         self.job_queue = None
++        self.artifacts = None
++        self.delivery = None
++        self.role = None
+         self.started = False
+         self.started_at = 0.0
+         self._owners.clear()
+ 
+     def snapshot(self) -> dict[str, Any]:
+         workers = job_worker_snapshot()
++        expects_workers = bool(self.role and _role_has_workers(self.role))
+         return {
+             "started": self.started,
+             "started_at": self.started_at or None,
++            "role": self.role,
+             "owners": sorted(self._owners),
+             "redis": self.redis is not None,
+             "supabase": self.supabase is not None,
+             "security": bool(self.security),
+             "job_queue": self.job_queue is not None,
++            "artifacts": {
++                "configured": self.artifacts is not None,
++                "backend": self.artifacts.backend if self.artifacts else None,
++                "shared": self.artifacts.shared if self.artifacts else False,
++            },
++            "delivery": self.delivery is not None,
++            "expects_workers": expects_workers,
+             "workers": workers,
+             "providers": get_provider_manager().metadata(),
+         }
+@@ -211,4 +304,4 @@
+     return _RUNTIME
+ 
+ 
+-__all__ = ["RuntimeContext", "get_runtime_context"]
++__all__ = ["RuntimeContext", "RuntimeRole", "get_runtime_context"]
+diff -ruN '--exclude=bot_voice_runtime_update_v2_full.patch' '--exclude=__pycache__' a/app/services/artifacts/__init__.py b/app/services/artifacts/__init__.py
+--- a/app/services/artifacts/__init__.py	1970-01-01 00:00:00.000000000 +0000
++++ b/app/services/artifacts/__init__.py	2026-08-05 06:13:57.621791948 +0000
+@@ -0,0 +1,19 @@
++"""Durable job artifact services."""
++
++from app.services.artifacts.models import ArtifactRef
++from app.services.artifacts.storage import (
++    ArtifactNotFound,
++    ArtifactService,
++    ArtifactStorageError,
++    configure_artifact_service,
++    get_artifact_service,
++)
++
++__all__ = [
++    "ArtifactNotFound",
++    "ArtifactRef",
++    "ArtifactService",
++    "ArtifactStorageError",
++    "configure_artifact_service",
++    "get_artifact_service",
++]
+diff -ruN '--exclude=bot_voice_runtime_update_v2_full.patch' '--exclude=__pycache__' a/app/services/artifacts/models.py b/app/services/artifacts/models.py
+--- a/app/services/artifacts/models.py	1970-01-01 00:00:00.000000000 +0000
++++ b/app/services/artifacts/models.py	2026-08-05 06:13:57.616778579 +0000
+@@ -0,0 +1,45 @@
++"""Durable artifact metadata shared by background jobs and delivery code."""
++
++from __future__ import annotations
++
++from dataclasses import asdict, dataclass
++from typing import Any
++
++
++@dataclass(frozen=True, slots=True)
++class ArtifactRef:
++    """Small JSON-safe reference to content stored outside Redis job hashes."""
++
++    id: str
++    backend: str
++    path: str
++    content_type: str
++    size_bytes: int
++    sha256: str
++    created_at: float
++    expires_at: float | None = None
++    bucket: str = ""
++
++    def as_dict(self) -> dict[str, Any]:
++        return asdict(self)
++
++    @classmethod
++    def from_dict(cls, value: dict[str, Any]) -> "ArtifactRef":
++        return cls(
++            id=str(value.get("id") or ""),
++            backend=str(value.get("backend") or ""),
++            path=str(value.get("path") or ""),
++            content_type=str(value.get("content_type") or "application/octet-stream"),
++            size_bytes=int(value.get("size_bytes") or 0),
++            sha256=str(value.get("sha256") or ""),
++            created_at=float(value.get("created_at") or 0.0),
++            expires_at=(
++                float(value["expires_at"])
++                if value.get("expires_at") not in (None, "")
++                else None
++            ),
++            bucket=str(value.get("bucket") or ""),
++        )
++
++
++__all__ = ["ArtifactRef"]
+diff -ruN '--exclude=bot_voice_runtime_update_v2_full.patch' '--exclude=__pycache__' a/app/services/artifacts/storage.py b/app/services/artifacts/storage.py
+--- a/app/services/artifacts/storage.py	1970-01-01 00:00:00.000000000 +0000
++++ b/app/services/artifacts/storage.py	2026-08-05 06:22:02.153587826 +0000
+@@ -0,0 +1,324 @@
++"""Durable artifact storage for job outputs.
++
++Supabase Storage is the production backend. A local atomic backend remains
++available for one-process development and tests, but is intentionally reported
++as non-shared so deployments do not mistake it for cross-instance storage.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import hashlib
++import inspect
++import logging
++import os
++import re
++import tempfile
++import time
++import uuid
++from contextlib import suppress
++from pathlib import Path
++from typing import Any
++
++from app.services.artifacts.models import ArtifactRef
++
++logger = logging.getLogger(__name__)
++_SAFE_PATH = re.compile(r"[^A-Za-z0-9._/-]+")
++
++
++class ArtifactStorageError(RuntimeError):
++    """Base artifact storage error."""
++
++
++class ArtifactNotFound(ArtifactStorageError):
++    """Raised when a referenced artifact no longer exists."""
++
++
++def _clean_path(value: str) -> str:
++    cleaned = _SAFE_PATH.sub("-", str(value or "").strip().replace("\\", "/"))
++    cleaned = "/".join(part for part in cleaned.split("/") if part not in {"", ".", ".."})
++    if not cleaned or len(cleaned) > 512:
++        raise ValueError("Artifact path is missing or too long.")
++    return cleaned
++
++
++def _content_hash(data: bytes) -> str:
++    return hashlib.sha256(data).hexdigest()
++
++
++def _artifact_id(path: str, digest: str) -> str:
++    return hashlib.sha256(f"{path}:{digest}".encode("utf-8")).hexdigest()[:32]
++
++
++class LocalArtifactStore:
++    """Atomic local storage for development and single-host deployments."""
++
++    backend = "local"
++    shared = False
++
++    def __init__(self, root: str | os.PathLike[str], *, max_bytes: int) -> None:
++        self.root = Path(root).expanduser().resolve()
++        self.root.mkdir(parents=True, exist_ok=True)
++        self.max_bytes = max(1_024, int(max_bytes))
++
++    def _target(self, path: str) -> Path:
++        clean = _clean_path(path)
++        target = (self.root / clean).resolve()
++        if self.root not in target.parents:
++            raise ValueError("Artifact path escapes the configured root.")
++        return target
++
++    async def put_bytes(
++        self,
++        path: str,
++        data: bytes,
++        *,
++        content_type: str,
++        ttl_seconds: int | None = None,
++    ) -> ArtifactRef:
++        payload = bytes(data)
++        if len(payload) > self.max_bytes:
++            raise ArtifactStorageError(
++                f"Artifact exceeds the {self.max_bytes}-byte limit."
++            )
++        target = self._target(path)
++        target.parent.mkdir(parents=True, exist_ok=True)
++        digest = _content_hash(payload)
++
++        def write() -> None:
++            fd, temporary = tempfile.mkstemp(
++                prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
++            )
++            try:
++                with os.fdopen(fd, "wb") as handle:
++                    handle.write(payload)
++                    handle.flush()
++                    os.fsync(handle.fileno())
++                os.replace(temporary, target)
++            except BaseException:
++                with suppress(OSError):
++                    os.close(fd)
++                with suppress(OSError):
++                    os.unlink(temporary)
++                raise
++
++        await asyncio.to_thread(write)
++        created = time.time()
++        return ArtifactRef(
++            id=_artifact_id(_clean_path(path), digest),
++            backend=self.backend,
++            path=_clean_path(path),
++            content_type=str(content_type or "application/octet-stream")[:128],
++            size_bytes=len(payload),
++            sha256=digest,
++            created_at=created,
++            expires_at=(created + int(ttl_seconds)) if ttl_seconds else None,
++        )
++
++    async def get_bytes(self, artifact: ArtifactRef) -> bytes:
++        target = self._target(artifact.path)
++        try:
++            payload = await asyncio.to_thread(target.read_bytes)
++        except FileNotFoundError as exc:
++            raise ArtifactNotFound(artifact.path) from exc
++        if len(payload) != artifact.size_bytes or _content_hash(payload) != artifact.sha256:
++            raise ArtifactStorageError("Artifact integrity validation failed.")
++        return payload
++
++    async def delete(self, artifact: ArtifactRef) -> bool:
++        target = self._target(artifact.path)
++
++        def remove() -> bool:
++            try:
++                target.unlink()
++            except FileNotFoundError:
++                return False
++            return True
++
++        return await asyncio.to_thread(remove)
++
++
++class SupabaseArtifactStore:
++    """Supabase Storage backend safe for separate web and worker services."""
++
++    backend = "supabase"
++    shared = True
++
++    def __init__(self, client: Any, *, bucket: str, max_bytes: int) -> None:
++        if client is None:
++            raise ArtifactStorageError("Supabase client is required.")
++        self.client = client
++        self.bucket = str(bucket or "bot-job-artifacts").strip()
++        if not self.bucket or len(self.bucket) > 128:
++            raise ValueError("Artifact bucket is missing or too long.")
++        self.max_bytes = max(1_024, int(max_bytes))
++
++    def _bucket(self) -> Any:
++        storage = getattr(self.client, "storage", None)
++        selector = getattr(storage, "from_", None)
++        if not callable(selector):
++            raise ArtifactStorageError("Supabase Storage API is unavailable.")
++        return selector(self.bucket)
++
++    async def put_bytes(
++        self,
++        path: str,
++        data: bytes,
++        *,
++        content_type: str,
++        ttl_seconds: int | None = None,
++    ) -> ArtifactRef:
++        payload = bytes(data)
++        if len(payload) > self.max_bytes:
++            raise ArtifactStorageError(
++                f"Artifact exceeds the {self.max_bytes}-byte limit."
++            )
++        clean = _clean_path(path)
++        digest = _content_hash(payload)
++
++        def upload() -> Any:
++            return self._bucket().upload(
++                clean,
++                payload,
++                file_options={
++                    "content-type": str(content_type or "application/octet-stream"),
++                    "upsert": "true",
++                },
++            )
++
++        try:
++            result = await asyncio.to_thread(upload)
++            if inspect.isawaitable(result):
++                await result
++        except Exception as exc:
++            raise ArtifactStorageError("Supabase artifact upload failed.") from exc
++        created = time.time()
++        return ArtifactRef(
++            id=_artifact_id(clean, digest),
++            backend=self.backend,
++            bucket=self.bucket,
++            path=clean,
++            content_type=str(content_type or "application/octet-stream")[:128],
++            size_bytes=len(payload),
++            sha256=digest,
++            created_at=created,
++            expires_at=(created + int(ttl_seconds)) if ttl_seconds else None,
++        )
++
++    async def get_bytes(self, artifact: ArtifactRef) -> bytes:
++        try:
++            payload = await asyncio.to_thread(self._bucket().download, artifact.path)
++            if inspect.isawaitable(payload):
++                payload = await payload
++        except Exception as exc:
++            raise ArtifactNotFound(artifact.path) from exc
++        data = bytes(payload or b"")
++        if len(data) != artifact.size_bytes or _content_hash(data) != artifact.sha256:
++            raise ArtifactStorageError("Artifact integrity validation failed.")
++        return data
++
++    async def delete(self, artifact: ArtifactRef) -> bool:
++        try:
++            result = await asyncio.to_thread(self._bucket().remove, [artifact.path])
++            if inspect.isawaitable(result):
++                await result
++        except Exception as exc:
++            raise ArtifactStorageError("Supabase artifact deletion failed.") from exc
++        return True
++
++
++class ArtifactService:
++    """Create deterministic artifact references for retry-safe jobs."""
++
++    def __init__(self, store: LocalArtifactStore | SupabaseArtifactStore) -> None:
++        self.store = store
++
++    @property
++    def backend(self) -> str:
++        return self.store.backend
++
++    @property
++    def shared(self) -> bool:
++        return self.store.shared
++
++    async def put_text(
++        self,
++        *,
++        job_id: str,
++        name: str,
++        text: str,
++        ttl_seconds: int | None = None,
++    ) -> ArtifactRef:
++        safe_name = _clean_path(name).rsplit("/", 1)[-1]
++        path = f"results/{_clean_path(job_id)}/{safe_name}"
++        return await self.store.put_bytes(
++            path,
++            str(text).encode("utf-8"),
++            content_type="text/plain; charset=utf-8",
++            ttl_seconds=ttl_seconds,
++        )
++
++    async def get_text(self, artifact: ArtifactRef) -> str:
++        return (await self.store.get_bytes(artifact)).decode("utf-8", errors="strict")
++
++
++_ARTIFACT_SERVICE: ArtifactService | None = None
++
++
++def configure_artifact_service(
++    *,
++    supabase_client: Any | None,
++    role: str,
++) -> ArtifactService:
++    global _ARTIFACT_SERVICE
++    mode = str(os.getenv("BOT_ARTIFACT_STORAGE_MODE", "auto") or "auto").strip().lower()
++    bucket = str(os.getenv("BOT_ARTIFACT_STORAGE_BUCKET", "bot-job-artifacts") or "bot-job-artifacts")
++    max_bytes = int(os.getenv("BOT_ARTIFACT_MAX_BYTES", "52428800") or 52_428_800)
++
++    if mode not in {"auto", "supabase", "local"}:
++        raise ArtifactStorageError("BOT_ARTIFACT_STORAGE_MODE must be auto, supabase, or local.")
++    if mode in {"auto", "supabase"} and supabase_client is not None:
++        store: LocalArtifactStore | SupabaseArtifactStore = SupabaseArtifactStore(
++            supabase_client,
++            bucket=bucket,
++            max_bytes=max_bytes,
++        )
++    elif mode == "supabase":
++        raise ArtifactStorageError("Supabase artifact storage was requested but is unavailable.")
++    else:
++        root = os.getenv("BOT_ARTIFACT_LOCAL_DIRECTORY", "data/job-artifacts")
++        store = LocalArtifactStore(root, max_bytes=max_bytes)
++        if str(role).lower() == "worker":
++            logger.warning(
++                "Worker is using local artifact storage. Use Supabase for multi-instance durability."
++            )
++    _ARTIFACT_SERVICE = ArtifactService(store)
++    return _ARTIFACT_SERVICE
++
++
++def get_artifact_service() -> ArtifactService:
++    if _ARTIFACT_SERVICE is None:
++        raise ArtifactStorageError("Artifact storage is not configured.")
++    return _ARTIFACT_SERVICE
++
++
++def reset_artifact_service() -> None:
++    global _ARTIFACT_SERVICE
++    _ARTIFACT_SERVICE = None
++
++
++def deterministic_artifact_name(kind: str) -> str:
++    clean = _clean_path(kind).replace("/", "-")
++    return f"{clean}-{uuid.uuid4().hex[:8]}.txt"
++
++
++__all__ = [
++    "ArtifactNotFound",
++    "ArtifactService",
++    "ArtifactStorageError",
++    "LocalArtifactStore",
++    "SupabaseArtifactStore",
++    "configure_artifact_service",
++    "get_artifact_service",
++    "reset_artifact_service",
++]
+diff -ruN '--exclude=bot_voice_runtime_update_v2_full.patch' '--exclude=__pycache__' a/app/services/jobs/handlers.py b/app/services/jobs/handlers.py
+--- a/app/services/jobs/handlers.py	2026-08-05 04:58:42.000000000 +0000
++++ b/app/services/jobs/handlers.py	2026-08-05 06:23:23.872517200 +0000
+@@ -8,6 +8,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import html
+ import os
+ import tempfile
+ from collections.abc import Mapping
+@@ -16,7 +17,9 @@
+ 
+ from telegram import Bot
+ 
++from app.services.artifacts.storage import ArtifactService
+ from app.services.jobs.queue import JobContext, JobHandler
++from app.services.telegram.delivery import IdempotentTelegramDelivery
+ 
+ 
+ class BotJobPayloadError(ValueError):
+@@ -61,8 +64,16 @@
+ class BotJobHandlers:
+     """Own a lightweight Telegram Bot client and durable workload handlers."""
+ 
+-    def __init__(self, legacy: Any) -> None:
++    def __init__(
++        self,
++        legacy: Any,
++        *,
++        artifacts: ArtifactService,
++        delivery: IdempotentTelegramDelivery,
++    ) -> None:
+         self.legacy = legacy
++        self.artifacts = artifacts
++        self.delivery = delivery
+         self._bot: Bot | None = None
+         self._bot_lock = asyncio.Lock()
+ 
+@@ -123,6 +134,15 @@
+                 os.unlink(path)
+             raise
+ 
++    @staticmethod
++    def _progress_message_id(payload: Mapping[str, Any]) -> int | None:
++        raw = payload.get("progress_message_id")
++        try:
++            value = int(raw or 0)
++        except (TypeError, ValueError):
++            return None
++        return value if value > 0 else None
++
+     async def _notify_terminal_error(
+         self,
+         payload: Mapping[str, Any],
+@@ -131,20 +151,117 @@
+     ) -> None:
+         if context.job.attempts < context.job.max_attempts:
+             return
+-        chat_id = payload.get("chat_id")
+         try:
+-            target = int(chat_id or 0)
++            target = int(payload.get("chat_id") or 0)
+         except (TypeError, ValueError):
+             return
+         if target <= 0:
+             return
+-        bot = await self.bot()
+         message = (
+-            "❌ The background task could not be completed after retries. "
+-            f"Job: {context.job.id[:12]} · {type(error).__name__}."
++            "❌ ការងារផ្ទៃក្រោយមិនអាចបញ្ចប់បានបន្ទាប់ពីសាកល្បងឡើងវិញ។ "
++            f"Job: {context.job.id[:12]}."
+         )
+         with suppress(Exception):
+-            await bot.send_message(chat_id=target, text=message)
++            await self.delivery.deliver_text(
++                bot=await self.bot(),
++                idempotency_key=f"job:{context.job.id}:terminal-error",
++                chat_id=target,
++                text=message,
++                progress_message_id=self._progress_message_id(payload),
++                reply_to_message_id=_optional_reply_id(payload),
++            )
++
++    def _result_page(
++        self,
++        text: str,
++        *,
++        header: str,
++    ) -> str:
++        limit = max(500, int(getattr(self.legacy, "TELE_MSG_LIMIT", 4096)) - len(header) - 180)
++        paginator = getattr(self.legacy, "_paginate_plain", None)
++        pages = paginator(text, limit=limit) if callable(paginator) else [text[:limit]]
++        first = str((pages or [""])[0])
++        suffix = ""
++        if len(pages or ()) > 1:
++            suffix = "\n\n<i>លទ្ធផលពេញត្រូវបានរក្សាទុកដោយសុវត្ថិភាពសម្រាប់សកម្មភាពបន្ទាប់។</i>"
++        return header + html.escape(first) + suffix
++
++    async def _deliver_text_result(
++        self,
++        *,
++        payload: Mapping[str, Any],
++        context: JobContext,
++        text: str,
++        kind: str,
++    ) -> dict[str, Any]:
++        artifact = await self.artifacts.put_text(
++            job_id=context.job.id,
++            name="ocr.txt" if kind == "ocr" else "transcript.txt",
++            text=text,
++            ttl_seconds=int(payload.get("artifact_ttl_seconds") or 604_800),
++        )
++        chat_id = _required_int(payload, "chat_id")
++        user_id = int(payload.get("user_id") or chat_id)
++        username = str(payload.get("username") or user_id)[:128]
++        lang_key = self.legacy._detect_lang(text)
++        lang_flag, lang_name = self.legacy._language_display(lang_key)
++        progress_id = self._progress_message_id(payload)
++        result_id = progress_id or int(payload.get("reply_to_message_id") or 0)
++
++        if kind == "ocr":
++            header = (
++                f"🔍 <b>អត្ថបទពីរូបភាព {lang_flag} "
++                f"{html.escape(lang_name)}</b>\n\n"
++            )
++            markup = self.legacy.get_ocr_confirm_kb(result_id) if result_id else None
++            cache_prefix = "[Image OCR]"
++        else:
++            source_kind = str(payload.get("source_kind") or "voice")
++            if source_kind == "audio_file":
++                filename = html.escape(str(payload.get("filename") or "audio")[:50])
++                header = (
++                    f"🎵 <b>អត្ថបទពីឯកសារអូឌីយ៉ូ</b> {lang_flag} "
++                    f"{html.escape(lang_name)} — <code>{filename}</code>\n\n"
++                )
++                markup = self.legacy.get_audio_file_kb(result_id) if result_id else None
++                cache_prefix = "[Audio File Transcript]"
++            else:
++                header = (
++                    f"📝 <b>អត្ថបទពីសារសំឡេង</b> {lang_flag} "
++                    f"{html.escape(lang_name)}\n\n"
++                )
++                markup = self.legacy.get_transcription_kb(result_id) if result_id else None
++                cache_prefix = "[Voice Transcript]"
++
++        rendered = self._result_page(text, header=header)
++        delivered = await self.delivery.deliver_text(
++            bot=await self.bot(),
++            idempotency_key=f"job:{context.job.id}:telegram-result",
++            chat_id=chat_id,
++            text=rendered,
++            progress_message_id=progress_id,
++            reply_to_message_id=_optional_reply_id(payload),
++            parse_mode="HTML",
++            reply_markup=markup,
++        )
++        resolved_id = int(delivered.get("message_id") or result_id or 0)
++        if resolved_id:
++            with suppress(Exception):
++                self.legacy.save_text_cache(
++                    resolved_id,
++                    text,
++                    chat_id=chat_id,
++                    user_id=user_id,
++                    username=username,
++                )
++        with suppress(Exception):
++            self.legacy.record_turn(user_id, "user", f"{cache_prefix}: {text[:500]}")
++        return {
++            "artifact": artifact.as_dict(),
++            "delivery": delivered,
++            "characters": len(text),
++            "language": lang_key,
++        }
+ 
+     async def _progress(
+         self,
+@@ -232,7 +349,6 @@
+         payload: Mapping[str, Any],
+         context: JobContext,
+     ) -> dict[str, Any]:
+-        chat_id = _required_int(payload, "chat_id")
+         file_id = _required_text(payload, "file_id", max_chars=512)
+         mime_type = str(payload.get("mime_type") or "image/jpeg").strip().lower()
+         suffix = str(payload.get("suffix") or ".jpg").strip()
+@@ -240,28 +356,25 @@
+             suffix = ".jpg"
+         max_bytes = int(getattr(self.legacy, "MAX_IMAGE_FILE_BYTES", 20_000_000))
+         await self._progress(context, 10, "downloading_image")
+-        path = await self._download(
+-            file_id,
+-            suffix=suffix,
+-            max_bytes=max_bytes,
+-        )
++        path = await self._download(file_id, suffix=suffix, max_bytes=max_bytes)
+         try:
++            if await context.cancelled():
++                return {"cancelled": True}
+             await self._progress(context, 45, "recognizing_text")
+             text = await self.legacy.ocr_image(path, mime_type)
+             if await context.cancelled():
+                 return {"cancelled": True}
+-            await self._progress(context, 85, "sending_result")
+-            bot = await self.bot()
+-            sent = await bot.send_message(
+-                chat_id=chat_id,
+-                text=text or "No text was detected.",
+-                reply_to_message_id=_optional_reply_id(payload),
++            if not text or str(text).strip().upper() == "NOTEXT":
++                text = "រូបភាពនេះមិនមានអត្ថបទដែលអាចអានបានទេ។"
++            await self._progress(context, 80, "storing_result")
++            result = await self._deliver_text_result(
++                payload=payload,
++                context=context,
++                text=str(text),
++                kind="ocr",
+             )
+-            return {
+-                "chat_id": chat_id,
+-                "message_id": int(getattr(sent, "message_id", 0) or 0),
+-                "characters": len(text or ""),
+-            }
++            await self._progress(context, 100, "completed")
++            return result
+         except Exception as exc:
+             await self._notify_terminal_error(payload, context, exc)
+             raise
+@@ -274,7 +387,6 @@
+         payload: Mapping[str, Any],
+         context: JobContext,
+     ) -> dict[str, Any]:
+-        chat_id = _required_int(payload, "chat_id")
+         file_id = _required_text(payload, "file_id", max_chars=512)
+         mime_type = str(payload.get("mime_type") or "audio/ogg").strip().lower()
+         suffix = str(payload.get("suffix") or ".ogg").strip()
+@@ -282,12 +394,10 @@
+             suffix = ".ogg"
+         max_bytes = int(getattr(self.legacy, "MAX_AUDIO_FILE_BYTES", 50_000_000))
+         await self._progress(context, 10, "downloading_audio")
+-        path = await self._download(
+-            file_id,
+-            suffix=suffix,
+-            max_bytes=max_bytes,
+-        )
++        path = await self._download(file_id, suffix=suffix, max_bytes=max_bytes)
+         try:
++            if await context.cancelled():
++                return {"cancelled": True}
+             await self._progress(context, 45, "transcribing_audio")
+             if mime_type == "audio/ogg":
+                 text = await self.legacy.transcribe_voice(path)
+@@ -295,18 +405,17 @@
+                 text = await self.legacy.transcribe_audio_file(path, mime_type)
+             if await context.cancelled():
+                 return {"cancelled": True}
+-            await self._progress(context, 85, "sending_result")
+-            bot = await self.bot()
+-            sent = await bot.send_message(
+-                chat_id=chat_id,
+-                text=text or "No speech was detected.",
+-                reply_to_message_id=_optional_reply_id(payload),
++            if not text:
++                text = "មិនអាចស្គាល់អត្ថបទនៅក្នុងសំឡេងនេះបានទេ។"
++            await self._progress(context, 80, "storing_result")
++            result = await self._deliver_text_result(
++                payload=payload,
++                context=context,
++                text=str(text),
++                kind="transcription",
+             )
+-            return {
+-                "chat_id": chat_id,
+-                "message_id": int(getattr(sent, "message_id", 0) or 0),
+-                "characters": len(text or ""),
+-            }
++            await self._progress(context, 100, "completed")
++            return result
+         except Exception as exc:
+             await self._notify_terminal_error(payload, context, exc)
+             raise
+@@ -395,8 +504,13 @@
+         }
+ 
+ 
+-def build_bot_job_handlers(legacy: Any) -> BotJobHandlers:
+-    return BotJobHandlers(legacy)
++def build_bot_job_handlers(
++    legacy: Any,
++    *,
++    artifacts: ArtifactService,
++    delivery: IdempotentTelegramDelivery,
++) -> BotJobHandlers:
++    return BotJobHandlers(legacy, artifacts=artifacts, delivery=delivery)
+ 
+ 
+ __all__ = [
+diff -ruN '--exclude=bot_voice_runtime_update_v2_full.patch' '--exclude=__pycache__' a/app/services/jobs/submission.py b/app/services/jobs/submission.py
+--- a/app/services/jobs/submission.py	2026-08-05 04:54:08.000000000 +0000
++++ b/app/services/jobs/submission.py	2026-08-05 06:16:28.845562968 +0000
+@@ -39,9 +39,12 @@
+ async def submit_ocr_job(
+     *,
+     chat_id: int,
++    user_id: int,
++    username: str,
+     file_id: str,
+     mime_type: str,
+     suffix: str = ".jpg",
++    progress_message_id: int | None = None,
+     reply_to_message_id: int | None = None,
+     idempotency_key: str,
+ ):
+@@ -49,10 +52,14 @@
+         "ocr",
+         {
+             "chat_id": int(chat_id),
++            "user_id": int(user_id),
++            "username": str(username),
+             "file_id": str(file_id),
+             "mime_type": str(mime_type),
+             "suffix": str(suffix),
++            "progress_message_id": progress_message_id,
+             "reply_to_message_id": reply_to_message_id,
++            "artifact_ttl_seconds": 604_800,
+         },
+         idempotency_key=idempotency_key,
+         timeout_seconds=180,
+@@ -63,20 +70,34 @@
+ async def submit_transcription_job(
+     *,
+     chat_id: int,
++    user_id: int,
++    username: str,
+     file_id: str,
+     mime_type: str,
+     suffix: str = ".ogg",
++    source_kind: str = "voice",
++    filename: str = "",
++    progress_message_id: int | None = None,
+     reply_to_message_id: int | None = None,
+     idempotency_key: str,
+ ):
++    clean_source = str(source_kind or "voice").strip().lower()
++    if clean_source not in {"voice", "audio_file"}:
++        raise ValueError("source_kind must be voice or audio_file.")
+     return await enqueue_bot_job(
+         "transcription",
+         {
+             "chat_id": int(chat_id),
++            "user_id": int(user_id),
++            "username": str(username),
+             "file_id": str(file_id),
+             "mime_type": str(mime_type),
+             "suffix": str(suffix),
++            "source_kind": clean_source,
++            "filename": str(filename),
++            "progress_message_id": progress_message_id,
+             "reply_to_message_id": reply_to_message_id,
++            "artifact_ttl_seconds": 604_800,
+         },
+         idempotency_key=idempotency_key,
+         timeout_seconds=240,
+diff -ruN '--exclude=bot_voice_runtime_update_v2_full.patch' '--exclude=__pycache__' a/app/services/telegram/delivery.py b/app/services/telegram/delivery.py
+--- a/app/services/telegram/delivery.py	1970-01-01 00:00:00.000000000 +0000
++++ b/app/services/telegram/delivery.py	2026-08-05 06:21:20.643388895 +0000
+@@ -0,0 +1,304 @@
++"""Redis-backed idempotent Telegram result delivery.
++
++A known progress message ID is edited in place whenever possible. Retrying the
++same job therefore converges on one Telegram message instead of sending a new
++result for every worker attempt.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import hashlib
++import json
++import secrets
++import time
++from dataclasses import dataclass
++from typing import Any
++
++try:
++    from telegram.error import BadRequest
++except Exception:  # pragma: no cover - optional in isolated tooling
++    class BadRequest(Exception):
++        """Fallback used when python-telegram-bot is not installed."""
++
++
++_CLAIM_SCRIPT = """
++-- bot_voice:delivery_claim_v1
++local state = redis.call('HGET', KEYS[1], 'state')
++if state == 'completed' then
++  return {2, redis.call('HGET', KEYS[1], 'result') or ''}
++end
++local deadline = tonumber(redis.call('HGET', KEYS[1], 'lease_deadline') or '0')
++if state == 'processing' and deadline > tonumber(ARGV[1]) then
++  return {0, ''}
++end
++redis.call(
++  'HSET', KEYS[1],
++  'state', 'processing',
++  'lease_token', ARGV[2],
++  'lease_deadline', ARGV[3],
++  'updated_at', ARGV[1]
++)
++redis.call('HINCRBY', KEYS[1], 'attempts', 1)
++redis.call('EXPIRE', KEYS[1], ARGV[4])
++return {1, ''}
++""".strip()
++
++_COMPLETE_SCRIPT = """
++-- bot_voice:delivery_complete_v1
++if redis.call('HGET', KEYS[1], 'state') ~= 'processing' then
++  return 0
++end
++if redis.call('HGET', KEYS[1], 'lease_token') ~= ARGV[1] then
++  return 0
++end
++redis.call(
++  'HSET', KEYS[1],
++  'state', 'completed',
++  'result', ARGV[2],
++  'updated_at', ARGV[3]
++)
++redis.call('HDEL', KEYS[1], 'lease_token', 'lease_deadline')
++redis.call('EXPIRE', KEYS[1], ARGV[4])
++return 1
++""".strip()
++
++_RELEASE_SCRIPT = """
++-- bot_voice:delivery_release_v1
++if redis.call('HGET', KEYS[1], 'state') ~= 'processing' then
++  return 0
++end
++if redis.call('HGET', KEYS[1], 'lease_token') ~= ARGV[1] then
++  return 0
++end
++redis.call(
++  'HSET', KEYS[1],
++  'state', 'failed',
++  'last_error', ARGV[2],
++  'updated_at', ARGV[3]
++)
++redis.call('HDEL', KEYS[1], 'lease_token', 'lease_deadline')
++redis.call('EXPIRE', KEYS[1], ARGV[4])
++return 1
++""".strip()
++
++
++class TelegramDeliveryError(RuntimeError):
++    """Base delivery error."""
++
++
++class TelegramDeliveryBusy(TelegramDeliveryError):
++    """Raised when another worker still owns the delivery lease."""
++
++
++@dataclass(frozen=True, slots=True)
++class DeliveryClaim:
++    status: str
++    token: str = ""
++    result: dict[str, Any] | None = None
++
++
++class RedisDeliveryStore:
++    """Small delivery state machine with expiring leases and retained results."""
++
++    def __init__(
++        self,
++        redis_client: Any,
++        *,
++        redis_prefix: str = "tgbot",
++        lease_seconds: float = 90.0,
++        retention_seconds: int = 604_800,
++    ) -> None:
++        if redis_client is None:
++            raise TelegramDeliveryError("Redis is required for idempotent delivery.")
++        prefix = str(redis_prefix or "tgbot").strip().strip(":") or "tgbot"
++        self.redis = redis_client
++        self.prefix = f"{prefix}:delivery:v1"
++        self.lease_seconds = max(15.0, min(3_600.0, float(lease_seconds)))
++        self.retention_seconds = max(300, min(2_592_000, int(retention_seconds)))
++
++    def key(self, idempotency_key: str) -> str:
++        clean = str(idempotency_key or "").strip()
++        if not clean:
++            raise ValueError("Delivery idempotency key is required.")
++        digest = hashlib.sha256(clean.encode("utf-8")).hexdigest()
++        return f"{self.prefix}:{digest}"
++
++    async def _call(self, method: str, *args: Any) -> Any:
++        try:
++            return await asyncio.to_thread(getattr(self.redis, method), *args)
++        except Exception as exc:
++            raise TelegramDeliveryError(f"Redis delivery {method} failed.") from exc
++
++    @staticmethod
++    def _decode(value: Any) -> str:
++        return value.decode("utf-8") if isinstance(value, bytes) else str(value or "")
++
++    async def claim(self, idempotency_key: str) -> DeliveryClaim:
++        now = time.time()
++        token = secrets.token_urlsafe(24)
++        raw = await self._call(
++            "eval",
++            _CLAIM_SCRIPT,
++            1,
++            self.key(idempotency_key),
++            str(now),
++            token,
++            str(now + self.lease_seconds),
++            str(self.retention_seconds),
++        )
++        values = list(raw or ())
++        if len(values) != 2:
++            raise TelegramDeliveryError("Redis returned an invalid delivery claim.")
++        status = int(values[0])
++        if status == 2:
++            result_raw = self._decode(values[1])
++            try:
++                result = json.loads(result_raw) if result_raw else {}
++            except json.JSONDecodeError as exc:
++                raise TelegramDeliveryError("Stored delivery result is invalid.") from exc
++            return DeliveryClaim("completed", result=result)
++        if status == 1:
++            return DeliveryClaim("claimed", token=token)
++        return DeliveryClaim("busy")
++
++    async def complete(
++        self,
++        idempotency_key: str,
++        token: str,
++        result: dict[str, Any],
++    ) -> bool:
++        payload = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
++        changed = await self._call(
++            "eval",
++            _COMPLETE_SCRIPT,
++            1,
++            self.key(idempotency_key),
++            token,
++            payload,
++            str(time.time()),
++            str(self.retention_seconds),
++        )
++        return bool(changed)
++
++    async def release(
++        self,
++        idempotency_key: str,
++        token: str,
++        error: BaseException | str,
++    ) -> bool:
++        changed = await self._call(
++            "eval",
++            _RELEASE_SCRIPT,
++            1,
++            self.key(idempotency_key),
++            token,
++            str(error)[:500],
++            str(time.time()),
++            str(self.retention_seconds),
++        )
++        return bool(changed)
++
++
++class IdempotentTelegramDelivery:
++    """Edit one known result message, or send once when no target exists."""
++
++    def __init__(self, store: RedisDeliveryStore) -> None:
++        self.store = store
++
++    async def deliver_text(
++        self,
++        *,
++        bot: Any,
++        idempotency_key: str,
++        chat_id: int,
++        text: str,
++        progress_message_id: int | None,
++        reply_to_message_id: int | None = None,
++        parse_mode: str | None = None,
++        reply_markup: Any | None = None,
++        disable_web_page_preview: bool = True,
++    ) -> dict[str, Any]:
++        claim = await self.store.claim(idempotency_key)
++        if claim.status == "completed":
++            return dict(claim.result or {})
++        if claim.status != "claimed":
++            raise TelegramDeliveryBusy("Another worker is delivering this result.")
++
++        try:
++            message_id = int(progress_message_id or 0)
++            if message_id > 0:
++                try:
++                    message = await bot.edit_message_text(
++                        chat_id=int(chat_id),
++                        message_id=message_id,
++                        text=str(text),
++                        parse_mode=parse_mode,
++                        reply_markup=reply_markup,
++                        disable_web_page_preview=disable_web_page_preview,
++                    )
++                    resolved_id = int(getattr(message, "message_id", 0) or message_id)
++                except BadRequest as exc:
++                    if "message is not modified" not in str(exc).lower():
++                        raise
++                    resolved_id = message_id
++            else:
++                kwargs: dict[str, Any] = {
++                    "chat_id": int(chat_id),
++                    "text": str(text),
++                    "parse_mode": parse_mode,
++                    "reply_markup": reply_markup,
++                    "disable_web_page_preview": disable_web_page_preview,
++                }
++                if reply_to_message_id:
++                    kwargs["reply_to_message_id"] = int(reply_to_message_id)
++                message = await bot.send_message(**kwargs)
++                resolved_id = int(getattr(message, "message_id", 0) or 0)
++
++            result = {
++                "chat_id": int(chat_id),
++                "message_id": resolved_id,
++                "mode": "edit" if message_id > 0 else "send",
++                "delivered_at": time.time(),
++            }
++            if not await self.store.complete(idempotency_key, claim.token, result):
++                raise TelegramDeliveryError("Delivery lease was lost before completion.")
++            return result
++        except BaseException as exc:
++            await self.store.release(idempotency_key, claim.token, exc)
++            raise
++
++
++_DELIVERY: IdempotentTelegramDelivery | None = None
++
++
++def configure_telegram_delivery(
++    redis_client: Any | None,
++    *,
++    redis_prefix: str = "tgbot",
++) -> IdempotentTelegramDelivery | None:
++    global _DELIVERY
++    if redis_client is None:
++        _DELIVERY = None
++        return None
++    _DELIVERY = IdempotentTelegramDelivery(
++        RedisDeliveryStore(redis_client, redis_prefix=redis_prefix)
++    )
++    return _DELIVERY
++
++
++def get_telegram_delivery() -> IdempotentTelegramDelivery:
++    if _DELIVERY is None:
++        raise TelegramDeliveryError("Telegram delivery is not configured.")
++    return _DELIVERY
++
++
++__all__ = [
++    "DeliveryClaim",
++    "IdempotentTelegramDelivery",
++    "RedisDeliveryStore",
++    "TelegramDeliveryBusy",
++    "TelegramDeliveryError",
++    "configure_telegram_delivery",
++    "get_telegram_delivery",
++]
+diff -ruN '--exclude=bot_voice_runtime_update_v2_full.patch' '--exclude=__pycache__' a/app/worker.py b/app/worker.py
+--- a/app/worker.py	1970-01-01 00:00:00.000000000 +0000
++++ b/app/worker.py	2026-08-05 06:17:54.193593305 +0000
+@@ -0,0 +1,64 @@
++"""Dedicated durable job worker process.
++
++Run with ``python -m app.worker``. This process does not bind an HTTP port or
++start Telegram polling/webhook ingestion; it only consumes Redis jobs.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import signal
++from contextlib import suppress
++
++from app.runtime import get_runtime_context
++from app.services.jobs.runtime import job_worker_snapshot
++
++logger = logging.getLogger(__name__)
++
++
++async def run_worker() -> None:
++    runtime = get_runtime_context()
++    stop_event = asyncio.Event()
++    loop = asyncio.get_running_loop()
++
++    def request_stop() -> None:
++        stop_event.set()
++
++    for signame in ("SIGINT", "SIGTERM"):
++        signum = getattr(signal, signame, None)
++        if signum is None:
++            continue
++        with suppress(NotImplementedError, RuntimeError, ValueError):
++            loop.add_signal_handler(signum, request_stop)
++
++    await runtime.start(None, owner="worker-process", role="worker")
++    snapshot = runtime.snapshot()
++    logger.info(
++        "Durable worker ready count=%s artifact_backend=%s shared=%s",
++        snapshot["workers"].get("count", 0),
++        snapshot["artifacts"].get("backend"),
++        snapshot["artifacts"].get("shared"),
++    )
++    try:
++        while not stop_event.is_set():
++            workers = job_worker_snapshot()
++            if workers.get("count", 0) and not workers.get("healthy"):
++                raise RuntimeError("A durable worker task stopped unexpectedly.")
++            try:
++                await asyncio.wait_for(stop_event.wait(), timeout=5.0)
++            except TimeoutError:
++                pass
++    finally:
++        await runtime.stop(owner="worker-process")
++
++
++def main() -> None:
++    try:
++        asyncio.run(run_worker())
++    except KeyboardInterrupt:
++        logger.info("Worker shutdown requested.")
++
++
++if __name__ == "__main__":
++    main()
+diff -ruN '--exclude=bot_voice_runtime_update_v2_full.patch' '--exclude=__pycache__' a/tests/test_artifact_storage_v3.py b/tests/test_artifact_storage_v3.py
+--- a/tests/test_artifact_storage_v3.py	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/test_artifact_storage_v3.py	2026-08-05 06:20:45.737591454 +0000
+@@ -0,0 +1,50 @@
++from __future__ import annotations
++
++import tempfile
++import unittest
++from pathlib import Path
++
++from app.services.artifacts.storage import ArtifactStorageError, LocalArtifactStore
++
++
++class LocalArtifactStoreTests(unittest.IsolatedAsyncioTestCase):
++    async def test_retry_safe_put_and_integrity_checked_get(self) -> None:
++        with tempfile.TemporaryDirectory() as directory:
++            store = LocalArtifactStore(directory, max_bytes=1024)
++            first = await store.put_bytes(
++                "results/job-1/transcript.txt",
++                b"hello",
++                content_type="text/plain",
++            )
++            second = await store.put_bytes(
++                "results/job-1/transcript.txt",
++                b"hello",
++                content_type="text/plain",
++            )
++
++            self.assertEqual(first.id, second.id)
++            self.assertEqual(b"hello", await store.get_bytes(first))
++
++    async def test_rejects_oversized_artifact(self) -> None:
++        with tempfile.TemporaryDirectory() as directory:
++            store = LocalArtifactStore(directory, max_bytes=1024)
++            with self.assertRaises(ArtifactStorageError):
++                await store.put_bytes(
++                    "results/job-1/too-large.bin",
++                    b"x" * 1025,
++                    content_type="application/octet-stream",
++                )
++
++    async def test_path_cannot_escape_root(self) -> None:
++        with tempfile.TemporaryDirectory() as directory:
++            store = LocalArtifactStore(directory, max_bytes=1024)
++            ref = await store.put_bytes(
++                "../safe.txt",
++                b"safe",
++                content_type="text/plain",
++            )
++            self.assertTrue((Path(directory) / ref.path).is_file())
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff -ruN '--exclude=bot_voice_runtime_update_v2_full.patch' '--exclude=__pycache__' a/tests/test_delivery_v3.py b/tests/test_delivery_v3.py
+--- a/tests/test_delivery_v3.py	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/test_delivery_v3.py	2026-08-05 06:20:45.738650755 +0000
+@@ -0,0 +1,110 @@
++from __future__ import annotations
++
++import json
++import unittest
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++
++from app.services.telegram.delivery import (
++    IdempotentTelegramDelivery,
++    RedisDeliveryStore,
++    TelegramDeliveryBusy,
++)
++
++
++class FakeRedis:
++    def __init__(self) -> None:
++        self.hashes: dict[str, dict[str, str]] = {}
++
++    def eval(self, script: str, number_of_keys: int, *values):
++        key = str(values[0])
++        args = [str(value) for value in values[number_of_keys:]]
++        data = self.hashes.setdefault(key, {})
++        if "delivery_claim_v1" in script:
++            now, token, deadline, _retention = args
++            if data.get("state") == "completed":
++                return [2, data.get("result", "")]
++            if data.get("state") == "processing" and float(
++                data.get("lease_deadline", "0")
++            ) > float(now):
++                return [0, ""]
++            data.update(
++                state="processing",
++                lease_token=token,
++                lease_deadline=deadline,
++                updated_at=now,
++                attempts=str(int(data.get("attempts", "0")) + 1),
++            )
++            return [1, ""]
++        if "delivery_complete_v1" in script:
++            token, result, updated_at, _retention = args
++            if data.get("state") != "processing" or data.get("lease_token") != token:
++                return 0
++            data.update(state="completed", result=result, updated_at=updated_at)
++            data.pop("lease_token", None)
++            data.pop("lease_deadline", None)
++            return 1
++        if "delivery_release_v1" in script:
++            token, error, updated_at, _retention = args
++            if data.get("state") != "processing" or data.get("lease_token") != token:
++                return 0
++            data.update(state="failed", last_error=error, updated_at=updated_at)
++            data.pop("lease_token", None)
++            data.pop("lease_deadline", None)
++            return 1
++        raise AssertionError("Unexpected Lua script")
++
++
++class DeliveryTests(unittest.IsolatedAsyncioTestCase):
++    async def test_retry_edits_only_once_and_returns_stored_result(self) -> None:
++        redis = FakeRedis()
++        delivery = IdempotentTelegramDelivery(RedisDeliveryStore(redis))
++        bot = SimpleNamespace(
++            edit_message_text=AsyncMock(
++                return_value=SimpleNamespace(message_id=77)
++            ),
++            send_message=AsyncMock(),
++        )
++
++        first = await delivery.deliver_text(
++            bot=bot,
++            idempotency_key="job:1:result",
++            chat_id=42,
++            text="done",
++            progress_message_id=77,
++        )
++        second = await delivery.deliver_text(
++            bot=bot,
++            idempotency_key="job:1:result",
++            chat_id=42,
++            text="done",
++            progress_message_id=77,
++        )
++
++        self.assertEqual(first["message_id"], second["message_id"])
++        bot.edit_message_text.assert_awaited_once()
++        bot.send_message.assert_not_awaited()
++        stored = next(iter(redis.hashes.values()))["result"]
++        self.assertEqual(77, json.loads(stored)["message_id"])
++
++    async def test_active_delivery_lease_is_busy(self) -> None:
++        redis = FakeRedis()
++        store = RedisDeliveryStore(redis)
++        first = await store.claim("job:busy")
++        self.assertEqual("claimed", first.status)
++        second = await store.claim("job:busy")
++        self.assertEqual("busy", second.status)
++
++        delivery = IdempotentTelegramDelivery(store)
++        with self.assertRaises(TelegramDeliveryBusy):
++            await delivery.deliver_text(
++                bot=SimpleNamespace(),
++                idempotency_key="job:busy",
++                chat_id=42,
++                text="done",
++                progress_message_id=7,
++            )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff -ruN '--exclude=bot_voice_runtime_update_v2_full.patch' '--exclude=__pycache__' a/tests/test_legacy_queue_migration_v3.py b/tests/test_legacy_queue_migration_v3.py
+--- a/tests/test_legacy_queue_migration_v3.py	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/test_legacy_queue_migration_v3.py	2026-08-05 06:20:45.741134393 +0000
+@@ -0,0 +1,25 @@
++from __future__ import annotations
++
++import unittest
++from pathlib import Path
++
++
++class LegacyQueueMigrationTests(unittest.TestCase):
++    def test_ocr_and_transcription_call_sites_enqueue_durable_jobs(self) -> None:
++        source = (
++            Path(__file__).resolve().parents[1] / "app" / "legacy.py"
++        ).read_text(encoding="utf-8")
++        self.assertIn('DURABLE_OCR_ENABLED", True', source)
++        self.assertIn("submit_ocr_job", source)
++        self.assertIn('DURABLE_TRANSCRIPTION_ENABLED", True', source)
++        self.assertGreaterEqual(source.count("submit_transcription_job"), 3)
++
++    def test_dedicated_worker_entrypoint_exists(self) -> None:
++        worker = Path(__file__).resolve().parents[1] / "app" / "worker.py"
++        source = worker.read_text(encoding="utf-8")
++        self.assertIn('role="worker"', source)
++        self.assertIn("python -m app.worker", source)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff -ruN '--exclude=bot_voice_runtime_update_v2_full.patch' '--exclude=__pycache__' a/tests/test_submission_v3.py b/tests/test_submission_v3.py
+--- a/tests/test_submission_v3.py	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/test_submission_v3.py	2026-08-05 06:20:45.739707675 +0000
+@@ -0,0 +1,48 @@
++from __future__ import annotations
++
++import unittest
++from unittest.mock import AsyncMock, patch
++
++from app.services.jobs.submission import submit_ocr_job, submit_transcription_job
++
++
++class SubmissionTests(unittest.IsolatedAsyncioTestCase):
++    async def test_ocr_payload_contains_delivery_target_and_user_context(self) -> None:
++        enqueue = AsyncMock(return_value=(object(), True))
++        with patch("app.services.jobs.submission.enqueue_bot_job", enqueue):
++            await submit_ocr_job(
++                chat_id=10,
++                user_id=20,
++                username="tester",
++                file_id="file",
++                mime_type="image/jpeg",
++                progress_message_id=30,
++                reply_to_message_id=40,
++                idempotency_key="ocr-key",
++            )
++        payload = enqueue.await_args.args[1]
++        self.assertEqual(30, payload["progress_message_id"])
++        self.assertEqual(20, payload["user_id"])
++        self.assertEqual("tester", payload["username"])
++
++    async def test_transcription_payload_identifies_audio_file_source(self) -> None:
++        enqueue = AsyncMock(return_value=(object(), True))
++        with patch("app.services.jobs.submission.enqueue_bot_job", enqueue):
++            await submit_transcription_job(
++                chat_id=10,
++                user_id=20,
++                username="tester",
++                file_id="file",
++                mime_type="audio/mpeg",
++                source_kind="audio_file",
++                filename="sample.mp3",
++                progress_message_id=30,
++                idempotency_key="transcription-key",
++            )
++        payload = enqueue.await_args.args[1]
++        self.assertEqual("audio_file", payload["source_kind"])
++        self.assertEqual("sample.mp3", payload["filename"])
++
++
++if __name__ == "__main__":
++    unittest.main()

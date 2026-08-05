@@ -37,6 +37,7 @@ _WORKER_STOP: asyncio.Event | None = None
 _WORKER_TASKS: dict[str, asyncio.Task[None]] = {}
 _WORKER_HEARTBEAT_TASKS: dict[str, asyncio.Task[None]] = {}
 _WORKER_STATUS: dict[str, dict[str, Any]] = {}
+_WORKERS_ACCEPTING = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +145,18 @@ async def _worker_runner(
         raise
 
 
+def set_job_workers_accepting(accepting: bool) -> bool:
+    """Enable or pause claims while allowing in-flight jobs to finish."""
+
+    global _WORKERS_ACCEPTING
+    _WORKERS_ACCEPTING = bool(accepting)
+    return _WORKERS_ACCEPTING
+
+
+def job_workers_accepting() -> bool:
+    return _WORKERS_ACCEPTING
+
+
 async def start_job_workers(
     handlers: Mapping[str, JobHandler],
     *,
@@ -151,7 +164,7 @@ async def start_job_workers(
 ) -> tuple[str, ...]:
     """Start process-local workers exactly once and return their IDs."""
 
-    global _WORKER_STOP
+    global _WORKER_STOP, _WORKERS_ACCEPTING
     async with _WORKER_LOCK:
         alive = {name: task for name, task in _WORKER_TASKS.items() if not task.done()}
         if alive:
@@ -166,6 +179,11 @@ async def start_job_workers(
         missing = sorted(BOT_JOB_TYPES - set(clean_handlers))
         if missing:
             raise ValueError(f"Missing durable job handler(s): {', '.join(missing)}")
+
+        start_drained = str(
+            os.getenv("BOT_JOB_START_DRAINED", "false") or "false"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        _WORKERS_ACCEPTING = not start_drained
 
         count = worker_count
         if count is None:
@@ -184,6 +202,7 @@ async def start_job_workers(
                 poll_interval_seconds=float(
                     os.getenv("BOT_JOB_POLL_SECONDS", "0.5") or 0.5
                 ),
+                can_claim=job_workers_accepting,
             )
             task = asyncio.create_task(
                 _worker_runner(worker, _WORKER_STOP),
@@ -245,6 +264,7 @@ def job_worker_snapshot(*, stale_after_seconds: float = 20.0) -> dict[str, Any]:
         )
     return {
         "configured": _QUEUE is not None,
+        "accepting": _WORKERS_ACCEPTING,
         "count": len(workers),
         "alive": sum(1 for worker in workers if worker.alive),
         "healthy": bool(workers) and all(worker.alive for worker in workers),
@@ -259,6 +279,8 @@ __all__ = [
     "enqueue_bot_job",
     "get_job_queue",
     "job_worker_snapshot",
+    "job_workers_accepting",
+    "set_job_workers_accepting",
     "start_job_workers",
     "stop_job_workers",
 ]

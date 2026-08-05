@@ -40,7 +40,11 @@ redis.call(
   'attempts', '0',
   'max_attempts', ARGV[7],
   'timeout_seconds', ARGV[8],
-  'cancel_requested', '0'
+  'cancel_requested', '0',
+  'progress_percent', '0',
+  'progress_stage', 'queued',
+  'progress_detail', '',
+  'updated_at', ARGV[5]
 )
 redis.call('ZADD', KEYS[1], ARGV[6], ARGV[1])
 if ARGV[9] == '1' then
@@ -67,15 +71,20 @@ for _, job_id in ipairs(expired) do
         'HSET', job_key,
         'state', 'cancelled',
         'completed_at', ARGV[1],
-        'last_error', 'cancelled while worker lease was unavailable'
+        'last_error', 'cancelled while worker lease was unavailable',
+        'progress_stage', 'cancelled',
+        'updated_at', ARGV[1]
       )
+      redis.call('ZADD', KEYS[4], ARGV[1], job_id)
       redis.call('EXPIRE', job_key, ARGV[5])
     elseif attempts >= max_attempts then
       redis.call(
         'HSET', job_key,
         'state', 'dead',
         'completed_at', ARGV[1],
-        'last_error', 'worker lease expired'
+        'last_error', 'worker lease expired',
+        'progress_stage', 'dead',
+        'updated_at', ARGV[1]
       )
       redis.call('ZADD', KEYS[3], ARGV[1], job_id)
       redis.call('EXPIRE', job_key, ARGV[5])
@@ -84,7 +93,9 @@ for _, job_id in ipairs(expired) do
         'HSET', job_key,
         'state', 'queued',
         'available_at', ARGV[1],
-        'last_error', 'worker lease expired'
+        'last_error', 'worker lease expired',
+        'progress_stage', 'retrying',
+        'updated_at', ARGV[1]
       )
       redis.call('HDEL', job_key, 'lease_token', 'lease_deadline', 'worker_id')
       redis.call('ZADD', KEYS[1], ARGV[1], job_id)
@@ -131,7 +142,9 @@ redis.call(
   'lease_token', ARGV[3],
   'lease_deadline', ARGV[4],
   'started_at', ARGV[1],
-  'cancel_requested', '0'
+  'cancel_requested', '0',
+  'progress_stage', 'running',
+  'updated_at', ARGV[1]
 )
 redis.call('ZADD', KEYS[2], ARGV[4], selected)
 return selected
@@ -148,7 +161,7 @@ end
 if redis.call('HGET', KEYS[2], 'cancel_requested') == '1' then
   return -1
 end
-redis.call('HSET', KEYS[2], 'lease_deadline', ARGV[2])
+redis.call('HSET', KEYS[2], 'lease_deadline', ARGV[2], 'updated_at', ARGV[4])
 redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3])
 return 1
 """.strip()
@@ -167,16 +180,23 @@ if redis.call('HGET', KEYS[2], 'cancel_requested') == '1' then
     'HSET', KEYS[2],
     'state', 'cancelled',
     'completed_at', ARGV[3],
-    'last_error', 'cancelled'
+    'last_error', 'cancelled',
+    'progress_stage', 'cancelled',
+    'updated_at', ARGV[3]
   )
+  redis.call('ZADD', KEYS[4], ARGV[3], ARGV[2])
 else
   redis.call(
     'HSET', KEYS[2],
     'state', 'succeeded',
     'completed_at', ARGV[3],
     'result', ARGV[4],
-    'last_error', ''
+    'last_error', '',
+    'progress_percent', '100',
+    'progress_stage', 'succeeded',
+    'updated_at', ARGV[3]
   )
+  redis.call('ZADD', KEYS[3], ARGV[3], ARGV[2])
 end
 redis.call(
   'HDEL', KEYS[2], 'lease_token', 'lease_deadline', 'worker_id'
@@ -204,8 +224,11 @@ if cancelled == '1' then
     'HSET', KEYS[3],
     'state', 'cancelled',
     'completed_at', ARGV[3],
-    'last_error', 'cancelled'
+    'last_error', 'cancelled',
+    'progress_stage', 'cancelled',
+    'updated_at', ARGV[3]
   )
+  redis.call('ZADD', KEYS[5], ARGV[3], ARGV[2])
   redis.call('EXPIRE', KEYS[3], ARGV[7])
   return 2
 end
@@ -214,7 +237,9 @@ if ARGV[6] == '1' and attempts < max_attempts then
     'HSET', KEYS[3],
     'state', 'queued',
     'available_at', ARGV[5],
-    'last_error', ARGV[4]
+    'last_error', ARGV[4],
+    'progress_stage', 'retrying',
+    'updated_at', ARGV[3]
   )
   redis.call(
     'HDEL', KEYS[3], 'lease_token', 'lease_deadline', 'worker_id'
@@ -226,7 +251,9 @@ redis.call(
   'HSET', KEYS[3],
   'state', 'dead',
   'completed_at', ARGV[3],
-  'last_error', ARGV[4]
+  'last_error', ARGV[4],
+  'progress_stage', 'dead',
+  'updated_at', ARGV[3]
 )
 redis.call(
   'HDEL', KEYS[3], 'lease_token', 'lease_deadline', 'worker_id'
@@ -249,13 +276,16 @@ if state == 'queued' then
     'state', 'cancelled',
     'cancel_requested', '1',
     'completed_at', ARGV[2],
-    'last_error', 'cancelled'
+    'last_error', 'cancelled',
+    'progress_stage', 'cancelled',
+    'updated_at', ARGV[2]
   )
+  redis.call('ZADD', KEYS[4], ARGV[2], ARGV[1])
   redis.call('EXPIRE', KEYS[3], ARGV[3])
   return 1
 end
 if state == 'running' then
-  redis.call('HSET', KEYS[3], 'cancel_requested', '1')
+  redis.call('HSET', KEYS[3], 'cancel_requested', '1', 'progress_stage', 'cancelling', 'updated_at', ARGV[2])
   return 2
 end
 return 0
@@ -263,7 +293,7 @@ return 0
 
 _RETRY_SCRIPT = """
 -- bot_voice:retry_v1
-local state = redis.call('HGET', KEYS[3], 'state')
+local state = redis.call('HGET', KEYS[4], 'state')
 if not state then
   return -1
 end
@@ -271,16 +301,21 @@ if state ~= 'dead' and state ~= 'cancelled' then
   return 0
 end
 redis.call('ZREM', KEYS[2], ARGV[1])
+redis.call('ZREM', KEYS[3], ARGV[1])
 redis.call(
-  'HSET', KEYS[3],
+  'HSET', KEYS[4],
   'state', 'queued',
   'available_at', ARGV[2],
   'attempts', '0',
   'cancel_requested', '0',
-  'last_error', ''
+  'last_error', '',
+  'progress_percent', '0',
+  'progress_stage', 'queued',
+  'progress_detail', '',
+  'updated_at', ARGV[2]
 )
-redis.call('HDEL', KEYS[3], 'completed_at', 'result')
-redis.call('PERSIST', KEYS[3])
+redis.call('HDEL', KEYS[4], 'completed_at', 'result')
+redis.call('PERSIST', KEYS[4])
 redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
 return 1
 """.strip()
@@ -317,6 +352,10 @@ class Job:
     last_error: str = ""
     result: Any = None
     cancel_requested: bool = False
+    progress_percent: int = 0
+    progress_stage: str = ""
+    progress_detail: str = ""
+    updated_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,6 +368,20 @@ class JobContext:
     async def cancelled(self) -> bool:
         current = await self.queue.get(self.job.id)
         return current.cancel_requested or current.state == "cancelled"
+
+    async def progress(
+        self,
+        percent: int,
+        stage: str,
+        detail: str = "",
+    ) -> bool:
+        return await self.queue.update_progress(
+            self.job.id,
+            self.lease_token,
+            percent=percent,
+            stage=stage,
+            detail=detail,
+        )
 
 
 JobHandler = Callable[[Mapping[str, Any], JobContext], Any | Awaitable[Any]]
@@ -356,6 +409,8 @@ class RedisJobQueue:
         self.ready_key = f"{self.key_prefix}:ready"
         self.leased_key = f"{self.key_prefix}:leased"
         self.dead_key = f"{self.key_prefix}:dead"
+        self.succeeded_key = f"{self.key_prefix}:succeeded"
+        self.cancelled_key = f"{self.key_prefix}:cancelled"
         self.job_prefix = f"{self.key_prefix}:data:"
         self.idempotency_prefix = f"{self.key_prefix}:idempotency:"
         self.lease_seconds = max(5.0, min(3_600.0, float(lease_seconds)))
@@ -392,10 +447,15 @@ class RedisJobQueue:
             return value.decode("utf-8", errors="strict")
         return str(value or "")
 
-    async def _redis_call(self, method: str, *args: Any) -> Any:
+    async def _redis_call(
+        self,
+        method: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
         try:
             operation = getattr(self.redis, method)
-            return await asyncio.to_thread(operation, *args)
+            return await asyncio.to_thread(operation, *args, **kwargs)
         except Exception as exc:
             raise JobQueueError(
                 f"Redis job queue operation {method} failed."
@@ -472,10 +532,11 @@ class RedisJobQueue:
         raw = await self._redis_call(
             "eval",
             _CLAIM_SCRIPT,
-            3,
+            4,
             self.ready_key,
             self.leased_key,
             self.dead_key,
+            self.cancelled_key,
             str(now),
             worker,
             token,
@@ -500,6 +561,7 @@ class RedisJobQueue:
                 lease_token,
                 str(deadline),
                 job_id,
+                str(time.time()),
             )
         )
 
@@ -517,9 +579,11 @@ class RedisJobQueue:
         changed = await self._redis_call(
             "eval",
             _COMPLETE_SCRIPT,
-            2,
+            4,
             self.leased_key,
             self._job_key(job_id),
+            self.succeeded_key,
+            self.cancelled_key,
             lease_token,
             job_id,
             str(time.time()),
@@ -543,11 +607,12 @@ class RedisJobQueue:
             await self._redis_call(
                 "eval",
                 _FAIL_SCRIPT,
-                4,
+                5,
                 self.ready_key,
                 self.leased_key,
                 self._job_key(job_id),
                 self.dead_key,
+                self.cancelled_key,
                 lease_token,
                 job_id,
                 str(now),
@@ -569,10 +634,11 @@ class RedisJobQueue:
             await self._redis_call(
                 "eval",
                 _CANCEL_SCRIPT,
-                3,
+                4,
                 self.ready_key,
                 self.leased_key,
                 self._job_key(job_id),
+                self.cancelled_key,
                 job_id,
                 str(time.time()),
                 str(self.retention_seconds),
@@ -586,9 +652,10 @@ class RedisJobQueue:
             await self._redis_call(
                 "eval",
                 _RETRY_SCRIPT,
-                3,
+                4,
                 self.ready_key,
                 self.dead_key,
+                self.cancelled_key,
                 self._job_key(job_id),
                 job_id,
                 str(time.time()),
@@ -633,9 +700,41 @@ class RedisJobQueue:
                 last_error=values.get("last_error", ""),
                 result=result,
                 cancel_requested=values.get("cancel_requested") == "1",
+                progress_percent=int(values.get("progress_percent") or 0),
+                progress_stage=values.get("progress_stage", ""),
+                progress_detail=values.get("progress_detail", ""),
+                updated_at=optional_float("updated_at"),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise JobQueueError(f"Job {job_id!r} contains invalid Redis data.") from exc
+
+    async def update_progress(
+        self,
+        job_id: str,
+        lease_token: str,
+        *,
+        percent: int,
+        stage: str,
+        detail: str = "",
+    ) -> bool:
+        clean_stage = str(stage or "").strip()[:120]
+        clean_detail = str(detail or "").strip()[:500]
+        if not clean_stage:
+            raise ValueError("Progress stage is required.")
+        current = await self.get(job_id)
+        if current.state != "running" or current.lease_token != lease_token:
+            return False
+        await self._redis_call(
+            "hset",
+            self._job_key(job_id),
+            mapping={
+                "progress_percent": str(max(0, min(100, int(percent)))),
+                "progress_stage": clean_stage,
+                "progress_detail": clean_detail,
+                "updated_at": str(time.time()),
+            },
+        )
+        return True
 
     async def list_jobs(
         self,
@@ -656,10 +755,14 @@ class RedisJobQueue:
             "queued": self.ready_key,
             "running": self.leased_key,
             "dead": self.dead_key,
+            "succeeded": self.succeeded_key,
+            "cancelled": self.cancelled_key,
         }
         redis_key = keys.get(clean_state)
         if redis_key is None:
-            raise ValueError("state must be queued, running, or dead.")
+            raise ValueError(
+                "state must be queued, running, dead, succeeded, or cancelled."
+            )
         page_size = max(1, min(200, int(limit)))
         try:
             offset = max(0, int(str(cursor or "0")))
@@ -690,16 +793,30 @@ class RedisJobQueue:
         return jobs, next_cursor
 
     async def stats(self) -> dict[str, int]:
-        ready, running, dead = await asyncio.gather(
+        cutoff = time.time() - self.retention_seconds
+        await asyncio.gather(
+            self._redis_call("zremrangebyscore", self.dead_key, "-inf", cutoff),
+            self._redis_call(
+                "zremrangebyscore", self.succeeded_key, "-inf", cutoff
+            ),
+            self._redis_call(
+                "zremrangebyscore", self.cancelled_key, "-inf", cutoff
+            ),
+        )
+        ready, running, dead, succeeded, cancelled = await asyncio.gather(
             self._redis_call("zcard", self.ready_key),
             self._redis_call("zcard", self.leased_key),
             self._redis_call("zcard", self.dead_key),
+            self._redis_call("zcard", self.succeeded_key),
+            self._redis_call("zcard", self.cancelled_key),
         )
         queued = int(ready or 0)
         return {
             "queued": queued,
             "running": int(running or 0),
             "dead": int(dead or 0),
+            "succeeded": int(succeeded or 0),
+            "cancelled": int(cancelled or 0),
             "queue_limit": self.max_queued_jobs,
             "queue_available": max(0, self.max_queued_jobs - queued),
         }
@@ -717,6 +834,7 @@ class RedisJobWorker:
         poll_interval_seconds: float = 0.5,
         retry_base_seconds: float = 2.0,
         retry_max_seconds: float = 300.0,
+        can_claim: Callable[[], bool] | None = None,
     ) -> None:
         self.queue = queue
         self.handlers = {
@@ -736,6 +854,7 @@ class RedisJobWorker:
             self.retry_base_seconds,
             float(retry_max_seconds),
         )
+        self.can_claim = can_claim or (lambda: True)
 
     async def _invoke(self, handler: JobHandler, context: JobContext) -> Any:
         if inspect.iscoroutinefunction(handler):
@@ -840,6 +959,15 @@ class RedisJobWorker:
 
     async def run(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
+            if not self.can_claim():
+                try:
+                    await asyncio.wait_for(
+                        stop_event.wait(),
+                        timeout=self.poll_interval_seconds,
+                    )
+                except TimeoutError:
+                    pass
+                continue
             processed = await self.process_one()
             if processed:
                 continue

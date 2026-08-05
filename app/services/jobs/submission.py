@@ -39,9 +39,12 @@ async def submit_tts_job(
 async def submit_ocr_job(
     *,
     chat_id: int,
+    user_id: int,
+    username: str,
     file_id: str,
     mime_type: str,
     suffix: str = ".jpg",
+    progress_message_id: int | None = None,
     reply_to_message_id: int | None = None,
     idempotency_key: str,
 ):
@@ -49,10 +52,14 @@ async def submit_ocr_job(
         "ocr",
         {
             "chat_id": int(chat_id),
+            "user_id": int(user_id),
+            "username": str(username),
             "file_id": str(file_id),
             "mime_type": str(mime_type),
             "suffix": str(suffix),
+            "progress_message_id": progress_message_id,
             "reply_to_message_id": reply_to_message_id,
+            "artifact_ttl_seconds": 604_800,
         },
         idempotency_key=idempotency_key,
         timeout_seconds=180,
@@ -63,20 +70,34 @@ async def submit_ocr_job(
 async def submit_transcription_job(
     *,
     chat_id: int,
+    user_id: int,
+    username: str,
     file_id: str,
     mime_type: str,
     suffix: str = ".ogg",
+    source_kind: str = "voice",
+    filename: str = "",
+    progress_message_id: int | None = None,
     reply_to_message_id: int | None = None,
     idempotency_key: str,
 ):
+    clean_source = str(source_kind or "voice").strip().lower()
+    if clean_source not in {"voice", "audio_file"}:
+        raise ValueError("source_kind must be voice or audio_file.")
     return await enqueue_bot_job(
         "transcription",
         {
             "chat_id": int(chat_id),
+            "user_id": int(user_id),
+            "username": str(username),
             "file_id": str(file_id),
             "mime_type": str(mime_type),
             "suffix": str(suffix),
+            "source_kind": clean_source,
+            "filename": str(filename),
+            "progress_message_id": progress_message_id,
             "reply_to_message_id": reply_to_message_id,
+            "artifact_ttl_seconds": 604_800,
         },
         idempotency_key=idempotency_key,
         timeout_seconds=240,

@@ -30,7 +30,7 @@ const translations = {
     saveSettings: "Save settings", overview: "Overview", health: "Health", jobs: "Jobs", providersShort: "Providers",
     admins: "Admins", settings: "Settings", operational: "Operational", starting: "Starting", healthy: "Healthy",
     unavailable: "Unavailable", connected: "Connected", memoryFallback: "Memory fallback", active: "Active",
-    paused: "Paused", processLocal: "Process-local", reset: "Reset", retry: "Retry", cancel: "Cancel", remove: "Remove",
+    paused: "Paused", drainWorkers: "Drain workers", resumeWorkers: "Resume workers", accepting: "Accepting jobs", drained: "Drained", processLocal: "Process-local", reset: "Reset", retry: "Retry", cancel: "Cancel", remove: "Remove",
   },
   km: {
     miniApp: "Telegram Mini App", controlCenter: "មជ្ឈមណ្ឌលគ្រប់គ្រងបូត", verifying: "កំពុងផ្ទៀងផ្ទាត់គណនី Telegram",
@@ -50,7 +50,7 @@ const translations = {
     saveSettings: "រក្សាទុក", overview: "ទិដ្ឋភាព", health: "សុខភាព", jobs: "ការងារ", providersShort: "Providers",
     admins: "Admin", settings: "ការកំណត់", operational: "ដំណើរការល្អ", starting: "កំពុងចាប់ផ្ដើម", healthy: "ល្អ",
     unavailable: "មិនអាចប្រើបាន", connected: "បានភ្ជាប់", memoryFallback: "ប្រើ Memory បម្រុង", active: "សកម្ម",
-    paused: "បានផ្អាក", processLocal: "តាម process", reset: "កំណត់ឡើងវិញ", retry: "សាកឡើងវិញ", cancel: "បោះបង់", remove: "ដកចេញ",
+    paused: "បានផ្អាក", drainWorkers: "ផ្អាកទទួលការងារ", resumeWorkers: "បន្តទទួលការងារ", accepting: "កំពុងទទួលការងារ", drained: "បានផ្អាកទទួលការងារ", processLocal: "តាម process", reset: "កំណត់ឡើងវិញ", retry: "សាកឡើងវិញ", cancel: "បោះបង់", remove: "ដកចេញ",
   },
 };
 
@@ -65,7 +65,7 @@ const elements = {
   corsForm: $("corsForm"), corsOrigin: $("corsOrigin"), corsList: $("corsList"), corsEmpty: $("corsEmpty"),
   runtimeForm: $("runtimeForm"), runtimeFields: $("runtimeFields"), saveRuntimeButton: $("saveRuntimeButton"),
   jobState: $("jobState"), refreshJobsButton: $("refreshJobsButton"), jobsList: $("jobsList"), jobsEmpty: $("jobsEmpty"),
-  jobSummary: $("jobSummary"), retrySelectedButton: $("retrySelectedButton"), loadMoreJobsButton: $("loadMoreJobsButton"),
+  jobSummary: $("jobSummary"), drainWorkersButton: $("drainWorkersButton"), resumeWorkersButton: $("resumeWorkersButton"), retrySelectedButton: $("retrySelectedButton"), loadMoreJobsButton: $("loadMoreJobsButton"),
   providersList: $("providersList"), providerScope: $("providerScope"), adminForm: $("adminForm"), adminUserId: $("adminUserId"),
   adminList: $("adminList"), auditList: $("auditList"), toast: $("toast"),
 };
@@ -141,12 +141,14 @@ function renderStats(payload, jobsPayload, workersPayload) {
   setHealth(elements.botHealth, bot.active ? t("operational") : t("starting"), bot.active ? "ok" : "warn");
   setHealth(elements.redisHealth, redis.ok ? t("healthy") : t("unavailable"), redis.ok ? "ok" : "down");
   setHealth(elements.databaseHealth, database.ok ? t("connected") : (database.memory_fallback ? t("memoryFallback") : t("unavailable")), database.ok ? "ok" : "warn");
-  setHealth(elements.workerHealth, workers.healthy ? `${workers.alive}/${workers.count} ${t("active")}` : `${workers.alive || 0}/${workers.count || 0} ${t("unavailable")}`, workers.healthy ? "ok" : "down");
+  setHealth(elements.workerHealth, workers.healthy ? `${workers.alive}/${workers.count} · ${workers.accepting ? t("accepting") : t("drained")}` : `${workers.alive || 0}/${workers.count || 0} ${t("unavailable")}`, workers.healthy ? (workers.accepting ? "ok" : "warn") : "down");
+  elements.drainWorkersButton.disabled = !workers.accepting;
+  elements.resumeWorkersButton.disabled = Boolean(workers.accepting);
   const overallHealthy = Boolean(bot.active && redis.ok && workers.healthy);
   elements.systemBadge.classList.toggle("down", !overallHealthy);
   elements.systemBadge.lastElementChild.textContent = overallHealthy ? t("operational") : t("unavailable");
   renderMaintenance(Boolean(bot.maintenance_mode));
-  elements.jobSummary.textContent = `Queued ${jobs.queued || 0} · Running ${jobs.running || 0} · Dead ${jobs.dead || 0} · Capacity ${jobs.queue_available ?? "—"}`;
+  elements.jobSummary.textContent = `Queued ${jobs.queued || 0} · Running ${jobs.running || 0} · Dead ${jobs.dead || 0} · Succeeded ${jobs.succeeded || 0} · Cancelled ${jobs.cancelled || 0} · Capacity ${jobs.queue_available ?? "—"}`;
 }
 function renderMaintenance(enabled) {
   elements.maintenanceToggle.checked = enabled;
@@ -187,14 +189,16 @@ async function refreshJobs({ append = false } = {}) {
   if (!append) { elements.jobsList.replaceChildren(); state.selectedJobs.clear(); }
   payload.jobs.forEach((job) => {
     const row = document.createElement("article"); row.className = "data-row job-row";
-    if (job.state === "dead") {
+    if (["dead", "cancelled"].includes(job.state)) {
       const check = document.createElement("input"); check.type = "checkbox"; check.className = "job-check"; check.addEventListener("change", () => { check.checked ? state.selectedJobs.add(job.id) : state.selectedJobs.delete(job.id); elements.retrySelectedButton.disabled = state.selectedJobs.size === 0; }); row.append(check);
     }
     const copy = document.createElement("div"); copy.className = "data-copy"; const title = document.createElement("strong"); title.textContent = `${job.type} · ${job.id.slice(0, 12)}`;
     const meta = document.createElement("small"); meta.textContent = `${job.state} · attempt ${job.attempts}/${job.max_attempts} · ${formatDate(job.created_at)}`;
-    copy.append(title, meta); if (job.last_error) { const error = document.createElement("p"); error.className = "row-error"; error.textContent = job.last_error; copy.append(error); } row.append(copy);
+    copy.append(title, meta);
+    if (job.progress_stage) { const progress = document.createElement("div"); progress.className = "job-progress"; const bar = document.createElement("span"); bar.style.width = `${Math.max(0, Math.min(100, Number(job.progress_percent) || 0))}%`; const label = document.createElement("small"); label.textContent = `${job.progress_percent || 0}% · ${job.progress_stage}${job.progress_detail ? ` · ${job.progress_detail}` : ""}`; progress.append(bar, label); copy.append(progress); }
+    if (job.last_error) { const error = document.createElement("p"); error.className = "row-error"; error.textContent = job.last_error; copy.append(error); } row.append(copy);
     const actions = document.createElement("div"); actions.className = "row-actions";
-    if (job.state === "dead") { const retry = document.createElement("button"); retry.className = "button small"; retry.textContent = t("retry"); retry.addEventListener("click", () => mutateJob(job.id, "retry", retry)); actions.append(retry); }
+    if (["dead", "cancelled"].includes(job.state)) { const retry = document.createElement("button"); retry.className = "button small"; retry.textContent = t("retry"); retry.addEventListener("click", () => mutateJob(job.id, "retry", retry)); actions.append(retry); }
     if (["queued", "running"].includes(job.state)) { const cancel = document.createElement("button"); cancel.className = "button danger"; cancel.textContent = t("cancel"); cancel.addEventListener("click", () => mutateJob(job.id, "cancel", cancel)); actions.append(cancel); }
     row.append(actions); elements.jobsList.append(row);
   });
@@ -202,6 +206,21 @@ async function refreshJobs({ append = false } = {}) {
   elements.jobsEmpty.classList.toggle("is-hidden", elements.jobsList.children.length > 0);
   elements.retrySelectedButton.disabled = state.selectedJobs.size === 0;
 }
+
+async function setWorkerAcceptance(action, button) {
+  button.disabled = true;
+  try {
+    const payload = await api(`/api/admin/runtime/workers/${action}`, { method: "POST" });
+    showToast(action === "drain" ? "Workers are draining." : "Workers resumed.");
+    elements.drainWorkersButton.disabled = !payload.accepting;
+    elements.resumeWorkersButton.disabled = Boolean(payload.accepting);
+    await refreshAll({ silent: true });
+  } catch (error) {
+    showToast(error.message, true);
+    button.disabled = false;
+  }
+}
+
 async function mutateJob(jobId, action, button) {
   button.disabled = true;
   try { await api(`/api/admin/runtime/jobs/${encodeURIComponent(jobId)}/${action}`, { method: "POST" }); showToast(`Job ${action} accepted.`); await refreshJobs(); }
@@ -276,6 +295,8 @@ elements.languageButton.addEventListener("click", () => { state.language = state
 elements.maintenanceToggle.addEventListener("change", (event) => confirmMaintenance(event.target.checked));
 elements.corsForm.addEventListener("submit", addOrigin); elements.runtimeForm.addEventListener("submit", saveRuntime);
 elements.jobState.addEventListener("change", () => refreshJobs()); elements.refreshJobsButton.addEventListener("click", () => refreshJobs());
+elements.drainWorkersButton.addEventListener("click", () => setWorkerAcceptance("drain", elements.drainWorkersButton));
+elements.resumeWorkersButton.addEventListener("click", () => setWorkerAcceptance("resume", elements.resumeWorkersButton));
 elements.loadMoreJobsButton.addEventListener("click", () => refreshJobs({ append: true })); elements.retrySelectedButton.addEventListener("click", retrySelected);
 elements.adminForm.addEventListener("submit", async (event) => { event.preventDefault(); const userId = Number.parseInt(elements.adminUserId.value, 10); if (!Number.isSafeInteger(userId) || userId <= 0) return showToast("Enter a valid Telegram user ID.", true); const button = elements.adminForm.querySelector("button"); await mutateAdministrator("add", userId, button); elements.adminUserId.value = ""; });
 

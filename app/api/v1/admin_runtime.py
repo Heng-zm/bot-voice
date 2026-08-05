@@ -11,7 +11,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.api.dependencies import AdminPrincipal, require_admin, require_admin_write
 from app.services.ai.providers import get_provider_manager
 from app.services.jobs.queue import JobNotFound, JobQueueError
-from app.services.jobs.runtime import get_job_queue, job_worker_snapshot
+from app.services.jobs.runtime import (
+    get_job_queue,
+    job_worker_snapshot,
+    set_job_workers_accepting,
+)
 
 router = APIRouter(prefix="/api/admin/runtime", tags=["admin-runtime"])
 
@@ -44,6 +48,10 @@ def _safe_job(job) -> dict:
         "worker_id": job.worker_id,
         "last_error": job.last_error,
         "cancel_requested": job.cancel_requested,
+        "progress_percent": job.progress_percent,
+        "progress_stage": job.progress_stage,
+        "progress_detail": job.progress_detail,
+        "updated_at": job.updated_at,
         "result": job.result,
     }
 
@@ -91,6 +99,24 @@ async def worker_health(
     return {"ok": True, **job_worker_snapshot()}
 
 
+@router.post("/workers/drain")
+async def drain_workers(
+    principal: Annotated[AdminPrincipal, Depends(require_admin_write)],
+) -> dict:
+    del principal
+    set_job_workers_accepting(False)
+    return {"ok": True, **job_worker_snapshot()}
+
+
+@router.post("/workers/resume")
+async def resume_workers(
+    principal: Annotated[AdminPrincipal, Depends(require_admin_write)],
+) -> dict:
+    del principal
+    set_job_workers_accepting(True)
+    return {"ok": True, **job_worker_snapshot()}
+
+
 @router.get("/jobs")
 async def job_stats(
     principal: Annotated[AdminPrincipal, Depends(require_admin)],
@@ -110,7 +136,7 @@ async def job_stats(
 async def job_list(
     principal: Annotated[AdminPrincipal, Depends(require_admin)],
     state: Annotated[
-        Literal["queued", "running", "dead"],
+        Literal["queued", "running", "dead", "succeeded", "cancelled"],
         Query(),
     ] = "dead",
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
@@ -245,6 +271,8 @@ async def retry_job(
 
 __all__ = [
     "JobRetrySelectedPayload",
+    "drain_workers",
+    "resume_workers",
     "ProviderResetPayload",
     "router",
 ]

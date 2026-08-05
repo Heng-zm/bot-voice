@@ -1,11 +1,10 @@
 .git
 .github
-.gitignore
-
 .env
 .env.*
 !.env.example
-
+.venv
+venv
 __pycache__
 *.py[cod]
 .pytest_cache
@@ -13,10 +12,9 @@ __pycache__
 .ruff_cache
 .coverage
 htmlcov
-
-.venv
-venv
-
+tests
 *.log
 tmp
 temp
+bot_voice_runtime_update*.zip
+bot_voice_runtime_update*.patch

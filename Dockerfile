@@ -10,12 +10,19 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt requirements.lock .
-RUN pip install --disable-pip-version-check --no-cache-dir -r requirements.lock
+RUN pip install --disable-pip-version-check --no-cache-dir -r requirements.lock \
+    && python -m pip check
 
 RUN useradd --create-home --uid 10001 appuser
 
 COPY --chown=appuser:appuser . .
 
 USER appuser
+
+EXPOSE 8080
+STOPSIGNAL SIGTERM
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -m app.healthcheck
 
 CMD ["python", "-m", "app.main"]
