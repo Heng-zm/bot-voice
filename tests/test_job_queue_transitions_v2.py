@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-import time
 import unittest
 
 from app.services.jobs.queue import RedisJobQueue
@@ -63,6 +61,8 @@ class TransitionRedis:
             return self._claim(keys, args)
         if "bot_voice:renew_v1" in script:
             return self._renew(keys, args)
+        if "bot_voice:update_progress_v1" in script:
+            return self._update_progress(keys, args)
         if "bot_voice:complete_v1" in script:
             return self._complete(keys, args)
         if "bot_voice:fail_v1" in script:
@@ -157,6 +157,20 @@ class TransitionRedis:
         self._zadd(leased, float(deadline), job_id)
         return 1
 
+    def _update_progress(self, keys: list[str], args: list[str]):
+        (job_key,) = keys
+        token, percent, stage, detail, updated_at = args
+        data = self.hashes[job_key]
+        if data.get("lease_token") != token or data.get("state") != "running":
+            return 0
+        data.update(
+            progress_percent=percent,
+            progress_stage=stage,
+            progress_detail=detail,
+            updated_at=updated_at,
+        )
+        return 1
+
     def _complete(self, keys: list[str], args: list[str]):
         leased, job_key, succeeded, cancelled = keys
         token, job_id, completed_at, result, _retention = args
@@ -204,6 +218,8 @@ class TransitionRedis:
                 updated_at=now,
             )
             self._zadd(cancelled, float(now), job_id)
+            for field in ("lease_token", "lease_deadline", "worker_id"):
+                data.pop(field, None)
             return 2
         if retryable == "1" and int(data["attempts"]) < int(data["max_attempts"]):
             data.update(
@@ -279,6 +295,9 @@ class TransitionRedis:
         )
         data.pop("completed_at", None)
         data.pop("result", None)
+        data.pop("started_at", None)
+        for field in ("lease_token", "lease_deadline", "worker_id"):
+            data.pop(field, None)
         self._zadd(ready, float(now), job_id)
         return 1
 
@@ -335,6 +354,25 @@ class JobQueueTransitionV2Tests(unittest.IsolatedAsyncioTestCase):
         dead, _ = await queue.list_jobs(state="dead")
         self.assertEqual([job.id], [item.id for item in dead])
         self.assertIn("provider unavailable", dead[0].last_error)
+
+    async def test_running_cancellation_clears_lease_metadata(self) -> None:
+        queue = RedisJobQueue(TransitionRedis(), redis_prefix="tests")
+        job, _ = await queue.enqueue("tts", {"text": "hello"})
+        running = await queue.claim("worker-1")
+        self.assertEqual("requested", await queue.cancel(job.id))
+
+        self.assertEqual(
+            "cancelled",
+            await queue.fail(job.id, running.lease_token, "cancelled"),
+        )
+        cancelled = await queue.get(job.id)
+        self.assertEqual("", cancelled.lease_token)
+        self.assertEqual("", cancelled.worker_id)
+
+        self.assertTrue(await queue.retry(job.id))
+        retried = await queue.get(job.id)
+        self.assertIsNone(retried.started_at)
+        self.assertIsNone(retried.completed_at)
 
 
 if __name__ == "__main__":

@@ -251,6 +251,8 @@ class FakeRedis:
                         updated_at=now,
                     )
                     self._zadd(cancelled_key, now_value, job_id)
+                    for field in ("lease_token", "lease_deadline", "worker_id"):
+                        data.pop(field, None)
                 elif int(data["attempts"]) >= int(data["max_attempts"]):
                     data.update(
                         state="dead",
@@ -260,6 +262,8 @@ class FakeRedis:
                         updated_at=now,
                     )
                     self._zadd(dead_key, now_value, job_id)
+                    for field in ("lease_token", "lease_deadline", "worker_id"):
+                        data.pop(field, None)
                 else:
                     data.update(
                         state="queued",
@@ -363,6 +367,8 @@ class FakeRedis:
                 updated_at=now,
             )
             self._zadd(cancelled_key, float(now), job_id)
+            for field in ("lease_token", "lease_deadline", "worker_id"):
+                data.pop(field, None)
             return 2
         if retryable == "1" and int(data["attempts"]) < int(data["max_attempts"]):
             data.update(
@@ -438,6 +444,9 @@ class FakeRedis:
         )
         data.pop("completed_at", None)
         data.pop("result", None)
+        data.pop("started_at", None)
+        for field in ("lease_token", "lease_deadline", "worker_id"):
+            data.pop(field, None)
         self._zadd(ready_key, float(now), job_id)
         return 1
 
@@ -663,6 +672,9 @@ class RedisJobQueueTests(unittest.IsolatedAsyncioTestCase):
                 "cancelled",
             ),
         )
+        cancelled = await self.queue.get(running.id)
+        self.assertEqual("", cancelled.lease_token)
+        self.assertEqual("", cancelled.worker_id)
 
     async def test_worker_retries_failed_handler(self) -> None:
         job, _created = await self.queue.enqueue(

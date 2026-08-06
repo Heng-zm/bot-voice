@@ -27,9 +27,15 @@ class AtomicFileWriteTests(unittest.TestCase):
             destination = Path(directory, "audio.bin")
             destination.write_bytes(b"old")
 
-            with patch.object(legacy.os, "replace", side_effect=OSError("replace failed")):
-                with self.assertRaisesRegex(OSError, "replace failed"):
-                    _write_file_bytes_sync(str(destination), b"new")
+            with (
+                patch.object(
+                    legacy.os,
+                    "replace",
+                    side_effect=OSError("replace failed"),
+                ),
+                self.assertRaisesRegex(OSError, "replace failed"),
+            ):
+                _write_file_bytes_sync(str(destination), b"new")
 
             self.assertEqual(b"old", destination.read_bytes())
             leftovers = [path for path in Path(directory).iterdir() if path != destination]

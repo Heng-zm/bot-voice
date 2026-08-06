@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from app.services.ai.language import _detect_lang, _language_display
@@ -25,9 +25,23 @@ class ProgressRedis:
     def hgetall(self, key: str):
         return dict(self.hashes.get(key, {}))
 
-    def hset(self, key: str, *, mapping: dict[str, str]):
-        self.hashes.setdefault(key, {}).update(mapping)
-        return len(mapping)
+    def eval(self, script: str, number_of_keys: int, *values):
+        if "bot_voice:update_progress_v1" not in script:
+            raise AssertionError("Unexpected script")
+        keys = list(values[:number_of_keys])
+        args = [str(value) for value in values[number_of_keys:]]
+        (job_key,) = keys
+        token, percent, stage, detail, updated_at = args
+        data = self.hashes[job_key]
+        if data.get("state") != "running" or data.get("lease_token") != token:
+            return 0
+        data.update(
+            progress_percent=percent,
+            progress_stage=stage,
+            progress_detail=detail,
+            updated_at=updated_at,
+        )
+        return 1
 
     def zrevrange(self, key: str, start: int, end: int):
         ordered = [
@@ -66,7 +80,7 @@ class ExtractedUtilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("km", _detect_lang("សួស្តី"))
         self.assertEqual("ar", _detect_lang("مرحبا"))
         self.assertEqual(("🇰🇭", "Khmer"), _language_display("km"))
-        utc_value = datetime(2026, 8, 5, 4, 0, tzinfo=timezone.utc)
+        utc_value = datetime(2026, 8, 5, 4, 0, tzinfo=UTC)
         local_value = _to_local_time(utc_value)
         self.assertEqual(11, local_value.hour)
         self.assertEqual(utc_value, _local_to_utc(local_value))
@@ -107,6 +121,25 @@ class DurableRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("generating_voice", job.progress_stage)
         self.assertEqual("model=edge", job.progress_detail)
         self.assertIsNotNone(job.updated_at)
+
+    async def test_progress_rejects_a_stale_lease(self) -> None:
+        redis = ProgressRedis()
+        queue = RedisJobQueue(redis, redis_prefix="tests")
+        job_id = "job-progress"
+        redis.hashes[queue._job_key(job_id)] = {
+            "state": "running",
+            "lease_token": "new-lease",
+        }
+
+        changed = await queue.update_progress(
+            job_id,
+            "stale-lease",
+            percent=90,
+            stage="almost_done",
+        )
+
+        self.assertFalse(changed)
+        self.assertNotIn("progress_percent", redis.hashes[queue._job_key(job_id)])
 
     async def test_terminal_state_indexes_are_listable_and_counted(self) -> None:
         redis = ProgressRedis()

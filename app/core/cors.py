@@ -10,7 +10,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -95,7 +95,7 @@ def normalize_origin(value: str) -> str:
             not _DNS_LABEL_RE.fullmatch(label)
             for label in hostname.split(".")
         ):
-            raise InvalidOriginError("Origin hostname is invalid.")
+            raise InvalidOriginError("Origin hostname is invalid.") from None
         host = hostname
     else:
         host = f"[{address.compressed}]" if address.version == 6 else address.compressed
@@ -330,7 +330,7 @@ class DynamicCorsStore:
                 separators=(",", ":"),
             ),
             "updated_by": int(admin_id),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
         }
         try:
             client.table("bot_settings").upsert(

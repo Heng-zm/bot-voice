@@ -6,13 +6,22 @@ import asyncio
 import hashlib
 import inspect
 import json
+import logging
 import random
 import secrets
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Consecutive failed lease renewals tolerated before the running job is
+# cancelled. Renewal runs at lease_seconds/3, so two failures still leave the
+# lease valid while a third means it is about to expire anyway.
+_MAX_HEARTBEAT_ERRORS = 3
 
 _ENQUEUE_SCRIPT = """
 -- bot_voice:enqueue_v1
@@ -76,6 +85,9 @@ for _, job_id in ipairs(expired) do
         'updated_at', ARGV[1]
       )
       redis.call('ZADD', KEYS[4], ARGV[1], job_id)
+      redis.call(
+        'HDEL', job_key, 'lease_token', 'lease_deadline', 'worker_id'
+      )
       redis.call('EXPIRE', job_key, ARGV[5])
     elseif attempts >= max_attempts then
       redis.call(
@@ -87,6 +99,9 @@ for _, job_id in ipairs(expired) do
         'updated_at', ARGV[1]
       )
       redis.call('ZADD', KEYS[3], ARGV[1], job_id)
+      redis.call(
+        'HDEL', job_key, 'lease_token', 'lease_deadline', 'worker_id'
+      )
       redis.call('EXPIRE', job_key, ARGV[5])
     else
       redis.call(
@@ -166,6 +181,24 @@ redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3])
 return 1
 """.strip()
 
+_UPDATE_PROGRESS_SCRIPT = """
+-- bot_voice:update_progress_v1
+if redis.call('HGET', KEYS[1], 'state') ~= 'running' then
+  return 0
+end
+if redis.call('HGET', KEYS[1], 'lease_token') ~= ARGV[1] then
+  return 0
+end
+redis.call(
+  'HSET', KEYS[1],
+  'progress_percent', ARGV[2],
+  'progress_stage', ARGV[3],
+  'progress_detail', ARGV[4],
+  'updated_at', ARGV[5]
+)
+return 1
+""".strip()
+
 _COMPLETE_SCRIPT = """
 -- bot_voice:complete_v1
 if redis.call('HGET', KEYS[2], 'state') ~= 'running' then
@@ -229,6 +262,9 @@ if cancelled == '1' then
     'updated_at', ARGV[3]
   )
   redis.call('ZADD', KEYS[5], ARGV[3], ARGV[2])
+  redis.call(
+    'HDEL', KEYS[3], 'lease_token', 'lease_deadline', 'worker_id'
+  )
   redis.call('EXPIRE', KEYS[3], ARGV[7])
   return 2
 end
@@ -314,7 +350,11 @@ redis.call(
   'progress_detail', '',
   'updated_at', ARGV[2]
 )
-redis.call('HDEL', KEYS[4], 'completed_at', 'result')
+redis.call(
+  'HDEL', KEYS[4],
+  'completed_at', 'result', 'started_at',
+  'lease_token', 'lease_deadline', 'worker_id'
+)
 redis.call('PERSIST', KEYS[4])
 redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
 return 1
@@ -721,20 +761,18 @@ class RedisJobQueue:
         clean_detail = str(detail or "").strip()[:500]
         if not clean_stage:
             raise ValueError("Progress stage is required.")
-        current = await self.get(job_id)
-        if current.state != "running" or current.lease_token != lease_token:
-            return False
-        await self._redis_call(
-            "hset",
+        changed = await self._redis_call(
+            "eval",
+            _UPDATE_PROGRESS_SCRIPT,
+            1,
             self._job_key(job_id),
-            mapping={
-                "progress_percent": str(max(0, min(100, int(percent)))),
-                "progress_stage": clean_stage,
-                "progress_detail": clean_detail,
-                "updated_at": str(time.time()),
-            },
+            lease_token,
+            str(max(0, min(100, int(percent)))),
+            clean_stage,
+            clean_detail,
+            str(time.time()),
         )
-        return True
+        return bool(changed)
 
     async def list_jobs(
         self,
@@ -835,6 +873,7 @@ class RedisJobWorker:
         retry_base_seconds: float = 2.0,
         retry_max_seconds: float = 300.0,
         can_claim: Callable[[], bool] | None = None,
+        on_error: Callable[[str], None] | None = None,
     ) -> None:
         self.queue = queue
         self.handlers = {
@@ -855,6 +894,15 @@ class RedisJobWorker:
             float(retry_max_seconds),
         )
         self.can_claim = can_claim or (lambda: True)
+        self.on_error = on_error
+
+    def _record_error(self, exc: BaseException) -> None:
+        """Publish a loop failure to the process-wide worker status table."""
+
+        if self.on_error is None:
+            return
+        with suppress(Exception):
+            self.on_error(f"{type(exc).__name__}: {exc}"[:500])
 
     async def _invoke(self, handler: JobHandler, context: JobContext) -> Any:
         if inspect.iscoroutinefunction(handler):
@@ -870,14 +918,31 @@ class RedisJobWorker:
         task: asyncio.Task[Any],
     ) -> None:
         interval = max(1.0, self.queue.lease_seconds / 3.0)
+        consecutive_errors = 0
         while not task.done():
             await asyncio.sleep(interval)
             if task.done():
                 return
-            renewed = await self.queue.renew(job.id, job.lease_token)
-            if renewed == -1:
-                task.cancel()
-                return
+            try:
+                renewed = await self.queue.renew(job.id, job.lease_token)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - transient Redis boundary
+                # A failed renew is retryable: the lease still has roughly two
+                # thirds of its life left. Only give up once the lease can no
+                # longer be saved, so a single Redis blip cannot orphan a job.
+                consecutive_errors += 1
+                logger.warning(
+                    "Lease renewal failed job=%s attempt=%s: %s",
+                    job.id,
+                    consecutive_errors,
+                    exc,
+                )
+                if consecutive_errors >= _MAX_HEARTBEAT_ERRORS:
+                    task.cancel()
+                    return
+                continue
+            consecutive_errors = 0
             if renewed != 1:
                 task.cancel()
                 return
@@ -917,7 +982,17 @@ class RedisJobWorker:
                 execution,
                 timeout=job.timeout_seconds,
             )
-            await self.queue.complete(job.id, job.lease_token, result)
+            completed = await self.queue.complete(job.id, job.lease_token, result)
+            if not completed:
+                # The lease was lost (expired and swept, or the job was
+                # cancelled), so this result is discarded. Surface it instead
+                # of failing silently: another worker may redo the work.
+                logger.warning(
+                    "Job result discarded because the lease was no longer held "
+                    "job=%s worker=%s",
+                    job.id,
+                    self.worker_id,
+                )
         except asyncio.CancelledError:
             current_task = asyncio.current_task()
             if current_task is not None and current_task.cancelling():
@@ -951,33 +1026,57 @@ class RedisJobWorker:
             )
         finally:
             heartbeat.cancel()
-            try:
+            # The heartbeat may already have finished with an exception, in
+            # which case cancel() is a no-op and awaiting it re-raises from a
+            # finally block — replacing the real job outcome. Swallow anything
+            # it raises; renewal failures are already logged in _heartbeat.
+            with suppress(asyncio.CancelledError, Exception):
                 await heartbeat
-            except asyncio.CancelledError:
-                pass
         return True
 
     async def run(self, stop_event: asyncio.Event) -> None:
+        consecutive_errors = 0
         while not stop_event.is_set():
             if not self.can_claim():
-                try:
+                with suppress(TimeoutError):
                     await asyncio.wait_for(
                         stop_event.wait(),
                         timeout=self.poll_interval_seconds,
                     )
-                except TimeoutError:
-                    pass
-                continue
-            processed = await self.process_one()
-            if processed:
                 continue
             try:
+                processed = await self.process_one()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - worker loop boundary
+                # Claiming or bookkeeping failed (usually a Redis blip). The
+                # worker must survive: letting this escape retires the task
+                # permanently and silently drains the fleet.
+                consecutive_errors += 1
+                self._record_error(exc)
+                logger.warning(
+                    "Job worker iteration failed worker=%s streak=%s: %s",
+                    self.worker_id,
+                    consecutive_errors,
+                    exc,
+                    exc_info=True,
+                )
+                backoff = min(
+                    self.retry_max_seconds,
+                    self.poll_interval_seconds
+                    * (2 ** min(consecutive_errors - 1, 6)),
+                )
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+                continue
+            consecutive_errors = 0
+            if processed:
+                continue
+            with suppress(TimeoutError):
                 await asyncio.wait_for(
                     stop_event.wait(),
                     timeout=self.poll_interval_seconds,
                 )
-            except TimeoutError:
-                pass
 
 
 __all__ = [

@@ -177,14 +177,26 @@ class BotJobHandlers:
         *,
         header: str,
     ) -> str:
-        limit = max(500, int(getattr(self.legacy, "TELE_MSG_LIMIT", 4096)) - len(header) - 180)
-        paginator = getattr(self.legacy, "_paginate_plain", None)
-        pages = paginator(text, limit=limit) if callable(paginator) else [text[:limit]]
-        first = str((pages or [""])[0])
-        suffix = ""
-        if len(pages or ()) > 1:
-            suffix = "\n\n<i>លទ្ធផលពេញត្រូវបានរក្សាទុកដោយសុវត្ថិភាពសម្រាប់សកម្មភាពបន្ទាប់។</i>"
-        return header + html.escape(first) + suffix
+        """Render the first page, budgeting on the escaped length.
+
+        Telegram counts the characters it receives, which is the escaped text.
+        Paginating the raw text first can overflow the limit by up to 6x (a
+        message of apostrophes becomes ``&#x27;`` each), so the page is cut to
+        fit *after* escaping.
+        """
+
+        suffix = (
+            "\n\n<i>លទ្ធផលពេញត្រូវបានរក្សាទុកដោយសុវត្ថិភាពសម្រាប់សកម្មភាពបន្ទាប់។</i>"
+        )
+        message_limit = int(getattr(self.legacy, "TELE_MSG_LIMIT", 4096))
+        budget = max(500, message_limit - len(header) - len(suffix) - 32)
+
+        take_prefix = getattr(self.legacy, "_take_escaped_prefix", None)
+        if callable(take_prefix):
+            first, remainder = take_prefix(str(text or "").strip(), budget)
+        else:  # pragma: no cover - the legacy helper is always present
+            first, remainder = str(text or "").strip()[:budget], ""
+        return header + html.escape(first) + (suffix if remainder else "")
 
     async def _deliver_text_result(
         self,
@@ -315,8 +327,11 @@ class BotJobHandlers:
             kwargs: dict[str, Any] = {"chat_id": chat_id}
             if reply_to is not None:
                 kwargs["reply_to_message_id"] = reply_to
-            with open(output_path, "rb") as handle:
+            handle = await asyncio.to_thread(open, output_path, "rb")
+            try:
                 sent = await bot.send_voice(voice=handle, **kwargs)
+            finally:
+                await asyncio.to_thread(handle.close)
             return {
                 "chat_id": chat_id,
                 "message_id": int(getattr(sent, "message_id", 0) or 0),
@@ -446,7 +461,7 @@ class BotJobHandlers:
         photo_file_id = str(payload.get("photo_file_id") or "").strip() or None
         link_preview = bool(payload.get("link_preview", True))
         bot = await self.bot()
-        sender = getattr(self.legacy, "_send_telegram_broadcast_message")
+        sender = self.legacy._send_telegram_broadcast_message
         concurrency = max(1, min(10, int(payload.get("concurrency") or 3)))
         semaphore = asyncio.Semaphore(concurrency)
         sent = failed = 0

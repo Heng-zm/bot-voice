@@ -54,7 +54,7 @@ def _content_hash(data: bytes) -> str:
 
 
 def _artifact_id(path: str, digest: str) -> str:
-    return hashlib.sha256(f"{path}:{digest}".encode("utf-8")).hexdigest()[:32]
+    return hashlib.sha256(f"{path}:{digest}".encode()).hexdigest()[:32]
 
 
 class LocalArtifactStore:

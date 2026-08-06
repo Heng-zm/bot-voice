@@ -45,10 +45,8 @@ async def run_worker() -> None:
             workers = job_worker_snapshot()
             if workers.get("count", 0) and not workers.get("healthy"):
                 raise RuntimeError("A durable worker task stopped unexpectedly.")
-            try:
+            with suppress(TimeoutError):
                 await asyncio.wait_for(stop_event.wait(), timeout=5.0)
-            except TimeoutError:
-                pass
     finally:
         await runtime.stop(owner="worker-process")
 

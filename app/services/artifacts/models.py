@@ -24,7 +24,7 @@ class ArtifactRef:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "ArtifactRef":
+    def from_dict(cls, value: dict[str, Any]) -> ArtifactRef:
         return cls(
             id=str(value.get("id") or ""),
             backend=str(value.get("backend") or ""),

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 APP_TIMEZONE_NAME = (
@@ -35,18 +35,18 @@ def _local_now() -> datetime:
 
 def _to_local_time(dt: datetime) -> datetime:
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
     return dt.astimezone(APP_TIMEZONE)
 
 
 def _local_to_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=APP_TIMEZONE)
-    return dt.astimezone(timezone.utc)
+    return dt.astimezone(UTC)
 
 
 def _fmt_local_dt(dt: datetime | None = None) -> str:
-    local_dt = _to_local_time(dt or datetime.now(timezone.utc))
+    local_dt = _to_local_time(dt or datetime.now(UTC))
     return (
         f"{local_dt.strftime('%Y-%m-%d %I:%M %p')} "
         f"{APP_TIMEZONE_ALIAS} ({APP_TIMEZONE_UTC_LABEL})"

@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -119,10 +120,19 @@ async def _heartbeat_loop(
         status = _WORKER_STATUS.get(worker_id)
         if status is not None:
             status["last_heartbeat_at"] = time.time()
-        try:
+        with suppress(TimeoutError):
             await asyncio.wait_for(stop_event.wait(), timeout=5.0)
-        except TimeoutError:
-            pass
+
+
+def _worker_error_recorder(worker_id: str) -> Any:
+    """Return a callback that stores a worker loop error for health reporting."""
+
+    def _record(message: str) -> None:
+        status = _WORKER_STATUS.get(worker_id)
+        if status is not None:
+            status["last_error"] = message
+
+    return _record
 
 
 async def _worker_runner(
@@ -195,14 +205,16 @@ async def start_job_workers(
         _WORKER_STATUS.clear()
 
         for index in range(1, count + 1):
+            worker_id = _worker_id(index)
             worker = RedisJobWorker(
                 queue,
                 clean_handlers,
-                worker_id=_worker_id(index),
+                worker_id=worker_id,
                 poll_interval_seconds=float(
                     os.getenv("BOT_JOB_POLL_SECONDS", "0.5") or 0.5
                 ),
                 can_claim=job_workers_accepting,
+                on_error=_worker_error_recorder(worker_id),
             )
             task = asyncio.create_task(
                 _worker_runner(worker, _WORKER_STOP),
@@ -239,6 +251,10 @@ async def stop_job_workers() -> None:
             await asyncio.gather(*tasks, *heartbeats, return_exceptions=True)
         _WORKER_TASKS.clear()
         _WORKER_HEARTBEAT_TASKS.clear()
+        # Without this the snapshot keeps reporting the stopped workers as
+        # dead (count=N, alive=0) after an intentional shutdown, so health
+        # endpoints show a permanently unhealthy fleet.
+        _WORKER_STATUS.clear()
         _WORKER_STOP = None
 
 
