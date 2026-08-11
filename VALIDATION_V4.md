@@ -1,6 +1,8 @@
 # V4 Validation
 
-Validated on Python 3.12 with the repository test and lint configuration.
+The codebase targets Python 3.11 and newer. Local validation was run on Python
+3.12, while CI compiles and tests the deployment sources on both Python 3.11
+and 3.12.
 
 ```text
 python -m pytest -q -p no:cacheprovider
@@ -23,6 +25,10 @@ runtime ownership, URL/finite-number validation, removed-model fallback, and
 extracted services. Bot Monitor coverage verifies process snapshots, bounded
 secret-redacted runtime logs, and safe TTS progress responses without job
 payloads or results.
+
+Deployment compatibility additionally checks the complete source tree with the
+Python 3.11 compiler in CI, preventing Python 3.12-only f-string grammar from
+reaching a Python 3.11 host.
 
 Supabase lock coverage verifies atomic RPC acquisition, duplicate-safe
 pre-migration fallback, same-owner renewal, bounded inputs, and the checked-in
