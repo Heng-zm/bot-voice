@@ -41,6 +41,36 @@ class AtomicFileWriteTests(unittest.TestCase):
             leftovers = [path for path in Path(directory).iterdir() if path != destination]
             self.assertEqual([], leftovers)
 
+    def test_failed_replace_does_not_close_a_handed_off_descriptor(self) -> None:
+        # os.fdopen takes ownership of the mkstemp descriptor, so closing it
+        # again on the error path would target a descriptor number the OS may
+        # already have reassigned to another thread's file or socket.
+        # Closing the file object goes through C, never through os.close, so
+        # any call recorded here is an explicit close from the writer itself.
+        closed: list[int] = []
+        real_close = legacy.os.close
+
+        def tracking_close(fd: int) -> None:
+            closed.append(fd)
+            real_close(fd)
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory, "audio.bin")
+            destination.write_bytes(b"old")
+
+            with (
+                patch.object(
+                    legacy.os,
+                    "replace",
+                    side_effect=OSError("replace failed"),
+                ),
+                patch.object(legacy.os, "close", tracking_close),
+                self.assertRaisesRegex(OSError, "replace failed"),
+            ):
+                _write_file_bytes_sync(str(destination), b"new")
+
+            self.assertEqual([], closed)
+
 
 class RetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_timed_out_worker_is_not_started_again(self) -> None:

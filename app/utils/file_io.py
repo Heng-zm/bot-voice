@@ -36,14 +36,21 @@ def _write_file_bytes_sync(path: str, data: bytes) -> None:
         dir=parent or None,
     )
     try:
-        with os.fdopen(fd, "wb") as handle:
+        # os.fdopen takes ownership of fd and closes it when the handle is
+        # closed. Close the raw descriptor only if that hand-off never
+        # happened; closing it afterwards could hit a descriptor number
+        # another thread has already been handed.
+        try:
+            handle = os.fdopen(fd, "wb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
     except BaseException:
-        with suppress(OSError):
-            os.close(fd)
         with suppress(OSError):
             os.unlink(temporary_path)
         raise

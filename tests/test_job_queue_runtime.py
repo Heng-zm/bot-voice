@@ -12,6 +12,7 @@ class FakeRedis:
         self.hashes: dict[str, dict[str, str]] = {}
         self.zsets: dict[str, dict[str, float]] = {}
         self.strings: dict[str, str] = {}
+        self.pipeline_execute_calls = 0
 
     def eval(self, script: str, key_count: int, *values):
         keys = list(values[:key_count])
@@ -49,6 +50,27 @@ class FakeRedis:
 
     def hgetall(self, key: str):
         return dict(self.hashes.get(key, {}))
+
+    def pipeline(self, *, transaction: bool = False):
+        assert not transaction
+        redis = self
+
+        class Pipeline:
+            def __init__(self) -> None:
+                self.keys: list[str] = []
+
+            def hgetall(self, key: str):
+                self.keys.append(key)
+                return self
+
+            def execute(self):
+                redis.pipeline_execute_calls += 1
+                return [dict(redis.hashes.get(key, {})) for key in self.keys]
+
+            def reset(self) -> None:
+                self.keys.clear()
+
+        return Pipeline()
 
     def zcard(self, key: str) -> int:
         return len(self.zsets.get(key, {}))
@@ -105,6 +127,7 @@ class JobQueueRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(cursor)
         self.assertEqual(1, len(second))
         self.assertIsNone(next_cursor)
+        self.assertEqual(2, redis.pipeline_execute_calls)
 
 
 if __name__ == "__main__":

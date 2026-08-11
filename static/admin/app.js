@@ -1,6 +1,7 @@
 "use strict";
 
 const telegram = window.Telegram?.WebApp ?? null;
+const API_TIMEOUT_MS = 15_000;
 const state = {
   language: window.localStorage.getItem("admin-language") || "en",
   settings: null,
@@ -94,12 +95,22 @@ async function api(path, options = {}) {
   if (!initData) throw new Error("Open this dashboard from the bot inside Telegram.");
   const headers = new Headers(options.headers || {});
   headers.set("X-Telegram-Init-Data", initData);
-  headers.set("Authorization", `Bearer ${initData}`);
   headers.set("Accept", "application/json");
   if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-  const response = await fetch(path, { ...options, headers, credentials: "same-origin", cache: "no-store" });
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeout = window.setTimeout(() => { timedOut = true; controller.abort(); }, API_TIMEOUT_MS);
+  let response;
   let payload = null;
-  try { payload = await response.json(); } catch {}
+  try {
+    response = await fetch(path, { ...options, headers, signal: controller.signal, credentials: "same-origin", cache: "no-store" });
+    try { payload = await response.json(); } catch (error) { if (timedOut) throw error; }
+  } catch (error) {
+    if (timedOut) throw new Error("The server took too long to respond. Please retry.");
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
   if (!response.ok) throw new Error(typeof payload?.detail === "string" ? payload.detail : `Request failed (${response.status})`);
   return payload;
 }

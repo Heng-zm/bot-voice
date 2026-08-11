@@ -85,14 +85,24 @@ class RuntimeContext:
             role or os.getenv("PROCESS_ROLE", "combined") or "combined"
         )
         async with self._lock:
-            if clean_owner in self._owners:
-                return
             if self.started:
+                previous_role = self._owners.get(clean_owner)
                 self._owners[clean_owner] = requested_role
-                if _role_has_workers(requested_role):
-                    await self._ensure_workers()
-                if _role_has_web(requested_role) and application is not None:
-                    await self._ensure_web_services(application)
+                try:
+                    if _role_has_workers(requested_role):
+                        await self._ensure_workers()
+                    if _role_has_web(requested_role) and application is not None:
+                        await self._ensure_web_services(application)
+                except BaseException:
+                    # Register ownership only after this owner's required
+                    # services are ready. A failed upgrade must remain
+                    # retryable and must not change the effective role.
+                    if previous_role is None:
+                        self._owners.pop(clean_owner, None)
+                    else:
+                        self._owners[clean_owner] = previous_role
+                    self.role = self._effective_role()
+                    raise
                 self.role = self._effective_role()
                 return
 

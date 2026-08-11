@@ -152,9 +152,11 @@ async def _combined_main_once() -> None:
 
     _legacy._start_web_broadcast_queue_workers()
     keepalive_stop = asyncio.Event()
-    tasks: list[asyncio.Task] = [
-        asyncio.create_task(_legacy.run_fastapi(), name="fastapi-web"),
-        asyncio.create_task(_legacy._run_bot(), name="telegram-bot"),
+    web_task = asyncio.create_task(_legacy.run_fastapi(), name="fastapi-web")
+    bot_task = asyncio.create_task(_legacy._run_bot(), name="telegram-bot")
+    tasks: list[asyncio.Task[None]] = [
+        web_task,
+        bot_task,
         asyncio.create_task(
             _legacy._run_startup_background_checks(),
             name="startup-background-checks",
@@ -173,16 +175,11 @@ async def _combined_main_once() -> None:
         )
 
     try:
-        done, _pending = await asyncio.wait(
-            tasks,
-            return_when=asyncio.FIRST_EXCEPTION,
-        )
-        for task in done:
-            if task.cancelled():
-                continue
-            error = task.exception()
-            if error is not None:
-                raise error
+        # Startup checks are finite by design, while the web and Telegram
+        # loops are both critical long-running services. If either critical
+        # loop returns normally, tear down the partial runtime so main() can
+        # restart the complete service instead of remaining half alive.
+        await _wait_for_critical_tasks([web_task, bot_task])
     finally:
         keepalive_stop.set()
         await _legacy._stop_web_broadcast_queue_workers()
@@ -193,6 +190,23 @@ async def _combined_main_once() -> None:
             with suppress(asyncio.CancelledError, Exception):
                 await task
         await runtime.stop(owner="combined")
+
+
+async def _wait_for_critical_tasks(tasks: list[asyncio.Task[None]]) -> None:
+    """Return when a critical service stops, propagating its exception."""
+
+    if not tasks:
+        raise ValueError("At least one critical task is required.")
+    done, _pending = await asyncio.wait(
+        tasks,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for task in done:
+        if task.cancelled():
+            continue
+        error = task.exception()
+        if error is not None:
+            raise error
 
 
 def main() -> None:

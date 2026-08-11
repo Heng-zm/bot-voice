@@ -709,6 +709,11 @@ class RedisJobQueue:
         raw = await self._redis_call("hgetall", self._job_key(job_id))
         if not raw:
             raise JobNotFound(f"Job {job_id!r} was not found.")
+        return self._job_from_raw(job_id, raw)
+
+    def _job_from_raw(self, job_id: str, raw: Any) -> Job:
+        """Decode one Redis hash into a validated job record."""
+
         values = {
             self._decode(key): self._decode(value)
             for key, value in dict(raw).items()
@@ -747,6 +752,40 @@ class RedisJobQueue:
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise JobQueueError(f"Job {job_id!r} contains invalid Redis data.") from exc
+
+    async def _get_many(self, job_ids: list[str]) -> list[Job]:
+        """Load one job page with a single Redis pipeline round trip."""
+
+        if not job_ids:
+            return []
+
+        def load() -> list[Any]:
+            pipeline_factory = getattr(self.redis, "pipeline", None)
+            if not callable(pipeline_factory):
+                return [self.redis.hgetall(self._job_key(job_id)) for job_id in job_ids]
+
+            pipeline = pipeline_factory(transaction=False)
+            try:
+                for job_id in job_ids:
+                    pipeline.hgetall(self._job_key(job_id))
+                return list(pipeline.execute())
+            finally:
+                reset = getattr(pipeline, "reset", None)
+                if callable(reset):
+                    reset()
+
+        try:
+            raw_jobs = await asyncio.to_thread(load)
+        except Exception as exc:
+            raise JobQueueError("Redis job queue bulk read failed.") from exc
+        if len(raw_jobs) != len(job_ids):
+            raise JobQueueError("Redis returned an invalid bulk job result.")
+
+        jobs: list[Job] = []
+        for job_id, raw in zip(job_ids, raw_jobs, strict=True):
+            if raw:
+                jobs.append(self._job_from_raw(job_id, raw))
+        return jobs
 
     async def update_progress(
         self,
@@ -816,17 +855,7 @@ class RedisJobQueue:
         ids = [self._decode(value) for value in list(raw_ids or ())]
         has_more = len(ids) > page_size
         ids = ids[:page_size]
-        jobs: list[Job] = []
-        if ids:
-            results = await asyncio.gather(
-                *(self.get(job_id) for job_id in ids),
-                return_exceptions=True,
-            )
-            for result in results:
-                if isinstance(result, Job):
-                    jobs.append(result)
-                elif not isinstance(result, JobNotFound):
-                    raise result
+        jobs = await self._get_many(ids)
         next_cursor = str(offset + page_size) if has_more else None
         return jobs, next_cursor
 
