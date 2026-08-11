@@ -29,7 +29,12 @@ def _job(job_id: str, state: str) -> SimpleNamespace:
 
 class _Queue:
     async def stats(self) -> dict:
-        return {"queued": 1, "running": 1, "throughput_per_minute": 2.5}
+        return {
+            "queued": 1,
+            "running": 1,
+            "queue_limit": 1000,
+            "throughput_per_minute": 2.5,
+        }
 
     async def list_jobs(self, *, state: str, limit: int):
         assert limit == (100 if state == "running" else 200)
@@ -65,6 +70,8 @@ class RuntimeMonitoringTests(unittest.TestCase):
 
         self.assertEqual(1, snapshot["count"])
         self.assertEqual("WARNING", snapshot["entries"][0]["level"])
+        self.assertEqual(1, snapshot["level_counts"]["INFO"])
+        self.assertEqual(1, snapshot["level_counts"]["WARNING"])
         all_text = str(monitoring.runtime_log_snapshot(limit=10))
         self.assertNotIn("top-secret", all_text)
         self.assertNotIn("abcdefghijklmnop", all_text)
@@ -77,6 +84,8 @@ class RuntimeMonitoringTests(unittest.TestCase):
         self.assertGreater(snapshot["pid"], 0)
         self.assertGreaterEqual(snapshot["uptime_seconds"], 0)
         self.assertGreaterEqual(snapshot["threads"], 1)
+        self.assertGreaterEqual(snapshot["sampled_at"], snapshot["started_at"])
+        self.assertGreaterEqual(snapshot["cpu_seconds"], 0)
         self.assertNotIn("environment", snapshot)
         self.assertNotIn("command_line", snapshot)
 
@@ -107,6 +116,8 @@ class MonitorEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(payload["ok"])
         self.assertEqual("instance-test", payload["process"]["instance_id"])
+        self.assertEqual("healthy", payload["health"]["state"])
+        self.assertAlmostEqual(0.1, payload["health"]["queue_pressure_percent"])
         self.assertEqual(1, payload["tts"]["running_count"])
         self.assertEqual(1, payload["tts"]["queued_count"])
         self.assertEqual("generating", payload["tts"]["running"][0]["progress_stage"])

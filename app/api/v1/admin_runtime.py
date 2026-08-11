@@ -209,6 +209,19 @@ async def bot_monitor(
     queued_jobs = [job for job in queued_page_jobs if job.type == "tts"][:50]
     legacy = _legacy_monitor_snapshot()
     process = process_snapshot()
+    workers = job_worker_snapshot()
+    queue_limit = max(1, int(counts.get("queue_limit") or 1))
+    queue_pressure = round(
+        min(100.0, (int(counts.get("queued") or 0) / queue_limit) * 100.0),
+        1,
+    )
+    failure_rate = float(counts.get("failure_rate_percent") or 0.0)
+    if workers.get("count") and not workers.get("healthy"):
+        health_state = "critical"
+    elif queue_pressure >= 80.0 or failure_rate >= 20.0:
+        health_state = "warning"
+    else:
+        health_state = "healthy"
     process.update(
         {
             "instance_id": get_provider_manager().metadata().get("instance_id", ""),
@@ -222,8 +235,13 @@ async def bot_monitor(
     return {
         "ok": True,
         "generated_at": datetime.now(UTC).isoformat(),
+        "health": {
+            "state": health_state,
+            "queue_pressure_percent": queue_pressure,
+            "failure_rate_percent": failure_rate,
+        },
         "process": process,
-        "workers": job_worker_snapshot(),
+        "workers": workers,
         "queue": counts,
         "tts": {
             "configured": int(tts_slots.get("configured") or 0),

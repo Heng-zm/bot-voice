@@ -106,6 +106,10 @@ def runtime_log_snapshot(
     with _RUNTIME_LOGS_LOCK:
         captured = len(_RUNTIME_LOGS)
         entries = list(_RUNTIME_LOGS)
+    level_counts = {
+        level: sum(1 for entry in entries if entry.get("level") == level)
+        for level in ("INFO", "WARNING", "ERROR", "CRITICAL")
+    }
     if clean_level:
         minimum = logging._nameToLevel[clean_level]  # noqa: SLF001
         entries = [
@@ -125,6 +129,7 @@ def runtime_log_snapshot(
         "count": min(len(entries), clean_limit),
         "matched": len(entries),
         "captured": captured,
+        "level_counts": level_counts,
     }
 
 
@@ -135,6 +140,8 @@ def process_snapshot() -> dict[str, Any]:
     snapshot: dict[str, Any] = {
         "pid": os.getpid(),
         "started_at": _MONITOR_STARTED_AT,
+        "sampled_at": now,
+        "cpu_seconds": round(time.process_time(), 4),
         "uptime_seconds": max(0, int(now - _MONITOR_STARTED_AT)),
         "threads": threading.active_count(),
     }

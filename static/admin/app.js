@@ -2,6 +2,8 @@
 
 const telegram = window.Telegram?.WebApp ?? null;
 const API_TIMEOUT_MS = 15_000;
+const MONITOR_INTERVALS = new Set([3000, 5000, 10000]);
+const storedMonitorInterval = Number.parseInt(window.localStorage.getItem("admin-monitor-interval") || "5000", 10);
 const state = {
   language: window.localStorage.getItem("admin-language") || "en",
   settings: null,
@@ -18,6 +20,12 @@ const state = {
   monitorTimer: null,
   monitorFullscreen: false,
   monitorVisible: false,
+  monitorIntervalMs: MONITOR_INTERVALS.has(storedMonitorInterval) ? storedMonitorInterval : 5000,
+  monitorHistory: { cpu: [], pressure: [], requests: [], tts: [] },
+  monitorLastSample: null,
+  monitorTtsFilter: "all",
+  monitorTtsPayload: null,
+  monitorLogs: [],
 };
 
 const translations = {
@@ -48,6 +56,13 @@ const translations = {
     runtimeLogs: "Runtime logs", logsSafe: "Recent logs are bounded and secrets are automatically hidden.", allLogs: "All logs",
     searchLogs: "Search logs", pauseLive: "Pause", resumeLive: "Resume", noLogs: "No matching runtime logs.", monitor: "Monitor",
     online: "Online", running: "Running", waiting: "Waiting", noWorkers: "No workers are running in this process.",
+    secureRealtime: "Secure real-time control", lastSync: "Last sync", monitorConnecting: "Connecting to runtime",
+    monitorConnectingHelp: "Waiting for the first secure process snapshot…", cpuActivity: "CPU activity", queuePressure: "Queue pressure",
+    webRequests: "Web requests", ttsLoad: "TTS workload", allProcesses: "All", copyLogs: "Copy logs", logsCopied: "Logs copied.",
+    monitorHealthy: "Runtime healthy", monitorHealthyHelp: "Workers and queue are operating within normal limits.",
+    monitorWarning: "Runtime needs attention", monitorWarningHelp: "Queue pressure or recent failure rate is elevated.",
+    monitorCritical: "Worker interruption detected", monitorCriticalHelp: "One or more durable workers are not healthy.",
+    monitorOffline: "Monitor unavailable", monitorOfflineHelp: "The secure runtime snapshot could not be refreshed.",
   },
   km: {
     miniApp: "Telegram Mini App", controlCenter: "មជ្ឈមណ្ឌលគ្រប់គ្រងបូត", verifying: "កំពុងផ្ទៀងផ្ទាត់គណនី Telegram",
@@ -76,6 +91,13 @@ const translations = {
     runtimeLogs: "Runtime logs", logsSafe: "Logs ថ្មីៗត្រូវបានកំណត់ចំនួន ហើយ secrets ត្រូវបានលាក់ដោយស្វ័យប្រវត្តិ។", allLogs: "Logs ទាំងអស់",
     searchLogs: "ស្វែងរក logs", pauseLive: "ផ្អាក", resumeLive: "បន្ត", noLogs: "មិនមាន runtime log ដែលត្រូវគ្នាទេ។", monitor: "តាមដាន",
     online: "អនឡាញ", running: "កំពុងដំណើរការ", waiting: "កំពុងរង់ចាំ", noWorkers: "មិនមាន worker ដំណើរការនៅក្នុង process នេះទេ។",
+    secureRealtime: "ការគ្រប់គ្រងផ្ទាល់ដែលមានសុវត្ថិភាព", lastSync: "ធ្វើសមកាលកម្មចុងក្រោយ", monitorConnecting: "កំពុងភ្ជាប់ Runtime",
+    monitorConnectingHelp: "កំពុងរង់ចាំទិន្នន័យ process ដែលមានសុវត្ថិភាព…", cpuActivity: "សកម្មភាព CPU", queuePressure: "សម្ពាធជួរ",
+    webRequests: "សំណើ Web", ttsLoad: "បន្ទុក TTS", allProcesses: "ទាំងអស់", copyLogs: "ចម្លង Logs", logsCopied: "បានចម្លង Logs។",
+    monitorHealthy: "Runtime ដំណើរការល្អ", monitorHealthyHelp: "Workers និងជួរការងារដំណើរការក្នុងកម្រិតធម្មតា។",
+    monitorWarning: "Runtime ត្រូវការការពិនិត្យ", monitorWarningHelp: "សម្ពាធជួរ ឬអត្រាបរាជ័យថ្មីៗកំពុងកើនឡើង។",
+    monitorCritical: "រកឃើញ Worker ផ្អាក", monitorCriticalHelp: "Durable worker មួយ ឬច្រើនមិនមានសុខភាពល្អ។",
+    monitorOffline: "មិនអាចប្រើ Monitor", monitorOfflineHelp: "មិនអាចផ្ទុកទិន្នន័យ Runtime ដែលមានសុវត្ថិភាពបានទេ។",
   },
 };
 
@@ -83,7 +105,7 @@ const $ = (id) => document.getElementById(id);
 const elements = {
   authState: $("authState"), dashboard: $("dashboard"), refreshButton: $("refreshButton"), languageButton: $("languageButton"),
   profilePhoto: $("profilePhoto"), profileFallback: $("profileFallback"), profileName: $("profileName"), profileHandle: $("profileHandle"),
-  systemBadge: $("systemBadge"), totalUsers: $("totalUsers"), messageCount: $("messageCount"), queuedJobs: $("queuedJobs"),
+  systemBadge: $("systemBadge"), heroSyncState: $("heroSyncState"), totalUsers: $("totalUsers"), messageCount: $("messageCount"), queuedJobs: $("queuedJobs"),
   deadJobs: $("deadJobs"), redisLatency: $("redisLatency"), uptime: $("uptime"), lastUpdated: $("lastUpdated"),
   botHealth: $("botHealth"), redisHealth: $("redisHealth"), databaseHealth: $("databaseHealth"), workerHealth: $("workerHealth"),
   botMode: $("botMode"), maintenanceToggle: $("maintenanceToggle"), maintenanceNotice: $("maintenanceNotice"),
@@ -92,12 +114,15 @@ const elements = {
   jobState: $("jobState"), jobType: $("jobType"), jobSearch: $("jobSearch"), refreshJobsButton: $("refreshJobsButton"), jobsList: $("jobsList"), jobsEmpty: $("jobsEmpty"),
   jobSummary: $("jobSummary"), drainWorkersButton: $("drainWorkersButton"), resumeWorkersButton: $("resumeWorkersButton"), retrySelectedButton: $("retrySelectedButton"), loadMoreJobsButton: $("loadMoreJobsButton"),
   queueCharts: $("queueCharts"),
-  monitor: $("monitor"), monitorLiveState: $("monitorLiveState"), refreshMonitorButton: $("refreshMonitorButton"), monitorFullscreenButton: $("monitorFullscreenButton"),
+  monitor: $("monitor"), monitorLiveState: $("monitorLiveState"), monitorInterval: $("monitorInterval"), refreshMonitorButton: $("refreshMonitorButton"), monitorFullscreenButton: $("monitorFullscreenButton"),
+  monitorAlert: $("monitorAlert"), monitorAlertTitle: $("monitorAlertTitle"), monitorAlertDetail: $("monitorAlertDetail"), monitorLatency: $("monitorLatency"),
   monitorProcessState: $("monitorProcessState"), monitorProcessMeta: $("monitorProcessMeta"), monitorWorkerState: $("monitorWorkerState"), monitorWorkerMeta: $("monitorWorkerMeta"),
   monitorTtsState: $("monitorTtsState"), monitorTtsMeta: $("monitorTtsMeta"), monitorQueueState: $("monitorQueueState"), monitorQueueMeta: $("monitorQueueMeta"),
+  monitorCpuValue: $("monitorCpuValue"), monitorCpuChart: $("monitorCpuChart"), monitorPressureValue: $("monitorPressureValue"), monitorPressureChart: $("monitorPressureChart"),
+  monitorRequestsValue: $("monitorRequestsValue"), monitorRequestsChart: $("monitorRequestsChart"), monitorTtsTrendValue: $("monitorTtsTrendValue"), monitorTtsTrendChart: $("monitorTtsTrendChart"),
   monitorUpdated: $("monitorUpdated"), monitorProcessDetails: $("monitorProcessDetails"), monitorWorkerCount: $("monitorWorkerCount"), monitorWorkerList: $("monitorWorkerList"),
   monitorTtsCount: $("monitorTtsCount"), monitorTtsList: $("monitorTtsList"), monitorTtsEmpty: $("monitorTtsEmpty"), monitorLogLevel: $("monitorLogLevel"),
-  monitorLogSearch: $("monitorLogSearch"), monitorPauseButton: $("monitorPauseButton"), monitorLogList: $("monitorLogList"), monitorLogsEmpty: $("monitorLogsEmpty"),
+  monitorLogSearch: $("monitorLogSearch"), monitorLogCount: $("monitorLogCount"), monitorCopyLogsButton: $("monitorCopyLogsButton"), monitorPauseButton: $("monitorPauseButton"), monitorLogList: $("monitorLogList"), monitorLogsEmpty: $("monitorLogsEmpty"),
   providersList: $("providersList"), providerScope: $("providerScope"), adminForm: $("adminForm"), adminUserId: $("adminUserId"),
   adminList: $("adminList"), auditList: $("auditList"), toast: $("toast"),
 };
@@ -112,6 +137,7 @@ function applyLanguage() {
   elements.jobSearch.placeholder = t("searchJobs");
   elements.monitorPauseButton.textContent = state.monitorPaused ? t("resumeLive") : t("pauseLive");
   elements.monitorFullscreenButton.textContent = state.monitorFullscreen ? t("exitFullScreen") : t("fullScreen");
+  elements.monitorInterval.value = String(state.monitorIntervalMs);
   window.localStorage.setItem("admin-language", state.language);
 }
 
@@ -191,6 +217,55 @@ function appendMonitorDetail(container, labelText, valueText) {
   row.append(label, value); container.append(row);
 }
 
+function pushMonitorSample(series, value) {
+  series.push(Math.max(0, Number(value) || 0));
+  if (series.length > 30) series.shift();
+}
+
+function renderMonitorTrend(container, values, color) {
+  container.replaceChildren(sparkline(values.length ? values : [0], color));
+}
+
+function updateMonitorTrends(payload) {
+  const process = payload.process || {}, health = payload.health || {}, tts = payload.tts || {};
+  const sampledAt = Number(process.sampled_at), cpuSeconds = Number(process.cpu_seconds);
+  let cpuPercent = 0;
+  const previous = state.monitorLastSample;
+  if (previous && previous.pid === process.pid && sampledAt > previous.sampledAt && cpuSeconds >= previous.cpuSeconds) {
+    cpuPercent = Math.min(999, ((cpuSeconds - previous.cpuSeconds) / (sampledAt - previous.sampledAt)) * 100);
+  }
+  if (Number.isFinite(sampledAt) && Number.isFinite(cpuSeconds)) state.monitorLastSample = { pid: process.pid, sampledAt, cpuSeconds };
+  const pressure = Number(health.queue_pressure_percent) || 0;
+  const requests = Number(process.active_requests) || 0;
+  const ttsLoad = (Number(tts.running_count) || 0) + (Number(tts.queued_count) || 0);
+  pushMonitorSample(state.monitorHistory.cpu, cpuPercent);
+  pushMonitorSample(state.monitorHistory.pressure, pressure);
+  pushMonitorSample(state.monitorHistory.requests, requests);
+  pushMonitorSample(state.monitorHistory.tts, ttsLoad);
+  elements.monitorCpuValue.textContent = `${cpuPercent.toFixed(1)}%`;
+  elements.monitorPressureValue.textContent = `${pressure.toFixed(1)}%`;
+  elements.monitorRequestsValue.textContent = compactNumber(requests);
+  elements.monitorTtsTrendValue.textContent = compactNumber(ttsLoad);
+  renderMonitorTrend(elements.monitorCpuChart, state.monitorHistory.cpu, "#65b5ff");
+  renderMonitorTrend(elements.monitorPressureChart, state.monitorHistory.pressure, pressure >= 80 ? "#ff6b79" : "#a58bff");
+  renderMonitorTrend(elements.monitorRequestsChart, state.monitorHistory.requests, "#50d890");
+  renderMonitorTrend(elements.monitorTtsTrendChart, state.monitorHistory.tts, "#ffbd59");
+}
+
+function renderMonitorAlert(payload, latencyMs) {
+  const healthState = ["healthy", "warning", "critical"].includes(payload.health?.state) ? payload.health.state : "warning";
+  const copy = {
+    healthy: [t("monitorHealthy"), t("monitorHealthyHelp")],
+    warning: [t("monitorWarning"), t("monitorWarningHelp")],
+    critical: [t("monitorCritical"), t("monitorCriticalHelp")],
+  }[healthState];
+  elements.monitorAlert.classList.remove("healthy", "warning", "critical", "down");
+  elements.monitorAlert.classList.add(healthState);
+  elements.monitorAlertTitle.textContent = copy[0];
+  elements.monitorAlertDetail.textContent = copy[1];
+  elements.monitorLatency.textContent = `${Math.max(0, Math.round(latencyMs))} ms`;
+}
+
 function renderMonitorWorkers(workers) {
   const rows = Array.isArray(workers.workers) ? workers.workers : [];
   elements.monitorWorkerList.replaceChildren();
@@ -212,10 +287,14 @@ function renderMonitorWorkers(workers) {
 
 function renderMonitorTts(tts) {
   const running = Array.isArray(tts.running) ? tts.running : [], queued = Array.isArray(tts.queued) ? tts.queued : [];
-  const jobs = [...running.map((job) => ({ ...job, monitorState: "running" })), ...queued.map((job) => ({ ...job, monitorState: "queued" }))];
+  state.monitorTtsPayload = tts;
+  const allJobs = [...running.map((job) => ({ ...job, monitorState: "running" })), ...queued.map((job) => ({ ...job, monitorState: "queued" }))];
+  const jobs = state.monitorTtsFilter === "all" ? allJobs : allJobs.filter((job) => job.monitorState === state.monitorTtsFilter);
   elements.monitorTtsList.replaceChildren();
-  elements.monitorTtsCount.textContent = `${running.length} ${t("running")} · ${queued.length} ${t("waiting")}`;
+  const truncated = tts.running_truncated || tts.queued_truncated ? "+" : "";
+  elements.monitorTtsCount.textContent = `${running.length} ${t("running")} · ${queued.length}${truncated} ${t("waiting")}`;
   elements.monitorTtsEmpty.classList.toggle("is-hidden", jobs.length > 0);
+  document.querySelectorAll("[data-tts-filter]").forEach((button) => button.classList.toggle("active", button.dataset.ttsFilter === state.monitorTtsFilter));
   jobs.forEach((job) => {
     const row = document.createElement("div"); row.className = "monitor-job-row";
     const badge = document.createElement("span"); badge.className = `monitor-job-badge ${job.monitorState}`; badge.textContent = job.monitorState === "running" ? t("running") : t("waiting");
@@ -223,6 +302,7 @@ function renderMonitorTts(tts) {
     const title = document.createElement("strong"); title.textContent = `TTS · ${String(job.id || "").slice(0, 18)}`;
     const meta = document.createElement("small"); meta.textContent = `${job.progress_percent || 0}% · ${job.progress_stage || job.monitorState} · attempt ${job.attempts || 0}/${job.max_attempts || 0}`;
     copy.append(title, meta);
+    const progress = document.createElement("div"); progress.className = "monitor-job-progress"; const progressBar = document.createElement("span"); progressBar.style.width = `${Math.max(0, Math.min(100, Number(job.progress_percent) || 0))}%`; progress.append(progressBar); copy.append(progress);
     if (job.progress_detail) { const detail = document.createElement("small"); detail.textContent = job.progress_detail; copy.append(detail); }
     if (job.last_error) { const error = document.createElement("p"); error.className = "row-error"; error.textContent = job.last_error; copy.append(error); }
     row.append(badge, copy); elements.monitorTtsList.append(row);
@@ -231,7 +311,9 @@ function renderMonitorTts(tts) {
 
 function renderMonitorLogs(logs) {
   const entries = Array.isArray(logs.entries) ? logs.entries : [];
+  state.monitorLogs = entries;
   elements.monitorLogList.replaceChildren();
+  elements.monitorLogCount.textContent = `${entries.length}/${logs.captured || entries.length}`;
   elements.monitorLogsEmpty.classList.toggle("is-hidden", entries.length > 0);
   entries.forEach((entry) => {
     const row = document.createElement("div"); row.className = `monitor-log-row level-${String(entry.level || "INFO").toLowerCase()}`;
@@ -244,12 +326,12 @@ function renderMonitorLogs(logs) {
   });
 }
 
-function renderMonitor(payload) {
+function renderMonitor(payload, latencyMs = 0) {
   const process = payload.process || {}, workers = payload.workers || {}, queue = payload.queue || {}, tts = payload.tts || {};
   elements.monitorLiveState.classList.remove("down", "paused");
   elements.monitorLiveState.lastElementChild.textContent = state.monitorPaused ? t("paused") : t("live");
   elements.monitorLiveState.classList.toggle("paused", state.monitorPaused);
-  elements.monitorProcessState.textContent = t("online");
+  elements.monitorProcessState.textContent = payload.health?.state === "critical" ? t("unavailable") : t("online");
   elements.monitorProcessMeta.textContent = `PID ${process.pid ?? "—"} · ${process.uptime || formatDuration(process.uptime_seconds)}`;
   elements.monitorWorkerState.textContent = `${workers.alive || 0}/${workers.count || 0}`;
   elements.monitorWorkerMeta.textContent = workers.accepting ? t("accepting") : t("drained");
@@ -259,13 +341,14 @@ function renderMonitor(payload) {
   elements.monitorQueueState.textContent = `${queue.running || 0} ${t("running")}`;
   elements.monitorQueueMeta.textContent = `${queue.queued || 0} ${t("waiting")} · ${Number(queue.throughput_per_minute || 0).toFixed(1)}/min`;
   elements.monitorUpdated.textContent = formatIsoDate(payload.generated_at);
+  elements.heroSyncState.textContent = `${t("lastSync")} · ${new Date(payload.generated_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
   elements.monitorProcessDetails.replaceChildren();
   [
     ["Instance", process.instance_id || "—"], ["PID", String(process.pid ?? "—")], [t("uptime"), process.uptime || formatDuration(process.uptime_seconds)],
     ["Threads", String(process.threads ?? "—")], ["Max RSS", formatMemory(process.max_rss_kb)], ["Load average", Array.isArray(process.load_average) && process.load_average.length ? process.load_average.join(" · ") : "—"],
     ["Active web requests", String(process.active_requests ?? 0)], ["DB executor queue", String(process.db_queue_size ?? 0)], ["TTS completed", compactNumber(process.metrics?.tts || 0)],
   ].forEach(([label, value]) => appendMonitorDetail(elements.monitorProcessDetails, label, value));
-  renderMonitorWorkers(workers); renderMonitorTts(tts); renderMonitorLogs(payload.logs || {});
+  renderMonitorAlert(payload, latencyMs); updateMonitorTrends(payload); renderMonitorWorkers(workers); renderMonitorTts(tts); renderMonitorLogs(payload.logs || {});
 }
 
 async function refreshMonitor({ force = false, silent = true } = {}) {
@@ -275,9 +358,13 @@ async function refreshMonitor({ force = false, silent = true } = {}) {
   if (elements.monitorLogLevel.value) params.set("log_level", elements.monitorLogLevel.value);
   if (elements.monitorLogSearch.value.trim()) params.set("log_query", elements.monitorLogSearch.value.trim());
   try {
-    renderMonitor(await api(`/api/admin/runtime/monitor?${params}`));
+    const requestStarted = performance.now();
+    const payload = await api(`/api/admin/runtime/monitor?${params}`);
+    renderMonitor(payload, performance.now() - requestStarted);
   } catch (error) {
     elements.monitorLiveState.classList.add("down"); elements.monitorLiveState.lastElementChild.textContent = t("unavailable");
+    elements.monitorAlert.classList.remove("healthy", "warning", "critical"); elements.monitorAlert.classList.add("down");
+    elements.monitorAlertTitle.textContent = t("monitorOffline"); elements.monitorAlertDetail.textContent = t("monitorOfflineHelp"); elements.monitorLatency.textContent = "— ms";
     if (!silent) showToast(error.message, true);
   } finally { state.monitorRefreshing = false; elements.refreshMonitorButton.disabled = false; }
 }
@@ -296,6 +383,20 @@ function toggleMonitorFullscreen() {
   document.body.classList.toggle("monitor-fullscreen-open", state.monitorFullscreen);
   elements.monitorFullscreenButton.textContent = state.monitorFullscreen ? t("exitFullScreen") : t("fullScreen");
   if (state.monitorFullscreen) { telegram?.expand?.(); elements.monitor.scrollTop = 0; runAsync(() => refreshMonitor({ force: true })); }
+}
+
+function scheduleMonitorPolling() {
+  window.clearInterval(state.monitorTimer);
+  state.monitorTimer = window.setInterval(() => runAsync(() => refreshMonitor()), state.monitorIntervalMs);
+}
+
+async function copyMonitorLogs() {
+  if (!state.monitorLogs.length) return showToast(t("noLogs"), true);
+  const text = state.monitorLogs.map((entry) => `[${entry.ts || ""}] ${entry.level || "INFO"} ${entry.source || "runtime"} — ${entry.message || ""}`).join("\n");
+  try {
+    await navigator.clipboard.writeText(text);
+    haptic(); showToast(t("logsCopied"));
+  } catch { showToast("Could not copy logs.", true); }
 }
 function renderProfile(payload) {
   const user = payload.user || {};
@@ -495,7 +596,9 @@ function applyTelegramTheme() { const root = document.documentElement, params = 
 function updateViewportVars() { const root = document.documentElement, viewportHeight = telegram?.viewportHeight || window.innerHeight, stableHeight = telegram?.viewportStableHeight || viewportHeight; root.style.setProperty("--tg-viewport-height", `${viewportHeight}px`); root.style.setProperty("--tg-viewport-stable-height", `${stableHeight}px`); }
 function initializeTelegram() { if (!telegram) return; telegram.ready(); telegram.expand(); applyTelegramTheme(); telegram.onEvent?.("themeChanged", applyTelegramTheme); telegram.onEvent?.("viewportChanged", updateViewportVars); }
 
-document.querySelectorAll("[data-nav-target]").forEach((item) => item.addEventListener("click", () => document.querySelectorAll("[data-nav-target]").forEach((candidate) => candidate.classList.toggle("active", candidate === item))));
+const navigationItems = [...document.querySelectorAll("[data-nav-target]")];
+function activateNavigation(target) { navigationItems.forEach((item) => item.classList.toggle("active", item.dataset.navTarget === target)); }
+navigationItems.forEach((item) => item.addEventListener("click", () => { activateNavigation(item.dataset.navTarget); haptic(); }));
 elements.refreshButton.addEventListener("click", () => refreshAll());
 elements.languageButton.addEventListener("click", () => { state.language = state.language === "en" ? "km" : "en"; applyLanguage(); refreshAll({ silent: true }); });
 elements.maintenanceToggle.addEventListener("change", (event) => confirmMaintenance(event.target.checked));
@@ -508,6 +611,17 @@ elements.loadMoreJobsButton.addEventListener("click", () => runAsync(() => refre
 elements.refreshMonitorButton.addEventListener("click", () => runAsync(() => refreshMonitor({ force: true, silent: false })));
 elements.monitorPauseButton.addEventListener("click", toggleMonitorPause);
 elements.monitorFullscreenButton.addEventListener("click", toggleMonitorFullscreen);
+elements.monitorCopyLogsButton.addEventListener("click", () => runAsync(copyMonitorLogs));
+elements.monitorInterval.addEventListener("change", () => {
+  const interval = Number.parseInt(elements.monitorInterval.value, 10);
+  if (!MONITOR_INTERVALS.has(interval)) return;
+  state.monitorIntervalMs = interval; window.localStorage.setItem("admin-monitor-interval", String(interval)); scheduleMonitorPolling();
+  runAsync(() => refreshMonitor({ force: true }));
+});
+document.querySelectorAll("[data-tts-filter]").forEach((button) => button.addEventListener("click", () => {
+  state.monitorTtsFilter = button.dataset.ttsFilter || "all";
+  if (state.monitorTtsPayload) renderMonitorTts(state.monitorTtsPayload);
+}));
 elements.monitorLogLevel.addEventListener("change", () => runAsync(() => refreshMonitor({ force: true, silent: false })));
 let monitorSearchTimer = null; elements.monitorLogSearch.addEventListener("input", () => { window.clearTimeout(monitorSearchTimer); monitorSearchTimer = window.setTimeout(() => runAsync(() => refreshMonitor({ force: true })), 300); });
 document.addEventListener("keydown", (event) => { if (event.key === "Escape" && state.monitorFullscreen) toggleMonitorFullscreen(); });
@@ -516,10 +630,20 @@ elements.adminForm.addEventListener("submit", async (event) => { event.preventDe
 
 applyLanguage(); initializeTelegram(); refreshAll({ initial: true });
 if ("IntersectionObserver" in window) {
+  const visibleSections = new Map();
+  const navigationObserver = new IntersectionObserver((entries) => {
+    entries.forEach((entry) => {
+      if (entry.isIntersecting) visibleSections.set(entry.target.id, entry.intersectionRatio);
+      else visibleSections.delete(entry.target.id);
+    });
+    const active = [...visibleSections.entries()].sort((left, right) => right[1] - left[1])[0]?.[0];
+    if (active) activateNavigation(active);
+  }, { rootMargin: "-18% 0px -62% 0px", threshold: [0.05, 0.25, 0.5] });
+  navigationItems.map((item) => document.getElementById(item.dataset.navTarget)).filter(Boolean).forEach((section) => navigationObserver.observe(section));
   const monitorObserver = new IntersectionObserver((entries) => {
     state.monitorVisible = entries.some((entry) => entry.isIntersecting);
     if (state.monitorVisible && !state.monitorPaused) runAsync(() => refreshMonitor());
   }, { rootMargin: "200px 0px" });
   monitorObserver.observe(elements.monitor);
 } else state.monitorVisible = true;
-state.monitorTimer = window.setInterval(() => runAsync(() => refreshMonitor()), 5000);
+scheduleMonitorPolling();

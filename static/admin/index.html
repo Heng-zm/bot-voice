@@ -9,9 +9,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Google+Sans+Flex:opsz,wght@6..144,400..800&amp;family=Noto+Sans+Khmer:wght@400..800&amp;display=swap">
-  <link rel="stylesheet" href="/miniapp/admin/assets/styles.css?v=7">
+  <link rel="stylesheet" href="/miniapp/admin/assets/styles.css?v=8">
   <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
-  <script src="/miniapp/admin/assets/app.js?v=7" defer></script>
+  <script src="/miniapp/admin/assets/app.js?v=8" defer></script>
 </head>
 <body>
   <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -20,7 +20,9 @@
   <main class="shell">
     <header class="topbar">
       <div class="brand">
-        <div class="brand-mark" aria-hidden="true">V</div>
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" focusable="false"><path d="M16 5v3M12.5 5h7M8 12.5A3.5 3.5 0 0 1 11.5 9h9a3.5 3.5 0 0 1 3.5 3.5v8a3.5 3.5 0 0 1-3.5 3.5h-9A3.5 3.5 0 0 1 8 20.5z"/><circle cx="12.5" cy="16" r="1.5"/><circle cx="19.5" cy="16" r="1.5"/><path d="M12.5 20h7"/></svg>
+        </div>
         <div>
           <p class="eyebrow" data-i18n="miniApp">Telegram Mini App</p>
           <h1 data-i18n="controlCenter">Bot Control Center</h1>
@@ -44,6 +46,7 @@
 
     <div id="dashboard" class="dashboard is-hidden">
       <section id="overview" class="hero panel dashboard-section">
+        <div class="hero-orbit" aria-hidden="true"></div>
         <div class="profile">
           <div id="profileFallback" class="avatar avatar-fallback" aria-hidden="true">A</div>
           <img id="profilePhoto" class="avatar is-hidden" alt="">
@@ -53,9 +56,12 @@
             <p id="profileHandle" class="muted">Telegram verified</p>
           </div>
         </div>
-        <div id="systemBadge" class="status-pill">
-          <span class="status-dot"></span>
-          <span data-i18n="checkingSystem">Checking system</span>
+        <div class="hero-status-stack">
+          <div id="systemBadge" class="status-pill">
+            <span class="status-dot"></span>
+            <span data-i18n="checkingSystem">Checking system</span>
+          </div>
+          <small id="heroSyncState" class="hero-sync" data-i18n="secureRealtime">Secure real-time control</small>
         </div>
       </section>
 
@@ -91,9 +97,20 @@
           <div><p class="eyebrow" data-i18n="liveMonitor">Live operations</p><h2 data-i18n="botMonitor">Bot Monitor</h2></div>
           <div class="section-actions">
             <span id="monitorLiveState" class="status-pill monitor-live"><span class="status-dot"></span><span data-i18n="live">Live</span></span>
+            <select id="monitorInterval" class="select monitor-interval" aria-label="Monitor refresh interval">
+              <option value="3000">3s</option>
+              <option value="5000" selected>5s</option>
+              <option value="10000">10s</option>
+            </select>
             <button id="refreshMonitorButton" class="button" type="button" data-i18n="refresh">Refresh</button>
             <button id="monitorFullscreenButton" class="button primary" type="button" data-i18n="fullScreen">Full screen</button>
           </div>
+        </div>
+
+        <div id="monitorAlert" class="monitor-alert" role="status">
+          <span class="monitor-alert-icon" aria-hidden="true">●</span>
+          <div><strong id="monitorAlertTitle" data-i18n="monitorConnecting">Connecting to runtime</strong><small id="monitorAlertDetail" data-i18n="monitorConnectingHelp">Waiting for the first secure process snapshot…</small></div>
+          <span id="monitorLatency" class="monitor-latency">— ms</span>
         </div>
 
         <div class="monitor-metrics" aria-label="Live runtime metrics">
@@ -101,6 +118,13 @@
           <article class="monitor-metric"><span data-i18n="workerProcesses">Worker processes</span><strong id="monitorWorkerState">—</strong><small id="monitorWorkerMeta">—</small></article>
           <article class="monitor-metric"><span data-i18n="ttsProcesses">TTS processes</span><strong id="monitorTtsState">—</strong><small id="monitorTtsMeta">—</small></article>
           <article class="monitor-metric"><span data-i18n="queueActivity">Queue activity</span><strong id="monitorQueueState">—</strong><small id="monitorQueueMeta">—</small></article>
+        </div>
+
+        <div class="monitor-trends" aria-label="Recent process trends">
+          <article class="monitor-trend-card"><div><span data-i18n="cpuActivity">CPU activity</span><strong id="monitorCpuValue">—</strong></div><div id="monitorCpuChart" class="monitor-trend-chart"></div></article>
+          <article class="monitor-trend-card"><div><span data-i18n="queuePressure">Queue pressure</span><strong id="monitorPressureValue">—</strong></div><div id="monitorPressureChart" class="monitor-trend-chart"></div></article>
+          <article class="monitor-trend-card"><div><span data-i18n="webRequests">Web requests</span><strong id="monitorRequestsValue">—</strong></div><div id="monitorRequestsChart" class="monitor-trend-chart"></div></article>
+          <article class="monitor-trend-card"><div><span data-i18n="ttsLoad">TTS workload</span><strong id="monitorTtsTrendValue">—</strong></div><div id="monitorTtsTrendChart" class="monitor-trend-chart"></div></article>
         </div>
 
         <div class="monitor-grid">
@@ -115,7 +139,12 @@
         </div>
 
         <article class="monitor-card monitor-tts-card">
-          <div class="monitor-card-heading"><div><h3 data-i18n="ttsProcessQueue">TTS process queue</h3><p class="muted" data-i18n="ttsMonitorHelp">Running and waiting voice jobs refresh automatically.</p></div><span id="monitorTtsCount" class="secure-label">—</span></div>
+          <div class="monitor-card-heading monitor-tts-heading"><div><h3 data-i18n="ttsProcessQueue">TTS process queue</h3><p class="muted" data-i18n="ttsMonitorHelp">Running and waiting voice jobs refresh automatically.</p></div><span id="monitorTtsCount" class="secure-label">—</span></div>
+          <div class="monitor-filter-tabs" role="group" aria-label="Filter TTS processes">
+            <button class="monitor-filter-tab active" type="button" data-tts-filter="all" data-i18n="allProcesses">All</button>
+            <button class="monitor-filter-tab" type="button" data-tts-filter="running" data-i18n="running">Running</button>
+            <button class="monitor-filter-tab" type="button" data-tts-filter="queued" data-i18n="waiting">Waiting</button>
+          </div>
           <div id="monitorTtsList" class="monitor-job-list"></div>
           <p id="monitorTtsEmpty" class="empty-state is-hidden" data-i18n="noTtsProcesses">No active or queued TTS processes.</p>
         </article>
@@ -124,6 +153,7 @@
           <div class="monitor-card-heading monitor-log-heading">
             <div><h3 data-i18n="runtimeLogs">Runtime logs</h3><p class="muted" data-i18n="logsSafe">Recent logs are bounded and secrets are automatically hidden.</p></div>
             <div class="section-actions monitor-log-controls">
+              <span id="monitorLogCount" class="secure-label">0</span>
               <select id="monitorLogLevel" class="select" aria-label="Minimum log level">
                 <option value="" data-i18n="allLogs">All logs</option>
                 <option value="INFO">Info+</option>
@@ -131,6 +161,7 @@
                 <option value="ERROR">Error+</option>
               </select>
               <input id="monitorLogSearch" class="text-input" type="search" maxlength="128" placeholder="Search logs" data-i18n-placeholder="searchLogs" aria-label="Search logs">
+              <button id="monitorCopyLogsButton" class="button" type="button" data-i18n="copyLogs">Copy logs</button>
               <button id="monitorPauseButton" class="button" type="button" data-i18n="pauseLive">Pause</button>
             </div>
           </div>
