@@ -57,6 +57,7 @@ class FakeRedis:
 
         class Pipeline:
             def __init__(self) -> None:
+<<<<<<< Updated upstream
                 self.operations: list[tuple[str, tuple, dict]] = []
 
             def hgetall(self, key: str):
@@ -79,10 +80,17 @@ class FakeRedis:
 
             def zcount(self, key: str, minimum, maximum):
                 self.operations.append(("zcount", (key, minimum, maximum), {}))
+=======
+                self.keys: list[str] = []
+
+            def hgetall(self, key: str):
+                self.keys.append(key)
+>>>>>>> Stashed changes
                 return self
 
             def execute(self):
                 redis.pipeline_execute_calls += 1
+<<<<<<< Updated upstream
                 return [
                     getattr(redis, method)(*args, **kwargs)
                     for method, args, kwargs in self.operations
@@ -90,6 +98,12 @@ class FakeRedis:
 
             def reset(self) -> None:
                 self.operations.clear()
+=======
+                return [dict(redis.hashes.get(key, {})) for key in self.keys]
+
+            def reset(self) -> None:
+                self.keys.clear()
+>>>>>>> Stashed changes
 
         return Pipeline()
 
@@ -168,6 +182,7 @@ class JobQueueRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(second))
         self.assertIsNone(next_cursor)
         self.assertEqual(2, redis.pipeline_execute_calls)
+<<<<<<< Updated upstream
 
     async def test_job_filters_and_queue_metrics(self) -> None:
         redis = FakeRedis()
@@ -208,6 +223,8 @@ class JobQueueRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, metrics["succeeded_last_hour"])
         self.assertEqual(3, metrics["failed_last_hour"])
         self.assertEqual(75.0, metrics["failure_rate_percent"])
+=======
+>>>>>>> Stashed changes
 
 
 if __name__ == "__main__":

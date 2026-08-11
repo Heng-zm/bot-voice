@@ -873,6 +873,7 @@ class RedisJobQueue:
             ).lower()
             return clean_query in searchable
 
+<<<<<<< Updated upstream
         jobs: list[Job] = []
         scan_offset = offset
         scanned = 0
@@ -901,6 +902,20 @@ class RedisJobQueue:
             if len(ids) < fetch_count:
                 return jobs, None
         return jobs, str(scan_offset) if scanned >= max_scan else None
+=======
+        raw_ids = await self._redis_call(
+            "zrevrange",
+            redis_key,
+            offset,
+            offset + page_size,
+        )
+        ids = [self._decode(value) for value in list(raw_ids or ())]
+        has_more = len(ids) > page_size
+        ids = ids[:page_size]
+        jobs = await self._get_many(ids)
+        next_cursor = str(offset + page_size) if has_more else None
+        return jobs, next_cursor
+>>>>>>> Stashed changes
 
     async def stats(self) -> dict[str, int | float]:
         now = time.time()
