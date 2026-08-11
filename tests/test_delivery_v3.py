@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import io
 import json
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from app.services.jobs.handlers import BotJobHandlers
 from app.services.telegram.delivery import (
     IdempotentTelegramDelivery,
     RedisDeliveryStore,
@@ -56,6 +60,54 @@ class FakeRedis:
 
 
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tts_handler_routes_voice_through_idempotent_delivery(self) -> None:
+        bot = SimpleNamespace()
+
+        async def generate(
+            text,
+            gender,
+            speed,
+            output_path,
+            model,
+            **kwargs,
+        ) -> bytes:
+            del text, gender, speed, model, kwargs
+            await asyncio.to_thread(Path(output_path).write_bytes, b"voice")
+            return b"voice"
+
+        legacy = SimpleNamespace(
+            _TELEGRAM_APP=SimpleNamespace(bot=bot),
+            generate_user_voice_limited=generate,
+        )
+        delivery = SimpleNamespace(
+            deliver_voice=AsyncMock(
+                return_value={"chat_id": 42, "message_id": 99}
+            )
+        )
+        handlers = BotJobHandlers(
+            legacy,
+            artifacts=SimpleNamespace(),
+            delivery=delivery,
+        )
+
+        class Context:
+            job = SimpleNamespace(id="tts-job", attempts=1, max_attempts=3)
+
+            async def cancelled(self) -> bool:
+                return False
+
+            async def progress(self, percent, stage, detail) -> bool:
+                del percent, stage, detail
+                return True
+
+        result = await handlers.tts(
+            {"chat_id": 42, "user_id": 42, "text": "hello"},
+            Context(),
+        )
+
+        self.assertEqual(99, result["message_id"])
+        delivery.deliver_voice.assert_awaited_once()
+
     async def test_retry_edits_only_once_and_returns_stored_result(self) -> None:
         redis = FakeRedis()
         delivery = IdempotentTelegramDelivery(RedisDeliveryStore(redis))
@@ -104,6 +156,30 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 text="done",
                 progress_message_id=7,
             )
+
+    async def test_voice_retry_sends_only_once(self) -> None:
+        redis = FakeRedis()
+        delivery = IdempotentTelegramDelivery(RedisDeliveryStore(redis))
+        bot = SimpleNamespace(
+            send_voice=AsyncMock(return_value=SimpleNamespace(message_id=88)),
+        )
+
+        first = await delivery.deliver_voice(
+            bot=bot,
+            idempotency_key="job:voice:result",
+            chat_id=42,
+            voice=io.BytesIO(b"voice"),
+        )
+        second = await delivery.deliver_voice(
+            bot=bot,
+            idempotency_key="job:voice:result",
+            chat_id=42,
+            voice=io.BytesIO(b"voice"),
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(88, first["message_id"])
+        bot.send_voice.assert_awaited_once()
 
 
 if __name__ == "__main__":

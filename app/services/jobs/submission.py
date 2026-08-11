@@ -19,15 +19,18 @@ async def submit_tts_job(
     reply_to_message_id: int | None = None,
     idempotency_key: str,
 ):
+    model = str(tts_model or "auto").strip().lower().replace("-", "_")
+    if model not in {"auto", "hf_space", "edge"}:
+        model = "auto"
     return await enqueue_bot_job(
-        "voxcpm2" if tts_model.strip().lower() == "voxcpm2" else "tts",
+        "tts",
         {
             "chat_id": int(chat_id),
             "user_id": int(user_id),
             "text": str(text),
             "gender": str(gender),
             "speed": float(speed),
-            "tts_model": str(tts_model),
+            "tts_model": model,
             "reply_to_message_id": reply_to_message_id,
         },
         idempotency_key=idempotency_key,

@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from unittest.mock import patch
 
 from app.services.jobs.queue import Job, JobQueueError, RedisJobWorker
+from app.services.jobs.runtime import _WORKER_STATUS, _worker_runner
 
 
 def _job(job_id: str = "job-1", job_type: str = "tts") -> Job:
@@ -81,6 +83,83 @@ class RecordingQueue:
 
 
 class WorkerResilienceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_runner_restarts_an_unexpectedly_stopped_loop(self) -> None:
+        recovered = asyncio.Event()
+
+        class RestartingWorker:
+            worker_id = "worker-restart"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def run(self, stop_event: asyncio.Event) -> None:
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("unexpected exit")
+                recovered.set()
+                await stop_event.wait()
+
+        worker = RestartingWorker()
+        stop = asyncio.Event()
+        with patch(
+            "app.services.jobs.runtime._WORKER_RESTART_BASE_SECONDS",
+            0.01,
+        ):
+            task = asyncio.create_task(_worker_runner(worker, stop))
+            try:
+                await asyncio.wait_for(recovered.wait(), timeout=1.0)
+            finally:
+                stop.set()
+                await asyncio.wait_for(task, timeout=1.0)
+                _WORKER_STATUS.pop(worker.worker_id, None)
+
+        self.assertEqual(2, worker.calls)
+
+    async def test_restart_backoff_resets_after_a_stable_worker_run(self) -> None:
+        recovered = asyncio.Event()
+
+        class RestartingWorker:
+            worker_id = "worker-stable-restart"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def run(self, stop_event: asyncio.Event) -> None:
+                self.calls += 1
+                if self.calls <= 2:
+                    raise RuntimeError(f"unexpected exit {self.calls}")
+                recovered.set()
+                await stop_event.wait()
+
+        worker = RestartingWorker()
+        stop = asyncio.Event()
+        with (
+            patch(
+                "app.services.jobs.runtime._WORKER_RESTART_BASE_SECONDS",
+                0.01,
+            ),
+            patch(
+                "app.services.jobs.runtime._WORKER_STABLE_RUN_SECONDS",
+                5.0,
+            ),
+            patch(
+                "app.services.jobs.runtime._monotonic",
+                side_effect=(0.0, 1.0, 10.0, 20.0, 30.0),
+            ),
+        ):
+            task = asyncio.create_task(_worker_runner(worker, stop))
+            try:
+                await asyncio.wait_for(recovered.wait(), timeout=1.0)
+                status = _WORKER_STATUS[worker.worker_id]
+                self.assertEqual(2, status["restart_count"])
+                self.assertEqual(1, status["restart_streak"])
+            finally:
+                stop.set()
+                await asyncio.wait_for(task, timeout=1.0)
+                _WORKER_STATUS.pop(worker.worker_id, None)
+
+        self.assertEqual(3, worker.calls)
+
     async def test_transient_claim_error_does_not_kill_the_worker(self) -> None:
         """A Redis error during claim must be absorbed, not retire the task."""
 

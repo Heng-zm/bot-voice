@@ -10,12 +10,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
 import tempfile
 import time
 import uuid
+from collections.abc import Mapping
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -39,6 +41,37 @@ class ArtifactStorageError(RuntimeError):
 
 class ArtifactNotFound(ArtifactStorageError):
     """Raised when a referenced artifact no longer exists."""
+
+
+class ArtifactIntegrityError(ArtifactStorageError):
+    """Raised when a deterministic path contains different artifact bytes."""
+
+
+def _is_not_found_error(error: BaseException) -> bool:
+    """Conservatively identify a Storage API not-found response.
+
+    Supabase client versions expose HTTP errors with slightly different
+    attributes. Treat only an explicit 404/code or a clear not-found message as
+    absence; transport and authentication failures must remain retryable.
+    """
+
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        for attribute in ("status_code", "status", "code"):
+            raw = getattr(current, attribute, None)
+            if str(raw or "").strip().lower() in {
+                "404",
+                "not_found",
+                "notfound",
+            }:
+                return True
+        message = str(current).strip().lower()
+        if "not found" in message or "not_found" in message:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _clean_path(value: str) -> str:
@@ -129,7 +162,7 @@ class LocalArtifactStore:
         except FileNotFoundError as exc:
             raise ArtifactNotFound(artifact.path) from exc
         if len(payload) != artifact.size_bytes or _content_hash(payload) != artifact.sha256:
-            raise ArtifactStorageError("Artifact integrity validation failed.")
+            raise ArtifactIntegrityError("Artifact integrity validation failed.")
         return payload
 
     async def delete(self, artifact: ArtifactRef) -> bool:
@@ -218,10 +251,12 @@ class SupabaseArtifactStore:
             if inspect.isawaitable(payload):
                 payload = await payload
         except Exception as exc:
-            raise ArtifactNotFound(artifact.path) from exc
+            if _is_not_found_error(exc):
+                raise ArtifactNotFound(artifact.path) from exc
+            raise ArtifactStorageError("Supabase artifact download failed.") from exc
         data = bytes(payload or b"")
         if len(data) != artifact.size_bytes or _content_hash(data) != artifact.sha256:
-            raise ArtifactStorageError("Artifact integrity validation failed.")
+            raise ArtifactIntegrityError("Artifact integrity validation failed.")
         return data
 
     async def delete(self, artifact: ArtifactRef) -> bool:
@@ -237,8 +272,20 @@ class SupabaseArtifactStore:
 class ArtifactService:
     """Create deterministic artifact references for retry-safe jobs."""
 
-    def __init__(self, store: LocalArtifactStore | SupabaseArtifactStore) -> None:
+    def __init__(
+        self,
+        store: LocalArtifactStore | SupabaseArtifactStore,
+        *,
+        redis_client: Any | None = None,
+        redis_prefix: str = "tgbot",
+    ) -> None:
         self.store = store
+        self.redis = redis_client
+        prefix = str(redis_prefix or "tgbot").strip().strip(":") or "tgbot"
+        self.expiry_key = f"{prefix}:artifacts:expires:v1"
+        self.last_cleanup_at = 0.0
+        self.last_cleanup_deleted = 0
+        self.last_cleanup_errors = 0
 
     @property
     def backend(self) -> str:
@@ -258,15 +305,204 @@ class ArtifactService:
     ) -> ArtifactRef:
         safe_name = _clean_path(name).rsplit("/", 1)[-1]
         path = f"results/{_clean_path(job_id)}/{safe_name}"
-        return await self.store.put_bytes(
+        artifact = await self.store.put_bytes(
             path,
             str(text).encode("utf-8"),
             content_type="text/plain; charset=utf-8",
             ttl_seconds=ttl_seconds,
         )
+        await self._register_expiry(artifact)
+        return artifact
 
     async def get_text(self, artifact: ArtifactRef) -> str:
+        if artifact.expires_at is not None and artifact.expires_at <= time.time():
+            try:
+                # Verify that the path still contains this exact artifact. A
+                # retry may have replaced the deterministic path with newer
+                # content that must not be removed by an older reference.
+                await self.store.get_bytes(artifact)
+            except ArtifactStorageError:
+                pass
+            else:
+                await self.store.delete(artifact)
+            raise ArtifactNotFound(f"Artifact {artifact.path!r} has expired.")
         return (await self.store.get_bytes(artifact)).decode("utf-8", errors="strict")
+
+    @staticmethod
+    def _registry_member(artifact: ArtifactRef) -> str:
+        value = artifact.as_dict()
+        # Exclude timestamps so retrying the same deterministic artifact
+        # updates its ZSET score instead of creating an older cleanup entry.
+        value.pop("created_at", None)
+        value.pop("expires_at", None)
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    async def _register_expiry(self, artifact: ArtifactRef) -> None:
+        if self.redis is None or artifact.expires_at is None:
+            return
+        member = self._registry_member(artifact)
+        try:
+            await asyncio.to_thread(
+                self.redis.zadd,
+                self.expiry_key,
+                {member: float(artifact.expires_at)},
+            )
+        except Exception as exc:
+            raise ArtifactStorageError(
+                "Could not register artifact expiration in Redis."
+            ) from exc
+
+    async def cleanup_expired(
+        self,
+        *,
+        now: float | None = None,
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        """Delete one bounded batch of expired artifacts from the active store."""
+
+        cleanup_time = time.time() if now is None else float(now)
+        batch_size = max(1, min(5_000, int(limit)))
+        if self.redis is None:
+            return {
+                "configured": False,
+                "checked": 0,
+                "deleted": 0,
+                "errors": 0,
+                "remaining_due": 0,
+            }
+        try:
+            raw_members = await asyncio.to_thread(
+                self.redis.zrangebyscore,
+                self.expiry_key,
+                "-inf",
+                cleanup_time,
+                start=0,
+                num=batch_size,
+            )
+        except Exception as exc:
+            raise ArtifactStorageError(
+                "Could not load expired artifact references from Redis."
+            ) from exc
+
+        members = list(raw_members or ())
+        removable: list[Any] = []
+        deleted = errors = 0
+        semaphore = asyncio.Semaphore(8)
+
+        async def remove_one(raw_member: Any) -> tuple[Any, bool, bool, bool]:
+            text = (
+                raw_member.decode("utf-8", errors="strict")
+                if isinstance(raw_member, bytes)
+                else str(raw_member)
+            )
+            try:
+                decoded = json.loads(text)
+                if not isinstance(decoded, Mapping):
+                    raise ValueError("Artifact registry entry must be an object.")
+                artifact = ArtifactRef.from_dict(dict(decoded))
+                clean_path = _clean_path(artifact.path)
+                if (
+                    clean_path != artifact.path
+                    or not artifact.id
+                    or artifact.size_bytes < 0
+                    or not re.fullmatch(r"[0-9a-f]{64}", artifact.sha256)
+                ):
+                    raise ValueError("Artifact registry entry is invalid.")
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                return raw_member, False, True, False
+            if artifact.backend != self.backend:
+                logger.warning(
+                    "Cannot clean expired artifact for inactive backend=%s path=%s",
+                    artifact.backend,
+                    artifact.path,
+                )
+                return raw_member, True, False, False
+            async with semaphore:
+                try:
+                    await self.store.get_bytes(artifact)
+                except ArtifactNotFound:
+                    return raw_member, False, True, False
+                except ArtifactIntegrityError:
+                    # The deterministic path now contains different content;
+                    # discard only this stale registry entry.
+                    return raw_member, False, True, False
+                except ArtifactStorageError:
+                    logger.warning(
+                        "Expired artifact validation failed path=%s",
+                        artifact.path,
+                        exc_info=True,
+                    )
+                    return raw_member, True, False, False
+                except Exception:  # noqa: BLE001 - cleanup batch boundary
+                    logger.warning(
+                        "Unexpected expired artifact validation failure path=%s",
+                        artifact.path,
+                        exc_info=True,
+                    )
+                    return raw_member, True, False, False
+                try:
+                    await self.store.delete(artifact)
+                except ArtifactStorageError:
+                    logger.warning(
+                        "Expired artifact deletion failed path=%s",
+                        artifact.path,
+                        exc_info=True,
+                    )
+                    return raw_member, True, False, False
+                except Exception:  # noqa: BLE001 - cleanup batch boundary
+                    logger.warning(
+                        "Unexpected expired artifact deletion failure path=%s",
+                        artifact.path,
+                        exc_info=True,
+                    )
+                    return raw_member, True, False, False
+            return raw_member, False, True, True
+
+        results = await asyncio.gather(*(remove_one(member) for member in members))
+        for raw_member, failed, remove_registry_entry, artifact_deleted in results:
+            if failed:
+                errors += 1
+            elif remove_registry_entry:
+                removable.append(raw_member)
+                deleted += int(artifact_deleted)
+
+        if removable:
+            try:
+                await asyncio.to_thread(
+                    self.redis.zrem,
+                    self.expiry_key,
+                    *removable,
+                )
+            except Exception as exc:
+                raise ArtifactStorageError(
+                    "Artifacts were deleted but their expiration entries remain."
+                ) from exc
+
+        self.last_cleanup_at = cleanup_time
+        self.last_cleanup_deleted = deleted
+        self.last_cleanup_errors = errors
+        return {
+            "configured": True,
+            "checked": len(members),
+            "deleted": deleted,
+            "errors": errors,
+            "remaining_due": max(0, len(members) - len(removable)),
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "backend": self.backend,
+            "shared": self.shared,
+            "cleanup_configured": self.redis is not None,
+            "last_cleanup_at": self.last_cleanup_at or None,
+            "last_cleanup_deleted": self.last_cleanup_deleted,
+            "last_cleanup_errors": self.last_cleanup_errors,
+        }
 
 
 _ARTIFACT_SERVICE: ArtifactService | None = None
@@ -275,6 +511,8 @@ _ARTIFACT_SERVICE: ArtifactService | None = None
 def configure_artifact_service(
     *,
     supabase_client: Any | None,
+    redis_client: Any | None = None,
+    redis_prefix: str = "tgbot",
     role: str,
 ) -> ArtifactService:
     global _ARTIFACT_SERVICE
@@ -329,7 +567,11 @@ def configure_artifact_service(
             logger.warning(
                 "Worker is using local artifact storage. Use Supabase for multi-instance durability."
             )
-    _ARTIFACT_SERVICE = ArtifactService(store)
+    _ARTIFACT_SERVICE = ArtifactService(
+        store,
+        redis_client=redis_client,
+        redis_prefix=redis_prefix,
+    )
     return _ARTIFACT_SERVICE
 
 
@@ -350,6 +592,7 @@ def deterministic_artifact_name(kind: str) -> str:
 
 
 __all__ = [
+    "ArtifactIntegrityError",
     "ArtifactNotFound",
     "ArtifactService",
     "ArtifactStorageError",

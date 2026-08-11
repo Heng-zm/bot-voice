@@ -13,6 +13,10 @@ from pydantic import BaseModel, ConfigDict
 
 from app._legacy_bridge import legacy_module
 from app.api.dependencies import AdminPrincipal, require_admin, require_admin_write
+from app.services.settings.runtime import (
+    build_runtime_settings_payload,
+    coerce_runtime_updates,
+)
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 logger = logging.getLogger(__name__)
@@ -59,21 +63,7 @@ async def _redis_health(redis_client: Any | None) -> dict[str, Any]:
 
 
 def _runtime_settings_payload(legacy: Any) -> dict[str, dict[str, Any]]:
-    values: dict[str, dict[str, Any]] = {}
-    specs = getattr(legacy, "_RUNTIME_CONFIG_SPECS", {})
-    run_state = getattr(legacy, "RUN_STATE", {})
-    for key in MINI_APP_RUNTIME_KEYS:
-        spec = dict(specs.get(key) or {})
-        value = run_state.get(key, getattr(legacy, key, None))
-        values[key] = {
-            "value": value,
-            "kind": str(spec.get("kind") or "str"),
-            "label": str(spec.get("label") or key.replace("_", " ").title()),
-            "help": str(spec.get("help") or ""),
-            "min": spec.get("min"),
-            "max": spec.get("max"),
-        }
-    return values
+    return build_runtime_settings_payload(legacy, MINI_APP_RUNTIME_KEYS)
 
 
 @router.get("/me")
@@ -198,15 +188,16 @@ async def update_admin_settings(
             detail=f"Unsupported runtime setting(s): {', '.join(unsupported)}",
         )
 
-    coerced_runtime: dict[str, Any] = {}
-    for key, value in requested_runtime.items():
-        try:
-            coerced_runtime[key] = legacy._coerce_run_state_value(key, value)
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"{key}: {exc}",
-            ) from exc
+    try:
+        coerced_runtime = coerce_runtime_updates(
+            requested_runtime,
+            getattr(legacy, "_RUNTIME_CONFIG_SPECS", {}),
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
 
     changed: list[str] = []
     if payload.maintenance_mode is not None:

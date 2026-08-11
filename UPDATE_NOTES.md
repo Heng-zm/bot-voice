@@ -8,7 +8,7 @@ logic to `app/legacy.py`.
 - A single idempotent `RuntimeContext` for ASGI-only and combined-process boot.
 - Durable Redis workers started and stopped with the application lifecycle.
 - Worker heartbeat data included in `/readyz` and the admin API.
-- Production job handlers for TTS, VoxCPM2, OCR, transcription, and broadcast.
+- Production job handlers for TTS, OCR, transcription, and broadcast.
 - Typed submission helpers using durable Telegram file IDs and idempotency keys.
 - Queue backpressure with `BOT_JOB_QUEUE_MAX`.
 - Cursor listing for queued, running, and dead jobs.

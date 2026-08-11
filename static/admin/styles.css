@@ -531,6 +531,14 @@ input::placeholder { color: #6f7f99; }
   font-size: 12px;
 }
 
+.queue-charts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 12px 0 16px; }
+.queue-chart { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface-soft); }
+.queue-chart span { display: block; color: var(--muted); font-size: 11px; }
+.queue-chart strong { display: block; margin-top: 3px; font-size: 18px; }
+.queue-chart svg { width: 120px; max-width: 45%; height: 36px; overflow: visible; }
+.job-search { width: min(220px, 100%); }
+.section-actions { flex-wrap: wrap; }
+
 .data-list { display: grid; gap: 9px; }
 .data-list.compact { gap: 6px; }
 .data-row {
@@ -569,6 +577,7 @@ input::placeholder { color: #6f7f99; }
 }
 
 @media (max-width: 520px) {
+  .queue-charts { grid-template-columns: 1fr; }
   .top-actions { gap: 6px; }
   .text-button { min-height: 40px; padding: 0 10px; }
   .section-heading { align-items: flex-start; flex-direction: column; }

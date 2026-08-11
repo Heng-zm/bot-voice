@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import socket
 import threading
@@ -20,10 +21,11 @@ from app.services.jobs.queue import (
     RedisJobWorker,
 )
 
+logger = logging.getLogger(__name__)
+
 BOT_JOB_TYPES = frozenset(
     {
         "tts",
-        "voxcpm2",
         "ocr",
         "transcription",
         "broadcast",
@@ -39,6 +41,10 @@ _WORKER_TASKS: dict[str, asyncio.Task[None]] = {}
 _WORKER_HEARTBEAT_TASKS: dict[str, asyncio.Task[None]] = {}
 _WORKER_STATUS: dict[str, dict[str, Any]] = {}
 _WORKERS_ACCEPTING = True
+_WORKER_RESTART_BASE_SECONDS = 1.0
+_WORKER_RESTART_MAX_SECONDS = 30.0
+_WORKER_STABLE_RUN_SECONDS = 60.0
+_monotonic = time.monotonic
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +54,8 @@ class WorkerSnapshot:
     started_at: float
     last_heartbeat_at: float
     last_error: str
+    restart_count: int
+    last_restart_at: float
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +64,8 @@ class WorkerSnapshot:
             "started_at": self.started_at,
             "last_heartbeat_at": self.last_heartbeat_at,
             "last_error": self.last_error,
+            "restart_count": self.restart_count,
+            "last_restart_at": self.last_restart_at,
         }
 
 
@@ -145,14 +155,44 @@ async def _worker_runner(
         "started_at": started_at,
         "last_heartbeat_at": started_at,
         "last_error": "",
+        "restart_count": 0,
+        "restart_streak": 0,
+        "last_restart_at": 0.0,
     }
-    try:
-        await worker.run(stop_event)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - worker process boundary
-        _WORKER_STATUS[worker_id]["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
-        raise
+    while not stop_event.is_set():
+        run_started = _monotonic()
+        try:
+            await worker.run(stop_event)
+            if stop_event.is_set():
+                return
+            error = RuntimeError("Worker loop exited unexpectedly.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - worker process boundary
+            error = exc
+
+        status = _WORKER_STATUS[worker_id]
+        run_duration = max(0.0, _monotonic() - run_started)
+        if run_duration >= _WORKER_STABLE_RUN_SECONDS:
+            status["restart_streak"] = 0
+        status["last_error"] = f"{type(error).__name__}: {error}"[:500]
+        status["restart_count"] = int(status.get("restart_count") or 0) + 1
+        status["restart_streak"] = int(status.get("restart_streak") or 0) + 1
+        status["last_restart_at"] = time.time()
+        restart_count = int(status["restart_count"])
+        restart_streak = int(status["restart_streak"])
+        logger.error(
+            "Durable worker stopped unexpectedly; restarting worker=%s count=%s: %s",
+            worker_id,
+            restart_count,
+            error,
+        )
+        delay = min(
+            _WORKER_RESTART_MAX_SECONDS,
+            _WORKER_RESTART_BASE_SECONDS * (2 ** min(restart_streak - 1, 5)),
+        )
+        with suppress(TimeoutError):
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
 
 
 def set_job_workers_accepting(accepting: bool) -> bool:
@@ -276,6 +316,8 @@ def job_worker_snapshot(*, stale_after_seconds: float = 20.0) -> dict[str, Any]:
                 started_at=float(status.get("started_at") or 0.0),
                 last_heartbeat_at=heartbeat,
                 last_error=str(status.get("last_error") or ""),
+                restart_count=int(status.get("restart_count") or 0),
+                last_restart_at=float(status.get("last_restart_at") or 0.0),
             )
         )
     return {

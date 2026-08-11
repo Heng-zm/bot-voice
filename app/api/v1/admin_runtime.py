@@ -141,6 +141,8 @@ async def job_list(
     ] = "dead",
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     cursor: Annotated[str, Query(max_length=32)] = "",
+    job_type: Annotated[str, Query(max_length=64)] = "",
+    query: Annotated[str, Query(max_length=128)] = "",
 ) -> dict:
     del principal
     try:
@@ -148,6 +150,8 @@ async def job_list(
             state=state,
             limit=limit,
             cursor=cursor,
+            job_type=job_type,
+            query=query,
         )
     except ValueError as exc:
         raise HTTPException(
@@ -162,6 +166,8 @@ async def job_list(
     return {
         "ok": True,
         "state": state,
+        "job_type": job_type.strip().lower(),
+        "query": query.strip(),
         "jobs": [_safe_job(job) for job in jobs],
         "count": len(jobs),
         "next_cursor": next_cursor,

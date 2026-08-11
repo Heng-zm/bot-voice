@@ -2,6 +2,7 @@
 
 from app.services.artifacts.models import ArtifactRef
 from app.services.artifacts.storage import (
+    ArtifactIntegrityError,
     ArtifactNotFound,
     ArtifactService,
     ArtifactStorageError,
@@ -10,6 +11,7 @@ from app.services.artifacts.storage import (
 )
 
 __all__ = [
+    "ArtifactIntegrityError",
     "ArtifactNotFound",
     "ArtifactRef",
     "ArtifactService",

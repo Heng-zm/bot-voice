@@ -159,7 +159,7 @@ class MinimalSettingsTests(unittest.TestCase):
         expected = {
             "REDIS_URL",
             "SUPABASE_URL",
-            "SUPABASE_KEY",
+            "SUPABASE_SERVICE_ROLE_KEY",
             "TELEGRAM_BOT_TOKEN",
             "GEMINI_API_KEY",
         }

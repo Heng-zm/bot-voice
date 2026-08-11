@@ -430,7 +430,6 @@ def configure_default_providers() -> ProviderManager:
         ("gemini", {"ai", "ocr", "transcription"}, 10, 90.0),
         ("huggingface", {"ai", "ocr", "tts"}, 20, 120.0),
         ("edge_tts", {"tts"}, 30, 60.0),
-        ("voxcpm2", {"tts", "voice_clone"}, 10, 300.0),
     )
     for name, capabilities, priority, timeout in defaults:
         _PROVIDER_MANAGER.register(

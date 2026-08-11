@@ -6,7 +6,7 @@ visibility, deploy controls, and three low-risk legacy extractions.
 ## Added
 
 - Per-job progress fields: percentage, stage, detail, and update timestamp.
-- Progress reporting from TTS, VoxCPM2, OCR, transcription, and broadcast workers.
+- Progress reporting from TTS, OCR, transcription, and broadcast workers.
 - Redis indexes for succeeded and cancelled jobs in addition to queued, running,
   and dead jobs.
 - Retention pruning for terminal job indexes.

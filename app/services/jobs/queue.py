@@ -819,12 +819,15 @@ class RedisJobQueue:
         state: str = "dead",
         limit: int = 50,
         cursor: str = "",
+        job_type: str = "",
+        query: str = "",
     ) -> tuple[list[Job], str | None]:
-        """Return one cursor page from queued, running, or dead indexes.
+        """Return one filtered cursor page from a durable state index.
 
         The cursor is an opaque decimal offset.  It is intentionally simple: the
         admin surface is operational visibility, not a transactional export.
-        Missing/expired job hashes are skipped safely.
+        Missing/expired job hashes are skipped safely. Filtered scans are bounded
+        to 1,000 index entries per request to protect Redis from broad searches.
         """
 
         clean_state = str(state or "").strip().lower()
@@ -845,39 +848,132 @@ class RedisJobQueue:
             offset = max(0, int(str(cursor or "0")))
         except ValueError as exc:
             raise ValueError("Invalid job-list cursor.") from exc
+        clean_type = str(job_type or "").strip().lower()
+        clean_query = str(query or "").strip().lower()
+        if len(clean_type) > 64:
+            raise ValueError("Job type filter is too long.")
+        if len(clean_query) > 128:
+            raise ValueError("Job search query is too long.")
 
-        raw_ids = await self._redis_call(
-            "zrevrange",
-            redis_key,
-            offset,
-            offset + page_size,
-        )
-        ids = [self._decode(value) for value in list(raw_ids or ())]
-        has_more = len(ids) > page_size
-        ids = ids[:page_size]
-        jobs = await self._get_many(ids)
-        next_cursor = str(offset + page_size) if has_more else None
-        return jobs, next_cursor
+        def matches(job: Job) -> bool:
+            if clean_type and job.type != clean_type:
+                return False
+            if not clean_query:
+                return True
+            searchable = "\n".join(
+                (
+                    job.id,
+                    job.type,
+                    job.state,
+                    job.worker_id,
+                    job.last_error,
+                    job.progress_stage,
+                    job.progress_detail,
+                )
+            ).lower()
+            return clean_query in searchable
 
-    async def stats(self) -> dict[str, int]:
-        cutoff = time.time() - self.retention_seconds
-        await asyncio.gather(
-            self._redis_call("zremrangebyscore", self.dead_key, "-inf", cutoff),
-            self._redis_call(
-                "zremrangebyscore", self.succeeded_key, "-inf", cutoff
-            ),
-            self._redis_call(
-                "zremrangebyscore", self.cancelled_key, "-inf", cutoff
-            ),
-        )
-        ready, running, dead, succeeded, cancelled = await asyncio.gather(
-            self._redis_call("zcard", self.ready_key),
-            self._redis_call("zcard", self.leased_key),
-            self._redis_call("zcard", self.dead_key),
-            self._redis_call("zcard", self.succeeded_key),
-            self._redis_call("zcard", self.cancelled_key),
-        )
+        jobs: list[Job] = []
+        scan_offset = offset
+        scanned = 0
+        max_scan = 1_000
+        while len(jobs) < page_size and scanned < max_scan:
+            fetch_count = min(201, max(51, page_size + 1), max_scan - scanned)
+            raw_ids = await self._redis_call(
+                "zrevrange",
+                redis_key,
+                scan_offset,
+                scan_offset + fetch_count - 1,
+            )
+            ids = [self._decode(value) for value in list(raw_ids or ())]
+            if not ids:
+                return jobs, None
+            loaded = {job.id: job for job in await self._get_many(ids)}
+            for index, job_id in enumerate(ids):
+                scan_offset += 1
+                scanned += 1
+                job = loaded.get(job_id)
+                if job is not None and matches(job):
+                    jobs.append(job)
+                    if len(jobs) >= page_size:
+                        has_more = index + 1 < len(ids) or len(ids) == fetch_count
+                        return jobs, str(scan_offset) if has_more else None
+            if len(ids) < fetch_count:
+                return jobs, None
+        return jobs, str(scan_offset) if scanned >= max_scan else None
+
+    async def stats(self) -> dict[str, int | float]:
+        now = time.time()
+        cutoff = now - self.retention_seconds
+        hour_ago = now - 3_600.0
+
+        def load() -> list[Any]:
+            operations = (
+                ("zremrangebyscore", (self.dead_key, "-inf", cutoff), {}),
+                ("zremrangebyscore", (self.succeeded_key, "-inf", cutoff), {}),
+                ("zremrangebyscore", (self.cancelled_key, "-inf", cutoff), {}),
+                ("zcard", (self.ready_key,), {}),
+                ("zcard", (self.leased_key,), {}),
+                ("zcard", (self.dead_key,), {}),
+                ("zcard", (self.succeeded_key,), {}),
+                ("zcard", (self.cancelled_key,), {}),
+                ("zrange", (self.ready_key, 0, 0), {"withscores": True}),
+                ("zcount", (self.succeeded_key, hour_ago, "+inf"), {}),
+                ("zcount", (self.dead_key, hour_ago, "+inf"), {}),
+                ("zcount", (self.cancelled_key, hour_ago, "+inf"), {}),
+            )
+
+            pipeline_factory = getattr(self.redis, "pipeline", None)
+            if not callable(pipeline_factory):
+                return [
+                    getattr(self.redis, method)(*args, **kwargs)
+                    for method, args, kwargs in operations
+                ]
+
+            pipeline = pipeline_factory(transaction=False)
+            reset = getattr(pipeline, "reset", None)
+            try:
+                if not all(
+                    callable(getattr(pipeline, method, None))
+                    for method, _args, _kwargs in operations
+                ):
+                    return [
+                        getattr(self.redis, method)(*args, **kwargs)
+                        for method, args, kwargs in operations
+                    ]
+                for method, args, kwargs in operations:
+                    getattr(pipeline, method)(*args, **kwargs)
+                return list(pipeline.execute())
+            finally:
+                if callable(reset):
+                    reset()
+
+        try:
+            values = await asyncio.to_thread(load)
+        except Exception as exc:
+            raise JobQueueError("Redis job queue stats read failed.") from exc
+        if len(values) != 12:
+            raise JobQueueError("Redis returned an invalid job stats result.")
+        (
+            _removed_dead,
+            _removed_succeeded,
+            _removed_cancelled,
+            ready,
+            running,
+            dead,
+            succeeded,
+            cancelled,
+            oldest_ready,
+            succeeded_hour,
+            failed_hour,
+            cancelled_hour,
+        ) = values
         queued = int(ready or 0)
+        oldest_values = list(oldest_ready or ())
+        oldest_score = float(oldest_values[0][1]) if oldest_values else now
+        completed_recently = int(succeeded_hour or 0)
+        failed_recently = int(failed_hour or 0)
+        terminal_recently = completed_recently + failed_recently
         return {
             "queued": queued,
             "running": int(running or 0),
@@ -886,6 +982,17 @@ class RedisJobQueue:
             "cancelled": int(cancelled or 0),
             "queue_limit": self.max_queued_jobs,
             "queue_available": max(0, self.max_queued_jobs - queued),
+            "oldest_queued_age_seconds": round(max(0.0, now - oldest_score), 1),
+            "succeeded_last_hour": completed_recently,
+            "failed_last_hour": failed_recently,
+            "cancelled_last_hour": int(cancelled_hour or 0),
+            "throughput_per_minute": round(completed_recently / 60.0, 2),
+            "failure_rate_percent": round(
+                (failed_recently / terminal_recently) * 100.0,
+                2,
+            )
+            if terminal_recently
+            else 0.0,
         }
 
 

@@ -12,6 +12,7 @@ import hashlib
 import json
 import secrets
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -265,7 +266,47 @@ class IdempotentTelegramDelivery:
                 raise TelegramDeliveryError("Delivery lease was lost before completion.")
             return result
         except BaseException as exc:
-            await self.store.release(idempotency_key, claim.token, exc)
+            with suppress(Exception):
+                await self.store.release(idempotency_key, claim.token, exc)
+            raise
+
+    async def deliver_voice(
+        self,
+        *,
+        bot: Any,
+        idempotency_key: str,
+        chat_id: int,
+        voice: Any,
+        reply_to_message_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Send a voice result once and reuse its stored result on retries."""
+
+        claim = await self.store.claim(idempotency_key)
+        if claim.status == "completed":
+            return dict(claim.result or {})
+        if claim.status != "claimed":
+            raise TelegramDeliveryBusy("Another worker is delivering this voice result.")
+
+        try:
+            kwargs: dict[str, Any] = {
+                "chat_id": int(chat_id),
+                "voice": voice,
+            }
+            if reply_to_message_id:
+                kwargs["reply_to_message_id"] = int(reply_to_message_id)
+            message = await bot.send_voice(**kwargs)
+            result = {
+                "chat_id": int(chat_id),
+                "message_id": int(getattr(message, "message_id", 0) or 0),
+                "mode": "send_voice",
+                "delivered_at": time.time(),
+            }
+            if not await self.store.complete(idempotency_key, claim.token, result):
+                raise TelegramDeliveryError("Voice delivery lease was lost before completion.")
+            return result
+        except BaseException as exc:
+            with suppress(Exception):
+                await self.store.release(idempotency_key, claim.token, exc)
             raise
 
 

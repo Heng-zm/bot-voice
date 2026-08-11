@@ -46,7 +46,6 @@ tests/
 ├── test_core.py
 ├── test_telegram.py
 ├── test_ai.py
-├── test_voxcpm2.py
 ├── test_runtime_security.py
 ├── test_dynamic_cors.py
 ├── test_telegram_auth.py
@@ -110,7 +109,7 @@ HTTP application but does not start the combined Telegram/scheduler lifecycle.
 ```dotenv
 REDIS_URL=
 SUPABASE_URL=
-SUPABASE_KEY=
+SUPABASE_SERVICE_ROLE_KEY=
 TELEGRAM_BOT_TOKEN=
 GEMINI_API_KEY=
 ```
@@ -197,21 +196,6 @@ DELETE /api/admin/cors
 controls and maintenance mode. Deployment-level settings and secrets are not
 editable from the Mini App.
 
-## VoxCPM2 voice cloning
-
-In Telegram, run `/voxcpm2` and follow the setup panel:
-
-1. Choose **Controllable Clone** to preserve the reference voice while changing
-   emotion, pace, or style, or choose **Ultimate Clone** for transcript-guided
-   continuation that preserves more of the original vocal detail.
-2. Upload a clean Telegram voice message or WAV/MP3/OGG/FLAC file. A 5–30
-   second clip is recommended; the default configured maximum is 50 seconds.
-3. For Controllable Clone, optionally enter a style instruction. For Ultimate
-   Clone, enter the exact transcript spoken in the reference clip.
-4. Select VoxCPM2 and send the text that should be spoken.
-
-Only clone a voice you own or have permission to use.
-
 ## Test
 
 ```bash
@@ -279,3 +263,25 @@ Supabase mode when workers can run on different machines or containers.
 
 See [`UPDATE_V3_NOTES.md`](UPDATE_V3_NOTES.md) for migration and rollback
 instructions.
+
+## Reliability and observability update v4
+
+V4 makes Telegram voice delivery retry-safe, automatically restarts workers
+whose outer loop stops unexpectedly, and deletes expired local or Supabase
+artifacts through a Redis expiration registry. The admin Mini App now exposes
+queue age, hourly throughput, final failure rate, job-type filters, and search.
+
+Pure validation and normalization logic now lives in focused TTS, OCR,
+broadcast, and runtime-settings service modules. `app/legacy.py` keeps thin
+compatibility wrappers while extraction continues without breaking imports.
+
+Artifact cleanup runs in worker and combined roles every five minutes by
+default. `BOT_ARTIFACT_CLEANUP_SECONDS` is an optional deployment override; it
+does not belong in the minimal `.env.example`.
+
+The V4 hardening pass also pipelines queue statistics, preserves artifact
+cleanup records across transient storage outages, resets stale worker backoff
+after healthy operation, and prevents overlapping Mini App pagination calls.
+
+See [`UPDATE_V4_NOTES.md`](UPDATE_V4_NOTES.md) for operational details and
+[`VALIDATION_V4.md`](VALIDATION_V4.md) for the verification record.

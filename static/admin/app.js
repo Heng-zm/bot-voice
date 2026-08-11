@@ -10,6 +10,9 @@ const state = {
   toastTimer: null,
   jobCursor: null,
   selectedJobs: new Set(),
+  jobRequestId: 0,
+  jobAppendPending: false,
+  queueHistory: [],
 };
 
 const translations = {
@@ -32,6 +35,7 @@ const translations = {
     admins: "Admins", settings: "Settings", operational: "Operational", starting: "Starting", healthy: "Healthy",
     unavailable: "Unavailable", connected: "Connected", memoryFallback: "Memory fallback", active: "Active",
     paused: "Paused", drainWorkers: "Drain workers", resumeWorkers: "Resume workers", accepting: "Accepting jobs", drained: "Drained", processLocal: "Process-local", reset: "Reset", retry: "Retry", cancel: "Cancel", remove: "Remove",
+    allTypes: "All types", searchJobs: "Search jobs", queueAge: "Oldest queued", throughput: "Throughput/min", failureRate: "Failure rate",
   },
   km: {
     miniApp: "Telegram Mini App", controlCenter: "មជ្ឈមណ្ឌលគ្រប់គ្រងបូត", verifying: "កំពុងផ្ទៀងផ្ទាត់គណនី Telegram",
@@ -52,6 +56,7 @@ const translations = {
     admins: "Admin", settings: "ការកំណត់", operational: "ដំណើរការល្អ", starting: "កំពុងចាប់ផ្ដើម", healthy: "ល្អ",
     unavailable: "មិនអាចប្រើបាន", connected: "បានភ្ជាប់", memoryFallback: "ប្រើ Memory បម្រុង", active: "សកម្ម",
     paused: "បានផ្អាក", drainWorkers: "ផ្អាកទទួលការងារ", resumeWorkers: "បន្តទទួលការងារ", accepting: "កំពុងទទួលការងារ", drained: "បានផ្អាកទទួលការងារ", processLocal: "តាម process", reset: "កំណត់ឡើងវិញ", retry: "សាកឡើងវិញ", cancel: "បោះបង់", remove: "ដកចេញ",
+    allTypes: "គ្រប់ប្រភេទ", searchJobs: "ស្វែងរកការងារ", queueAge: "ការងារចាស់បំផុត", throughput: "បានបញ្ចប់/នាទី", failureRate: "អត្រាបរាជ័យ",
   },
 };
 
@@ -65,8 +70,9 @@ const elements = {
   botMode: $("botMode"), maintenanceToggle: $("maintenanceToggle"), maintenanceNotice: $("maintenanceNotice"),
   corsForm: $("corsForm"), corsOrigin: $("corsOrigin"), corsList: $("corsList"), corsEmpty: $("corsEmpty"),
   runtimeForm: $("runtimeForm"), runtimeFields: $("runtimeFields"), saveRuntimeButton: $("saveRuntimeButton"),
-  jobState: $("jobState"), refreshJobsButton: $("refreshJobsButton"), jobsList: $("jobsList"), jobsEmpty: $("jobsEmpty"),
+  jobState: $("jobState"), jobType: $("jobType"), jobSearch: $("jobSearch"), refreshJobsButton: $("refreshJobsButton"), jobsList: $("jobsList"), jobsEmpty: $("jobsEmpty"),
   jobSummary: $("jobSummary"), drainWorkersButton: $("drainWorkersButton"), resumeWorkersButton: $("resumeWorkersButton"), retrySelectedButton: $("retrySelectedButton"), loadMoreJobsButton: $("loadMoreJobsButton"),
+  queueCharts: $("queueCharts"),
   providersList: $("providersList"), providerScope: $("providerScope"), adminForm: $("adminForm"), adminUserId: $("adminUserId"),
   adminList: $("adminList"), auditList: $("auditList"), toast: $("toast"),
 };
@@ -76,6 +82,8 @@ function applyLanguage() {
   document.documentElement.lang = state.language;
   document.querySelectorAll("[data-i18n]").forEach((node) => { node.textContent = t(node.dataset.i18n); });
   elements.languageButton.textContent = state.language === "en" ? "ខ្មែរ" : "English";
+  elements.jobType.options[0].textContent = t("allTypes");
+  elements.jobSearch.placeholder = t("searchJobs");
   window.localStorage.setItem("admin-language", state.language);
 }
 
@@ -87,8 +95,14 @@ function showToast(message, isError = false) {
   elements.toast.classList.add("show");
   state.toastTimer = window.setTimeout(() => elements.toast.classList.remove("show"), 3200);
 }
+function runAsync(action) {
+  Promise.resolve()
+    .then(action)
+    .catch((error) => showToast(error instanceof Error ? error.message : String(error), true));
+}
 function compactNumber(value) { return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(Number(value) || 0); }
 function formatDate(value) { return value ? new Date(Number(value) * 1000).toLocaleString() : "—"; }
+function formatDuration(value) { const seconds = Math.max(0, Number(value) || 0); if (seconds < 60) return `${Math.round(seconds)}s`; if (seconds < 3600) return `${Math.round(seconds / 60)}m`; return `${(seconds / 3600).toFixed(1)}h`; }
 
 async function api(path, options = {}) {
   const initData = String(window.Telegram?.WebApp?.initData || "").trim();
@@ -119,6 +133,25 @@ function setHealth(element, label, kind = "ok") {
   element.textContent = label;
   element.classList.toggle("warn", kind === "warn");
   element.classList.toggle("down", kind === "down");
+}
+function sparkline(values, color) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 120 36"); svg.setAttribute("role", "img"); svg.setAttribute("aria-label", "Recent samples");
+  const clean = values.map((value) => Math.max(0, Number(value) || 0)); const maximum = Math.max(1, ...clean);
+  const chartValues = clean.length === 1 ? [clean[0], clean[0]] : clean;
+  const points = chartValues.map((value, index) => `${(index / (chartValues.length - 1)) * 120},${34 - (value / maximum) * 30}`).join(" ");
+  const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline"); line.setAttribute("points", points); line.setAttribute("fill", "none"); line.setAttribute("stroke", color); line.setAttribute("stroke-width", "3"); line.setAttribute("stroke-linecap", "round"); line.setAttribute("stroke-linejoin", "round"); svg.append(line); return svg;
+}
+function renderQueueCharts(jobs) {
+  const sample = { age: Number(jobs.oldest_queued_age_seconds) || 0, throughput: Number(jobs.throughput_per_minute) || 0, failures: Number(jobs.failure_rate_percent) || 0 };
+  state.queueHistory.push(sample); if (state.queueHistory.length > 20) state.queueHistory.shift();
+  const specs = [
+    ["age", t("queueAge"), formatDuration(sample.age), "#f7b955"],
+    ["throughput", t("throughput"), sample.throughput.toFixed(2), "#50d890"],
+    ["failures", t("failureRate"), `${sample.failures.toFixed(1)}%`, "#ff6b7a"],
+  ];
+  elements.queueCharts.replaceChildren();
+  specs.forEach(([key, labelText, valueText, color]) => { const card = document.createElement("article"); card.className = "queue-chart"; const copy = document.createElement("div"), label = document.createElement("span"), value = document.createElement("strong"); label.textContent = labelText; value.textContent = valueText; copy.append(label, value); card.append(copy, sparkline(state.queueHistory.map((item) => item[key]), color)); elements.queueCharts.append(card); });
 }
 function renderProfile(payload) {
   const user = payload.user || {};
@@ -160,6 +193,7 @@ function renderStats(payload, jobsPayload, workersPayload) {
   elements.systemBadge.lastElementChild.textContent = overallHealthy ? t("operational") : t("unavailable");
   renderMaintenance(Boolean(bot.maintenance_mode));
   elements.jobSummary.textContent = `Queued ${jobs.queued || 0} · Running ${jobs.running || 0} · Dead ${jobs.dead || 0} · Succeeded ${jobs.succeeded || 0} · Cancelled ${jobs.cancelled || 0} · Capacity ${jobs.queue_available ?? "—"}`;
+  renderQueueCharts(jobs);
 }
 function renderMaintenance(enabled) {
   elements.maintenanceToggle.checked = enabled;
@@ -194,28 +228,45 @@ function renderCors(origins) {
 }
 
 async function refreshJobs({ append = false } = {}) {
+  if (append && (!state.jobCursor || state.jobAppendPending)) return;
+  if (append) state.jobAppendPending = true;
   const selectedState = elements.jobState.value;
-  const cursor = append && state.jobCursor ? `&cursor=${encodeURIComponent(state.jobCursor)}` : "";
-  const payload = await api(`/api/admin/runtime/jobs/list?state=${selectedState}&limit=50${cursor}`);
-  if (!append) { elements.jobsList.replaceChildren(); state.selectedJobs.clear(); }
-  payload.jobs.forEach((job) => {
-    const row = document.createElement("article"); row.className = "data-row job-row";
-    if (["dead", "cancelled"].includes(job.state)) {
-      const check = document.createElement("input"); check.type = "checkbox"; check.className = "job-check"; check.addEventListener("change", () => { check.checked ? state.selectedJobs.add(job.id) : state.selectedJobs.delete(job.id); elements.retrySelectedButton.disabled = state.selectedJobs.size === 0; }); row.append(check);
+  const requestId = ++state.jobRequestId;
+  elements.refreshJobsButton.disabled = true;
+  elements.loadMoreJobsButton.disabled = true;
+  const params = new URLSearchParams({ state: selectedState, limit: "50" });
+  if (elements.jobType.value) params.set("job_type", elements.jobType.value);
+  if (elements.jobSearch.value.trim()) params.set("query", elements.jobSearch.value.trim());
+  if (append && state.jobCursor) params.set("cursor", state.jobCursor);
+  try {
+    const payload = await api(`/api/admin/runtime/jobs/list?${params}`);
+    if (requestId !== state.jobRequestId) return;
+    if (!append) { elements.jobsList.replaceChildren(); state.selectedJobs.clear(); }
+    payload.jobs.forEach((job) => {
+      const row = document.createElement("article"); row.className = "data-row job-row";
+      if (["dead", "cancelled"].includes(job.state)) {
+        const check = document.createElement("input"); check.type = "checkbox"; check.className = "job-check"; check.addEventListener("change", () => { check.checked ? state.selectedJobs.add(job.id) : state.selectedJobs.delete(job.id); elements.retrySelectedButton.disabled = state.selectedJobs.size === 0; }); row.append(check);
+      }
+      const copy = document.createElement("div"); copy.className = "data-copy"; const title = document.createElement("strong"); title.textContent = `${job.type} · ${job.id.slice(0, 12)}`;
+      const meta = document.createElement("small"); meta.textContent = `${job.state} · attempt ${job.attempts}/${job.max_attempts} · ${formatDate(job.created_at)}`;
+      copy.append(title, meta);
+      if (job.progress_stage) { const progress = document.createElement("div"); progress.className = "job-progress"; const bar = document.createElement("span"); bar.style.width = `${Math.max(0, Math.min(100, Number(job.progress_percent) || 0))}%`; const label = document.createElement("small"); label.textContent = `${job.progress_percent || 0}% · ${job.progress_stage}${job.progress_detail ? ` · ${job.progress_detail}` : ""}`; progress.append(bar, label); copy.append(progress); }
+      if (job.last_error) { const error = document.createElement("p"); error.className = "row-error"; error.textContent = job.last_error; copy.append(error); } row.append(copy);
+      const actions = document.createElement("div"); actions.className = "row-actions";
+      if (["dead", "cancelled"].includes(job.state)) { const retry = document.createElement("button"); retry.className = "button small"; retry.textContent = t("retry"); retry.addEventListener("click", () => mutateJob(job.id, "retry", retry)); actions.append(retry); }
+      if (["queued", "running"].includes(job.state)) { const cancel = document.createElement("button"); cancel.className = "button danger"; cancel.textContent = t("cancel"); cancel.addEventListener("click", () => mutateJob(job.id, "cancel", cancel)); actions.append(cancel); }
+      row.append(actions); elements.jobsList.append(row);
+    });
+    state.jobCursor = payload.next_cursor; elements.loadMoreJobsButton.classList.toggle("is-hidden", !state.jobCursor);
+    elements.jobsEmpty.classList.toggle("is-hidden", elements.jobsList.children.length > 0);
+    elements.retrySelectedButton.disabled = state.selectedJobs.size === 0;
+  } finally {
+    if (append) state.jobAppendPending = false;
+    if (requestId === state.jobRequestId) {
+      elements.refreshJobsButton.disabled = false;
+      elements.loadMoreJobsButton.disabled = !state.jobCursor;
     }
-    const copy = document.createElement("div"); copy.className = "data-copy"; const title = document.createElement("strong"); title.textContent = `${job.type} · ${job.id.slice(0, 12)}`;
-    const meta = document.createElement("small"); meta.textContent = `${job.state} · attempt ${job.attempts}/${job.max_attempts} · ${formatDate(job.created_at)}`;
-    copy.append(title, meta);
-    if (job.progress_stage) { const progress = document.createElement("div"); progress.className = "job-progress"; const bar = document.createElement("span"); bar.style.width = `${Math.max(0, Math.min(100, Number(job.progress_percent) || 0))}%`; const label = document.createElement("small"); label.textContent = `${job.progress_percent || 0}% · ${job.progress_stage}${job.progress_detail ? ` · ${job.progress_detail}` : ""}`; progress.append(bar, label); copy.append(progress); }
-    if (job.last_error) { const error = document.createElement("p"); error.className = "row-error"; error.textContent = job.last_error; copy.append(error); } row.append(copy);
-    const actions = document.createElement("div"); actions.className = "row-actions";
-    if (["dead", "cancelled"].includes(job.state)) { const retry = document.createElement("button"); retry.className = "button small"; retry.textContent = t("retry"); retry.addEventListener("click", () => mutateJob(job.id, "retry", retry)); actions.append(retry); }
-    if (["queued", "running"].includes(job.state)) { const cancel = document.createElement("button"); cancel.className = "button danger"; cancel.textContent = t("cancel"); cancel.addEventListener("click", () => mutateJob(job.id, "cancel", cancel)); actions.append(cancel); }
-    row.append(actions); elements.jobsList.append(row);
-  });
-  state.jobCursor = payload.next_cursor; elements.loadMoreJobsButton.classList.toggle("is-hidden", !state.jobCursor);
-  elements.jobsEmpty.classList.toggle("is-hidden", elements.jobsList.children.length > 0);
-  elements.retrySelectedButton.disabled = state.selectedJobs.size === 0;
+  }
 }
 
 async function setWorkerAcceptance(action, button) {
@@ -279,8 +330,8 @@ async function mutateAdministrator(action, userId, button) {
 async function refreshAll({ initial = false, silent = false } = {}) {
   if (state.refreshing) return; state.refreshing = true; elements.refreshButton.disabled = true;
   try {
-    const [profile, stats, settings, cors, jobs, workers] = await Promise.all([api("/api/admin/me"), api("/api/admin/stats"), api("/api/admin/settings"), api("/api/admin/cors"), api("/api/admin/runtime/jobs"), api("/api/admin/runtime/workers")]);
-    renderProfile(profile); renderStats(stats, jobs, workers); renderSettings(settings); renderCors(cors.origins);
+    const [profile, stats, settings, cors, jobs] = await Promise.all([api("/api/admin/me"), api("/api/admin/stats"), api("/api/admin/settings"), api("/api/admin/cors"), api("/api/admin/runtime/jobs")]);
+    renderProfile(profile); renderStats(stats, jobs, jobs.workers); renderSettings(settings); renderCors(cors.origins);
     const optional = await Promise.allSettled([refreshJobs(), refreshProviders(), refreshAdministrators()]);
     optional.filter((item) => item.status === "rejected").forEach((item) => console.warn(item.reason));
     elements.authState.classList.add("is-hidden"); elements.dashboard.classList.remove("is-hidden"); if (!initial && !silent) { haptic(); showToast("Dashboard refreshed."); }
@@ -305,10 +356,11 @@ elements.refreshButton.addEventListener("click", () => refreshAll());
 elements.languageButton.addEventListener("click", () => { state.language = state.language === "en" ? "km" : "en"; applyLanguage(); refreshAll({ silent: true }); });
 elements.maintenanceToggle.addEventListener("change", (event) => confirmMaintenance(event.target.checked));
 elements.corsForm.addEventListener("submit", addOrigin); elements.runtimeForm.addEventListener("submit", saveRuntime);
-elements.jobState.addEventListener("change", () => refreshJobs()); elements.refreshJobsButton.addEventListener("click", () => refreshJobs());
+elements.jobState.addEventListener("change", () => runAsync(() => refreshJobs())); elements.jobType.addEventListener("change", () => runAsync(() => refreshJobs())); elements.refreshJobsButton.addEventListener("click", () => runAsync(() => refreshJobs()));
+let jobSearchTimer = null; elements.jobSearch.addEventListener("input", () => { window.clearTimeout(jobSearchTimer); jobSearchTimer = window.setTimeout(() => runAsync(() => refreshJobs()), 250); });
 elements.drainWorkersButton.addEventListener("click", () => setWorkerAcceptance("drain", elements.drainWorkersButton));
 elements.resumeWorkersButton.addEventListener("click", () => setWorkerAcceptance("resume", elements.resumeWorkersButton));
-elements.loadMoreJobsButton.addEventListener("click", () => refreshJobs({ append: true })); elements.retrySelectedButton.addEventListener("click", retrySelected);
+elements.loadMoreJobsButton.addEventListener("click", () => runAsync(() => refreshJobs({ append: true }))); elements.retrySelectedButton.addEventListener("click", retrySelected);
 elements.adminForm.addEventListener("submit", async (event) => { event.preventDefault(); const userId = Number.parseInt(elements.adminUserId.value, 10); if (!Number.isSafeInteger(userId) || userId <= 0) return showToast("Enter a valid Telegram user ID.", true); const button = elements.adminForm.querySelector("button"); await mutateAdministrator("add", userId, button); elements.adminUserId.value = ""; });
 
 applyLanguage(); initializeTelegram(); refreshAll({ initial: true });

@@ -57,23 +57,63 @@ class FakeRedis:
 
         class Pipeline:
             def __init__(self) -> None:
-                self.keys: list[str] = []
+                self.operations: list[tuple[str, tuple, dict]] = []
 
             def hgetall(self, key: str):
-                self.keys.append(key)
+                self.operations.append(("hgetall", (key,), {}))
+                return self
+
+            def zremrangebyscore(self, key: str, minimum, maximum):
+                self.operations.append(
+                    ("zremrangebyscore", (key, minimum, maximum), {})
+                )
+                return self
+
+            def zcard(self, key: str):
+                self.operations.append(("zcard", (key,), {}))
+                return self
+
+            def zrange(self, key: str, start: int, end: int, **kwargs):
+                self.operations.append(("zrange", (key, start, end), kwargs))
+                return self
+
+            def zcount(self, key: str, minimum, maximum):
+                self.operations.append(("zcount", (key, minimum, maximum), {}))
                 return self
 
             def execute(self):
                 redis.pipeline_execute_calls += 1
-                return [dict(redis.hashes.get(key, {})) for key in self.keys]
+                return [
+                    getattr(redis, method)(*args, **kwargs)
+                    for method, args, kwargs in self.operations
+                ]
 
             def reset(self) -> None:
-                self.keys.clear()
+                self.operations.clear()
 
         return Pipeline()
 
     def zcard(self, key: str) -> int:
         return len(self.zsets.get(key, {}))
+
+    def zcount(self, key: str, minimum, maximum) -> int:
+        low = float(minimum)
+        high = float("inf") if maximum == "+inf" else float(maximum)
+        return sum(low <= score <= high for score in self.zsets.get(key, {}).values())
+
+    def zrange(self, key: str, start: int, end: int, *, withscores: bool = False):
+        ordered = sorted(self.zsets.get(key, {}).items(), key=lambda item: item[1])
+        values = ordered[start : end + 1]
+        return values if withscores else [member for member, _score in values]
+
+    def zremrangebyscore(self, key: str, minimum, maximum) -> int:
+        del minimum
+        cutoff = float(maximum)
+        values = self.zsets.setdefault(key, {})
+        expired = [member for member, score in values.items() if score <= cutoff]
+        for member in expired:
+            values.pop(member, None)
+        return len(expired)
 
     def zrevrange(self, key: str, start: int, end: int):
         ordered = [
@@ -128,6 +168,46 @@ class JobQueueRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(second))
         self.assertIsNone(next_cursor)
         self.assertEqual(2, redis.pipeline_execute_calls)
+
+    async def test_job_filters_and_queue_metrics(self) -> None:
+        redis = FakeRedis()
+        queue = RedisJobQueue(redis, redis_prefix="tests")
+        now = time.time()
+        for index, job_type in enumerate(("tts", "ocr", "tts")):
+            job_id = f"filter-{index}"
+            redis.hashes[queue._job_key(job_id)] = {
+                "id": job_id,
+                "type": job_type,
+                "payload": "{}",
+                "state": "dead",
+                "priority": "0",
+                "created_at": str(now - index),
+                "available_at": str(now - index),
+                "attempts": "3",
+                "max_attempts": "3",
+                "timeout_seconds": "10",
+                "cancel_requested": "0",
+                "last_error": "provider timeout" if index == 2 else "failed",
+            }
+            redis.zsets.setdefault(queue.dead_key, {})[job_id] = now - index
+
+        filtered, cursor = await queue.list_jobs(
+            state="dead",
+            job_type="tts",
+            query="timeout",
+        )
+        self.assertEqual(["filter-2"], [job.id for job in filtered])
+        self.assertIsNone(cursor)
+
+        redis.zsets.setdefault(queue.ready_key, {})["queued"] = now - 45
+        redis.zsets.setdefault(queue.succeeded_key, {})["success"] = now - 60
+        pipeline_calls = redis.pipeline_execute_calls
+        metrics = await queue.stats()
+        self.assertEqual(pipeline_calls + 1, redis.pipeline_execute_calls)
+        self.assertGreaterEqual(metrics["oldest_queued_age_seconds"], 45)
+        self.assertEqual(1, metrics["succeeded_last_hour"])
+        self.assertEqual(3, metrics["failed_last_hour"])
+        self.assertEqual(75.0, metrics["failure_rate_percent"])
 
 
 if __name__ == "__main__":

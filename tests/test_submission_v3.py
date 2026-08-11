@@ -3,10 +3,28 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from app.services.jobs.submission import submit_ocr_job, submit_transcription_job
+from app.services.jobs.submission import (
+    submit_ocr_job,
+    submit_transcription_job,
+    submit_tts_job,
+)
 
 
 class SubmissionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_removed_tts_model_falls_back_to_standard_tts_queue(self) -> None:
+        enqueue = AsyncMock(return_value=(object(), True))
+        with patch("app.services.jobs.submission.enqueue_bot_job", enqueue):
+            await submit_tts_job(
+                chat_id=10,
+                user_id=20,
+                text="hello",
+                tts_model="voxcpm2",
+                idempotency_key="tts-key",
+            )
+
+        self.assertEqual("tts", enqueue.await_args.args[0])
+        self.assertEqual("auto", enqueue.await_args.args[1]["tts_model"])
+
     async def test_ocr_payload_contains_delivery_target_and_user_context(self) -> None:
         enqueue = AsyncMock(return_value=(object(), True))
         with patch("app.services.jobs.submission.enqueue_bot_job", enqueue):

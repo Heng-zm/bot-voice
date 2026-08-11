@@ -6,9 +6,9 @@
   <meta name="color-scheme" content="light dark">
   <meta name="description" content="Secure Telegram bot administration dashboard">
   <title>Bot Control Center</title>
-  <link rel="stylesheet" href="/miniapp/admin/assets/styles.css?v=4">
+  <link rel="stylesheet" href="/miniapp/admin/assets/styles.css?v=5">
   <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
-  <script src="/miniapp/admin/assets/app.js?v=4" defer></script>
+  <script src="/miniapp/admin/assets/app.js?v=6" defer></script>
 </head>
 <body>
   <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -94,12 +94,21 @@
               <option value="succeeded">Succeeded</option>
               <option value="cancelled">Cancelled</option>
             </select>
+            <select id="jobType" class="select" aria-label="Filter jobs by type">
+              <option value="">All types</option>
+              <option value="tts">TTS</option>
+              <option value="ocr">OCR</option>
+              <option value="transcription">Transcription</option>
+              <option value="broadcast">Broadcast</option>
+            </select>
+            <input id="jobSearch" class="text-input job-search" type="search" maxlength="128" placeholder="Search jobs" aria-label="Search jobs">
             <button id="drainWorkersButton" class="button danger" type="button" data-i18n="drainWorkers">Drain workers</button>
             <button id="resumeWorkersButton" class="button" type="button" data-i18n="resumeWorkers">Resume workers</button>
             <button id="refreshJobsButton" class="button" type="button" data-i18n="refresh">Refresh</button>
           </div>
         </div>
         <div id="jobSummary" class="summary-strip"></div>
+        <div id="queueCharts" class="queue-charts" aria-label="Queue performance charts"></div>
         <div id="jobsList" class="data-list"></div>
         <p id="jobsEmpty" class="empty-state is-hidden" data-i18n="noJobs">No jobs in this state.</p>
         <div class="form-actions"><button id="retrySelectedButton" class="button primary" type="button" disabled data-i18n="retrySelected">Retry selected</button><button id="loadMoreJobsButton" class="button is-hidden" type="button" data-i18n="loadMore">Load more</button></div>

@@ -66,6 +66,16 @@ class ProgressRedis:
     def zcard(self, key: str) -> int:
         return len(self.zsets.get(key, {}))
 
+    def zcount(self, key: str, minimum, maximum) -> int:
+        low = float(minimum)
+        high = float("inf") if maximum == "+inf" else float(maximum)
+        return sum(low <= score <= high for score in self.zsets.get(key, {}).values())
+
+    def zrange(self, key: str, start: int, end: int, *, withscores: bool = False):
+        ordered = sorted(self.zsets.get(key, {}).items(), key=lambda item: item[1])
+        values = ordered[start : end + 1]
+        return values if withscores else [member for member, _score in values]
+
 
 class ExtractedUtilityTests(unittest.IsolatedAsyncioTestCase):
     async def test_atomic_file_helpers_and_limit(self) -> None:

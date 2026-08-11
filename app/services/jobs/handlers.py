@@ -17,8 +17,11 @@ from typing import Any
 
 from telegram import Bot
 
+from app.services.ai.ocr import normalize_media_suffix, normalize_ocr_result
+from app.services.ai.tts import normalize_tts_request
 from app.services.artifacts.storage import ArtifactService
 from app.services.jobs.queue import JobContext, JobHandler
+from app.services.telegram.broadcast import BroadcastRequest
 from app.services.telegram.delivery import IdempotentTelegramDelivery
 
 
@@ -289,34 +292,26 @@ class BotJobHandlers:
         self,
         payload: Mapping[str, Any],
         context: JobContext,
-        *,
-        force_model: str = "",
     ) -> dict[str, Any]:
         chat_id = _required_int(payload, "chat_id")
         user_id = int(payload.get("user_id") or chat_id)
-        text = _required_text(payload, "text", max_chars=20_000)
-        gender = str(payload.get("gender") or "female").strip().lower()
-        if gender not in {"female", "male"}:
-            raise BotJobPayloadError("gender must be female or male.")
         try:
-            speed = float(payload.get("speed") or 1.0)
-        except (TypeError, ValueError) as exc:
-            raise BotJobPayloadError("speed must be numeric.") from exc
-        speed = max(0.5, min(2.0, speed))
-        model = str(force_model or payload.get("tts_model") or "auto").strip().lower()
+            request = normalize_tts_request(payload)
+        except ValueError as exc:
+            raise BotJobPayloadError(str(exc)) from exc
         reply_to = _optional_reply_id(payload)
-        await self._progress(context, 10, "preparing", f"model={model}")
+        await self._progress(context, 10, "preparing", f"model={request.model}")
         bot = await self.bot()
         fd, output_path = tempfile.mkstemp(prefix="durable-tts-", suffix=".ogg")
         os.close(fd)
         try:
             await self._progress(context, 30, "generating_voice")
             audio = await self.legacy.generate_user_voice_limited(
-                text,
-                gender,
-                speed,
+                request.text,
+                request.gender,
+                request.speed,
                 output_path,
-                model,
+                request.model,
                 user_id=user_id,
                 bot=bot,
                 chat_id=chat_id,
@@ -329,14 +324,19 @@ class BotJobHandlers:
                 kwargs["reply_to_message_id"] = reply_to
             handle = await asyncio.to_thread(open, output_path, "rb")
             try:
-                sent = await bot.send_voice(voice=handle, **kwargs)
+                delivered = await self.delivery.deliver_voice(
+                    bot=bot,
+                    idempotency_key=f"job:{context.job.id}:telegram-voice",
+                    voice=handle,
+                    **kwargs,
+                )
             finally:
                 await asyncio.to_thread(handle.close)
             return {
                 "chat_id": chat_id,
-                "message_id": int(getattr(sent, "message_id", 0) or 0),
+                "message_id": int(delivered.get("message_id") or 0),
                 "bytes": len(audio or b""),
-                "model": model,
+                "model": request.model,
             }
         except Exception as exc:
             await self._notify_terminal_error(payload, context, exc)
@@ -352,13 +352,6 @@ class BotJobHandlers:
     ) -> dict[str, Any]:
         return await self.tts(payload, context)
 
-    async def voxcpm2_job(
-        self,
-        payload: Mapping[str, Any],
-        context: JobContext,
-    ) -> dict[str, Any]:
-        return await self.tts(payload, context, force_model="voxcpm2")
-
     async def ocr_job(
         self,
         payload: Mapping[str, Any],
@@ -366,9 +359,7 @@ class BotJobHandlers:
     ) -> dict[str, Any]:
         file_id = _required_text(payload, "file_id", max_chars=512)
         mime_type = str(payload.get("mime_type") or "image/jpeg").strip().lower()
-        suffix = str(payload.get("suffix") or ".jpg").strip()
-        if not suffix.startswith(".") or len(suffix) > 10:
-            suffix = ".jpg"
+        suffix = normalize_media_suffix(str(payload.get("suffix") or ""), default=".jpg")
         max_bytes = int(getattr(self.legacy, "MAX_IMAGE_FILE_BYTES", 20_000_000))
         await self._progress(context, 10, "downloading_image")
         path = await self._download(file_id, suffix=suffix, max_bytes=max_bytes)
@@ -379,8 +370,10 @@ class BotJobHandlers:
             text = await self.legacy.ocr_image(path, mime_type)
             if await context.cancelled():
                 return {"cancelled": True}
-            if not text or str(text).strip().upper() == "NOTEXT":
-                text = "រូបភាពនេះមិនមានអត្ថបទដែលអាចអានបានទេ។"
+            text = normalize_ocr_result(
+                text,
+                no_text_message="រូបភាពនេះមិនមានអត្ថបទដែលអាចអានបានទេ។",
+            )
             await self._progress(context, 80, "storing_result")
             result = await self._deliver_text_result(
                 payload=payload,
@@ -404,9 +397,7 @@ class BotJobHandlers:
     ) -> dict[str, Any]:
         file_id = _required_text(payload, "file_id", max_chars=512)
         mime_type = str(payload.get("mime_type") or "audio/ogg").strip().lower()
-        suffix = str(payload.get("suffix") or ".ogg").strip()
-        if not suffix.startswith(".") or len(suffix) > 10:
-            suffix = ".ogg"
+        suffix = normalize_media_suffix(str(payload.get("suffix") or ""), default=".ogg")
         max_bytes = int(getattr(self.legacy, "MAX_AUDIO_FILE_BYTES", 50_000_000))
         await self._progress(context, 10, "downloading_audio")
         path = await self._download(file_id, suffix=suffix, max_bytes=max_bytes)
@@ -443,27 +434,13 @@ class BotJobHandlers:
         payload: Mapping[str, Any],
         context: JobContext,
     ) -> dict[str, Any]:
-        raw_recipients = payload.get("recipient_ids")
-        if not isinstance(raw_recipients, list) or not raw_recipients:
-            raise BotJobPayloadError("recipient_ids must be a non-empty list.")
-        if len(raw_recipients) > 10_000:
-            raise BotJobPayloadError("recipient_ids exceeds 10,000 entries.")
-        recipients: list[int] = []
-        for value in raw_recipients:
-            try:
-                recipient = int(value)
-            except (TypeError, ValueError) as exc:
-                raise BotJobPayloadError("recipient_ids contains an invalid ID.") from exc
-            if recipient > 0:
-                recipients.append(recipient)
-        text = _required_text(payload, "text", max_chars=4096)
-        parse_mode = str(payload.get("parse_mode") or "auto").strip().lower()
-        photo_file_id = str(payload.get("photo_file_id") or "").strip() or None
-        link_preview = bool(payload.get("link_preview", True))
+        try:
+            request = BroadcastRequest.from_payload(payload)
+        except ValueError as exc:
+            raise BotJobPayloadError(str(exc)) from exc
         bot = await self.bot()
         sender = self.legacy._send_telegram_broadcast_message
-        concurrency = max(1, min(10, int(payload.get("concurrency") or 3)))
-        semaphore = asyncio.Semaphore(concurrency)
+        semaphore = asyncio.Semaphore(request.concurrency)
         sent = failed = 0
         await self._progress(context, 5, "broadcast_starting")
 
@@ -474,17 +451,17 @@ class BotJobHandlers:
                 await sender(
                     bot,
                     chat_id=chat_id,
-                    text=text,
-                    parse_mode=parse_mode,
-                    photo_file_id=photo_file_id,
-                    link_preview=link_preview,
+                    text=request.text,
+                    parse_mode=request.parse_mode,
+                    photo_file_id=request.photo_file_id,
+                    link_preview=request.link_preview,
                 )
                 return True
 
-        for start in range(0, len(recipients), 100):
+        for start in range(0, len(request.recipients), 100):
             if await context.cancelled():
                 break
-            batch = recipients[start : start + 100]
+            batch = request.recipients[start : start + 100]
             results = await asyncio.gather(
                 *(send_one(chat_id) for chat_id in batch),
                 return_exceptions=True,
@@ -494,8 +471,8 @@ class BotJobHandlers:
                     sent += 1
                 else:
                     failed += 1
-            processed = min(start + len(batch), len(recipients))
-            percent = 5 + int((processed / len(recipients)) * 90)
+            processed = min(start + len(batch), len(request.recipients))
+            percent = 5 + int((processed / len(request.recipients)) * 90)
             await self._progress(
                 context,
                 percent,
@@ -503,7 +480,7 @@ class BotJobHandlers:
                 f"processed={processed} sent={sent} failed={failed}",
             )
         return {
-            "recipients": len(recipients),
+            "recipients": len(request.recipients),
             "sent": sent,
             "failed": failed,
             "cancelled": await context.cancelled(),
@@ -512,7 +489,6 @@ class BotJobHandlers:
     def mapping(self) -> dict[str, JobHandler]:
         return {
             "tts": self.tts_job,
-            "voxcpm2": self.voxcpm2_job,
             "ocr": self.ocr_job,
             "transcription": self.transcription_job,
             "broadcast": self.broadcast_job,

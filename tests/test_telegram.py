@@ -190,8 +190,8 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
             classify_callback("user_broken", speed_callbacks=speeds)
         )
         self.assertTrue(callback_requires_tts_access("speed", "spd_1.0"))
-        self.assertFalse(
-            callback_requires_tts_access("voxcpm2", "voxcpm2:refresh")
+        self.assertIsNone(
+            classify_callback("voxcpm2:refresh", speed_callbacks=speeds)
         )
 
     def test_broadcast_markdown_link_and_preview_directives(self) -> None:
@@ -379,23 +379,6 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(allowed)
         message.reply_text.assert_awaited_once()
-
-    async def test_disabling_tts_clears_pending_voxcpm2_input(self) -> None:
-        context = SimpleNamespace(
-            user_data={"voxcpm2_state": legacy.VOXCPM2_WAIT_CONTROL},
-        )
-        with patch.object(
-            legacy,
-            "_ensure_user_allowed",
-            AsyncMock(return_value=False),
-        ):
-            allowed = await legacy._ensure_voxcpm2_allowed(
-                SimpleNamespace(),
-                context,
-            )
-
-        self.assertFalse(allowed)
-        self.assertNotIn("voxcpm2_state", context.user_data)
 
     async def test_setting_toggle_updates_runtime_cache_immediately(self) -> None:
         old_memory = dict(legacy._bot_settings_memory)

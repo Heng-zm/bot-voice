@@ -67,6 +67,8 @@ class RuntimeContext:
         self.artifacts: ArtifactService | None = None
         self.delivery: IdempotentTelegramDelivery | None = None
         self.job_handlers: BotJobHandlers | None = None
+        self.artifact_cleanup_task: asyncio.Task[None] | None = None
+        self.artifact_cleanup_stop: asyncio.Event | None = None
         self.role: RuntimeRole | None = None
         self.started = False
         self.started_at = 0.0
@@ -143,6 +145,8 @@ class RuntimeContext:
                     raise RuntimeError("Could not configure the durable job queue.")
                 self.artifacts = configure_artifact_service(
                     supabase_client=self.supabase,
+                    redis_client=self.redis,
+                    redis_prefix=redis_prefix,
                     role=requested_role,
                 )
                 self.delivery = configure_telegram_delivery(
@@ -219,6 +223,7 @@ class RuntimeContext:
 
     async def _ensure_workers(self) -> None:
         if self.job_handlers is not None and job_worker_snapshot().get("count", 0):
+            self._ensure_artifact_cleanup()
             return
         if self.artifacts is None or self.delivery is None:
             raise RuntimeError("Worker dependencies are not configured.")
@@ -232,6 +237,34 @@ class RuntimeContext:
             handlers.mapping(),
             worker_count=int(os.getenv("BOT_JOB_WORKERS", "2") or 2),
         )
+        self._ensure_artifact_cleanup()
+
+    def _ensure_artifact_cleanup(self) -> None:
+        if self.artifact_cleanup_task is not None and not self.artifact_cleanup_task.done():
+            return
+        self.artifact_cleanup_stop = asyncio.Event()
+        self.artifact_cleanup_task = asyncio.create_task(
+            self._artifact_cleanup_loop(self.artifact_cleanup_stop),
+            name="artifact-expiration-cleanup",
+        )
+
+    async def _artifact_cleanup_loop(self, stop_event: asyncio.Event) -> None:
+        try:
+            interval = float(os.getenv("BOT_ARTIFACT_CLEANUP_SECONDS", "300") or 300)
+        except ValueError:
+            interval = 300.0
+        interval = max(30.0, min(86_400.0, interval))
+        while not stop_event.is_set():
+            artifacts = self.artifacts
+            if artifacts is not None:
+                try:
+                    result = await artifacts.cleanup_expired(limit=500)
+                    if result["deleted"] or result["errors"]:
+                        logger.info("Artifact cleanup result=%s", result)
+                except Exception:
+                    logger.warning("Artifact cleanup iteration failed.", exc_info=True)
+            with suppress(TimeoutError):
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
 
     async def stop(self, *, owner: str) -> None:
         clean_owner = str(owner or "runtime").strip()[:64] or "runtime"
@@ -243,6 +276,14 @@ class RuntimeContext:
             await self._stop_unlocked()
 
     async def _stop_unlocked(self) -> None:
+        if self.artifact_cleanup_stop is not None:
+            self.artifact_cleanup_stop.set()
+        cleanup_task, self.artifact_cleanup_task = self.artifact_cleanup_task, None
+        self.artifact_cleanup_stop = None
+        if cleanup_task is not None:
+            cleanup_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await cleanup_task
         await stop_job_workers()
         handlers, self.job_handlers = self.job_handlers, None
         if handlers is not None:
@@ -297,8 +338,7 @@ class RuntimeContext:
             "job_queue": self.job_queue is not None,
             "artifacts": {
                 "configured": self.artifacts is not None,
-                "backend": self.artifacts.backend if self.artifacts else None,
-                "shared": self.artifacts.shared if self.artifacts else False,
+                **(self.artifacts.snapshot() if self.artifacts else {}),
             },
             "delivery": self.delivery is not None,
             "expects_workers": expects_workers,
