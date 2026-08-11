@@ -34,7 +34,8 @@ _ADMIN_CSP = (
     "form-action 'self'; "
     "frame-ancestors https://web.telegram.org https://*.telegram.org; "
     "script-src 'self' https://telegram.org; "
-    "style-src 'self'; "
+    "style-src 'self' https://fonts.googleapis.com; "
+    "font-src 'self' https://fonts.gstatic.com; "
     "img-src 'self' data: https:; "
     "connect-src 'self'"
 )

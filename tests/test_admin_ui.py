@@ -1,0 +1,47 @@
+from __future__ import annotations
+
+import unittest
+from pathlib import Path
+
+
+class AdminMiniAppUiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        root = Path(__file__).resolve().parents[1]
+        cls.html = (root / "static" / "admin" / "index.html").read_text(
+            encoding="utf-8"
+        )
+        cls.css = (root / "static" / "admin" / "styles.css").read_text(
+            encoding="utf-8"
+        )
+        cls.main = (root / "app" / "main.py").read_text(encoding="utf-8")
+
+    def test_google_sans_and_khmer_fallback_are_loaded(self) -> None:
+        self.assertIn("family=Google+Sans+Flex", self.html)
+        self.assertIn("family=Noto+Sans+Khmer", self.html)
+        self.assertIn('crossorigin', self.html)
+        self.assertIn('styles.css?v=7', self.html)
+        self.assertIn('--font-sans: "Google Sans Flex"', self.css)
+        self.assertIn('"Noto Sans Khmer"', self.css)
+
+    def test_font_hosts_are_narrowly_allowed_by_csp(self) -> None:
+        self.assertIn(
+            '"style-src \'self\' https://fonts.googleapis.com; "',
+            self.main,
+        )
+        self.assertIn(
+            '"font-src \'self\' https://fonts.gstatic.com; "',
+            self.main,
+        )
+        self.assertNotIn("font-src *", self.main)
+
+    def test_small_telegram_viewports_have_dedicated_layouts(self) -> None:
+        for breakpoint in (700, 420, 350):
+            self.assertIn(f"@media (max-width: {breakpoint}px)", self.css)
+        self.assertIn("env(safe-area-inset-bottom)", self.css)
+        self.assertIn("touch-action: manipulation", self.css)
+        self.assertIn("-webkit-text-size-adjust: 100%", self.css)
+
+
+if __name__ == "__main__":
+    unittest.main()
