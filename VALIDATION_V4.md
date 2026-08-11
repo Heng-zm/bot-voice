@@ -6,7 +6,7 @@ and 3.12.
 
 ```text
 python -m pytest -q -p no:cacheprovider
-140 passed
+143 passed
 
 python -m ruff check .
 All checks passed!
@@ -29,6 +29,11 @@ payloads or results.
 Deployment compatibility additionally checks the complete source tree with the
 Python 3.11 compiler in CI, preventing Python 3.12-only f-string grammar from
 reaching a Python 3.11 host.
+
+Startup recovery coverage verifies automatic polling fallback when a persisted
+WEBHOOK mode has no service-local public URL, cleanup of a started Telegram
+Application after activation failure, and graceful Uvicorn listener shutdown
+before a combined-runtime restart.
 
 Supabase lock coverage verifies atomic RPC acquisition, duplicate-safe
 pre-migration fallback, same-owner renewal, bounded inputs, and the checked-in

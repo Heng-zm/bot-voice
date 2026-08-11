@@ -2318,6 +2318,7 @@ def _webhook_rotate_finish(success: bool) -> None:
 async def run_fastapi():
     """Run the FastAPI dashboard inside the main asyncio runtime."""
     import uvicorn
+
     port = _env_int("PORT", 8080, minimum=1, maximum=65535)
     config = uvicorn.Config(
         app,
@@ -2328,7 +2329,26 @@ async def run_fastapi():
         forwarded_allow_ips="*" if _env_bool("WEB_TRUST_PROXY", _env_bool("RENDER", False)) else None,
     )
     server = uvicorn.Server(config)
-    await server.serve()
+    serve_task = asyncio.create_task(server.serve(), name=f"uvicorn-server-{port}")
+    try:
+        # Shield Uvicorn's task so cancellation of the combined runtime can
+        # request an orderly shutdown before the listening socket is reused.
+        await asyncio.shield(serve_task)
+    except asyncio.CancelledError:
+        server.should_exit = True
+        try:
+            await asyncio.wait_for(asyncio.shield(serve_task), timeout=10.0)
+        except TimeoutError:
+            logger.warning(
+                "Uvicorn did not stop within 10 seconds; forcing shutdown on port %s.",
+                port,
+            )
+            server.force_exit = True
+            serve_task.cancel()
+            await asyncio.gather(serve_task, return_exceptions=True)
+        except Exception:
+            logger.warning("Uvicorn failed during graceful shutdown.", exc_info=True)
+        raise
 
 
 async def keep_alive_async(stop_event: asyncio.Event | None = None):
@@ -9293,6 +9313,31 @@ def _run_state_get(key: str, default: Any = None) -> Any:
 def _run_state_bot_mode() -> str:
     mode = str(RUN_STATE.get("BOT_MODE") or BOT_MODE or _perf_default("BOT_MODE", "WEBHOOK")).strip().upper()
     return mode if mode in {"POLLING", "WEBHOOK"} else str(_perf_default("BOT_MODE", "WEBHOOK")).upper()
+
+
+def _ensure_startup_telegram_mode() -> str:
+    """Return a bootable Telegram mode for the service-local environment.
+
+    A Redis admin override may request WEBHOOK even when this service has no
+    public URL.  Long polling is the safe operational fallback in that case.
+    The Redis value is intentionally left unchanged so adding the URL on a
+    future deployment restores the requested webhook mode automatically.
+    """
+    global BOT_MODE
+
+    mode = _run_state_bot_mode()
+    if mode != "WEBHOOK" or _runtime_webhook_base_url():
+        return mode
+
+    with RUN_STATE_LOCK:
+        RUN_STATE["BOT_MODE"] = "POLLING"
+        BOT_MODE = "POLLING"
+    webhook_logger.warning(
+        "BOT_MODE=WEBHOOK has no TELEGRAM_WEBHOOK_URL/RENDER_EXTERNAL_URL; "
+        "using POLLING for this startup. The persisted WEBHOOK preference was "
+        "not overwritten."
+    )
+    return "POLLING"
 
 
 def _run_state_user_rate_limit() -> int:
@@ -27021,12 +27066,66 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # Bot runner
 # ---------------------------------------------------------------------------
+async def _activate_telegram_application(app_obj: Any) -> tuple[bool, bool]:
+    """Activate webhook or polling after the PTB Application has started."""
+    active_owner = await _telegram_leader_refresh_once(app_obj)
+    polling_started = False
+
+    if not active_owner:
+        webhook_logger.warning(
+            "Telegram application is running in STANDBY mode. Web/Admin routes "
+            "are online, but this service will not process Telegram updates "
+            "until it owns the active lock."
+        )
+    elif _run_state_bot_mode() == "WEBHOOK":
+        await _cancel_active_polling_task("startup_webhook_mode")
+        webhook_logger.info(
+            "Telegram polling updater is disabled because BOT_MODE=WEBHOOK "
+            "and this instance owns the active lock."
+        )
+    else:
+        # Startup may follow a previous webhook deployment; delete it before
+        # long polling to prevent Telegram 409 Conflict. Only the active owner
+        # may do this in two-server mode.
+        with suppress(Exception):
+            await _delete_telegram_webhook_via_http(drop_pending=True)
+        polling_started = await _telegram_start_polling_runtime(app_obj)
+        logger.info("Telegram polling started by active owner.")
+
+    return active_owner, polling_started
+
+
+async def _start_telegram_application(app_obj: Any) -> tuple[bool, bool]:
+    """Start and activate PTB, stopping it if activation cannot complete."""
+    global _TELEGRAM_APP_READY
+
+    started = False
+    try:
+        await app_obj.start()
+        started = True
+        _TELEGRAM_APP_READY = True
+        return await _activate_telegram_application(app_obj)
+    except BaseException:
+        _TELEGRAM_APP_READY = False
+        if started or bool(getattr(app_obj, "running", False)):
+            try:
+                await app_obj.stop()
+            except Exception:
+                logger.error(
+                    "Telegram Application failed to stop after startup activation error.",
+                    exc_info=True,
+                )
+        raise
+
+
 async def _run_bot():
     global _BOT_START_TIME, _AI_SEMAPHORE, _BROADCAST_SEMAPHORE
     global _prefs_cache_lock, _prefs_cache_lock_loop, _TTS_CHUNK_SEMAPHORE, _TELEGRAM_APP, _TELEGRAM_APP_READY, telegram_application
 
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
+
+    _ensure_startup_telegram_mode()
 
     # This application lifecycle supports both webhook and polling.  The
     # getUpdates worker itself is guarded separately by ACTIVE_POLLING_TASK;
@@ -27160,28 +27259,9 @@ async def _run_bot():
         # Application.__aenter__() already calls initialize(). Calling
         # initialize() again can raise "Application is already initialized"
         # on python-telegram-bot v20/v21 and break deploy restarts.
-        await app.start()
-        _TELEGRAM_APP_READY = True
-        polling_started = False
+        active_owner, polling_started = await _start_telegram_application(app)
         leader_refresh_due = 0.0
-        active_owner = await _telegram_leader_refresh_once(app)
         leader_refresh_due = time.monotonic() + _telegram_leader_renew_interval_s()
-
-        if not active_owner:
-            webhook_logger.warning(
-                "Telegram application is running in STANDBY mode. Web/Admin routes are online, but this Render service will not process Telegram updates until it owns the active lock."
-            )
-        elif _run_state_bot_mode() == "WEBHOOK":
-            await _cancel_active_polling_task("startup_webhook_mode")
-            webhook_logger.info("Telegram polling updater is disabled because BOT_MODE=WEBHOOK and this instance owns the active lock.")
-        else:
-            # Startup may follow a previous webhook deployment; delete it before
-            # long polling to prevent Telegram 409 Conflict. Only the active
-            # owner may do this in two-server mode.
-            with suppress(Exception):
-                await _delete_telegram_webhook_via_http(drop_pending=True)
-            polling_started = await _telegram_start_polling_runtime(app)
-            logger.info("Telegram polling started by active owner.")
 
         # Start background jobs only after the Telegram application is fully ready.
         # Scheduler itself has its own distributed lock, so both Render services
@@ -27280,6 +27360,7 @@ async def _async_main_once():
         await _restore_run_state_from_redis()
     except Exception as rexc:
         webhook_logger.warning("Redis fallback triggered. Runtime state restore failed during boot: %s", rexc)
+    _ensure_startup_telegram_mode()
     await _bootstrap_runtime_security()
     from app.core.telegram_auth import configure_telegram_admin_authorizer
 

@@ -121,6 +121,8 @@ class RuntimeContext:
                         exc,
                     )
 
+                self.legacy._ensure_startup_telegram_mode()
+
                 security_status = await self.legacy._bootstrap_runtime_security()
                 secret_manager = get_runtime_secret_manager()
                 redis_client = self.legacy.redis_client or secret_manager.redis_client
