@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
 
+from app._legacy_bridge import legacy_module
 from app.api.dependencies import AdminPrincipal, require_admin, require_admin_write
 from app.services.ai.providers import get_provider_manager
 from app.services.jobs.queue import JobNotFound, JobQueueError
@@ -15,6 +17,11 @@ from app.services.jobs.runtime import (
     get_job_queue,
     job_worker_snapshot,
     set_job_workers_accepting,
+)
+from app.services.monitoring import (
+    process_snapshot,
+    runtime_log_snapshot,
+    sanitize_monitor_text,
 )
 
 router = APIRouter(prefix="/api/admin/runtime", tags=["admin-runtime"])
@@ -53,6 +60,40 @@ def _safe_job(job) -> dict:
         "progress_detail": job.progress_detail,
         "updated_at": job.updated_at,
         "result": job.result,
+    }
+
+
+def _safe_monitor_job(job) -> dict:
+    """Expose only fields needed by the live monitor, never payloads/results."""
+
+    return {
+        "id": sanitize_monitor_text(job.id, limit=128),
+        "state": job.state,
+        "attempts": job.attempts,
+        "max_attempts": job.max_attempts,
+        "created_at": job.created_at,
+        "started_at": job.started_at,
+        "worker_id": sanitize_monitor_text(job.worker_id, limit=128),
+        "progress_percent": job.progress_percent,
+        "progress_stage": sanitize_monitor_text(job.progress_stage, limit=100),
+        "progress_detail": sanitize_monitor_text(job.progress_detail, limit=300),
+        "last_error": sanitize_monitor_text(job.last_error, limit=500),
+        "updated_at": job.updated_at,
+    }
+
+
+def _legacy_monitor_snapshot() -> dict:
+    legacy = legacy_module()
+    performance = legacy._runtime_performance_snapshot(light=True)
+    with legacy._tts_request_reservations_guard:
+        reserved_requests = len(legacy._tts_request_reservations)
+    return {
+        "uptime": str(performance.get("uptime") or "starting"),
+        "active_requests": int(performance.get("web", {}).get("active_requests") or 0),
+        "db_queue_size": int(legacy._db_executor_queue_size()),
+        "metrics": dict(performance.get("metrics") or {}),
+        "tts_slots": dict(performance.get("semaphores", {}).get("tts") or {}),
+        "reserved_requests": reserved_requests,
     }
 
 
@@ -130,6 +171,82 @@ async def job_stats(
             detail=str(exc),
         ) from exc
     return {"ok": True, "jobs": counts, "workers": job_worker_snapshot()}
+
+
+@router.get("/monitor")
+async def bot_monitor(
+    principal: Annotated[AdminPrincipal, Depends(require_admin)],
+    log_limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    log_level: Annotated[
+        Literal["", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        Query(),
+    ] = "",
+    log_query: Annotated[str, Query(max_length=128)] = "",
+) -> dict:
+    """Return a sanitized process, TTS, worker, queue, and log snapshot."""
+
+    del principal
+    queue = get_job_queue()
+    try:
+        counts, running_page, queued_page = await asyncio.gather(
+            queue.stats(),
+            # Active jobs are bounded by the worker count, so one unfiltered
+            # page is cheaper than repeatedly scanning for a type match.
+            queue.list_jobs(state="running", limit=100),
+            # Keep live polling to one bounded queued page. The full Jobs view
+            # remains available when an older TTS job is outside this window.
+            queue.list_jobs(state="queued", limit=200),
+        )
+    except (JobQueueError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+
+    running_page_jobs, running_cursor = running_page
+    queued_page_jobs, queued_cursor = queued_page
+    running_jobs = [job for job in running_page_jobs if job.type == "tts"][:50]
+    queued_jobs = [job for job in queued_page_jobs if job.type == "tts"][:50]
+    legacy = _legacy_monitor_snapshot()
+    process = process_snapshot()
+    process.update(
+        {
+            "instance_id": get_provider_manager().metadata().get("instance_id", ""),
+            "uptime": legacy["uptime"],
+            "active_requests": legacy["active_requests"],
+            "db_queue_size": legacy["db_queue_size"],
+            "metrics": legacy["metrics"],
+        }
+    )
+    tts_slots = legacy["tts_slots"]
+    return {
+        "ok": True,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "process": process,
+        "workers": job_worker_snapshot(),
+        "queue": counts,
+        "tts": {
+            "configured": int(tts_slots.get("configured") or 0),
+            "available": tts_slots.get("available"),
+            "in_use": tts_slots.get("in_use"),
+            "reserved_requests": legacy["reserved_requests"],
+            "running": [_safe_monitor_job(job) for job in running_jobs],
+            "queued": [_safe_monitor_job(job) for job in queued_jobs],
+            "running_count": len(running_jobs),
+            "queued_count": len(queued_jobs),
+            "running_truncated": bool(running_cursor) or sum(
+                job.type == "tts" for job in running_page_jobs
+            ) > len(running_jobs),
+            "queued_truncated": bool(queued_cursor) or sum(
+                job.type == "tts" for job in queued_page_jobs
+            ) > len(queued_jobs),
+        },
+        "logs": runtime_log_snapshot(
+            limit=log_limit,
+            level=log_level,
+            query=log_query,
+        ),
+    }
 
 
 @router.get("/jobs/list")

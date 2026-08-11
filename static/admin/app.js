@@ -13,6 +13,11 @@ const state = {
   jobRequestId: 0,
   jobAppendPending: false,
   queueHistory: [],
+  monitorRefreshing: false,
+  monitorPaused: false,
+  monitorTimer: null,
+  monitorFullscreen: false,
+  monitorVisible: false,
 };
 
 const translations = {
@@ -36,6 +41,13 @@ const translations = {
     unavailable: "Unavailable", connected: "Connected", memoryFallback: "Memory fallback", active: "Active",
     paused: "Paused", drainWorkers: "Drain workers", resumeWorkers: "Resume workers", accepting: "Accepting jobs", drained: "Drained", processLocal: "Process-local", reset: "Reset", retry: "Retry", cancel: "Cancel", remove: "Remove",
     allTypes: "All types", searchJobs: "Search jobs", queueAge: "Oldest queued", throughput: "Throughput/min", failureRate: "Failure rate",
+    liveMonitor: "Live operations", botMonitor: "Bot Monitor", live: "Live", fullScreen: "Full screen", exitFullScreen: "Exit full screen",
+    processState: "Bot process", workerProcesses: "Worker processes", ttsProcesses: "TTS processes", queueActivity: "Queue activity",
+    processDetails: "Process details", durableWorkers: "Durable workers", ttsProcessQueue: "TTS process queue",
+    ttsMonitorHelp: "Running and waiting voice jobs refresh automatically.", noTtsProcesses: "No active or queued TTS processes.",
+    runtimeLogs: "Runtime logs", logsSafe: "Recent logs are bounded and secrets are automatically hidden.", allLogs: "All logs",
+    searchLogs: "Search logs", pauseLive: "Pause", resumeLive: "Resume", noLogs: "No matching runtime logs.", monitor: "Monitor",
+    online: "Online", running: "Running", waiting: "Waiting", noWorkers: "No workers are running in this process.",
   },
   km: {
     miniApp: "Telegram Mini App", controlCenter: "មជ្ឈមណ្ឌលគ្រប់គ្រងបូត", verifying: "កំពុងផ្ទៀងផ្ទាត់គណនី Telegram",
@@ -57,6 +69,13 @@ const translations = {
     unavailable: "មិនអាចប្រើបាន", connected: "បានភ្ជាប់", memoryFallback: "ប្រើ Memory បម្រុង", active: "សកម្ម",
     paused: "បានផ្អាក", drainWorkers: "ផ្អាកទទួលការងារ", resumeWorkers: "បន្តទទួលការងារ", accepting: "កំពុងទទួលការងារ", drained: "បានផ្អាកទទួលការងារ", processLocal: "តាម process", reset: "កំណត់ឡើងវិញ", retry: "សាកឡើងវិញ", cancel: "បោះបង់", remove: "ដកចេញ",
     allTypes: "គ្រប់ប្រភេទ", searchJobs: "ស្វែងរកការងារ", queueAge: "ការងារចាស់បំផុត", throughput: "បានបញ្ចប់/នាទី", failureRate: "អត្រាបរាជ័យ",
+    liveMonitor: "ប្រតិបត្តិការផ្ទាល់", botMonitor: "តាមដានបូត", live: "ផ្ទាល់", fullScreen: "ពេញអេក្រង់", exitFullScreen: "ចាកចេញពីពេញអេក្រង់",
+    processState: "Process បូត", workerProcesses: "Worker processes", ttsProcesses: "TTS processes", queueActivity: "សកម្មភាពជួរ",
+    processDetails: "ព័ត៌មាន Process", durableWorkers: "Durable workers", ttsProcessQueue: "ជួរ TTS process",
+    ttsMonitorHelp: "ការងារសំឡេងដែលកំពុងដំណើរការ និងរង់ចាំ ផ្ទុកឡើងវិញដោយស្វ័យប្រវត្តិ។", noTtsProcesses: "មិនមាន TTS process កំពុងដំណើរការ ឬរង់ចាំទេ។",
+    runtimeLogs: "Runtime logs", logsSafe: "Logs ថ្មីៗត្រូវបានកំណត់ចំនួន ហើយ secrets ត្រូវបានលាក់ដោយស្វ័យប្រវត្តិ។", allLogs: "Logs ទាំងអស់",
+    searchLogs: "ស្វែងរក logs", pauseLive: "ផ្អាក", resumeLive: "បន្ត", noLogs: "មិនមាន runtime log ដែលត្រូវគ្នាទេ។", monitor: "តាមដាន",
+    online: "អនឡាញ", running: "កំពុងដំណើរការ", waiting: "កំពុងរង់ចាំ", noWorkers: "មិនមាន worker ដំណើរការនៅក្នុង process នេះទេ។",
   },
 };
 
@@ -73,6 +92,12 @@ const elements = {
   jobState: $("jobState"), jobType: $("jobType"), jobSearch: $("jobSearch"), refreshJobsButton: $("refreshJobsButton"), jobsList: $("jobsList"), jobsEmpty: $("jobsEmpty"),
   jobSummary: $("jobSummary"), drainWorkersButton: $("drainWorkersButton"), resumeWorkersButton: $("resumeWorkersButton"), retrySelectedButton: $("retrySelectedButton"), loadMoreJobsButton: $("loadMoreJobsButton"),
   queueCharts: $("queueCharts"),
+  monitor: $("monitor"), monitorLiveState: $("monitorLiveState"), refreshMonitorButton: $("refreshMonitorButton"), monitorFullscreenButton: $("monitorFullscreenButton"),
+  monitorProcessState: $("monitorProcessState"), monitorProcessMeta: $("monitorProcessMeta"), monitorWorkerState: $("monitorWorkerState"), monitorWorkerMeta: $("monitorWorkerMeta"),
+  monitorTtsState: $("monitorTtsState"), monitorTtsMeta: $("monitorTtsMeta"), monitorQueueState: $("monitorQueueState"), monitorQueueMeta: $("monitorQueueMeta"),
+  monitorUpdated: $("monitorUpdated"), monitorProcessDetails: $("monitorProcessDetails"), monitorWorkerCount: $("monitorWorkerCount"), monitorWorkerList: $("monitorWorkerList"),
+  monitorTtsCount: $("monitorTtsCount"), monitorTtsList: $("monitorTtsList"), monitorTtsEmpty: $("monitorTtsEmpty"), monitorLogLevel: $("monitorLogLevel"),
+  monitorLogSearch: $("monitorLogSearch"), monitorPauseButton: $("monitorPauseButton"), monitorLogList: $("monitorLogList"), monitorLogsEmpty: $("monitorLogsEmpty"),
   providersList: $("providersList"), providerScope: $("providerScope"), adminForm: $("adminForm"), adminUserId: $("adminUserId"),
   adminList: $("adminList"), auditList: $("auditList"), toast: $("toast"),
 };
@@ -81,9 +106,12 @@ function t(key) { return translations[state.language]?.[key] || translations.en[
 function applyLanguage() {
   document.documentElement.lang = state.language;
   document.querySelectorAll("[data-i18n]").forEach((node) => { node.textContent = t(node.dataset.i18n); });
+  document.querySelectorAll("[data-i18n-placeholder]").forEach((node) => { node.placeholder = t(node.dataset.i18nPlaceholder); });
   elements.languageButton.textContent = state.language === "en" ? "ខ្មែរ" : "English";
   elements.jobType.options[0].textContent = t("allTypes");
   elements.jobSearch.placeholder = t("searchJobs");
+  elements.monitorPauseButton.textContent = state.monitorPaused ? t("resumeLive") : t("pauseLive");
+  elements.monitorFullscreenButton.textContent = state.monitorFullscreen ? t("exitFullScreen") : t("fullScreen");
   window.localStorage.setItem("admin-language", state.language);
 }
 
@@ -102,7 +130,9 @@ function runAsync(action) {
 }
 function compactNumber(value) { return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(Number(value) || 0); }
 function formatDate(value) { return value ? new Date(Number(value) * 1000).toLocaleString() : "—"; }
+function formatIsoDate(value) { const date = value ? new Date(value) : null; return date && !Number.isNaN(date.getTime()) ? date.toLocaleString() : "—"; }
 function formatDuration(value) { const seconds = Math.max(0, Number(value) || 0); if (seconds < 60) return `${Math.round(seconds)}s`; if (seconds < 3600) return `${Math.round(seconds / 60)}m`; return `${(seconds / 3600).toFixed(1)}h`; }
+function formatMemory(value) { const kilobytes = Number(value); return Number.isFinite(kilobytes) && kilobytes >= 0 ? `${(kilobytes / 1024).toFixed(1)} MiB` : "—"; }
 
 async function api(path, options = {}) {
   const initData = String(window.Telegram?.WebApp?.initData || "").trim();
@@ -152,6 +182,120 @@ function renderQueueCharts(jobs) {
   ];
   elements.queueCharts.replaceChildren();
   specs.forEach(([key, labelText, valueText, color]) => { const card = document.createElement("article"); card.className = "queue-chart"; const copy = document.createElement("div"), label = document.createElement("span"), value = document.createElement("strong"); label.textContent = labelText; value.textContent = valueText; copy.append(label, value); card.append(copy, sparkline(state.queueHistory.map((item) => item[key]), color)); elements.queueCharts.append(card); });
+}
+
+function appendMonitorDetail(container, labelText, valueText) {
+  const row = document.createElement("div"); row.className = "monitor-detail-row";
+  const label = document.createElement("span"); label.textContent = labelText;
+  const value = document.createElement("strong"); value.textContent = valueText;
+  row.append(label, value); container.append(row);
+}
+
+function renderMonitorWorkers(workers) {
+  const rows = Array.isArray(workers.workers) ? workers.workers : [];
+  elements.monitorWorkerList.replaceChildren();
+  elements.monitorWorkerCount.textContent = `${workers.alive || 0}/${workers.count || 0}`;
+  if (!rows.length) {
+    const empty = document.createElement("p"); empty.className = "empty-state"; empty.textContent = t("noWorkers"); elements.monitorWorkerList.append(empty); return;
+  }
+  rows.forEach((worker) => {
+    const row = document.createElement("div"); row.className = "monitor-worker-row";
+    const status = document.createElement("span"); status.className = `monitor-state-dot ${worker.alive ? "" : "down"}`; status.setAttribute("aria-label", worker.alive ? t("healthy") : t("unavailable"));
+    const copy = document.createElement("div"); copy.className = "data-copy";
+    const title = document.createElement("strong"); title.textContent = worker.worker_id || "worker";
+    const meta = document.createElement("small"); meta.textContent = `${worker.alive ? t("running") : t("unavailable")} · heartbeat ${formatDate(worker.last_heartbeat_at)} · restarts ${worker.restart_count || 0}`;
+    copy.append(title, meta);
+    if (worker.last_error) { const error = document.createElement("p"); error.className = "row-error"; error.textContent = worker.last_error; copy.append(error); }
+    row.append(status, copy); elements.monitorWorkerList.append(row);
+  });
+}
+
+function renderMonitorTts(tts) {
+  const running = Array.isArray(tts.running) ? tts.running : [], queued = Array.isArray(tts.queued) ? tts.queued : [];
+  const jobs = [...running.map((job) => ({ ...job, monitorState: "running" })), ...queued.map((job) => ({ ...job, monitorState: "queued" }))];
+  elements.monitorTtsList.replaceChildren();
+  elements.monitorTtsCount.textContent = `${running.length} ${t("running")} · ${queued.length} ${t("waiting")}`;
+  elements.monitorTtsEmpty.classList.toggle("is-hidden", jobs.length > 0);
+  jobs.forEach((job) => {
+    const row = document.createElement("div"); row.className = "monitor-job-row";
+    const badge = document.createElement("span"); badge.className = `monitor-job-badge ${job.monitorState}`; badge.textContent = job.monitorState === "running" ? t("running") : t("waiting");
+    const copy = document.createElement("div"); copy.className = "data-copy";
+    const title = document.createElement("strong"); title.textContent = `TTS · ${String(job.id || "").slice(0, 18)}`;
+    const meta = document.createElement("small"); meta.textContent = `${job.progress_percent || 0}% · ${job.progress_stage || job.monitorState} · attempt ${job.attempts || 0}/${job.max_attempts || 0}`;
+    copy.append(title, meta);
+    if (job.progress_detail) { const detail = document.createElement("small"); detail.textContent = job.progress_detail; copy.append(detail); }
+    if (job.last_error) { const error = document.createElement("p"); error.className = "row-error"; error.textContent = job.last_error; copy.append(error); }
+    row.append(badge, copy); elements.monitorTtsList.append(row);
+  });
+}
+
+function renderMonitorLogs(logs) {
+  const entries = Array.isArray(logs.entries) ? logs.entries : [];
+  elements.monitorLogList.replaceChildren();
+  elements.monitorLogsEmpty.classList.toggle("is-hidden", entries.length > 0);
+  entries.forEach((entry) => {
+    const row = document.createElement("div"); row.className = `monitor-log-row level-${String(entry.level || "INFO").toLowerCase()}`;
+    const meta = document.createElement("div"); meta.className = "monitor-log-meta";
+    const level = document.createElement("span"); level.className = "monitor-log-level"; level.textContent = entry.level || "INFO";
+    const time = document.createElement("time"); time.dateTime = entry.ts || ""; time.textContent = formatIsoDate(entry.ts);
+    const source = document.createElement("span"); source.textContent = entry.source || "runtime"; meta.append(level, time, source);
+    const message = document.createElement("p"); message.textContent = entry.message || "";
+    row.append(meta, message); elements.monitorLogList.append(row);
+  });
+}
+
+function renderMonitor(payload) {
+  const process = payload.process || {}, workers = payload.workers || {}, queue = payload.queue || {}, tts = payload.tts || {};
+  elements.monitorLiveState.classList.remove("down", "paused");
+  elements.monitorLiveState.lastElementChild.textContent = state.monitorPaused ? t("paused") : t("live");
+  elements.monitorLiveState.classList.toggle("paused", state.monitorPaused);
+  elements.monitorProcessState.textContent = t("online");
+  elements.monitorProcessMeta.textContent = `PID ${process.pid ?? "—"} · ${process.uptime || formatDuration(process.uptime_seconds)}`;
+  elements.monitorWorkerState.textContent = `${workers.alive || 0}/${workers.count || 0}`;
+  elements.monitorWorkerMeta.textContent = workers.accepting ? t("accepting") : t("drained");
+  const ttsInUse = tts.in_use == null ? tts.running_count || 0 : tts.in_use;
+  elements.monitorTtsState.textContent = `${ttsInUse}/${tts.configured || 0}`;
+  elements.monitorTtsMeta.textContent = `${tts.running_count || 0} ${t("running")} · ${tts.queued_count || 0} ${t("waiting")}`;
+  elements.monitorQueueState.textContent = `${queue.running || 0} ${t("running")}`;
+  elements.monitorQueueMeta.textContent = `${queue.queued || 0} ${t("waiting")} · ${Number(queue.throughput_per_minute || 0).toFixed(1)}/min`;
+  elements.monitorUpdated.textContent = formatIsoDate(payload.generated_at);
+  elements.monitorProcessDetails.replaceChildren();
+  [
+    ["Instance", process.instance_id || "—"], ["PID", String(process.pid ?? "—")], [t("uptime"), process.uptime || formatDuration(process.uptime_seconds)],
+    ["Threads", String(process.threads ?? "—")], ["Max RSS", formatMemory(process.max_rss_kb)], ["Load average", Array.isArray(process.load_average) && process.load_average.length ? process.load_average.join(" · ") : "—"],
+    ["Active web requests", String(process.active_requests ?? 0)], ["DB executor queue", String(process.db_queue_size ?? 0)], ["TTS completed", compactNumber(process.metrics?.tts || 0)],
+  ].forEach(([label, value]) => appendMonitorDetail(elements.monitorProcessDetails, label, value));
+  renderMonitorWorkers(workers); renderMonitorTts(tts); renderMonitorLogs(payload.logs || {});
+}
+
+async function refreshMonitor({ force = false, silent = true } = {}) {
+  if (state.monitorRefreshing || (state.monitorPaused && !force) || (!state.monitorVisible && !force) || document.hidden) return;
+  state.monitorRefreshing = true; elements.refreshMonitorButton.disabled = true;
+  const params = new URLSearchParams({ log_limit: "120" });
+  if (elements.monitorLogLevel.value) params.set("log_level", elements.monitorLogLevel.value);
+  if (elements.monitorLogSearch.value.trim()) params.set("log_query", elements.monitorLogSearch.value.trim());
+  try {
+    renderMonitor(await api(`/api/admin/runtime/monitor?${params}`));
+  } catch (error) {
+    elements.monitorLiveState.classList.add("down"); elements.monitorLiveState.lastElementChild.textContent = t("unavailable");
+    if (!silent) showToast(error.message, true);
+  } finally { state.monitorRefreshing = false; elements.refreshMonitorButton.disabled = false; }
+}
+
+function toggleMonitorPause() {
+  state.monitorPaused = !state.monitorPaused;
+  elements.monitorPauseButton.textContent = state.monitorPaused ? t("resumeLive") : t("pauseLive");
+  elements.monitorLiveState.classList.toggle("paused", state.monitorPaused);
+  elements.monitorLiveState.lastElementChild.textContent = state.monitorPaused ? t("paused") : t("live");
+  if (!state.monitorPaused) runAsync(() => refreshMonitor({ force: true }));
+}
+
+function toggleMonitorFullscreen() {
+  state.monitorFullscreen = !state.monitorFullscreen;
+  elements.monitor.classList.toggle("is-monitor-fullscreen", state.monitorFullscreen);
+  document.body.classList.toggle("monitor-fullscreen-open", state.monitorFullscreen);
+  elements.monitorFullscreenButton.textContent = state.monitorFullscreen ? t("exitFullScreen") : t("fullScreen");
+  if (state.monitorFullscreen) { telegram?.expand?.(); elements.monitor.scrollTop = 0; runAsync(() => refreshMonitor({ force: true })); }
 }
 function renderProfile(payload) {
   const user = payload.user || {};
@@ -332,7 +476,7 @@ async function refreshAll({ initial = false, silent = false } = {}) {
   try {
     const [profile, stats, settings, cors, jobs] = await Promise.all([api("/api/admin/me"), api("/api/admin/stats"), api("/api/admin/settings"), api("/api/admin/cors"), api("/api/admin/runtime/jobs")]);
     renderProfile(profile); renderStats(stats, jobs, jobs.workers); renderSettings(settings); renderCors(cors.origins);
-    const optional = await Promise.allSettled([refreshJobs(), refreshProviders(), refreshAdministrators()]);
+    const optional = await Promise.allSettled([refreshJobs(), refreshProviders(), refreshAdministrators(), refreshMonitor({ force: true })]);
     optional.filter((item) => item.status === "rejected").forEach((item) => console.warn(item.reason));
     elements.authState.classList.add("is-hidden"); elements.dashboard.classList.remove("is-hidden"); if (!initial && !silent) { haptic(); showToast("Dashboard refreshed."); }
   } catch (error) {
@@ -361,6 +505,21 @@ let jobSearchTimer = null; elements.jobSearch.addEventListener("input", () => { 
 elements.drainWorkersButton.addEventListener("click", () => setWorkerAcceptance("drain", elements.drainWorkersButton));
 elements.resumeWorkersButton.addEventListener("click", () => setWorkerAcceptance("resume", elements.resumeWorkersButton));
 elements.loadMoreJobsButton.addEventListener("click", () => runAsync(() => refreshJobs({ append: true }))); elements.retrySelectedButton.addEventListener("click", retrySelected);
+elements.refreshMonitorButton.addEventListener("click", () => runAsync(() => refreshMonitor({ force: true, silent: false })));
+elements.monitorPauseButton.addEventListener("click", toggleMonitorPause);
+elements.monitorFullscreenButton.addEventListener("click", toggleMonitorFullscreen);
+elements.monitorLogLevel.addEventListener("change", () => runAsync(() => refreshMonitor({ force: true, silent: false })));
+let monitorSearchTimer = null; elements.monitorLogSearch.addEventListener("input", () => { window.clearTimeout(monitorSearchTimer); monitorSearchTimer = window.setTimeout(() => runAsync(() => refreshMonitor({ force: true })), 300); });
+document.addEventListener("keydown", (event) => { if (event.key === "Escape" && state.monitorFullscreen) toggleMonitorFullscreen(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden && !state.monitorPaused) runAsync(() => refreshMonitor()); });
 elements.adminForm.addEventListener("submit", async (event) => { event.preventDefault(); const userId = Number.parseInt(elements.adminUserId.value, 10); if (!Number.isSafeInteger(userId) || userId <= 0) return showToast("Enter a valid Telegram user ID.", true); const button = elements.adminForm.querySelector("button"); await mutateAdministrator("add", userId, button); elements.adminUserId.value = ""; });
 
 applyLanguage(); initializeTelegram(); refreshAll({ initial: true });
+if ("IntersectionObserver" in window) {
+  const monitorObserver = new IntersectionObserver((entries) => {
+    state.monitorVisible = entries.some((entry) => entry.isIntersecting);
+    if (state.monitorVisible && !state.monitorPaused) runAsync(() => refreshMonitor());
+  }, { rootMargin: "200px 0px" });
+  monitorObserver.observe(elements.monitor);
+} else state.monitorVisible = true;
+state.monitorTimer = window.setInterval(() => runAsync(() => refreshMonitor()), 5000);

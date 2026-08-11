@@ -6,9 +6,9 @@
   <meta name="color-scheme" content="light dark">
   <meta name="description" content="Secure Telegram bot administration dashboard">
   <title>Bot Control Center</title>
-  <link rel="stylesheet" href="/miniapp/admin/assets/styles.css?v=5">
+  <link rel="stylesheet" href="/miniapp/admin/assets/styles.css?v=6">
   <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
-  <script src="/miniapp/admin/assets/app.js?v=6" defer></script>
+  <script src="/miniapp/admin/assets/app.js?v=7" defer></script>
 </head>
 <body>
   <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -83,6 +83,59 @@
         </article>
       </section>
 
+      <section id="monitor" class="panel dashboard-section monitor-panel">
+        <div class="section-heading monitor-heading">
+          <div><p class="eyebrow" data-i18n="liveMonitor">Live operations</p><h2 data-i18n="botMonitor">Bot Monitor</h2></div>
+          <div class="section-actions">
+            <span id="monitorLiveState" class="status-pill monitor-live"><span class="status-dot"></span><span data-i18n="live">Live</span></span>
+            <button id="refreshMonitorButton" class="button" type="button" data-i18n="refresh">Refresh</button>
+            <button id="monitorFullscreenButton" class="button primary" type="button" data-i18n="fullScreen">Full screen</button>
+          </div>
+        </div>
+
+        <div class="monitor-metrics" aria-label="Live runtime metrics">
+          <article class="monitor-metric"><span data-i18n="processState">Bot process</span><strong id="monitorProcessState">—</strong><small id="monitorProcessMeta">—</small></article>
+          <article class="monitor-metric"><span data-i18n="workerProcesses">Worker processes</span><strong id="monitorWorkerState">—</strong><small id="monitorWorkerMeta">—</small></article>
+          <article class="monitor-metric"><span data-i18n="ttsProcesses">TTS processes</span><strong id="monitorTtsState">—</strong><small id="monitorTtsMeta">—</small></article>
+          <article class="monitor-metric"><span data-i18n="queueActivity">Queue activity</span><strong id="monitorQueueState">—</strong><small id="monitorQueueMeta">—</small></article>
+        </div>
+
+        <div class="monitor-grid">
+          <article class="monitor-card">
+            <div class="monitor-card-heading"><h3 data-i18n="processDetails">Process details</h3><span id="monitorUpdated" class="muted">—</span></div>
+            <div id="monitorProcessDetails" class="monitor-detail-list"></div>
+          </article>
+          <article class="monitor-card">
+            <div class="monitor-card-heading"><h3 data-i18n="durableWorkers">Durable workers</h3><span id="monitorWorkerCount" class="secure-label">—</span></div>
+            <div id="monitorWorkerList" class="monitor-worker-list"></div>
+          </article>
+        </div>
+
+        <article class="monitor-card monitor-tts-card">
+          <div class="monitor-card-heading"><div><h3 data-i18n="ttsProcessQueue">TTS process queue</h3><p class="muted" data-i18n="ttsMonitorHelp">Running and waiting voice jobs refresh automatically.</p></div><span id="monitorTtsCount" class="secure-label">—</span></div>
+          <div id="monitorTtsList" class="monitor-job-list"></div>
+          <p id="monitorTtsEmpty" class="empty-state is-hidden" data-i18n="noTtsProcesses">No active or queued TTS processes.</p>
+        </article>
+
+        <article class="monitor-card monitor-log-card">
+          <div class="monitor-card-heading monitor-log-heading">
+            <div><h3 data-i18n="runtimeLogs">Runtime logs</h3><p class="muted" data-i18n="logsSafe">Recent logs are bounded and secrets are automatically hidden.</p></div>
+            <div class="section-actions monitor-log-controls">
+              <select id="monitorLogLevel" class="select" aria-label="Minimum log level">
+                <option value="" data-i18n="allLogs">All logs</option>
+                <option value="INFO">Info+</option>
+                <option value="WARNING">Warning+</option>
+                <option value="ERROR">Error+</option>
+              </select>
+              <input id="monitorLogSearch" class="text-input" type="search" maxlength="128" placeholder="Search logs" data-i18n-placeholder="searchLogs" aria-label="Search logs">
+              <button id="monitorPauseButton" class="button" type="button" data-i18n="pauseLive">Pause</button>
+            </div>
+          </div>
+          <div id="monitorLogList" class="monitor-log-list" role="log" aria-live="off"></div>
+          <p id="monitorLogsEmpty" class="empty-state is-hidden" data-i18n="noLogs">No matching runtime logs.</p>
+        </article>
+      </section>
+
       <section id="jobs" class="panel dashboard-section">
         <div class="section-heading">
           <div><p class="eyebrow" data-i18n="durableRuntime">Durable runtime</p><h2 data-i18n="jobQueue">Job queue</h2></div>
@@ -143,6 +196,7 @@
   <nav class="mobile-nav" aria-label="Admin sections">
     <a class="mobile-nav-item active" href="#overview" data-nav-target="overview">⌂<span data-i18n="overview">Overview</span></a>
     <a class="mobile-nav-item" href="#health" data-nav-target="health">◉<span data-i18n="health">Health</span></a>
+    <a class="mobile-nav-item" href="#monitor" data-nav-target="monitor">▣<span data-i18n="monitor">Monitor</span></a>
     <a class="mobile-nav-item" href="#jobs" data-nav-target="jobs">≡<span data-i18n="jobs">Jobs</span></a>
     <a class="mobile-nav-item" href="#providers" data-nav-target="providers">◇<span data-i18n="providersShort">Providers</span></a>
     <a class="mobile-nav-item" href="#administrators" data-nav-target="administrators">♙<span data-i18n="admins">Admins</span></a>

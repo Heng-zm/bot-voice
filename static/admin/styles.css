@@ -630,3 +630,103 @@ input::placeholder { color: #6f7f99; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Live bot monitor */
+.monitor-panel { position: relative; }
+.monitor-heading { align-items: flex-start; }
+.monitor-live { padding: 7px 11px; }
+.monitor-live.paused { border-color: rgba(255, 189, 89, 0.24); color: var(--warning-text); background: rgba(255, 189, 89, 0.09); }
+.monitor-live.down { border-color: rgba(255, 107, 121, 0.25); color: var(--red); background: rgba(255, 107, 121, 0.09); }
+
+.monitor-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.monitor-metric, .monitor-card {
+  border: 1px solid var(--border);
+  border-radius: 15px;
+  background: rgba(5, 12, 25, 0.22);
+}
+
+.monitor-metric { min-width: 0; padding: 13px 14px; }
+.monitor-metric > span, .monitor-metric > small { display: block; overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.monitor-metric > strong { display: block; margin: 4px 0 2px; overflow: hidden; font-size: 19px; text-overflow: ellipsis; white-space: nowrap; }
+
+.monitor-grid { display: grid; grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr); gap: 12px; }
+.monitor-card { min-width: 0; padding: 14px; }
+.monitor-tts-card, .monitor-log-card { margin-top: 12px; }
+.monitor-card-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 11px; }
+.monitor-card-heading h3 { margin: 0; font-size: 14px; }
+
+.monitor-detail-list { display: grid; gap: 0; }
+.monitor-detail-row { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 14px; padding: 7px 0; border-bottom: 1px solid var(--border); }
+.monitor-detail-row:last-child { border-bottom: 0; }
+.monitor-detail-row span { color: var(--muted); font-size: 11px; }
+.monitor-detail-row strong { overflow: hidden; max-width: 62%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
+
+.monitor-worker-list, .monitor-job-list { display: grid; gap: 7px; }
+.monitor-worker-row, .monitor-job-row { display: flex; min-width: 0; align-items: flex-start; gap: 10px; border: 1px solid var(--border); border-radius: 12px; padding: 10px; background: var(--surface-soft); }
+.monitor-state-dot { width: 9px; height: 9px; flex: 0 0 auto; margin-top: 4px; border-radius: 50%; background: var(--green); box-shadow: 0 0 9px color-mix(in srgb, var(--green) 70%, transparent); }
+.monitor-state-dot.down { background: var(--red); box-shadow: 0 0 9px color-mix(in srgb, var(--red) 70%, transparent); }
+.monitor-job-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.monitor-job-badge { flex: 0 0 auto; border-radius: 999px; padding: 4px 7px; color: var(--success-text); background: rgba(66, 211, 146, 0.1); font-size: 9px; font-weight: 800; text-transform: uppercase; }
+.monitor-job-badge.queued { color: var(--warning-text); background: rgba(255, 189, 89, 0.1); }
+
+.monitor-log-heading { align-items: flex-start; }
+.monitor-log-controls { justify-content: flex-end; }
+.monitor-log-controls .text-input { width: min(230px, 100%); }
+.monitor-log-list { display: grid; max-height: 360px; gap: 1px; overflow: auto; border: 1px solid var(--border); border-radius: 12px; background: rgba(2, 7, 16, 0.56); scrollbar-color: var(--muted) transparent; }
+.monitor-log-row { min-width: 0; padding: 9px 11px; border-bottom: 1px solid rgba(255, 255, 255, 0.055); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.monitor-log-row:last-child { border-bottom: 0; }
+.monitor-log-meta { display: flex; min-width: 0; align-items: center; gap: 9px; color: var(--muted); font-size: 9px; }
+.monitor-log-meta span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.monitor-log-level { min-width: 48px; color: #9bcaff; font-weight: 900; }
+.level-warning .monitor-log-level { color: var(--amber); }
+.level-error .monitor-log-level, .level-critical .monitor-log-level { color: var(--red); }
+.monitor-log-row p { margin-top: 5px; overflow-wrap: anywhere; color: var(--text); font-size: 11px; line-height: 1.45; }
+
+body.monitor-fullscreen-open { overflow: hidden; }
+.monitor-panel.is-monitor-fullscreen {
+  position: fixed;
+  z-index: 100;
+  inset: 0;
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  overflow: auto;
+  border: 0;
+  border-radius: 0;
+  padding: max(18px, env(safe-area-inset-top)) max(18px, env(safe-area-inset-right)) max(18px, env(safe-area-inset-bottom)) max(18px, env(safe-area-inset-left));
+  background: var(--bg);
+  box-shadow: none;
+}
+.monitor-panel.is-monitor-fullscreen .monitor-heading { position: sticky; z-index: 2; top: calc(-1 * max(18px, env(safe-area-inset-top))); margin: 0 -4px 18px; padding: max(18px, env(safe-area-inset-top)) 4px 12px; background: color-mix(in srgb, var(--bg) 94%, transparent); backdrop-filter: blur(16px); }
+.monitor-panel.is-monitor-fullscreen .monitor-log-list { max-height: 48vh; }
+
+@media (max-width: 820px) {
+  .monitor-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .monitor-grid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 520px) {
+  .monitor-heading .section-actions { display: grid; grid-template-columns: 1fr 1fr; }
+  .monitor-heading .monitor-live { grid-column: 1 / -1; justify-content: center; }
+  .monitor-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .monitor-metric { padding: 11px; }
+  .monitor-job-list { grid-template-columns: 1fr; }
+  .monitor-log-heading { align-items: stretch; flex-direction: column; }
+  .monitor-log-controls { display: grid; grid-template-columns: 1fr 1fr; width: 100%; }
+  .monitor-log-controls .text-input { grid-column: 1 / -1; grid-row: 1; width: 100%; }
+  .monitor-log-controls .select, .monitor-log-controls .button { width: 100%; }
+  .monitor-panel.is-monitor-fullscreen { padding-right: 12px; padding-left: 12px; }
+  .monitor-panel.is-monitor-fullscreen .monitor-heading { margin-right: 0; margin-left: 0; }
+}
+
+@media (prefers-color-scheme: light) {
+  .monitor-metric, .monitor-card { background: rgba(244, 248, 253, 0.76); }
+  .monitor-log-list { background: rgba(232, 238, 247, 0.78); }
+  .monitor-log-row { border-bottom-color: rgba(24, 51, 87, 0.08); }
+}
