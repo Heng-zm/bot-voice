@@ -196,6 +196,19 @@ DELETE /api/admin/cors
 controls and maintenance mode. Deployment-level settings and secrets are not
 editable from the Mini App.
 
+## Atomic Supabase bot locks
+
+Scheduler and Telegram leader leases use the `public.bot_locks` table. Run
+[`scripts/supabase_bot_locks.sql`](scripts/supabase_bot_locks.sql) once in the
+Supabase SQL Editor to install the atomic `acquire_bot_lock` function. The SQL
+is idempotent and grants execution only to `service_role`.
+
+The application prefers that single-statement database function. During a
+rolling deployment where the SQL has not been installed yet, it falls back to
+conditional updates plus `ON CONFLICT DO NOTHING`; concurrent first acquisition
+therefore returns `false` for the losing instance instead of raising
+`bot_locks_pkey` / PostgreSQL `23505`.
+
 ## Test
 
 ```bash

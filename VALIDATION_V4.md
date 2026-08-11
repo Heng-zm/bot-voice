@@ -4,7 +4,7 @@ Validated on Python 3.12 with the repository test and lint configuration.
 
 ```text
 python -m pytest -q -p no:cacheprovider
-131 passed
+136 passed
 
 python -m ruff check .
 All checks passed!
@@ -23,6 +23,10 @@ runtime ownership, URL/finite-number validation, removed-model fallback, and
 extracted services. Bot Monitor coverage verifies process snapshots, bounded
 secret-redacted runtime logs, and safe TTS progress responses without job
 payloads or results.
+
+Supabase lock coverage verifies atomic RPC acquisition, duplicate-safe
+pre-migration fallback, same-owner renewal, bounded inputs, and the checked-in
+service-role-only SQL migration.
 
 The host's shared Python installation emits a Requests dependency warning that
 is outside the project lock file. It does not fail this repository's checks.

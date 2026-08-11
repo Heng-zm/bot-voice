@@ -142,6 +142,7 @@ from app.services.telegram.flow import (
     callback_requires_tts_access,
     classify_callback,
 )
+from app.services.db.locks import BOT_LOCKS_SQL, SupabaseLockService
 try:
     from pydantic_settings import BaseSettings, SettingsConfigDict
     _PYDANTIC_SETTINGS_AVAILABLE = True
@@ -2698,29 +2699,7 @@ insert into public.bot_settings (key, value) values
   ('WEB_STATUS_POLL_SECONDS', '30'),
   ('WEB_LIVE_POLL_SECONDS', '30')
 on conflict (key) do nothing;
-
--- Distributed scheduler lock. Required for safe scheduled broadcasts when
--- Render restarts quickly or when more than one worker/instance is running.
-create table if not exists public.bot_locks (
-  lock_key text primary key,
-  owner text not null,
-  locked_until timestamptz not null,
-  updated_at timestamptz not null default now()
-);
-
-create index if not exists bot_locks_locked_until_idx
-  on public.bot_locks (locked_until);
-
-alter table public.bot_locks enable row level security;
-
-drop policy if exists "service_role_bot_locks_all" on public.bot_locks;
-create policy "service_role_bot_locks_all"
-on public.bot_locks
-for all
-to service_role
-using (true)
-with check (true);
-"""
+""" + BOT_LOCKS_SQL
 
 def _extract_ai_request_key() -> str:
     """Extract AI API key without leaking credentials through URLs by default."""
@@ -7694,24 +7673,7 @@ def web_admin_locks():
 @app_flask.route("/admin/sql")
 @web_admin_required
 def web_admin_sql():
-    locks_sql = """create table if not exists public.bot_locks (
-  lock_key text primary key,
-  owner text not null,
-  locked_until timestamptz not null,
-  updated_at timestamptz not null default now()
-);
-
-create index if not exists bot_locks_locked_until_idx on public.bot_locks (locked_until);
-
-alter table public.bot_locks enable row level security;
-
-drop policy if exists "service_role_bot_locks_all" on public.bot_locks;
-create policy "service_role_bot_locks_all"
-on public.bot_locks
-for all
-to service_role
-using (true)
-with check (true);"""
+    locks_sql = BOT_LOCKS_SQL
     schedule_indexes = """create index if not exists scheduled_broadcasts_due_idx
 on public.scheduled_broadcasts (broadcast_at)
 where status = 'pending' and error_msg is null;
@@ -14818,67 +14780,22 @@ async def resolve_tts_text(
 # ---------------------------------------------------------------------------
 # Distributed lock helpers — scheduler ownership across bot instances
 # ---------------------------------------------------------------------------
-def _lock_until_iso(ttl_s: int | float) -> str:
-    return _sched_iso(datetime.now(timezone.utc) + timedelta(seconds=max(1, int(ttl_s))))
+_SUPABASE_LOCK_SERVICE = SupabaseLockService()
 
 
 def db_lock_acquire(lock_key: str = _SCHED_LOCK_KEY, owner: str = _BOT_LOCK_OWNER, ttl_s: int = _SCHED_LOCK_TTL_S) -> bool:
-    """Acquire or renew a lightweight Supabase lock.
-
-    This intentionally does NOT use db_call_sync, because a missing bot_locks
-    table should not trip the global Supabase circuit breaker and break the bot.
-
-    Flow:
-    1) renew if this process already owns the lock
-    2) steal only if locked_until is in the past
-    3) insert if the lock row does not exist yet
-    """
+    """Acquire or renew the scheduler lease without tripping DB breakers."""
     if not _SCHED_LOCK_ENABLED:
         return True
     if not supabase:
         return not _SCHED_LOCK_REQUIRED
-
-    lock_key = str(lock_key or _SCHED_LOCK_KEY)
-    owner = str(owner or _BOT_LOCK_OWNER)[:240]
-    now_iso = _sched_iso()
-    until_iso = _lock_until_iso(ttl_s)
-    update = {"owner": owner, "locked_until": until_iso, "updated_at": now_iso}
-
     try:
-        # Fast path: renew our own lock.
-        res = (
-            supabase.table("bot_locks")
-            .update(update)
-            .eq("lock_key", lock_key)
-            .eq("owner", owner)
-            .execute()
+        return _SUPABASE_LOCK_SERVICE.acquire(
+            supabase,
+            str(lock_key or _SCHED_LOCK_KEY),
+            str(owner or _BOT_LOCK_OWNER),
+            ttl_s,
         )
-        if getattr(res, "data", None):
-            return True
-
-        # Safe takeover: only expired rows are updateable. Postgres re-checks
-        # this predicate after row locking, so two instances should not both win.
-        res = (
-            supabase.table("bot_locks")
-            .update(update)
-            .eq("lock_key", lock_key)
-            .lt("locked_until", now_iso)
-            .execute()
-        )
-        if getattr(res, "data", None):
-            return True
-
-        # First boot path: create the lock row. If another instance inserts
-        # first, the unique constraint fails and we simply do not own it.
-        try:
-            res = supabase.table("bot_locks").insert({"lock_key": lock_key, **update}).execute()
-            return bool(getattr(res, "data", None))
-        except Exception as insert_exc:
-            # Unique violation means another instance already owns/created it.
-            low = str(insert_exc).lower()
-            if "duplicate" in low or "23505" in low or "unique" in low:
-                return False
-            raise
     except Exception as exc:
         _log_once(
             logging.WARNING,
@@ -14893,14 +14810,11 @@ def db_lock_release(lock_key: str = _SCHED_LOCK_KEY, owner: str = _BOT_LOCK_OWNE
     if not _SCHED_LOCK_ENABLED or not supabase:
         return True
     try:
-        res = (
-            supabase.table("bot_locks")
-            .delete()
-            .eq("lock_key", str(lock_key))
-            .eq("owner", str(owner)[:240])
-            .execute()
+        return _SUPABASE_LOCK_SERVICE.release(
+            supabase,
+            str(lock_key),
+            str(owner),
         )
-        return bool(getattr(res, "data", None))
     except Exception as exc:
         _log_once(logging.WARNING, "sched_lock_release_failed", "Scheduler lock release failed: %s", exc)
         return False
@@ -14910,15 +14824,7 @@ def db_lock_read(lock_key: str = _SCHED_LOCK_KEY) -> dict | None:
     if not supabase:
         return None
     try:
-        res = (
-            supabase.table("bot_locks")
-            .select("lock_key, owner, locked_until, updated_at")
-            .eq("lock_key", str(lock_key))
-            .limit(1)
-            .execute()
-        )
-        rows = list(getattr(res, "data", None) or [])
-        return rows[0] if rows else None
+        return _SUPABASE_LOCK_SERVICE.read(supabase, str(lock_key))
     except Exception:
         return None
 
@@ -14927,46 +14833,20 @@ def db_named_lock_acquire(lock_key: str, owner: str, ttl_s: int | float) -> bool
     """Acquire/renew a named lock in Supabase without depending on scheduler flags."""
     if not supabase:
         return False
-    lock_key = str(lock_key or "lock")[:240]
-    owner = str(owner or "unknown")[:240]
-    now_iso = _sched_iso()
-    until_iso = _lock_until_iso(ttl_s)
-    update = {"owner": owner, "locked_until": until_iso, "updated_at": now_iso}
     try:
-        res = (
-            supabase.table("bot_locks")
-            .update(update)
-            .eq("lock_key", lock_key)
-            .eq("owner", owner)
-            .execute()
+        return _SUPABASE_LOCK_SERVICE.acquire(
+            supabase,
+            str(lock_key or "lock"),
+            str(owner or "unknown"),
+            ttl_s,
         )
-        if getattr(res, "data", None):
-            return True
-
-        res = (
-            supabase.table("bot_locks")
-            .update(update)
-            .eq("lock_key", lock_key)
-            .lt("locked_until", now_iso)
-            .execute()
-        )
-        if getattr(res, "data", None):
-            return True
-
-        try:
-            res = supabase.table("bot_locks").insert({"lock_key": lock_key, **update}).execute()
-            return bool(getattr(res, "data", None))
-        except Exception as insert_exc:
-            low = str(insert_exc).lower()
-            if "duplicate" in low or "23505" in low or "unique" in low:
-                return False
-            raise
     except Exception as exc:
+        safe_key = str(lock_key or "lock")[:240]
         _log_once(
             logging.WARNING,
-            f"named_lock_unavailable:{lock_key}:{type(exc).__name__}:{str(exc)[:120]}",
+            f"named_lock_unavailable:{safe_key}:{type(exc).__name__}:{str(exc)[:120]}",
             "Named distributed lock unavailable key=%s error=%s",
-            lock_key,
+            safe_key,
             exc,
         )
         return False
@@ -14976,14 +14856,7 @@ def db_named_lock_release(lock_key: str, owner: str) -> bool:
     if not supabase:
         return False
     try:
-        res = (
-            supabase.table("bot_locks")
-            .delete()
-            .eq("lock_key", str(lock_key)[:240])
-            .eq("owner", str(owner)[:240])
-            .execute()
-        )
-        return bool(getattr(res, "data", None))
+        return _SUPABASE_LOCK_SERVICE.release(supabase, lock_key, owner)
     except Exception as exc:
         _log_once(logging.WARNING, f"named_lock_release_failed:{lock_key}", "Named lock release failed key=%s: %s", lock_key, exc)
         return False

@@ -37,8 +37,11 @@
 
 ## Operations
 
-No database migration is required. Redis automatically creates the artifact
-expiration sorted set under the configured cache prefix.
+The V4 queue/artifact changes require no database migration. A later lock-race
+hardening update adds the recommended
+`scripts/supabase_bot_locks.sql` migration for atomic scheduler/leader lease
+acquisition. The runtime remains compatible during rollout through a
+duplicate-safe fallback.
 
 The cleanup loop defaults to 300 seconds. An optional
 `BOT_ARTIFACT_CLEANUP_SECONDS` deployment variable can set a value from 30 to
