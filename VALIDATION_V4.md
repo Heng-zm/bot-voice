@@ -4,7 +4,7 @@ Validated on Python 3.12 with the repository test and lint configuration.
 
 ```text
 python -m pytest -q -p no:cacheprovider
-124 passed
+128 passed
 
 python -m ruff check .
 All checks passed!

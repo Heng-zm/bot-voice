@@ -183,6 +183,14 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
             classify_callback("ttsmodel_auto", speed_callbacks=speeds),
         )
         self.assertEqual(
+            "myprefs",
+            classify_callback("myprefs_open", speed_callbacks=speeds),
+        )
+        self.assertEqual(
+            "myprefs",
+            classify_callback("myprefs_speed:spd_1.0", speed_callbacks=speeds),
+        )
+        self.assertEqual(
             "delete",
             classify_callback("audio_del:42", speed_callbacks=speeds),
         )
@@ -193,6 +201,132 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(
             classify_callback("voxcpm2:refresh", speed_callbacks=speeds)
         )
+
+    def test_welcome_and_preferences_keyboards_expose_requested_links(self) -> None:
+        self.assertNotIn("/myprefs", legacy.WELCOME_TEXT)
+        self.assertNotIn(legacy.CHANNEL_URL, legacy.WELCOME_TEXT)
+        self.assertEqual(
+            legacy.WELCOME_TEXT,
+            legacy.BOT_SETTING_DEFAULTS[legacy.WELCOME_MESSAGE_SETTING_KEY],
+        )
+
+        welcome_buttons = [
+            button
+            for row in legacy.get_welcome_kb().inline_keyboard
+            for button in row
+        ]
+        self.assertIn("myprefs_open", {button.callback_data for button in welcome_buttons})
+        self.assertIn(legacy.CHANNEL_URL, {button.url for button in welcome_buttons})
+        self.assertIn(legacy.SUPPORT_URL, {button.url for button in welcome_buttons})
+
+        prefs_buttons = [
+            button
+            for row in legacy.get_myprefs_kb(
+                {"gender": "female", "speed": 1.0, "tts_model": "auto"}
+            ).inline_keyboard
+            for button in row
+        ]
+        self.assertIn("myprefs_gender:female", {button.callback_data for button in prefs_buttons})
+        self.assertIn("myprefs_speed:spd_1.0", {button.callback_data for button in prefs_buttons})
+        self.assertIn(legacy.SUPPORT_URL, {button.url for button in prefs_buttons})
+
+        admin_callbacks = {
+            button.callback_data
+            for row in legacy.get_admin_dashboard_kb().inline_keyboard
+            for button in row
+            if button.callback_data
+        }
+        self.assertIn("admin_welcome_edit", admin_callbacks)
+
+    async def test_myprefs_updates_only_changed_preferences_without_tts(self) -> None:
+        message = SimpleNamespace(edit_text=AsyncMock())
+        query = SimpleNamespace(message=message)
+        prefs = {"gender": "female", "speed": 1.0, "tts_model": "auto"}
+        with (
+            patch.object(legacy, "update_user_speed") as update_speed,
+            patch.object(
+                legacy,
+                "get_user_prefs_async",
+                AsyncMock(return_value=prefs),
+            ),
+            patch.object(legacy, "generate_user_voice_limited") as generate_voice,
+        ):
+            await legacy._cb_myprefs(
+                query,
+                42,
+                SimpleNamespace(),
+                "myprefs_speed:spd_1.5",
+            )
+            await legacy._cb_myprefs(
+                query,
+                42,
+                SimpleNamespace(),
+                "myprefs_speed:spd_1.0",
+            )
+
+        update_speed.assert_called_once_with(42, 1.5)
+        generate_voice.assert_not_called()
+        self.assertEqual(2, message.edit_text.await_count)
+
+    async def test_admin_welcome_preview_stays_within_telegram_limit(self) -> None:
+        message = SimpleNamespace(edit_text=AsyncMock())
+        query = SimpleNamespace(message=message)
+        long_escaped_message = "&" * legacy.WELCOME_MESSAGE_MAX_CHARS
+        with patch.object(
+            legacy,
+            "get_bot_settings_async",
+            AsyncMock(return_value=(
+                {legacy.WELCOME_MESSAGE_SETTING_KEY: long_escaped_message},
+                {"db_ok": True},
+            )),
+        ):
+            await legacy._admin_open_welcome_editor(query, 42)
+        try:
+            rendered = message.edit_text.await_args.args[0]
+            self.assertLessEqual(len(rendered), legacy.TELE_MSG_LIMIT)
+        finally:
+            with legacy.ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+                legacy.ACTIVE_ADMIN_CONVERSATIONS.pop(42, None)
+
+    async def test_admin_welcome_message_input_is_persisted_and_cleared(self) -> None:
+        admin_id = 42
+        message = SimpleNamespace(text="Welcome from admin", reply_text=AsyncMock())
+        update = SimpleNamespace(
+            message=message,
+            effective_user=SimpleNamespace(id=admin_id),
+        )
+        with legacy.ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+            legacy.ACTIVE_ADMIN_CONVERSATIONS[admin_id] = {
+                "state": "awaiting_welcome_message",
+                "current": "Old welcome",
+                "ts": 0.0,
+            }
+        try:
+            with (
+                patch.object(legacy, "_is_admin", return_value=True),
+                patch.object(
+                    legacy,
+                    "db_bot_setting_value_set",
+                    return_value=(True, "saved"),
+                ) as persist,
+            ):
+                handled = await legacy._handle_runtime_admin_text(
+                    update,
+                    SimpleNamespace(user_data={}),
+                )
+
+            self.assertTrue(handled)
+            persist.assert_called_once_with(
+                legacy.WELCOME_MESSAGE_SETTING_KEY,
+                "Welcome from admin",
+                admin_id,
+            )
+            with legacy.ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+                self.assertNotIn(admin_id, legacy.ACTIVE_ADMIN_CONVERSATIONS)
+            message.reply_text.assert_awaited_once()
+        finally:
+            with legacy.ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+                legacy.ACTIVE_ADMIN_CONVERSATIONS.pop(admin_id, None)
 
     def test_broadcast_markdown_link_and_preview_directives(self) -> None:
         stored = legacy._broadcast_apply_option_directives(

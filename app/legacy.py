@@ -118,7 +118,6 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardRemove,
     WebAppInfo,
 )
 from telegram.error import (
@@ -5684,7 +5683,7 @@ def web_admin_home():
     setting_rows = "".join(
         f"<tr><td>{_web_h(BOT_SETTING_LABELS.get(k,k))}<br><span class='muted'>{_web_h(BOT_SETTING_DESCRIPTIONS.get(k,''))}</span></td>"
         f"<td>{_web_badge('ON' if _setting_bool_from(settings,k) else 'OFF', 'ok' if _setting_bool_from(settings,k) else 'muted')}</td></tr>"
-        for k in BOT_SETTING_DEFAULTS
+        for k in BOT_FEATURE_SETTING_KEYS
     )
     live_schedule_rows = _web_schedule_rows_html(_web_live_schedules(), _web_csrf_token(), "")
     live_job_rows = _web_broadcast_job_rows_html(_web_csrf_token(), include_actions=False)
@@ -5747,7 +5746,7 @@ def web_admin_health():
     settings_rows = "".join(
         f"<tr><td>{_web_h(BOT_SETTING_LABELS.get(k,k))}<br><span class='muted'>{_web_h(BOT_SETTING_DESCRIPTIONS.get(k,''))}</span></td>"
         f"<td>{_web_badge('ON' if _setting_bool_from(settings,k) else 'OFF', 'ok' if _setting_bool_from(settings,k) else 'muted')}</td></tr>"
-        for k in BOT_SETTING_DEFAULTS
+        for k in BOT_FEATURE_SETTING_KEYS
     )
     body = f"""
     <div data-live-status></div>
@@ -10015,6 +10014,65 @@ async def _handle_runtime_admin_text(update: Any, context: Any) -> bool:
             ))
         return True
 
+    if state.get("state") == "awaiting_welcome_message":
+        raw = (msg.text or "").replace("\x00", "").strip()
+        if raw.lower() in {"/cancel", "cancel", "បោះបង់"}:
+            with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+                ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
+            await safe_send(lambda: msg.reply_text(
+                "បានបោះបង់ការកែ Welcome Message។",
+                reply_markup=get_admin_dashboard_kb(),
+            ))
+            return True
+        if not raw:
+            await safe_send(lambda: msg.reply_text("⚠️ Welcome Message មិនអាចទទេបានទេ។"))
+            return True
+        if len(raw) > WELCOME_MESSAGE_MAX_CHARS:
+            await safe_send(lambda: msg.reply_text(
+                f"⚠️ សារវែងពេក។ អតិបរមា {WELCOME_MESSAGE_MAX_CHARS} តួអក្សរ; "
+                f"អ្នកបានផ្ញើ {len(raw)} តួអក្សរ។"
+            ))
+            return True
+
+        if raw == str(state.get("current") or ""):
+            with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+                ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
+            await safe_send(lambda: msg.reply_text(
+                "ℹ️ Welcome Message មិនមានការផ្លាស់ប្ដូរទេ។",
+                reply_markup=get_admin_dashboard_kb(),
+            ))
+            return True
+
+        ok, info = await asyncio.get_running_loop().run_in_executor(
+            _DB_EXECUTOR,
+            lambda: db_bot_setting_value_set(
+                WELCOME_MESSAGE_SETTING_KEY,
+                raw,
+                user.id,
+            ),
+        )
+        if not ok:
+            await safe_send(lambda: msg.reply_text(
+                f"⚠️ មិនអាចរក្សាទុក Welcome Message បានទេ៖ "
+                f"<code>{html.escape(str(info)[:500])}</code>\n\nសូមព្យាយាមម្ដងទៀត ឬ /cancel។",
+                parse_mode="HTML",
+            ))
+            return True
+
+        with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+            ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
+        preview_raw, preview_rest = _take_escaped_prefix(raw, 2400)
+        preview = html.escape(preview_raw) + ("…" if preview_rest else "")
+        await safe_send(lambda: msg.reply_text(
+            "✅ <b>Welcome Message បានកែរួចរាល់។</b>\n\n"
+            f"<pre>{preview}</pre>\n\n"
+            "ប្រើ /start ដើម្បីសាកល្បង។",
+            parse_mode="HTML",
+            reply_markup=get_admin_dashboard_kb(),
+            disable_web_page_preview=True,
+        ))
+        return True
+
     if state.get("state") != "awaiting_rate_limit":
         return False
 
@@ -12095,6 +12153,10 @@ SPEED_OPTIONS = {
     "spd_1.5": ("x1.5", 1.5),
     "spd_2.0": ("x2.0", 2.0),
 }
+CHANNEL_URL = "https://t.me/m11mmm112"
+SUPPORT_URL = "https://pay-coffee-topaz.vercel.app/"
+WELCOME_MESSAGE_SETTING_KEY = "welcome_message"
+WELCOME_MESSAGE_MAX_CHARS = 3500
 WELCOME_TEXT = (
     "🎵 សួស្តី! ខ្ញុំជាបូតបម្លែងអត្ថបទទៅជាសំឡេងដោយ AI។\n\n"
     "📌 វាយអត្ថបទជាភាសាណាមួយ ហើយផ្ញើមកបូត។ បូតនឹងបង្កើតសំឡេងដោយស្វ័យប្រវត្តិ។\n"
@@ -12103,8 +12165,7 @@ WELCOME_TEXT = (
     "🇰🇭 ខ្មែរ | 🇺🇸 អង់គ្លេស | 🇨🇳 ចិន | 🇰🇷 កូរ៉េ | 🇯🇵 ជប៉ុន\n"
     "🇮🇳 ហិណ្ឌី | 🇲🇾 ម៉ាឡេ | 🇮🇩 ឥណ្ឌូណេស៊ី | 🇵🇭 ហ្វីលីពីន | 🇸🇦 អារ៉ាប់\n"
     "💡 បូតស្គាល់ភាសា និងជ្រើសសំឡេងដែលសមស្របដោយស្វ័យប្រវត្តិ ១០០%។\n\n"
-    "⚙️ ប្រើ /myprefs ដើម្បីមើលការកំណត់របស់អ្នក។\n"
-    "📢 ចូលរួមឆានែល៖ https://t.me/m11mmm112"
+    "👇 ប្រើប៊ូតុងខាងក្រោម ដើម្បីមើលការកំណត់ ចូលរួមឆានែល ឬគាំទ្របូត។"
 )
 BOT_TAG = "@voicekhaibot"
 
@@ -13671,6 +13732,7 @@ BOT_SETTING_DEFAULTS: dict[str, str] = {
     "audio_transcribe_enabled": "1",
     "audio_to_voice_enabled": "1",
     "ai_resolver_enabled": "1",
+    WELCOME_MESSAGE_SETTING_KEY: WELCOME_TEXT,
     **{key: str(_perf_default(key, spec.get("default", ""))) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 BOT_SETTING_LABELS: dict[str, str] = {
@@ -13681,6 +13743,7 @@ BOT_SETTING_LABELS: dict[str, str] = {
     "audio_transcribe_enabled": "🎵 Audio File Transcribe",
     "audio_to_voice_enabled": "🎙️ MP3/Audio → Voice Record",
     "ai_resolver_enabled": "🧠 AI Text Resolver",
+    WELCOME_MESSAGE_SETTING_KEY: "👋 Welcome Message",
     **{key: str(spec.get("label", key)) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 BOT_SETTING_DESCRIPTIONS: dict[str, str] = {
@@ -13691,6 +13754,7 @@ BOT_SETTING_DESCRIPTIONS: dict[str, str] = {
     "audio_transcribe_enabled": "Allow uploaded audio-file transcription.",
     "audio_to_voice_enabled": "Convert uploaded MP3/audio files to Telegram OGG/Opus voice records.",
     "ai_resolver_enabled": "Allow AI to rewrite/resolve text before TTS when enabled by env.",
+    WELCOME_MESSAGE_SETTING_KEY: "Message shown by /start and /help.",
     **{key: str(spec.get("help", "")) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 _SETTINGS_CACHE_TTL_S = _env_float("BOT_SETTINGS_CACHE_TTL_S", 30.0, minimum=0.0, maximum=3600.0)
@@ -13854,6 +13918,19 @@ async def get_bot_settings_async(force: bool = False) -> tuple[dict[str, str], d
     if status.get("db_ok") or not supabase:
         await _redis_cache_set_many_json({redis_key: _cache_payload(dict(data))}, CACHE_ASIDE_DEFAULT_TTL_S)
     return data, status
+
+
+def _normalize_welcome_message(value: Any) -> str:
+    """Return a bounded plain-text welcome message."""
+    text = str(value or "").replace("\x00", "").strip()
+    return (text or WELCOME_TEXT)[:WELCOME_MESSAGE_MAX_CHARS]
+
+
+async def get_welcome_message_async(force: bool = False) -> str:
+    settings, _status = await get_bot_settings_async(force=force)
+    return _normalize_welcome_message(
+        settings.get(WELCOME_MESSAGE_SETTING_KEY, WELCOME_TEXT)
+    )
 
 
 def _cache_bot_setting_runtime_value(key: str, value: str) -> None:
@@ -16038,6 +16115,7 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("⚡ Optimize", callback_data="admin_optimize")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings"),
          InlineKeyboardButton("🛠 Runtime", callback_data="admin_runtime")],
+        [InlineKeyboardButton("✏️ Edit Welcome Message", callback_data="admin_welcome_edit")],
         [InlineKeyboardButton("📄 Report", callback_data="admin_report"),
          InlineKeyboardButton("🔐 WEB_KEY", callback_data="admin_web_key")],
         [InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
@@ -18662,6 +18740,83 @@ async def _deliver_paged_tts(
 # ---------------------------------------------------------------------------
 # Keyboard builders
 # ---------------------------------------------------------------------------
+def get_welcome_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚙️ ការកំណត់របស់ខ្ញុំ", callback_data="myprefs_open")],
+        [InlineKeyboardButton("📢 ចូលរួមឆានែល", url=CHANNEL_URL),
+         InlineKeyboardButton("💖 គាំទ្រ", url=SUPPORT_URL)],
+    ])
+
+
+def _myprefs_text(prefs: dict[str, Any], notice: str = "") -> str:
+    gender = str(prefs.get("gender") or "female")
+    gender_label = "👩 សំឡេងស្រី" if gender == "female" else "👨 សំឡេងប្រុស"
+    try:
+        speed = float(prefs.get("speed") or DEFAULT_SPEED)
+    except (TypeError, ValueError):
+        speed = DEFAULT_SPEED
+    speed_label = next(
+        (label for _key, (label, value) in SPEED_OPTIONS.items() if abs(value - speed) < 0.01),
+        f"{speed:g}x",
+    )
+    model_label = _tts_model_label(prefs.get("tts_model", "auto"))
+    prefix = f"{html.escape(str(notice).strip())}\n\n" if str(notice).strip() else ""
+    return (
+        f"{prefix}⚙️ <b>ការកំណត់របស់អ្នក</b>\n\n"
+        f"🗣️ ប្រភេទសំឡេង៖ <b>{gender_label}</b>\n"
+        f"🎚️ ល្បឿនសំឡេង៖ <b>{html.escape(speed_label)}</b>\n"
+        f"🤖 ម៉ូដែល TTS៖ <b>{html.escape(model_label)}</b>\n\n"
+        "ចុចប៊ូតុងខាងក្រោមដើម្បីកែការកំណត់។ "
+        "ការកែប្រែនឹងប្រើសម្រាប់សំឡេងដែលបង្កើតបន្ទាប់។"
+    )
+
+
+def get_myprefs_kb(prefs: dict[str, Any]) -> InlineKeyboardMarkup:
+    """Preference-only controls that never regenerate an older voice."""
+    gender = str(prefs.get("gender") or "female")
+    try:
+        speed = float(prefs.get("speed") or DEFAULT_SPEED)
+    except (TypeError, ValueError):
+        speed = DEFAULT_SPEED
+    model_key = _normalize_tts_model(prefs.get("tts_model", "auto"))
+    speed_row = [
+        InlineKeyboardButton(
+            label + (" ✅" if abs(value - speed) < 0.01 else ""),
+            callback_data=f"myprefs_speed:{callback}",
+        )
+        for callback, (label, value) in SPEED_OPTIONS.items()
+    ]
+    model_label = TTS_MODEL_OPTIONS.get(model_key, TTS_MODEL_OPTIONS["auto"])[0]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "👩 ស្រី" + (" ✅" if gender == "female" else ""),
+            callback_data="myprefs_gender:female",
+        ), InlineKeyboardButton(
+            "👨 ប្រុស" + (" ✅" if gender == "male" else ""),
+            callback_data="myprefs_gender:male",
+        )],
+        speed_row,
+        [InlineKeyboardButton(f"🤖 ម៉ូដែល៖ {model_label}", callback_data="myprefs_models")],
+        [InlineKeyboardButton("📢 ចូលរួមឆានែល", url=CHANNEL_URL),
+         InlineKeyboardButton("💖 គាំទ្រ", url=SUPPORT_URL)],
+        [InlineKeyboardButton("🔄 ផ្ទុកឡើងវិញ", callback_data="myprefs_open"),
+         InlineKeyboardButton("❌ បិទ", callback_data="myprefs_close")],
+    ])
+
+
+def get_myprefs_model_kb(current_model: str = "auto") -> InlineKeyboardMarkup:
+    current = _normalize_tts_model(current_model)
+    rows: list[list[InlineKeyboardButton]] = []
+    for key, (label, hint) in TTS_MODEL_OPTIONS.items():
+        detail = f" — {hint}" if hint else ""
+        rows.append([InlineKeyboardButton(
+            f"{label}{' ✅' if key == current else ''}{detail}",
+            callback_data=f"myprefs_model:{key}",
+        )])
+    rows.append([InlineKeyboardButton("🔙 ត្រឡប់", callback_data="myprefs_open")])
+    return InlineKeyboardMarkup(rows)
+
+
 def get_main_kb(gender: str, tts_model: str = "auto") -> InlineKeyboardMarkup:
     f_btn = "👩 សំឡេងស្រី" + (" ✅" if gender == "female" else "")
     m_btn = "👨 សំឡេងប្រុស" + (" ✅" if gender == "male" else "")
@@ -19455,6 +19610,7 @@ def get_bot_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
             state = "ON ✅" if enabled else "OFF ⚠️"
         rows.append([InlineKeyboardButton(f"{label}: {state}", callback_data=f"admin_set:{key}")])
 
+    rows.append([InlineKeyboardButton("✏️ Edit Welcome Message", callback_data="admin_welcome_edit")])
     rows.append([InlineKeyboardButton("⚡ Performance Settings", callback_data="admin_perf")])
     rows.extend([
         [InlineKeyboardButton("🔄 Refresh", callback_data="admin_settings_refresh"),
@@ -19463,6 +19619,14 @@ def get_bot_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
          InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
     return InlineKeyboardMarkup(rows)
+
+
+def get_admin_welcome_editor_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("♻️ Reset to Default", callback_data="admin_welcome_reset")],
+        [InlineKeyboardButton("⬅️ Settings", callback_data="admin_settings"),
+         InlineKeyboardButton("❌ Cancel", callback_data="admin_cancel_state")],
+    ])
 
 
 def get_bot_perf_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
@@ -22808,6 +22972,31 @@ async def _admin_open_settings_panel(query, force: bool = False, notice: str = "
     ))
 
 
+async def _admin_open_welcome_editor(query, user_id: int) -> None:
+    settings, status = await get_bot_settings_async(force=True)
+    current = _normalize_welcome_message(
+        settings.get(WELCOME_MESSAGE_SETTING_KEY, WELCOME_TEXT)
+    )
+    preview_raw, preview_rest = _take_escaped_prefix(current, 2400)
+    preview = html.escape(preview_raw) + ("…" if preview_rest else "")
+    with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+        ACTIVE_ADMIN_CONVERSATIONS[int(user_id)] = {
+            "state": "awaiting_welcome_message",
+            "current": current,
+            "ts": time.monotonic(),
+        }
+    await safe_send(lambda: query.message.edit_text(
+        "✏️ <b>Edit Welcome Message</b>\n\n"
+        "ផ្ញើសារថ្មីដែលត្រូវបង្ហាញពេលអ្នកប្រើ /start ឬ /help។\n"
+        f"អតិបរមា៖ <b>{WELCOME_MESSAGE_MAX_CHARS}</b> តួអក្សរ · "
+        f"Storage៖ <b>{_ok_bad(bool(status.get('db_ok')), 'Supabase', 'Memory / Redis')}</b>\n\n"
+        f"<b>សារបច្ចុប្បន្ន៖</b>\n<pre>{preview}</pre>",
+        parse_mode="HTML",
+        reply_markup=get_admin_welcome_editor_kb(),
+        disable_web_page_preview=True,
+    ))
+
+
 async def _admin_send_settings_sql(message) -> None:
     for page in _paginate_pre_html(
         ADMIN_V2_TABLES_SQL,
@@ -23587,6 +23776,25 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
             reply_markup=get_runtime_admin_kb(),
             disable_web_page_preview=True,
         ))
+        return
+
+    if data == "admin_welcome_edit":
+        await _admin_open_welcome_editor(query, user_id)
+        return
+
+    if data == "admin_welcome_reset":
+        with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+            ACTIVE_ADMIN_CONVERSATIONS.pop(int(user_id), None)
+        ok, info = await asyncio.get_running_loop().run_in_executor(
+            _DB_EXECUTOR,
+            lambda: db_bot_setting_value_set(
+                WELCOME_MESSAGE_SETTING_KEY,
+                WELCOME_TEXT,
+                user_id,
+            ),
+        )
+        notice = "✅ Welcome message reset to the default." if ok else f"⚠️ Reset failed: {info}"
+        await _admin_open_settings_panel(query, force=True, notice=notice)
         return
 
     if data in ("admin_settings", "admin_settings_refresh"):
@@ -25530,9 +25738,10 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sync_user_data(update.effective_user)
         if not await _ensure_user_allowed(update, context):
             return
+        welcome_message = await get_welcome_message_async()
         await safe_send(lambda: update.message.reply_text(
-            WELCOME_TEXT,
-            reply_markup=ReplyKeyboardRemove(),
+            welcome_message,
+            reply_markup=get_welcome_kb(),
             disable_web_page_preview=True,
         ))
     except Exception as e:
@@ -25545,22 +25754,12 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    prefs   = await get_user_prefs_async(user_id)
-    gender_label = "👩 សំឡេងស្រី" if prefs["gender"] == "female" else "👨 សំឡេងប្រុស"
-    speed_label  = next(
-        (lbl for _, (lbl, val) in SPEED_OPTIONS.items() if abs(val - prefs["speed"]) < 0.01),
-        f"{prefs['speed']}x",
-    )
-    model_label = _tts_model_label(prefs.get("tts_model", "auto"))
+    prefs = await get_user_prefs_async(user_id)
     await safe_send(lambda: update.message.reply_text(
-        f"⚙️ <b>ការកំណត់របស់អ្នក</b>\n\n"
-        f"🗣️ សំឡេង: <b>{gender_label}</b>\n"
-        f"🎚️ ល្បឿន: <b>{speed_label}</b>\n"
-        f"🤖 ម៉ូដែល TTS: <b>{html.escape(model_label)}</b>\n\n"
-        "ផ្ញើអត្ថបទណាមួយ។ បូតស្គាល់ភាសា និងជ្រើសសំឡេងដោយស្វ័យប្រវត្តិ; "
-        "ប៊ូតុងក្រោមសារសំឡេងប្រើសម្រាប់ប្តូរម៉ូដែល ល្បឿន ឬប្រភេទសំឡេង។",
+        _myprefs_text(prefs),
         parse_mode="HTML",
-        reply_markup=get_main_kb(prefs["gender"], prefs.get("tts_model", "auto")),
+        reply_markup=get_myprefs_kb(prefs),
+        disable_web_page_preview=True,
     ))
 
 
@@ -26399,6 +26598,57 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # Callback helpers
 # ---------------------------------------------------------------------------
+async def _cb_myprefs(query, user_id: int, context, data: str) -> None:
+    del context
+    if query.message is None:
+        return
+    if data == "myprefs_close":
+        with suppress(Exception):
+            await query.message.delete()
+        return
+
+    prefs = dict(await get_user_prefs_async(user_id))
+    notice = ""
+    if data.startswith("myprefs_gender:"):
+        gender = data.split(":", 1)[1].strip().lower()
+        if gender not in {"female", "male"}:
+            return
+        if str(prefs.get("gender") or "female") != gender:
+            update_user_gender(user_id, gender)
+            prefs["gender"] = gender
+            notice = "✅ បានកែប្រភេទសំឡេងរួចរាល់។"
+    elif data.startswith("myprefs_speed:"):
+        speed_key = data.split(":", 1)[1].strip()
+        option = SPEED_OPTIONS.get(speed_key)
+        if option is None:
+            return
+        current_speed = float(prefs.get("speed") or DEFAULT_SPEED)
+        if abs(current_speed - option[1]) >= 0.01:
+            update_user_speed(user_id, option[1])
+            prefs["speed"] = option[1]
+            notice = f"✅ បានកែល្បឿនទៅ {option[0]}។"
+    elif data.startswith("myprefs_model:"):
+        model_key = data.split(":", 1)[1].strip()
+        if model_key not in TTS_MODEL_OPTIONS:
+            return
+        if _normalize_tts_model(prefs.get("tts_model", "auto")) != model_key:
+            update_user_tts_model(user_id, model_key)
+            prefs["tts_model"] = model_key
+            notice = f"✅ បានកែម៉ូដែលទៅ {TTS_MODEL_OPTIONS[model_key][0]}។"
+
+    markup = (
+        get_myprefs_model_kb(prefs.get("tts_model", "auto"))
+        if data == "myprefs_models"
+        else get_myprefs_kb(prefs)
+    )
+    await safe_send(lambda: query.message.edit_text(
+        _myprefs_text(prefs, notice=notice),
+        parse_mode="HTML",
+        reply_markup=markup,
+        disable_web_page_preview=True,
+    ))
+
+
 async def _cb_show_speed(query, user_id: int, context):
     prefs = await get_user_prefs_async(user_id)
     await safe_send(lambda: query.message.edit_reply_markup(
@@ -26827,7 +27077,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ):
             return
 
-        if action == "show_speed":
+        if action == "myprefs":
+            await _cb_myprefs(query, user_id, context, data)
+        elif action == "show_speed":
             await _cb_show_speed(query, user_id, context)
         elif action == "hide_speed":
             await _cb_hide_speed(query, user_id, context)

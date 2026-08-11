@@ -19,6 +19,9 @@ def classify_callback(
 
     value = str(data or "").strip()
     exact_actions = {
+        "myprefs_open": "myprefs",
+        "myprefs_models": "myprefs",
+        "myprefs_close": "myprefs",
         "show_speed": "show_speed",
         "hide_speed": "hide_speed",
         "show_tts_model": "show_tts_model",
@@ -32,6 +35,9 @@ def classify_callback(
         return "speed"
 
     prefix_actions = (
+        ("myprefs_gender:", "myprefs"),
+        ("myprefs_speed:", "myprefs"),
+        ("myprefs_model:", "myprefs"),
         ("ttsmodel_", "tts_model"),
         ("tts_transcript:", "tts_transcript"),
         ("del_transcript:", "delete"),
