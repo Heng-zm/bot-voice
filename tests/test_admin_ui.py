@@ -23,8 +23,8 @@ class AdminMiniAppUiTests(unittest.TestCase):
         self.assertIn("family=Google+Sans+Flex", self.html)
         self.assertIn("family=Noto+Sans+Khmer", self.html)
         self.assertIn('crossorigin', self.html)
-        self.assertIn('styles.css?v=9', self.html)
-        self.assertIn('app.js?v=10', self.html)
+        self.assertIn('styles.css?v=10', self.html)
+        self.assertIn('app.js?v=11', self.html)
         self.assertIn('--font-sans: "Google Sans Flex"', self.css)
         self.assertIn('"Noto Sans Khmer"', self.css)
 
@@ -74,6 +74,17 @@ class AdminMiniAppUiTests(unittest.TestCase):
         self.assertIn('redis.status === "disabled"', self.javascript)
         self.assertIn("queueMode.durable === false", self.javascript)
         self.assertIn('t("processLocal")', self.javascript)
+
+    def test_resilient_mobile_operations_are_present(self) -> None:
+        self.assertIn('id="connectionBadge"', self.html)
+        self.assertIn('id="jobDetailDialog"', self.html)
+        self.assertIn('window.addEventListener("offline"', self.javascript)
+        self.assertIn('window.addEventListener("online"', self.javascript)
+        self.assertIn("scheduleDashboardRefresh()", self.javascript)
+        self.assertIn("refreshOverview", self.javascript)
+        self.assertIn("confirmAction", self.javascript)
+        self.assertIn("openJobDetail", self.javascript)
+        self.assertIn("DASHBOARD_REFRESH_MS", self.javascript)
 
 
 if __name__ == "__main__":

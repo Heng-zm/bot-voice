@@ -2,6 +2,7 @@
 
 const telegram = window.Telegram?.WebApp ?? null;
 const API_TIMEOUT_MS = 15_000;
+const DASHBOARD_REFRESH_MS = 30_000;
 const MONITOR_INTERVALS = new Set([3000, 5000, 10000]);
 const storedMonitorInterval = Number.parseInt(window.localStorage.getItem("admin-monitor-interval") || "5000", 10);
 const state = {
@@ -9,6 +10,7 @@ const state = {
   settings: null,
   corsOrigins: [],
   refreshing: false,
+  overviewRefreshing: false,
   toastTimer: null,
   jobCursor: null,
   selectedJobs: new Set(),
@@ -27,6 +29,11 @@ const state = {
   monitorWorkloadType: "all",
   monitorTtsPayload: null,
   monitorLogs: [],
+  dashboardTimer: null,
+  connected: navigator.onLine,
+  connectionState: navigator.onLine ? "connecting" : "offline",
+  currentJobId: "",
+  lastDashboardRefresh: 0,
 };
 
 const translations = {
@@ -66,6 +73,8 @@ const translations = {
     monitorWarning: "Runtime needs attention", monitorWarningHelp: "Queue pressure or recent failure rate is elevated.",
     monitorCritical: "Worker interruption detected", monitorCriticalHelp: "One or more durable workers are not healthy.",
     monitorOffline: "Monitor unavailable", monitorOfflineHelp: "The secure runtime snapshot could not be refreshed.",
+    connecting: "Connecting", offline: "Offline", reconnecting: "Reconnecting",
+    details: "Details", jobDetails: "Job details", copyJobId: "Copy job ID", close: "Close", copied: "Copied",
   },
   km: {
     miniApp: "Telegram Mini App", controlCenter: "មជ្ឈមណ្ឌលគ្រប់គ្រងបូត", verifying: "កំពុងផ្ទៀងផ្ទាត់គណនី Telegram",
@@ -103,12 +112,15 @@ const translations = {
     monitorWarning: "Runtime ត្រូវការការពិនិត្យ", monitorWarningHelp: "សម្ពាធជួរ ឬអត្រាបរាជ័យថ្មីៗកំពុងកើនឡើង។",
     monitorCritical: "រកឃើញ Worker ផ្អាក", monitorCriticalHelp: "Durable worker មួយ ឬច្រើនមិនមានសុខភាពល្អ។",
     monitorOffline: "មិនអាចប្រើ Monitor", monitorOfflineHelp: "មិនអាចផ្ទុកទិន្នន័យ Runtime ដែលមានសុវត្ថិភាពបានទេ។",
+    connecting: "កំពុងភ្ជាប់", offline: "ក្រៅបណ្ដាញ", reconnecting: "កំពុងភ្ជាប់ឡើងវិញ",
+    details: "ព័ត៌មានលម្អិត", jobDetails: "ព័ត៌មានការងារ", copyJobId: "ចម្លង Job ID", close: "បិទ", copied: "បានចម្លង",
   },
 };
 
 const $ = (id) => document.getElementById(id);
 const elements = {
   authState: $("authState"), dashboard: $("dashboard"), refreshButton: $("refreshButton"), languageButton: $("languageButton"),
+  connectionBadge: $("connectionBadge"), connectionText: $("connectionText"),
   profilePhoto: $("profilePhoto"), profileFallback: $("profileFallback"), profileName: $("profileName"), profileHandle: $("profileHandle"),
   systemBadge: $("systemBadge"), heroSyncState: $("heroSyncState"), totalUsers: $("totalUsers"), messageCount: $("messageCount"), queuedJobs: $("queuedJobs"),
   deadJobs: $("deadJobs"), redisLatency: $("redisLatency"), uptime: $("uptime"), lastUpdated: $("lastUpdated"),
@@ -132,6 +144,8 @@ const elements = {
   monitorLogSearch: $("monitorLogSearch"), monitorLogCount: $("monitorLogCount"), monitorCopyLogsButton: $("monitorCopyLogsButton"), monitorDownloadLogsButton: $("monitorDownloadLogsButton"), monitorPauseButton: $("monitorPauseButton"), monitorLogList: $("monitorLogList"), monitorLogsEmpty: $("monitorLogsEmpty"),
   providersList: $("providersList"), providerScope: $("providerScope"), adminForm: $("adminForm"), adminUserId: $("adminUserId"),
   adminList: $("adminList"), auditList: $("auditList"), toast: $("toast"),
+  jobDetailDialog: $("jobDetailDialog"), jobDetailTitle: $("jobDetailTitle"), jobDetailContent: $("jobDetailContent"),
+  closeJobDetailButton: $("closeJobDetailButton"), copyJobIdButton: $("copyJobIdButton"),
 };
 
 function t(key) { return translations[state.language]?.[key] || translations.en[key] || key; }
@@ -145,10 +159,34 @@ function applyLanguage() {
   elements.monitorPauseButton.textContent = state.monitorPaused ? t("resumeLive") : t("pauseLive");
   elements.monitorFullscreenButton.textContent = state.monitorFullscreen ? t("exitFullScreen") : t("fullScreen");
   elements.monitorInterval.value = String(state.monitorIntervalMs);
+  renderConnectionState(state.connectionState);
   window.localStorage.setItem("admin-language", state.language);
 }
 
 function haptic(type = "light") { try { telegram?.HapticFeedback?.impactOccurred(type); } catch {} }
+function renderConnectionState(status) {
+  state.connectionState = status;
+  state.connected = status === "online";
+  elements.connectionText.textContent = t(status);
+  elements.connectionBadge.classList.toggle("offline", status === "offline");
+  elements.connectionBadge.classList.toggle("reconnecting", ["connecting", "reconnecting"].includes(status));
+}
+function confirmAction(message) {
+  return new Promise((resolve) => {
+    if (typeof telegram?.showConfirm === "function") {
+      telegram.showConfirm(message, (confirmed) => resolve(Boolean(confirmed)));
+      return;
+    }
+    resolve(window.confirm(message));
+  });
+}
+async function copyText(value) {
+  if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(value);
+  else {
+    const area = document.createElement("textarea"); area.value = value; area.setAttribute("readonly", ""); area.style.position = "fixed"; area.style.opacity = "0";
+    document.body.append(area); area.select(); document.execCommand("copy"); area.remove();
+  }
+}
 function showToast(message, isError = false) {
   window.clearTimeout(state.toastTimer);
   elements.toast.textContent = String(message);
@@ -183,11 +221,13 @@ async function api(path, options = {}) {
     response = await fetch(path, { ...options, headers, signal: controller.signal, credentials: "same-origin", cache: "no-store" });
     try { payload = await response.json(); } catch (error) { if (timedOut) throw error; }
   } catch (error) {
+    renderConnectionState(navigator.onLine ? "reconnecting" : "offline");
     if (timedOut) throw new Error("The server took too long to respond. Please retry.");
     throw error;
   } finally {
     window.clearTimeout(timeout);
   }
+  renderConnectionState("online");
   if (!response.ok) throw new Error(typeof payload?.detail === "string" ? payload.detail : `Request failed (${response.status})`);
   return payload;
 }
@@ -549,6 +589,49 @@ function renderCors(origins) {
   });
 }
 
+function appendJobDetail(labelText, valueText) {
+  const row = document.createElement("div"); row.className = "job-detail-row";
+  const label = document.createElement("span"); label.textContent = labelText;
+  const value = document.createElement("strong"); value.textContent = valueText == null || valueText === "" ? "—" : String(valueText);
+  row.append(label, value); elements.jobDetailContent.append(row);
+}
+function renderJobDetail(job) {
+  elements.jobDetailTitle.textContent = `${job.type} · ${job.id.slice(0, 12)}`;
+  elements.jobDetailContent.replaceChildren();
+  [
+    ["Job ID", job.id], ["State", job.state], ["Priority", job.priority],
+    ["Attempts", `${job.attempts}/${job.max_attempts}`], ["Worker", job.worker_id],
+    ["Created", formatDate(job.created_at)], ["Started", formatDate(job.started_at)],
+    ["Completed", formatDate(job.completed_at)], ["Updated", formatDate(job.updated_at)],
+    ["Progress", `${job.progress_percent || 0}% · ${job.progress_stage || "—"}`],
+    ["Detail", job.progress_detail], ["Last error", job.last_error],
+  ].forEach(([label, value]) => appendJobDetail(label, value));
+  if (job.result != null) {
+    const result = document.createElement("div"); result.className = "job-detail-result";
+    const label = document.createElement("span"); label.textContent = "Result";
+    const content = document.createElement("pre"); content.textContent = JSON.stringify(job.result, null, 2);
+    result.append(label, content); elements.jobDetailContent.append(result);
+  }
+}
+async function openJobDetail(jobId, button) {
+  button.disabled = true;
+  try {
+    const payload = await api(`/api/admin/runtime/jobs/${encodeURIComponent(jobId)}`);
+    state.currentJobId = payload.job.id;
+    renderJobDetail(payload.job);
+    elements.jobDetailDialog.classList.remove("is-hidden");
+    document.body.classList.add("dialog-open");
+    elements.closeJobDetailButton.focus();
+  } catch (error) {
+    showToast(error.message, true);
+  } finally { button.disabled = false; }
+}
+function closeJobDetail() {
+  elements.jobDetailDialog.classList.add("is-hidden");
+  document.body.classList.remove("dialog-open");
+  state.currentJobId = "";
+}
+
 async function refreshJobs({ append = false } = {}) {
   if (append && (!state.jobCursor || state.jobAppendPending)) return;
   if (append) state.jobAppendPending = true;
@@ -575,6 +658,7 @@ async function refreshJobs({ append = false } = {}) {
       if (job.progress_stage) { const progress = document.createElement("div"); progress.className = "job-progress"; const bar = document.createElement("span"); bar.style.width = `${Math.max(0, Math.min(100, Number(job.progress_percent) || 0))}%`; const label = document.createElement("small"); label.textContent = `${job.progress_percent || 0}% · ${job.progress_stage}${job.progress_detail ? ` · ${job.progress_detail}` : ""}`; progress.append(bar, label); copy.append(progress); }
       if (job.last_error) { const error = document.createElement("p"); error.className = "row-error"; error.textContent = job.last_error; copy.append(error); } row.append(copy);
       const actions = document.createElement("div"); actions.className = "row-actions";
+      const details = document.createElement("button"); details.className = "button small"; details.textContent = t("details"); details.addEventListener("click", () => openJobDetail(job.id, details)); actions.append(details);
       if (["dead", "cancelled"].includes(job.state)) { const retry = document.createElement("button"); retry.className = "button small"; retry.textContent = t("retry"); retry.addEventListener("click", () => mutateJob(job.id, "retry", retry)); actions.append(retry); }
       if (["queued", "running"].includes(job.state)) { const cancel = document.createElement("button"); cancel.className = "button danger"; cancel.textContent = t("cancel"); cancel.addEventListener("click", () => mutateJob(job.id, "cancel", cancel)); actions.append(cancel); }
       row.append(actions); elements.jobsList.append(row);
@@ -592,6 +676,7 @@ async function refreshJobs({ append = false } = {}) {
 }
 
 async function setWorkerAcceptance(action, button) {
+  if (action === "drain" && !await confirmAction("Stop workers from accepting new jobs? Running jobs will continue.")) return;
   button.disabled = true;
   try {
     const payload = await api(`/api/admin/runtime/workers/${action}`, { method: "POST" });
@@ -606,6 +691,7 @@ async function setWorkerAcceptance(action, button) {
 }
 
 async function mutateJob(jobId, action, button) {
+  if (action === "cancel" && !await confirmAction(`Cancel job ${jobId.slice(0, 12)}?`)) return;
   button.disabled = true;
   try { await api(`/api/admin/runtime/jobs/${encodeURIComponent(jobId)}/${action}`, { method: "POST" }); showToast(`Job ${action} accepted.`); await refreshJobs(); }
   catch (error) { showToast(error.message, true); button.disabled = false; }
@@ -624,7 +710,7 @@ function renderProviders(payload) {
     const reset = document.createElement("button"); reset.className = "button small"; reset.textContent = t("reset"); reset.addEventListener("click", () => resetProvider(name, reset)); card.append(heading, meta, reset); elements.providersList.append(card);
   });
 }
-async function resetProvider(name, button) { button.disabled = true; try { await api("/api/admin/runtime/providers/reset", { method: "POST", body: JSON.stringify({ provider: name }) }); showToast(`${name} reset.`); await refreshProviders(); } catch (error) { showToast(error.message, true); button.disabled = false; } }
+async function resetProvider(name, button) { if (!await confirmAction(`Reset health and cooldown state for ${name}?`)) return; button.disabled = true; try { await api("/api/admin/runtime/providers/reset", { method: "POST", body: JSON.stringify({ provider: name }) }); showToast(`${name} reset.`); await refreshProviders(); } catch (error) { showToast(error.message, true); button.disabled = false; } }
 async function refreshProviders() { renderProviders(await api("/api/admin/runtime/providers")); }
 
 function renderAdministrators(payload) {
@@ -641,6 +727,7 @@ function renderAudit(payload) {
 }
 async function refreshAdministrators() { const [admins, audit] = await Promise.all([api("/api/admin/administrators"), api("/api/admin/administrators/audit?limit=50")]); renderAdministrators(admins); renderAudit(audit); }
 async function mutateAdministrator(action, userId, button) {
+  if (action === "remove" && !await confirmAction(`Remove Telegram administrator ${userId}?`)) return;
   button.disabled = true;
   try {
     const confirmation = await api("/api/admin/administrators/confirmations", { method: "POST", body: JSON.stringify({ action, user_id: userId }) });
@@ -656,17 +743,37 @@ async function refreshAll({ initial = false, silent = false } = {}) {
     renderProfile(profile); renderStats(stats, jobs, jobs.workers); renderSettings(settings); renderCors(cors.origins);
     const optional = await Promise.allSettled([refreshJobs(), refreshProviders(), refreshAdministrators(), refreshMonitor({ force: true })]);
     optional.filter((item) => item.status === "rejected").forEach((item) => console.warn(item.reason));
+    state.lastDashboardRefresh = Date.now();
     elements.authState.classList.add("is-hidden"); elements.dashboard.classList.remove("is-hidden"); if (!initial && !silent) { haptic(); showToast("Dashboard refreshed."); }
   } catch (error) {
-    if (initial) { elements.authState.classList.add("error"); elements.authState.replaceChildren(); const copy = document.createElement("div"), title = document.createElement("strong"), detail = document.createElement("p"); title.textContent = "Admin access denied"; detail.textContent = error.message; copy.append(title, detail); elements.authState.append(copy); }
+    if (initial) { elements.authState.classList.add("error"); elements.authState.replaceChildren(); const copy = document.createElement("div"), title = document.createElement("strong"), detail = document.createElement("p"), retry = document.createElement("button"); title.textContent = "Unable to open dashboard"; detail.textContent = error.message; retry.type = "button"; retry.className = "button primary auth-retry"; retry.textContent = "Retry"; retry.addEventListener("click", () => { elements.authState.classList.remove("error"); retry.disabled = true; runAsync(() => refreshAll({ initial: true })); }); copy.append(title, detail, retry); elements.authState.append(copy); }
     else showToast(error.message, true);
   } finally { state.refreshing = false; elements.refreshButton.disabled = false; }
 }
 
+async function refreshOverview({ silent = true } = {}) {
+  if (state.refreshing || state.overviewRefreshing) return;
+  state.overviewRefreshing = true;
+  try {
+    const [stats, jobs] = await Promise.all([api("/api/admin/stats"), api("/api/admin/runtime/jobs")]);
+    renderStats(stats, jobs, jobs.workers);
+    state.lastDashboardRefresh = Date.now();
+  } catch (error) {
+    if (!silent) showToast(error.message, true);
+  } finally { state.overviewRefreshing = false; }
+}
+
+function scheduleDashboardRefresh() {
+  window.clearInterval(state.dashboardTimer);
+  state.dashboardTimer = window.setInterval(() => {
+    if (!document.hidden && navigator.onLine && !elements.dashboard.classList.contains("is-hidden")) runAsync(() => refreshOverview());
+  }, DASHBOARD_REFRESH_MS);
+}
+
 async function updateMaintenance(nextValue) { elements.maintenanceToggle.disabled = true; try { const payload = await api("/api/admin/settings", { method: "POST", body: JSON.stringify({ maintenance_mode: nextValue }) }); renderMaintenance(Boolean(payload.maintenance_mode)); haptic("medium"); showToast("Maintenance setting updated."); } catch (error) { renderMaintenance(!nextValue); showToast(error.message, true); } finally { elements.maintenanceToggle.disabled = false; } }
-async function confirmMaintenance(nextValue) { const message = nextValue ? "Pause bot features for normal users?" : "Resume bot features for normal users?"; if (typeof telegram?.showConfirm === "function") { telegram.showConfirm(message, (confirmed) => confirmed ? updateMaintenance(nextValue) : renderMaintenance(!nextValue)); return; } if (window.confirm(message)) await updateMaintenance(nextValue); else renderMaintenance(!nextValue); }
+async function confirmMaintenance(nextValue) { const message = nextValue ? "Pause bot features for normal users?" : "Resume bot features for normal users?"; if (await confirmAction(message)) await updateMaintenance(nextValue); else renderMaintenance(!nextValue); }
 async function addOrigin(event) { event.preventDefault(); const origin = elements.corsOrigin.value.trim(); if (!origin) return; const submit = elements.corsForm.querySelector("button[type='submit']"); submit.disabled = true; try { const payload = await api("/api/admin/cors", { method: "POST", body: JSON.stringify({ origin }) }); elements.corsOrigin.value = ""; renderCors(payload.origins); showToast(payload.changed ? "Origin added." : "Origin already allowed."); } catch (error) { showToast(error.message, true); } finally { submit.disabled = false; } }
-async function removeOrigin(origin, button) { button.disabled = true; try { const payload = await api("/api/admin/cors", { method: "DELETE", body: JSON.stringify({ origin }) }); renderCors(payload.origins); showToast("Origin removed."); } catch (error) { button.disabled = false; showToast(error.message, true); } }
+async function removeOrigin(origin, button) { if (!await confirmAction(`Remove allowed origin ${origin}?`)) return; button.disabled = true; try { const payload = await api("/api/admin/cors", { method: "DELETE", body: JSON.stringify({ origin }) }); renderCors(payload.origins); showToast("Origin removed."); } catch (error) { button.disabled = false; showToast(error.message, true); } }
 async function saveRuntime(event) { event.preventDefault(); const runtime = {}; elements.runtimeFields.querySelectorAll("input[name]").forEach((input) => { runtime[input.name] = input.dataset.kind === "bool" ? input.checked : (input.dataset.kind === "int" ? Number.parseInt(input.value, 10) : Number.parseFloat(input.value)); }); if (Object.values(runtime).some(Number.isNaN)) return showToast("Enter valid values.", true); elements.saveRuntimeButton.disabled = true; try { const payload = await api("/api/admin/settings", { method: "POST", body: JSON.stringify({ runtime }) }); renderSettings(payload); showToast("Runtime settings saved."); } catch (error) { showToast(error.message, true); } finally { elements.saveRuntimeButton.disabled = false; } }
 
 function applyTelegramTheme() { const root = document.documentElement, params = telegram?.themeParams || {}; Object.entries({ "--tg-bg": params.bg_color, "--tg-text": params.text_color }).forEach(([name, value]) => { if (value) root.style.setProperty(name, value); }); updateViewportVars(); }
@@ -706,11 +813,16 @@ elements.monitorWorkloadType.addEventListener("change", () => {
 });
 elements.monitorLogLevel.addEventListener("change", () => runAsync(() => refreshMonitor({ force: true, silent: false })));
 let monitorSearchTimer = null; elements.monitorLogSearch.addEventListener("input", () => { window.clearTimeout(monitorSearchTimer); monitorSearchTimer = window.setTimeout(() => runAsync(() => refreshMonitor({ force: true })), 300); });
-document.addEventListener("keydown", (event) => { if (event.key === "Escape" && state.monitorFullscreen) toggleMonitorFullscreen(); });
-document.addEventListener("visibilitychange", () => { if (!document.hidden && !state.monitorPaused) runAsync(() => refreshMonitor()); });
+document.addEventListener("keydown", (event) => { if (event.key !== "Escape") return; if (!elements.jobDetailDialog.classList.contains("is-hidden")) closeJobDetail(); else if (state.monitorFullscreen) toggleMonitorFullscreen(); });
+document.addEventListener("visibilitychange", () => { if (document.hidden) return; if (!state.monitorPaused) runAsync(() => refreshMonitor()); if (navigator.onLine && Date.now() - state.lastDashboardRefresh >= DASHBOARD_REFRESH_MS) runAsync(() => refreshOverview()); });
+window.addEventListener("offline", () => renderConnectionState("offline"));
+window.addEventListener("online", () => { renderConnectionState("reconnecting"); runAsync(() => elements.dashboard.classList.contains("is-hidden") ? refreshAll({ initial: true }) : refreshOverview({ silent: false })); });
+document.querySelectorAll("[data-close-job-detail]").forEach((button) => button.addEventListener("click", closeJobDetail));
+elements.closeJobDetailButton.addEventListener("click", closeJobDetail);
+elements.copyJobIdButton.addEventListener("click", () => runAsync(async () => { if (!state.currentJobId) return; await copyText(state.currentJobId); haptic(); showToast(t("copied")); }));
 elements.adminForm.addEventListener("submit", async (event) => { event.preventDefault(); const userId = Number.parseInt(elements.adminUserId.value, 10); if (!Number.isSafeInteger(userId) || userId <= 0) return showToast("Enter a valid Telegram user ID.", true); const button = elements.adminForm.querySelector("button"); await mutateAdministrator("add", userId, button); elements.adminUserId.value = ""; });
 
-applyLanguage(); initializeTelegram(); refreshAll({ initial: true });
+applyLanguage(); initializeTelegram(); scheduleDashboardRefresh(); refreshAll({ initial: true });
 if ("IntersectionObserver" in window) {
   const visibleSections = new Map();
   const navigationObserver = new IntersectionObserver((entries) => {

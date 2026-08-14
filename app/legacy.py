@@ -14009,18 +14009,17 @@ def ensure_tts_model_column() -> None:
 def startup_self_check() -> None:
     """Log actionable setup problems once at startup without crashing the bot."""
     checks: list[str] = []
+    redis_enabled = _redis_enabled()
     if not TELEGRAM_BOT_TOKEN:
         checks.append("TELEGRAM_BOT_TOKEN is missing")
     if not ADMIN_IDS:
         checks.append("ADMIN_IDS is empty; admin-only commands will reject everyone")
     if not _web_admin_password() and _web_admin_enabled():
         checks.append("ADMIN_WEB_PASSWORD / WEB_ADMIN_PASSWORD is missing; /admin web dashboard is locked")
-    if not _web_stable_secret_configured():
+    if redis_enabled and not _web_stable_secret_configured():
         checks.append("Redis WEB_SECRET_KEY is not available; set REDIS_URL so web admin sessions persist across restarts/two servers")
     if supabase and not os.environ.get("SUPABASE_SERVICE_ROLE_KEY"):
         checks.append("SUPABASE_SERVICE_ROLE_KEY is not set; admin tables may fail under RLS/publishable key")
-    if supabase and not SUPABASE_DB_POOLER_URL:
-        checks.append("SUPABASE_DB_POOLER_URL is not set; direct PostgreSQL workloads should use the Supabase pooler/Supavisor transaction URL on port 6543")
     if BOT_MODE == "WEBHOOK" and not TELEGRAM_WEBHOOK_URL:
         checks.append("BOT_MODE=WEBHOOK but TELEGRAM_WEBHOOK_URL is missing; /telegram-webhook will receive updates only after setWebhook is configured")
     if AI_PROVIDER == "hf" and not HF_TOKEN:
@@ -14035,7 +14034,7 @@ def startup_self_check() -> None:
         checks.append("gradio_client is missing; Khmer HF Space TTS will fall back to Edge. Add `gradio_client` to requirements.txt")
     if _should_try_hf_khmer_tts("សាកល្បង", "hf_space") and not HF_TTS_SPACE:
         checks.append("HF_TTS_SPACE is empty; Khmer HF Space TTS is disabled")
-    if not REDIS_URL:
+    if redis_enabled and not REDIS_URL:
         checks.append("REDIS_URL is missing; cache/history fallback will use memory + Supabase only")
 
     if checks:
@@ -15416,10 +15415,18 @@ async def _telegram_leader_acquire() -> bool:
     s_client = supabase_async or supabase
     if s_client is not None and leader_store in {"auto", "supabase"}:
         lock_key = _telegram_leader_lock_key()
+
         async def _db_acquire():
             if supabase_async:
                 # Use the stored procedure for atomic lock
-                res = await supabase_async.rpc("acquire_bot_lock", {"l_key": lock_key, "l_owner": owner, "l_ttl": ttl}).execute()
+                res = await supabase_async.rpc(
+                    "acquire_bot_lock",
+                    {
+                        "p_lock_key": lock_key,
+                        "p_owner": owner,
+                        "p_ttl_seconds": ttl,
+                    },
+                ).execute()
                 return bool(getattr(res, "data", False))
             return db_named_lock_acquire(lock_key, owner, ttl)
 

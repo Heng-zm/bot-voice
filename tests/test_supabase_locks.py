@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.services.db.locks import BOT_LOCKS_SQL, SupabaseLockService
 
@@ -167,6 +169,88 @@ class SupabaseLockServiceTests(unittest.TestCase):
             self.assertIn("security definer", normalized)
             self.assertIn("grant execute", normalized)
             self.assertIn("to service_role", normalized)
+
+
+class TelegramLeaderLockTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_leader_rpc_uses_migration_parameter_names(self) -> None:
+        from app import legacy
+
+        class AsyncExecute:
+            async def execute(self):
+                return _Response(True)
+
+        class AsyncClient:
+            def __init__(self) -> None:
+                self.call: tuple[str, dict] | None = None
+
+            def rpc(self, name: str, params: dict):
+                self.call = (name, dict(params))
+                return AsyncExecute()
+
+        async def direct_db_call(_name, factory, **_options):
+            return await factory()
+
+        client = AsyncClient()
+        with (
+            patch.dict(
+                os.environ,
+                {"TELEGRAM_LEADER_STORE": "supabase"},
+                clear=False,
+            ),
+            patch.multiple(
+                legacy,
+                create=True,
+                redis_client_async=None,
+                redis_client=None,
+                supabase_async=client,
+                supabase=object(),
+                TELEGRAM_ACTIVE_LOCK_ENABLED=True,
+                TELEGRAM_ACTIVE_LOCK_KEY="telegram_webhook_owner",
+                TELEGRAM_ACTIVE_LOCK_TTL_S=90,
+                _TELEGRAM_LEADER_OWNER_ID_CACHE="instance-a",
+            ),
+            patch.object(legacy, "db_call", new=direct_db_call),
+        ):
+            acquired = await legacy._telegram_leader_acquire()
+
+        self.assertTrue(acquired)
+        self.assertEqual("acquire_bot_lock", client.call[0])
+        self.assertEqual(
+            {
+                "p_lock_key": "telegram_webhook_owner",
+                "p_owner": "instance-a",
+                "p_ttl_seconds": 90,
+            },
+            client.call[1],
+        )
+
+    def test_disabled_redis_and_unused_pooler_do_not_warn(self) -> None:
+        from app import legacy
+
+        with (
+            patch.dict(
+                os.environ,
+                {"REDIS_ENABLED": "false", "DISABLE_REDIS": "true"},
+                clear=False,
+            ),
+            patch.multiple(
+                legacy,
+                supabase=object(),
+                SUPABASE_DB_POOLER_URL="",
+            ),
+            patch.object(
+                legacy,
+                "_web_stable_secret_configured",
+                return_value=False,
+            ),
+            patch.object(legacy.logger, "warning") as warning,
+        ):
+            legacy.startup_self_check()
+
+        output = " ".join(str(call) for call in warning.call_args_list)
+        self.assertNotIn("Redis WEB_SECRET_KEY", output)
+        self.assertNotIn("REDIS_URL is missing", output)
+        self.assertNotIn("SUPABASE_DB_POOLER_URL", output)
 
 
 if __name__ == "__main__":
