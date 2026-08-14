@@ -19,11 +19,13 @@ class SubmissionTests(unittest.IsolatedAsyncioTestCase):
                 user_id=20,
                 text="hello",
                 tts_model="voxcpm2",
+                progress_message_id=30,
                 idempotency_key="tts-key",
             )
 
         self.assertEqual("tts", enqueue.await_args.args[0])
         self.assertEqual("auto", enqueue.await_args.args[1]["tts_model"])
+        self.assertEqual(30, enqueue.await_args.args[1]["progress_message_id"])
 
     async def test_ocr_payload_contains_delivery_target_and_user_context(self) -> None:
         enqueue = AsyncMock(return_value=(object(), True))

@@ -6,7 +6,8 @@ from unittest.mock import patch
 
 from app.runtime import RuntimeContext, redis_runtime_enabled
 from app.services.jobs.memory import MemoryJobQueue
-from app.services.jobs.queue import RedisJobWorker
+from app.services.jobs.queue import JobQueueError, RedisJobWorker
+from app.services.jobs.runtime import configure_job_queue, enqueue_bot_job
 
 
 class RedisSwitchTests(unittest.TestCase):
@@ -46,6 +47,19 @@ class RedisSwitchTests(unittest.TestCase):
 
 
 class MemoryJobQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_submission_rejects_memory_queue_without_healthy_worker(
+        self,
+    ) -> None:
+        configure_job_queue(None, memory_fallback=True)
+        try:
+            with patch(
+                "app.services.jobs.runtime.job_worker_snapshot",
+                return_value={"accepting": True, "healthy": False},
+            ), self.assertRaises(JobQueueError):
+                await enqueue_bot_job("tts", {"chat_id": 1})
+        finally:
+            configure_job_queue(None, memory_fallback=False)
+
     async def test_concurrent_memory_enqueues_and_claims_are_atomic(self) -> None:
         queue = MemoryJobQueue()
         duplicate_results = await asyncio.gather(

@@ -122,7 +122,14 @@ async def enqueue_bot_job(
     clean_type = str(job_type or "").strip().lower()
     if clean_type not in BOT_JOB_TYPES:
         raise ValueError(f"Unsupported bot job type: {clean_type or '<empty>'}")
-    return await get_job_queue().enqueue(clean_type, payload, **options)
+    queue = get_job_queue()
+    if not bool(getattr(queue, "durable", True)):
+        workers = job_worker_snapshot()
+        if not workers.get("accepting") or not workers.get("healthy"):
+            raise JobQueueError(
+                "The process-local job queue has no healthy accepting worker."
+            )
+    return await queue.enqueue(clean_type, payload, **options)
 
 
 def _worker_id(index: int) -> str:

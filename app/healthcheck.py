@@ -7,6 +7,8 @@ import sys
 import urllib.request
 from pathlib import Path
 
+from app.core.network import web_server_port
+
 
 def _role() -> str:
     configured = str(os.getenv("PROCESS_ROLE", "") or "").strip().lower()
@@ -39,7 +41,7 @@ def _check_worker() -> None:
 
 
 def _check_web() -> None:
-    port = str(os.getenv("PORT", "8080") or "8080")
+    port = web_server_port()
     with urllib.request.urlopen(
         f"http://127.0.0.1:{port}/readyz",
         timeout=4,

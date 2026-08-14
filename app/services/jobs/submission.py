@@ -16,6 +16,7 @@ async def submit_tts_job(
     gender: str = "female",
     speed: float = 1.0,
     tts_model: str = "auto",
+    progress_message_id: int | None = None,
     reply_to_message_id: int | None = None,
     idempotency_key: str,
 ):
@@ -31,6 +32,7 @@ async def submit_tts_job(
             "gender": str(gender),
             "speed": float(speed),
             "tts_model": model,
+            "progress_message_id": progress_message_id,
             "reply_to_message_id": reply_to_message_id,
         },
         idempotency_key=idempotency_key,

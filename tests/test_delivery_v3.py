@@ -84,7 +84,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         bot.send_voice.assert_awaited_once()
 
     async def test_tts_handler_routes_voice_through_idempotent_delivery(self) -> None:
-        bot = SimpleNamespace()
+        bot = SimpleNamespace(edit_message_text=AsyncMock())
 
         async def generate(
             text,
@@ -124,12 +124,22 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 return True
 
         result = await handlers.tts(
-            {"chat_id": 42, "user_id": 42, "text": "hello"},
+            {
+                "chat_id": 42,
+                "user_id": 42,
+                "text": "hello",
+                "progress_message_id": 77,
+            },
             Context(),
         )
 
         self.assertEqual(99, result["message_id"])
         delivery.deliver_voice.assert_awaited_once()
+        self.assertEqual(3, bot.edit_message_text.await_count)
+        self.assertIn(
+            "ជោគជ័យ",
+            bot.edit_message_text.await_args.kwargs["text"],
+        )
 
     async def test_retry_edits_only_once_and_returns_stored_result(self) -> None:
         redis = FakeRedis()

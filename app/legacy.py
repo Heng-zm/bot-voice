@@ -144,6 +144,7 @@ from app.services.telegram.flow import (
     classify_callback,
 )
 from app.services.db.locks import BOT_LOCKS_SQL, SupabaseLockService
+from app.core.network import web_server_port
 try:
     from pydantic_settings import BaseSettings, SettingsConfigDict
     _PYDANTIC_SETTINGS_AVAILABLE = True
@@ -2355,9 +2356,8 @@ async def run_fastapi():
     """Run the FastAPI dashboard inside the main asyncio runtime."""
     import uvicorn
 
-    # Pterodactyl and some other hosts use SERVER_PORT.
-    port = _env_int("PORT", _env_int("SERVER_PORT", 8080, minimum=1, maximum=65535), minimum=1, maximum=65535)
-    logger.info("FastAPI dashboard starting on port %s", port)
+    port = web_server_port()
+    logger.info("FastAPI dashboard starting on http://0.0.0.0:%s", port)
     config = uvicorn.Config(
         app,
         host="0.0.0.0",
@@ -27121,17 +27121,23 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             loop = asyncio.get_running_loop()
             tts_text = await resolve_tts_text(user_id, stripped, loop)
             prefs = await get_user_prefs_async(user_id)
-            await submit_tts_job(
+            job, created = await submit_tts_job(
                 chat_id=msg.chat_id,
                 user_id=user_id,
                 text=tts_text or stripped,
                 gender=prefs["gender"],
                 speed=prefs["speed"],
                 tts_model=prefs.get("tts_model", "auto"),
+                progress_message_id=progress.message_id,
                 reply_to_message_id=int(msg.message_id),
                 idempotency_key=f"telegram:tts:{int(getattr(update, 'update_id', 0) or 0)}:{user_id}",
             )
-            await progress.finish("✅ ការងារបម្លែងសំឡេងត្រូវបានដាក់ក្នុងជួររង់ចាំ។ អ្នកនឹងទទួលបានសំឡេងក្នុងពេលឆាប់ៗនេះ។")
+            await progress.update(
+                10,
+                "បានដាក់ចូលជួររង់ចាំ",
+                f"Job {job.id[:12]} · {'ថ្មី' if created else 'មានរួចហើយ'}",
+                force=True,
+            )
             _release_tts_request(user_id)
             return
         except Exception as exc:

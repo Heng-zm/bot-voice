@@ -288,6 +288,30 @@ class BotJobHandlers:
         with suppress(Exception):
             await context.progress(percent, stage, detail)
 
+    async def _update_telegram_progress(
+        self,
+        payload: Mapping[str, Any],
+        text: str,
+    ) -> None:
+        """Update the request's original progress message when available."""
+
+        message_id = self._progress_message_id(payload)
+        if message_id is None:
+            return
+        try:
+            chat_id = _required_int(payload, "chat_id")
+            bot = await self.bot()
+            edit = getattr(bot, "edit_message_text", None)
+            if callable(edit):
+                await edit(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=str(text),
+                )
+        except Exception:
+            # Telegram progress is best-effort and must never fail the audio job.
+            return
+
     async def tts(
         self,
         payload: Mapping[str, Any],
@@ -306,6 +330,12 @@ class BotJobHandlers:
         os.close(fd)
         try:
             await self._progress(context, 30, "generating_voice")
+            await self._update_telegram_progress(
+                payload,
+                "⏳ កំពុងបម្លែងអត្ថបទទៅជាសំឡេង…\n\n"
+                "██████░░░░░░░░░░░░░░  30%\n"
+                "📌 កំពុងបង្កើតសំឡេង",
+            )
             audio = await self.legacy.generate_user_voice_limited(
                 request.text,
                 request.gender,
@@ -319,6 +349,12 @@ class BotJobHandlers:
             if await context.cancelled():
                 return {"cancelled": True, "bytes": len(audio or b"")}
             await self._progress(context, 85, "sending_voice")
+            await self._update_telegram_progress(
+                payload,
+                "⏳ កំពុងបម្លែងអត្ថបទទៅជាសំឡេង…\n\n"
+                "█████████████████░░░  85%\n"
+                "📌 កំពុងផ្ញើសំឡេងទៅ Telegram",
+            )
             kwargs: dict[str, Any] = {"chat_id": chat_id}
             if reply_to is not None:
                 kwargs["reply_to_message_id"] = reply_to
@@ -332,6 +368,10 @@ class BotJobHandlers:
                 )
             finally:
                 await asyncio.to_thread(handle.close)
+            await self._update_telegram_progress(
+                payload,
+                "✅ បានបម្លែង និងផ្ញើសំឡេងដោយជោគជ័យ។",
+            )
             return {
                 "chat_id": chat_id,
                 "message_id": int(delivered.get("message_id") or 0),

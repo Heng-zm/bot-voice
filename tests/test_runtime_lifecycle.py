@@ -277,7 +277,12 @@ class UvicornShutdownTests(unittest.IsolatedAsyncioTestCase):
                 self.stopped.set()
 
         with (
-            patch("uvicorn.Config", return_value=object()),
+            patch.dict(
+                "os.environ",
+                {"SERVER_PORT": "13961", "PORT": "8080"},
+                clear=False,
+            ),
+            patch("uvicorn.Config", return_value=object()) as config,
             patch("uvicorn.Server", FakeServer),
         ):
             task = asyncio.create_task(legacy.run_fastapi())
@@ -291,6 +296,11 @@ class UvicornShutdownTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(server.should_exit)
         self.assertTrue(server.stopped.is_set())
         self.assertFalse(server.force_exit)
+        self.assertEqual(
+            "0.0.0.0",  # noqa: S104 - public binding is the requirement
+            config.call_args.kwargs["host"],
+        )
+        self.assertEqual(13_961, config.call_args.kwargs["port"])
 
 
 if __name__ == "__main__":

@@ -3,14 +3,13 @@
 # Ensure we are in the correct directory
 cd "$(dirname "$0")"
 
-# Set default port if not provided by the environment
-# Pterodactyl uses SERVER_PORT, while other hosts use PORT.
-if [ -z "$PORT" ]; then
-    if [ ! -z "$SERVER_PORT" ]; then
-        export PORT="$SERVER_PORT"
-    else
-        export PORT=8080
-    fi
+# Pterodactyl/Wispbyte's allocated SERVER_PORT must override a generic PORT.
+if [ -n "$SERVER_PORT" ]; then
+    export PORT="$SERVER_PORT"
+elif [ -n "$WISPBYTE_PORT" ]; then
+    export PORT="$WISPBYTE_PORT"
+elif [ -z "$PORT" ]; then
+    export PORT=8080
 fi
 
 # Default to POLLING mode on Pterodactyl to avoid port 400 errors from Telegram
