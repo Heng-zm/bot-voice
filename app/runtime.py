@@ -13,6 +13,7 @@ from fastapi import FastAPI
 
 from app import legacy as _legacy
 from app.core.cors import configure_dynamic_cors_store, get_dynamic_cors_store
+from app.core.resources import resource_default, resource_value
 from app.core.security import get_runtime_secret_manager
 from app.core.telegram_auth import configure_telegram_admin_authorizer
 from app.services.ai.providers import get_provider_manager
@@ -272,7 +273,18 @@ class RuntimeContext:
         self.job_handlers = handlers
         await start_job_workers(
             handlers.mapping(),
-            worker_count=int(os.getenv("BOT_JOB_WORKERS", "2") or 2),
+            worker_count=int(
+                resource_value(
+                    "BOT_JOB_WORKERS",
+                    int(
+                        os.getenv(
+                            "BOT_JOB_WORKERS",
+                            str(resource_default("BOT_JOB_WORKERS", 2)),
+                        )
+                        or 2
+                    ),
+                )
+            ),
         )
         self._ensure_artifact_cleanup()
 
@@ -287,7 +299,13 @@ class RuntimeContext:
 
     async def _artifact_cleanup_loop(self, stop_event: asyncio.Event) -> None:
         try:
-            interval = float(os.getenv("BOT_ARTIFACT_CLEANUP_SECONDS", "300") or 300)
+            interval = float(
+                os.getenv(
+                    "BOT_ARTIFACT_CLEANUP_SECONDS",
+                    str(resource_default("BOT_ARTIFACT_CLEANUP_SECONDS", 300)),
+                )
+                or 300
+            )
         except ValueError:
             interval = 300.0
         interval = max(30.0, min(86_400.0, interval))
@@ -295,7 +313,16 @@ class RuntimeContext:
             artifacts = self.artifacts
             if artifacts is not None:
                 try:
-                    result = await artifacts.cleanup_expired(limit=500)
+                    cleanup_limit = int(
+                        os.getenv(
+                            "BOT_ARTIFACT_CLEANUP_LIMIT",
+                            str(resource_default("BOT_ARTIFACT_CLEANUP_LIMIT", 500)),
+                        )
+                        or 500
+                    )
+                    result = await artifacts.cleanup_expired(
+                        limit=max(10, min(5_000, cleanup_limit))
+                    )
                     if result["deleted"] or result["errors"]:
                         logger.info("Artifact cleanup result=%s", result)
                 except Exception:

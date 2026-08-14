@@ -145,6 +145,7 @@ from app.services.telegram.flow import (
 )
 from app.services.db.locks import BOT_LOCKS_SQL, SupabaseLockService
 from app.core.network import web_server_port
+from app.core.resources import resource_default, resource_profile, resource_value
 try:
     from pydantic_settings import BaseSettings, SettingsConfigDict
     _PYDANTIC_SETTINGS_AVAILABLE = True
@@ -412,7 +413,7 @@ PERFORMANCE_CODE_DEFAULTS: dict[str, Any] = {
 
 
 def _perf_default(name: str, fallback: Any = None) -> Any:
-    return PERFORMANCE_CODE_DEFAULTS.get(name, fallback)
+    return resource_default(name, PERFORMANCE_CODE_DEFAULTS.get(name, fallback))
 
 
 # ── Admin cookie defaults ──────────────────────────────────────────────────
@@ -471,9 +472,9 @@ class AppSettings(BaseSettings):
     ADMIN_API_TOKEN_TTL_SECONDS: int = 3600
     WEB_REQUIRE_STABLE_SECRET_IN_PRODUCTION: bool = True
     MAX_CONCURRENT_TTS_USERS: int = int(_perf_default("MAX_CONCURRENT_TTS_USERS", 2))
-    MAX_CONCURRENT_AI: int = 3
-    MAX_CONCURRENT_GEMINI: int = 3
-    MAX_CONCURRENT_BROADCAST: int = 3
+    MAX_CONCURRENT_AI: int = int(resource_default("MAX_CONCURRENT_AI", 3))
+    MAX_CONCURRENT_GEMINI: int = int(resource_default("MAX_CONCURRENT_GEMINI", 3))
+    MAX_CONCURRENT_BROADCAST: int = int(resource_default("MAX_CONCURRENT_BROADCAST", 3))
     BROADCAST_BATCH_SIZE: int = 3
     BROADCAST_INTER_BATCH_DELAY: float = 0.20
     TTS_RESOLVER_AI_ENABLED: bool = False
@@ -483,7 +484,7 @@ class AppSettings(BaseSettings):
     APP_TIMEZONE_UTC_LABEL: str = "UTC+7"
     BOT_SETTINGS_CACHE_TTL_S: float = 30.0
     WEB_BROADCAST_JOBS_MAX: int = 50
-    WEB_BROADCAST_WORKERS: int = 3
+    WEB_BROADCAST_WORKERS: int = int(resource_default("WEB_BROADCAST_WORKERS", 3))
     WEB_BROADCAST_DELAY_S: float = 0.05
     WEB_TABLE_PAGE_SIZE: int = 50
     WEB_COUNTS_CACHE_TTL_S: float = 30.0
@@ -1539,8 +1540,11 @@ app_flask.config["MAX_CONTENT_LENGTH"] = _web_max_content_length()
 # These are intentionally env-tunable so Render small instances can stay stable.
 WEB_SLOW_REQUEST_MS = _env_float("WEB_SLOW_REQUEST_MS", 1500.0, minimum=100.0, maximum=60_000.0)
 WEB_ADMIN_AUDIT_MAX = _env_int("WEB_ADMIN_AUDIT_MAX", 300, minimum=50, maximum=5_000)
-TELEGRAM_CONCURRENT_UPDATES = _env_int("TELEGRAM_CONCURRENT_UPDATES", int(_perf_default("TELEGRAM_CONCURRENT_UPDATES", 4)), minimum=1, maximum=64)
-TELEGRAM_CONNECTION_POOL_SIZE = _env_int("TELEGRAM_CONNECTION_POOL_SIZE", int(_perf_default("TELEGRAM_CONNECTION_POOL_SIZE", 24)), minimum=4, maximum=256)
+TELEGRAM_CONCURRENT_UPDATES = int(resource_value("TELEGRAM_CONCURRENT_UPDATES", _env_int("TELEGRAM_CONCURRENT_UPDATES", int(_perf_default("TELEGRAM_CONCURRENT_UPDATES", 4)), minimum=1, maximum=64)))
+TELEGRAM_CONNECTION_POOL_SIZE = int(resource_value(
+    "TELEGRAM_CONNECTION_POOL_SIZE",
+    _env_int("TELEGRAM_CONNECTION_POOL_SIZE", int(_perf_default("TELEGRAM_CONNECTION_POOL_SIZE", 24)), minimum=4, maximum=256),
+))
 _WEB_ACTIVE_REQUESTS = 0
 _WEB_ACTIVE_REQUESTS_LOCK = threading.Lock()
 _WEB_SLOW_REQUESTS = deque(maxlen=200)
@@ -2490,9 +2494,9 @@ _AI_SYSTEM_PROMPT = (
 # ---------------------------------------------------------------------------
 # Concurrency limits
 # ---------------------------------------------------------------------------
-MAX_CONCURRENT_TTS_USERS   = _env_int("MAX_CONCURRENT_TTS_USERS", int(_perf_default("MAX_CONCURRENT_TTS_USERS", 2)), minimum=1, maximum=50)
-MAX_CONCURRENT_AI          = _env_int("MAX_CONCURRENT_AI", _env_int("MAX_CONCURRENT_GEMINI", 3, minimum=1), minimum=1, maximum=50)
-MAX_CONCURRENT_BROADCAST   = _env_int("MAX_CONCURRENT_BROADCAST", 3, minimum=1, maximum=50)
+MAX_CONCURRENT_TTS_USERS   = int(resource_value("MAX_CONCURRENT_TTS_USERS", _env_int("MAX_CONCURRENT_TTS_USERS", int(_perf_default("MAX_CONCURRENT_TTS_USERS", 2)), minimum=1, maximum=50)))
+MAX_CONCURRENT_AI          = int(resource_value("MAX_CONCURRENT_AI", _env_int("MAX_CONCURRENT_AI", _env_int("MAX_CONCURRENT_GEMINI", int(resource_default("MAX_CONCURRENT_GEMINI", 3)), minimum=1), minimum=1, maximum=50)))
+MAX_CONCURRENT_BROADCAST   = int(resource_value("MAX_CONCURRENT_BROADCAST", _env_int("MAX_CONCURRENT_BROADCAST", int(resource_default("MAX_CONCURRENT_BROADCAST", 3)), minimum=1, maximum=50)))
 BROADCAST_BATCH_SIZE       = _env_int("BROADCAST_BATCH_SIZE", MAX_CONCURRENT_BROADCAST, minimum=1, maximum=500)
 BROADCAST_INTER_BATCH_DELAY = _env_float("BROADCAST_INTER_BATCH_DELAY", 0.20, minimum=0.0, maximum=30.0)
 TTS_RESOLVER_AI_ENABLED    = _env_bool("TTS_RESOLVER_AI_ENABLED", False)
@@ -2649,7 +2653,7 @@ _AI_API_KEY_RANDOM_BYTES = 32
 _AI_API_KEY_DISPLAY_CHARS = 18
 _AI_API_KEY_VALIDATION_CACHE_TTL_S = _env_float("AI_API_KEY_CACHE_TTL_S", 60.0, minimum=1.0, maximum=3600.0)
 _AI_API_KEY_TOUCH_INTERVAL_S = _env_float("AI_API_KEY_TOUCH_INTERVAL_S", 60.0, minimum=1.0, maximum=3600.0)
-_AI_API_KEY_CACHE_MAX = 10_000
+_AI_API_KEY_CACHE_MAX = int(resource_default("AI_API_KEY_CACHE_MAX", 10_000))
 
 _api_key_validation_cache: OrderedDict[str, tuple[bool, int | None, float]] = OrderedDict()
 _api_key_validation_cache_lock = threading.Lock()
@@ -3460,7 +3464,7 @@ def ai_info():
 _WEB_BROADCAST_JOBS: OrderedDict[str, dict] = OrderedDict()
 _WEB_BROADCAST_JOBS_LOCK = threading.Lock()
 _WEB_BROADCAST_JOBS_MAX = _env_int("WEB_BROADCAST_JOBS_MAX", 50, minimum=10, maximum=2000)
-WEB_BROADCAST_WORKERS = max(1, _env_int("WEB_BROADCAST_WORKERS", MAX_CONCURRENT_BROADCAST))
+WEB_BROADCAST_WORKERS = max(1, int(resource_value("WEB_BROADCAST_WORKERS", _env_int("WEB_BROADCAST_WORKERS", int(resource_default("WEB_BROADCAST_WORKERS", MAX_CONCURRENT_BROADCAST))))))
 WEB_BROADCAST_DELAY_S = max(0.0, _env_float("WEB_BROADCAST_DELAY_S", 0.05))
 WEB_BROADCAST_MAX_ACTIVE_JOBS = max(1, _env_int("WEB_BROADCAST_MAX_ACTIVE_JOBS", 2, minimum=1, maximum=10))
 _WEB_BROADCAST_EXECUTOR = ThreadPoolExecutor(
@@ -9255,8 +9259,8 @@ REDIS_TEXT_CACHE_TTL_S   = _env_int("REDIS_TEXT_CACHE_TTL_S", 86400, minimum=60,
 REDIS_HISTORY_TTL_S      = _env_int("REDIS_HISTORY_TTL_S", 86400, minimum=60, maximum=604800)
 REDIS_SOCKET_TIMEOUT_S   = _env_float("REDIS_SOCKET_TIMEOUT_S", 3.0, minimum=0.2, maximum=30.0)
 CACHE_ASIDE_DEFAULT_TTL_S = _env_int("CACHE_ASIDE_DEFAULT_TTL_S", 3600, minimum=30, maximum=86400)
-HTTP_MAX_CONNECTIONS = _env_int("HTTP_MAX_CONNECTIONS", int(_perf_default("HTTP_MAX_CONNECTIONS", 100)), minimum=10, maximum=1000)
-HTTP_MAX_KEEPALIVE_CONNECTIONS = _env_int("HTTP_MAX_KEEPALIVE_CONNECTIONS", int(_perf_default("HTTP_MAX_KEEPALIVE_CONNECTIONS", 20)), minimum=2, maximum=500)
+HTTP_MAX_CONNECTIONS = int(resource_value("HTTP_MAX_CONNECTIONS", _env_int("HTTP_MAX_CONNECTIONS", int(_perf_default("HTTP_MAX_CONNECTIONS", 100)), minimum=10, maximum=1000)))
+HTTP_MAX_KEEPALIVE_CONNECTIONS = int(resource_value("HTTP_MAX_KEEPALIVE_CONNECTIONS", _env_int("HTTP_MAX_KEEPALIVE_CONNECTIONS", int(_perf_default("HTTP_MAX_KEEPALIVE_CONNECTIONS", 20)), minimum=2, maximum=500)))
 REDIS_MAX_CONNECTIONS = _env_int("REDIS_MAX_CONNECTIONS", 100, minimum=2, maximum=1000)
 HTTPX_HIGH_CONCURRENCY_LIMITS = httpx.Limits(
     max_connections=HTTP_MAX_CONNECTIONS,
@@ -9750,7 +9754,7 @@ async def _update_run_state(key: str, value: Any, *, persist: bool = True) -> No
     if key not in _RUN_STATE_REDIS_KEYS:
         raise ValueError(f"Unsupported runtime setting: {key}")
 
-    persisted_value = _coerce_run_state_value(key, value)
+    persisted_value = resource_value(key, _coerce_run_state_value(key, value))
     if key == "TELEGRAM_WEBHOOK_SECRET_TOKEN" and persist:
         from app.core.security import get_runtime_secret_manager
 
@@ -10449,8 +10453,8 @@ def _refresh_arch_runtime_settings() -> None:
     global WEB_BROADCAST_QUEUE_MAXSIZE
 
     CACHE_ASIDE_DEFAULT_TTL_S = _env_int("CACHE_ASIDE_DEFAULT_TTL_S", 3600, minimum=30, maximum=86400)
-    HTTP_MAX_CONNECTIONS = _env_int("HTTP_MAX_CONNECTIONS", 100, minimum=10, maximum=1000)
-    HTTP_MAX_KEEPALIVE_CONNECTIONS = _env_int("HTTP_MAX_KEEPALIVE_CONNECTIONS", 20, minimum=2, maximum=500)
+    HTTP_MAX_CONNECTIONS = int(resource_value("HTTP_MAX_CONNECTIONS", _env_int("HTTP_MAX_CONNECTIONS", int(_perf_default("HTTP_MAX_CONNECTIONS", 100)), minimum=10, maximum=1000)))
+    HTTP_MAX_KEEPALIVE_CONNECTIONS = int(resource_value("HTTP_MAX_KEEPALIVE_CONNECTIONS", _env_int("HTTP_MAX_KEEPALIVE_CONNECTIONS", int(_perf_default("HTTP_MAX_KEEPALIVE_CONNECTIONS", 20)), minimum=2, maximum=500)))
     REDIS_MAX_CONNECTIONS = _env_int("REDIS_MAX_CONNECTIONS", 100, minimum=2, maximum=1000)
     HTTPX_HIGH_CONCURRENCY_LIMITS = httpx.Limits(
         max_connections=HTTP_MAX_CONNECTIONS,
@@ -10531,11 +10535,11 @@ EDGE_TTS_STREAM_TIMEOUT_S = _env_float("EDGE_TTS_STREAM_TIMEOUT_S", 45.0, minimu
 EDGE_TTS_CROSS_LANG_FALLBACK = _env_bool("EDGE_TTS_CROSS_LANG_FALLBACK", False)
 # Smooth performance knobs. Keep Edge chunk parallelism conservative because
 # too many websocket calls can trigger throttling/403 on small Render services.
-EDGE_TTS_PARALLEL_CHUNKS   = _env_int("EDGE_TTS_PARALLEL_CHUNKS", int(_perf_default("EDGE_TTS_PARALLEL_CHUNKS", 1)), minimum=1, maximum=4)
+EDGE_TTS_PARALLEL_CHUNKS   = int(resource_value("EDGE_TTS_PARALLEL_CHUNKS", _env_int("EDGE_TTS_PARALLEL_CHUNKS", int(_perf_default("EDGE_TTS_PARALLEL_CHUNKS", 1)), minimum=1, maximum=4)))
 TTS_AUDIO_CACHE_ENABLED    = _env_bool("TTS_AUDIO_CACHE_ENABLED", bool(_perf_default("TTS_AUDIO_CACHE_ENABLED", True)))
 TTS_AUDIO_CACHE_TTL_S      = _env_float("TTS_AUDIO_CACHE_TTL_S", float(_perf_default("TTS_AUDIO_CACHE_TTL_S", 1200.0)), minimum=30.0, maximum=86400.0)
-TTS_AUDIO_CACHE_MAX_MB     = _env_int("TTS_AUDIO_CACHE_MAX_MB", int(_perf_default("TTS_AUDIO_CACHE_MAX_MB", 64)), minimum=4, maximum=512)
-TTS_AUDIO_CACHE_ITEM_MAX_MB = _env_int("TTS_AUDIO_CACHE_ITEM_MAX_MB", int(_perf_default("TTS_AUDIO_CACHE_ITEM_MAX_MB", 8)), minimum=1, maximum=64)
+TTS_AUDIO_CACHE_MAX_MB     = int(resource_value("TTS_AUDIO_CACHE_MAX_MB", _env_int("TTS_AUDIO_CACHE_MAX_MB", int(_perf_default("TTS_AUDIO_CACHE_MAX_MB", 64)), minimum=4, maximum=512)))
+TTS_AUDIO_CACHE_ITEM_MAX_MB = int(resource_value("TTS_AUDIO_CACHE_ITEM_MAX_MB", _env_int("TTS_AUDIO_CACHE_ITEM_MAX_MB", int(_perf_default("TTS_AUDIO_CACHE_ITEM_MAX_MB", 8)), minimum=1, maximum=64)))
 TTS_AUDIO_CACHE_MAX_BYTES  = TTS_AUDIO_CACHE_MAX_MB * 1024 * 1024
 TTS_AUDIO_CACHE_ITEM_MAX_BYTES = TTS_AUDIO_CACHE_ITEM_MAX_MB * 1024 * 1024
 PAGED_TTS_SEND_DELAY_S     = _env_float("PAGED_TTS_SEND_DELAY_S", float(_perf_default("PAGED_TTS_SEND_DELAY_S", 0.10)), minimum=0.0, maximum=2.0)
@@ -10569,7 +10573,7 @@ HF_TTS_NO_AUDIO_COOLDOWN_S = _env_float("HF_TTS_NO_AUDIO_COOLDOWN_S", 600.0, min
 HF_TTS_CLIENT_CACHE      = _env_bool("HF_TTS_CLIENT_CACHE", True)
 HF_TTS_SERIALIZE_CALLS   = _env_bool("HF_TTS_SERIALIZE_CALLS", True)
 
-GRADIO_CLIENT_MAX_WORKERS   = _env_int("GRADIO_CLIENT_MAX_WORKERS", 4, minimum=1, maximum=16)
+GRADIO_CLIENT_MAX_WORKERS   = int(resource_value("GRADIO_CLIENT_MAX_WORKERS", _env_int("GRADIO_CLIENT_MAX_WORKERS", int(resource_default("GRADIO_CLIENT_MAX_WORKERS", 4)), minimum=1, maximum=16)))
 GRADIO_CLIENT_CONNECT_TIMEOUT_S = _env_float("GRADIO_CLIENT_CONNECT_TIMEOUT_S", 10.0, minimum=2.0, maximum=60.0)
 GRADIO_CLIENT_READ_TIMEOUT_S = _env_float(
     "GRADIO_CLIENT_READ_TIMEOUT_S",
@@ -10628,19 +10632,20 @@ def _audio_mime_for_gemini(filename: str | None, mime_type: str | None) -> str:
 
 
 _DB_EXECUTOR = ThreadPoolExecutor(
-    # Increased default workers from 3 to 10 to improve database throughput
-    # while still protecting against resource exhaustion.
-    max_workers=_env_int(
+    # Three DB workers keep Supabase responsive without excess thread stacks on
+    # small hosts. Larger profiles can override this through the admin setting.
+    max_workers=int(resource_value(
         "DB_EXECUTOR_MAX_WORKERS",
-        int(_perf_default("DB_EXECUTOR_MAX_WORKERS", 10)),
-        minimum=1,
-        maximum=32,
-    ),
+        _env_int(
+            "DB_EXECUTOR_MAX_WORKERS",
+            int(_perf_default("DB_EXECUTOR_MAX_WORKERS", 3)),
+            minimum=1,
+            maximum=32,
+        ),
+    )),
     thread_name_prefix="db_write",
 )
-_AI_EXECUTOR = ThreadPoolExecutor(
-    max_workers=max(2, MAX_CONCURRENT_AI), thread_name_prefix="ai"
-)
+_AI_EXECUTOR = ThreadPoolExecutor(max_workers=max(2, MAX_CONCURRENT_AI), thread_name_prefix="ai")
 
 
 def _shutdown_thread_executors() -> None:
@@ -12526,12 +12531,12 @@ BOT_TAG = "@voicekhaibot"
 # Prefs cache — memory -> Redis -> Supabase -> safe defaults
 # ---------------------------------------------------------------------------
 _PREFS_TTL      = _env_float("PREFS_CACHE_TTL_S", float(_perf_default("PREFS_CACHE_TTL_S", 600.0)), minimum=30.0, maximum=86400.0)
-_PREFS_MAX_SIZE = _env_int("PREFS_CACHE_MAX_SIZE", 10_000, minimum=500, maximum=200_000)
+_PREFS_MAX_SIZE = _env_int("PREFS_CACHE_MAX_SIZE", int(resource_default("PREFS_CACHE_MAX_SIZE", 10_000)), minimum=500, maximum=200_000)
 _prefs_cache: OrderedDict[int, tuple[dict, float]] = OrderedDict()
 _prefs_cache_lock: asyncio.Lock | None = None
 _prefs_cache_lock_loop: asyncio.AbstractEventLoop | None = None
 _prefs_cache_thread_lock = threading.RLock()
-_PREFS_LOAD_LOCKS_MAX = _env_int("PREFS_LOAD_LOCKS_MAX", 5000, minimum=100, maximum=50000)
+_PREFS_LOAD_LOCKS_MAX = _env_int("PREFS_LOAD_LOCKS_MAX", int(resource_default("PREFS_LOAD_LOCKS_MAX", 5000)), minimum=100, maximum=50000)
 _prefs_load_locks: OrderedDict[int, asyncio.Lock] = OrderedDict()
 _prefs_load_locks_guard = threading.RLock()
 
@@ -13359,7 +13364,7 @@ async def _periodic_temp_sweep(stop_event: asyncio.Event) -> None:
 # Database helpers — user prefs
 # ---------------------------------------------------------------------------
 _USER_SYNC_TTL = _env_float("USER_SYNC_TTL_S", float(_perf_default("USER_SYNC_TTL_S", 1800.0)), minimum=60.0, maximum=86400.0)
-_USER_SYNC_MAX = _env_int("USER_SYNC_MAX", 20_000, minimum=1000, maximum=500_000)
+_USER_SYNC_MAX = _env_int("USER_SYNC_MAX", int(resource_default("USER_SYNC_MAX", 20_000)), minimum=1000, maximum=500_000)
 _user_sync_seen: OrderedDict[int, float] = OrderedDict()
 _user_sync_seen_lock = threading.RLock()
 
@@ -13682,7 +13687,7 @@ def update_user_tts_model(user_id: int, tts_model: str) -> str:
 _rls_warned = False
 
 # Fast cache for callback buttons: memory -> Redis -> Supabase.
-_TEXT_CACHE_MEMORY_MAX = 20_000
+_TEXT_CACHE_MEMORY_MAX = _env_int("TEXT_CACHE_MEMORY_MAX", int(resource_default("TEXT_CACHE_MEMORY_MAX", 20_000)), minimum=500, maximum=200_000)
 _TEXT_CACHE_MEMORY_TTL_S = _env_float("TEXT_CACHE_MEMORY_TTL_S", 3600.0, minimum=60.0, maximum=86400.0)
 _text_cache_memory: OrderedDict[tuple[int, int], tuple[str, float]] = OrderedDict()
 _TEXT_CACHE_MEMORY_LOCK = threading.RLock()
@@ -14121,7 +14126,7 @@ _blocked_users_memory: set[int] = set()
 _blocked_user_cache: OrderedDict[int, tuple[bool, float]] = OrderedDict()
 _BLOCKED_USER_CACHE_LOCK = threading.RLock()
 _BLOCKED_USER_CACHE_TTL_S = 60.0
-_BLOCKED_USER_CACHE_MAX = 20_000
+_BLOCKED_USER_CACHE_MAX = _env_int("BLOCKED_USER_CACHE_MAX", int(resource_default("BLOCKED_USER_CACHE_MAX", 20_000)), minimum=500, maximum=200_000)
 
 _RUNTIME_METRICS: OrderedDict[str, int] = OrderedDict([
     ("tts", 0),
@@ -14200,7 +14205,7 @@ def _coerce_bot_perf_setting(key: str, raw: Any) -> Any:
             raise ValueError(f"Minimum is {spec['min']}.")
         if "max" in spec and value > int(spec["max"]):
             raise ValueError(f"Maximum is {spec['max']}.")
-        return value
+        return resource_value(key, value)
     if kind == "float":
         try:
             value = float(str(raw).strip())
@@ -14210,7 +14215,7 @@ def _coerce_bot_perf_setting(key: str, raw: Any) -> Any:
             raise ValueError(f"Minimum is {spec['min']}.")
         if "max" in spec and value > float(spec["max"]):
             raise ValueError(f"Maximum is {spec['max']}.")
-        return value
+        return resource_value(key, value)
     return str(raw).strip()
 
 
@@ -14568,7 +14573,7 @@ ADMIN_DETAIL_HISTORY_TURNS = _env_int("ADMIN_DETAIL_HISTORY_TURNS", 10, minimum=
 ADMIN_FULL_HISTORY_TURNS   = _env_int("ADMIN_FULL_HISTORY_TURNS", 50, minimum=10, maximum=100)
 ADMIN_HISTORY_PAGE_SIZE    = _env_int("ADMIN_HISTORY_PAGE_SIZE", 10, minimum=5, maximum=20)
 
-_HIST_CACHE_MAX_USERS = 5_000
+_HIST_CACHE_MAX_USERS = _env_int("HISTORY_CACHE_MAX_USERS", int(resource_default("HISTORY_CACHE_MAX_USERS", 5_000)), minimum=500, maximum=100_000)
 _HIST_CACHE_TURNS     = max(ADMIN_FULL_HISTORY_TURNS, 50)
 _hist_cache: OrderedDict[int, deque] = OrderedDict()
 _HIST_CACHE_LOCK = threading.RLock()
@@ -27968,6 +27973,7 @@ async def _run_bot():
 
     logger.info(
         f"Bot starting in {_run_state_bot_mode()} mode. Admins: {ADMIN_IDS or 'none configured'} | "
+        f"Resources: {resource_profile()} | "
         f"HF: {HF_MODEL} | OCR provider: {OCR_PROVIDER} | "
         f"HF OCR: {HF_OCR_MODEL} | Gemini: {_gemini is not None} | "
         f"TTS: {_tts_provider_summary()}"
@@ -28108,7 +28114,7 @@ async def _async_main_once():
         f"OCR: {OCR_PROVIDER} | HF OCR: {HF_OCR_MODEL} | "
         f"TTS: {TTS_PROVIDER}/{KHMER_TTS_PROVIDER} | user_model_default: {_normalize_tts_model(DEFAULT_TTS_MODEL)} | "
         f"Redis: {'on' if redis_client is not None else 'off'} | "
-        f"TG mode: {_run_state_bot_mode()} | TG leader-lock: {'on' if TELEGRAM_ACTIVE_LOCK_ENABLED else 'off'} | TG updates: {TELEGRAM_CONCURRENT_UPDATES} | TG pool: {_run_state_http_max_connections()} | "
+        f"Resources: {resource_profile()} | TG mode: {_run_state_bot_mode()} | TG leader-lock: {'on' if TELEGRAM_ACTIVE_LOCK_ENABLED else 'off'} | TG updates: {TELEGRAM_CONCURRENT_UPDATES} | TG pool: {TELEGRAM_CONNECTION_POOL_SIZE} | "
         f"HTTP pool: {HTTP_MAX_CONNECTIONS}/{HTTP_MAX_KEEPALIVE_CONNECTIONS})"
     )
 

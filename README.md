@@ -139,6 +139,44 @@ disabled. Runtime administrator allowlist edits require Redis.
 Set `REDIS_ENABLED=true` and configure `REDIS_URL` to restore durable,
 multi-process operation.
 
+### Server resource profile
+
+The bot defaults to `BOT_RESOURCE_PROFILE=efficient`. This keeps two queue
+workers for responsive TTS delivery while using smaller HTTP/Telegram pools,
+provider thread pools, memory caches, and less frequent artifact cleanup. It is
+the recommended profile for a single small Wispbyte/Render-style server.
+
+Hosts with more CPU and memory can opt out of the efficient caps:
+
+```dotenv
+BOT_RESOURCE_PROFILE=balanced
+```
+
+Use `performance` only for a larger dedicated host. Environment variables and
+admin performance controls still tune individual values; in `efficient` mode,
+oversized persisted pool/concurrency values are safely capped on startup.
+
+### Automatic Wispbyte updates
+
+In the Wispbyte client panel, open the server's **GitHub** page, set the
+repository to `https://github.com/Heng-zm/bot-voice`, select branch `main`, and
+enable **Auto-update on startup**. Wispbyte documents this as its supported
+repository update path.
+
+`start.sh` also performs a safe fast-forward check on Wispbyte before launching
+the bot. It never resets files or overwrites tracked server edits: a dirty or
+diverged checkout starts its existing version and prints a warning. Controls:
+
+```dotenv
+AUTO_UPDATE_ON_START=true
+AUTO_UPDATE_BRANCH=main
+```
+
+The Wispbyte default is enabled; set `AUTO_UPDATE_ON_START=false` to disable the
+fallback. Updates apply when the server starts or restarts. A push alone does
+not force a running Wispbyte server to restart because the host does not publish
+a documented deployment/restart API.
+
 When Redis is enabled, the application atomically loads or creates 64-character
 `TELEGRAM_WEBHOOK_SECRET_TOKEN`, `WEB_SECRET_KEY`, and `FLASK_SECRET_KEY`
 values in Redis. They have no expiry and their raw values are never logged.

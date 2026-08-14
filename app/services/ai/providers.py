@@ -25,6 +25,8 @@ from concurrent.futures import (
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
+from app.core.resources import resource_default, resource_value
+
 T = TypeVar("T")
 ProviderOperation = Callable[[str], T | Awaitable[T]]
 
@@ -420,8 +422,30 @@ class ProviderManager:
 
 
 _PROVIDER_MANAGER = ProviderManager(
-    sync_max_workers=int(os.getenv("PROVIDER_SYNC_MAX_WORKERS", "4") or 4),
-    sync_max_inflight=int(os.getenv("PROVIDER_SYNC_MAX_INFLIGHT", "8") or 8),
+    sync_max_workers=int(
+        resource_value(
+            "PROVIDER_SYNC_MAX_WORKERS",
+            int(
+                os.getenv(
+                    "PROVIDER_SYNC_MAX_WORKERS",
+                    str(resource_default("PROVIDER_SYNC_MAX_WORKERS", 4)),
+                )
+                or 4
+            ),
+        )
+    ),
+    sync_max_inflight=int(
+        resource_value(
+            "PROVIDER_SYNC_MAX_INFLIGHT",
+            int(
+                os.getenv(
+                    "PROVIDER_SYNC_MAX_INFLIGHT",
+                    str(resource_default("PROVIDER_SYNC_MAX_INFLIGHT", 8)),
+                )
+                or 8
+            ),
+        )
+    ),
 )
 
 
