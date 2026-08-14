@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
+import os
 import time
 import unittest
+from unittest.mock import AsyncMock, patch
 from urllib.parse import urlencode
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api.dependencies import AdminPrincipal
-from app.api.v1.admin import router
+from app.api.v1.admin import _redis_health, router
 from app.core.telegram_auth import configure_telegram_admin_authorizer
 
 BOT_TOKEN = "123456789:TEST_bot_token_for_unit_tests"
@@ -44,10 +47,41 @@ class _FakeRedis:
         return len(values)
 
 
+class _AsyncHealthRedis:
+    async def ping(self) -> bool:
+        return True
+
+
+class AdminHealthTests(unittest.TestCase):
+    def test_disabled_redis_is_healthy_without_a_client(self) -> None:
+        result = asyncio.run(_redis_health(None, enabled=False))
+
+        self.assertEqual(
+            {"ok": True, "latency_ms": None, "status": "disabled"},
+            result,
+        )
+
+    def test_async_redis_client_health_is_awaited(self) -> None:
+        result = asyncio.run(_redis_health(_AsyncHealthRedis()))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("healthy", result["status"])
+        self.assertIsInstance(result["latency_ms"], float)
+
+
 class AdminApiAuthenticationTests(unittest.TestCase):
     def setUp(self) -> None:
         from app import legacy
 
+        # The application intentionally supports a separate admin bot token.
+        # Isolate these primary-token tests from developer/deployment dotenv
+        # files that may define that optional override.
+        self.admin_token_env = patch.dict(
+            os.environ,
+            {"TELEGRAM_ADMIN_BOT_TOKEN": ""},
+            clear=False,
+        )
+        self.admin_token_env.start()
         self.original_token = legacy.TELEGRAM_BOT_TOKEN
         legacy.TELEGRAM_BOT_TOKEN = BOT_TOKEN
         configure_telegram_admin_authorizer(
@@ -62,6 +96,7 @@ class AdminApiAuthenticationTests(unittest.TestCase):
 
         legacy.TELEGRAM_BOT_TOKEN = self.original_token
         configure_telegram_admin_authorizer(redis_client=None)
+        self.admin_token_env.stop()
 
     def test_missing_telegram_credentials_returns_401(self) -> None:
         response = self.client.get("/api/admin/me")
@@ -82,6 +117,40 @@ class AdminApiAuthenticationTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.assertEqual(42, response.json()["user"]["id"])
         self.assertEqual("telegram_init_data", response.json()["auth_method"])
+
+    def test_admin_stats_include_build_metadata(self) -> None:
+        from app import legacy
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "BOT_BUILD_VERSION": "2026.08.12",
+                    "RELEASE_SHA": "abcdef1234567890fedcba",
+                },
+                clear=False,
+            ),
+            patch.object(legacy, "_web_counts", return_value={"users": 3, "blocked": 1}),
+            patch.object(
+                legacy,
+                "get_bot_settings_async",
+                AsyncMock(return_value=({}, {"db_ok": True, "memory": False})),
+            ),
+            patch.object(legacy, "_run_state_bot_mode", return_value="WEBHOOK"),
+            patch.object(legacy, "_format_uptime", return_value="1m 0s"),
+            patch.object(legacy, "_TELEGRAM_POLLING_ACTIVE", False),
+            patch.object(legacy, "_TELEGRAM_APP", object()),
+        ):
+            response = self.client.get(
+                "/api/admin/stats",
+                headers={"X-Telegram-Init-Data": _signed_init_data(42)},
+            )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual("2026.08.12", payload["build"]["version"])
+        self.assertEqual("abcdef123456", payload["build"]["commit_short"])
+        self.assertEqual("WEBHOOK", payload["bot"]["mode"])
 
 
 class AdminApiSchemaTests(unittest.TestCase):

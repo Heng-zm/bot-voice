@@ -9,9 +9,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Google+Sans+Flex:opsz,wght@6..144,400..800&amp;family=Noto+Sans+Khmer:wght@400..800&amp;display=swap">
-  <link rel="stylesheet" href="/miniapp/admin/assets/styles.css?v=8">
+  <link rel="stylesheet" href="/miniapp/admin/assets/styles.css?v=9">
   <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
-  <script src="/miniapp/admin/assets/app.js?v=8" defer></script>
+  <script src="/miniapp/admin/assets/app.js?v=10" defer></script>
 </head>
 <body>
   <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -125,6 +125,8 @@
           <article class="monitor-trend-card"><div><span data-i18n="queuePressure">Queue pressure</span><strong id="monitorPressureValue">—</strong></div><div id="monitorPressureChart" class="monitor-trend-chart"></div></article>
           <article class="monitor-trend-card"><div><span data-i18n="webRequests">Web requests</span><strong id="monitorRequestsValue">—</strong></div><div id="monitorRequestsChart" class="monitor-trend-chart"></div></article>
           <article class="monitor-trend-card"><div><span data-i18n="ttsLoad">TTS workload</span><strong id="monitorTtsTrendValue">—</strong></div><div id="monitorTtsTrendChart" class="monitor-trend-chart"></div></article>
+          <article class="monitor-trend-card"><div><span data-i18n="queueAge">Oldest queued</span><strong id="monitorQueueAgeValue">—</strong></div><div id="monitorQueueAgeChart" class="monitor-trend-chart"></div></article>
+          <article class="monitor-trend-card"><div><span data-i18n="failureRate">Failure rate</span><strong id="monitorFailureValue">—</strong></div><div id="monitorFailureChart" class="monitor-trend-chart"></div></article>
         </div>
 
         <div class="monitor-grid">
@@ -138,15 +140,29 @@
           </article>
         </div>
 
+        <article class="monitor-card monitor-incident-card">
+          <div class="monitor-card-heading"><div><h3 data-i18n="incidentRecovery">Incident recovery</h3><p class="muted" data-i18n="incidentRecoveryHelp">Component restarts, backoff, recovery, and open configuration circuits.</p></div><span id="monitorIncidentCount" class="secure-label">0</span></div>
+          <div id="monitorIncidentList" class="monitor-incident-list"></div>
+          <p id="monitorIncidentsEmpty" class="empty-state" data-i18n="noIncidents">No component incidents since startup.</p>
+        </article>
+
         <article class="monitor-card monitor-tts-card">
-          <div class="monitor-card-heading monitor-tts-heading"><div><h3 data-i18n="ttsProcessQueue">TTS process queue</h3><p class="muted" data-i18n="ttsMonitorHelp">Running and waiting voice jobs refresh automatically.</p></div><span id="monitorTtsCount" class="secure-label">—</span></div>
-          <div class="monitor-filter-tabs" role="group" aria-label="Filter TTS processes">
-            <button class="monitor-filter-tab active" type="button" data-tts-filter="all" data-i18n="allProcesses">All</button>
-            <button class="monitor-filter-tab" type="button" data-tts-filter="running" data-i18n="running">Running</button>
-            <button class="monitor-filter-tab" type="button" data-tts-filter="queued" data-i18n="waiting">Waiting</button>
+          <div class="monitor-card-heading monitor-tts-heading"><div><h3 data-i18n="mediaProcessQueue">TTS, OCR &amp; transcription</h3><p class="muted" data-i18n="mediaMonitorHelp">Real-time progress for running and waiting media jobs.</p></div><span id="monitorTtsCount" class="secure-label">—</span></div>
+          <div class="monitor-workload-controls">
+            <div class="monitor-filter-tabs" role="group" aria-label="Filter media process state">
+              <button class="monitor-filter-tab active" type="button" data-tts-filter="all" data-i18n="allProcesses">All</button>
+              <button class="monitor-filter-tab" type="button" data-tts-filter="running" data-i18n="running">Running</button>
+              <button class="monitor-filter-tab" type="button" data-tts-filter="queued" data-i18n="waiting">Waiting</button>
+            </div>
+            <select id="monitorWorkloadType" class="select" aria-label="Filter media process type">
+              <option value="all" data-i18n="allTypes">All types</option>
+              <option value="tts">TTS</option>
+              <option value="ocr">OCR</option>
+              <option value="transcription">Transcription</option>
+            </select>
           </div>
           <div id="monitorTtsList" class="monitor-job-list"></div>
-          <p id="monitorTtsEmpty" class="empty-state is-hidden" data-i18n="noTtsProcesses">No active or queued TTS processes.</p>
+          <p id="monitorTtsEmpty" class="empty-state is-hidden" data-i18n="noMediaProcesses">No active or queued media processes.</p>
         </article>
 
         <article class="monitor-card monitor-log-card">
@@ -162,6 +178,7 @@
               </select>
               <input id="monitorLogSearch" class="text-input" type="search" maxlength="128" placeholder="Search logs" data-i18n-placeholder="searchLogs" aria-label="Search logs">
               <button id="monitorCopyLogsButton" class="button" type="button" data-i18n="copyLogs">Copy logs</button>
+              <button id="monitorDownloadLogsButton" class="button" type="button" data-i18n="downloadLogs">Download</button>
               <button id="monitorPauseButton" class="button" type="button" data-i18n="pauseLive">Pause</button>
             </div>
           </div>

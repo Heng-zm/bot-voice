@@ -64,10 +64,10 @@ boundaries for incremental extraction. Avoid adding new features to
 
 ## Run
 
-Copy `.env.example` to `.env`, configure the required values, then:
+Create `.env`, configure the required values, then:
 
 ```bash
-pip install -r requirements.lock
+python -m pip install -r requirements.lock
 python -m app.main
 ```
 
@@ -80,19 +80,15 @@ python -m venv .venv
 python -m pip install --upgrade pip
 python -m pip install -r requirements.lock -r requirements-dev.txt
 python -m ruff check .
-python -m unittest discover -s tests -v
+pytest -q
 ```
 
 The lint baseline intentionally excludes `app/legacy.py` during the staged
 extraction. New or extracted modules remain checked in CI.
 
-`requirements.lock` is the pinned runtime dependency set used by Docker and
-CI. Regenerate it only when intentionally updating dependencies:
-
-```bash
-python -m pip install pip-tools
-pip-compile --output-file requirements.lock requirements.txt
-```
+`requirements.txt` defines the direct runtime dependencies used to regenerate
+`requirements.lock`. Docker, CI, and local setup install the lock file so they
+all run the same tested versions.
 
 Never commit `.env`. If a populated `.env` was committed previously, remove it
 from Git tracking and rotate every exposed credential; adding `.gitignore`
@@ -102,29 +98,60 @@ environment file from being copied into container images.
 The ASGI app is also exposed as `app.main:app`. Running only Uvicorn serves the
 HTTP application but does not start the combined Telegram/scheduler lifecycle.
 
+Optional release metadata can be injected at deploy time for status reporting:
+
+```dotenv
+BOT_BUILD_VERSION=2026.08.12
+RELEASE_SHA=abcdef1234567890
+RELEASE_CREATED_AT=2026-08-12T10:30:00Z
+```
+
+The bot exposes that metadata through:
+
+```text
+Telegram command: /version
+HTTP endpoints:   /version and /api/version
+Admin API:        GET /api/admin/stats
+```
+
 ## Runtime secrets and CORS
 
-`.env` contains only the five core connection values:
+`.env` contains the core connection values and the Redis feature switch:
 
 ```dotenv
 REDIS_URL=
+REDIS_ENABLED=false
+ADMIN_IDS=123456789
 SUPABASE_URL=
 SUPABASE_SERVICE_ROLE_KEY=
 TELEGRAM_BOT_TOKEN=
 GEMINI_API_KEY=
 ```
 
-At startup the application atomically loads or creates 64-character
+With `REDIS_ENABLED=false`, the application does not connect to Redis even if
+`REDIS_URL` is present. Run the application as one combined process (the
+default `PROCESS_ROLE=combined`). Jobs, delivery idempotency, caches, and
+generated session secrets are held in memory and are lost on restart; separate
+web and worker processes and multi-instance coordination require Redis.
+Set `ADMIN_IDS` to a comma-separated list of Telegram user IDs when Redis is
+disabled. Runtime administrator allowlist edits require Redis.
+
+Set `REDIS_ENABLED=true` and configure `REDIS_URL` to restore durable,
+multi-process operation.
+
+When Redis is enabled, the application atomically loads or creates 64-character
 `TELEGRAM_WEBHOOK_SECRET_TOKEN`, `WEB_SECRET_KEY`, and `FLASK_SECRET_KEY`
 values in Redis. They have no expiry and their raw values are never logged.
-Startup fails closed when Redis is unavailable. When a new Telegram secret
-needs registration and the bot is in webhook mode, startup registers it with
-Telegram before accepting traffic.
+Startup fails closed if Redis was enabled but is unavailable. In Redis-disabled
+mode, these values are generated in memory and sessions reset on restart. When
+a new Telegram secret needs registration and the bot is in webhook mode,
+startup registers it with Telegram before accepting traffic.
 
-CORS origins are exact HTTP(S) origins stored in Redis and mirrored to the
-Supabase `bot_settings` row named `frontend_allowed_origins`. Wildcards, URL
-paths, credentials, query strings, and fragments are rejected. The initial
-production policy is an empty list.
+CORS origins are exact HTTP(S) origins stored in Redis when enabled and mirrored
+to the Supabase `bot_settings` row named `frontend_allowed_origins`. Without
+Redis, Supabase is the persistent source. Wildcards, URL paths, credentials,
+query strings, and fragments are rejected. The initial production policy is an
+empty list.
 
 Authenticated administrators can manage it using:
 
@@ -217,15 +244,14 @@ python -m unittest discover -s tests -v
 
 ## Runtime reliability update
 
-See [`UPDATE_NOTES.md`](UPDATE_NOTES.md) for the durable worker lifecycle,
-provider timeout consistency, unified `RuntimeContext`, queue backpressure,
-admin operations UI, and staged migration instructions.
+The runtime includes durable worker lifecycle management, provider timeout
+consistency, a unified `RuntimeContext`, queue backpressure, and admin
+operations UI.
 
 ## Runtime reliability update v2
 
-See [`UPDATE_V2_NOTES.md`](UPDATE_V2_NOTES.md) for job progress, terminal job
-history, worker drain/resume, extracted utility modules, CI, and Docker health
-checks.
+The v2 reliability work added job progress, terminal job history, worker
+drain/resume, extracted utility modules, CI checks, and Docker health checks.
 
 ## Runtime reliability update v3
 
@@ -251,6 +277,9 @@ PROCESS_ROLE=worker python -m app.worker
 `python -m app.main` remains the backward-compatible combined process for local
 runs and one-service deployments.
 
+Use `/version` in Telegram or `GET /api/version` after deploy to confirm the
+running release metadata and active process role.
+
 ### Artifact storage
 
 Supabase Storage is selected automatically when a Supabase client is
@@ -274,8 +303,8 @@ DURABLE_TRANSCRIPTION_ENABLED=true
 Local artifact storage is for development or a single shared host. Use
 Supabase mode when workers can run on different machines or containers.
 
-See [`UPDATE_V3_NOTES.md`](UPDATE_V3_NOTES.md) for migration and rollback
-instructions.
+Deploy the worker and web processes from the same release when using the split
+web/worker topology.
 
 ## Reliability and observability update v4
 
@@ -296,5 +325,5 @@ The V4 hardening pass also pipelines queue statistics, preserves artifact
 cleanup records across transient storage outages, resets stale worker backoff
 after healthy operation, and prevents overlapping Mini App pagination calls.
 
-See [`UPDATE_V4_NOTES.md`](UPDATE_V4_NOTES.md) for operational details and
-[`VALIDATION_V4.md`](VALIDATION_V4.md) for the verification record.
+The v4 hardening pass added retry-safe Telegram voice delivery, worker
+supervision, artifact expiry cleanup, and richer admin queue telemetry.

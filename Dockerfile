@@ -9,7 +9,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg libopus-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt requirements.lock .
+COPY requirements.lock .
 RUN pip install --disable-pip-version-check --no-cache-dir -r requirements.lock \
     && python -m pip check
 

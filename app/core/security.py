@@ -98,8 +98,22 @@ class RuntimeSecretManager:
         *,
         redis_client: Any | None = None,
         redis_url: str = "",
+        disable_redis: bool = False,
     ) -> RuntimeSecretManager:
         with self._thread_lock:
+            if disable_redis:
+                if self._owns_redis and self._redis is not None:
+                    try:
+                        self._redis.close()
+                    except Exception:
+                        logger.debug(
+                            "Disabled runtime-secret Redis client close failed.",
+                            exc_info=True,
+                        )
+                self._redis = None
+                self._redis_url = ""
+                self._owns_redis = False
+                return self
             if redis_client is not None:
                 if (
                     self._owns_redis
@@ -407,6 +421,7 @@ def configure_runtime_secret_manager(
     redis_client: Any | None = None,
     redis_url: str = "",
     redis_prefix: str | None = None,
+    disable_redis: bool = False,
 ) -> RuntimeSecretManager:
     global _RUNTIME_SECRET_MANAGER
     if redis_prefix:
@@ -420,6 +435,7 @@ def configure_runtime_secret_manager(
     return _RUNTIME_SECRET_MANAGER.configure(
         redis_client=redis_client,
         redis_url=redis_url,
+        disable_redis=disable_redis,
     )
 
 
@@ -433,11 +449,13 @@ def bootstrap_runtime_secrets_sync(
     redis_url: str = "",
     redis_prefix: str = "tgbot",
     strict: bool = True,
+    disable_redis: bool = False,
 ) -> RuntimeSecrets:
     manager = configure_runtime_secret_manager(
         redis_client=redis_client,
         redis_url=redis_url,
         redis_prefix=redis_prefix,
+        disable_redis=disable_redis,
     )
     return manager.bootstrap_sync(strict=strict)
 
@@ -448,11 +466,13 @@ async def bootstrap_runtime_secrets(
     redis_url: str = "",
     redis_prefix: str = "tgbot",
     strict: bool = True,
+    disable_redis: bool = False,
 ) -> RuntimeSecrets:
     manager = configure_runtime_secret_manager(
         redis_client=redis_client,
         redis_url=redis_url,
         redis_prefix=redis_prefix,
+        disable_redis=disable_redis,
     )
     return await manager.bootstrap(strict=strict)
 

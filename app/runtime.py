@@ -21,6 +21,7 @@ from app.services.artifacts.storage import (
     configure_artifact_service,
     reset_artifact_service,
 )
+from app.services.build_info import get_build_info
 from app.services.jobs.handlers import BotJobHandlers, build_bot_job_handlers
 from app.services.jobs.runtime import (
     configure_job_queue,
@@ -52,12 +53,26 @@ def _role_has_web(role: RuntimeRole) -> bool:
     return role in {"web", "combined"}
 
 
+def redis_runtime_enabled() -> bool:
+    """Return whether this deployment should connect to Redis."""
+
+    disabled = str(os.getenv("DISABLE_REDIS", "") or "").strip().lower()
+    if disabled in {"1", "true", "yes", "on"}:
+        return False
+    configured = os.getenv("REDIS_ENABLED")
+    if configured is None:
+        return bool(str(os.getenv("REDIS_URL", "") or "").strip())
+    enabled = str(configured).strip().lower()
+    return enabled not in {"0", "false", "no", "off"}
+
+
 class RuntimeContext:
     """Own external clients, queues, artifacts, delivery, and workers once."""
 
     def __init__(self, legacy: Any = _legacy) -> None:
         self.legacy = legacy
         self.settings: Any | None = None
+        self.redis_enabled = True
         self.redis: Any | None = None
         self.supabase: Any | None = None
         self.security: dict[str, Any] = {}
@@ -125,8 +140,15 @@ class RuntimeContext:
 
                 security_status = await self.legacy._bootstrap_runtime_security()
                 secret_manager = get_runtime_secret_manager()
-                redis_client = self.legacy.redis_client or secret_manager.redis_client
-                if redis_client is None:
+                self.redis_enabled = redis_runtime_enabled()
+                if requested_role == "worker" and not self.redis_enabled:
+                    raise RuntimeError(
+                        "A standalone worker requires Redis; use PROCESS_ROLE=combined "
+                        "for process-local Redis-disabled mode."
+                    )
+                # Prefer the async client for the modern runtime components.
+                redis_client = getattr(self.legacy, "redis_client_async", None) or self.legacy.redis_client or secret_manager.redis_client
+                if self.redis_enabled and redis_client is None:
                     raise RuntimeError("Redis is required for the durable runtime.")
                 redis_prefix = str(
                     getattr(self.legacy, "REDIS_CACHE_PREFIX", "") or "tgbot"
@@ -142,6 +164,7 @@ class RuntimeContext:
                     max_queued_jobs=int(
                         os.getenv("BOT_JOB_QUEUE_MAX", "1000") or 1000
                     ),
+                    memory_fallback=not self.redis_enabled,
                 )
                 if self.job_queue is None:
                     raise RuntimeError("Could not configure the durable job queue.")
@@ -154,6 +177,7 @@ class RuntimeContext:
                 self.delivery = configure_telegram_delivery(
                     redis_client,
                     redis_prefix=redis_prefix,
+                    memory_fallback=not self.redis_enabled,
                 )
                 if self.delivery is None:
                     raise RuntimeError("Could not configure Telegram delivery.")
@@ -175,6 +199,11 @@ class RuntimeContext:
                     job_worker_snapshot().get("count"),
                     self.artifacts.backend,
                 )
+                if not self.redis_enabled:
+                    logger.warning(
+                        "Redis is disabled; jobs, delivery leases, secrets, and caches "
+                        "are process-local and are lost on restart."
+                    )
             except BaseException:
                 await self._stop_unlocked()
                 raise
@@ -188,7 +217,7 @@ class RuntimeContext:
         return "web"
 
     async def _ensure_web_services(self, application: FastAPI) -> None:
-        if self.redis is None:
+        if self.redis_enabled and self.redis is None:
             raise RuntimeError("Runtime Redis is unavailable.")
         if self.cors_store is None:
             redis_url = str(
@@ -196,10 +225,16 @@ class RuntimeContext:
                 or getattr(self.legacy.SETTINGS, "REDIS_URL", "")
                 or ""
             )
+            # CORS uses synchronous transactions in worker threads. Prefer the
+            # sync client so an asyncio Redis pool is not moved across loops.
+            cors_redis_client = (
+                getattr(self.legacy, "redis_client", None) or self.redis
+            )
             self.cors_store = configure_dynamic_cors_store(
-                redis_client=self.redis,
-                redis_url=redis_url,
+                redis_client=cors_redis_client,
+                redis_url=redis_url if self.redis_enabled else "",
                 supabase_client=self.supabase,
+                disable_redis=not self.redis_enabled,
             )
             cors_snapshot = await self.cors_store.load(force=True)
             self.admin_authorizer = configure_telegram_admin_authorizer(
@@ -313,6 +348,7 @@ class RuntimeContext:
                         await result
 
         self.settings = None
+        self.redis_enabled = True
         self.redis = None
         self.supabase = None
         self.security = {}
@@ -335,9 +371,18 @@ class RuntimeContext:
             "role": self.role,
             "owners": sorted(self._owners),
             "redis": self.redis is not None,
+            "redis_enabled": self.redis_enabled,
             "supabase": self.supabase is not None,
             "security": bool(self.security),
             "job_queue": self.job_queue is not None,
+            "job_queue_backend": getattr(
+                self.job_queue,
+                "backend",
+                "unconfigured",
+            ),
+            "job_queue_durable": bool(
+                getattr(self.job_queue, "durable", False)
+            ),
             "artifacts": {
                 "configured": self.artifacts is not None,
                 **(self.artifacts.snapshot() if self.artifacts else {}),
@@ -346,6 +391,7 @@ class RuntimeContext:
             "expects_workers": expects_workers,
             "workers": workers,
             "providers": get_provider_manager().metadata(),
+            "build": get_build_info(role=self.role, started_at=self.started_at),
         }
 
 
@@ -356,4 +402,9 @@ def get_runtime_context() -> RuntimeContext:
     return _RUNTIME
 
 
-__all__ = ["RuntimeContext", "RuntimeRole", "get_runtime_context"]
+__all__ = [
+    "RuntimeContext",
+    "RuntimeRole",
+    "get_runtime_context",
+    "redis_runtime_enabled",
+]

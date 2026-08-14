@@ -12,6 +12,7 @@ import signal
 from contextlib import suppress
 
 from app.runtime import get_runtime_context
+from app.services.build_info import get_build_info
 from app.services.jobs.runtime import job_worker_snapshot
 
 logger = logging.getLogger(__name__)
@@ -34,8 +35,11 @@ async def run_worker() -> None:
 
     await runtime.start(None, owner="worker-process", role="worker")
     snapshot = runtime.snapshot()
+    build = get_build_info(role="worker", started_at=snapshot.get("started_at"))
     logger.info(
-        "Durable worker ready count=%s artifact_backend=%s shared=%s",
+        "Durable worker ready version=%s commit=%s count=%s artifact_backend=%s shared=%s",
+        build["version"],
+        build["commit_short"] or "-",
         snapshot["workers"].get("count", 0),
         snapshot["artifacts"].get("backend"),
         snapshot["artifacts"].get("shared"),

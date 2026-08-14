@@ -21,7 +21,7 @@ import atexit
 import base64
 import httpx
 import imageio_ffmpeg as _iio_ffmpeg
-from typing import Any, Callable
+from typing import Any, Callable, Awaitable
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from contextlib import suppress
@@ -125,6 +125,7 @@ from telegram.error import (
     TimedOut,
     RetryAfter,
     BadRequest,
+    Conflict,
     TelegramError,
     Forbidden,
 )
@@ -507,8 +508,8 @@ class AppSettings(BaseSettings):
     # local/minimal .env deployments safely default to polling.
     BOT_MODE: str = (
         "WEBHOOK"
-        if os.environ.get("TELEGRAM_WEBHOOK_URL")
-        or os.environ.get("RENDER_EXTERNAL_URL")
+        if (os.environ.get("TELEGRAM_WEBHOOK_URL") and "://" in str(os.environ.get("TELEGRAM_WEBHOOK_URL")))
+        or (os.environ.get("RENDER_EXTERNAL_URL") and "onrender.com" in str(os.environ.get("RENDER_EXTERNAL_URL")) and "your-service" not in str(os.environ.get("RENDER_EXTERNAL_URL")))
         else "POLLING"
     )
     TELEGRAM_WEBHOOK_URL: str | None = None
@@ -572,6 +573,21 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if isinstance(raw, bool):
         return raw
     return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _redis_enabled() -> bool:
+    if _env_bool("DISABLE_REDIS", False):
+        return False
+    configured = os.environ.get("REDIS_ENABLED")
+    if configured is None:
+        return bool(
+            str(
+                os.environ.get("REDIS_URL")
+                or getattr(SETTINGS, "REDIS_URL", "")
+                or ""
+            ).strip()
+        )
+    return str(configured).strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
 def _env_int(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
@@ -669,6 +685,8 @@ def _web_secret_redis_key() -> str:
 
 
 def _web_secret_redis_url() -> str:
+    if not _redis_enabled():
+        return ""
     return str(
         os.environ.get("REDIS_URL")
         or getattr(SETTINGS, "REDIS_URL", "")
@@ -685,6 +703,10 @@ def _web_secret_redis_client() -> Any | None:
     the normal redis_client exists, this helper reuses it.
     """
     global _WEB_SESSION_SECRET_REDIS_CLIENT, _WEB_SESSION_SECRET_REDIS_LAST_ERROR
+
+    if not _redis_enabled():
+        _WEB_SESSION_SECRET_REDIS_LAST_ERROR = "Redis is explicitly disabled"
+        return None
 
     shared_client = globals().get("redis_client")
     if shared_client is not None:
@@ -840,7 +862,8 @@ def _web_session_secret_key() -> str:
         redis_client=globals().get("redis_client"),
         redis_url=_web_secret_redis_url(),
         redis_prefix=str(os.environ.get("REDIS_CACHE_PREFIX") or "tgbot"),
-        strict=True,
+        strict=_redis_enabled(),
+        disable_redis=not _redis_enabled(),
     )
     record = state.records["WEB_SECRET_KEY"]
     _WEB_SESSION_SECRET_CACHE = record.value
@@ -1723,11 +1746,12 @@ def generate_new_webhook_token() -> str:
 
 
 def _runtime_webhook_base_url() -> str:
-    """Return this Render service's public webhook base URL.
+    """Return this service's discovered public webhook base URL.
 
     In two-server mode, TELEGRAM_WEBHOOK_URL / RENDER_EXTERNAL_URL is
     intentionally treated as service-local.  Redis RUN_STATE may contain the
     other Render service's URL, so local env must win before persisted state.
+    Common platform-provided domains are used as a final safe fallback.
     """
     env_value = str(
         os.environ.get("TELEGRAM_WEBHOOK_URL")
@@ -1744,7 +1768,12 @@ def _runtime_webhook_base_url() -> str:
         value = run_state.get("TELEGRAM_WEBHOOK_URL")
         if value:
             return str(value).strip().rstrip("/")
-    return env_value or str(globals().get("TELEGRAM_WEBHOOK_URL") or "").strip().rstrip("/")
+    configured = env_value or str(globals().get("TELEGRAM_WEBHOOK_URL") or "").strip().rstrip("/")
+    if configured:
+        return configured
+    from app.services.monitoring import discover_public_url
+
+    return str(discover_public_url().get("url") or "")
 
 
 def _telegram_webhook_target_url_for_secret(secret_token: str) -> str:
@@ -2071,6 +2100,18 @@ async def _process_telegram_webhook_request(req: FastAPIRequest, path_secret_tok
     update_id = getattr(update, "update_id", None)
     claimed = False
     claim_token: str | None = None
+    async def _run_update_background(u: Update, uid: int, token: str | None):
+        try:
+            # Add a safe processing timeout to prevent leaked tasks
+            await asyncio.wait_for(app_obj.process_update(u), timeout=55.0)
+            await _telegram_webhook_update_complete(uid, claim_token=token)
+        except asyncio.TimeoutError:
+            webhook_logger.warning("Telegram update processing timed out update_id=%s", uid)
+            await _telegram_webhook_update_release(uid, claim_token=token)
+        except Exception as e:
+            webhook_logger.error("Telegram update processing failed update_id=%s: %s", uid, e, exc_info=True)
+            await _telegram_webhook_update_release(uid, claim_token=token)
+
     try:
         claim_state, claim_token = await _telegram_webhook_update_claim(
             update_id,
@@ -2080,37 +2121,20 @@ async def _process_telegram_webhook_request(req: FastAPIRequest, path_secret_tok
             webhook_logger.info("Completed Telegram webhook update ignored update_id=%s", update_id)
             _metric_inc("replay_dropped")
             return _FastJSONResponse({"status": "ok", "duplicate": True}, status_code=200)
+        
         if claim_state == "processing":
-            response = _FastJSONResponse({"status": "retry", "reason": "already_processing"}, status_code=503)
-            response.headers["Retry-After"] = "2"
-            return response
-        claimed = claim_state == "claimed"
-        await app_obj.process_update(update)
-        await _telegram_webhook_update_complete(
-            update_id,
-            claim_token=claim_token,
-        )
+            # If already processing, acknowledge to Telegram to stop retries, 
+            # but log that it was a duplicate.
+            return _FastJSONResponse({"status": "ok", "duplicate": True, "reason": "already_processing"}, status_code=200)
+
+        # Offload to background task so we can return 200 OK immediately
+        asyncio.create_task(_run_update_background(update, update_id, claim_token), name=f"tg-update-{update_id}")
+        return _FastJSONResponse({"status": "ok", "update_id": update_id}, status_code=200)
+
     except Exception as exc:
-        if claimed:
-            await _telegram_webhook_update_release(
-                update_id,
-                claim_token=claim_token,
-            )
         error_id = secrets.token_hex(6)
-        webhook_logger.error(
-            "Telegram webhook processing failed error_id=%s update_id=%s: %s",
-            error_id,
-            update_id,
-            exc,
-            exc_info=True,
-        )
-        response = _FastJSONResponse({
-            "status": "retry",
-            "reason": "processing_failed",
-            "reference": error_id,
-        }, status_code=503)
-        response.headers["Retry-After"] = "2"
-        return response
+        webhook_logger.error("Telegram webhook ingest failed error_id=%s: %s", error_id, exc, exc_info=True)
+        return _FastJSONResponse({"status": "error", "reference": error_id}, status_code=200)
 
     return _FastJSONResponse({"status": "ok"}, status_code=200)
 
@@ -2217,16 +2241,22 @@ async def _bootstrap_runtime_security() -> dict[str, Any]:
         get_runtime_secret_manager,
     )
 
+    redis_enabled = _redis_enabled()
     state = await bootstrap_runtime_secrets(
         redis_client=globals().get("redis_client"),
         redis_url=str(
-            globals().get("REDIS_URL")
-            or os.environ.get("REDIS_URL")
-            or getattr(SETTINGS, "REDIS_URL", "")
-            or ""
+            (
+                globals().get("REDIS_URL")
+                or os.environ.get("REDIS_URL")
+                or getattr(SETTINGS, "REDIS_URL", "")
+                or ""
+            )
+            if redis_enabled
+            else ""
         ),
         redis_prefix=str(os.environ.get("REDIS_CACHE_PREFIX") or "tgbot"),
-        strict=True,
+        strict=redis_enabled,
+        disable_redis=not redis_enabled,
     )
     persistent_web_secret = state.value("WEB_SECRET_KEY")
     if (
@@ -2250,10 +2280,16 @@ async def _bootstrap_runtime_security() -> dict[str, Any]:
         RUN_STATE["TELEGRAM_WEBHOOK_SECRET_TOKEN"] = TELEGRAM_WEBHOOK_SECRET_TOKEN
 
     webhook_registered = False
-    if _run_state_bot_mode() == "WEBHOOK" and state.webhook_registration_required:
-        webhook_registered = await get_runtime_secret_manager().ensure_webhook_registered(
-            _configure_telegram_webhook_via_http_for_secret
-        )
+    if _run_state_bot_mode() == "WEBHOOK":
+        if not redis_enabled:
+            await _configure_telegram_webhook_via_http_for_secret(
+                state.value("TELEGRAM_WEBHOOK_SECRET_TOKEN")
+            )
+            webhook_registered = True
+        elif state.webhook_registration_required:
+            webhook_registered = await get_runtime_secret_manager().ensure_webhook_registered(
+                _configure_telegram_webhook_via_http_for_secret
+            )
     current_state = get_runtime_secret_manager().current() or state
 
     return {
@@ -2319,7 +2355,9 @@ async def run_fastapi():
     """Run the FastAPI dashboard inside the main asyncio runtime."""
     import uvicorn
 
-    port = _env_int("PORT", 8080, minimum=1, maximum=65535)
+    # Pterodactyl and some other hosts use SERVER_PORT.
+    port = _env_int("PORT", _env_int("SERVER_PORT", 8080, minimum=1, maximum=65535), minimum=1, maximum=65535)
+    logger.info("FastAPI dashboard starting on port %s", port)
     config = uvicorn.Config(
         app,
         host="0.0.0.0",
@@ -2354,9 +2392,11 @@ async def run_fastapi():
 async def keep_alive_async(stop_event: asyncio.Event | None = None):
     """Self-ping every 4 min with non-blocking HTTPX instead of requests."""
     logger_ka = logging.getLogger("keep_alive")
-    render_url = (os.environ.get("RENDER_EXTERNAL_URL") or getattr(SETTINGS, "RENDER_EXTERNAL_URL", "") or "").strip().rstrip("/")
+    from app.services.monitoring import discover_public_url
+
+    render_url = str(discover_public_url().get("url") or "").strip().rstrip("/")
     if not render_url:
-        logger_ka.warning("RENDER_EXTERNAL_URL not set — self-ping disabled.")
+        logger_ka.warning("Public server URL not detected — self-ping disabled.")
         return
 
     await asyncio.sleep(10)
@@ -3224,14 +3264,14 @@ async def ai_assistant():
                 ))
             contents = _build_gemini_contents(message, history, image_data, audio_data, image_mime, audio_mime)
 
-            def _generate_audio_reply():
-                return _gemini.models.generate_content(
+            async def _generate_audio_reply():
+                return await _gemini.aio.models.generate_content(
                     model=GEMINI_MODEL,
                     contents=contents,
                     config=_ai_gen_config(),
                 )
 
-            response = await _run_ai_api_blocking(_generate_audio_reply)
+            response = await _generate_audio_reply()
             reply_text = (response.text or "").strip()
             return _ai_cors(jsonify({
                 "ok": True,
@@ -3287,8 +3327,8 @@ async def ai_transcribe():
 
     from google.genai import types as _gtypes
 
-    def _transcribe_audio():
-        return _gemini.models.generate_content(
+    async def _transcribe_audio():
+        return await _gemini.aio.models.generate_content(
             model=GEMINI_MODEL,
             contents=[
                 _gtypes.Part.from_bytes(data=audio_data, mime_type=audio_mime),
@@ -3302,7 +3342,7 @@ async def ai_transcribe():
         )
 
     try:
-        response = await _run_ai_api_blocking(_transcribe_audio)
+        response = await _transcribe_audio()
         transcript = (response.text or "").strip()
         return _ai_cors(jsonify({
             "ok": True,
@@ -5066,7 +5106,7 @@ async def _web_broadcast_queue_consumer(worker_id: int) -> None:
             else:
                 job_id, admin_id, text = item
                 parse_mode = _BROADCAST_PARSE_MODE_AUTO
-            await asyncio.to_thread(_web_broadcast_worker, job_id, admin_id, text, parse_mode)
+            await _web_broadcast_worker(job_id, admin_id, text, parse_mode)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -6148,6 +6188,8 @@ def _web_send_telegram_message(
     parse_mode: str | None = "plain",
     link_preview: bool = True,
 ) -> tuple[bool, str]:
+    """Send one web-admin message through the legacy synchronous API."""
+
     if not TELEGRAM_BOT_TOKEN:
         return False, "TELEGRAM_BOT_TOKEN missing."
 
@@ -6172,7 +6214,10 @@ def _web_send_telegram_message(
             created_client = True
 
         last_error = ""
-        for telegram_parse_mode in _broadcast_candidate_parse_modes(prepared_text, prepared_mode):
+        for telegram_parse_mode in _broadcast_candidate_parse_modes(
+            prepared_text,
+            prepared_mode,
+        ):
             payload = {
                 "chat_id": int(chat_id),
                 "text": prepared_text,
@@ -6182,6 +6227,91 @@ def _web_send_telegram_message(
                 payload["parse_mode"] = telegram_parse_mode
 
             resp = tg_client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json=payload,
+                timeout=20,
+            )
+            if resp.status_code == 403:
+                blocker_admin_id = int(admin_id or 0)
+                if not blocker_admin_id:
+                    with suppress(Exception):
+                        blocker_admin_id = _web_current_admin_id()
+                db_user_set_blocked(
+                    int(chat_id),
+                    blocker_admin_id,
+                    True,
+                    "Telegram Forbidden from web send",
+                )
+            if not (200 <= resp.status_code < 300):
+                response_text = str(getattr(resp, "text", ""))
+                last_error = f"Telegram HTTP {resp.status_code}: {response_text[:300]}"
+                if telegram_parse_mode and _is_telegram_parse_error(last_error):
+                    continue
+                return False, last_error
+
+            try:
+                response_payload = resp.json()
+            except Exception:
+                response_payload = {}
+            if response_payload.get("ok"):
+                return True, "sent"
+
+            last_error = str(response_payload)[:300]
+            if telegram_parse_mode and _is_telegram_parse_error(last_error):
+                continue
+            return False, last_error or "Telegram send failed."
+
+        return False, last_error or "Telegram parse mode rejected message."
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        if created_client and tg_client is not None:
+            tg_client.close()
+
+
+async def _web_send_telegram_message_async(
+    chat_id: int,
+    text: str,
+    *,
+    admin_id: int | None = None,
+    client: httpx.AsyncClient | None = None,
+    parse_mode: str | None = "plain",
+    link_preview: bool = True,
+) -> tuple[bool, str]:
+    if not TELEGRAM_BOT_TOKEN:
+        return False, "TELEGRAM_BOT_TOKEN missing."
+
+    try:
+        prepared_text, prepared_mode, prepared_link_preview = _broadcast_prepare_text(
+            text,
+            parse_mode,
+            max_chars=TELE_MSG_LIMIT,
+            default_link_preview=link_preview,
+        )
+    except ValueError as exc:
+        return False, str(exc)
+
+    if not prepared_text:
+        return False, "Message is empty."
+
+    created_client = False
+    tg_client = client
+    try:
+        if tg_client is None:
+            tg_client = httpx.AsyncClient(timeout=20)
+            created_client = True
+
+        last_error = ""
+        for telegram_parse_mode in _broadcast_candidate_parse_modes(prepared_text, prepared_mode):
+            payload = {
+                "chat_id": int(chat_id),
+                "text": prepared_text,
+                "disable_web_page_preview": not prepared_link_preview,
+            }
+            if telegram_parse_mode:
+                payload["parse_mode"] = telegram_parse_mode
+
+            resp = await tg_client.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                 json=payload,
                 timeout=20,
@@ -6215,8 +6345,7 @@ def _web_send_telegram_message(
         return False, str(exc)
     finally:
         if created_client and tg_client is not None:
-            with suppress(Exception):
-                tg_client.close()
+            await tg_client.aclose()
 
 
 @app_flask.route("/admin/users")
@@ -6493,7 +6622,7 @@ def web_admin_user_detail(user_id: int):
 
 @app_flask.route("/admin/users/action", methods=["POST"])
 @web_admin_required
-def web_admin_users_action():
+async def web_admin_users_action():
     _web_check_csrf()
     admin_id = _web_current_admin_id()
     user_id = _web_int(request.form.get("user_id"), 0)
@@ -6511,7 +6640,7 @@ def web_admin_users_action():
         db_history_clear(user_id)
         ok, msg = True, "history clear queued"
     elif action == "send_message":
-        ok, msg = _web_send_telegram_message(user_id, request.form.get("message") or "", admin_id=_web_current_admin_id())
+        ok, msg = await _web_send_telegram_message_async(user_id, request.form.get("message") or "", admin_id=_web_current_admin_id())
     else:
         ok, msg = False, "Unknown action."
     flask_flash(("OK: " if ok else "ERROR: ") + msg, "success" if ok else "error")
@@ -7393,7 +7522,7 @@ def _web_broadcast_job_set(job_id: str, **updates) -> None:
             _WEB_BROADCAST_JOBS.popitem(last=False)
 
 
-def _web_broadcast_worker(
+async def _web_broadcast_worker(
     job_id: str,
     admin_id: int,
     text: str,
@@ -7402,7 +7531,7 @@ def _web_broadcast_worker(
     """Run web dashboard broadcast in bounded concurrent batches with pause/cancel."""
     parse_mode = _broadcast_normalize_parse_mode(parse_mode)
     try:
-        raw_users = get_all_user_ids()
+        raw_users = await asyncio.to_thread(get_all_user_ids)
     except Exception as exc:
         logger.error("web broadcast could not load users: %s", exc, exc_info=True)
         _web_broadcast_job_set(job_id, status="failed", error=str(exc)[:500], finished_at=_sched_iso())
@@ -7439,12 +7568,12 @@ def _web_broadcast_worker(
         _web_broadcast_job_set(job_id, status="done", finished_at=_sched_iso())
         return
 
-    blocked_ids = _web_blocked_ids_for_users(users)
+    blocked_ids = await asyncio.to_thread(_web_blocked_ids_for_users, users)
 
     def _control_state() -> str:
         return str(_web_broadcast_job_get(job_id).get("control") or "run").lower()
 
-    def _wait_if_paused() -> bool:
+    async def _wait_if_paused() -> bool:
         while True:
             control = _control_state()
             if control == "cancel":
@@ -7452,32 +7581,33 @@ def _web_broadcast_worker(
             if control != "pause":
                 return True
             _web_broadcast_job_set(job_id, status="paused")
-            time.sleep(0.5)
+            await asyncio.sleep(0.5)
 
-    def _send_one(uid: int) -> str:
-        try:
-            if _control_state() == "cancel":
-                return "skipped"
-            if uid in blocked_ids:
-                return "blocked"
-            ok, send_msg = _web_send_telegram_message(
-                uid,
-                text,
-                admin_id=admin_id,
-                client=tg_client,
-                parse_mode=parse_mode,
-            )
-            if ok:
-                return "sent"
-            low = str(send_msg or "").lower()
-            if "403" in low or "forbidden" in low or "bot was blocked" in low:
-                db_user_set_blocked(uid, admin_id, True, "Telegram blocked during web broadcast")
-                return "blocked"
-            logger.warning("web broadcast failed uid=%s: %s", uid, str(send_msg)[:240])
-            return "failed"
-        except Exception as exc:
-            logger.warning("web broadcast exception uid=%s: %s", uid, exc)
-            return "failed"
+    async def _send_one(uid: int, client: httpx.AsyncClient, semaphore: asyncio.Semaphore) -> str:
+        async with semaphore:
+            try:
+                if _control_state() == "cancel":
+                    return "skipped"
+                if uid in blocked_ids:
+                    return "blocked"
+                ok, send_msg = await _web_send_telegram_message_async(
+                    uid,
+                    text,
+                    admin_id=admin_id,
+                    client=client,
+                    parse_mode=parse_mode,
+                )
+                if ok:
+                    return "sent"
+                low = str(send_msg or "").lower()
+                if "403" in low or "forbidden" in low or "bot was blocked" in low:
+                    await asyncio.to_thread(db_user_set_blocked, uid, admin_id, True, "Telegram blocked during web broadcast")
+                    return "blocked"
+                logger.warning("web broadcast failed uid=%s: %s", uid, str(send_msg)[:240])
+                return "failed"
+            except Exception as exc:
+                logger.warning("web broadcast exception uid=%s: %s", uid, exc)
+                return "failed"
 
     workers = max(1, min(WEB_BROADCAST_WORKERS, _run_state_max_concurrent_broadcast(), max(1, len(users))))
     batch_size = max(1, max(_run_state_broadcast_batch_size(), workers))
@@ -7486,46 +7616,49 @@ def _web_broadcast_worker(
         max_keepalive_connections=max(_run_state_http_keepalive_connections(), workers),
         max_connections=max(_run_state_http_max_connections(), workers * 2),
     )
+    semaphore = asyncio.Semaphore(workers)
     try:
-        with httpx.Client(timeout=20, limits=limits) as tg_client:
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="web_broadcast") as pool:
-                for start in range(0, total, batch_size):
-                    if not _wait_if_paused():
-                        skipped += max(0, total - start)
-                        _web_broadcast_job_set(job_id, status="cancelled", skipped=skipped, sent=sent, failed=failed, blocked=blocked, finished_at=_sched_iso())
-                        return
-                    _web_broadcast_job_set(job_id, status="running")
-                    batch = users[start:start + batch_size]
-                    futures = [pool.submit(_send_one, uid) for uid in batch]
-                    last_progress_update = 0.0
-                    for future in as_completed(futures):
-                        try:
-                            result = future.result()
-                        except Exception as exc:
-                            logger.warning("web broadcast future failed job=%s: %s", job_id, exc)
-                            result = "failed"
+        async with httpx.AsyncClient(timeout=20, limits=limits) as tg_client:
+            for start in range(0, total, batch_size):
+                if not await _wait_if_paused():
+                    skipped += max(0, total - start)
+                    _web_broadcast_job_set(job_id, status="cancelled", skipped=skipped, sent=sent, failed=failed, blocked=blocked, finished_at=_sched_iso())
+                    return
+                _web_broadcast_job_set(job_id, status="running")
+                batch = users[start:start + batch_size]
+                
+                tasks = [asyncio.create_task(_send_one(uid, tg_client, semaphore)) for uid in batch]
+                last_progress_update = 0.0
+                
+                for task in asyncio.as_completed(tasks):
+                    try:
+                        result = await task
+                    except Exception as exc:
+                        logger.warning("web broadcast task failed job=%s: %s", job_id, exc)
+                        result = "failed"
 
-                        if result == "sent":
-                            sent += 1
-                        elif result == "blocked":
-                            blocked += 1
-                        elif result == "skipped":
-                            skipped += 1
-                        else:
-                            failed += 1
+                    if result == "sent":
+                        sent += 1
+                    elif result == "blocked":
+                        blocked += 1
+                    elif result == "skipped":
+                        skipped += 1
+                    else:
+                        failed += 1
 
-                        now = time.monotonic()
-                        if now - last_progress_update >= 1.0:
-                            _web_broadcast_job_set(job_id, sent=sent, failed=failed, blocked=blocked, skipped=skipped)
-                            last_progress_update = now
+                    now = time.monotonic()
+                    if now - last_progress_update >= 1.0:
+                        _web_broadcast_job_set(job_id, sent=sent, failed=failed, blocked=blocked, skipped=skipped)
+                        last_progress_update = now
 
-                    _web_broadcast_job_set(job_id, sent=sent, failed=failed, blocked=blocked, skipped=skipped)
-                    if _control_state() == "cancel":
-                        skipped += max(0, total - (start + len(batch)))
-                        _web_broadcast_job_set(job_id, status="cancelled", skipped=skipped, sent=sent, failed=failed, blocked=blocked, finished_at=_sched_iso())
-                        return
-                    if start + len(batch) < total and delay_s:
-                        time.sleep(delay_s)
+                _web_broadcast_job_set(job_id, sent=sent, failed=failed, blocked=blocked, skipped=skipped)
+                if _control_state() == "cancel":
+                    skipped += max(0, total - (start + len(batch)))
+                    _web_broadcast_job_set(job_id, status="cancelled", skipped=skipped, sent=sent, failed=failed, blocked=blocked, finished_at=_sched_iso())
+                    return
+
+                if start + len(batch) < total and delay_s:
+                    await asyncio.sleep(delay_s)
 
         _web_broadcast_job_set(job_id, status="done", control="done", sent=sent, failed=failed, blocked=blocked, skipped=skipped, finished_at=_sched_iso())
     except Exception as exc:
@@ -9231,6 +9364,7 @@ ACTIVE_ADMIN_CONVERSATIONS: dict[int, dict[str, Any]] = {}
 ACTIVE_ADMIN_CONVERSATIONS_LOCK = threading.RLock()
 _TELEGRAM_POLLING_ACTIVE = False
 _TELEGRAM_POLLING_LOCK: asyncio.Lock | None = None
+_TELEGRAM_CONFLICT_RECOVERY_TASK: asyncio.Task | None = None
 # Tracks the single active long-polling lifecycle guard.  It prevents duplicate
 # getUpdates workers and gives runtime mode switches one concrete task to
 # cancel before Telegram webhook operations, avoiding 409 polling/webhook
@@ -9326,17 +9460,46 @@ def _ensure_startup_telegram_mode() -> str:
     global BOT_MODE
 
     mode = _run_state_bot_mode()
-    if mode != "WEBHOOK" or _runtime_webhook_base_url():
+    base_url = _runtime_webhook_base_url()
+
+    # Telegram only allows ports 80, 88, 443, or 8443 for webhooks.
+    # If the discovered URL uses a non-standard port, we must fallback to POLLING.
+    is_valid_webhook_url = False
+    if mode == "WEBHOOK" and base_url:
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(base_url)
+            # If no port is specified, it's 443 (https) or 80 (http), which are fine.
+            # If a port is specified, it MUST be one of the Telegram-approved ports.
+            port = parsed.port
+            if not port or port in {80, 88, 443, 8443}:
+                is_valid_webhook_url = True
+            else:
+                webhook_logger.warning(
+                    "BOT_MODE=WEBHOOK detected non-standard port %s in URL %s. "
+                    "Telegram only supports 80, 88, 443, 8443. Falling back to POLLING.",
+                    port, base_url
+                )
+        except Exception as exc:
+            webhook_logger.warning("Failed to validate webhook URL port: %s", exc)
+
+    if mode != "WEBHOOK" or is_valid_webhook_url:
         return mode
 
     with RUN_STATE_LOCK:
         RUN_STATE["BOT_MODE"] = "POLLING"
         BOT_MODE = "POLLING"
-    webhook_logger.warning(
-        "BOT_MODE=WEBHOOK has no TELEGRAM_WEBHOOK_URL/RENDER_EXTERNAL_URL; "
-        "using POLLING for this startup. The persisted WEBHOOK preference was "
-        "not overwritten."
-    )
+    
+    if not base_url:
+        webhook_logger.warning(
+            "BOT_MODE=WEBHOOK has no TELEGRAM_WEBHOOK_URL/RENDER_EXTERNAL_URL; "
+            "using POLLING for this startup."
+        )
+    else:
+        webhook_logger.warning(
+            "BOT_MODE=WEBHOOK using POLLING due to port restrictions or invalid URL."
+        )
+        
     return "POLLING"
 
 
@@ -9744,7 +9907,11 @@ def _telegram_app_updater(app_obj: Any) -> Any:
     return getattr(app_obj, "updater", None) if app_obj is not None else None
 
 
-async def _telegram_start_polling_runtime(app_obj: Any) -> bool:
+async def _telegram_start_polling_runtime(
+    app_obj: Any,
+    *,
+    webhook_prepared: bool = False,
+) -> bool:
     global _TELEGRAM_POLLING_ACTIVE, ACTIVE_POLLING_TASK
     updater = _telegram_app_updater(app_obj)
     if updater is None:
@@ -9763,9 +9930,15 @@ async def _telegram_start_polling_runtime(app_obj: Any) -> bool:
             if ACTIVE_POLLING_TASK is None or ACTIVE_POLLING_TASK.done():
                 ACTIVE_POLLING_TASK = asyncio.create_task(_telegram_polling_task_guard(app_obj), name="telegram-polling-guard")
             return True
+        if not webhook_prepared:
+            # Never start getUpdates until Telegram confirms that no webhook is
+            # registered. Suppressing this failure creates an endless Conflict
+            # loop inside python-telegram-bot's updater.
+            await _delete_telegram_webhook_via_http(drop_pending=False)
         await updater.start_polling(
             allowed_updates=_telegram_allowed_updates(),
             drop_pending_updates=_env_bool("TELEGRAM_POLLING_DROP_PENDING_UPDATES", True),
+            error_callback=_telegram_polling_error_callback,
         )
         _TELEGRAM_POLLING_ACTIVE = True
         ACTIVE_POLLING_TASK = asyncio.create_task(_telegram_polling_task_guard(app_obj), name="telegram-polling-guard")
@@ -9774,8 +9947,15 @@ async def _telegram_start_polling_runtime(app_obj: Any) -> bool:
 
 
 async def _telegram_stop_polling_runtime(app_obj: Any, *, cancel_task: bool = True) -> bool:
-    global _TELEGRAM_POLLING_ACTIVE
+    global _TELEGRAM_POLLING_ACTIVE, _TELEGRAM_CONFLICT_RECOVERY_TASK
     updater = _telegram_app_updater(app_obj)
+    recovery_task = _TELEGRAM_CONFLICT_RECOVERY_TASK
+    if recovery_task is not None and recovery_task is not asyncio.current_task():
+        if not recovery_task.done():
+            recovery_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await recovery_task
+        _TELEGRAM_CONFLICT_RECOVERY_TASK = None
     if cancel_task:
         await _cancel_active_polling_task("stop_polling")
     if updater is None:
@@ -9792,19 +9972,119 @@ async def _telegram_stop_polling_runtime(app_obj: Any, *, cancel_task: bool = Tr
 
 
 async def _delete_telegram_webhook_via_http(drop_pending: bool = True) -> None:
+    """Delete and verify Telegram's webhook before getUpdates is allowed."""
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
-    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
+
+    delete_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
+    info_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getWebhookInfo"
     timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
+    last_error = "Telegram did not confirm webhook deletion."
+
     async with httpx.AsyncClient(timeout=timeout, limits=_make_httpx_limits_from_run_state()) as client:
-        resp = await client.post(api_url, json={"drop_pending_updates": bool(drop_pending)})
+        for attempt in range(1, 6):
+            try:
+                resp = await client.post(
+                    delete_url,
+                    json={"drop_pending_updates": bool(drop_pending)},
+                )
+                try:
+                    data = _json_loads_fast(resp.content)
+                except Exception:
+                    data = {"ok": False, "description": resp.text[:500]}
+                if resp.status_code >= 400 or not bool(data.get("ok")):
+                    raise RuntimeError(
+                        "Telegram deleteWebhook failed "
+                        f"status={resp.status_code} response={str(data)[:500]}"
+                    )
+
+                info_resp = await client.get(info_url)
+                try:
+                    info = _json_loads_fast(info_resp.content)
+                except Exception:
+                    info = {"ok": False, "description": info_resp.text[:500]}
+                if info_resp.status_code >= 400 or not bool(info.get("ok")):
+                    raise RuntimeError(
+                        "Telegram getWebhookInfo failed "
+                        f"status={info_resp.status_code} response={str(info)[:500]}"
+                    )
+
+                webhook_url = str((info.get("result") or {}).get("url") or "").strip()
+                if not webhook_url:
+                    webhook_logger.info(
+                        "Telegram webhook deletion confirmed; polling may start."
+                    )
+                    return
+                last_error = "Telegram still reports an active webhook after deleteWebhook."
+            except (httpx.HTTPError, RuntimeError) as exc:
+                last_error = str(exc)
+
+            if attempt < 5:
+                webhook_logger.warning(
+                    "Webhook deletion not confirmed; retrying attempt=%s/5.",
+                    attempt,
+                )
+                await asyncio.sleep(min(3.0, float(attempt)))
+
+    raise RuntimeError(last_error)
+
+
+async def _recover_polling_webhook_conflict() -> None:
+    """Remove a webhook that appeared after polling was already activated."""
+    global _TELEGRAM_CONFLICT_RECOVERY_TASK
+
+    from app.services.incidents import record_component_event, send_incident_alert
+
     try:
-        data = _json_loads_fast(resp.content)
-    except Exception:
-        data = {"ok": False, "description": resp.text[:500]}
-    if resp.status_code >= 400 or not bool(data.get("ok")):
-        raise RuntimeError(f"Telegram deleteWebhook failed status={resp.status_code} response={str(data)[:500]}")
-    webhook_logger.info("Telegram webhook deleted via HTTPX.")
+        if _run_state_bot_mode() != "POLLING":
+            return
+        await _delete_telegram_webhook_via_http(drop_pending=False)
+        webhook_logger.warning(
+            "Recovered Telegram polling after an unexpected active webhook."
+        )
+        recovered_event = record_component_event(
+            "telegram_webhook",
+            "conflict_recovered",
+            severity="info",
+            message=(
+                "An unexpected active webhook was deleted and polling recovered."
+            ),
+            state="running",
+        )
+        await send_incident_alert(recovered_event)
+    except Exception as exc:
+        webhook_logger.error(
+            "Could not recover Telegram polling webhook conflict.",
+            exc_info=True,
+        )
+        failed_event = record_component_event(
+            "telegram_webhook",
+            "conflict_recovery_failed",
+            severity="critical",
+            message=f"{type(exc).__name__}: {exc}",
+            state="failed",
+        )
+        await send_incident_alert(failed_event)
+    finally:
+        _TELEGRAM_CONFLICT_RECOVERY_TASK = None
+
+
+def _telegram_polling_error_callback(error: TelegramError) -> None:
+    """Schedule one self-healing deleteWebhook operation for Conflict errors."""
+    global _TELEGRAM_CONFLICT_RECOVERY_TASK
+
+    if not isinstance(error, Conflict):
+        return
+    task = _TELEGRAM_CONFLICT_RECOVERY_TASK
+    if task is not None and not task.done():
+        return
+    webhook_logger.warning(
+        "Telegram getUpdates found an active webhook; scheduling verified cleanup."
+    )
+    _TELEGRAM_CONFLICT_RECOVERY_TASK = asyncio.create_task(
+        _recover_polling_webhook_conflict(),
+        name="telegram-webhook-conflict-recovery",
+    )
 
 
 async def _switch_telegram_runtime_mode(target_mode: str, admin_id: int = 0) -> str:
@@ -9836,7 +10116,7 @@ async def _switch_telegram_runtime_mode(target_mode: str, admin_id: int = 0) -> 
     # 409 Conflict errors when polling starts immediately.
     await asyncio.sleep(1.5)
     await _update_run_state("BOT_MODE", "POLLING")
-    await _telegram_start_polling_runtime(app_obj)
+    await _telegram_start_polling_runtime(app_obj, webhook_prepared=True)
     _runtime_admin_log_state("switch_polling", admin_id)
     return "POLLING"
 
@@ -10348,13 +10628,13 @@ def _audio_mime_for_gemini(filename: str | None, mime_type: str | None) -> str:
 
 
 _DB_EXECUTOR = ThreadPoolExecutor(
-    # Keep Supabase writes bounded. Too many SDK threads can trigger
-    # [Errno 11] Resource temporarily unavailable on small Render instances.
+    # Increased default workers from 3 to 10 to improve database throughput
+    # while still protecting against resource exhaustion.
     max_workers=_env_int(
         "DB_EXECUTOR_MAX_WORKERS",
-        int(_perf_default("DB_EXECUTOR_MAX_WORKERS", 3)),
+        int(_perf_default("DB_EXECUTOR_MAX_WORKERS", 10)),
         minimum=1,
-        maximum=16,
+        maximum=32,
     ),
     thread_name_prefix="db_write",
 )
@@ -10594,7 +10874,7 @@ def retry_call_sync(
 
 async def retry_call(
     name: str,
-    factory: Callable[[], Any],
+    factory: Callable[[], Any | Awaitable[Any]],
     *,
     default: Any = None,
     attempts: int = 3,
@@ -10604,7 +10884,12 @@ async def retry_call(
     breaker: CircuitBreaker | None = None,
     critical: bool = False,
 ) -> Any:
-    """Async-safe retry wrapper. Blocking SDK calls run in a thread."""
+    """High-performance async-native retry wrapper.
+
+    Automatically handles both synchronous blocking SDK calls (via thread offloading)
+    and native asynchronous coroutines without redundant executor overhead.
+    """
+    from typing import Awaitable
     if breaker and breaker.is_open():
         _log_once(logging.WARNING, f"{name}:breaker_open", "%s skipped: circuit breaker is open", name)
         if critical:
@@ -10612,39 +10897,44 @@ async def retry_call(
         return default
 
     last_exc: BaseException | None = None
+    is_async_factory = inspect.iscoroutinefunction(factory)
+
     for attempt in range(1, max(1, attempts) + 1):
         try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(lambda: _resolve_maybe_awaitable_sync(factory())),
-                timeout=timeout,
-            )
+            if is_async_factory:
+                # Native async path: zero thread overhead
+                result = await asyncio.wait_for(factory(), timeout=timeout)
+            else:
+                # Hybrid/Sync path: offload blocking calls but resolve awaitables correctly
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(lambda: _resolve_maybe_awaitable_sync(factory())),
+                    timeout=timeout,
+                )
+
             if breaker:
                 breaker.record_success()
             return result
         except asyncio.TimeoutError as exc:
-            # asyncio cannot stop work that is already running in a worker
-            # thread. Retrying here can duplicate writes and multiply stuck
-            # workers, so a timed-out operation is never started again.
             last_exc = exc
             if breaker:
                 breaker.record_failure(exc)
             _log_once(
                 logging.WARNING,
                 f"{name}:timeout",
-                "%s timed out after %.2fs; not retrying because the worker may still be running",
+                "%s timed out after %.2fs",
                 name,
                 timeout,
             )
+            # Safety: stop retrying on timeout to prevent worker pool exhaustion
             break
         except Exception as exc:
             last_exc = exc
-            retryable = _is_retryable_store_error(exc)
-            if not retryable:
+            if not _is_retryable_store_error(exc):
                 if breaker:
                     breaker.record_failure(exc)
                 _log_once(
                     logging.ERROR,
-                    f"{name}:non_retryable:{type(exc).__name__}:{str(exc)[:120]}",
+                    f"{name}:non_retryable:{type(exc).__name__}",
                     "%s failed with non-retryable error: %s",
                     name,
                     _format_exception_detail(exc),
@@ -10656,18 +10946,9 @@ async def retry_call(
             if attempt >= attempts:
                 if breaker:
                     breaker.record_failure(exc)
-                _log_once(
-                    logging.WARNING,
-                    f"{name}:failed:{type(exc).__name__}:{str(exc)[:120]}",
-                    "%s failed after %d attempt(s): %s",
-                    name,
-                    attempts,
-                    _format_exception_detail(exc),
-                )
                 break
 
             delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
-            logger.warning("%s temporary error attempt %d/%d: %s", name, attempt, attempts, _format_exception_detail(exc))
             await asyncio.sleep(delay)
 
     if critical and last_exc:
@@ -10686,7 +10967,17 @@ def db_call_sync(name: str, factory: Callable[[], Any], *, default: Any = None, 
     )
 
 
-async def db_call(name: str, factory: Callable[[], Any], *, default: Any = None, attempts: int = 3, timeout: float = 8.0, critical: bool = False) -> Any:
+async def db_call(
+    name: str,
+    factory: Callable[[], Any | Awaitable[Any]],
+    *,
+    default: Any = None,
+    attempts: int = 3,
+    timeout: float = 8.0,
+    critical: bool = False
+) -> Any:
+    """Async Supabase wrapper with health-aware routing."""
+    from typing import Awaitable
     return await retry_call(
         f"Supabase:{name}",
         factory,
@@ -11116,10 +11407,15 @@ async def _rate_limit_check(key: str, limit: int, window_s: float) -> tuple[bool
                 dq.append(now)
             if len(_RATE_LIMIT_MEMORY) > 100_000:
                 stale_before = now - max(window * 4, 60.0)
-                for old_key in list(_RATE_LIMIT_MEMORY.keys())[:5000]:
+                # Use iterator to avoid full key list copy; trim up to 5000 entries
+                count = 0
+                for old_key in _RATE_LIMIT_MEMORY:
                     old_dq = _RATE_LIMIT_MEMORY.get(old_key)
                     if not old_dq or old_dq[-1] < stale_before:
                         _RATE_LIMIT_MEMORY.pop(old_key, None)
+                    count += 1
+                    if count >= 5000:
+                        break
             return allowed, max(0, limit_i - len(dq))
 
 
@@ -11843,7 +12139,7 @@ def ask_huggingface_ocr(image_data: bytes) -> str:
     raise _friendly_ocr_error(errors)
 
 
-def ask_gemini_ocr(image_data: bytes, mime_type: str = "image/jpeg") -> str:
+async def ask_gemini_ocr(image_data: bytes, mime_type: str = "image/jpeg") -> str:
     if _gemini is None:
         raise RuntimeError("Gemini OCR is not configured. Set GEMINI_API_KEY; GEMINI_MODEL optional.")
     if not image_data:
@@ -11854,7 +12150,7 @@ def ask_gemini_ocr(image_data: bytes, mime_type: str = "image/jpeg") -> str:
         "and Japanese exactly. Keep useful line breaks. If there is no readable text, "
         "output only NOTEXT. Do not describe the image and do not add explanations."
     )
-    response = _gemini.models.generate_content(
+    response = await _gemini.aio.models.generate_content(
         model=GEMINI_MODEL,
         contents=[
             _gtypes.Part.from_bytes(data=image_data, mime_type=mime_type or "image/jpeg"),
@@ -11865,16 +12161,39 @@ def ask_gemini_ocr(image_data: bytes, mime_type: str = "image/jpeg") -> str:
     return text or "NOTEXT"
 
 
-def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tuple[str, str, str]:
-    """Unified OCR with provider fallback. Returns (text, provider, model).
+def ask_local_ocr(image_data: bytes) -> str:
+    """Local OCR fallback supporting pytesseract (Tesseract) safely without blocking or high RAM consumption."""
+    if not image_data:
+        raise RuntimeError("Empty image data.")
+    
+    # Try pytesseract first (lightweight C++ binary wrapper, safe for low-RAM Pterodactyl hosting)
+    try:
+        import pytesseract
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(image_data))
+        try:
+            text = pytesseract.image_to_string(img, lang='khm+eng')
+        except Exception:
+            try:
+                text = pytesseract.image_to_string(img, lang='eng')
+            except Exception:
+                text = pytesseract.image_to_string(img)
+        text = (text or "").strip()
+        if text:
+            return text
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning("Pytesseract local OCR failed: %s", e)
 
-    v27 fixes:
-    - auto mode can prefer Gemini first to avoid Render/HF DNS failures.
-    - unavailable providers are recorded clearly instead of producing confusing
-      fallback logs when a fallback is not configured.
-    - temporarily disabled providers are skipped quickly until cooldown ends.
-    - unknown runtime provider values fall back to the safe Gemini default.
-    """
+    # Note: EasyOCR is intentionally disabled by default in low-RAM environments (Pterodactyl)
+    # because PyTorch model loading consumes > 1GB RAM and causes container OOM crashes.
+    raise RuntimeError("Local OCR (Tesseract) failed or is not installed. Please install tesseract-ocr and tesseract-ocr-khm on your server.")
+
+
+async def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tuple[str, str, str]:
+    """Unified OCR with provider fallback (including local offline OCR). Returns (text, provider, model)."""
     if not image_data:
         raise RuntimeError("Empty image data.")
 
@@ -11884,6 +12203,17 @@ def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tuple[str
     from app.services.ai.providers import get_provider_manager
 
     provider_manager = get_provider_manager()
+    
+    # If user wants local or explicitly forces local
+    if provider in {"local", "tesseract", "easyocr"}:
+        try:
+            started = time.perf_counter()
+            text = await asyncio.to_thread(ask_local_ocr, image_data)
+            return text, "local", "tesseract-or-easyocr"
+        except Exception as e:
+            errors.append(f"local={type(e).__name__}: {e!r}")
+            raise _friendly_ocr_error(errors)
+
     configured_order = _ocr_provider_order(provider)
     manager_names = [
         "huggingface" if name == "hf" else name
@@ -11897,12 +12227,24 @@ def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tuple[str
         order = [
             "hf" if name == "huggingface" else name
             for name in routed_names
-            if name in {"gemini", "huggingface"}
+            if name in {"gemini", "huggingface", "local"}
         ]
+        # Always allow local as a final offline fallback in auto mode
+        if "local" not in order:
+            order.append("local")
     else:
         order = configured_order
 
     for item in order:
+        if item == "local":
+            try:
+                started = time.perf_counter()
+                text = await asyncio.to_thread(ask_local_ocr, image_data)
+                return text, "local", "tesseract-or-easyocr"
+            except Exception as e:
+                errors.append(f"local={type(e).__name__}: {e!r}")
+                continue
+
         if item == "gemini":
             if _gemini is None or not GEMINI_MODEL:
                 errors.append("gemini=not configured: set GEMINI_API_KEY; GEMINI_MODEL optional")
@@ -11912,7 +12254,7 @@ def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tuple[str
                 continue
             try:
                 started = time.perf_counter()
-                text = ask_gemini_ocr(image_data, mime_type)
+                text = await ask_gemini_ocr(image_data, mime_type)
                 _mark_ocr_provider_success("gemini")
                 provider_manager.record_success(
                     "gemini",
@@ -11965,15 +12307,16 @@ def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tuple[str
     raise _friendly_ocr_error(errors)
 
 
-def ai_text_reply(prompt: str, history: list[dict] | None = None) -> tuple[str, str, int | None]:
-    """Return (reply, model_used, tokens_used) for text-only chat."""
+async def ai_text_reply(prompt: str, history: list[dict] | None = None) -> tuple[str, str, int | None]:
+    """Return (reply, model_used, tokens_used) for text-only chat (Async)."""
     from app.services.ai.providers import get_provider_manager
 
     configured = (AI_PROVIDER or "hf").lower().strip()
     preferred = ["huggingface" if configured == "hf" else "gemini"]
 
-    def execute(provider_name: str) -> tuple[str, str, int | None]:
+    async def execute(provider_name: str) -> tuple[str, str, int | None]:
         if provider_name == "huggingface":
+            # For now, HF remains sync but run in thread by ProviderManager.execute
             reply = ask_huggingface(prompt, history)
             return reply, HF_MODEL, None
         if provider_name != "gemini":
@@ -11988,7 +12331,7 @@ def ai_text_reply(prompt: str, history: list[dict] | None = None) -> tuple[str, 
             image_mime="",
             audio_mime="",
         )
-        response = _gemini.models.generate_content(
+        response = await _gemini.aio.models.generate_content(
             model=GEMINI_MODEL,
             contents=contents,
             config=_ai_gen_config(),
@@ -12001,7 +12344,7 @@ def ai_text_reply(prompt: str, history: list[dict] | None = None) -> tuple[str, 
             raise RuntimeError("Gemini returned an empty response.")
         return reply, GEMINI_MODEL, tokens_used
 
-    result, _provider_name = get_provider_manager().execute_sync(
+    result, _provider_name = await get_provider_manager().execute(
         "ai",
         execute,
         preferred=preferred,
@@ -12017,7 +12360,7 @@ def _init_clients() -> None:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     SB_URL             = os.getenv("SUPABASE_URL", "")
     SB_KEY             = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY", "")
-    REDIS_URL          = os.getenv("REDIS_URL", "").strip()
+    REDIS_URL          = os.getenv("REDIS_URL", "").strip() if _redis_enabled() else ""
     GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
     # Code default: DEFAULT_GEMINI_MODEL. Env values are optional overrides only.
     GEMINI_MODEL       = (os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_GENAI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
@@ -12094,7 +12437,8 @@ def _init_clients() -> None:
                 logger.warning(f"Redis init failed — cache disabled: {e}")
                 redis_client = None
     else:
-        logger.info("REDIS_URL not set — Redis cache disabled; using memory + Supabase fallback.")
+        reason = "REDIS_ENABLED=false" if not _redis_enabled() else "REDIS_URL not set"
+        logger.info("%s — Redis disabled; using memory + Supabase fallback.", reason)
 
     gemini_sdk_available = bool(GEMINI_API_KEY and GEMINI_MODEL and _load_google_genai_sdk())
     if GEMINI_API_KEY and GEMINI_MODEL and gemini_sdk_available:
@@ -14339,31 +14683,57 @@ def db_history_append(user_id: int, role: str, content: str) -> None:
     _submit_db(_run)
 
 
-def db_history_fetch(user_id: int, limit: int = CONV_HISTORY_LIMIT) -> list[dict]:
-    redis_rows = _redis_get_json_sync(_hist_redis_key(user_id), default=None)
-    if isinstance(redis_rows, list) and redis_rows:
-        return _hist_rows_normalized(redis_rows)[-limit:]
+async def db_history_fetch(user_id: int, limit: int = CONV_HISTORY_LIMIT) -> list[dict]:
+    """Fetch conversation history with Redis cache and Supabase fallback (Async)."""
+    user_id = int(user_id)
+    cache_key = _hist_redis_key(user_id)
+    
+    # Try async Redis first
+    if redis_client_async:
+        try:
+            raw = await redis_client_async.get(cache_key)
+            if raw:
+                redis_rows = _json_loads_fast(raw)
+                if isinstance(redis_rows, list):
+                    return _hist_rows_normalized(redis_rows)[-limit:]
+        except Exception as e:
+            logger.warning("Async Redis history fetch failed: %s", e)
+    else:
+        redis_rows = _redis_get_json_sync(cache_key, default=None)
+        if isinstance(redis_rows, list) and redis_rows:
+            return _hist_rows_normalized(redis_rows)[-limit:]
 
-    if not supabase:
+    if not supabase_async and not supabase:
         return []
 
-    res = db_call_sync(
-        f"history_fetch:{user_id}",
-        lambda: supabase.table("conversation_history")
-            .select("role, content, created_at")
-            .eq("user_id", user_id)
-            .order("created_at", desc=True)
-            .limit(limit)
-            .execute(),
-        default=None,
-        attempts=3,
-        critical=False,
-    )
+    # Fallback to Supabase (prefer async)
+    async def _fetch():
+        if supabase_async:
+            return await supabase_async.table("conversation_history") \
+                .select("role, content, created_at") \
+                .eq("user_id", user_id) \
+                .order("created_at", desc=True) \
+                .limit(limit) \
+                .execute()
+        return supabase.table("conversation_history") \
+            .select("role, content, created_at") \
+            .eq("user_id", user_id) \
+            .order("created_at", desc=True) \
+            .limit(limit) \
+            .execute()
+
+    res = await db_call(f"history_fetch:{user_id}", _fetch, default=None, attempts=3)
 
     rows = list(reversed(getattr(res, "data", None) or [])) if res else []
     clean = _hist_rows_normalized(rows)[-limit:]
     if clean:
-        _hist_redis_save_sync(user_id, clean)
+        if redis_client_async:
+            try:
+                await redis_client_async.set(cache_key, _json_dumps_fast(clean).decode("utf-8"), ex=3600)
+            except Exception:
+                pass
+        else:
+            _hist_redis_save_sync(user_id, clean)
     return clean
 
 
@@ -14672,17 +15042,32 @@ async def _init_async_clients() -> None:
     the guarded DB executor. New FastAPI-native routes can use supabase_async
     when the installed supabase-py version exposes acreate_client().
     """
-    global supabase_async
+    global supabase_async, redis_client_async
     if not SB_URL or not SB_KEY or not _load_supabase_sdk() or acreate_client is None:
         supabase_async = None
-        return
-    try:
-        maybe_client = acreate_client(SB_URL, SB_KEY)
-        supabase_async = await maybe_client if inspect.isawaitable(maybe_client) else maybe_client
-        logger.info("Async Supabase client initialised.")
-    except Exception as e:
-        supabase_async = None
-        logger.warning(f"Async Supabase init unavailable; using guarded sync DB executor: {e}")
+    else:
+        try:
+            maybe_client = acreate_client(SB_URL, SB_KEY)
+            supabase_async = await maybe_client if inspect.isawaitable(maybe_client) else maybe_client
+            logger.info("Async Supabase client initialised.")
+        except Exception as e:
+            supabase_async = None
+            logger.warning(f"Async Supabase init unavailable; using guarded sync DB executor: {e}")
+
+    if not REDIS_URL:
+        redis_client_async = None
+    else:
+        try:
+            import redis.asyncio as aioredis
+            redis_client_async = aioredis.from_url(
+                REDIS_URL,
+                max_connections=int(os.environ.get("REDIS_MAX_CONNECTIONS", 100)),
+                decode_responses=True,
+            )
+            logger.info("Async Redis client initialised.")
+        except Exception as e:
+            redis_client_async = None
+            logger.warning(f"Async Redis init unavailable: {e}")
 
 # ---------------------------------------------------------------------------
 # TTS text resolver (history-aware)
@@ -14700,7 +15085,7 @@ async def resolve_tts_text(
     history = _hist_cache_get(user_id)
     if history is None:
         try:
-            db_rows = await loop.run_in_executor(_DB_EXECUTOR, db_history_fetch, user_id)
+            db_rows = await db_history_fetch(user_id)
             for row in db_rows:
                 _hist_cache_append(user_id, row.get("role", "user"), row.get("content", ""))
             history = db_rows
@@ -14799,9 +15184,7 @@ async def resolve_tts_text(
 
     async def _guarded_call():
         async with semaphore:
-            def _call():
-                return _gemini.models.generate_content(model=GEMINI_MODEL, contents=combined)
-            return await loop.run_in_executor(_AI_EXECUTOR, _call)
+            return await _gemini.aio.models.generate_content(model=GEMINI_MODEL, contents=combined)
 
     try:
         response = await asyncio.wait_for(_guarded_call(), timeout=CONV_RESOLVE_TIMEOUT_S)
@@ -14977,82 +15360,76 @@ def _telegram_leader_store_available() -> bool:
     return bool(globals().get("redis_client") is not None or globals().get("supabase") is not None)
 
 
-def _telegram_leader_acquire_sync() -> bool:
-    """Acquire/renew active Telegram ownership. Redis is preferred; Supabase is fallback."""
+async def _telegram_leader_acquire() -> bool:
+    """Acquire/renew active Telegram ownership (Async). Redis is preferred; Supabase is fallback."""
     global _TELEGRAM_LEADER_LAST_ERROR
     if not _telegram_leader_lock_enabled():
         return True
 
     owner = _telegram_leader_owner_id()
     ttl = _telegram_leader_ttl_s()
+    leader_store = str(os.environ.get("TELEGRAM_LEADER_STORE", "auto")).lower().strip()
 
-    if redis_client is not None:
+    # 1. Try Redis (prefer async client)
+    r_client = redis_client_async or redis_client
+    if r_client is not None and leader_store in {"auto", "redis"}:
         key = _telegram_leader_redis_lock_key()
         meta_key = _telegram_leader_redis_meta_key()
         try:
-            ok = redis_call_sync(
-                "telegram_leader_set_nx",
-                lambda: redis_client.set(key, owner, ex=ttl, nx=True),
-                default=False,
-                attempts=2,
-                critical=False,
-            )
-            current = None
-            if ok:
-                current = owner
+            # Atomic SET NX
+            if hasattr(r_client, "set"):
+                if inspect.iscoroutinefunction(r_client.set):
+                    ok = await r_client.set(key, owner, ex=ttl, nx=True)
+                else:
+                    ok = r_client.set(key, owner, ex=ttl, nx=True)
             else:
-                current = redis_call_sync(
-                    "telegram_leader_get",
-                    lambda: redis_client.get(key),
-                    default=None,
-                    attempts=2,
-                    critical=False,
-                )
+                ok = False
+
+            current = owner if ok else None
+            if not ok:
+                if hasattr(r_client, "get"):
+                    if inspect.iscoroutinefunction(r_client.get):
+                        current = await r_client.get(key)
+                    else:
+                        current = r_client.get(key)
                 if isinstance(current, bytes):
                     current = current.decode("utf-8", errors="ignore")
 
             if hmac.compare_digest(str(current or ""), owner):
-                # Renew only if the lock still belongs to this process.
-                redis_call_sync(
-                    "telegram_leader_expire",
-                    lambda: redis_client.expire(key, ttl),
-                    default=False,
-                    attempts=2,
-                    critical=False,
-                )
-                redis_call_sync(
-                    "telegram_leader_meta",
-                    lambda: redis_client.set(meta_key, _json_dumps_fast(_telegram_leader_meta()).decode("utf-8"), ex=ttl),
-                    default=False,
-                    attempts=1,
-                    critical=False,
-                )
+                # Renew
+                meta = _json_dumps_fast(_telegram_leader_meta()).decode("utf-8")
+                if inspect.iscoroutinefunction(r_client.expire):
+                    await r_client.expire(key, ttl)
+                    await r_client.set(meta_key, meta, ex=ttl)
+                else:
+                    r_client.expire(key, ttl)
+                    r_client.set(meta_key, meta, ex=ttl)
                 _TELEGRAM_LEADER_LAST_ERROR = ""
                 return True
             _TELEGRAM_LEADER_LAST_ERROR = f"owned_by:{str(current or '')[:120]}"
             return False
         except Exception as exc:
-            _TELEGRAM_LEADER_LAST_ERROR = f"redis:{type(exc).__name__}:{str(exc)[:160]}"
+            _TELEGRAM_LEADER_LAST_ERROR = f"redis:{type(exc).__name__}"
             _log_once(logging.WARNING, "telegram_leader_redis_failed", "Telegram leader Redis lock failed: %s", exc)
 
-    if supabase is not None:
-        ok = db_named_lock_acquire(_telegram_leader_lock_key(), owner, ttl)
+    # 2. Try Supabase (prefer async client)
+    s_client = supabase_async or supabase
+    if s_client is not None and leader_store in {"auto", "supabase"}:
+        lock_key = _telegram_leader_lock_key()
+        async def _db_acquire():
+            if supabase_async:
+                # Use the stored procedure for atomic lock
+                res = await supabase_async.rpc("acquire_bot_lock", {"l_key": lock_key, "l_owner": owner, "l_ttl": ttl}).execute()
+                return bool(getattr(res, "data", False))
+            return db_named_lock_acquire(lock_key, owner, ttl)
+
+        ok = await db_call("leader_acquire", _db_acquire, default=False, attempts=2)
         _TELEGRAM_LEADER_LAST_ERROR = "" if ok else "supabase:not_owner"
         return bool(ok)
 
-    _TELEGRAM_LEADER_LAST_ERROR = "no_redis_or_supabase"
+    _TELEGRAM_LEADER_LAST_ERROR = "no_store"
     if _telegram_leader_require_store():
-        _log_once(
-            logging.ERROR,
-            "telegram_leader_no_store_required",
-            "Two-server Telegram mode requires REDIS_URL or Supabase bot_locks table. This instance stays standby.",
-        )
         return False
-    _log_once(
-        logging.WARNING,
-        "telegram_leader_no_store_single",
-        "Telegram leader lock store unavailable; continuing as single active instance because TELEGRAM_ACTIVE_LOCK_REQUIRED=0.",
-    )
     return True
 
 
@@ -15148,6 +15525,34 @@ def _telegram_webhook_signature() -> tuple[Any, ...]:
     )
 
 
+async def _clean_memory_caches_task():
+    """Periodically clear expired entries from in-memory caches to prevent leaks."""
+    while True:
+        try:
+            await asyncio.sleep(60)
+            now = time.time()
+            now_mono = time.monotonic()
+            
+            # 1. Clean Rate Limit Memory
+            with _RATE_LIMIT_MEMORY_LOCK:
+                with _RATE_LIMIT_MEMORY_THREAD_LOCK:
+                    stale_keys = [
+                        k for k, dq in _RATE_LIMIT_MEMORY.items() 
+                        if not dq or dq[-1] < (now - 600) # 10 min stale
+                    ]
+                    for k in stale_keys:
+                        _RATE_LIMIT_MEMORY.pop(k, None)
+            
+            # 2. Clean Webhook Replay Memory
+            with _WEBHOOK_UPDATE_MEMORY_LOCK:
+                ttl = _webhook_replay_ttl_seconds()
+                _trim_webhook_memory_locked(now_mono, ttl)
+                
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("Memory cleanup task error: %s", e)
+
 async def _telegram_leader_refresh_once(app_obj: Any | None = None) -> bool:
     """Renew/acquire Telegram active ownership and configure webhook once per owner."""
     global _TELEGRAM_LEADER_OWNED, _TELEGRAM_LEADER_LAST_CHANGE_AT, _TELEGRAM_LEADER_LAST_RENEW_AT
@@ -15182,8 +15587,7 @@ async def _telegram_leader_refresh_once(app_obj: Any | None = None) -> bool:
 
         return True
 
-    loop = asyncio.get_running_loop()
-    acquired = await loop.run_in_executor(None, _telegram_leader_acquire_sync)
+    acquired = await _telegram_leader_acquire()
     now = time.monotonic()
     if not acquired:
         if _TELEGRAM_LEADER_OWNED:
@@ -16043,6 +16447,8 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔑 API Keys", callback_data="admin_api"),
          InlineKeyboardButton("🕘 History", callback_data="admin_history")],
         [InlineKeyboardButton("📱 Compact", callback_data="admin_compact"),
+         InlineKeyboardButton("🧹 Clean Redis", callback_data="admin_clean_redis")],
+        [InlineKeyboardButton("👷 Active Tasks", callback_data="admin_active_tasks"),
          InlineKeyboardButton("🔄 Refresh", callback_data="admin_home")],
         [InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ]
@@ -18334,14 +18740,11 @@ async def _gemini_generate_with_retry(
     for attempt in range(1, attempts + 1):
         try:
             async with semaphore:
-                def _call():
-                    return _gemini.models.generate_content(
+                return await asyncio.wait_for(
+                    _gemini.aio.models.generate_content(
                         model=GEMINI_MODEL,
                         contents=contents,
-                    )
-
-                return await asyncio.wait_for(
-                    loop.run_in_executor(_AI_EXECUTOR, _call),
+                    ),
                     timeout=timeout_s,
                 )
         except asyncio.TimeoutError as exc:
@@ -18376,7 +18779,7 @@ async def transcribe_voice(ogg_path: str) -> str:
         raise RuntimeError(f"Cannot read voice file: {exc}") from exc
 
     prompt = (
-        "Transcribe this audio exactly as spoken. "
+        "Transcribe this audio exactly as spoken, with special emphasis on accurate Khmer vocabulary, grammar, and loanwords. "
         "Output ONLY the transcribed text — no labels, no explanation. "
         "Support Khmer, English, Chinese, Korean, Japanese, Hindi, Malay, Indonesian, Filipino, and Arabic."
     )
@@ -18386,7 +18789,7 @@ async def transcribe_voice(ogg_path: str) -> str:
             prompt,
         ],
         timeout_s=60,
-        operation="Gemini voice transcription",
+        operation="Gemini Khmer voice transcription",
     )
     return (response.text or "").strip()
 
@@ -18400,7 +18803,7 @@ async def transcribe_audio_file(file_path: str, mime_type: str) -> str:
         raise RuntimeError(f"Cannot read audio file: {exc}") from exc
 
     prompt = (
-        "Transcribe this audio exactly as spoken. "
+        "Transcribe this audio exactly as spoken, with special emphasis on accurate Khmer vocabulary, grammar, and loanwords. "
         "Output ONLY the transcribed text — no labels, no explanation. "
         "Support Khmer, English, Chinese, Korean, Japanese, Hindi, Malay, Indonesian, Filipino, and Arabic."
     )
@@ -18410,7 +18813,7 @@ async def transcribe_audio_file(file_path: str, mime_type: str) -> str:
             prompt,
         ],
         timeout_s=90,
-        operation="Gemini audio transcription",
+        operation="Gemini Khmer audio transcription",
     )
     return (response.text or "").strip()
 
@@ -18494,9 +18897,8 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
 
     async def _guarded_call():
         async with semaphore:
-            return await loop.run_in_executor(
-                _AI_EXECUTOR, lambda: ask_ocr_image(image_bytes, mime_type)[0]
-            )
+            text_tuple = await ask_ocr_image(image_bytes, mime_type)
+            return text_tuple[0]
 
     try:
         return await asyncio.wait_for(_guarded_call(), timeout=OCR_TIMEOUT_SECONDS)
@@ -18661,10 +19063,11 @@ async def _deliver_paged_tts(
 # Keyboard builders
 # ---------------------------------------------------------------------------
 def get_welcome_kb() -> InlineKeyboardMarkup:
+    """Polished, structured welcome keyboard with clear visual hierarchy."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚙️ ការកំណត់របស់ខ្ញុំ", callback_data="myprefs_open")],
-        [InlineKeyboardButton("📢 ចូលរួមឆានែល", url=CHANNEL_URL),
-         InlineKeyboardButton("💖 គាំទ្រ", url=SUPPORT_URL)],
+        [InlineKeyboardButton("⚙️ ការកំណត់ និងកែសំឡេង", callback_data="myprefs_open")],
+        [InlineKeyboardButton("📢 ឆានែលផ្លូវការ", url=CHANNEL_URL),
+         InlineKeyboardButton("💖 ជំនួយ & គាំទ្រ", url=SUPPORT_URL)],
     ])
 
 
@@ -18692,7 +19095,7 @@ def _myprefs_text(prefs: dict[str, Any], notice: str = "") -> str:
 
 
 def get_myprefs_kb(prefs: dict[str, Any]) -> InlineKeyboardMarkup:
-    """Preference-only controls that never regenerate an older voice."""
+    """Clean, well-structured preference keyboard with intuitive grid layout."""
     gender = str(prefs.get("gender") or "female")
     try:
         speed = float(prefs.get("speed") or DEFAULT_SPEED)
@@ -18709,16 +19112,16 @@ def get_myprefs_kb(prefs: dict[str, Any]) -> InlineKeyboardMarkup:
     model_label = TTS_MODEL_OPTIONS.get(model_key, TTS_MODEL_OPTIONS["auto"])[0]
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(
-            "👩 ស្រី" + (" ✅" if gender == "female" else ""),
+            "👩 សំឡេងស្រី" + (" ✅" if gender == "female" else ""),
             callback_data="myprefs_gender:female",
         ), InlineKeyboardButton(
-            "👨 ប្រុស" + (" ✅" if gender == "male" else ""),
+            "👨 សំឡេងប្រុស" + (" ✅" if gender == "male" else ""),
             callback_data="myprefs_gender:male",
         )],
         speed_row,
-        [InlineKeyboardButton(f"🤖 ម៉ូដែល៖ {model_label}", callback_data="myprefs_models")],
-        [InlineKeyboardButton("📢 ចូលរួមឆានែល", url=CHANNEL_URL),
-         InlineKeyboardButton("💖 គាំទ្រ", url=SUPPORT_URL)],
+        [InlineKeyboardButton(f"🤖 ម៉ូដែល TTS: {model_label}", callback_data="myprefs_models")],
+        [InlineKeyboardButton("📢 ឆានែលផ្លូវការ", url=CHANNEL_URL),
+         InlineKeyboardButton("💖 ជំនួយ & គាំទ្រ", url=SUPPORT_URL)],
         [InlineKeyboardButton("🔄 ផ្ទុកឡើងវិញ", callback_data="myprefs_open"),
          InlineKeyboardButton("❌ បិទ", callback_data="myprefs_close")],
     ])
@@ -18738,15 +19141,16 @@ def get_myprefs_model_kb(current_model: str = "auto") -> InlineKeyboardMarkup:
 
 
 def get_main_kb(gender: str, tts_model: str = "auto") -> InlineKeyboardMarkup:
+    """Clean 2x2 grid layout for primary bot controls."""
     f_btn = "👩 សំឡេងស្រី" + (" ✅" if gender == "female" else "")
     m_btn = "👨 សំឡេងប្រុស" + (" ✅" if gender == "male" else "")
     model_key = _normalize_tts_model(tts_model)
-    model_btn = f"🤖 ម៉ូដែល TTS: {TTS_MODEL_OPTIONS.get(model_key, TTS_MODEL_OPTIONS['auto'])[0]}"
+    model_name = TTS_MODEL_OPTIONS.get(model_key, TTS_MODEL_OPTIONS['auto'])[0]
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f_btn, callback_data="tg_female"),
          InlineKeyboardButton(m_btn, callback_data="tg_male")],
-        [InlineKeyboardButton("🎚️ ល្បឿនសំឡេង", callback_data="show_speed")],
-        [InlineKeyboardButton(model_btn, callback_data="show_tts_model")],
+        [InlineKeyboardButton("🎚️ ល្បឿនសំឡេង", callback_data="show_speed"),
+         InlineKeyboardButton(f"🤖 {model_name}", callback_data="show_tts_model")],
     ])
 
 
@@ -21463,6 +21867,51 @@ async def _admin_smart_alert_lines(counts: dict | None = None) -> list[str]:
     return list(dict.fromkeys(alerts))[:5]
 
 
+def get_admin_active_tasks_kb(broadcast_jobs: list[tuple[str, dict]]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for jid, row in broadcast_jobs[:8]:
+        status = str(row.get("status") or "").lower()
+        short_id = jid[:8]
+        rows.append([
+            InlineKeyboardButton(f"❌ Cancel #{short_id}", callback_data=f"admin_cancel_task:{jid}")
+        ])
+    rows.append([
+        InlineKeyboardButton("🔄 Refresh", callback_data="admin_active_tasks"),
+        InlineKeyboardButton("⬅️ Admin Home", callback_data="admin_home"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _admin_active_tasks_data() -> tuple[str, InlineKeyboardMarkup]:
+    """Show currently running broadcast jobs, schedules, DB queue status, and background loops with cancel actions."""
+    broadcast_jobs = []
+    with suppress(Exception):
+        active_states = {"queued", "running", "paused", "cancelling"}
+        with _WEB_BROADCAST_JOBS_LOCK:
+            for jid, row in _WEB_BROADCAST_JOBS.items():
+                if str(row.get("status") or "").lower() in active_states:
+                    broadcast_jobs.append((jid, row))
+
+    bc_text = "\n".join(
+        f"• <code>{jid[:8]}</code>: <b>{row.get('status')}</b> (Sent: {row.get('sent', 0)}/{row.get('total', 0)})"
+        for jid, row in broadcast_jobs[:10]
+    ) if broadcast_jobs else "• No active broadcast jobs"
+
+    db_queue = 0
+    with suppress(Exception):
+        db_queue = int(_db_executor_queue_size())
+
+    text = (
+        "👷 <b>Active Bot Tasks & Workflows</b>\n\n"
+        f"🧵 DB Executor Queue: <b>{db_queue} pending</b>\n"
+        f"📢 Active Broadcast Jobs: <b>{len(broadcast_jobs)}</b>\n\n"
+        "<b>Broadcast Queue Details:</b>\n"
+        f"{bc_text}\n\n"
+        "Click cancel below to terminate any running broadcast job."
+    )
+    return text, get_admin_active_tasks_kb(broadcast_jobs)
+
+
 async def _admin_compact_text(admin_id: int) -> str:
     counts = await _admin_summary_counts(admin_id)
     mode = _run_state_bot_mode() if "_run_state_bot_mode" in globals() else str(globals().get("BOT_MODE", "POLLING"))
@@ -23087,6 +23536,29 @@ async def cmd_runtime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ))
 
 
+async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    del context
+    from app.services.monitoring import discover_public_url
+    from app.services.build_info import get_build_info
+
+    build = get_build_info(role=os.getenv("PROCESS_ROLE", "combined"))
+    public_url = discover_public_url().get("url") or "not detected"
+    message = (
+        "<b>Bot version</b>\n\n"
+        f"Version: <code>{html.escape(str(build['version']))}</code>\n"
+        f"Commit: <code>{html.escape(str(build.get('commit_short') or '-'))}</code>\n"
+        f"Role: <code>{html.escape(str(build['process_role']))}</code>\n"
+        f"Mode: <code>{html.escape(str(_run_state_bot_mode()))}</code>\n"
+        f"Built at: <code>{html.escape(str(build.get('deployed_at') or '-'))}</code>\n"
+        f"Public URL: <code>{html.escape(str(public_url))}</code>"
+    )
+    await safe_send(lambda: update.effective_message.reply_text(
+        message,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    ))
+
+
 @admin_only
 async def cmd_botsettings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings, status = await get_bot_settings_async(force=True)
@@ -23636,6 +24108,39 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         ))
         return
 
+    if data == "admin_active_tasks":
+        text, kb = await _admin_active_tasks_data()
+        await safe_send(lambda: query.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        ))
+        return
+
+    if data.startswith("admin_cancel_task:"):
+        target_jid = data.split(":", 1)[1].strip()
+        cancelled_ok = False
+        with suppress(Exception):
+            with _WEB_BROADCAST_JOBS_LOCK:
+                if target_jid in _WEB_BROADCAST_JOBS:
+                    _WEB_BROADCAST_JOBS[target_jid]["status"] = "cancelled"
+                    _WEB_BROADCAST_JOBS[target_jid]["finished_at"] = _sched_iso()
+                    cancelled_ok = True
+        
+        with suppress(Exception):
+            await query.answer("✅ កិច្ចការត្រូវបានលុបចោល (Cancelled)!" if cancelled_ok else "⚠️ រកមិនឃើញកិច្ចการនេះទេ", show_alert=True)
+
+        text, kb = await _admin_active_tasks_data()
+        with suppress(Exception):
+            await query.message.edit_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+        return
+
     if data == "admin_stats":
         text = await _admin_stats_text(user_id)
         await safe_send(lambda: query.message.edit_text(
@@ -23696,6 +24201,61 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
             reply_markup=get_runtime_admin_kb(),
             disable_web_page_preview=True,
         ))
+        return
+
+    if data == "admin_clean_redis":
+        try:
+            client = redis_client_async or redis_client
+            count = 0
+            if client is not None:
+                keys_to_del = []
+                try:
+                    if hasattr(client, "scan_iter"):
+                        # Check if redis_client_async or sync redis client
+                        try:
+                            # Try async iteration first if client is async
+                            async for k in client.scan_iter(match="tgbot:*", count=100):
+                                keys_to_del.append(k)
+                        except TypeError:
+                            # Fallback to sync iteration
+                            for k in client.scan_iter(match="tgbot:*", count=100):
+                                keys_to_del.append(k)
+                    elif hasattr(client, "keys"):
+                        res = client.keys("tgbot:*")
+                        if inspect.iscoroutine(res):
+                            keys_to_del = await res
+                        else:
+                            keys_to_del = res
+                    
+                    if keys_to_del:
+                        try:
+                            if inspect.iscoroutinefunction(getattr(client, "delete", None)):
+                                await client.delete(*keys_to_del)
+                            else:
+                                res_del = client.delete(*keys_to_del)
+                                if inspect.iscoroutine(res_del):
+                                    await res_del
+                        except Exception:
+                            for k in keys_to_del:
+                                with suppress(Exception):
+                                    res_one = client.delete(k)
+                                    if inspect.iscoroutine(res_one):
+                                        await res_one
+                        count = len(keys_to_del)
+                except Exception as ex:
+                    logger.warning("Redis scan/delete error: %s", ex)
+
+            with suppress(Exception):
+                await query.answer(f"🧹 បានសម្អាត Redis Cache រួចរាល់ ({count} keys)!", show_alert=True)
+            text = await _admin_home_text(user_id, title=f"🧹 Redis Cleaned Successfully ({count} keys removed)")
+            await safe_send(lambda: query.message.edit_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=get_admin_dashboard_kb(),
+            ))
+        except Exception as e:
+            with suppress(Exception):
+                await query.answer(f"⚠️ សម្អាតမកើត: {e}", show_alert=True)
         return
 
     if data == "admin_welcome_edit":
@@ -24691,41 +25251,126 @@ async def _show_user_full_history(query, user_id: int, back_ref: str = "p0", pag
 
 
 async def _handle_user_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if context.user_data.get("user_search_state") != USER_SEARCH_WAIT_QUERY:
+        if context.user_data.get("user_search_state") != USER_SEARCH_WAIT_QUERY:
+            return False
+
+        msg = update.message
+        query_text = (msg.text or "").strip()
+        context.user_data.pop("user_search_state", None)
+
+        if not query_text:
+            await safe_send(lambda: msg.reply_text(
+                '⚠️ ពាក្យស្វែងរកទទេ។ សូមចុច /users ហើយព្យាយាមម្ដងទៀត។',
+                reply_markup=get_user_search_prompt_kb(),
+            ))
+            return True
+
+        results = await asyncio.get_running_loop().run_in_executor(
+            _DB_EXECUTOR,
+            lambda: search_users_by_query(query_text),
+        )
+        context.user_data["users_search_query"] = query_text
+        context.user_data["users_search_results"] = results
+
+        if not results:
+            await safe_send(lambda: msg.reply_text(
+                f'🔎 <b>ស្វែងរកអ្នកប្រើប្រាស់</b>\n\nរកមិនឃើញអ្នកប្រើប្រាស់សម្រាប់៖ <code>{html.escape(query_text)}</code>\n\nការស្វែងរកគាំទ្រលេខសម្គាល់ និងឈ្មោះអ្នកប្រើប្រាស់ Telegram។',
+                parse_mode="HTML",
+                reply_markup=get_user_search_prompt_kb(),
+            ))
+            return True
+
+        await safe_send(lambda: msg.reply_text(
+            f'🔎 <b>លទ្ធផលស្វែងរកអ្នកប្រើប្រាស់</b>\n\nពាក្យស្វែងរក៖ <code>{html.escape(query_text)}</code>\nរកឃើញ៖ <b>{len(results)}</b> នាក់\n\nសូមជ្រើសរើសអ្នកប្រើប្រាស់ ដើម្បីមើលព័ត៌មានលម្អិត។',
+            parse_mode="HTML",
+            reply_markup=get_user_search_page_kb(results, page=0),
+        ))
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Admin-Only AI Chat Assistant & Message Edit/Delete Management
+# ---------------------------------------------------------------------------
+ADMIN_AI_CHAT_STATE = "admin_ai_chat_waiting"
+
+async def admin_ai_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Exclusive AI chat assistant for administrators only."""
+    user = update.effective_user
+    if not user or not _is_admin(user.id):
+        if update.message:
+            await safe_send(lambda: update.message.reply_text("⛔ មុខងារនេះសម្រាប់តែ Administrator ប៉ុណ្ណោះ។"))
+        return
+
+    context.user_data[ADMIN_AI_CHAT_STATE] = True
+    await safe_send(lambda: update.message.reply_text(
+        "🤖 <b>Admin AI Chat Assistant (Private Mode)</b>\n\n"
+        "សូមផ្ញើសំណួរ ឬបញ្ជាមកកាន់ AI ខាងក្រោម។ មានតែអ្នកជា Admin ប៉ុណ្ណោះដែលមើលឃើញ និងប្រើប្រាស់បាន។\n\n"
+        "ចុច /cancelforadmin ដើម្បីចាកចេញពីរបៀបជជែកជាមួយ AI។",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ បិទ / ចាកចេញ", callback_data="admin_ai_exit")]]),
+    ))
+
+async def handle_admin_ai_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not context.user_data.get(ADMIN_AI_CHAT_STATE):
+        return False
+    user = update.effective_user
+    if not user or not _is_admin(user.id):
+        context.user_data.pop(ADMIN_AI_CHAT_STATE, None)
         return False
 
     msg = update.message
-    query_text = (msg.text or "").strip()
-    context.user_data.pop("user_search_state", None)
+    if not msg or not msg.text:
+        return False
 
-    if not query_text:
-        await safe_send(lambda: msg.reply_text(
-            '⚠️ ពាក្យស្វែងរកទទេ។ សូមចុច /users ហើយព្យាយាមម្ដងទៀត។',
-            reply_markup=get_user_search_prompt_kb(),
-        ))
+    text = msg.text.strip()
+    if text in {"/cancel", "/cancelforadmin", "exit"}:
+        context.user_data.pop(ADMIN_AI_CHAT_STATE, None)
+        await safe_send(lambda: msg.reply_text("✅ បានចាកចេញពី Admin AI Chat Assistant."))
         return True
 
-    results = await asyncio.get_running_loop().run_in_executor(
-        _DB_EXECUTOR,
-        lambda: search_users_by_query(query_text),
-    )
-    context.user_data["users_search_query"] = query_text
-    context.user_data["users_search_results"] = results
-
-    if not results:
-        await safe_send(lambda: msg.reply_text(
-            f'🔎 <b>ស្វែងរកអ្នកប្រើប្រាស់</b>\n\nរកមិនឃើញអ្នកប្រើប្រាស់សម្រាប់៖ <code>{html.escape(query_text)}</code>\n\nការស្វែងរកគាំទ្រលេខសម្គាល់ និងឈ្មោះអ្នកប្រើប្រាស់ Telegram។',
-            parse_mode="HTML",
-            reply_markup=get_user_search_prompt_kb(),
-        ))
-        return True
-
-    await safe_send(lambda: msg.reply_text(
-        f'🔎 <b>លទ្ធផលស្វែងរកអ្នកប្រើប្រាស់</b>\n\nពាក្យស្វែងរក៖ <code>{html.escape(query_text)}</code>\nរកឃើញ៖ <b>{len(results)}</b> នាក់\n\nសូមជ្រើសរើសអ្នកប្រើប្រាស់ ដើម្បីមើលព័ត៌មានលម្អិត។',
-        parse_mode="HTML",
-        reply_markup=get_user_search_page_kb(results, page=0),
-    ))
+    # Send processing status and reply via AI
+    sent = await safe_send(lambda: msg.reply_text("🤖 AI កំពុងគិត..."))
+    try:
+        reply, model, tokens = await ai_text_reply(text)
+        response_text = f"🤖 <b>Admin AI ({model}):</b>\n\n{reply}"
+        if sent:
+            await safe_send(lambda: sent.edit_text(response_text, parse_mode="HTML"))
+        else:
+            await safe_send(lambda: msg.reply_text(response_text, parse_mode="HTML"))
+    except Exception as e:
+        err_msg = f"⚠️ AI Error: {e}"
+        if sent:
+            await safe_send(lambda: sent.edit_text(err_msg))
+        else:
+            await safe_send(lambda: msg.reply_text(err_msg))
     return True
+
+
+async def admin_message_edit_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin tool to edit or delete bot messages dynamically."""
+    query = update.callback_query
+    if not query:
+        return
+    user = query.from_user
+    if not user or not _is_admin(user.id):
+        with suppress(Exception):
+            await query.answer("⛔ អ្នកមិនមានសិទ្ធិគ្រប់គ្រងសារទេ។", show_alert=True)
+        return
+
+    data = query.data or ""
+    if data == "admin_ai_exit":
+        context.user_data.pop(ADMIN_AI_CHAT_STATE, None)
+        with suppress(Exception):
+            await query.message.edit_text("✅ បានបិទ Admin AI Assistant។")
+        return
+
+    if data.startswith("admin_del_msg:"):
+        try:
+            with suppress(Exception):
+                await query.message.delete()
+            await query.answer("🗑️ បានលុបសារដោយជោគជ័យ។")
+        except Exception as e:
+            await query.answer(f"⚠️ លុបមិនកើត: {e}", show_alert=True)
 
 
 async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -26331,6 +26976,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = int(user.id)
 
     if _is_admin(user_id):
+        if await handle_admin_ai_chat_message(update, context):
+            return
         if await _handle_feature_request_admin_reply_text(update, context):
             return
         if await _handle_runtime_admin_text(update, context):
@@ -26421,6 +27068,29 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except BaseException:
         _release_tts_request(user_id)
         raise
+
+    if _env_bool("DURABLE_TTS_ENABLED", True):
+        try:
+            from app.services.jobs.submission import submit_tts_job
+            loop = asyncio.get_running_loop()
+            tts_text = await resolve_tts_text(user_id, stripped, loop)
+            prefs = await get_user_prefs_async(user_id)
+            await submit_tts_job(
+                chat_id=msg.chat_id,
+                user_id=user_id,
+                text=tts_text or stripped,
+                gender=prefs["gender"],
+                speed=prefs["speed"],
+                tts_model=prefs.get("tts_model", "auto"),
+                reply_to_message_id=int(msg.message_id),
+                idempotency_key=f"telegram:tts:{int(getattr(update, 'update_id', 0) or 0)}:{user_id}",
+            )
+            await progress.finish("✅ ការងារបម្លែងសំឡេងត្រូវបានដាក់ក្នុងជួររង់ចាំ។ អ្នកនឹងទទួលបានសំឡេងក្នុងពេលឆាប់ៗនេះ។")
+            _release_tts_request(user_id)
+            return
+        except Exception as exc:
+            logger.error("Failed to submit durable TTS job: %s", exc)
+
     file_path: str | None = None
     try:
         await progress.update(12, "កំពុងអានការកំណត់របស់អ្នក", "កំពុងជ្រើសសំឡេង ល្បឿន និងម៉ូដែល។", force=True)
@@ -26764,7 +27434,7 @@ async def get_callback_original_text(query, user_id: int) -> str | None:
     try:
         history = _hist_cache_get(user_id)
         if history is None:
-            history = await loop.run_in_executor(_DB_EXECUTOR, db_history_fetch, user_id)
+            history = await db_history_fetch(user_id)
             for row in history or []:
                 _hist_cache_append(user_id, row.get("role", "user"), row.get("content", ""))
 
@@ -27084,11 +27754,8 @@ async def _activate_telegram_application(app_obj: Any) -> tuple[bool, bool]:
             "and this instance owns the active lock."
         )
     else:
-        # Startup may follow a previous webhook deployment; delete it before
-        # long polling to prevent Telegram 409 Conflict. Only the active owner
-        # may do this in two-server mode.
-        with suppress(Exception):
-            await _delete_telegram_webhook_via_http(drop_pending=True)
+        # _telegram_start_polling_runtime verifies deleteWebhook before it
+        # allows getUpdates to start.
         polling_started = await _telegram_start_polling_runtime(app_obj)
         logger.info("Telegram polling started by active owner.")
 
@@ -27192,6 +27859,8 @@ async def _run_bot():
 
     # Commands
     app.add_handler(CommandHandler("start",           on_start))
+    app.add_handler(CommandHandler("adminai",         admin_ai_chat_command))
+    app.add_handler(CommandHandler("cancelforadmin",  admin_ai_chat_command))
     app.add_handler(CommandHandler("help",            on_help))
     app.add_handler(CommandHandler("myprefs",         cmd_myprefs))
     app.add_handler(CommandHandler("ttsmodel",        cmd_ttsmodel))
@@ -27211,6 +27880,7 @@ async def _run_bot():
     app.add_handler(CommandHandler("feedback",        cmd_feature_request))
     app.add_handler(CommandHandler("request_feature", cmd_feature_request))
     app.add_handler(CommandHandler("runtime",         cmd_runtime))
+    app.add_handler(CommandHandler("version",         cmd_version))
     app.add_handler(CommandHandler("api",             cmd_api))
     app.add_handler(CommandHandler("botsettings",     cmd_botsettings))
     app.add_handler(CommandHandler("users",           cmd_users))
@@ -27227,6 +27897,7 @@ async def _run_bot():
     ))
     app.add_handler(CallbackQueryHandler(sched_callback,      pattern=r"^sched_"))
     app.add_handler(CallbackQueryHandler(_runtime_admin_callback, pattern=r"^rtadmin_"))
+    app.add_handler(CallbackQueryHandler(admin_message_edit_delete_callback, pattern=r"^admin_(?:ai_exit|del_msg:|cancel_task:)"))
     app.add_handler(CallbackQueryHandler(on_callback))
 
     # Message handlers
@@ -27295,8 +27966,6 @@ async def _run_bot():
                     await _telegram_stop_polling_runtime(app)
                     polling_started = False
                 elif not polling_started and mode == "POLLING":
-                    with suppress(Exception):
-                        await _delete_telegram_webhook_via_http(drop_pending=True)
                     polling_started = await _telegram_start_polling_runtime(app)
 
                 await asyncio.sleep(1.0)
@@ -27307,7 +27976,7 @@ async def _run_bot():
                 with suppress(Exception):
                     await _telegram_stop_polling_runtime(app)
             with suppress(Exception):
-                await asyncio.to_thread(_telegram_leader_release_sync)
+                await _telegram_leader_release()
             for task in (sched_task, sweep_task):
                 if task is None:
                     continue
@@ -27387,6 +28056,7 @@ async def _async_main_once():
     )
 
     _start_web_broadcast_queue_workers()
+    asyncio.create_task(_clean_memory_caches_task(), name="memory-cleanup")
     keepalive_stop = asyncio.Event()
     telegram_app_task = asyncio.create_task(_run_bot(), name="telegram-bot")
     startup_checks_task = asyncio.create_task(_run_startup_background_checks(), name="startup-background-checks")

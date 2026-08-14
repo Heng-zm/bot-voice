@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import ipaddress
 import json
 import logging
@@ -156,11 +157,19 @@ class DynamicCorsStore:
         redis_client: Any | None = None,
         redis_url: str = "",
         supabase_client: Any | None = None,
+        disable_redis: bool = False,
     ) -> DynamicCorsStore:
         requested_url = str(redis_url).strip()
         with self._load_lock, self._client_lock:
             changed = False
-            if redis_client is not None:
+            if disable_redis:
+                self._close_owned_redis_locked()
+                if self.redis_client is not None or self.redis_url:
+                    changed = True
+                self.redis_client = None
+                self.redis_url = ""
+                self._owns_redis = False
+            elif redis_client is not None:
                 if redis_client is not self.redis_client:
                     self._close_owned_redis_locked()
                     self.redis_client = redis_client
@@ -225,17 +234,37 @@ class DynamicCorsStore:
             return value.decode("utf-8", errors="strict")
         return str(value or "")
 
+    @staticmethod
+    def _resolve_sync(value: Any) -> Any:
+        """Resolve a possible awaitable from a synchronous worker thread."""
+
+        return asyncio.run(value) if inspect.isawaitable(value) else value
+
     def _redis_read_sync(self) -> tuple[list[str] | None, str]:
         client = self._connect_redis_sync()
         if client is None:
             return None, "redis-unavailable"
         try:
-            initialized = bool(client.get(self.redis_initialized_key))
+            op_get = getattr(client, "get", None)
+            if op_get is not None:
+                initialized = bool(
+                    self._resolve_sync(op_get(self.redis_initialized_key))
+                )
+            else:
+                initialized = False
+
             if not initialized:
                 return None, "redis-not-initialized"
+
+            op_smembers = getattr(client, "smembers", None)
+            if op_smembers is not None:
+                members = self._resolve_sync(op_smembers(self.redis_origins_key))
+            else:
+                members = set()
+
             origins = sorted(
                 normalize_origin(self._decode(value))
-                for value in (client.smembers(self.redis_origins_key) or set())
+                for value in (members or set())
             )
             return list(dict.fromkeys(origins)), "redis"
         except InvalidOriginError as exc:
@@ -277,12 +306,21 @@ class DynamicCorsStore:
             return False
         normalized = sorted({normalize_origin(item) for item in origins})
         try:
-            pipe = client.pipeline(transaction=True)
-            pipe.delete(self.redis_origins_key)
-            if normalized:
-                pipe.sadd(self.redis_origins_key, *normalized)
-            pipe.set(self.redis_initialized_key, "1")
-            pipe.execute()
+            op_pipeline = getattr(client, "pipeline", None)
+            if op_pipeline is not None:
+                pipe = self._resolve_sync(op_pipeline(transaction=True))
+                try:
+                    self._resolve_sync(pipe.delete(self.redis_origins_key))
+                    if normalized:
+                        self._resolve_sync(
+                            pipe.sadd(self.redis_origins_key, *normalized)
+                        )
+                    self._resolve_sync(pipe.set(self.redis_initialized_key, "1"))
+                    self._resolve_sync(pipe.execute())
+                finally:
+                    reset = getattr(pipe, "reset", None)
+                    if callable(reset):
+                        self._resolve_sync(reset())
             return True
         except Exception as exc:  # noqa: BLE001 - Redis pipeline boundary
             logger.warning("Dynamic CORS Redis write failed: %s", exc)
@@ -301,17 +339,25 @@ class DynamicCorsStore:
             return False, False, []
         normalized = normalize_origin(origin)
         try:
-            pipe = client.pipeline(transaction=True)
-            if add:
-                pipe.sadd(self.redis_origins_key, normalized)
-            else:
-                pipe.srem(self.redis_origins_key, normalized)
-            pipe.set(self.redis_initialized_key, "1")
-            results = pipe.execute()
+            pipe = self._resolve_sync(client.pipeline(transaction=True))
+            try:
+                if add:
+                    self._resolve_sync(pipe.sadd(self.redis_origins_key, normalized))
+                else:
+                    self._resolve_sync(pipe.srem(self.redis_origins_key, normalized))
+                self._resolve_sync(pipe.set(self.redis_initialized_key, "1"))
+                results = self._resolve_sync(pipe.execute())
+            finally:
+                reset = getattr(pipe, "reset", None)
+                if callable(reset):
+                    self._resolve_sync(reset())
             changed = bool(results[0])
             origins = sorted(
                 normalize_origin(self._decode(value))
-                for value in (client.smembers(self.redis_origins_key) or set())
+                for value in (
+                    self._resolve_sync(client.smembers(self.redis_origins_key))
+                    or set()
+                )
             )
             return True, changed, list(dict.fromkeys(origins))
         except Exception as exc:  # noqa: BLE001 - Redis pipeline boundary
@@ -622,11 +668,13 @@ def configure_dynamic_cors_store(
     redis_client: Any | None = None,
     redis_url: str = "",
     supabase_client: Any | None = None,
+    disable_redis: bool = False,
 ) -> DynamicCorsStore:
     return _DYNAMIC_CORS_STORE.configure(
         redis_client=redis_client,
         redis_url=redis_url,
         supabase_client=supabase_client,
+        disable_redis=disable_redis,
     )
 
 

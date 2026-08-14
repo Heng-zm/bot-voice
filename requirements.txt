@@ -3,19 +3,21 @@ python-telegram-bot
 # layer. Keep the tested release pinned until that layer is fully extracted.
 fastapi==0.128.2
 uvicorn[standard]
-httpx
+httpx[http2]
 pydantic-settings
 jinja2
+orjson
+uvloop; sys_platform != 'win32'
+redis>=5.0.0
+google-genai>=0.3.0
+supabase>=2.10.0
 itsdangerous
 python-multipart
 python-dotenv
-supabase
-redis
 imageio-ffmpeg
 edge-tts
-google-genai
 huggingface_hub
 gradio_client>=2,<3
-orjson
 ujson
 reportlab
+pytesseract

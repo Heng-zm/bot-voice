@@ -157,6 +157,8 @@ class MinimalSettingsTests(unittest.TestCase):
 
     def test_env_template_contains_only_core_connections(self) -> None:
         expected = {
+            "ADMIN_IDS",
+            "REDIS_ENABLED",
             "REDIS_URL",
             "SUPABASE_URL",
             "SUPABASE_SERVICE_ROLE_KEY",

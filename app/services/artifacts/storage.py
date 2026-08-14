@@ -342,13 +342,24 @@ class ArtifactService:
             sort_keys=True,
         )
 
+    async def _redis_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        """Run one Redis command without blocking or invoking it twice."""
+
+        operation = getattr(self.redis, method)
+        if inspect.iscoroutinefunction(operation):
+            return await operation(*args, **kwargs)
+        result = await asyncio.to_thread(operation, *args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
     async def _register_expiry(self, artifact: ArtifactRef) -> None:
         if self.redis is None or artifact.expires_at is None:
             return
         member = self._registry_member(artifact)
         try:
-            await asyncio.to_thread(
-                self.redis.zadd,
+            await self._redis_call(
+                "zadd",
                 self.expiry_key,
                 {member: float(artifact.expires_at)},
             )
@@ -376,14 +387,25 @@ class ArtifactService:
                 "remaining_due": 0,
             }
         try:
-            raw_members = await asyncio.to_thread(
-                self.redis.zrangebyscore,
-                self.expiry_key,
-                "-inf",
-                cleanup_time,
-                start=0,
-                num=batch_size,
-            )
+            # redis-py variants use either start/num or offset/count.
+            try:
+                raw_members = await self._redis_call(
+                    "zrangebyscore",
+                    self.expiry_key,
+                    "-inf",
+                    cleanup_time,
+                    start=0,
+                    num=batch_size,
+                )
+            except TypeError:
+                raw_members = await self._redis_call(
+                    "zrangebyscore",
+                    self.expiry_key,
+                    "-inf",
+                    cleanup_time,
+                    offset=0,
+                    count=batch_size,
+                )
         except Exception as exc:
             raise ArtifactStorageError(
                 "Could not load expired artifact references from Redis."
@@ -473,11 +495,7 @@ class ArtifactService:
 
         if removable:
             try:
-                await asyncio.to_thread(
-                    self.redis.zrem,
-                    self.expiry_key,
-                    *removable,
-                )
+                await self._redis_call("zrem", self.expiry_key, *removable)
             except Exception as exc:
                 raise ArtifactStorageError(
                     "Artifacts were deleted but their expiration entries remain."

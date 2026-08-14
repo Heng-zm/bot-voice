@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 import warnings
 from datetime import UTC, datetime
@@ -462,6 +463,33 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
             "This button is no longer available. Please reopen the menu.",
             show_alert=False,
         )
+
+    async def test_version_command_reports_build_metadata(self) -> None:
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(message=message, effective_message=message)
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "BOT_BUILD_VERSION": "2026.08.12",
+                    "RELEASE_SHA": "abcdef1234567890fedcba",
+                    "PROCESS_ROLE": "web",
+                },
+                clear=False,
+            ),
+            patch.object(legacy, "_run_state_bot_mode", return_value="WEBHOOK"),
+            patch(
+                "app.services.monitoring.discover_public_url",
+                return_value={"url": "https://bot.example.com"},
+            ),
+        ):
+            await legacy.cmd_version(update, SimpleNamespace())
+
+        rendered = message.reply_text.await_args.args[0]
+        self.assertIn("2026.08.12", rendered)
+        self.assertIn("abcdef123456", rendered)
+        self.assertIn("https://bot.example.com", rendered)
 
     async def test_tts_callback_honors_runtime_access_policy(self) -> None:
         query = SimpleNamespace(

@@ -7,6 +7,11 @@ from unittest.mock import AsyncMock, patch
 from app import legacy
 from app.main import _wait_for_critical_tasks
 from app.runtime import RuntimeContext
+from app.services.incidents import (
+    configure_incident_alert_handler,
+    incident_snapshot,
+    reset_incident_state,
+)
 
 
 class RuntimeOwnershipTests(unittest.IsolatedAsyncioTestCase):
@@ -111,6 +116,133 @@ class TelegramStartupRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(application.stopped)
         self.assertFalse(application.running)
         self.assertFalse(legacy._TELEGRAM_APP_READY)
+
+    async def test_polling_does_not_start_when_webhook_deletion_fails(self) -> None:
+        class FakeUpdater:
+            started = False
+
+            async def start_polling(self, **_kwargs) -> None:
+                self.started = True
+
+        application = type("FakeApplication", (), {"updater": FakeUpdater()})()
+        original_active = legacy._TELEGRAM_POLLING_ACTIVE
+        original_task = legacy.ACTIVE_POLLING_TASK
+        original_lock = legacy._TELEGRAM_POLLING_LOCK
+        legacy._TELEGRAM_POLLING_ACTIVE = False
+        legacy.ACTIVE_POLLING_TASK = None
+        legacy._TELEGRAM_POLLING_LOCK = None
+        try:
+            with (
+                patch.object(legacy, "_run_state_bot_mode", return_value="POLLING"),
+                patch.object(
+                    legacy,
+                    "_cancel_active_polling_task",
+                    AsyncMock(),
+                ),
+                patch.object(
+                    legacy,
+                    "_delete_telegram_webhook_via_http",
+                    AsyncMock(side_effect=RuntimeError("deletion not confirmed")),
+                ),
+                self.assertRaisesRegex(RuntimeError, "deletion not confirmed"),
+            ):
+                await legacy._telegram_start_polling_runtime(application)
+        finally:
+            legacy._TELEGRAM_POLLING_ACTIVE = original_active
+            legacy.ACTIVE_POLLING_TASK = original_task
+            legacy._TELEGRAM_POLLING_LOCK = original_lock
+
+        self.assertFalse(application.updater.started)
+
+    async def test_webhook_deletion_is_verified_and_retried(self) -> None:
+        class FakeResponse:
+            status_code = 200
+            text = ""
+
+            def __init__(self, content: bytes) -> None:
+                self.content = content
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.info_calls = 0
+                self.delete_calls = 0
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args) -> None:
+                return None
+
+            async def post(self, _url, **_kwargs):
+                self.delete_calls += 1
+                return FakeResponse(b'{"ok":true,"result":true}')
+
+            async def get(self, _url):
+                self.info_calls += 1
+                url = "https://old.example/webhook" if self.info_calls == 1 else ""
+                return FakeResponse(
+                    ('{"ok":true,"result":{"url":"' + url + '"}}').encode()
+                )
+
+        client = FakeClient()
+        with (
+            patch.object(legacy, "TELEGRAM_BOT_TOKEN", "test-token"),
+            patch.object(legacy.httpx, "AsyncClient", return_value=client),
+            patch.object(legacy.asyncio, "sleep", AsyncMock()),
+        ):
+            await legacy._delete_telegram_webhook_via_http(drop_pending=False)
+
+        self.assertEqual(2, client.delete_calls)
+        self.assertEqual(2, client.info_calls)
+
+    async def test_polling_conflict_runs_verified_cleanup(self) -> None:
+        reset_incident_state()
+        cleanup = AsyncMock()
+        legacy._TELEGRAM_CONFLICT_RECOVERY_TASK = asyncio.current_task()
+        with (
+            patch.object(legacy, "_run_state_bot_mode", return_value="POLLING"),
+            patch.object(
+                legacy,
+                "_delete_telegram_webhook_via_http",
+                cleanup,
+            ),
+        ):
+            await legacy._recover_polling_webhook_conflict()
+
+        cleanup.assert_awaited_once_with(drop_pending=False)
+        self.assertIsNone(legacy._TELEGRAM_CONFLICT_RECOVERY_TASK)
+        event = incident_snapshot()["events"][0]
+        self.assertEqual("telegram_webhook", event["component"])
+        self.assertEqual("conflict_recovered", event["event"])
+
+    async def test_failed_polling_conflict_recovery_alerts_admin(self) -> None:
+        reset_incident_state()
+        alerted = asyncio.Event()
+        alerts: list[dict] = []
+
+        async def alert_handler(event: dict) -> None:
+            alerts.append(event)
+            alerted.set()
+
+        configure_incident_alert_handler(alert_handler)
+        legacy._TELEGRAM_CONFLICT_RECOVERY_TASK = asyncio.current_task()
+        try:
+            with (
+                patch.object(legacy, "_run_state_bot_mode", return_value="POLLING"),
+                patch.object(
+                    legacy,
+                    "_delete_telegram_webhook_via_http",
+                    AsyncMock(side_effect=RuntimeError("Telegram API unavailable")),
+                ),
+            ):
+                await legacy._recover_polling_webhook_conflict()
+            await asyncio.wait_for(alerted.wait(), timeout=0.2)
+        finally:
+            configure_incident_alert_handler(None)
+
+        self.assertEqual(1, len(alerts))
+        self.assertEqual("conflict_recovery_failed", alerts[0]["event"])
+        self.assertEqual("critical", alerts[0]["severity"])
 
 
 class UvicornShutdownTests(unittest.IsolatedAsyncioTestCase):

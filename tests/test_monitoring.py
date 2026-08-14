@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import logging
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.api.dependencies import AdminPrincipal
-from app.api.v1.admin_runtime import bot_monitor
+from app.api.v1.admin_runtime import bot_monitor, download_monitor_logs
 from app.services import monitoring
+from app.services.incidents import reset_incident_state
 
 
-def _job(job_id: str, state: str) -> SimpleNamespace:
+def _job(job_id: str, state: str, job_type: str = "tts") -> SimpleNamespace:
     return SimpleNamespace(
         id=job_id,
+        type=job_type,
         state=state,
         attempts=1,
         max_attempts=3,
@@ -38,9 +41,11 @@ class _Queue:
 
     async def list_jobs(self, *, state: str, limit: int):
         assert limit == (100 if state == "running" else 200)
-        job = _job(f"tts-{state}", state)
-        job.type = "tts"
-        return [job], None
+        return [
+            _job(f"tts-{state}", state),
+            _job(f"ocr-{state}", state, "ocr"),
+            _job(f"transcription-{state}", state, "transcription"),
+        ], None
 
 
 class _ProviderManager:
@@ -52,13 +57,17 @@ class RuntimeMonitoringTests(unittest.TestCase):
     def setUp(self) -> None:
         with monitoring._RUNTIME_LOGS_LOCK:
             monitoring._RUNTIME_LOGS.clear()
+        reset_incident_state()
 
     def test_monitor_log_redacts_credentials_and_supports_filters(self) -> None:
         logger = logging.getLogger("tests.monitoring.tts")
         logger.setLevel(logging.INFO)
         logger.info(
             "TTS started token=top-secret Bearer abcdefghijklmnop "
-            "redis://user:password@example.invalid/0"
+            "redis://user:password@example.invalid/0 "
+            "content=private-user-sentence "
+            "https://storage.example/file?X-Amz-Signature=signed-secret "
+            "/tg-webhook-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
         )
         logger.warning("TTS queue is delayed")
 
@@ -76,7 +85,23 @@ class RuntimeMonitoringTests(unittest.TestCase):
         self.assertNotIn("top-secret", all_text)
         self.assertNotIn("abcdefghijklmnop", all_text)
         self.assertNotIn("user:password@", all_text)
+        self.assertNotIn("private-user-sentence", all_text)
+        self.assertNotIn("signed-secret", all_text)
+        self.assertNotIn("abcdefghijklmnopqrstuvwxyzABC", all_text)
         self.assertIn("<hidden>", all_text)
+        self.assertIn("<user-content>", all_text)
+
+    def test_public_url_is_discovered_from_host_environment(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"RAILWAY_PUBLIC_DOMAIN": "voice-bot.example.com"},
+            clear=True,
+        ):
+            public_url = monitoring.discover_public_url()
+
+        self.assertEqual("https://voice-bot.example.com", public_url["url"])
+        self.assertEqual("RAILWAY_PUBLIC_DOMAIN", public_url["source"])
+        self.assertTrue(public_url["detected"])
 
     def test_process_snapshot_is_safe_and_local(self) -> None:
         snapshot = monitoring.process_snapshot()
@@ -120,9 +145,30 @@ class MonitorEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(0.1, payload["health"]["queue_pressure_percent"])
         self.assertEqual(1, payload["tts"]["running_count"])
         self.assertEqual(1, payload["tts"]["queued_count"])
+        self.assertEqual(3, payload["workloads"]["running_count"])
+        self.assertEqual(3, payload["workloads"]["queued_count"])
+        self.assertEqual(
+            {"running": 1, "queued": 1},
+            payload["workloads"]["counts_by_type"]["ocr"],
+        )
         self.assertEqual("generating", payload["tts"]["running"][0]["progress_stage"])
         self.assertNotIn("payload", payload["tts"]["running"][0])
         self.assertNotIn("result", payload["tts"]["running"][0])
+
+    async def test_log_download_is_bounded_and_redacted(self) -> None:
+        principal = AdminPrincipal(admin_id=42, auth_method="telegram_init_data")
+        logger = logging.getLogger("tests.monitoring.download")
+        logger.setLevel(logging.INFO)
+        logger.info("token=download-secret content=private-message")
+
+        response = await download_monitor_logs(principal, 400, "", "")
+        body = bytes(response.body).decode("utf-8")
+
+        self.assertIn("attachment;", response.headers["content-disposition"])
+        self.assertNotIn("download-secret", body)
+        self.assertNotIn("private-message", body)
+        self.assertIn("<hidden>", body)
+        self.assertIn("<user-content>", body)
 
 
 if __name__ == "__main__":

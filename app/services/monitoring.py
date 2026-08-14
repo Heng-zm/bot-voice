@@ -10,6 +10,7 @@ import time
 from collections import deque
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 _MONITOR_STARTED_AT = time.time()
 _RUNTIME_LOGS: deque[dict[str, Any]] = deque(maxlen=400)
@@ -35,8 +36,27 @@ _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         r"\1\2<hidden>",
     ),
     (
+        re.compile(
+            r"(?i)\b(credential|signature|x-amz-signature|sig)"
+            r"(\s*[:=]\s*)([^\s,;&]+)"
+        ),
+        r"\1\2<hidden>",
+    ),
+    (
         re.compile(r"(?i)\b(redis|rediss|postgres|postgresql)://([^\s:/]+):([^\s@]+)@"),
         r"\1://\2:<hidden>@",
+    ),
+    (
+        re.compile(r"(?i)(/tg-webhook-)[A-Za-z0-9_-]{20,}"),
+        r"\1<hidden>",
+    ),
+    (
+        re.compile(
+            r"(?i)\b(text|content|input|message|payload|prompt|query|transcript|"
+            r"user[_-]?message)"
+            r"(\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&]+)"
+        ),
+        r"\1\2<user-content>",
     ),
 )
 
@@ -98,7 +118,7 @@ def runtime_log_snapshot(
 ) -> dict[str, Any]:
     """Return a filtered copy of recent runtime log records."""
 
-    clean_limit = max(1, min(200, int(limit)))
+    clean_limit = max(1, min(400, int(limit)))
     clean_level = str(level or "").strip().upper()
     if clean_level and clean_level not in _LOG_LEVELS:
         raise ValueError("Unsupported log level.")
@@ -133,6 +153,63 @@ def runtime_log_snapshot(
     }
 
 
+def _public_origin(value: Any) -> str:
+    raw = str(value or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = f"https://{raw}"
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return ""
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        return ""
+    host = parsed.hostname.encode("idna").decode("ascii").lower()
+    try:
+        parsed_port = parsed.port
+    except ValueError:
+        return ""
+    port = f":{parsed_port}" if parsed_port and parsed_port != 443 else ""
+    return f"https://{host}{port}"
+
+
+def discover_public_url() -> dict[str, Any]:
+    """Discover a safe HTTPS server origin from common hosting environments."""
+
+    direct_candidates = (
+        "TELEGRAM_WEBHOOK_URL",
+        "PUBLIC_URL",
+        "APP_URL",
+        "RENDER_EXTERNAL_URL",
+        "RAILWAY_STATIC_URL",
+    )
+    for source in direct_candidates:
+        url = _public_origin(os.getenv(source))
+        if url:
+            return {"url": url, "source": source, "detected": True}
+
+    domain_candidates = (
+        "RAILWAY_PUBLIC_DOMAIN",
+        "RENDER_EXTERNAL_HOSTNAME",
+        "KOYEB_PUBLIC_DOMAIN",
+        "VERCEL_URL",
+        "SPACE_HOST",
+    )
+    for source in domain_candidates:
+        url = _public_origin(os.getenv(source))
+        if url:
+            return {"url": url, "source": source, "detected": True}
+
+    fly_app = str(os.getenv("FLY_APP_NAME") or "").strip()
+    if fly_app:
+        url = _public_origin(f"{fly_app}.fly.dev")
+        if url:
+            return {"url": url, "source": "FLY_APP_NAME", "detected": True}
+
+    return {"url": "", "source": "", "detected": False}
+
+
 def process_snapshot() -> dict[str, Any]:
     """Return safe process-local facts using only the Python standard library."""
 
@@ -162,6 +239,7 @@ install_runtime_log_handler()
 
 
 __all__ = [
+    "discover_public_url",
     "install_runtime_log_handler",
     "process_snapshot",
     "runtime_log_snapshot",

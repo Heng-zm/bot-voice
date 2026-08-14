@@ -7,11 +7,13 @@ from datetime import UTC, datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app._legacy_bridge import legacy_module
 from app.api.dependencies import AdminPrincipal, require_admin, require_admin_write
 from app.services.ai.providers import get_provider_manager
+from app.services.incidents import incident_snapshot
 from app.services.jobs.queue import JobNotFound, JobQueueError
 from app.services.jobs.runtime import (
     get_job_queue,
@@ -19,6 +21,7 @@ from app.services.jobs.runtime import (
     set_job_workers_accepting,
 )
 from app.services.monitoring import (
+    discover_public_url,
     process_snapshot,
     runtime_log_snapshot,
     sanitize_monitor_text,
@@ -68,6 +71,7 @@ def _safe_monitor_job(job) -> dict:
 
     return {
         "id": sanitize_monitor_text(job.id, limit=128),
+        "type": sanitize_monitor_text(job.type, limit=64),
         "state": job.state,
         "attempts": job.attempts,
         "max_attempts": job.max_attempts,
@@ -80,6 +84,51 @@ def _safe_monitor_job(job) -> dict:
         "last_error": sanitize_monitor_text(job.last_error, limit=500),
         "updated_at": job.updated_at,
     }
+
+
+def _safe_worker_snapshot(snapshot: dict) -> dict:
+    """Redact worker failures and IDs before returning them to the browser."""
+
+    safe = {
+        key: snapshot.get(key)
+        for key in (
+            "configured",
+            "accepting",
+            "count",
+            "alive",
+            "healthy",
+            "restart_total",
+        )
+    }
+    safe["workers"] = [
+        {
+            **{
+                key: worker.get(key)
+                for key in (
+                    "alive",
+                    "started_at",
+                    "last_heartbeat_at",
+                    "restart_count",
+                    "last_restart_at",
+                )
+            },
+            "worker_id": sanitize_monitor_text(worker.get("worker_id"), limit=128),
+            "last_error": sanitize_monitor_text(worker.get("last_error"), limit=500),
+        }
+        for worker in list(snapshot.get("workers") or [])[:50]
+    ]
+    safe["restart_history"] = [
+        {
+            "timestamp": item.get("timestamp"),
+            "restart_count": item.get("restart_count"),
+            "restart_streak": item.get("restart_streak"),
+            "delay_seconds": item.get("delay_seconds"),
+            "worker_id": sanitize_monitor_text(item.get("worker_id"), limit=128),
+            "error": sanitize_monitor_text(item.get("error"), limit=500),
+        }
+        for item in list(snapshot.get("restart_history") or [])[:50]
+    ]
+    return safe
 
 
 def _legacy_monitor_snapshot() -> dict:
@@ -163,14 +212,23 @@ async def job_stats(
     principal: Annotated[AdminPrincipal, Depends(require_admin)],
 ) -> dict:
     del principal
+    queue = get_job_queue()
     try:
-        counts = await get_job_queue().stats()
+        counts = await queue.stats()
     except JobQueueError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
         ) from exc
-    return {"ok": True, "jobs": counts, "workers": job_worker_snapshot()}
+    return {
+        "ok": True,
+        "jobs": counts,
+        "workers": job_worker_snapshot(),
+        "queue": {
+            "backend": getattr(queue, "backend", "unknown"),
+            "durable": bool(getattr(queue, "durable", False)),
+        },
+    }
 
 
 @router.get("/monitor")
@@ -205,18 +263,28 @@ async def bot_monitor(
 
     running_page_jobs, running_cursor = running_page
     queued_page_jobs, queued_cursor = queued_page
-    running_jobs = [job for job in running_page_jobs if job.type == "tts"][:50]
-    queued_jobs = [job for job in queued_page_jobs if job.type == "tts"][:50]
+    workload_types = {"tts", "ocr", "transcription"}
+    running_workloads = [
+        job for job in running_page_jobs if job.type in workload_types
+    ][:100]
+    queued_workloads = [
+        job for job in queued_page_jobs if job.type in workload_types
+    ][:100]
+    running_jobs = [job for job in running_workloads if job.type == "tts"][:50]
+    queued_jobs = [job for job in queued_workloads if job.type == "tts"][:50]
     legacy = _legacy_monitor_snapshot()
     process = process_snapshot()
-    workers = job_worker_snapshot()
+    workers = _safe_worker_snapshot(job_worker_snapshot())
     queue_limit = max(1, int(counts.get("queue_limit") or 1))
     queue_pressure = round(
         min(100.0, (int(counts.get("queued") or 0) / queue_limit) * 100.0),
         1,
     )
     failure_rate = float(counts.get("failure_rate_percent") or 0.0)
-    if workers.get("count") and not workers.get("healthy"):
+    incidents = incident_snapshot(limit=50)
+    if incidents.get("open_circuits") or (
+        workers.get("count") and not workers.get("healthy")
+    ):
         health_state = "critical"
     elif queue_pressure >= 80.0 or failure_rate >= 20.0:
         health_state = "warning"
@@ -242,7 +310,28 @@ async def bot_monitor(
         },
         "process": process,
         "workers": workers,
+        "public_url": discover_public_url(),
+        "incidents": incidents,
         "queue": counts,
+        "queue_mode": {
+            "backend": getattr(queue, "backend", "unknown"),
+            "durable": bool(getattr(queue, "durable", False)),
+        },
+        "workloads": {
+            "running": [_safe_monitor_job(job) for job in running_workloads],
+            "queued": [_safe_monitor_job(job) for job in queued_workloads],
+            "running_count": len(running_workloads),
+            "queued_count": len(queued_workloads),
+            "counts_by_type": {
+                job_type: {
+                    "running": sum(job.type == job_type for job in running_workloads),
+                    "queued": sum(job.type == job_type for job in queued_workloads),
+                }
+                for job_type in sorted(workload_types)
+            },
+            "running_truncated": bool(running_cursor),
+            "queued_truncated": bool(queued_cursor),
+        },
         "tts": {
             "configured": int(tts_slots.get("configured") or 0),
             "available": tts_slots.get("available"),
@@ -265,6 +354,40 @@ async def bot_monitor(
             query=log_query,
         ),
     }
+
+
+@router.get("/monitor/logs/download", response_class=PlainTextResponse)
+async def download_monitor_logs(
+    principal: Annotated[AdminPrincipal, Depends(require_admin)],
+    log_limit: Annotated[int, Query(ge=1, le=400)] = 400,
+    log_level: Annotated[
+        Literal["", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        Query(),
+    ] = "",
+    log_query: Annotated[str, Query(max_length=128)] = "",
+) -> PlainTextResponse:
+    """Download the same bounded, redacted log view shown in the monitor."""
+
+    del principal
+    snapshot = runtime_log_snapshot(
+        limit=log_limit,
+        level=log_level,
+        query=log_query,
+    )
+    lines = [
+        f"[{entry.get('ts') or ''}] {entry.get('level') or 'INFO'} "
+        f"{entry.get('source') or 'runtime'} — {entry.get('message') or ''}"
+        for entry in snapshot["entries"]
+    ]
+    filename = f"bot-runtime-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}.log"
+    return PlainTextResponse(
+        "\n".join(lines) + ("\n" if lines else ""),
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.get("/jobs/list")

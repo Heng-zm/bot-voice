@@ -12,7 +12,12 @@ import unittest
 from unittest.mock import patch
 
 from app.services.jobs.queue import Job, JobQueueError, RedisJobWorker
-from app.services.jobs.runtime import _WORKER_STATUS, _worker_runner
+from app.services.jobs.runtime import (
+    _WORKER_RESTART_HISTORY,
+    _WORKER_STATUS,
+    _worker_runner,
+    job_worker_snapshot,
+)
 
 
 def _job(job_id: str = "job-1", job_type: str = "tts") -> Job:
@@ -84,6 +89,7 @@ class RecordingQueue:
 
 class WorkerResilienceTests(unittest.IsolatedAsyncioTestCase):
     async def test_worker_runner_restarts_an_unexpectedly_stopped_loop(self) -> None:
+        _WORKER_RESTART_HISTORY.clear()
         recovered = asyncio.Event()
 
         class RestartingWorker:
@@ -114,6 +120,14 @@ class WorkerResilienceTests(unittest.IsolatedAsyncioTestCase):
                 _WORKER_STATUS.pop(worker.worker_id, None)
 
         self.assertEqual(2, worker.calls)
+        snapshot = job_worker_snapshot()
+        self.assertEqual(1, snapshot["restart_total"])
+        self.assertEqual(
+            worker.worker_id,
+            snapshot["restart_history"][0]["worker_id"],
+        )
+        self.assertIn("unexpected exit", snapshot["restart_history"][0]["error"])
+        _WORKER_RESTART_HISTORY.clear()
 
     async def test_restart_backoff_resets_after_a_stable_worker_run(self) -> None:
         recovered = asyncio.Event()

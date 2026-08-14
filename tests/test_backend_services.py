@@ -211,9 +211,13 @@ class FakeRedis:
             use_idempotency,
             _idempotency_ttl,
             max_queued_jobs,
+            job_prefix,
         ) = args
         if use_idempotency == "1" and idempotency_key in self.strings:
-            return [self.strings[idempotency_key], 0]
+            existing = self.strings[idempotency_key]
+            if f"{job_prefix}{existing}" in self.hashes:
+                return [existing, 0]
+            self.strings.pop(idempotency_key, None)
         if job_key in self.hashes:
             return [job_id, 0]
         if len(self.zsets.get(ready_key, {})) >= int(max_queued_jobs):

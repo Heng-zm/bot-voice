@@ -167,6 +167,8 @@ python-multipart==0.0.32
     # via -r requirements.txt
 python-telegram-bot==22.8
     # via -r requirements.txt
+pytesseract==0.3.13
+    # via -r requirements.txt
 pyyaml==6.0.3
     # via
     #   huggingface-hub

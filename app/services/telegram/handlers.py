@@ -3,6 +3,7 @@
 from app._legacy_bridge import exported_dir, exported_getattr
 
 __all__ = [
+    "cmd_version",
     "_run_bot",
     "error_handler",
     "on_any_media",

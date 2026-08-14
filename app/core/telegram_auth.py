@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import re
@@ -288,8 +289,17 @@ class TelegramAdminAuthorizer:
             return None
         return user_id if user_id > 0 else None
 
-    def _load_ids_sync(self, *, force: bool = False) -> frozenset[int]:
-        with self._load_lock:
+    async def load_ids(self, *, force: bool = False) -> frozenset[int]:
+        now = time.monotonic()
+        with self._lock:
+            if not force and now < self._cache_deadline:
+                return self._cached_ids
+
+        # A thread lock works across the async API and the synchronous
+        # compatibility entry point.  Acquire it off-loop, then re-check the
+        # cache so concurrent misses collapse into one Redis lookup.
+        await asyncio.to_thread(self._load_lock.acquire)
+        try:
             now = time.monotonic()
             with self._lock:
                 if not force and now < self._cache_deadline:
@@ -301,7 +311,7 @@ class TelegramAdminAuthorizer:
                 allowed = fallback
             else:
                 try:
-                    members = client.smembers(self.redis_key)
+                    members = await self._redis_call(client, "smembers", self.redis_key)
                     allowed = frozenset(
                         user_id
                         for user_id in (
@@ -311,9 +321,11 @@ class TelegramAdminAuthorizer:
                         if user_id is not None
                     )
                     if not allowed and fallback:
-                        client.sadd(
+                        await self._redis_call(
+                            client,
+                            "sadd",
                             self.redis_key,
-                            *[str(value) for value in sorted(fallback)],
+                            *(str(value) for value in sorted(fallback)),
                         )
                         allowed = fallback
                         logger.warning(
@@ -335,13 +347,36 @@ class TelegramAdminAuthorizer:
 
             with self._lock:
                 self._cached_ids = allowed
-                self._cache_deadline = (
-                    time.monotonic() + self.cache_ttl_seconds
-                )
+                self._cache_deadline = time.monotonic() + self.cache_ttl_seconds
             return allowed
+        finally:
+            self._load_lock.release()
 
-    async def load_ids(self, *, force: bool = False) -> frozenset[int]:
-        return await asyncio.to_thread(self._load_ids_sync, force=force)
+    @staticmethod
+    async def _redis_call(client: Any, method: str, *args: Any) -> Any:
+        operation = getattr(client, method)
+        if inspect.iscoroutinefunction(operation):
+            return await operation(*args)
+        result = await asyncio.to_thread(operation, *args)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    def _load_ids_sync(self, *, force: bool = False) -> frozenset[int]:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            with self._lock:
+                return self._cached_ids or self._fallback_ids
+        else:
+            try:
+                return asyncio.run(self.load_ids(force=force))
+            except RuntimeError:
+                with self._lock:
+                    return self._cached_ids or self._fallback_ids
 
     def invalidate(self) -> None:
         """Expire the local allowlist after an administrator mutation."""

@@ -9,11 +9,13 @@ import socket
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
+from app.services.jobs.memory import MemoryJobQueue
 from app.services.jobs.queue import (
     JobHandler,
     JobQueueError,
@@ -32,7 +34,7 @@ BOT_JOB_TYPES = frozenset(
     }
 )
 
-_QUEUE: RedisJobQueue | None = None
+_QUEUE: RedisJobQueue | MemoryJobQueue | None = None
 _QUEUE_REDIS: Any | None = None
 _LOCK = threading.RLock()
 _WORKER_LOCK = asyncio.Lock()
@@ -40,6 +42,7 @@ _WORKER_STOP: asyncio.Event | None = None
 _WORKER_TASKS: dict[str, asyncio.Task[None]] = {}
 _WORKER_HEARTBEAT_TASKS: dict[str, asyncio.Task[None]] = {}
 _WORKER_STATUS: dict[str, dict[str, Any]] = {}
+_WORKER_RESTART_HISTORY: deque[dict[str, Any]] = deque(maxlen=200)
 _WORKERS_ACCEPTING = True
 _WORKER_RESTART_BASE_SECONDS = 1.0
 _WORKER_RESTART_MAX_SECONDS = 30.0
@@ -74,13 +77,21 @@ def configure_job_queue(
     *,
     redis_prefix: str = "tgbot",
     max_queued_jobs: int | None = None,
-) -> RedisJobQueue | None:
+    memory_fallback: bool = False,
+) -> RedisJobQueue | MemoryJobQueue | None:
     global _QUEUE, _QUEUE_REDIS
     with _LOCK:
         if redis_client is None:
-            _QUEUE = None
             _QUEUE_REDIS = None
-            return None
+            if not memory_fallback:
+                _QUEUE = None
+                return None
+            if not isinstance(_QUEUE, MemoryJobQueue):
+                queue_limit = max_queued_jobs
+                if queue_limit is None:
+                    queue_limit = int(os.getenv("BOT_JOB_QUEUE_MAX", "1000") or 1000)
+                _QUEUE = MemoryJobQueue(max_queued_jobs=queue_limit)
+            return _QUEUE
         if _QUEUE is None or redis_client is not _QUEUE_REDIS:
             queue_limit = max_queued_jobs
             if queue_limit is None:
@@ -94,7 +105,7 @@ def configure_job_queue(
         return _QUEUE
 
 
-def get_job_queue() -> RedisJobQueue:
+def get_job_queue() -> RedisJobQueue | MemoryJobQueue:
     with _LOCK:
         if _QUEUE is None:
             raise JobQueueError("The durable Redis job queue is not configured.")
@@ -181,15 +192,25 @@ async def _worker_runner(
         status["last_restart_at"] = time.time()
         restart_count = int(status["restart_count"])
         restart_streak = int(status["restart_streak"])
+        delay = min(
+            _WORKER_RESTART_MAX_SECONDS,
+            _WORKER_RESTART_BASE_SECONDS * (2 ** min(restart_streak - 1, 5)),
+        )
+        _WORKER_RESTART_HISTORY.appendleft(
+            {
+                "timestamp": time.time(),
+                "worker_id": worker_id,
+                "error": f"{type(error).__name__}: {error}"[:500],
+                "restart_count": restart_count,
+                "restart_streak": restart_streak,
+                "delay_seconds": delay,
+            }
+        )
         logger.error(
             "Durable worker stopped unexpectedly; restarting worker=%s count=%s: %s",
             worker_id,
             restart_count,
             error,
-        )
-        delay = min(
-            _WORKER_RESTART_MAX_SECONDS,
-            _WORKER_RESTART_BASE_SECONDS * (2 ** min(restart_streak - 1, 5)),
         )
         with suppress(TimeoutError):
             await asyncio.wait_for(stop_event.wait(), timeout=delay)
@@ -327,6 +348,8 @@ def job_worker_snapshot(*, stale_after_seconds: float = 20.0) -> dict[str, Any]:
         "alive": sum(1 for worker in workers if worker.alive),
         "healthy": bool(workers) and all(worker.alive for worker in workers),
         "workers": [worker.as_dict() for worker in workers],
+        "restart_total": len(_WORKER_RESTART_HISTORY),
+        "restart_history": list(_WORKER_RESTART_HISTORY)[:50],
     }
 
 

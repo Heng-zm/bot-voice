@@ -23,8 +23,8 @@ class AdminMiniAppUiTests(unittest.TestCase):
         self.assertIn("family=Google+Sans+Flex", self.html)
         self.assertIn("family=Noto+Sans+Khmer", self.html)
         self.assertIn('crossorigin', self.html)
-        self.assertIn('styles.css?v=8', self.html)
-        self.assertIn('app.js?v=8', self.html)
+        self.assertIn('styles.css?v=9', self.html)
+        self.assertIn('app.js?v=10', self.html)
         self.assertIn('--font-sans: "Google Sans Flex"', self.css)
         self.assertIn('"Noto Sans Khmer"', self.css)
 
@@ -54,14 +54,26 @@ class AdminMiniAppUiTests(unittest.TestCase):
             "monitorPressureChart",
             "monitorRequestsChart",
             "monitorTtsTrendChart",
+            "monitorQueueAgeChart",
+            "monitorFailureChart",
+            "monitorIncidentList",
+            "monitorWorkloadType",
             "monitorCopyLogsButton",
+            "monitorDownloadLogsButton",
         ):
             self.assertIn(f'id="{element_id}"', self.html)
         self.assertIn('data-tts-filter="running"', self.html)
         self.assertIn("scheduleMonitorPolling()", self.javascript)
         self.assertIn("updateMonitorTrends(payload)", self.javascript)
         self.assertIn("copyMonitorLogs", self.javascript)
+        self.assertIn("downloadMonitorLogs", self.javascript)
+        self.assertIn("renderMonitorIncidents", self.javascript)
         self.assertIn("navigationObserver", self.javascript)
+
+    def test_redis_disabled_queue_mode_is_rendered_as_expected(self) -> None:
+        self.assertIn('redis.status === "disabled"', self.javascript)
+        self.assertIn("queueMode.durable === false", self.javascript)
+        self.assertIn('t("processLocal")', self.javascript)
 
 
 if __name__ == "__main__":

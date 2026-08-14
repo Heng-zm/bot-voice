@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from datetime import UTC, datetime
@@ -13,6 +14,8 @@ from pydantic import BaseModel, ConfigDict
 
 from app._legacy_bridge import legacy_module
 from app.api.dependencies import AdminPrincipal, require_admin, require_admin_write
+from app.runtime import get_runtime_context
+from app.services.build_info import get_build_info
 from app.services.settings.runtime import (
     build_runtime_settings_payload,
     coerce_runtime_updates,
@@ -43,15 +46,24 @@ class AdminSettingsPayload(BaseModel):
     runtime: dict[str, Any] | None = None
 
 
-async def _redis_health(redis_client: Any | None) -> dict[str, Any]:
+async def _redis_health(
+    redis_client: Any | None,
+    *,
+    enabled: bool = True,
+) -> dict[str, Any]:
+    if not enabled:
+        return {"ok": True, "latency_ms": None, "status": "disabled"}
     if redis_client is None:
         return {"ok": False, "latency_ms": None, "status": "not_configured"}
     started = time.perf_counter()
     try:
-        pong = await asyncio.wait_for(
-            asyncio.to_thread(redis_client.ping),
-            timeout=2.5,
-        )
+        if inspect.iscoroutinefunction(redis_client.ping):
+            operation = redis_client.ping()
+        else:
+            operation = asyncio.to_thread(redis_client.ping)
+        pong = await asyncio.wait_for(operation, timeout=2.5)
+        if inspect.isawaitable(pong):
+            pong = await asyncio.wait_for(pong, timeout=2.5)
     except Exception as exc:  # noqa: BLE001 - health output is intentionally safe
         logger.warning("Admin Mini App Redis health check failed: %s", exc)
         return {"ok": False, "latency_ms": None, "status": "unavailable"}
@@ -96,10 +108,14 @@ async def get_admin_stats(
 ) -> dict[str, Any]:
     del principal
     legacy = legacy_module()
+    runtime_snapshot = get_runtime_context().snapshot()
     counts_result, settings_result, redis_health = await asyncio.gather(
         asyncio.to_thread(legacy._web_counts, False),
         legacy.get_bot_settings_async(),
-        _redis_health(getattr(legacy, "redis_client", None)),
+        _redis_health(
+            getattr(legacy, "redis_client", None),
+            enabled=bool(runtime_snapshot.get("redis_enabled", True)),
+        ),
         return_exceptions=True,
     )
 
@@ -123,10 +139,13 @@ async def get_admin_stats(
     bot_mode = str(legacy._run_state_bot_mode())
     polling_active = bool(getattr(legacy, "_TELEGRAM_POLLING_ACTIVE", False))
     telegram_app_ready = bool(getattr(legacy, "_TELEGRAM_APP", None))
-
     return {
         "ok": True,
         "generated_at": datetime.now(UTC).isoformat(),
+        "build": get_build_info(
+            role=runtime_snapshot.get("role"),
+            started_at=runtime_snapshot.get("started_at"),
+        ),
         "bot": {
             "active": telegram_app_ready or polling_active,
             "mode": bot_mode,
@@ -144,6 +163,21 @@ async def get_admin_stats(
         "database": {
             "ok": bool(settings_status.get("db_ok")),
             "memory_fallback": bool(settings_status.get("memory")),
+        },
+        "runtime": {
+            "role": runtime_snapshot.get("role") or "combined",
+            "redis_enabled": bool(
+                runtime_snapshot.get("redis_enabled", True)
+            ),
+            "queue": {
+                "backend": runtime_snapshot.get(
+                    "job_queue_backend",
+                    "unconfigured",
+                ),
+                "durable": bool(
+                    runtime_snapshot.get("job_queue_durable", False)
+                ),
+            },
         },
     }
 

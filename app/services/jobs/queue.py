@@ -28,7 +28,10 @@ _ENQUEUE_SCRIPT = """
 if ARGV[9] == '1' then
   local existing = redis.call('GET', KEYS[3])
   if existing then
-    return {existing, 0}
+    if redis.call('EXISTS', ARGV[12] .. existing) == 1 then
+      return {existing, 0}
+    end
+    redis.call('DEL', KEYS[3])
   end
 end
 if redis.call('EXISTS', KEYS[2]) == 1 then
@@ -430,6 +433,9 @@ JobHandler = Callable[[Mapping[str, Any], JobContext], Any | Awaitable[Any]]
 class RedisJobQueue:
     """Redis-backed queue safe for multiple workers and process restarts."""
 
+    backend = "redis"
+    durable = True
+
     def __init__(
         self,
         redis_client: Any,
@@ -495,11 +501,78 @@ class RedisJobQueue:
     ) -> Any:
         try:
             operation = getattr(self.redis, method)
-            return await asyncio.to_thread(operation, *args, **kwargs)
+            if inspect.iscoroutinefunction(operation):
+                return await operation(*args, **kwargs)
+
+            result = await asyncio.to_thread(operation, *args, **kwargs)
+            if inspect.isawaitable(result):
+                return await result
+            return result
         except Exception as exc:
             raise JobQueueError(
-                f"Redis job queue operation {method} failed."
+                f"Redis operation {method!r} failed: {exc}"
             ) from exc
+
+    async def _pipeline_call(
+        self,
+        operations: tuple[tuple[str, tuple[Any, ...], dict[str, Any]], ...],
+    ) -> list[Any]:
+        """Execute one pipeline with either redis or redis.asyncio clients."""
+
+        pipeline_factory = getattr(self.redis, "pipeline", None)
+        if not callable(pipeline_factory):
+            return [
+                await self._redis_call(method, *args, **kwargs)
+                for method, args, kwargs in operations
+            ]
+
+        try:
+            pipeline = pipeline_factory(transaction=False)
+            if inspect.isawaitable(pipeline):
+                pipeline = await pipeline
+        except Exception as exc:
+            raise JobQueueError("Could not create a Redis job queue pipeline.") from exc
+
+        reset = getattr(pipeline, "reset", None)
+        try:
+            if not all(
+                callable(getattr(pipeline, method, None))
+                for method, _args, _kwargs in operations
+            ):
+                return [
+                    await self._redis_call(method, *args, **kwargs)
+                    for method, args, kwargs in operations
+                ]
+            for method, args, kwargs in operations:
+                queued = getattr(pipeline, method)(*args, **kwargs)
+                if inspect.isawaitable(queued):
+                    await queued
+
+            execute = getattr(pipeline, "execute", None)
+            if not callable(execute):
+                raise JobQueueError("Redis pipeline does not expose execute().")
+            if inspect.iscoroutinefunction(execute):
+                values = await execute()
+            else:
+                values = await asyncio.to_thread(execute)
+                if inspect.isawaitable(values):
+                    values = await values
+            return list(values or ())
+        except JobQueueError:
+            raise
+        except Exception as exc:
+            raise JobQueueError("Redis job queue pipeline failed.") from exc
+        finally:
+            if callable(reset):
+                try:
+                    if inspect.iscoroutinefunction(reset):
+                        await reset()
+                    else:
+                        reset_result = await asyncio.to_thread(reset)
+                        if inspect.isawaitable(reset_result):
+                            await reset_result
+                except Exception:
+                    logger.debug("Redis job queue pipeline reset failed.", exc_info=True)
 
     async def enqueue(
         self,
@@ -549,6 +622,7 @@ class RedisJobQueue:
             "1" if use_idempotency else "0",
             str(max(60, min(2_592_000, int(idempotency_ttl_seconds)))),
             str(self.max_queued_jobs),
+            self.job_prefix,
         )
         values = list(raw or ())
         if len(values) != 2:
@@ -759,23 +833,13 @@ class RedisJobQueue:
         if not job_ids:
             return []
 
-        def load() -> list[Any]:
-            pipeline_factory = getattr(self.redis, "pipeline", None)
-            if not callable(pipeline_factory):
-                return [self.redis.hgetall(self._job_key(job_id)) for job_id in job_ids]
-
-            pipeline = pipeline_factory(transaction=False)
-            try:
-                for job_id in job_ids:
-                    pipeline.hgetall(self._job_key(job_id))
-                return list(pipeline.execute())
-            finally:
-                reset = getattr(pipeline, "reset", None)
-                if callable(reset):
-                    reset()
-
         try:
-            raw_jobs = await asyncio.to_thread(load)
+            raw_jobs = await self._pipeline_call(
+                tuple(
+                    ("hgetall", (self._job_key(job_id),), {})
+                    for job_id in job_ids
+                )
+            )
         except Exception as exc:
             raise JobQueueError("Redis job queue bulk read failed.") from exc
         if len(raw_jobs) != len(job_ids):
@@ -907,49 +971,23 @@ class RedisJobQueue:
         cutoff = now - self.retention_seconds
         hour_ago = now - 3_600.0
 
-        def load() -> list[Any]:
-            operations = (
-                ("zremrangebyscore", (self.dead_key, "-inf", cutoff), {}),
-                ("zremrangebyscore", (self.succeeded_key, "-inf", cutoff), {}),
-                ("zremrangebyscore", (self.cancelled_key, "-inf", cutoff), {}),
-                ("zcard", (self.ready_key,), {}),
-                ("zcard", (self.leased_key,), {}),
-                ("zcard", (self.dead_key,), {}),
-                ("zcard", (self.succeeded_key,), {}),
-                ("zcard", (self.cancelled_key,), {}),
-                ("zrange", (self.ready_key, 0, 0), {"withscores": True}),
-                ("zcount", (self.succeeded_key, hour_ago, "+inf"), {}),
-                ("zcount", (self.dead_key, hour_ago, "+inf"), {}),
-                ("zcount", (self.cancelled_key, hour_ago, "+inf"), {}),
-            )
-
-            pipeline_factory = getattr(self.redis, "pipeline", None)
-            if not callable(pipeline_factory):
-                return [
-                    getattr(self.redis, method)(*args, **kwargs)
-                    for method, args, kwargs in operations
-                ]
-
-            pipeline = pipeline_factory(transaction=False)
-            reset = getattr(pipeline, "reset", None)
-            try:
-                if not all(
-                    callable(getattr(pipeline, method, None))
-                    for method, _args, _kwargs in operations
-                ):
-                    return [
-                        getattr(self.redis, method)(*args, **kwargs)
-                        for method, args, kwargs in operations
-                    ]
-                for method, args, kwargs in operations:
-                    getattr(pipeline, method)(*args, **kwargs)
-                return list(pipeline.execute())
-            finally:
-                if callable(reset):
-                    reset()
-
         try:
-            values = await asyncio.to_thread(load)
+            values = await self._pipeline_call(
+                (
+                    ("zremrangebyscore", (self.dead_key, "-inf", cutoff), {}),
+                    ("zremrangebyscore", (self.succeeded_key, "-inf", cutoff), {}),
+                    ("zremrangebyscore", (self.cancelled_key, "-inf", cutoff), {}),
+                    ("zcard", (self.ready_key,), {}),
+                    ("zcard", (self.leased_key,), {}),
+                    ("zcard", (self.dead_key,), {}),
+                    ("zcard", (self.succeeded_key,), {}),
+                    ("zcard", (self.cancelled_key,), {}),
+                    ("zrange", (self.ready_key, 0, 0), {"withscores": True}),
+                    ("zcount", (self.succeeded_key, hour_ago, "+inf"), {}),
+                    ("zcount", (self.dead_key, hour_ago, "+inf"), {}),
+                    ("zcount", (self.cancelled_key, hour_ago, "+inf"), {}),
+                )
+            )
         except Exception as exc:
             raise JobQueueError("Redis job queue stats read failed.") from exc
         if len(values) != 12:

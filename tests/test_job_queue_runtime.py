@@ -23,9 +23,13 @@ class FakeRedis:
         (
             job_id, job_type, payload, priority, created_at, available_at,
             max_attempts, timeout_seconds, use_idempotency, _ttl, max_queued,
+            job_prefix,
         ) = args
         if use_idempotency == "1" and idempotency_key in self.strings:
-            return [self.strings[idempotency_key], 0]
+            existing = self.strings[idempotency_key]
+            if f"{job_prefix}{existing}" in self.hashes:
+                return [existing, 0]
+            self.strings.pop(idempotency_key, None)
         if job_key in self.hashes:
             return [job_id, 0]
         if len(self.zsets.get(ready_key, {})) >= int(max_queued):
@@ -128,6 +132,55 @@ class FakeRedis:
 
 
 class JobQueueRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stale_idempotency_pointer_does_not_hide_new_job(self) -> None:
+        redis = FakeRedis()
+        queue = RedisJobQueue(redis, redis_prefix="tests")
+        redis.strings[queue._idempotency_key("request-1")] = "expired-job"
+
+        job, created = await queue.enqueue(
+            "tts",
+            {"chat_id": 1},
+            idempotency_key="request-1",
+        )
+
+        self.assertTrue(created)
+        self.assertNotEqual("expired-job", job.id)
+
+    async def test_async_redis_pipeline_supports_listing_and_stats(self) -> None:
+        class AsyncPipelineRedis(FakeRedis):
+            def pipeline(self, *, transaction: bool = False):
+                inner = super().pipeline(transaction=transaction)
+
+                class AsyncPipeline:
+                    def __getattr__(self, name):
+                        operation = getattr(inner, name)
+
+                        def queue(*args, **kwargs):
+                            operation(*args, **kwargs)
+                            return self
+
+                        return queue
+
+                    async def execute(self):
+                        return inner.execute()
+
+                    async def reset(self) -> None:
+                        inner.reset()
+
+                return AsyncPipeline()
+
+        redis = AsyncPipelineRedis()
+        queue = RedisJobQueue(redis, redis_prefix="tests")
+        job, _created = await queue.enqueue("tts", {"chat_id": 1})
+
+        jobs, cursor = await queue.list_jobs(state="queued")
+        stats = await queue.stats()
+
+        self.assertEqual([job.id], [item.id for item in jobs])
+        self.assertIsNone(cursor)
+        self.assertEqual(1, stats["queued"])
+        self.assertEqual(2, redis.pipeline_execute_calls)
+
     async def test_queue_limit_applies_backpressure(self) -> None:
         queue = RedisJobQueue(FakeRedis(), redis_prefix="tests", max_queued_jobs=1)
         _job, created = await queue.enqueue("tts", {"chat_id": 1})

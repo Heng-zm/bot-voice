@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 from app.services.jobs.handlers import BotJobHandlers
 from app.services.telegram.delivery import (
     IdempotentTelegramDelivery,
+    MemoryDeliveryStore,
     RedisDeliveryStore,
     TelegramDeliveryBusy,
 )
@@ -60,6 +61,28 @@ class FakeRedis:
 
 
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_memory_delivery_is_idempotent_without_redis(self) -> None:
+        delivery = IdempotentTelegramDelivery(MemoryDeliveryStore())
+        bot = SimpleNamespace(
+            send_voice=AsyncMock(return_value=SimpleNamespace(message_id=91)),
+        )
+
+        first = await delivery.deliver_voice(
+            bot=bot,
+            idempotency_key="memory:voice",
+            chat_id=42,
+            voice=io.BytesIO(b"voice"),
+        )
+        second = await delivery.deliver_voice(
+            bot=bot,
+            idempotency_key="memory:voice",
+            chat_id=42,
+            voice=io.BytesIO(b"voice"),
+        )
+
+        self.assertEqual(first, second)
+        bot.send_voice.assert_awaited_once()
+
     async def test_tts_handler_routes_voice_through_idempotent_delivery(self) -> None:
         bot = SimpleNamespace()
 

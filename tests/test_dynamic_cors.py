@@ -94,7 +94,89 @@ class FakeRedis:
         return FakePipeline(self)
 
 
+class AsyncFakePipeline:
+    def __init__(self, redis: AsyncFakeRedis) -> None:
+        self.redis = redis
+        self.operations: list[tuple[str, tuple, dict]] = []
+        self.reset_called = False
+
+    def delete(self, *args, **kwargs):
+        self.operations.append(("delete", args, kwargs))
+        return self
+
+    def sadd(self, *args, **kwargs):
+        self.operations.append(("sadd", args, kwargs))
+        return self
+
+    def srem(self, *args, **kwargs):
+        self.operations.append(("srem", args, kwargs))
+        return self
+
+    def set(self, *args, **kwargs):
+        self.operations.append(("set", args, kwargs))
+        return self
+
+    async def execute(self):
+        return [
+            await getattr(self.redis, name)(*args, **kwargs)
+            for name, args, kwargs in self.operations
+        ]
+
+    async def reset(self) -> None:
+        self.reset_called = True
+        self.operations.clear()
+
+
+class AsyncFakeRedis(FakeRedis):
+    async def get(self, key: str):
+        return super().get(key)
+
+    async def set(self, key: str, value: str, **kwargs):
+        return super().set(key, value, **kwargs)
+
+    async def delete(self, key: str):
+        return super().delete(key)
+
+    async def sadd(self, key: str, *values: str):
+        return super().sadd(key, *values)
+
+    async def srem(self, key: str, *values: str):
+        return super().srem(key, *values)
+
+    async def smembers(self, key: str):
+        return super().smembers(key)
+
+    def pipeline(self, transaction: bool = True):
+        self.last_pipeline_transaction = transaction
+        pipeline = AsyncFakePipeline(self)
+        self.last_pipeline = pipeline
+        return pipeline
+
+
 class DynamicCorsStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_redis_pipeline_supports_policy_mutations(self) -> None:
+        redis = AsyncFakeRedis()
+        store = DynamicCorsStore(
+            redis_client=redis,
+            redis_prefix="async-tests",
+        )
+        await store.load(force=True)
+
+        added, added_changed = await store.add(
+            "https://admin.example",
+            admin_id=7,
+        )
+        removed, removed_changed = await store.delete(
+            "https://admin.example",
+            admin_id=7,
+        )
+
+        self.assertTrue(added_changed)
+        self.assertEqual(("https://admin.example",), added.origins)
+        self.assertTrue(removed_changed)
+        self.assertEqual((), removed.origins)
+        self.assertTrue(redis.last_pipeline.reset_called)
+
     async def asyncSetUp(self) -> None:
         self.redis = FakeRedis()
         self.store = DynamicCorsStore(

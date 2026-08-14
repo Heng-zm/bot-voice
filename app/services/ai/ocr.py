@@ -30,8 +30,10 @@ def normalize_ocr_provider(value: object, *, default: str = "gemini") -> str:
         "google": "gemini",
         "google_gemini": "gemini",
         "gemini_ocr": "gemini",
+        "tesseract": "local",
+        "easyocr": "local",
     }.get(provider, provider)
-    return provider if provider in {"gemini", "auto", "hf"} else "gemini"
+    return provider if provider in {"gemini", "auto", "hf", "local"} else "gemini"
 
 
 def normalize_preferred_ocr_provider(

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import secrets
 import time
@@ -127,7 +128,18 @@ class RedisDeliveryStore:
 
     async def _call(self, method: str, *args: Any) -> Any:
         try:
-            return await asyncio.to_thread(getattr(self.redis, method), *args)
+            op = getattr(self.redis, method)
+            if inspect.iscoroutinefunction(op):
+                return await op(*args)
+            # Calling a synchronous Redis client on the event-loop thread both
+            # blocks other jobs and, previously, caused the command to be run a
+            # second time in ``to_thread``.  Some proxy clients are not marked
+            # as coroutine functions but still return an awaitable, so retain
+            # that compatibility after making exactly one call.
+            res = await asyncio.to_thread(op, *args)
+            if inspect.isawaitable(res):
+                return await res
+            return res
         except Exception as exc:
             raise TelegramDeliveryError(f"Redis delivery {method} failed.") from exc
 
@@ -201,10 +213,83 @@ class RedisDeliveryStore:
         return bool(changed)
 
 
+class MemoryDeliveryStore:
+    """Process-local delivery leases for explicit Redis-disabled mode."""
+
+    def __init__(
+        self,
+        *,
+        lease_seconds: float = 90.0,
+        retention_seconds: int = 604_800,
+    ) -> None:
+        self.lease_seconds = max(15.0, min(3_600.0, float(lease_seconds)))
+        self.retention_seconds = max(300, min(2_592_000, int(retention_seconds)))
+        self._states: dict[str, dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def claim(self, idempotency_key: str) -> DeliveryClaim:
+        key = str(idempotency_key or "").strip()
+        if not key:
+            raise ValueError("Delivery idempotency key is required.")
+        now = time.time()
+        async with self._lock:
+            state = self._states.get(key)
+            if state and state.get("state") == "completed":
+                completed_at = float(state.get("completed_at") or now)
+                if completed_at + self.retention_seconds > now:
+                    return DeliveryClaim("completed", result=dict(state.get("result") or {}))
+                self._states.pop(key, None)
+                state = None
+            if (
+                state
+                and state.get("state") == "processing"
+                and float(state.get("lease_deadline") or 0.0) > now
+            ):
+                return DeliveryClaim("busy")
+            token = secrets.token_urlsafe(24)
+            self._states[key] = {
+                "state": "processing",
+                "token": token,
+                "lease_deadline": now + self.lease_seconds,
+            }
+            return DeliveryClaim("claimed", token=token)
+
+    async def complete(
+        self,
+        idempotency_key: str,
+        token: str,
+        result: dict[str, Any],
+    ) -> bool:
+        async with self._lock:
+            state = self._states.get(str(idempotency_key))
+            if not state or state.get("state") != "processing" or state.get("token") != token:
+                return False
+            self._states[str(idempotency_key)] = {
+                "state": "completed",
+                "result": dict(result),
+                "completed_at": time.time(),
+            }
+            return True
+
+    async def release(
+        self,
+        idempotency_key: str,
+        token: str,
+        error: BaseException | str,
+    ) -> bool:
+        del error
+        async with self._lock:
+            key = str(idempotency_key)
+            state = self._states.get(key)
+            if not state or state.get("state") != "processing" or state.get("token") != token:
+                return False
+            self._states.pop(key, None)
+            return True
+
 class IdempotentTelegramDelivery:
     """Edit one known result message, or send once when no target exists."""
 
-    def __init__(self, store: RedisDeliveryStore) -> None:
+    def __init__(self, store: RedisDeliveryStore | MemoryDeliveryStore) -> None:
         self.store = store
 
     async def deliver_text(
@@ -317,11 +402,16 @@ def configure_telegram_delivery(
     redis_client: Any | None,
     *,
     redis_prefix: str = "tgbot",
+    memory_fallback: bool = False,
 ) -> IdempotentTelegramDelivery | None:
     global _DELIVERY
     if redis_client is None:
-        _DELIVERY = None
-        return None
+        _DELIVERY = (
+            IdempotentTelegramDelivery(MemoryDeliveryStore())
+            if memory_fallback
+            else None
+        )
+        return _DELIVERY
     _DELIVERY = IdempotentTelegramDelivery(
         RedisDeliveryStore(redis_client, redis_prefix=redis_prefix)
     )
@@ -337,6 +427,7 @@ def get_telegram_delivery() -> IdempotentTelegramDelivery:
 __all__ = [
     "DeliveryClaim",
     "IdempotentTelegramDelivery",
+    "MemoryDeliveryStore",
     "RedisDeliveryStore",
     "TelegramDeliveryBusy",
     "TelegramDeliveryError",
