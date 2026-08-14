@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from app.services.db.locks import BOT_LOCKS_SQL, SupabaseLockService
 
@@ -223,6 +223,117 @@ class TelegramLeaderLockTests(unittest.IsolatedAsyncioTestCase):
             },
             client.call[1],
         )
+
+    async def test_async_leader_timeout_is_not_reported_as_another_owner(
+        self,
+    ) -> None:
+        from app import legacy
+
+        async def unavailable_db_call(_name, _factory, **options):
+            return options.get("default")
+
+        with (
+            patch.dict(
+                os.environ,
+                {"TELEGRAM_LEADER_STORE": "supabase"},
+                clear=False,
+            ),
+            patch.multiple(
+                legacy,
+                create=True,
+                redis_client_async=None,
+                redis_client=None,
+                supabase_async=object(),
+                supabase=object(),
+                TELEGRAM_ACTIVE_LOCK_ENABLED=True,
+            ),
+            patch.object(legacy, "db_call", new=unavailable_db_call),
+        ):
+            acquired = await legacy._telegram_leader_acquire()
+            error = legacy._TELEGRAM_LEADER_LAST_ERROR
+
+        self.assertFalse(acquired)
+        self.assertEqual("supabase:unavailable", error)
+
+    async def test_transient_renewal_failure_uses_unexpired_lease_grace(
+        self,
+    ) -> None:
+        from app import legacy
+
+        with (
+            patch.multiple(
+                legacy,
+                TELEGRAM_ACTIVE_LOCK_ENABLED=True,
+                TELEGRAM_ACTIVE_LOCK_TTL_S=90,
+                _TELEGRAM_LEADER_OWNED=True,
+                _TELEGRAM_LEADER_LAST_RENEW_AT=100.0,
+                _TELEGRAM_LEADER_LAST_ERROR="supabase:unavailable",
+            ),
+            patch.object(
+                legacy,
+                "_telegram_leader_acquire",
+                new=AsyncMock(return_value=False),
+            ),
+            patch.object(legacy.time, "monotonic", return_value=120.0),
+            patch.object(legacy, "_log_once"),
+        ):
+            active = await legacy._telegram_leader_refresh_once()
+            still_owned = legacy._TELEGRAM_LEADER_OWNED
+
+        self.assertTrue(active)
+        self.assertTrue(still_owned)
+
+    async def test_confirmed_other_owner_bypasses_lease_grace(self) -> None:
+        from app import legacy
+
+        with (
+            patch.multiple(
+                legacy,
+                TELEGRAM_ACTIVE_LOCK_ENABLED=True,
+                TELEGRAM_ACTIVE_LOCK_TTL_S=90,
+                _TELEGRAM_LEADER_OWNED=True,
+                _TELEGRAM_LEADER_LAST_RENEW_AT=100.0,
+                _TELEGRAM_LEADER_LAST_ERROR="supabase:not_owner",
+            ),
+            patch.object(
+                legacy,
+                "_telegram_leader_acquire",
+                new=AsyncMock(return_value=False),
+            ),
+            patch.object(legacy.time, "monotonic", return_value=120.0),
+        ):
+            active = await legacy._telegram_leader_refresh_once()
+            still_owned = legacy._TELEGRAM_LEADER_OWNED
+
+        self.assertFalse(active)
+        self.assertFalse(still_owned)
+
+    async def test_transient_failure_stands_down_before_lease_expiry(
+        self,
+    ) -> None:
+        from app import legacy
+
+        with (
+            patch.multiple(
+                legacy,
+                TELEGRAM_ACTIVE_LOCK_ENABLED=True,
+                TELEGRAM_ACTIVE_LOCK_TTL_S=90,
+                _TELEGRAM_LEADER_OWNED=True,
+                _TELEGRAM_LEADER_LAST_RENEW_AT=100.0,
+                _TELEGRAM_LEADER_LAST_ERROR="supabase:unavailable",
+            ),
+            patch.object(
+                legacy,
+                "_telegram_leader_acquire",
+                new=AsyncMock(return_value=False),
+            ),
+            patch.object(legacy.time, "monotonic", return_value=185.0),
+        ):
+            active = await legacy._telegram_leader_refresh_once()
+            still_owned = legacy._TELEGRAM_LEADER_OWNED
+
+        self.assertFalse(active)
+        self.assertFalse(still_owned)
 
     def test_disabled_redis_and_unused_pooler_do_not_warn(self) -> None:
         from app import legacy

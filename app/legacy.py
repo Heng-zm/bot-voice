@@ -15359,6 +15359,26 @@ def _telegram_leader_store_available() -> bool:
     return bool(globals().get("redis_client") is not None or globals().get("supabase") is not None)
 
 
+def _telegram_leader_failure_is_transient() -> bool:
+    error = str(globals().get("_TELEGRAM_LEADER_LAST_ERROR", "") or "")
+    return error.startswith(("redis:", "supabase:unavailable", "no_store"))
+
+
+def _telegram_leader_grace_remaining(now: float | None = None) -> float:
+    """Return safe lease time remaining after a transient store failure."""
+    if not bool(globals().get("_TELEGRAM_LEADER_OWNED", False)):
+        return 0.0
+    last_renew = float(
+        globals().get("_TELEGRAM_LEADER_LAST_RENEW_AT", 0.0) or 0.0
+    )
+    if last_renew <= 0:
+        return 0.0
+    current = time.monotonic() if now is None else float(now)
+    # Stop before the database lease can expire to avoid overlapping owners.
+    safe_deadline = last_renew + _telegram_leader_ttl_s() - 5.0
+    return max(0.0, safe_deadline - current)
+
+
 async def _telegram_leader_acquire() -> bool:
     """Acquire/renew active Telegram ownership (Async). Redis is preferred; Supabase is fallback."""
     global _TELEGRAM_LEADER_LAST_ERROR
@@ -15430,13 +15450,22 @@ async def _telegram_leader_acquire() -> bool:
                 return bool(getattr(res, "data", False))
             return db_named_lock_acquire(lock_key, owner, ttl)
 
-        ok = await db_call("leader_acquire", _db_acquire, default=False, attempts=2)
+        ok = await db_call(
+            "leader_acquire",
+            _db_acquire,
+            default=None,
+            attempts=2,
+        )
+        if ok is None:
+            _TELEGRAM_LEADER_LAST_ERROR = "supabase:unavailable"
+            return False
         _TELEGRAM_LEADER_LAST_ERROR = "" if ok else "supabase:not_owner"
         return bool(ok)
 
     _TELEGRAM_LEADER_LAST_ERROR = "no_store"
     if _telegram_leader_require_store():
         return False
+    _TELEGRAM_LEADER_LAST_ERROR = ""
     return True
 
 
@@ -15597,6 +15626,16 @@ async def _telegram_leader_refresh_once(app_obj: Any | None = None) -> bool:
     acquired = await _telegram_leader_acquire()
     now = time.monotonic()
     if not acquired:
+        grace_remaining = _telegram_leader_grace_remaining(now)
+        if _telegram_leader_failure_is_transient() and grace_remaining > 0:
+            _log_once(
+                logging.WARNING,
+                "telegram_leader_renewal_grace",
+                "Telegram leader store is temporarily unavailable; retaining "
+                "active ownership for up to %.1fs within the current lease.",
+                grace_remaining,
+            )
+            return True
         if _TELEGRAM_LEADER_OWNED:
             webhook_logger.warning("This Render instance lost Telegram active ownership; switching to standby.")
             if app_obj is not None:
@@ -27951,7 +27990,12 @@ async def _run_bot():
                 now = time.monotonic()
                 if now >= leader_refresh_due:
                     active_owner = await _telegram_leader_refresh_once(app)
-                    leader_refresh_due = now + _telegram_leader_renew_interval_s()
+                    retry_delay = (
+                        min(5.0, _telegram_leader_renew_interval_s())
+                        if _telegram_leader_failure_is_transient()
+                        else _telegram_leader_renew_interval_s()
+                    )
+                    leader_refresh_due = time.monotonic() + retry_delay
                 else:
                     active_owner = _telegram_should_run_telegram_workers()
 
