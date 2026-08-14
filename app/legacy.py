@@ -144,6 +144,19 @@ from app.services.telegram.flow import (
     classify_callback,
 )
 from app.services.db.locks import BOT_LOCKS_SQL, SupabaseLockService
+from app.api.v1 import telegram as _telegram_api_transport
+from app.services.telegram import client as _telegram_webhook_client
+from app.services.telegram import deduplication as _telegram_deduplication
+from app.services.telegram.welcome import (
+    WELCOME_IMAGE_CAPTION_MAX_CHARS,
+    WELCOME_IMAGE_FILE_ID_MAX_CHARS,
+    WELCOME_IMAGE_SETTING_KEY,
+    WELCOME_MESSAGE_MAX_CHARS,
+    WELCOME_MESSAGE_SETTING_KEY,
+    normalize_welcome_image_file_id as _normalize_welcome_image_file_id_service,
+    normalize_welcome_message as _normalize_welcome_message_service,
+    send_welcome_content as _send_welcome_content_service,
+)
 from app.core.network import web_server_port
 from app.core.resources import resource_default, resource_profile, resource_value
 try:
@@ -1790,13 +1803,10 @@ def _telegram_webhook_target_url_for_secret(secret_token: str) -> str:
     failed setWebhook call from making the app reject Telegram's still-active
     old webhook path with 403 Invalid path secret.
     """
-    base_url = _runtime_webhook_base_url()
-    secret_token = str(secret_token or "").strip()
-    if not base_url:
-        raise RuntimeError("BOT_MODE=WEBHOOK requires TELEGRAM_WEBHOOK_URL.")
-    if not secret_token:
-        raise RuntimeError("BOT_MODE=WEBHOOK requires TELEGRAM_WEBHOOK_SECRET_TOKEN.")
-    return f"{base_url}/tg-webhook-{quote(secret_token, safe='')}"
+    return _telegram_webhook_client.build_webhook_target_url(
+        _runtime_webhook_base_url(),
+        secret_token,
+    )
 
 
 def _telegram_webhook_target_url() -> str:
@@ -1820,333 +1830,69 @@ def _telegram_allowed_updates() -> list[str]:
         or getattr(SETTINGS, "TELEGRAM_ALLOWED_UPDATES", "message,callback_query")
         or "message,callback_query"
     )
-    allowed = []
-    for item in raw.split(","):
-        item = item.strip()
-        if item and re.fullmatch(r"[a-z_]+", item) and item not in allowed:
-            allowed.append(item)
-    return allowed or ["message", "callback_query"]
+    return _telegram_webhook_client.parse_allowed_updates(raw)
 
 
-_WEBHOOK_UPDATE_MEMORY: OrderedDict[
-    int,
-    tuple[str, float, str | None],
-] = OrderedDict()
-_WEBHOOK_UPDATE_MEMORY_LOCK = threading.RLock()
+_telegram_deduplication.configure_webhook_deduplicator(
+    redis_client_provider=lambda: globals().get("redis_client"),
+    replay_key_builder=lambda uid: (
+        _redis_key("tg_update_seen", uid)
+        if "_redis_key" in globals()
+        else f"tg_update_seen:{uid}"
+    ),
+)
+_WEBHOOK_UPDATE_MEMORY = _telegram_deduplication.WEBHOOK_UPDATE_MEMORY
+_WEBHOOK_UPDATE_MEMORY_LOCK = _telegram_deduplication.WEBHOOK_UPDATE_MEMORY_LOCK
+_webhook_replay_ttl_seconds = _telegram_deduplication._webhook_replay_ttl_seconds
+_webhook_processing_ttl_seconds = (
+    _telegram_deduplication._webhook_processing_ttl_seconds
+)
+_telegram_webhook_update_id = _telegram_deduplication._telegram_webhook_update_id
+_telegram_webhook_replay_key = (
+    _telegram_deduplication._telegram_webhook_replay_key
+)
+_trim_webhook_memory_locked = _telegram_deduplication._trim_webhook_memory_locked
+_telegram_webhook_update_claim = (
+    _telegram_deduplication._telegram_webhook_update_claim
+)
+_telegram_webhook_update_complete = (
+    _telegram_deduplication._telegram_webhook_update_complete
+)
+_telegram_webhook_update_release = (
+    _telegram_deduplication._telegram_webhook_update_release
+)
 
 
-def _webhook_replay_ttl_seconds() -> int:
-    return _env_int("WEBHOOK_REPLAY_TTL_S", 600, minimum=60, maximum=86400)
-
-
-def _webhook_processing_ttl_seconds() -> int:
-    return _env_int("WEBHOOK_PROCESSING_TTL_S", 120, minimum=15, maximum=_webhook_replay_ttl_seconds())
-
-
-def _telegram_webhook_update_id(update_id: Any) -> int | None:
-    try:
-        return int(update_id)
-    except Exception:
-        return None
-
-
-def _telegram_webhook_replay_key(uid: int) -> str:
-    return _redis_key("tg_update_seen", uid) if "_redis_key" in globals() else f"tg_update_seen:{uid}"
-
-
-def _trim_webhook_memory_locked(now: float, ttl: int) -> None:
-    stale_before = now - ttl
-    for old_uid, (_state, old_ts, _token) in list(
-        _WEBHOOK_UPDATE_MEMORY.items()
-    )[:5000]:
-        if old_ts < stale_before:
-            _WEBHOOK_UPDATE_MEMORY.pop(old_uid, None)
-    while len(_WEBHOOK_UPDATE_MEMORY) > 50_000:
-        _WEBHOOK_UPDATE_MEMORY.popitem(last=False)
-
-
-async def _telegram_webhook_update_claim(
-    update_id: Any,
-    *,
-    include_token: bool = False,
-) -> str | tuple[str, str | None]:
-    """Return claimed, processing, completed, or invalid for an update id."""
-
-    def result(
-        state: str,
-        token: str | None = None,
-    ) -> str | tuple[str, str | None]:
-        return (state, token) if include_token else state
-
-    uid = _telegram_webhook_update_id(update_id)
-    if uid is None:
-        return result("invalid")
-
-    claim_token = secrets.token_urlsafe(18) if include_token else None
-    processing_value = (
-        f"processing:{claim_token}" if claim_token is not None else "processing"
-    )
-
-    redis_obj = globals().get("redis_client")
-    if redis_obj is not None:
-        key = _telegram_webhook_replay_key(uid)
-        processing_ttl = _webhook_processing_ttl_seconds()
-        try:
-            created = await asyncio.to_thread(
-                lambda: redis_obj.set(
-                    key,
-                    processing_value,
-                    ex=processing_ttl,
-                    nx=True,
-                )
-            )
-            if created:
-                return result("claimed", claim_token)
-            raw = await asyncio.to_thread(lambda: redis_obj.get(key))
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8", errors="ignore")
-            state = (
-                "completed"
-                if str(raw or "").lower() == "done"
-                else "processing"
-            )
-            return result(state)
-        except Exception as exc:
-            _log_once(logging.WARNING, "webhook_replay_redis_fallback", "Webhook replay Redis fallback: %s", exc)
-
-    now = time.monotonic()
-    ttl = _webhook_replay_ttl_seconds()
-    with _WEBHOOK_UPDATE_MEMORY_LOCK:
-        _trim_webhook_memory_locked(now, ttl)
-        existing = _WEBHOOK_UPDATE_MEMORY.get(uid)
-        if existing:
-            state, _ts, _token = existing
-            _WEBHOOK_UPDATE_MEMORY.move_to_end(uid)
-            existing_state = "completed" if state == "done" else "processing"
-            return result(existing_state)
-        _WEBHOOK_UPDATE_MEMORY[uid] = ("processing", now, claim_token)
-        _trim_webhook_memory_locked(now, ttl)
-        return result("claimed", claim_token)
-
-
-async def _telegram_webhook_update_complete(
-    update_id: Any,
-    *,
-    claim_token: str | None = None,
-) -> bool:
-    uid = _telegram_webhook_update_id(update_id)
-    if uid is None:
-        return False
-    redis_obj = globals().get("redis_client")
-    if redis_obj is not None:
-        key = _telegram_webhook_replay_key(uid)
-        try:
-            if claim_token is None:
-                await asyncio.to_thread(
-                    lambda: redis_obj.set(
-                        key,
-                        "done",
-                        ex=_webhook_replay_ttl_seconds(),
-                    )
-                )
-            else:
-                script = (
-                    "if redis.call('GET', KEYS[1]) == ARGV[1] then "
-                    "redis.call('SET', KEYS[1], 'done', 'EX', ARGV[2]); "
-                    "return 1 else return 0 end"
-                )
-                completed = await asyncio.to_thread(
-                    lambda: redis_obj.eval(
-                        script,
-                        1,
-                        key,
-                        f"processing:{claim_token}",
-                        str(_webhook_replay_ttl_seconds()),
-                    )
-                )
-                if not completed:
-                    return False
-        except Exception as exc:
-            _log_once(logging.WARNING, "webhook_replay_complete_fallback", "Webhook replay completion Redis fallback: %s", exc)
-    now = time.monotonic()
-    with _WEBHOOK_UPDATE_MEMORY_LOCK:
-        existing = _WEBHOOK_UPDATE_MEMORY.get(uid)
-        if (
-            claim_token is not None
-            and existing is not None
-            and existing[2] not in {None, claim_token}
-        ):
-            return False
-        _WEBHOOK_UPDATE_MEMORY[uid] = ("done", now, None)
-        _WEBHOOK_UPDATE_MEMORY.move_to_end(uid)
-        _trim_webhook_memory_locked(now, _webhook_replay_ttl_seconds())
-    return True
-
-
-async def _telegram_webhook_update_release(
-    update_id: Any,
-    *,
-    claim_token: str | None = None,
-) -> bool:
-    uid = _telegram_webhook_update_id(update_id)
-    if uid is None:
-        return False
-    released = True
-    redis_obj = globals().get("redis_client")
-    if redis_obj is not None:
-        key = _telegram_webhook_replay_key(uid)
-        script = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end"
-        expected = (
-            f"processing:{claim_token}"
-            if claim_token is not None
-            else "processing"
-        )
-        try:
-            released = bool(
-                await asyncio.to_thread(
-                    lambda: redis_obj.eval(script, 1, key, expected)
-                )
-            )
-        except Exception as exc:
-            _log_once(logging.WARNING, "webhook_replay_release_fallback", "Webhook replay release Redis fallback: %s", exc)
-    with _WEBHOOK_UPDATE_MEMORY_LOCK:
-        existing = _WEBHOOK_UPDATE_MEMORY.get(uid)
-        owned = (
-            existing
-            and existing[0] == "processing"
-            and (claim_token is None or existing[2] == claim_token)
-        )
-        if owned:
-            _WEBHOOK_UPDATE_MEMORY.pop(uid, None)
-        elif existing is not None and claim_token is not None:
-            released = False
-    return released
-
-
-async def _read_limited_webhook_body(req: FastAPIRequest, max_body: int) -> bytes:
-    """Read Telegram webhook payloads with a hard body cap.
-
-    Content-Length is rejected before body streaming.  The chunked stream path
-    also enforces the cap so a missing/lying header cannot flood memory.
-    """
-    content_length = req.headers.get("content-length")
-    if content_length:
-        try:
-            if int(content_length) > max_body:
-                raise HTTPException(status_code=413, detail=f"Request body too large. Max {max_body} bytes.")
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid Content-Length header.")
-
-    chunks: list[bytes] = []
-    total = 0
-    async for chunk in req.stream():
-        if not chunk:
-            continue
-        total += len(chunk)
-        if total > max_body:
-            raise HTTPException(status_code=413, detail=f"Request body too large. Max {max_body} bytes.")
-        chunks.append(chunk)
-    return b"".join(chunks)
-
-
-async def _process_telegram_webhook_request(req: FastAPIRequest, path_secret_token: str | None = None):
-    """Validate, parse, claim, and process a Telegram webhook update safely."""
-    if "_run_state_bot_mode" in globals() and _run_state_bot_mode() != "WEBHOOK":
-        webhook_logger.info("Webhook update ignored because BOT_MODE=%s.", _run_state_bot_mode())
-        return _FastJSONResponse({"status": "ignored", "reason": "not_webhook_mode"}, status_code=200)
-
-    expected_secret = _runtime_webhook_secret_token()
-    if not expected_secret:
-        webhook_logger.error("Rejected Telegram webhook request because TELEGRAM_WEBHOOK_SECRET_TOKEN is not configured.")
-        raise HTTPException(status_code=503, detail="Telegram webhook secret is not configured.")
-    if path_secret_token is not None and not hmac.compare_digest(str(path_secret_token), expected_secret):
-        webhook_logger.warning("Rejected Telegram webhook request with invalid path secret from %s", req.client.host if req.client else "unknown")
-        raise HTTPException(status_code=403, detail="Invalid webhook path secret.")
-
-    got_secret = (req.headers.get("X-Telegram-Bot-Api-Secret-Token") or "").strip()
-    if not hmac.compare_digest(got_secret, expected_secret):
-        webhook_logger.warning("Rejected Telegram webhook request with invalid secret header from %s", req.client.host if req.client else "unknown")
-        raise HTTPException(status_code=403, detail="Invalid webhook secret.")
-
-    app_obj = globals().get("telegram_application") or globals().get("_TELEGRAM_APP")
-    if app_obj is None or not bool(globals().get("_TELEGRAM_APP_READY", False)):
-        webhook_logger.warning("Telegram webhook rejected with 503 because application is not ready yet.")
-        raise HTTPException(status_code=503, detail="Telegram application is starting. Please retry.")
-    if not _telegram_should_process_webhook_update():
-        webhook_logger.info("Webhook update acknowledged by standby instance; active owner=%s", _telegram_leader_snapshot().get("owner"))
-        return _FastJSONResponse({"status": "ignored", "reason": "standby_instance"}, status_code=200)
-
-    max_body = min(_web_max_content_length(), 2 * 1024 * 1024)
-    try:
-        raw = await _read_limited_webhook_body(req, max_body)
-        data = _json_loads_fast(raw)
-        if not isinstance(data, dict):
-            raise ValueError("Telegram webhook JSON must be an object.")
-        update = Update.de_json(data, app_obj.bot)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        # Telegram itself should never send malformed JSON. Acknowledge an
-        # invalid payload once so a permanently bad body cannot create a retry
-        # storm, while keeping real handler failures retryable below.
-        error_id = secrets.token_hex(6)
-        webhook_logger.warning(
-            "Invalid Telegram webhook payload ignored error_id=%s: %s",
-            error_id,
-            exc,
-            exc_info=True,
-        )
-        return _FastJSONResponse({
-            "status": "ignored",
-            "reason": "invalid_payload",
-            "reference": error_id,
-        }, status_code=200)
-
-    update_id = getattr(update, "update_id", None)
-    claimed = False
-    claim_token: str | None = None
-    async def _run_update_background(u: Update, uid: int, token: str | None):
-        try:
-            # Add a safe processing timeout to prevent leaked tasks
-            await asyncio.wait_for(app_obj.process_update(u), timeout=55.0)
-            await _telegram_webhook_update_complete(uid, claim_token=token)
-        except asyncio.TimeoutError:
-            webhook_logger.warning("Telegram update processing timed out update_id=%s", uid)
-            await _telegram_webhook_update_release(uid, claim_token=token)
-        except Exception as e:
-            webhook_logger.error("Telegram update processing failed update_id=%s: %s", uid, e, exc_info=True)
-            await _telegram_webhook_update_release(uid, claim_token=token)
-
-    try:
-        claim_state, claim_token = await _telegram_webhook_update_claim(
-            update_id,
-            include_token=True,
-        )
-        if claim_state == "completed":
-            webhook_logger.info("Completed Telegram webhook update ignored update_id=%s", update_id)
-            _metric_inc("replay_dropped")
-            return _FastJSONResponse({"status": "ok", "duplicate": True}, status_code=200)
-        
-        if claim_state == "processing":
-            # If already processing, acknowledge to Telegram to stop retries, 
-            # but log that it was a duplicate.
-            return _FastJSONResponse({"status": "ok", "duplicate": True, "reason": "already_processing"}, status_code=200)
-
-        # Offload to background task so we can return 200 OK immediately
-        asyncio.create_task(_run_update_background(update, update_id, claim_token), name=f"tg-update-{update_id}")
-        return _FastJSONResponse({"status": "ok", "update_id": update_id}, status_code=200)
-
-    except Exception as exc:
-        error_id = secrets.token_hex(6)
-        webhook_logger.error("Telegram webhook ingest failed error_id=%s: %s", error_id, exc, exc_info=True)
-        return _FastJSONResponse({"status": "error", "reference": error_id}, status_code=200)
-
-    return _FastJSONResponse({"status": "ok"}, status_code=200)
+_telegram_api_transport.configure_telegram_webhook_transport(
+    bot_mode_provider=lambda: (
+        _run_state_bot_mode()
+        if "_run_state_bot_mode" in globals()
+        else globals().get("BOT_MODE", "POLLING")
+    ),
+    secret_provider=_runtime_webhook_secret_token,
+    application_provider=lambda: (
+        globals().get("telegram_application") or globals().get("_TELEGRAM_APP")
+    ),
+    ready_provider=lambda: bool(globals().get("_TELEGRAM_APP_READY", False)),
+    active_owner_provider=lambda: _telegram_should_process_webhook_update(),
+    owner_snapshot_provider=lambda: _telegram_leader_snapshot(),
+    max_body_provider=_web_max_content_length,
+    json_loader=_json_loads_fast,
+    response_factory=lambda payload, status_code: _FastJSONResponse(
+        payload,
+        status_code=status_code,
+    ),
+    metric_callback=lambda name: _metric_inc(name),
+)
+_read_limited_webhook_body = _telegram_api_transport._read_limited_webhook_body
+_process_telegram_webhook_request = (
+    _telegram_api_transport._process_telegram_webhook_request
+)
 
 
 @app.post("/tg-webhook-{secret_token}", include_in_schema=False)
 async def telegram_webhook_ingest(secret_token: str, req: FastAPIRequest):
-    return await _process_telegram_webhook_request(req, secret_token)
+    return await _telegram_api_transport.telegram_webhook_ingest(secret_token, req)
 
 
 @app.post("/telegram/webhook", include_in_schema=False)
@@ -2157,82 +1903,39 @@ async def telegram_webhook(req: FastAPIRequest):
     New deployments should use /tg-webhook-{secret_token}; setWebhook now
     registers that canonical route automatically.
     """
-    return await _process_telegram_webhook_request(req, None)
+    return await _telegram_api_transport.telegram_webhook(req)
 
 
-async def _configure_telegram_webhook_via_http_for_secret(secret_token: str) -> None:
-    """Configure Telegram webhook for an explicit secret token with 429 retry.
-
-    Used by rotation so the remote Telegram webhook is updated first.  Only
-    after this function succeeds should the new token be saved to RUN_STATE.
-    """
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
-
-    secret_token = str(secret_token or "").strip()
-    target_url = _telegram_webhook_target_url_for_secret(secret_token)
-
-    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
-    payload = {
-        "url": target_url,
-        "allowed_updates": _telegram_allowed_updates(),
-        # Keep pending updates by default so a Render restart/deploy does not
-        # silently lose user messages. Set TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES=true
-        # only when intentionally clearing a broken backlog.
-        "drop_pending_updates": _env_bool("TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES", False),
-        "secret_token": secret_token,
-    }
-    timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
-    max_attempts = _env_int("TELEGRAM_SETWEBHOOK_MAX_RETRIES", 3, minimum=1, maximum=10)
-    last_error: str | None = None
-
-    for attempt in range(1, max_attempts + 1):
-        async with httpx.AsyncClient(timeout=timeout, limits=_make_httpx_limits_from_run_state()) as client:
-            resp = await client.post(api_url, json=payload)
-        try:
-            data = _json_loads_fast(resp.content)
-        except Exception:
-            data = {"ok": False, "description": resp.text[:500]}
-
-        if resp.status_code == 429:
-            retry_after = 1
-            try:
-                retry_after = int((data.get("parameters") or {}).get("retry_after") or 1)
-            except Exception:
-                retry_after = 1
-            last_error = f"Telegram setWebhook rate-limited status=429 response={str(data)[:500]}"
-            if attempt < max_attempts:
-                webhook_logger.warning(
-                    "Telegram setWebhook rate-limited; retrying after %ss attempt=%s/%s",
-                    retry_after,
-                    attempt,
-                    max_attempts,
-                )
-                await asyncio.sleep(max(1, retry_after))
-                continue
-
-        if resp.status_code >= 400 or not bool(data.get("ok")):
-            raise RuntimeError(f"Telegram setWebhook failed status={resp.status_code} response={str(data)[:500]}")
-
-        webhook_logger.info(
-            "Telegram webhook configured via HTTPX url=%s max_connections=%s keepalive=%s",
-            target_url,
-            _run_state_http_max_connections(),
-            min(max(2, int(HTTP_MAX_KEEPALIVE_CONNECTIONS or 20)), _run_state_http_max_connections()),
-        )
-        return
-
-    raise RuntimeError(last_error or "Telegram setWebhook rate-limited after retries.")
-
-
-async def _configure_telegram_webhook_via_http() -> None:
-    """Configure Telegram webhook using the currently persisted runtime token."""
-    await _configure_telegram_webhook_via_http_for_secret(_runtime_webhook_secret_token())
-
-
-async def set_telegram_webhook() -> None:
-    """Public compatibility wrapper used by runtime admin orchestration."""
-    await _configure_telegram_webhook_via_http()
+_telegram_webhook_client.configure_telegram_webhook_client(
+    bot_token_provider=lambda: globals().get("TELEGRAM_BOT_TOKEN", ""),
+    target_url_builder=_telegram_webhook_target_url_for_secret,
+    current_secret_provider=_runtime_webhook_secret_token,
+    allowed_updates_provider=_telegram_allowed_updates,
+    drop_pending_provider=lambda: _env_bool(
+        "TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES",
+        False,
+    ),
+    limits_provider=lambda: _make_httpx_limits_from_run_state(),
+    set_max_attempts_provider=lambda: _env_int(
+        "TELEGRAM_SETWEBHOOK_MAX_RETRIES",
+        3,
+        minimum=1,
+        maximum=10,
+    ),
+    pool_snapshot_provider=lambda: {
+        "max_connections": _run_state_http_max_connections(),
+        "keepalive_connections": _run_state_http_keepalive_connections(),
+    },
+    json_loader=_json_loads_fast,
+    sleep=lambda seconds: asyncio.sleep(seconds),
+)
+_configure_telegram_webhook_via_http_for_secret = (
+    _telegram_webhook_client._configure_telegram_webhook_via_http_for_secret
+)
+_configure_telegram_webhook_via_http = (
+    _telegram_webhook_client._configure_telegram_webhook_via_http
+)
+set_telegram_webhook = _telegram_webhook_client.set_telegram_webhook
 
 
 async def _bootstrap_runtime_security() -> dict[str, Any]:
@@ -9976,61 +9679,9 @@ async def _telegram_stop_polling_runtime(app_obj: Any, *, cancel_task: bool = Tr
 
 
 async def _delete_telegram_webhook_via_http(drop_pending: bool = True) -> None:
-    """Delete and verify Telegram's webhook before getUpdates is allowed."""
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
-
-    delete_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
-    info_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getWebhookInfo"
-    timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
-    last_error = "Telegram did not confirm webhook deletion."
-
-    async with httpx.AsyncClient(timeout=timeout, limits=_make_httpx_limits_from_run_state()) as client:
-        for attempt in range(1, 6):
-            try:
-                resp = await client.post(
-                    delete_url,
-                    json={"drop_pending_updates": bool(drop_pending)},
-                )
-                try:
-                    data = _json_loads_fast(resp.content)
-                except Exception:
-                    data = {"ok": False, "description": resp.text[:500]}
-                if resp.status_code >= 400 or not bool(data.get("ok")):
-                    raise RuntimeError(
-                        "Telegram deleteWebhook failed "
-                        f"status={resp.status_code} response={str(data)[:500]}"
-                    )
-
-                info_resp = await client.get(info_url)
-                try:
-                    info = _json_loads_fast(info_resp.content)
-                except Exception:
-                    info = {"ok": False, "description": info_resp.text[:500]}
-                if info_resp.status_code >= 400 or not bool(info.get("ok")):
-                    raise RuntimeError(
-                        "Telegram getWebhookInfo failed "
-                        f"status={info_resp.status_code} response={str(info)[:500]}"
-                    )
-
-                webhook_url = str((info.get("result") or {}).get("url") or "").strip()
-                if not webhook_url:
-                    webhook_logger.info(
-                        "Telegram webhook deletion confirmed; polling may start."
-                    )
-                    return
-                last_error = "Telegram still reports an active webhook after deleteWebhook."
-            except (httpx.HTTPError, RuntimeError) as exc:
-                last_error = str(exc)
-
-            if attempt < 5:
-                webhook_logger.warning(
-                    "Webhook deletion not confirmed; retrying attempt=%s/5.",
-                    attempt,
-                )
-                await asyncio.sleep(min(3.0, float(attempt)))
-
-    raise RuntimeError(last_error)
+    await _telegram_webhook_client._delete_telegram_webhook_via_http(
+        drop_pending=drop_pending
+    )
 
 
 async def _recover_polling_webhook_conflict() -> None:
@@ -10273,6 +9924,61 @@ async def _runtime_admin_callback(update: Any, context: Any) -> None:
             "This runtime button is no longer available. Please reopen the menu.",
             show_alert=False,
         )
+
+
+async def _handle_runtime_admin_photo(update: Any, _context: Any) -> bool:
+    """Capture a photo only while an admin is editing the welcome content."""
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user or not _is_admin(user.id):
+        return False
+    with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+        state = dict(ACTIVE_ADMIN_CONVERSATIONS.get(user.id) or {})
+    if state.get("state") != "awaiting_welcome_message":
+        return False
+
+    photos = list(getattr(msg, "photo", None) or [])
+    image_file_id = _normalize_welcome_image_file_id(
+        getattr(photos[-1], "file_id", "") if photos else ""
+    )
+    if not image_file_id:
+        await safe_send(lambda: msg.reply_text(
+            "⚠️ មិនអាចអាន Telegram image file ID បានទេ។ សូមផ្ញើរូបភាពម្ដងទៀត។"
+        ))
+        return True
+
+    caption = str(getattr(msg, "caption", "") or "").replace("\x00", "").strip()
+    if len(caption) > WELCOME_MESSAGE_MAX_CHARS:
+        await safe_send(lambda: msg.reply_text(
+            f"⚠️ Caption វែងពេក។ អតិបរមា {WELCOME_MESSAGE_MAX_CHARS} តួអក្សរ; "
+            f"អ្នកបានផ្ញើ {len(caption)} តួអក្សរ។"
+        ))
+        return True
+
+    message_update = caption if caption and caption != str(state.get("current") or "") else None
+    ok, info = await asyncio.get_running_loop().run_in_executor(
+        _DB_EXECUTOR,
+        lambda: db_welcome_content_set(message_update, image_file_id, user.id),
+    )
+    if not ok:
+        await safe_send(lambda: msg.reply_text(
+            "⚠️ មិនអាចរក្សាទុក Welcome Image បានទេ៖ "
+            f"<code>{html.escape(str(info)[:500])}</code>\n\n"
+            "សូមព្យាយាមម្ដងទៀត ឬ /cancel។",
+            parse_mode="HTML",
+        ))
+        return True
+
+    with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+        ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
+    caption_notice = " និង Caption ជា Welcome Message" if message_update else ""
+    await safe_send(lambda: msg.reply_text(
+        f"✅ <b>Welcome Image បានរក្សាទុក{caption_notice}។</b>\n\n"
+        "ប្រើ /start ដើម្បីសាកល្បង។",
+        parse_mode="HTML",
+        reply_markup=get_admin_dashboard_kb(),
+    ))
+    return True
 
 
 async def _handle_runtime_admin_text(update: Any, context: Any) -> bool:
@@ -12513,8 +12219,6 @@ SPEED_OPTIONS = {
 }
 CHANNEL_URL = "https://t.me/m11mmm112"
 SUPPORT_URL = "https://pay-coffee-topaz.vercel.app/"
-WELCOME_MESSAGE_SETTING_KEY = "welcome_message"
-WELCOME_MESSAGE_MAX_CHARS = 3500
 WELCOME_TEXT = (
     "🎵 សួស្តី! ខ្ញុំជាបូតបម្លែងអត្ថបទទៅជាសំឡេងដោយ AI។\n\n"
     "📌 វាយអត្ថបទជាភាសាណាមួយ ហើយផ្ញើមកបូត។ បូតនឹងបង្កើតសំឡេងដោយស្វ័យប្រវត្តិ។\n"
@@ -14090,6 +13794,7 @@ BOT_SETTING_DEFAULTS: dict[str, str] = {
     "audio_to_voice_enabled": "1",
     "ai_resolver_enabled": "1",
     WELCOME_MESSAGE_SETTING_KEY: WELCOME_TEXT,
+    WELCOME_IMAGE_SETTING_KEY: "",
     **{key: str(_perf_default(key, spec.get("default", ""))) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 BOT_SETTING_LABELS: dict[str, str] = {
@@ -14101,6 +13806,7 @@ BOT_SETTING_LABELS: dict[str, str] = {
     "audio_to_voice_enabled": "🎙️ MP3/Audio → Voice Record",
     "ai_resolver_enabled": "🧠 AI Text Resolver",
     WELCOME_MESSAGE_SETTING_KEY: "👋 Welcome Message",
+    WELCOME_IMAGE_SETTING_KEY: "🖼️ Welcome Image",
     **{key: str(spec.get("label", key)) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 BOT_SETTING_DESCRIPTIONS: dict[str, str] = {
@@ -14112,6 +13818,7 @@ BOT_SETTING_DESCRIPTIONS: dict[str, str] = {
     "audio_to_voice_enabled": "Convert uploaded MP3/audio files to Telegram OGG/Opus voice records.",
     "ai_resolver_enabled": "Allow AI to rewrite/resolve text before TTS when enabled by env.",
     WELCOME_MESSAGE_SETTING_KEY: "Message shown by /start and /help.",
+    WELCOME_IMAGE_SETTING_KEY: "Optional Telegram image shown by /start and /help.",
     **{key: str(spec.get("help", "")) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 _SETTINGS_CACHE_TTL_S = _env_float("BOT_SETTINGS_CACHE_TTL_S", 30.0, minimum=0.0, maximum=3600.0)
@@ -14279,15 +13986,29 @@ async def get_bot_settings_async(force: bool = False) -> tuple[dict[str, str], d
 
 def _normalize_welcome_message(value: Any) -> str:
     """Return a bounded plain-text welcome message."""
-    text = str(value or "").replace("\x00", "").strip()
-    return (text or WELCOME_TEXT)[:WELCOME_MESSAGE_MAX_CHARS]
+    return _normalize_welcome_message_service(value, default_text=WELCOME_TEXT)
+
+
+def _normalize_welcome_image_file_id(value: Any) -> str:
+    """Return a bounded Telegram photo file ID or an empty string."""
+    return _normalize_welcome_image_file_id_service(value)
+
+
+async def get_welcome_content_async(force: bool = False) -> tuple[str, str]:
+    settings, _status = await get_bot_settings_async(force=force)
+    return (
+        _normalize_welcome_message(
+            settings.get(WELCOME_MESSAGE_SETTING_KEY, WELCOME_TEXT)
+        ),
+        _normalize_welcome_image_file_id(
+            settings.get(WELCOME_IMAGE_SETTING_KEY, "")
+        ),
+    )
 
 
 async def get_welcome_message_async(force: bool = False) -> str:
-    settings, _status = await get_bot_settings_async(force=force)
-    return _normalize_welcome_message(
-        settings.get(WELCOME_MESSAGE_SETTING_KEY, WELCOME_TEXT)
-    )
+    message, _image_file_id = await get_welcome_content_async(force=force)
+    return message
 
 
 def _cache_bot_setting_runtime_value(key: str, value: str) -> None:
@@ -14340,6 +14061,29 @@ def db_bot_setting_value_set(key: str, value: Any, admin_id: int) -> tuple[bool,
         return True, "saved"
     except Exception as e:
         return False, str(e)
+
+
+def db_welcome_content_set(
+    message: Any | None,
+    image_file_id: Any | None,
+    admin_id: int,
+) -> tuple[bool, str]:
+    """Persist one or both welcome fields through the normal setting path."""
+    changes: list[tuple[str, str]] = []
+    if message is not None:
+        changes.append((WELCOME_MESSAGE_SETTING_KEY, _normalize_welcome_message(message)))
+    if image_file_id is not None:
+        changes.append((WELCOME_IMAGE_SETTING_KEY, _normalize_welcome_image_file_id(image_file_id)))
+    if not changes:
+        return True, "no changes"
+
+    details: list[str] = []
+    for key, value in changes:
+        ok, info = db_bot_setting_value_set(key, value, admin_id)
+        if not ok:
+            return False, f"{key}: {info}"
+        details.append(str(info))
+    return True, "; ".join(details)
 
 
 def db_bot_setting_set(key: str, enabled: bool, admin_id: int) -> tuple[bool, str]:
@@ -15508,6 +15252,14 @@ def _telegram_leader_release_sync() -> bool:
     elif supabase is not None:
         released = db_named_lock_release(_telegram_leader_lock_key(), owner)
     return bool(released)
+
+
+async def _telegram_leader_release() -> bool:
+    """Release the active-owner lock without blocking the event loop."""
+    return await asyncio.get_running_loop().run_in_executor(
+        _DB_EXECUTOR,
+        _telegram_leader_release_sync,
+    )
 
 
 def _telegram_leader_snapshot() -> dict[str, Any]:
@@ -19998,6 +19750,8 @@ def get_bot_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
 
 def get_admin_welcome_editor_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👁️ Preview", callback_data="admin_welcome_preview"),
+         InlineKeyboardButton("🗑️ Remove Image", callback_data="admin_welcome_image_remove")],
         [InlineKeyboardButton("♻️ Reset to Default", callback_data="admin_welcome_reset")],
         [InlineKeyboardButton("⬅️ Settings", callback_data="admin_settings"),
          InlineKeyboardButton("❌ Cancel", callback_data="admin_cancel_state")],
@@ -23397,19 +23151,25 @@ async def _admin_open_welcome_editor(query, user_id: int) -> None:
     current = _normalize_welcome_message(
         settings.get(WELCOME_MESSAGE_SETTING_KEY, WELCOME_TEXT)
     )
+    current_image = _normalize_welcome_image_file_id(
+        settings.get(WELCOME_IMAGE_SETTING_KEY, "")
+    )
     preview_raw, preview_rest = _take_escaped_prefix(current, 2400)
     preview = html.escape(preview_raw) + ("…" if preview_rest else "")
     with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
         ACTIVE_ADMIN_CONVERSATIONS[int(user_id)] = {
             "state": "awaiting_welcome_message",
             "current": current,
+            "current_image": current_image,
             "ts": time.monotonic(),
         }
     await safe_send(lambda: query.message.edit_text(
         "✏️ <b>Edit Welcome Message</b>\n\n"
-        "ផ្ញើសារថ្មីដែលត្រូវបង្ហាញពេលអ្នកប្រើ /start ឬ /help។\n"
+        "ផ្ញើសារថ្មី ឬផ្ញើរូបភាពដែលត្រូវបង្ហាញពេលអ្នកប្រើ /start ឬ /help។\n"
+        "អ្នកអាចដាក់ Caption ជាមួយរូបភាព ដើម្បីកែរូបភាព និងសារក្នុងពេលតែមួយ។\n"
         f"អតិបរមា៖ <b>{WELCOME_MESSAGE_MAX_CHARS}</b> តួអក្សរ · "
-        f"Storage៖ <b>{_ok_bad(bool(status.get('db_ok')), 'Supabase', 'Memory / Redis')}</b>\n\n"
+        f"Storage៖ <b>{_ok_bad(bool(status.get('db_ok')), 'Supabase', 'Memory / Redis')}</b>\n"
+        f"រូបភាព៖ <b>{'បានកំណត់ ✅' if current_image else 'មិនទាន់មាន'}</b>\n\n"
         f"<b>សារបច្ចុប្បន្ន៖</b>\n<pre>{preview}</pre>",
         parse_mode="HTML",
         reply_markup=get_admin_welcome_editor_kb(),
@@ -24313,18 +24073,38 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         await _admin_open_welcome_editor(query, user_id)
         return
 
-    if data == "admin_welcome_reset":
+    if data == "admin_welcome_preview":
+        welcome_message, image_file_id = await get_welcome_content_async(force=True)
+        await _send_welcome_content(query.message, welcome_message, image_file_id)
+        return
+
+    if data == "admin_welcome_image_remove":
         with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
             ACTIVE_ADMIN_CONVERSATIONS.pop(int(user_id), None)
         ok, info = await asyncio.get_running_loop().run_in_executor(
             _DB_EXECUTOR,
             lambda: db_bot_setting_value_set(
-                WELCOME_MESSAGE_SETTING_KEY,
-                WELCOME_TEXT,
+                WELCOME_IMAGE_SETTING_KEY,
+                "",
                 user_id,
             ),
         )
-        notice = "✅ Welcome message reset to the default." if ok else f"⚠️ Reset failed: {info}"
+        notice = "✅ Welcome image removed." if ok else f"⚠️ Remove failed: {info}"
+        await _admin_open_settings_panel(query, force=True, notice=notice)
+        return
+
+    if data == "admin_welcome_reset":
+        with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+            ACTIVE_ADMIN_CONVERSATIONS.pop(int(user_id), None)
+        ok, info = await asyncio.get_running_loop().run_in_executor(
+            _DB_EXECUTOR,
+            lambda: db_welcome_content_set(
+                WELCOME_TEXT,
+                "",
+                user_id,
+            ),
+        )
+        notice = "✅ Welcome message and image reset to the default." if ok else f"⚠️ Reset failed: {info}"
         await _admin_open_settings_panel(query, force=True, notice=notice)
         return
 
@@ -26349,17 +26129,29 @@ async def cmd_delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 
+async def _send_welcome_content(
+    message: Any,
+    welcome_message: Any,
+    image_file_id: Any = "",
+) -> Any:
+    return await _send_welcome_content_service(
+        message,
+        welcome_message,
+        image_file_id,
+        default_text=WELCOME_TEXT,
+        reply_markup=get_welcome_kb(),
+        safe_sender=safe_send,
+        logger=logger,
+    )
+
+
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         sync_user_data(update.effective_user)
         if not await _ensure_user_allowed(update, context):
             return
-        welcome_message = await get_welcome_message_async()
-        await safe_send(lambda: update.message.reply_text(
-            welcome_message,
-            reply_markup=get_welcome_kb(),
-            disable_web_page_preview=True,
-        ))
+        welcome_message, image_file_id = await get_welcome_content_async()
+        await _send_welcome_content(update.message, welcome_message, image_file_id)
     except Exception as e:
         logger.error(f"on_start error: {e}")
 
@@ -26409,6 +26201,8 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if _is_admin(user_id):
+        if await _handle_runtime_admin_photo(update, context):
+            return
         sched_state = context.user_data.get("sched_state")
         if sched_state == SCHED_EDIT_WAIT_PHOTO:
             await _handle_sched_edit_photo(update, context)

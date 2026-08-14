@@ -210,6 +210,10 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
             legacy.WELCOME_TEXT,
             legacy.BOT_SETTING_DEFAULTS[legacy.WELCOME_MESSAGE_SETTING_KEY],
         )
+        self.assertEqual(
+            "",
+            legacy.BOT_SETTING_DEFAULTS[legacy.WELCOME_IMAGE_SETTING_KEY],
+        )
 
         welcome_buttons = [
             button
@@ -238,6 +242,15 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
             if button.callback_data
         }
         self.assertIn("admin_welcome_edit", admin_callbacks)
+
+        welcome_editor_callbacks = {
+            button.callback_data
+            for row in legacy.get_admin_welcome_editor_kb().inline_keyboard
+            for button in row
+            if button.callback_data
+        }
+        self.assertIn("admin_welcome_preview", welcome_editor_callbacks)
+        self.assertIn("admin_welcome_image_remove", welcome_editor_callbacks)
 
     async def test_myprefs_updates_only_changed_preferences_without_tts(self) -> None:
         message = SimpleNamespace(edit_text=AsyncMock())
@@ -328,6 +341,92 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
         finally:
             with legacy.ACTIVE_ADMIN_CONVERSATIONS_LOCK:
                 legacy.ACTIVE_ADMIN_CONVERSATIONS.pop(admin_id, None)
+
+    async def test_admin_welcome_photo_and_caption_are_persisted(self) -> None:
+        admin_id = 42
+        message = SimpleNamespace(
+            photo=[SimpleNamespace(file_id="small"), SimpleNamespace(file_id="large-photo-id")],
+            caption="Welcome with an image",
+            reply_text=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            message=message,
+            effective_user=SimpleNamespace(id=admin_id),
+        )
+        with legacy.ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+            legacy.ACTIVE_ADMIN_CONVERSATIONS[admin_id] = {
+                "state": "awaiting_welcome_message",
+                "current": "Old welcome",
+                "current_image": "",
+                "ts": 0.0,
+            }
+        try:
+            with (
+                patch.object(legacy, "_is_admin", return_value=True),
+                patch.object(
+                    legacy,
+                    "db_welcome_content_set",
+                    return_value=(True, "saved"),
+                ) as persist,
+            ):
+                handled = await legacy._handle_runtime_admin_photo(
+                    update,
+                    SimpleNamespace(user_data={}),
+                )
+
+            self.assertTrue(handled)
+            persist.assert_called_once_with(
+                "Welcome with an image",
+                "large-photo-id",
+                admin_id,
+            )
+            with legacy.ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+                self.assertNotIn(admin_id, legacy.ACTIVE_ADMIN_CONVERSATIONS)
+            message.reply_text.assert_awaited_once()
+        finally:
+            with legacy.ACTIVE_ADMIN_CONVERSATIONS_LOCK:
+                legacy.ACTIVE_ADMIN_CONVERSATIONS.pop(admin_id, None)
+
+    async def test_welcome_image_uses_caption_when_text_fits(self) -> None:
+        message = SimpleNamespace(
+            reply_photo=AsyncMock(return_value=SimpleNamespace(message_id=1)),
+            reply_text=AsyncMock(),
+        )
+
+        await legacy._send_welcome_content(message, "Short welcome", "photo-id")
+
+        message.reply_photo.assert_awaited_once()
+        kwargs = message.reply_photo.await_args.kwargs
+        self.assertEqual("photo-id", kwargs["photo"])
+        self.assertEqual("Short welcome", kwargs["caption"])
+        self.assertIsNotNone(kwargs["reply_markup"])
+        message.reply_text.assert_not_awaited()
+
+    async def test_long_welcome_text_is_sent_after_image(self) -> None:
+        message = SimpleNamespace(
+            reply_photo=AsyncMock(return_value=SimpleNamespace(message_id=1)),
+            reply_text=AsyncMock(return_value=SimpleNamespace(message_id=2)),
+        )
+        long_welcome = "x" * (legacy.WELCOME_IMAGE_CAPTION_MAX_CHARS + 1)
+
+        await legacy._send_welcome_content(message, long_welcome, "photo-id")
+
+        message.reply_photo.assert_awaited_once_with(photo="photo-id")
+        message.reply_text.assert_awaited_once()
+        self.assertEqual(long_welcome, message.reply_text.await_args.args[0])
+        self.assertIsNotNone(message.reply_text.await_args.kwargs["reply_markup"])
+
+    async def test_invalid_welcome_image_falls_back_to_text(self) -> None:
+        message = SimpleNamespace(
+            reply_photo=AsyncMock(side_effect=legacy.BadRequest("wrong file identifier")),
+            reply_text=AsyncMock(return_value=SimpleNamespace(message_id=2)),
+        )
+
+        await legacy._send_welcome_content(message, "Fallback welcome", "invalid-photo")
+
+        message.reply_photo.assert_awaited_once()
+        message.reply_text.assert_awaited_once()
+        self.assertEqual("Fallback welcome", message.reply_text.await_args.args[0])
 
     def test_broadcast_markdown_link_and_preview_directives(self) -> None:
         stored = legacy._broadcast_apply_option_directives(

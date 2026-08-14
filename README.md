@@ -28,7 +28,8 @@ app/
 │   ├── telegram/
 │   │   ├── client.py
 │   │   ├── handlers.py
-│   │   └── deduplication.py
+│   │   ├── deduplication.py
+│   │   └── welcome.py
 │   ├── ai/
 │   │   ├── gemini.py
 │   │   ├── tts.py
@@ -355,9 +356,10 @@ Pure validation and normalization logic now lives in focused TTS, OCR,
 broadcast, and runtime-settings service modules. `app/legacy.py` keeps thin
 compatibility wrappers while extraction continues without breaking imports.
 
-Artifact cleanup runs in worker and combined roles every five minutes by
-default. `BOT_ARTIFACT_CLEANUP_SECONDS` is an optional deployment override; it
-does not belong in the minimal `.env.example`.
+Artifact cleanup runs in worker and combined roles every 15 minutes under the
+efficient profile (five minutes under balanced/performance).
+`BOT_ARTIFACT_CLEANUP_SECONDS` is an optional deployment override; it does not
+belong in the minimal `.env.example`.
 
 The V4 hardening pass also pipelines queue statistics, preserves artifact
 cleanup records across transient storage outages, resets stale worker backoff
@@ -365,3 +367,20 @@ after healthy operation, and prevents overlapping Mini App pagination calls.
 
 The v4 hardening pass added retry-safe Telegram voice delivery, worker
 supervision, artifact expiry cleanup, and richer admin queue telemetry.
+
+## Legacy extraction update
+
+Telegram webhook replay protection now lives entirely in
+`app/services/telegram/deduplication.py`. It owns Redis processing leases,
+claim-token validation, completion/release transitions, TTL bounds, and the
+bounded in-memory fallback. `app/legacy.py` only supplies the runtime Redis
+client and key namespace, then exposes compatibility aliases for older imports.
+
+## Telegram Webhook Transport Extraction V6
+
+Webhook body limits, path/header secret validation, JSON parsing, active-owner
+checks, duplicate acknowledgement, and background dispatch now live in
+`app/api/v1/telegram.py`. Telegram `setWebhook`, `deleteWebhook`, verification,
+HTTP 429 retry handling, URL construction, and allowed-update normalization now
+live in `app/services/telegram/client.py`. Legacy retains only FastAPI route
+registration and thin runtime dependency/compatibility adapters.
