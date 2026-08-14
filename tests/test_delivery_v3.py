@@ -6,7 +6,7 @@ import json
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from app.services.jobs.handlers import BotJobHandlers
 from app.services.telegram.delivery import (
@@ -63,6 +63,7 @@ class FakeRedis:
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_memory_delivery_is_idempotent_without_redis(self) -> None:
         delivery = IdempotentTelegramDelivery(MemoryDeliveryStore())
+        keyboard = object()
         bot = SimpleNamespace(
             send_voice=AsyncMock(return_value=SimpleNamespace(message_id=91)),
         )
@@ -72,16 +73,22 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             idempotency_key="memory:voice",
             chat_id=42,
             voice=io.BytesIO(b"voice"),
+            caption="voice result",
+            reply_markup=keyboard,
         )
         second = await delivery.deliver_voice(
             bot=bot,
             idempotency_key="memory:voice",
             chat_id=42,
             voice=io.BytesIO(b"voice"),
+            caption="voice result",
+            reply_markup=keyboard,
         )
 
         self.assertEqual(first, second)
         bot.send_voice.assert_awaited_once()
+        self.assertEqual("voice result", bot.send_voice.await_args.kwargs["caption"])
+        self.assertIs(keyboard, bot.send_voice.await_args.kwargs["reply_markup"])
 
     async def test_tts_handler_routes_voice_through_idempotent_delivery(self) -> None:
         bot = SimpleNamespace(edit_message_text=AsyncMock())
@@ -98,9 +105,16 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.to_thread(Path(output_path).write_bytes, b"voice")
             return b"voice"
 
+        keyboard = object()
         legacy = SimpleNamespace(
             _TELEGRAM_APP=SimpleNamespace(bot=bot),
             generate_user_voice_limited=generate,
+            BOT_TAG="@testbot",
+            CONV_CONTEXT_MAX_CHARS=6000,
+            get_main_kb=Mock(return_value=keyboard),
+            save_text_cache=Mock(),
+            record_turn=Mock(),
+            _set_last_tts=Mock(),
         )
         delivery = SimpleNamespace(
             deliver_voice=AsyncMock(
@@ -127,7 +141,9 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             {
                 "chat_id": 42,
                 "user_id": 42,
+                "username": "tester",
                 "text": "hello",
+                "original_text": "original hello",
                 "progress_message_id": 77,
             },
             Context(),
@@ -135,11 +151,47 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(99, result["message_id"])
         delivery.deliver_voice.assert_awaited_once()
-        self.assertEqual(3, bot.edit_message_text.await_count)
+        delivery_kwargs = delivery.deliver_voice.await_args.kwargs
+        self.assertEqual("🗣️ @testbot", delivery_kwargs["caption"])
+        self.assertIs(keyboard, delivery_kwargs["reply_markup"])
+        legacy.save_text_cache.assert_called_once_with(
+            99,
+            "hello",
+            chat_id=42,
+            user_id=42,
+            username="tester",
+        )
+        self.assertEqual(2, legacy.record_turn.call_count)
+        self.assertEqual(
+            (42, "user", "original hello"),
+            legacy.record_turn.call_args_list[0].args,
+        )
+        legacy._set_last_tts.assert_called_once_with(42)
+        self.assertEqual(4, bot.edit_message_text.await_count)
         self.assertIn(
             "ជោគជ័យ",
             bot.edit_message_text.await_args.kwargs["text"],
         )
+
+    async def test_retry_updates_progress_instead_of_looking_stuck(self) -> None:
+        bot = SimpleNamespace(edit_message_text=AsyncMock())
+        handlers = BotJobHandlers(
+            SimpleNamespace(_TELEGRAM_APP=SimpleNamespace(bot=bot)),
+            artifacts=SimpleNamespace(),
+            delivery=SimpleNamespace(),
+        )
+        context = SimpleNamespace(
+            job=SimpleNamespace(id="retry-job", attempts=1, max_attempts=3)
+        )
+
+        await handlers._notify_terminal_error(
+            {"chat_id": 42, "progress_message_id": 77},
+            context,
+            RuntimeError("temporary provider failure"),
+        )
+
+        bot.edit_message_text.assert_awaited_once()
+        self.assertIn("Attempt 1/3", bot.edit_message_text.await_args.kwargs["text"])
 
     async def test_retry_edits_only_once_and_returns_stored_result(self) -> None:
         redis = FakeRedis()

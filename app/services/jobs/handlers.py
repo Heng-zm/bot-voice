@@ -153,6 +153,12 @@ class BotJobHandlers:
         error: BaseException,
     ) -> None:
         if context.job.attempts < context.job.max_attempts:
+            await self._update_telegram_progress(
+                payload,
+                "⚠️ ការងារមិនទាន់បានជោគជ័យ។ Bot នឹងសាកល្បងម្ដងទៀតដោយស្វ័យប្រវត្តិ។\n\n"
+                f"Job: {context.job.id[:12]} · "
+                f"Attempt {context.job.attempts}/{context.job.max_attempts}",
+            )
             return
         try:
             target = int(payload.get("chat_id") or 0)
@@ -270,7 +276,12 @@ class BotJobHandlers:
                     username=username,
                 )
         with suppress(Exception):
-            self.legacy.record_turn(user_id, "user", f"{cache_prefix}: {text[:500]}")
+            await asyncio.to_thread(
+                self.legacy.record_turn,
+                user_id,
+                "user",
+                f"{cache_prefix}: {text[:500]}",
+            )
         return {
             "artifact": artifact.as_dict(),
             "delivery": delivered,
@@ -325,6 +336,12 @@ class BotJobHandlers:
             raise BotJobPayloadError(str(exc)) from exc
         reply_to = _optional_reply_id(payload)
         await self._progress(context, 10, "preparing", f"model={request.model}")
+        await self._update_telegram_progress(
+            payload,
+            "⏳ កំពុងបម្លែងអត្ថបទទៅជាសំឡេង…\n\n"
+            "██░░░░░░░░░░░░░░░░░░  10%\n"
+            "📌 Worker បានទទួលការងារ និងកំពុងរៀបចំ",
+        )
         bot = await self.bot()
         fd, output_path = tempfile.mkstemp(prefix="durable-tts-", suffix=".ogg")
         os.close(fd)
@@ -360,10 +377,19 @@ class BotJobHandlers:
                 kwargs["reply_to_message_id"] = reply_to
             handle = await asyncio.to_thread(open, output_path, "rb")
             try:
+                bot_tag = str(getattr(self.legacy, "BOT_TAG", "") or "").strip()
+                keyboard_factory = getattr(self.legacy, "get_main_kb", None)
+                reply_markup = (
+                    keyboard_factory(request.gender, request.model)
+                    if callable(keyboard_factory)
+                    else None
+                )
                 delivered = await self.delivery.deliver_voice(
                     bot=bot,
                     idempotency_key=f"job:{context.job.id}:telegram-voice",
                     voice=handle,
+                    caption=f"🗣️ {bot_tag}".strip(),
+                    reply_markup=reply_markup,
                     **kwargs,
                 )
             finally:
@@ -372,6 +398,35 @@ class BotJobHandlers:
                 payload,
                 "✅ បានបម្លែង និងផ្ញើសំឡេងដោយជោគជ័យ។",
             )
+            delivered_message_id = int(delivered.get("message_id") or 0)
+            username = str(payload.get("username") or user_id)[:128]
+            if delivered_message_id:
+                with suppress(Exception):
+                    self.legacy.save_text_cache(
+                        delivered_message_id,
+                        request.text,
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        username=username,
+                    )
+
+            def _record_tts_success() -> None:
+                original_text = str(payload.get("original_text") or request.text)
+                self.legacy.record_turn(user_id, "user", original_text)
+                self.legacy.record_turn(
+                    user_id,
+                    "assistant",
+                    request.text[
+                        : int(getattr(self.legacy, "CONV_CONTEXT_MAX_CHARS", 6000))
+                    ],
+                )
+
+            with suppress(Exception):
+                await asyncio.to_thread(_record_tts_success)
+            set_last_tts = getattr(self.legacy, "_set_last_tts", None)
+            if callable(set_last_tts):
+                with suppress(Exception):
+                    set_last_tts(user_id)
             return {
                 "chat_id": chat_id,
                 "message_id": int(delivered.get("message_id") or 0),

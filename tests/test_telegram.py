@@ -253,7 +253,7 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("admin_welcome_image_remove", welcome_editor_callbacks)
 
     async def test_myprefs_updates_only_changed_preferences_without_tts(self) -> None:
-        message = SimpleNamespace(edit_text=AsyncMock())
+        message = SimpleNamespace(text="preferences", edit_text=AsyncMock())
         query = SimpleNamespace(message=message)
         prefs = {"gender": "female", "speed": 1.0, "tts_model": "auto"}
         with (
@@ -281,6 +281,32 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
         update_speed.assert_called_once_with(42, 1.5)
         generate_voice.assert_not_called()
         self.assertEqual(2, message.edit_text.await_count)
+
+    async def test_myprefs_from_welcome_photo_replies_with_text_menu(self) -> None:
+        message = SimpleNamespace(
+            text=None,
+            caption="Welcome",
+            edit_text=AsyncMock(),
+            reply_text=AsyncMock(),
+        )
+        query = SimpleNamespace(message=message)
+        prefs = {"gender": "female", "speed": 1.0, "tts_model": "auto"}
+
+        with patch.object(
+            legacy,
+            "get_user_prefs_async",
+            AsyncMock(return_value=prefs),
+        ):
+            await legacy._cb_myprefs(
+                query,
+                42,
+                SimpleNamespace(),
+                "myprefs_open",
+            )
+
+        message.edit_text.assert_not_awaited()
+        message.reply_text.assert_awaited_once()
+        self.assertIn("ការកំណត់", message.reply_text.await_args.args[0])
 
     async def test_admin_welcome_preview_stays_within_telegram_limit(self) -> None:
         message = SimpleNamespace(edit_text=AsyncMock())
@@ -427,6 +453,75 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
         message.reply_photo.assert_awaited_once()
         message.reply_text.assert_awaited_once()
         self.assertEqual("Fallback welcome", message.reply_text.await_args.args[0])
+
+    async def test_queued_tts_is_not_generated_twice_when_progress_edit_fails(self) -> None:
+        user_id = 42
+        message = SimpleNamespace(
+            text="Generate this voice",
+            chat_id=100,
+            message_id=200,
+            reply_text=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            message=message,
+            effective_user=SimpleNamespace(
+                id=user_id,
+                username="tester",
+                first_name="Test",
+            ),
+            update_id=300,
+        )
+        context = SimpleNamespace(bot=SimpleNamespace(), user_data={})
+        progress = SimpleNamespace(
+            message_id=400,
+            update=AsyncMock(side_effect=RuntimeError("Telegram edit failed")),
+        )
+        queued_job = SimpleNamespace(id="queued-job-123456")
+
+        with (
+            patch.object(legacy, "_is_admin", return_value=False),
+            patch.object(
+                legacy,
+                "_handle_feature_request_user_text",
+                AsyncMock(return_value=False),
+            ),
+            patch.object(legacy, "_get_admin_for_user", return_value=None),
+            patch.object(legacy, "_ensure_user_allowed", AsyncMock(return_value=True)),
+            patch.object(legacy, "_check_cooldown", AsyncMock(return_value=False)),
+            patch.object(legacy, "_reserve_tts_request", return_value=True),
+            patch.object(legacy, "_release_tts_request") as release_request,
+            patch.object(legacy, "_set_last_tts") as set_last_tts,
+            patch.object(legacy, "sync_user_data"),
+            patch.object(legacy, "_metric_inc"),
+            patch.object(legacy.TelegramProgress, "start", AsyncMock(return_value=progress)),
+            patch.object(legacy, "_env_bool", return_value=True),
+            patch.object(legacy, "resolve_tts_text", AsyncMock(return_value="Resolved text")),
+            patch.object(
+                legacy,
+                "get_user_prefs_async",
+                AsyncMock(return_value={
+                    "gender": "female",
+                    "speed": 1.0,
+                    "tts_model": "auto",
+                }),
+            ),
+            patch(
+                "app.services.jobs.submission.submit_tts_job",
+                AsyncMock(return_value=(queued_job, True)),
+            ) as submit,
+            patch.object(
+                legacy,
+                "generate_user_voice_limited",
+                AsyncMock(),
+            ) as generate_direct,
+        ):
+            await legacy.on_text(update, context)
+
+        submit.assert_awaited_once()
+        progress.update.assert_awaited_once()
+        set_last_tts.assert_called_once_with(user_id)
+        release_request.assert_called_once_with(user_id)
+        generate_direct.assert_not_awaited()
 
     def test_broadcast_markdown_link_and_preview_directives(self) -> None:
         stored = legacy._broadcast_apply_option_directives(

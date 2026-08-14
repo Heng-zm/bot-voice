@@ -363,6 +363,8 @@ class IdempotentTelegramDelivery:
         chat_id: int,
         voice: Any,
         reply_to_message_id: int | None = None,
+        caption: str | None = None,
+        reply_markup: Any | None = None,
     ) -> dict[str, Any]:
         """Send a voice result once and reuse its stored result on retries."""
 
@@ -379,6 +381,10 @@ class IdempotentTelegramDelivery:
             }
             if reply_to_message_id:
                 kwargs["reply_to_message_id"] = int(reply_to_message_id)
+            if caption:
+                kwargs["caption"] = str(caption)[:1024]
+            if reply_markup is not None:
+                kwargs["reply_markup"] = reply_markup
             message = await bot.send_voice(**kwargs)
             result = {
                 "chat_id": int(chat_id),

@@ -17,7 +17,9 @@ class SubmissionTests(unittest.IsolatedAsyncioTestCase):
             await submit_tts_job(
                 chat_id=10,
                 user_id=20,
+                username="tester",
                 text="hello",
+                original_text="original hello",
                 tts_model="voxcpm2",
                 progress_message_id=30,
                 idempotency_key="tts-key",
@@ -25,6 +27,8 @@ class SubmissionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("tts", enqueue.await_args.args[0])
         self.assertEqual("auto", enqueue.await_args.args[1]["tts_model"])
+        self.assertEqual("tester", enqueue.await_args.args[1]["username"])
+        self.assertEqual("original hello", enqueue.await_args.args[1]["original_text"])
         self.assertEqual(30, enqueue.await_args.args[1]["progress_message_id"])
 
     async def test_ocr_payload_contains_delivery_target_and_user_context(self) -> None:

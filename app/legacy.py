@@ -26923,7 +26923,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             job, created = await submit_tts_job(
                 chat_id=msg.chat_id,
                 user_id=user_id,
+                username=user.username or user.first_name or str(user_id),
                 text=tts_text or stripped,
+                original_text=stripped,
                 gender=prefs["gender"],
                 speed=prefs["speed"],
                 tts_model=prefs.get("tts_model", "auto"),
@@ -26931,16 +26933,28 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_to_message_id=int(msg.message_id),
                 idempotency_key=f"telegram:tts:{int(getattr(update, 'update_id', 0) or 0)}:{user_id}",
             )
-            await progress.update(
-                10,
-                "បានដាក់ចូលជួររង់ចាំ",
-                f"Job {job.id[:12]} · {'ថ្មី' if created else 'មានរួចហើយ'}",
-                force=True,
-            )
-            _release_tts_request(user_id)
-            return
         except Exception as exc:
             logger.error("Failed to submit durable TTS job: %s", exc)
+        else:
+            # Once enqueue succeeds the worker owns this request. A Telegram
+            # progress-edit failure must never fall through and generate a
+            # duplicate voice in the request process.
+            _set_last_tts(user_id)
+            _release_tts_request(user_id)
+            try:
+                await progress.update(
+                    10,
+                    "បានដាក់ចូលជួររង់ចាំ",
+                    f"Job {job.id[:12]} · {'ថ្មី' if created else 'មានរួចហើយ'}",
+                    force=True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "TTS job %s was queued, but its progress message could not be updated: %s",
+                    job.id,
+                    exc,
+                )
+            return
 
     file_path: str | None = None
     try:
@@ -27039,6 +27053,21 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # Callback helpers
 # ---------------------------------------------------------------------------
+async def _edit_or_reply_menu_text(
+    message: Any,
+    text: str,
+    **kwargs: Any,
+) -> Any:
+    """Edit text menus, but reply when the callback originated from media."""
+    if getattr(message, "text", None) is not None:
+        try:
+            return await safe_send(lambda: message.edit_text(text, **kwargs))
+        except BadRequest as exc:
+            if "no text in the message to edit" not in str(exc).lower():
+                raise
+    return await safe_send(lambda: message.reply_text(text, **kwargs))
+
+
 async def _cb_myprefs(query, user_id: int, context, data: str) -> None:
     del context
     if query.message is None:
@@ -27082,12 +27111,13 @@ async def _cb_myprefs(query, user_id: int, context, data: str) -> None:
         if data == "myprefs_models"
         else get_myprefs_kb(prefs)
     )
-    await safe_send(lambda: query.message.edit_text(
+    await _edit_or_reply_menu_text(
+        query.message,
         _myprefs_text(prefs, notice=notice),
         parse_mode="HTML",
         reply_markup=markup,
         disable_web_page_preview=True,
-    ))
+    )
 
 
 async def _cb_show_speed(query, user_id: int, context):

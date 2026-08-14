@@ -13,6 +13,8 @@ async def submit_tts_job(
     chat_id: int,
     user_id: int,
     text: str,
+    username: str = "",
+    original_text: str = "",
     gender: str = "female",
     speed: float = 1.0,
     tts_model: str = "auto",
@@ -28,7 +30,9 @@ async def submit_tts_job(
         {
             "chat_id": int(chat_id),
             "user_id": int(user_id),
+            "username": str(username)[:128],
             "text": str(text),
+            "original_text": str(original_text or text),
             "gender": str(gender),
             "speed": float(speed),
             "tts_model": model,

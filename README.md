@@ -335,6 +335,7 @@ BOT_ARTIFACT_LOCAL_DIRECTORY=data/job-artifacts
 BOT_ARTIFACT_MAX_BYTES=52428800
 BOT_JOB_WORKERS=2
 BOT_JOB_QUEUE_MAX=1000
+DURABLE_TTS_ENABLED=true
 DURABLE_OCR_ENABLED=true
 DURABLE_TRANSCRIPTION_ENABLED=true
 ```
@@ -384,3 +385,13 @@ checks, duplicate acknowledgement, and background dispatch now live in
 HTTP 429 retry handling, URL construction, and allowed-update normalization now
 live in `app/services/telegram/client.py`. Legacy retains only FastAPI route
 registration and thin runtime dependency/compatibility adapters.
+
+## TTS Queue Experience V7
+
+Durable TTS now updates the original Telegram progress message as soon as a
+worker claims the job and shows automatic-retry status instead of appearing
+permanently queued. A successfully enqueued request cannot fall through to the
+direct generator when a progress edit fails, preventing duplicate audio and
+wasted CPU. Worker-delivered voices retain the normal caption and keyboard,
+update text/history caches, and apply submission cooldowns consistently. These
+improvements work with both Redis and the process-local Redis-disabled queue.
