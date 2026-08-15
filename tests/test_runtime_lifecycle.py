@@ -71,6 +71,75 @@ class CriticalTaskSupervisionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TelegramStartupRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    def test_wispbyte_allocation_overrides_persisted_webhook_mode(self) -> None:
+        original_mode = legacy.BOT_MODE
+        with legacy.RUN_STATE_LOCK:
+            original_state = dict(legacy.RUN_STATE)
+            legacy.RUN_STATE["BOT_MODE"] = "WEBHOOK"
+            legacy.BOT_MODE = "WEBHOOK"
+        try:
+            with (
+                patch.dict("os.environ", {"SERVER_PORT": "13961"}, clear=True),
+                patch.object(
+                    legacy,
+                    "_runtime_webhook_base_url",
+                    return_value="https://old-render-service.onrender.com",
+                ),
+            ):
+                mode = legacy._ensure_startup_telegram_mode()
+
+            self.assertEqual("POLLING", mode)
+            self.assertEqual("POLLING", legacy._run_state_bot_mode())
+        finally:
+            with legacy.RUN_STATE_LOCK:
+                legacy.RUN_STATE.clear()
+                legacy.RUN_STATE.update(original_state)
+                legacy.BOT_MODE = original_mode
+
+    def test_wispbyte_disables_implicit_render_leader_lock(self) -> None:
+        with (
+            patch.dict("os.environ", {"SERVER_PORT": "13961"}, clear=True),
+            patch.object(legacy, "TELEGRAM_ACTIVE_LOCK_ENABLED", True),
+            patch.object(legacy, "TELEGRAM_ACTIVE_LOCK_REQUIRED", True),
+        ):
+            self.assertFalse(legacy._telegram_leader_lock_enabled())
+            self.assertFalse(legacy._telegram_leader_require_store())
+
+    def test_wispbyte_respects_explicit_webhook_and_leader_lock(self) -> None:
+        original_mode = legacy.BOT_MODE
+        with legacy.RUN_STATE_LOCK:
+            original_state = dict(legacy.RUN_STATE)
+            legacy.RUN_STATE["BOT_MODE"] = "POLLING"
+            legacy.BOT_MODE = "POLLING"
+        try:
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        "SERVER_PORT": "13961",
+                        "BOT_MODE": "WEBHOOK",
+                        "TELEGRAM_ACTIVE_LOCK_ENABLED": "true",
+                        "TELEGRAM_ACTIVE_LOCK_REQUIRED": "true",
+                    },
+                    clear=True,
+                ),
+                patch.object(
+                    legacy,
+                    "_runtime_webhook_base_url",
+                    return_value="https://bot.example.com",
+                ),
+                patch.object(legacy, "TELEGRAM_ACTIVE_LOCK_ENABLED", True),
+                patch.object(legacy, "TELEGRAM_ACTIVE_LOCK_REQUIRED", True),
+            ):
+                self.assertEqual("WEBHOOK", legacy._ensure_startup_telegram_mode())
+                self.assertTrue(legacy._telegram_leader_lock_enabled())
+                self.assertTrue(legacy._telegram_leader_require_store())
+        finally:
+            with legacy.RUN_STATE_LOCK:
+                legacy.RUN_STATE.clear()
+                legacy.RUN_STATE.update(original_state)
+                legacy.BOT_MODE = original_mode
+
     def test_missing_webhook_url_falls_back_to_polling(self) -> None:
         original_mode = legacy.BOT_MODE
         with legacy.RUN_STATE_LOCK:

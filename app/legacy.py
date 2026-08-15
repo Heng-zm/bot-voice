@@ -8993,10 +8993,17 @@ TELEGRAM_WEBHOOK_SECRET_TOKEN = ""
 # code is deployed as two Render Web Services, both processes must NOT call
 # setWebhook/process webhook updates at the same time.  This leader lease lets
 # both web dashboards stay online while only one service owns Telegram traffic.
+_IS_WISPBYTE_ENV = bool(
+    str(os.environ.get("SERVER_PORT") or "").strip()
+    or str(os.environ.get("WISPBYTE_PORT") or "").strip()
+)
 _IS_RENDER_ENV = (
-    _env_bool("RENDER", False)
-    or bool(os.environ.get("RENDER_SERVICE_ID"))
-    or bool(os.environ.get("RENDER_EXTERNAL_URL"))
+    not _IS_WISPBYTE_ENV
+    and (
+        _env_bool("RENDER", False)
+        or bool(os.environ.get("RENDER_SERVICE_ID"))
+        or bool(os.environ.get("RENDER_EXTERNAL_URL"))
+    )
 )
 TELEGRAM_MULTI_SERVER_ENABLED = _env_bool("TELEGRAM_MULTI_SERVER_ENABLED", _IS_RENDER_ENV)
 TELEGRAM_ACTIVE_LOCK_ENABLED = _env_bool("TELEGRAM_ACTIVE_LOCK_ENABLED", TELEGRAM_MULTI_SERVER_ENABLED)
@@ -9163,6 +9170,26 @@ def _run_state_bot_mode() -> str:
     return mode if mode in {"POLLING", "WEBHOOK"} else str(_perf_default("BOT_MODE", "WEBHOOK")).upper()
 
 
+def _wispbyte_runtime_detected() -> bool:
+    """Return whether this process has a Wispbyte/Pterodactyl allocation."""
+
+    return bool(
+        str(os.environ.get("SERVER_PORT") or "").strip()
+        or str(os.environ.get("WISPBYTE_PORT") or "").strip()
+    )
+
+
+def _deployment_bot_mode_override() -> str:
+    """Return an explicit deployment mode, including Wispbyte's safe default."""
+
+    configured = str(os.environ.get("BOT_MODE") or "").strip().upper()
+    if configured in {"POLLING", "WEBHOOK"}:
+        return configured
+    if _wispbyte_runtime_detected():
+        return "POLLING"
+    return ""
+
+
 def _ensure_startup_telegram_mode() -> str:
     """Return a bootable Telegram mode for the service-local environment.
 
@@ -9174,6 +9201,18 @@ def _ensure_startup_telegram_mode() -> str:
     global BOT_MODE
 
     mode = _run_state_bot_mode()
+    deployment_override = _deployment_bot_mode_override()
+    if deployment_override:
+        if mode != deployment_override:
+            webhook_logger.warning(
+                "Deployment mode overrides persisted BOT_MODE=%s with %s.",
+                mode,
+                deployment_override,
+            )
+        with RUN_STATE_LOCK:
+            RUN_STATE["BOT_MODE"] = deployment_override
+            BOT_MODE = deployment_override
+        mode = deployment_override
     base_url = _runtime_webhook_base_url()
 
     # Telegram only allows ports 80, 88, 443, or 8443 for webhooks.
@@ -15058,10 +15097,20 @@ def db_named_lock_release(lock_key: str, owner: str) -> bool:
 # Telegram active-owner lease for two Render Web Services
 # ---------------------------------------------------------------------------
 def _telegram_leader_lock_enabled() -> bool:
+    if (
+        _wispbyte_runtime_detected()
+        and "TELEGRAM_ACTIVE_LOCK_ENABLED" not in os.environ
+    ):
+        return False
     return bool(globals().get("TELEGRAM_ACTIVE_LOCK_ENABLED", False))
 
 
 def _telegram_leader_require_store() -> bool:
+    if (
+        _wispbyte_runtime_detected()
+        and "TELEGRAM_ACTIVE_LOCK_REQUIRED" not in os.environ
+    ):
+        return False
     return bool(globals().get("TELEGRAM_ACTIVE_LOCK_REQUIRED", False))
 
 
