@@ -103,6 +103,20 @@ class RuntimeMonitoringTests(unittest.TestCase):
         self.assertEqual("RAILWAY_PUBLIC_DOMAIN", public_url["source"])
         self.assertTrue(public_url["detected"])
 
+    def test_invalid_public_url_candidate_is_skipped(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "PUBLIC_URL": "https://\ud800.example",
+                "RAILWAY_PUBLIC_DOMAIN": "voice-bot.example.com",
+            },
+            clear=True,
+        ):
+            public_url = monitoring.discover_public_url()
+
+        self.assertEqual("https://voice-bot.example.com", public_url["url"])
+        self.assertEqual("RAILWAY_PUBLIC_DOMAIN", public_url["source"])
+
     def test_process_snapshot_is_safe_and_local(self) -> None:
         snapshot = monitoring.process_snapshot()
 

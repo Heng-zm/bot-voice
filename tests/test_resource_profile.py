@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from app.core.resources import resource_default, resource_profile, resource_value
+from app.utils.env import bounded_env_float, bounded_env_int
 
 
 class ResourceProfileTests(unittest.TestCase):
@@ -44,3 +45,37 @@ class ResourceProfileTests(unittest.TestCase):
         self.assertEqual(
             resource_profile({"BOT_RESOURCE_PROFILE": "typo"}), "efficient"
         )
+
+    def test_runtime_environment_numbers_are_bounded_and_fault_tolerant(self) -> None:
+        self.assertEqual(
+            4,
+            bounded_env_int(
+                "WORKERS",
+                4,
+                minimum=1,
+                maximum=32,
+                environ={"WORKERS": "invalid"},
+            ),
+        )
+        self.assertEqual(
+            32,
+            bounded_env_int(
+                "WORKERS",
+                4,
+                minimum=1,
+                maximum=32,
+                environ={"WORKERS": "999"},
+            ),
+        )
+        for invalid in ("nan", "inf", "invalid"):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(
+                    0.5,
+                    bounded_env_float(
+                        "POLL_SECONDS",
+                        0.5,
+                        minimum=0.05,
+                        maximum=30.0,
+                        environ={"POLL_SECONDS": invalid},
+                    ),
+                )

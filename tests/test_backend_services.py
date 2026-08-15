@@ -645,6 +645,52 @@ class RedisJobQueueTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual("succeeded", (await self.queue.get(high.id)).state)
 
+    async def test_enqueue_and_claim_use_single_redis_round_trip(self) -> None:
+        class InlineReplyRedis(FakeRedis):
+            def __init__(self) -> None:
+                super().__init__()
+                self.eval_calls = 0
+                self.hgetall_calls = 0
+
+            @staticmethod
+            def _flat_hash(values: dict[str, str]) -> list[str]:
+                return [item for pair in values.items() for item in pair]
+
+            def eval(self, script: str, number_of_keys: int, *values):
+                self.eval_calls += 1
+                result = super().eval(script, number_of_keys, *values)
+                args = [str(value) for value in values[number_of_keys:]]
+                if "bot_voice:enqueue_v1" in script and int(result[1]) >= 0:
+                    job_id = str(result[0])
+                    return [
+                        job_id,
+                        result[1],
+                        self._flat_hash(self.hashes[f"{args[11]}{job_id}"]),
+                    ]
+                if "bot_voice:claim_v1" in script and result:
+                    job_id = str(result)
+                    return [
+                        job_id,
+                        self._flat_hash(self.hashes[f"{args[5]}{job_id}"]),
+                    ]
+                return result
+
+            def hgetall(self, key: str) -> dict[str, str]:
+                self.hgetall_calls += 1
+                return super().hgetall(key)
+
+        redis = InlineReplyRedis()
+        queue = RedisJobQueue(redis, redis_prefix="tests")
+
+        enqueued, created = await queue.enqueue("tts", {"text": "hello"})
+        claimed = await queue.claim("worker-fast")
+
+        self.assertTrue(created)
+        self.assertIsNotNone(claimed)
+        self.assertEqual(enqueued.id, claimed.id)
+        self.assertEqual(2, redis.eval_calls)
+        self.assertEqual(0, redis.hgetall_calls)
+
     async def test_retry_dead_letter_cancel_and_manual_retry(self) -> None:
         job, _created = await self.queue.enqueue(
             "transcription",

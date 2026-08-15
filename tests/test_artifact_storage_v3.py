@@ -4,7 +4,9 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from app.services.artifacts import storage
 from app.services.artifacts.storage import (
     DEFAULT_BOT_ARTIFACT_LOCAL_DIRECTORY,
     DEFAULT_BOT_ARTIFACT_MAX_BYTES,
@@ -167,6 +169,37 @@ class LocalArtifactStoreTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(first.id, second.id)
             self.assertEqual(b"hello", await store.get_bytes(first))
+
+    async def test_failed_replace_does_not_double_close_descriptor(self) -> None:
+        closed: list[int] = []
+        real_close = storage.os.close
+
+        def tracking_close(fd: int) -> None:
+            closed.append(fd)
+            real_close(fd)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalArtifactStore(directory, max_bytes=1024)
+            with (
+                patch.object(
+                    storage.os,
+                    "replace",
+                    side_effect=OSError("replace failed"),
+                ),
+                patch.object(storage.os, "close", tracking_close),
+                self.assertRaisesRegex(OSError, "replace failed"),
+            ):
+                await store.put_bytes(
+                    "results/job-1/transcript.txt",
+                    b"hello",
+                    content_type="text/plain",
+                )
+
+            self.assertEqual([], closed)
+            leftovers = await asyncio.to_thread(
+                lambda: list(Path(directory).rglob("*.tmp"))
+            )
+            self.assertEqual([], leftovers)
 
     async def test_rejects_oversized_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

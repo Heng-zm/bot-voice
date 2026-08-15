@@ -71,6 +71,13 @@ class TelegramWebhookRequestTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(400, invalid_header.exception.status_code)
 
+        with self.assertRaises(HTTPException) as negative_header:
+            await _read_limited_webhook_body(
+                make_request(b"{}", {"content-length": "-1"}),
+                10,
+            )
+        self.assertEqual(400, negative_header.exception.status_code)
+
     async def test_transport_rejects_bad_secret_before_parsing(self) -> None:
         transport = TelegramWebhookTransport(
             bot_mode_provider=lambda: "WEBHOOK",
@@ -167,6 +174,23 @@ class TelegramWebhookRequestTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual({"status": "ok", "duplicate": True}, json.loads(response.body))
         self.assertEqual(["replay_dropped"], metrics)
+
+    async def test_release_failure_does_not_escape_background_task(self) -> None:
+        class Application:
+            async def process_update(self, _update) -> None:
+                raise RuntimeError("handler failed")
+
+        async def release(_update_id, *, claim_token=None):
+            raise RuntimeError(f"release failed for {claim_token}")
+
+        transport = TelegramWebhookTransport(release_update=release)
+
+        await transport._run_update_background(
+            Application(),
+            object(),
+            606,
+            "owner-token",
+        )
 
 
 class TelegramWebhookClientTests(unittest.IsolatedAsyncioTestCase):

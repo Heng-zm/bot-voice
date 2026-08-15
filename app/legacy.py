@@ -2070,6 +2070,13 @@ async def run_fastapi():
         host="0.0.0.0",
         port=port,
         log_level=os.environ.get("UVICORN_LOG_LEVEL", "info").lower(),
+        access_log=_env_bool("UVICORN_ACCESS_LOG", False),
+        timeout_keep_alive=_env_int(
+            "WEB_KEEP_ALIVE_SECONDS",
+            15,
+            minimum=1,
+            maximum=120,
+        ),
         proxy_headers=_env_bool("WEB_TRUST_PROXY", _env_bool("RENDER", False)),
         forwarded_allow_ips="*" if _env_bool("WEB_TRUST_PROXY", _env_bool("RENDER", False)) else None,
     )
@@ -10293,6 +10300,7 @@ AUDIO_TO_VOICE_MAX_CONCURRENT = _env_int("AUDIO_TO_VOICE_MAX_CONCURRENT", 2, min
 DEFAULT_SPEED           = 1.0
 TELE_MSG_LIMIT          = 4000
 USER_COOLDOWN_S         = 3.0
+BOT_IMMEDIATE_TASKS     = _env_bool("BOT_IMMEDIATE_TASKS", True)
 _STALE_GRACE_S          = 30.0
 _KHMER_RE               = re.compile(r"[\u1780-\u17FF]")
 _SPEED_MIN              = 0.25
@@ -12593,30 +12601,36 @@ async def get_user_prefs_async(user_id: int) -> dict:
 _USER_LOCK_MAX = 5_000
 _user_locks: OrderedDict[int, asyncio.Lock] = OrderedDict()
 _user_locks_guard = threading.RLock()
-_tts_request_reservations: set[int] = set()
+_tts_request_reservations: dict[int, int] = {}
 _tts_request_reservations_guard = threading.RLock()
 
 
 def _reserve_tts_request(user_id: int) -> bool:
-    """Reserve the preparation window before the per-user async lock is held."""
+    """Reserve a request while allowing immediate-mode tasks to stack safely."""
 
     user_id = int(user_id)
     lock = _get_user_lock(user_id)
     with _tts_request_reservations_guard:
-        if lock.locked() or user_id in _tts_request_reservations:
+        current = _tts_request_reservations.get(user_id, 0)
+        if not BOT_IMMEDIATE_TASKS and (lock.locked() or current > 0):
             return False
-        _tts_request_reservations.add(user_id)
+        _tts_request_reservations[user_id] = current + 1
         return True
 
 
 def _release_tts_request(user_id: int) -> None:
     with _tts_request_reservations_guard:
-        _tts_request_reservations.discard(int(user_id))
+        user_id = int(user_id)
+        remaining = _tts_request_reservations.get(user_id, 0) - 1
+        if remaining > 0:
+            _tts_request_reservations[user_id] = remaining
+        else:
+            _tts_request_reservations.pop(user_id, None)
 
 
 def _tts_request_reserved(user_id: int) -> bool:
     with _tts_request_reservations_guard:
-        return int(user_id) in _tts_request_reservations
+        return _tts_request_reservations.get(int(user_id), 0) > 0
 
 
 def _evict_idle_user_locks() -> int:
@@ -18713,6 +18727,8 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
 # Cooldown check
 # ---------------------------------------------------------------------------
 async def _check_cooldown(reply_target, user_id: int) -> bool:
+    if BOT_IMMEDIATE_TASKS:
+        return False
     lock = _get_user_lock(user_id)
     if lock.locked() or _tts_request_reserved(user_id):
         await safe_send(lambda: reply_target.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
@@ -26944,7 +26960,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await progress.update(
                     10,
-                    "បានដាក់ចូលជួររង់ចាំ",
+                    "បានទទួល · កំពុងដំណើរការដោយស្វ័យប្រវត្តិ",
                     f"Job {job.id[:12]} · {'ថ្មី' if created else 'មានរួចហើយ'}",
                     force=True,
                 )

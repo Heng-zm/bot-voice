@@ -161,14 +161,15 @@ def _public_origin(value: Any) -> str:
         raw = f"https://{raw}"
     try:
         parsed = urlsplit(raw)
-    except ValueError:
+        hostname = parsed.hostname
+    except (UnicodeError, ValueError):
         return ""
-    if parsed.scheme.lower() != "https" or not parsed.hostname:
+    if parsed.scheme.lower() != "https" or not hostname:
         return ""
-    host = parsed.hostname.encode("idna").decode("ascii").lower()
     try:
+        host = hostname.encode("idna").decode("ascii").lower()
         parsed_port = parsed.port
-    except ValueError:
+    except (UnicodeError, ValueError):
         return ""
     port = f":{parsed_port}" if parsed_port and parsed_port != 443 else ""
     return f"https://{host}{port}"

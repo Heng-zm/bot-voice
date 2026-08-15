@@ -60,6 +60,15 @@ class MemoryJobQueueTests(unittest.IsolatedAsyncioTestCase):
         finally:
             configure_job_queue(None, memory_fallback=False)
 
+    async def test_invalid_queue_limit_environment_uses_safe_default(self) -> None:
+        with patch.dict("os.environ", {"BOT_JOB_QUEUE_MAX": "invalid"}):
+            queue = configure_job_queue(None, memory_fallback=True)
+        try:
+            self.assertIsInstance(queue, MemoryJobQueue)
+            self.assertEqual(1_000, queue.max_queued_jobs)
+        finally:
+            configure_job_queue(None, memory_fallback=False)
+
     async def test_concurrent_memory_enqueues_and_claims_are_atomic(self) -> None:
         queue = MemoryJobQueue()
         duplicate_results = await asyncio.gather(

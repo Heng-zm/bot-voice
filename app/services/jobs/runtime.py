@@ -22,6 +22,7 @@ from app.services.jobs.queue import (
     RedisJobQueue,
     RedisJobWorker,
 )
+from app.utils.env import bounded_env_float, bounded_env_int
 
 logger = logging.getLogger(__name__)
 
@@ -89,13 +90,23 @@ def configure_job_queue(
             if not isinstance(_QUEUE, MemoryJobQueue):
                 queue_limit = max_queued_jobs
                 if queue_limit is None:
-                    queue_limit = int(os.getenv("BOT_JOB_QUEUE_MAX", "1000") or 1000)
+                    queue_limit = bounded_env_int(
+                        "BOT_JOB_QUEUE_MAX",
+                        1_000,
+                        minimum=1,
+                        maximum=1_000_000,
+                    )
                 _QUEUE = MemoryJobQueue(max_queued_jobs=queue_limit)
             return _QUEUE
         if _QUEUE is None or redis_client is not _QUEUE_REDIS:
             queue_limit = max_queued_jobs
             if queue_limit is None:
-                queue_limit = int(os.getenv("BOT_JOB_QUEUE_MAX", "1000") or 1000)
+                queue_limit = bounded_env_int(
+                    "BOT_JOB_QUEUE_MAX",
+                    1_000,
+                    minimum=1,
+                    maximum=1_000_000,
+                )
             _QUEUE = RedisJobQueue(
                 redis_client,
                 redis_prefix=redis_prefix,
@@ -265,7 +276,12 @@ async def start_job_workers(
 
         count = worker_count
         if count is None:
-            count = int(os.getenv("BOT_JOB_WORKERS", "2") or 2)
+            count = bounded_env_int(
+                "BOT_JOB_WORKERS",
+                2,
+                minimum=1,
+                maximum=32,
+            )
         count = max(1, min(32, int(count)))
         _WORKER_STOP = asyncio.Event()
         _WORKER_TASKS.clear()
@@ -278,8 +294,11 @@ async def start_job_workers(
                 queue,
                 clean_handlers,
                 worker_id=worker_id,
-                poll_interval_seconds=float(
-                    os.getenv("BOT_JOB_POLL_SECONDS", "0.5") or 0.5
+                poll_interval_seconds=bounded_env_float(
+                    "BOT_JOB_POLL_SECONDS",
+                    0.5,
+                    minimum=0.05,
+                    maximum=30.0,
                 ),
                 can_claim=job_workers_accepting,
                 on_error=_worker_error_recorder(worker_id),

@@ -135,7 +135,7 @@ def _legacy_monitor_snapshot() -> dict:
     legacy = legacy_module()
     performance = legacy._runtime_performance_snapshot(light=True)
     with legacy._tts_request_reservations_guard:
-        reserved_requests = len(legacy._tts_request_reservations)
+        reserved_requests = sum(legacy._tts_request_reservations.values())
     return {
         "uptime": str(performance.get("uptime") or "starting"),
         "active_requests": int(performance.get("web", {}).get("active_requests") or 0),

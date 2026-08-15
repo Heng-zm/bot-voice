@@ -28,14 +28,15 @@ _ENQUEUE_SCRIPT = """
 if ARGV[9] == '1' then
   local existing = redis.call('GET', KEYS[3])
   if existing then
-    if redis.call('EXISTS', ARGV[12] .. existing) == 1 then
-      return {existing, 0}
+    local existing_key = ARGV[12] .. existing
+    if redis.call('EXISTS', existing_key) == 1 then
+      return {existing, 0, redis.call('HGETALL', existing_key)}
     end
     redis.call('DEL', KEYS[3])
   end
 end
 if redis.call('EXISTS', KEYS[2]) == 1 then
-  return {ARGV[1], 0}
+  return {ARGV[1], 0, redis.call('HGETALL', KEYS[2])}
 end
 if tonumber(ARGV[11]) > 0 and redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[11]) then
   return {'', -1}
@@ -62,7 +63,7 @@ redis.call('ZADD', KEYS[1], ARGV[6], ARGV[1])
 if ARGV[9] == '1' then
   redis.call('SET', KEYS[3], ARGV[1], 'EX', ARGV[10])
 end
-return {ARGV[1], 1}
+return {ARGV[1], 1, redis.call('HGETALL', KEYS[2])}
 """.strip()
 
 _CLAIM_SCRIPT = """
@@ -72,12 +73,13 @@ local expired = redis.call(
 )
 for _, job_id in ipairs(expired) do
   local job_key = ARGV[6] .. job_id
-  if redis.call('HGET', job_key, 'state') == 'running' then
-    local cancelled = redis.call('HGET', job_key, 'cancel_requested')
-    local attempts = tonumber(redis.call('HGET', job_key, 'attempts') or '0')
-    local max_attempts = tonumber(
-      redis.call('HGET', job_key, 'max_attempts') or '1'
-    )
+  local fields = redis.call(
+    'HMGET', job_key, 'state', 'cancel_requested', 'attempts', 'max_attempts'
+  )
+  if fields[1] == 'running' then
+    local cancelled = fields[2]
+    local attempts = tonumber(fields[3] or '0')
+    local max_attempts = tonumber(fields[4] or '1')
     if cancelled == '1' then
       redis.call(
         'HSET', job_key,
@@ -130,9 +132,12 @@ local selected_priority = -1
 local selected_created = nil
 for _, job_id in ipairs(candidates) do
   local job_key = ARGV[6] .. job_id
-  if redis.call('HGET', job_key, 'state') == 'queued' then
-    local priority = tonumber(redis.call('HGET', job_key, 'priority') or '0')
-    local created = tonumber(redis.call('HGET', job_key, 'created_at') or '0')
+  local fields = redis.call(
+    'HMGET', job_key, 'state', 'priority', 'created_at'
+  )
+  if fields[1] == 'queued' then
+    local priority = tonumber(fields[2] or '0')
+    local created = tonumber(fields[3] or '0')
     if (
       not selected
       or priority > selected_priority
@@ -165,7 +170,7 @@ redis.call(
   'updated_at', ARGV[1]
 )
 redis.call('ZADD', KEYS[2], ARGV[4], selected)
-return selected
+return {selected, redis.call('HGETALL', selected_key)}
 """.strip()
 
 _RENEW_SCRIPT = """
@@ -625,7 +630,7 @@ class RedisJobQueue:
             self.job_prefix,
         )
         values = list(raw or ())
-        if len(values) != 2:
+        if len(values) < 2:
             raise JobQueueError("Redis returned an invalid enqueue result.")
         resolved_id = self._decode(values[0])
         status_code = int(values[1])
@@ -634,6 +639,8 @@ class RedisJobQueue:
                 f"The durable job queue reached its {self.max_queued_jobs}-job limit."
             )
         created = bool(status_code)
+        if len(values) >= 3 and values[2]:
+            return self._job_from_script_reply(resolved_id, values[2]), created
         return await self.get(resolved_id), created
 
     async def claim(self, worker_id: str) -> Job | None:
@@ -658,9 +665,17 @@ class RedisJobQueue:
             str(self.retention_seconds),
             self.job_prefix,
         )
-        job_id = self._decode(raw)
+        embedded_job = None
+        if isinstance(raw, (list, tuple)):
+            values = list(raw)
+            job_id = self._decode(values[0]) if values else ""
+            embedded_job = values[1] if len(values) >= 2 else None
+        else:
+            job_id = self._decode(raw)
         if not job_id:
             return None
+        if embedded_job:
+            return self._job_from_script_reply(job_id, embedded_job)
         return await self.get(job_id)
 
     async def renew(self, job_id: str, lease_token: str) -> int:
@@ -826,6 +841,22 @@ class RedisJobQueue:
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise JobQueueError(f"Job {job_id!r} contains invalid Redis data.") from exc
+
+    def _job_from_script_reply(self, job_id: str, raw: Any) -> Job:
+        """Decode an HGETALL reply embedded in a Lua result."""
+
+        if isinstance(raw, Mapping):
+            return self._job_from_raw(job_id, raw)
+        fields = list(raw or ())
+        if not fields or len(fields) % 2:
+            raise JobQueueError(
+                f"Job {job_id!r} contains an invalid Redis script reply."
+            )
+        mapping = {
+            self._decode(fields[index]): fields[index + 1]
+            for index in range(0, len(fields), 2)
+        }
+        return self._job_from_raw(job_id, mapping)
 
     async def _get_many(self, job_ids: list[str]) -> list[Job]:
         """Load one job page with a single Redis pipeline round trip."""

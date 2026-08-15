@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from datetime import UTC, datetime
 from typing import Any
@@ -29,11 +30,14 @@ def _clean_timestamp(value: Any) -> str | None:
 def _runtime_started_iso(started_at: Any) -> str | None:
     try:
         timestamp = float(started_at or 0.0)
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return None
-    if timestamp <= 0.0:
+    if timestamp <= 0.0 or not math.isfinite(timestamp):
         return None
-    return datetime.fromtimestamp(timestamp, tz=UTC).isoformat()
+    try:
+        return datetime.fromtimestamp(timestamp, tz=UTC).isoformat()
+    except (OSError, OverflowError, ValueError):
+        return None
 
 
 def get_build_info(*, role: str | None = None, started_at: Any = None) -> dict[str, Any]:

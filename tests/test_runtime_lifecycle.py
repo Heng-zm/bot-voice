@@ -279,7 +279,12 @@ class UvicornShutdownTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.dict(
                 "os.environ",
-                {"SERVER_PORT": "13961", "PORT": "8080"},
+                {
+                    "SERVER_PORT": "13961",
+                    "PORT": "8080",
+                    "UVICORN_ACCESS_LOG": "false",
+                    "WEB_KEEP_ALIVE_SECONDS": "15",
+                },
                 clear=False,
             ),
             patch("uvicorn.Config", return_value=object()) as config,
@@ -301,6 +306,8 @@ class UvicornShutdownTests(unittest.IsolatedAsyncioTestCase):
             config.call_args.kwargs["host"],
         )
         self.assertEqual(13_961, config.call_args.kwargs["port"])
+        self.assertFalse(config.call_args.kwargs["access_log"])
+        self.assertEqual(15, config.call_args.kwargs["timeout_keep_alive"])
 
 
 if __name__ == "__main__":

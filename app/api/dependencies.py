@@ -108,9 +108,13 @@ async def require_admin(request: Request) -> AdminPrincipal:
     authorization = str(request.headers.get("authorization") or "").strip()
     if authorization.lower().startswith("bearer "):
         token = authorization.split(None, 1)[1].strip()
-        admin_id = legacy._admin_verify_api_token(token)
-        if admin_id and legacy._web_valid_admin_id(int(admin_id)):
-            return AdminPrincipal(int(admin_id), "bearer")
+        raw_admin_id = legacy._admin_verify_api_token(token)
+        try:
+            admin_id = int(raw_admin_id or 0)
+        except (TypeError, ValueError, OverflowError):
+            admin_id = 0
+        if admin_id > 0 and legacy._web_valid_admin_id(admin_id):
+            return AdminPrincipal(admin_id, "bearer")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired administrator bearer token.",

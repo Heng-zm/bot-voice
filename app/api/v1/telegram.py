@@ -33,7 +33,10 @@ async def _read_limited_webhook_body(req: Request, max_body: int) -> bytes:
     content_length = req.headers.get("content-length")
     if content_length:
         try:
-            if int(content_length) > max_body:
+            parsed_length = int(content_length)
+            if parsed_length < 0:
+                raise ValueError
+            if parsed_length > max_body:
                 raise HTTPException(
                     status_code=413,
                     detail=f"Request body too large. Max {max_body} bytes.",
@@ -174,6 +177,17 @@ class TelegramWebhookTransport:
         update_id: int,
         claim_token: str | None,
     ) -> None:
+        async def release_claim() -> None:
+            try:
+                await self._release_update(update_id, claim_token=claim_token)
+            except Exception as exc:  # noqa: BLE001 - cleanup boundary
+                logger.error(
+                    "Telegram update claim release failed update_id=%s: %s",
+                    update_id,
+                    exc,
+                    exc_info=True,
+                )
+
         try:
             await asyncio.wait_for(
                 application.process_update(update),
@@ -184,7 +198,7 @@ class TelegramWebhookTransport:
             logger.warning(
                 "Telegram update processing timed out update_id=%s", update_id
             )
-            await self._release_update(update_id, claim_token=claim_token)
+            await release_claim()
         except Exception as exc:
             logger.error(
                 "Telegram update processing failed update_id=%s: %s",
@@ -192,7 +206,7 @@ class TelegramWebhookTransport:
                 exc,
                 exc_info=True,
             )
-            await self._release_update(update_id, claim_token=claim_token)
+            await release_claim()
 
     async def process(
         self,

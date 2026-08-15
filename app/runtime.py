@@ -34,6 +34,7 @@ from app.services.telegram.delivery import (
     IdempotentTelegramDelivery,
     configure_telegram_delivery,
 )
+from app.utils.env import bounded_env_int
 
 logger = logging.getLogger(__name__)
 RuntimeRole = Literal["web", "worker", "combined"]
@@ -162,8 +163,11 @@ class RuntimeContext:
                 self.job_queue = configure_job_queue(
                     redis_client,
                     redis_prefix=redis_prefix,
-                    max_queued_jobs=int(
-                        os.getenv("BOT_JOB_QUEUE_MAX", "1000") or 1000
+                    max_queued_jobs=bounded_env_int(
+                        "BOT_JOB_QUEUE_MAX",
+                        1_000,
+                        minimum=1,
+                        maximum=1_000_000,
                     ),
                     memory_fallback=not self.redis_enabled,
                 )
@@ -276,12 +280,11 @@ class RuntimeContext:
             worker_count=int(
                 resource_value(
                     "BOT_JOB_WORKERS",
-                    int(
-                        os.getenv(
-                            "BOT_JOB_WORKERS",
-                            str(resource_default("BOT_JOB_WORKERS", 2)),
-                        )
-                        or 2
+                    bounded_env_int(
+                        "BOT_JOB_WORKERS",
+                        int(resource_default("BOT_JOB_WORKERS", 2)),
+                        minimum=1,
+                        maximum=32,
                     ),
                 )
             ),

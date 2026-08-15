@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import unittest
 
+from starlette.middleware.base import BaseHTTPMiddleware
+
 from app.core.network import web_server_port
+from app.main import RuntimeReadyMiddleware, ServerFastPathMiddleware, app
 
 
 class WebServerPortTests(unittest.TestCase):
@@ -24,6 +27,34 @@ class WebServerPortTests(unittest.TestCase):
         for value in ("invalid", "0", "65536"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 web_server_port({"SERVER_PORT": value, "PORT": "8080"})
+
+
+class ServerMiddlewareTests(unittest.TestCase):
+    def test_readiness_fast_path_does_not_use_base_http_middleware(self) -> None:
+        entry = next(item for item in app.user_middleware if item.cls is RuntimeReadyMiddleware)
+
+        self.assertFalse(issubclass(entry.cls, BaseHTTPMiddleware))
+
+    def test_request_guards_and_timing_share_one_pure_asgi_layer(self) -> None:
+        entry = next(
+            item for item in app.user_middleware if item.cls is ServerFastPathMiddleware
+        )
+
+        self.assertFalse(issubclass(entry.cls, BaseHTTPMiddleware))
+        self.assertFalse(
+            any(issubclass(item.cls, BaseHTTPMiddleware) for item in app.user_middleware)
+        )
+
+    def test_untrusted_request_id_is_safe_for_response_headers(self) -> None:
+        self.assertEqual(
+            "trace-123:child",
+            ServerFastPathMiddleware._request_id("trace-123:child"),
+        )
+        generated = ServerFastPathMiddleware._request_id("bad\r\nheader")
+
+        self.assertEqual(16, len(generated))
+        self.assertTrue(generated.isascii())
+        self.assertTrue(generated.isalnum())
 
 
 if __name__ == "__main__":

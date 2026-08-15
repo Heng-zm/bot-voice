@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
 from app.core.resources import resource_default, resource_value
+from app.utils.env import bounded_env_int
 
 T = TypeVar("T")
 ProviderOperation = Callable[[str], T | Awaitable[T]]
@@ -283,12 +284,27 @@ class ProviderManager:
                 entry = self._providers[provider_name]
                 timeout = entry.policy.timeout_seconds
             started = time.perf_counter()
+            sync_future: Future[T] | None = None
             try:
 
-                async def invoke(selected: str = provider_name) -> T:
+                async def invoke(
+                    selected: str = provider_name,
+                    selected_timeout: float = timeout,
+                ) -> T:
+                    nonlocal sync_future
                     if inspect.iscoroutinefunction(operation):
                         return await operation(selected)
-                    value = await asyncio.to_thread(operation, selected)
+                    # Foreign SDK calls cannot be force-stopped after a
+                    # timeout. Route them through the manager's bounded pool so
+                    # repeated timeouts cannot grow the default executor
+                    # without limit.
+                    sync_future = self._submit_sync(
+                        operation,
+                        selected,
+                        selected_timeout,
+                        slot_wait_seconds=0.0,
+                    )
+                    value = await asyncio.wrap_future(sync_future)
                     if inspect.isawaitable(value):
                         return await value
                     return value
@@ -298,7 +314,17 @@ class ProviderManager:
                 self.record_success(provider_name, latency_ms)
                 return result, provider_name
             except asyncio.CancelledError:
+                if sync_future is not None:
+                    sync_future.cancel()
                 raise
+            except TimeoutError:
+                if sync_future is not None:
+                    sync_future.cancel()
+                error = ProviderTimeout(
+                    f"Provider {provider_name!r} timed out after {timeout:g} seconds."
+                )
+                self.record_failure(provider_name, error)
+                errors[provider_name] = f"ProviderTimeout: {error}"[:500]
             except Exception as exc:  # noqa: BLE001 - provider boundary
                 self.record_failure(provider_name, exc)
                 errors[provider_name] = f"{type(exc).__name__}: {exc}"[:500]
@@ -309,11 +335,18 @@ class ProviderManager:
         operation: Callable[[str], T],
         provider_name: str,
         timeout: float,
+        *,
+        slot_wait_seconds: float | None = None,
     ) -> Future[T]:
         with self._lock:
             if self._closed:
                 raise ProviderManagerError("Provider manager is closed.")
-        acquired = self._sync_slots.acquire(timeout=min(1.0, timeout))
+        wait_seconds = (
+            min(1.0, timeout)
+            if slot_wait_seconds is None
+            else max(0.0, float(slot_wait_seconds))
+        )
+        acquired = self._sync_slots.acquire(timeout=wait_seconds)
         if not acquired:
             raise ProviderBusy(
                 "The bounded synchronous provider executor is saturated."
@@ -425,24 +458,22 @@ _PROVIDER_MANAGER = ProviderManager(
     sync_max_workers=int(
         resource_value(
             "PROVIDER_SYNC_MAX_WORKERS",
-            int(
-                os.getenv(
-                    "PROVIDER_SYNC_MAX_WORKERS",
-                    str(resource_default("PROVIDER_SYNC_MAX_WORKERS", 4)),
-                )
-                or 4
+            bounded_env_int(
+                "PROVIDER_SYNC_MAX_WORKERS",
+                int(resource_default("PROVIDER_SYNC_MAX_WORKERS", 4)),
+                minimum=1,
+                maximum=32,
             ),
         )
     ),
     sync_max_inflight=int(
         resource_value(
             "PROVIDER_SYNC_MAX_INFLIGHT",
-            int(
-                os.getenv(
-                    "PROVIDER_SYNC_MAX_INFLIGHT",
-                    str(resource_default("PROVIDER_SYNC_MAX_INFLIGHT", 8)),
-                )
-                or 8
+            bounded_env_int(
+                "PROVIDER_SYNC_MAX_INFLIGHT",
+                int(resource_default("PROVIDER_SYNC_MAX_INFLIGHT", 8)),
+                minimum=1,
+                maximum=128,
             ),
         )
     ),

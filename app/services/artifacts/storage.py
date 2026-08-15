@@ -130,14 +130,17 @@ class LocalArtifactStore:
                 prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
             )
             try:
-                with os.fdopen(fd, "wb") as handle:
+                try:
+                    handle = os.fdopen(fd, "wb")
+                except BaseException:
+                    os.close(fd)
+                    raise
+                with handle:
                     handle.write(payload)
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(temporary, target)
             except BaseException:
-                with suppress(OSError):
-                    os.close(fd)
                 with suppress(OSError):
                     os.unlink(temporary)
                 raise

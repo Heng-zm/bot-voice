@@ -861,18 +861,32 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(key, context.user_data)
         save.assert_not_awaited()
 
-    async def test_tts_reservation_closes_preparation_race(self) -> None:
+    async def test_immediate_tasks_accept_back_to_back_requests(self) -> None:
         user_id = 9_999_001
         self.assertTrue(legacy._reserve_tts_request(user_id))
         self.assertTrue(legacy._tts_request_reserved(user_id))
-        self.assertFalse(legacy._reserve_tts_request(user_id))
+        self.assertTrue(legacy._reserve_tts_request(user_id))
 
         reply_target = SimpleNamespace(reply_text=AsyncMock())
-        self.assertTrue(await legacy._check_cooldown(reply_target, user_id))
-        reply_target.reply_text.assert_awaited_once()
+        self.assertFalse(await legacy._check_cooldown(reply_target, user_id))
+        reply_target.reply_text.assert_not_awaited()
 
         legacy._release_tts_request(user_id)
+        self.assertTrue(legacy._tts_request_reserved(user_id))
+        legacy._release_tts_request(user_id)
         self.assertFalse(legacy._tts_request_reserved(user_id))
+
+    async def test_immediate_tasks_can_be_disabled_for_legacy_throttling(self) -> None:
+        user_id = 9_999_002
+        reply_target = SimpleNamespace(reply_text=AsyncMock())
+
+        with patch.object(legacy, "BOT_IMMEDIATE_TASKS", False):
+            self.assertTrue(legacy._reserve_tts_request(user_id))
+            self.assertFalse(legacy._reserve_tts_request(user_id))
+            self.assertTrue(await legacy._check_cooldown(reply_target, user_id))
+
+        reply_target.reply_text.assert_awaited_once()
+        legacy._release_tts_request(user_id)
 
     async def test_gender_and_speed_updates_remain_in_local_preferences(self) -> None:
         user_id = 9_999_003

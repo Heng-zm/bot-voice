@@ -102,6 +102,24 @@ class AdminApiAuthenticationTests(unittest.TestCase):
         response = self.client.get("/api/admin/me")
         self.assertEqual(401, response.status_code)
 
+    def test_malformed_bearer_identity_returns_401_instead_of_500(self) -> None:
+        from app import legacy
+
+        with (
+            patch.object(legacy, "_web_admin_enabled", return_value=True),
+            patch.object(
+                legacy,
+                "_admin_verify_api_token",
+                return_value="not-an-integer",
+            ),
+        ):
+            response = self.client.get(
+                "/api/admin/me",
+                headers={"Authorization": "Bearer malformed-identity"},
+            )
+
+        self.assertEqual(401, response.status_code)
+
     def test_valid_non_admin_returns_403(self) -> None:
         response = self.client.get(
             "/api/admin/me",

@@ -30,6 +30,13 @@ class BuildInfoTests(unittest.TestCase):
         self.assertEqual("worker", payload["process_role"])
         self.assertIsNotNone(payload["runtime_started_at"])
 
+    def test_invalid_runtime_timestamps_do_not_break_build_metadata(self) -> None:
+        for started_at in (float("nan"), float("inf"), 1e300, "not-a-number"):
+            with self.subTest(started_at=started_at):
+                payload = get_build_info(started_at=started_at)
+
+                self.assertIsNone(payload["runtime_started_at"])
+
     def test_version_routes_are_registered(self) -> None:
         paths = {route.path for route in app.routes}
         self.assertIn("/version", paths)
