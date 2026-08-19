@@ -6,271 +6,38 @@
   <meta name="color-scheme" content="light dark">
   <meta name="description" content="Secure Telegram bot administration dashboard">
   <title>Bot Control Center</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Google+Sans+Flex:opsz,wght@6..144,400..800&amp;family=Noto+Sans+Khmer:wght@400..800&amp;display=swap">
-  <link rel="stylesheet" href="/miniapp/admin/assets/styles.css?v=10">
+  <link rel="stylesheet" href="/miniapp/admin/assets/styles.css?v=4">
   <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
-  <script src="/miniapp/admin/assets/app.js?v=11" defer></script>
+  <script src="/miniapp/admin/assets/app.js?v=4" defer></script>
 </head>
 <body>
-  <div class="ambient ambient-one" aria-hidden="true"></div>
-  <div class="ambient ambient-two" aria-hidden="true"></div>
-
+  <div class="ambient ambient-one" aria-hidden="true"></div><div class="ambient ambient-two" aria-hidden="true"></div>
   <main class="shell">
     <header class="topbar">
-      <div class="brand">
-        <div class="brand-mark" aria-hidden="true">
-          <svg viewBox="0 0 32 32" focusable="false"><path d="M16 5v3M12.5 5h7M8 12.5A3.5 3.5 0 0 1 11.5 9h9a3.5 3.5 0 0 1 3.5 3.5v8a3.5 3.5 0 0 1-3.5 3.5h-9A3.5 3.5 0 0 1 8 20.5z"/><circle cx="12.5" cy="16" r="1.5"/><circle cx="19.5" cy="16" r="1.5"/><path d="M12.5 20h7"/></svg>
-        </div>
-        <div>
-          <p class="eyebrow" data-i18n="miniApp">Telegram Mini App</p>
-          <h1 data-i18n="controlCenter">Bot Control Center</h1>
-        </div>
-      </div>
-      <div class="top-actions">
-        <span id="connectionBadge" class="connection-badge" role="status" aria-live="polite">
-          <span class="status-dot" aria-hidden="true"></span>
-          <span id="connectionText" data-i18n="connecting">Connecting</span>
-        </span>
-        <button id="languageButton" class="text-button" type="button" aria-label="Change language">ខ្មែរ</button>
-        <button id="refreshButton" class="icon-button" type="button" aria-label="Refresh dashboard">
-          <span aria-hidden="true">↻</span>
-        </button>
-      </div>
+      <div class="brand"><div class="brand-mark" aria-hidden="true">V</div><div><p class="eyebrow" data-i18n="miniApp">Telegram Mini App</p><h1 data-i18n="controlCenter">Bot Control Center</h1></div></div>
+      <div class="top-actions"><span id="connectionBadge" class="secure-label">Connecting</span><button id="languageButton" class="text-button" type="button">ខ្មែរ</button><button id="refreshButton" class="icon-button" type="button" aria-label="Refresh dashboard">↻</button></div>
     </header>
-
-    <section id="authState" class="auth-state" aria-live="polite">
-      <div class="spinner" aria-hidden="true"></div>
-      <div>
-        <strong data-i18n="verifying">Verifying Telegram account</strong>
-        <p data-i18n="secureSession">Establishing a secure admin session…</p>
-      </div>
-    </section>
-
+    <section id="authState" class="auth-state" aria-live="polite"><div class="spinner" aria-hidden="true"></div><div><strong data-i18n="verifying">Verifying Telegram account</strong><p id="authDetail" data-i18n="secureSession">Establishing a secure admin session…</p></div></section>
     <div id="dashboard" class="dashboard is-hidden">
-      <section id="overview" class="hero panel dashboard-section">
-        <div class="hero-orbit" aria-hidden="true"></div>
-        <div class="profile">
-          <div id="profileFallback" class="avatar avatar-fallback" aria-hidden="true">A</div>
-          <img id="profilePhoto" class="avatar is-hidden" alt="">
-          <div class="profile-copy">
-            <p class="eyebrow" data-i18n="authorizedAdmin">Authorized administrator</p>
-            <h2 id="profileName">Administrator</h2>
-            <p id="profileHandle" class="muted">Telegram verified</p>
-          </div>
-        </div>
-        <div class="hero-status-stack">
-          <div id="systemBadge" class="status-pill">
-            <span class="status-dot"></span>
-            <span data-i18n="checkingSystem">Checking system</span>
-          </div>
-          <small id="heroSyncState" class="hero-sync" data-i18n="secureRealtime">Secure real-time control</small>
-        </div>
-      </section>
-
+      <section id="overview" class="hero panel dashboard-section"><div class="profile"><div id="profileFallback" class="avatar avatar-fallback">A</div><img id="profilePhoto" class="avatar is-hidden" alt=""><div class="profile-copy"><p class="eyebrow" data-i18n="authorizedAdmin">Authorized administrator</p><h2 id="profileName">Administrator</h2><p id="profileHandle" class="muted">Telegram verified</p></div></div><div id="systemBadge" class="status-pill"><span class="status-dot"></span><span>Checking system</span></div></section>
       <section class="metric-grid" aria-label="Bot metrics">
         <article class="metric panel"><div class="metric-icon blue">U</div><div><span data-i18n="totalUsers">Total users</span><strong id="totalUsers">—</strong></div></article>
         <article class="metric panel"><div class="metric-icon violet">M</div><div><span data-i18n="messages">Messages handled</span><strong id="messageCount">—</strong></div></article>
-        <article class="metric panel"><div class="metric-icon green">Q</div><div><span data-i18n="queuedJobs">Queued jobs</span><strong id="queuedJobs">—</strong></div></article>
-        <article class="metric panel"><div class="metric-icon amber">D</div><div><span data-i18n="deadJobs">Dead jobs</span><strong id="deadJobs">—</strong></div></article>
-        <article class="metric panel"><div class="metric-icon green">R</div><div><span data-i18n="redisLatency">Redis latency</span><strong id="redisLatency">—</strong></div></article>
+        <article class="metric panel"><div class="metric-icon green">DB</div><div><span data-i18n="storage">Settings storage</span><strong id="storageBackend">—</strong></div></article>
         <article class="metric panel"><div class="metric-icon amber">T</div><div><span data-i18n="uptime">Uptime</span><strong id="uptime">—</strong></div></article>
       </section>
-
       <section id="health" class="two-column dashboard-section">
-        <article class="panel health-panel">
-          <div class="section-heading"><div><p class="eyebrow" data-i18n="liveStatus">Live status</p><h2 data-i18n="systemHealth">System health</h2></div><span id="lastUpdated" class="muted">Not updated</span></div>
-          <div class="health-list">
-            <div class="health-row"><span data-i18n="botService">Bot service</span><span id="botHealth" class="health-value">Checking…</span></div>
-            <div class="health-row"><span data-i18n="redisCache">Redis cache</span><span id="redisHealth" class="health-value">Checking…</span></div>
-            <div class="health-row"><span data-i18n="database">Settings database</span><span id="databaseHealth" class="health-value">Checking…</span></div>
-            <div class="health-row"><span data-i18n="workers">Durable workers</span><span id="workerHealth" class="health-value">Checking…</span></div>
-            <div class="health-row"><span data-i18n="botMode">Bot mode</span><span id="botMode" class="health-value">—</span></div>
-          </div>
-        </article>
-        <article class="panel maintenance-panel">
-          <div class="section-heading"><div><p class="eyebrow" data-i18n="quickControl">Quick control</p><h2 data-i18n="maintenance">Maintenance mode</h2></div><label class="switch"><input id="maintenanceToggle" type="checkbox"><span class="switch-track"></span></label></div>
-          <p class="muted" data-i18n="maintenanceHelp">Temporarily pause normal-user features while keeping admin controls available.</p>
-          <div id="maintenanceNotice" class="notice">Normal bot service is active.</div>
-        </article>
+        <article class="panel health-panel"><div class="section-heading"><div><p class="eyebrow" data-i18n="liveStatus">Live status</p><h2 data-i18n="systemHealth">System health</h2></div><span id="lastUpdated" class="muted">Not updated</span></div><div class="health-list"><div class="health-row"><span data-i18n="botService">Bot service</span><span id="botHealth" class="health-value">Checking…</span></div><div class="health-row"><span data-i18n="database">Settings database</span><span id="databaseHealth" class="health-value">Checking…</span></div><div class="health-row"><span data-i18n="architecture">Architecture</span><span id="architectureHealth" class="health-value">Single process</span></div><div class="health-row"><span data-i18n="botMode">Bot mode</span><span id="botMode" class="health-value">—</span></div></div></article>
+        <article class="panel maintenance-panel"><div class="section-heading"><div><p class="eyebrow" data-i18n="quickControl">Quick control</p><h2 data-i18n="maintenance">Maintenance mode</h2></div><label class="switch"><input id="maintenanceToggle" type="checkbox"><span class="switch-track"></span></label></div><p class="muted" data-i18n="maintenanceHelp">Temporarily pause normal-user features while keeping admin controls available.</p><div id="maintenanceNotice" class="notice">Normal bot service is active.</div></article>
       </section>
-
-      <section id="monitor" class="panel dashboard-section monitor-panel">
-        <div class="section-heading monitor-heading">
-          <div><p class="eyebrow" data-i18n="liveMonitor">Live operations</p><h2 data-i18n="botMonitor">Bot Monitor</h2></div>
-          <div class="section-actions">
-            <span id="monitorLiveState" class="status-pill monitor-live"><span class="status-dot"></span><span data-i18n="live">Live</span></span>
-            <select id="monitorInterval" class="select monitor-interval" aria-label="Monitor refresh interval">
-              <option value="3000">3s</option>
-              <option value="5000" selected>5s</option>
-              <option value="10000">10s</option>
-            </select>
-            <button id="refreshMonitorButton" class="button" type="button" data-i18n="refresh">Refresh</button>
-            <button id="monitorFullscreenButton" class="button primary" type="button" data-i18n="fullScreen">Full screen</button>
-          </div>
-        </div>
-
-        <div id="monitorAlert" class="monitor-alert" role="status">
-          <span class="monitor-alert-icon" aria-hidden="true">●</span>
-          <div><strong id="monitorAlertTitle" data-i18n="monitorConnecting">Connecting to runtime</strong><small id="monitorAlertDetail" data-i18n="monitorConnectingHelp">Waiting for the first secure process snapshot…</small></div>
-          <span id="monitorLatency" class="monitor-latency">— ms</span>
-        </div>
-
-        <div class="monitor-metrics" aria-label="Live runtime metrics">
-          <article class="monitor-metric"><span data-i18n="processState">Bot process</span><strong id="monitorProcessState">—</strong><small id="monitorProcessMeta">—</small></article>
-          <article class="monitor-metric"><span data-i18n="workerProcesses">Worker processes</span><strong id="monitorWorkerState">—</strong><small id="monitorWorkerMeta">—</small></article>
-          <article class="monitor-metric"><span data-i18n="ttsProcesses">TTS processes</span><strong id="monitorTtsState">—</strong><small id="monitorTtsMeta">—</small></article>
-          <article class="monitor-metric"><span data-i18n="queueActivity">Queue activity</span><strong id="monitorQueueState">—</strong><small id="monitorQueueMeta">—</small></article>
-        </div>
-
-        <div class="monitor-trends" aria-label="Recent process trends">
-          <article class="monitor-trend-card"><div><span data-i18n="cpuActivity">CPU activity</span><strong id="monitorCpuValue">—</strong></div><div id="monitorCpuChart" class="monitor-trend-chart"></div></article>
-          <article class="monitor-trend-card"><div><span data-i18n="queuePressure">Queue pressure</span><strong id="monitorPressureValue">—</strong></div><div id="monitorPressureChart" class="monitor-trend-chart"></div></article>
-          <article class="monitor-trend-card"><div><span data-i18n="webRequests">Web requests</span><strong id="monitorRequestsValue">—</strong></div><div id="monitorRequestsChart" class="monitor-trend-chart"></div></article>
-          <article class="monitor-trend-card"><div><span data-i18n="ttsLoad">TTS workload</span><strong id="monitorTtsTrendValue">—</strong></div><div id="monitorTtsTrendChart" class="monitor-trend-chart"></div></article>
-          <article class="monitor-trend-card"><div><span data-i18n="queueAge">Oldest queued</span><strong id="monitorQueueAgeValue">—</strong></div><div id="monitorQueueAgeChart" class="monitor-trend-chart"></div></article>
-          <article class="monitor-trend-card"><div><span data-i18n="failureRate">Failure rate</span><strong id="monitorFailureValue">—</strong></div><div id="monitorFailureChart" class="monitor-trend-chart"></div></article>
-        </div>
-
-        <div class="monitor-grid">
-          <article class="monitor-card">
-            <div class="monitor-card-heading"><h3 data-i18n="processDetails">Process details</h3><span id="monitorUpdated" class="muted">—</span></div>
-            <div id="monitorProcessDetails" class="monitor-detail-list"></div>
-          </article>
-          <article class="monitor-card">
-            <div class="monitor-card-heading"><h3 data-i18n="durableWorkers">Durable workers</h3><span id="monitorWorkerCount" class="secure-label">—</span></div>
-            <div id="monitorWorkerList" class="monitor-worker-list"></div>
-          </article>
-        </div>
-
-        <article class="monitor-card monitor-incident-card">
-          <div class="monitor-card-heading"><div><h3 data-i18n="incidentRecovery">Incident recovery</h3><p class="muted" data-i18n="incidentRecoveryHelp">Component restarts, backoff, recovery, and open configuration circuits.</p></div><span id="monitorIncidentCount" class="secure-label">0</span></div>
-          <div id="monitorIncidentList" class="monitor-incident-list"></div>
-          <p id="monitorIncidentsEmpty" class="empty-state" data-i18n="noIncidents">No component incidents since startup.</p>
-        </article>
-
-        <article class="monitor-card monitor-tts-card">
-          <div class="monitor-card-heading monitor-tts-heading"><div><h3 data-i18n="mediaProcessQueue">TTS, OCR &amp; transcription</h3><p class="muted" data-i18n="mediaMonitorHelp">Real-time progress for running and waiting media jobs.</p></div><span id="monitorTtsCount" class="secure-label">—</span></div>
-          <div class="monitor-workload-controls">
-            <div class="monitor-filter-tabs" role="group" aria-label="Filter media process state">
-              <button class="monitor-filter-tab active" type="button" data-tts-filter="all" data-i18n="allProcesses">All</button>
-              <button class="monitor-filter-tab" type="button" data-tts-filter="running" data-i18n="running">Running</button>
-              <button class="monitor-filter-tab" type="button" data-tts-filter="queued" data-i18n="waiting">Waiting</button>
-            </div>
-            <select id="monitorWorkloadType" class="select" aria-label="Filter media process type">
-              <option value="all" data-i18n="allTypes">All types</option>
-              <option value="tts">TTS</option>
-              <option value="ocr">OCR</option>
-              <option value="transcription">Transcription</option>
-            </select>
-          </div>
-          <div id="monitorTtsList" class="monitor-job-list"></div>
-          <p id="monitorTtsEmpty" class="empty-state is-hidden" data-i18n="noMediaProcesses">No active or queued media processes.</p>
-        </article>
-
-        <article class="monitor-card monitor-log-card">
-          <div class="monitor-card-heading monitor-log-heading">
-            <div><h3 data-i18n="runtimeLogs">Runtime logs</h3><p class="muted" data-i18n="logsSafe">Recent logs are bounded and secrets are automatically hidden.</p></div>
-            <div class="section-actions monitor-log-controls">
-              <span id="monitorLogCount" class="secure-label">0</span>
-              <select id="monitorLogLevel" class="select" aria-label="Minimum log level">
-                <option value="" data-i18n="allLogs">All logs</option>
-                <option value="INFO">Info+</option>
-                <option value="WARNING">Warning+</option>
-                <option value="ERROR">Error+</option>
-              </select>
-              <input id="monitorLogSearch" class="text-input" type="search" maxlength="128" placeholder="Search logs" data-i18n-placeholder="searchLogs" aria-label="Search logs">
-              <button id="monitorCopyLogsButton" class="button" type="button" data-i18n="copyLogs">Copy logs</button>
-              <button id="monitorDownloadLogsButton" class="button" type="button" data-i18n="downloadLogs">Download</button>
-              <button id="monitorPauseButton" class="button" type="button" data-i18n="pauseLive">Pause</button>
-            </div>
-          </div>
-          <div id="monitorLogList" class="monitor-log-list" role="log" aria-live="off"></div>
-          <p id="monitorLogsEmpty" class="empty-state is-hidden" data-i18n="noLogs">No matching runtime logs.</p>
-        </article>
-      </section>
-
-      <section id="jobs" class="panel dashboard-section">
-        <div class="section-heading">
-          <div><p class="eyebrow" data-i18n="durableRuntime">Durable runtime</p><h2 data-i18n="jobQueue">Job queue</h2></div>
-          <div class="section-actions">
-            <select id="jobState" class="select">
-              <option value="dead">Dead</option>
-              <option value="running">Running</option>
-              <option value="queued">Queued</option>
-              <option value="succeeded">Succeeded</option>
-              <option value="cancelled">Cancelled</option>
-            </select>
-            <select id="jobType" class="select" aria-label="Filter jobs by type">
-              <option value="">All types</option>
-              <option value="tts">TTS</option>
-              <option value="ocr">OCR</option>
-              <option value="transcription">Transcription</option>
-              <option value="broadcast">Broadcast</option>
-            </select>
-            <input id="jobSearch" class="text-input job-search" type="search" maxlength="128" placeholder="Search jobs" aria-label="Search jobs">
-            <button id="drainWorkersButton" class="button danger" type="button" data-i18n="drainWorkers">Drain workers</button>
-            <button id="resumeWorkersButton" class="button" type="button" data-i18n="resumeWorkers">Resume workers</button>
-            <button id="refreshJobsButton" class="button" type="button" data-i18n="refresh">Refresh</button>
-          </div>
-        </div>
-        <div id="jobSummary" class="summary-strip"></div>
-        <div id="queueCharts" class="queue-charts" aria-label="Queue performance charts"></div>
-        <div id="jobsList" class="data-list"></div>
-        <p id="jobsEmpty" class="empty-state is-hidden" data-i18n="noJobs">No jobs in this state.</p>
-        <div class="form-actions"><button id="retrySelectedButton" class="button primary" type="button" disabled data-i18n="retrySelected">Retry selected</button><button id="loadMoreJobsButton" class="button is-hidden" type="button" data-i18n="loadMore">Load more</button></div>
-      </section>
-
-      <section id="providers" class="panel dashboard-section">
-        <div class="section-heading"><div><p class="eyebrow" data-i18n="processHealth">This-instance health</p><h2 data-i18n="providers">AI & speech providers</h2></div><span id="providerScope" class="secure-label">Process-local</span></div>
-        <div id="providersList" class="card-grid"></div>
-      </section>
-
-      <section id="administrators" class="panel dashboard-section">
-        <div class="section-heading"><div><p class="eyebrow" data-i18n="accessControl">Access control</p><h2 data-i18n="administrators">Administrators</h2></div><span class="secure-label" data-i18n="confirmationRequired">Confirmation required</span></div>
-        <form id="adminForm" class="inline-form"><label class="sr-only" for="adminUserId">Telegram user ID</label><input id="adminUserId" class="text-input" inputmode="numeric" pattern="[0-9]+" placeholder="Telegram user ID" required><button class="button primary" type="submit" data-i18n="addAdmin">Add administrator</button></form>
-        <div id="adminList" class="data-list"></div>
-        <h3 class="subheading" data-i18n="auditLog">Audit log</h3>
-        <div id="auditList" class="data-list compact"></div>
-      </section>
-
-      <section id="security" class="panel dashboard-section">
-        <div class="section-heading"><div><p class="eyebrow" data-i18n="networkPolicy">Network policy</p><h2 data-i18n="corsOrigins">Allowed CORS origins</h2></div><span class="secure-label" data-i18n="exactOrigins">Exact origins only</span></div>
-        <form id="corsForm" class="inline-form"><label class="sr-only" for="corsOrigin">Allowed origin URL</label><input id="corsOrigin" name="origin" type="url" maxlength="2048" placeholder="https://dashboard.example.com" autocomplete="url" required><button class="button primary" type="submit" data-i18n="addOrigin">Add origin</button></form>
-        <div id="corsList" class="chip-list"></div><p id="corsEmpty" class="empty-state is-hidden" data-i18n="noOrigins">No browser origins are currently allowed.</p>
-      </section>
-
-      <section id="settings" class="panel dashboard-section">
-        <div class="section-heading"><div><p class="eyebrow" data-i18n="redisControls">Redis-backed controls</p><h2 data-i18n="runtimeSettings">Runtime settings</h2></div><span class="secure-label" data-i18n="validatedLimits">Validated limits</span></div>
-        <form id="runtimeForm"><div id="runtimeFields" class="settings-grid"></div><div class="form-actions"><span class="muted" data-i18n="settingsApply">Changes apply immediately and persist across restarts.</span><button id="saveRuntimeButton" class="button primary" type="submit" data-i18n="saveSettings">Save settings</button></div></form>
-      </section>
+      <section id="runtime" class="panel dashboard-section"><div class="section-heading"><div><p class="eyebrow" data-i18n="simplifiedRuntime">Simplified runtime</p><h2 data-i18n="runtimeArchitecture">Single-process architecture</h2></div><span class="secure-label">No Redis · No worker</span></div><div id="runtimeSummary" class="summary-strip">Loading runtime status…</div><div id="workloadGrid" class="workload-grid" aria-live="polite"></div></section>
+      <section id="providers" class="panel dashboard-section"><div class="section-heading"><div><p class="eyebrow" data-i18n="processHealth">This-instance health</p><h2 data-i18n="providers">AI & speech providers</h2></div><span id="providerScope" class="secure-label">Process-local</span></div><div id="providersList" class="card-grid"></div></section>
+      <section id="administrators" class="panel dashboard-section"><div class="section-heading"><div><p class="eyebrow" data-i18n="accessControl">Access control</p><h2 data-i18n="administrators">Administrators</h2></div><span class="secure-label" data-i18n="supabaseBacked">Supabase-backed</span></div><form id="adminForm" class="inline-form"><input id="adminUserId" class="text-input" inputmode="numeric" pattern="[0-9]+" placeholder="Telegram user ID" required><button class="button primary" type="submit" data-i18n="addAdmin">Add administrator</button></form><div id="adminList" class="data-list"></div><h3 class="subheading" data-i18n="auditLog">Audit log</h3><div id="auditList" class="data-list compact"></div></section>
+      <section id="security" class="panel dashboard-section"><div class="section-heading"><div><p class="eyebrow" data-i18n="networkPolicy">Network policy</p><h2 data-i18n="corsOrigins">Allowed CORS origins</h2></div><span class="secure-label" data-i18n="exactOrigins">Exact origins only</span></div><form id="corsForm" class="inline-form"><input id="corsOrigin" name="origin" type="url" maxlength="2048" placeholder="https://dashboard.example.com" autocomplete="url" required><button class="button primary" type="submit" data-i18n="addOrigin">Add origin</button></form><div id="corsList" class="chip-list"></div><p id="corsEmpty" class="empty-state is-hidden" data-i18n="noOrigins">No browser origins are currently allowed.</p></section>
+      <section id="settings" class="panel dashboard-section"><div class="section-heading"><div><p class="eyebrow" data-i18n="supabaseControls">Supabase-backed controls</p><h2 data-i18n="runtimeSettings">Runtime settings</h2></div><span class="secure-label" data-i18n="validatedLimits">Validated limits</span></div><form id="runtimeForm"><div id="runtimeFields" class="settings-grid"></div><div class="form-actions"><span class="muted" data-i18n="settingsApply">Changes apply immediately and persist across restarts.</span><button id="saveRuntimeButton" class="button primary" type="submit" data-i18n="saveSettings">Save settings</button></div></form></section>
     </div>
   </main>
-
-  <nav class="mobile-nav" aria-label="Admin sections">
-    <a class="mobile-nav-item active" href="#overview" data-nav-target="overview">⌂<span data-i18n="overview">Overview</span></a>
-    <a class="mobile-nav-item" href="#health" data-nav-target="health">◉<span data-i18n="health">Health</span></a>
-    <a class="mobile-nav-item" href="#monitor" data-nav-target="monitor">▣<span data-i18n="monitor">Monitor</span></a>
-    <a class="mobile-nav-item" href="#jobs" data-nav-target="jobs">≡<span data-i18n="jobs">Jobs</span></a>
-    <a class="mobile-nav-item" href="#providers" data-nav-target="providers">◇<span data-i18n="providersShort">Providers</span></a>
-    <a class="mobile-nav-item" href="#administrators" data-nav-target="administrators">♙<span data-i18n="admins">Admins</span></a>
-    <a class="mobile-nav-item" href="#settings" data-nav-target="settings">⚙<span data-i18n="settings">Settings</span></a>
-  </nav>
-  <div id="jobDetailDialog" class="detail-dialog is-hidden" role="dialog" aria-modal="true" aria-labelledby="jobDetailTitle">
-    <div class="detail-dialog-backdrop" data-close-job-detail></div>
-    <article class="detail-dialog-card panel">
-      <div class="section-heading">
-        <div><p class="eyebrow" data-i18n="jobDetails">Job details</p><h2 id="jobDetailTitle">Job</h2></div>
-        <button id="closeJobDetailButton" class="icon-button" type="button" aria-label="Close job details">×</button>
-      </div>
-      <div id="jobDetailContent" class="job-detail-content"></div>
-      <div class="form-actions">
-        <button id="copyJobIdButton" class="button" type="button" data-i18n="copyJobId">Copy job ID</button>
-        <button class="button primary" type="button" data-close-job-detail data-i18n="close">Close</button>
-      </div>
-    </article>
-  </div>
+  <nav class="mobile-nav" aria-label="Admin sections"><a class="mobile-nav-item active" href="#overview" data-nav-target="overview">⌂<span>Overview</span></a><a class="mobile-nav-item" href="#health" data-nav-target="health">◉<span>Health</span></a><a class="mobile-nav-item" href="#providers" data-nav-target="providers">◇<span>Providers</span></a><a class="mobile-nav-item" href="#administrators" data-nav-target="administrators">♙<span>Admins</span></a><a class="mobile-nav-item" href="#settings" data-nav-target="settings">⚙<span>Settings</span></a></nav>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 </body>
 </html>

@@ -18,15 +18,10 @@ from collections.abc import Awaitable, Callable, Iterable
 from concurrent.futures import (
     Future,
     ThreadPoolExecutor,
-)
-from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
-
-from app.core.resources import resource_default, resource_value
-from app.utils.env import bounded_env_int
 
 T = TypeVar("T")
 ProviderOperation = Callable[[str], T | Awaitable[T]]
@@ -164,7 +159,7 @@ class ProviderManager:
             max(0, int(priority)),
             max(1, int(failure_threshold)),
             max(1.0, float(cooldown_seconds)),
-            max(0.1, float(timeout_seconds)),
+            max(0.01, float(timeout_seconds)),
         )
         with self._lock:
             existing = self._providers.get(provider_name)
@@ -284,27 +279,12 @@ class ProviderManager:
                 entry = self._providers[provider_name]
                 timeout = entry.policy.timeout_seconds
             started = time.perf_counter()
-            sync_future: Future[T] | None = None
             try:
 
-                async def invoke(
-                    selected: str = provider_name,
-                    selected_timeout: float = timeout,
-                ) -> T:
-                    nonlocal sync_future
+                async def invoke(selected: str = provider_name) -> T:
                     if inspect.iscoroutinefunction(operation):
                         return await operation(selected)
-                    # Foreign SDK calls cannot be force-stopped after a
-                    # timeout. Route them through the manager's bounded pool so
-                    # repeated timeouts cannot grow the default executor
-                    # without limit.
-                    sync_future = self._submit_sync(
-                        operation,
-                        selected,
-                        selected_timeout,
-                        slot_wait_seconds=0.0,
-                    )
-                    value = await asyncio.wrap_future(sync_future)
+                    value = await asyncio.to_thread(operation, selected)
                     if inspect.isawaitable(value):
                         return await value
                     return value
@@ -314,17 +294,7 @@ class ProviderManager:
                 self.record_success(provider_name, latency_ms)
                 return result, provider_name
             except asyncio.CancelledError:
-                if sync_future is not None:
-                    sync_future.cancel()
                 raise
-            except TimeoutError:
-                if sync_future is not None:
-                    sync_future.cancel()
-                error = ProviderTimeout(
-                    f"Provider {provider_name!r} timed out after {timeout:g} seconds."
-                )
-                self.record_failure(provider_name, error)
-                errors[provider_name] = f"ProviderTimeout: {error}"[:500]
             except Exception as exc:  # noqa: BLE001 - provider boundary
                 self.record_failure(provider_name, exc)
                 errors[provider_name] = f"{type(exc).__name__}: {exc}"[:500]
@@ -335,18 +305,11 @@ class ProviderManager:
         operation: Callable[[str], T],
         provider_name: str,
         timeout: float,
-        *,
-        slot_wait_seconds: float | None = None,
     ) -> Future[T]:
         with self._lock:
             if self._closed:
                 raise ProviderManagerError("Provider manager is closed.")
-        wait_seconds = (
-            min(1.0, timeout)
-            if slot_wait_seconds is None
-            else max(0.0, float(slot_wait_seconds))
-        )
-        acquired = self._sync_slots.acquire(timeout=wait_seconds)
+        acquired = self._sync_slots.acquire(timeout=min(1.0, timeout))
         if not acquired:
             raise ProviderBusy(
                 "The bounded synchronous provider executor is saturated."
@@ -387,7 +350,7 @@ class ProviderManager:
                 latency_ms = (time.perf_counter() - started) * 1_000
                 self.record_success(provider_name, latency_ms)
                 return result, provider_name
-            except FutureTimeoutError:
+            except FutureTimeoutError as exc:
                 if future is not None:
                     future.cancel()
                 error = ProviderTimeout(
@@ -455,28 +418,8 @@ class ProviderManager:
 
 
 _PROVIDER_MANAGER = ProviderManager(
-    sync_max_workers=int(
-        resource_value(
-            "PROVIDER_SYNC_MAX_WORKERS",
-            bounded_env_int(
-                "PROVIDER_SYNC_MAX_WORKERS",
-                int(resource_default("PROVIDER_SYNC_MAX_WORKERS", 4)),
-                minimum=1,
-                maximum=32,
-            ),
-        )
-    ),
-    sync_max_inflight=int(
-        resource_value(
-            "PROVIDER_SYNC_MAX_INFLIGHT",
-            bounded_env_int(
-                "PROVIDER_SYNC_MAX_INFLIGHT",
-                int(resource_default("PROVIDER_SYNC_MAX_INFLIGHT", 8)),
-                minimum=1,
-                maximum=128,
-            ),
-        )
-    ),
+    sync_max_workers=int(os.getenv("PROVIDER_SYNC_MAX_WORKERS", "4") or 4),
+    sync_max_inflight=int(os.getenv("PROVIDER_SYNC_MAX_INFLIGHT", "8") or 8),
 )
 
 
@@ -485,6 +428,7 @@ def configure_default_providers() -> ProviderManager:
         ("gemini", {"ai", "ocr", "transcription"}, 10, 90.0),
         ("huggingface", {"ai", "ocr", "tts"}, 20, 120.0),
         ("edge_tts", {"tts"}, 30, 60.0),
+        ("voxcpm2", {"tts", "voice_clone"}, 10, 300.0),
     )
     for name, capabilities, priority, timeout in defaults:
         _PROVIDER_MANAGER.register(

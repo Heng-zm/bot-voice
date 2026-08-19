@@ -21,7 +21,7 @@ import atexit
 import base64
 import httpx
 import imageio_ffmpeg as _iio_ffmpeg
-from typing import Any, Callable, Awaitable
+from typing import Any, Callable
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from contextlib import suppress
@@ -118,6 +118,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardRemove,
     WebAppInfo,
 )
 from telegram.error import (
@@ -125,40 +126,18 @@ from telegram.error import (
     TimedOut,
     RetryAfter,
     BadRequest,
-    Conflict,
     TelegramError,
     Forbidden,
 )
 from telegram.ext import (
     Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
     ContextTypes,
-    TypeHandler,
-    CallbackQueryHandler,
     ApplicationHandlerStop,
 )
 from app.services.telegram.flow import (
     callback_requires_tts_access,
     classify_callback,
 )
-from app.services.db.locks import BOT_LOCKS_SQL, SupabaseLockService
-from app.api.v1 import telegram as _telegram_api_transport
-from app.services.telegram import client as _telegram_webhook_client
-from app.services.telegram import deduplication as _telegram_deduplication
-from app.services.telegram.welcome import (
-    WELCOME_IMAGE_CAPTION_MAX_CHARS,
-    WELCOME_IMAGE_FILE_ID_MAX_CHARS,
-    WELCOME_IMAGE_SETTING_KEY,
-    WELCOME_MESSAGE_MAX_CHARS,
-    WELCOME_MESSAGE_SETTING_KEY,
-    normalize_welcome_image_file_id as _normalize_welcome_image_file_id_service,
-    normalize_welcome_message as _normalize_welcome_message_service,
-    send_welcome_content as _send_welcome_content_service,
-)
-from app.core.network import web_server_port
-from app.core.resources import resource_default, resource_profile, resource_value
 try:
     from pydantic_settings import BaseSettings, SettingsConfigDict
     _PYDANTIC_SETTINGS_AVAILABLE = True
@@ -392,11 +371,9 @@ except Exception as exc:
     def _early_load_dotenv(*args: Any, **kwargs: Any) -> bool:
         return False
 
-try:
-    import redis as redis_lib
-except Exception as exc:
-    logging.getLogger(__name__).warning("Optional dependency redis is not available; Redis cache/locks disabled: %s", exc)
-    redis_lib = None
+# Redis support was removed in the single-process runtime.  Keep the sentinel
+# for old optional-cache branches while those branches are gradually extracted.
+redis_lib = None
 
 
 # ── Built-in smooth performance defaults ───────────────────────────────────
@@ -426,7 +403,7 @@ PERFORMANCE_CODE_DEFAULTS: dict[str, Any] = {
 
 
 def _perf_default(name: str, fallback: Any = None) -> Any:
-    return resource_default(name, PERFORMANCE_CODE_DEFAULTS.get(name, fallback))
+    return PERFORMANCE_CODE_DEFAULTS.get(name, fallback)
 
 
 # ── Admin cookie defaults ──────────────────────────────────────────────────
@@ -449,8 +426,7 @@ class AppSettings(BaseSettings):
     if hasattr(BaseSettings, "model_config") or BaseSettings is not object:
         model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
 
-    # The only deployment secrets/connection values that belong in .env.
-    REDIS_URL: str = ""
+    # Core deployment secrets/connection values that belong in .env.
     SUPABASE_URL: str = ""
     SUPABASE_KEY: str = ""
     TELEGRAM_BOT_TOKEN: str = ""
@@ -469,11 +445,11 @@ class AppSettings(BaseSettings):
     BACKEND_ONLY: bool = True
     WEB_ADMIN_FRONTEND_ENABLED: bool = False
     # Keep the backend API-only by default. Dynamic frontend origins are stored
-    # in Redis/Supabase and edited through /api/admin/cors.
+    # in Supabase bot_settings and edited through /api/admin/cors.
     ADMIN_FRONTEND_URL: str = ""
     ADMIN_LOGIN_RATE_LIMIT_ATTEMPTS: int = 5
     ADMIN_LOGIN_RATE_LIMIT_WINDOW_S: float = 300.0
-    ADMIN_LOGIN_RATE_LIMIT_REDIS_ENABLED: bool = True
+    ADMIN_LOGIN_RATE_LIMIT_REDIS_ENABLED: bool = False
     ADMIN_ORIGIN_GUARD_ENABLED: bool = True
     # Optional bearer fallback for separated frontends when browser cookies are
     # blocked by local dev, preview domains, or missing credentials: include.
@@ -485,9 +461,9 @@ class AppSettings(BaseSettings):
     ADMIN_API_TOKEN_TTL_SECONDS: int = 3600
     WEB_REQUIRE_STABLE_SECRET_IN_PRODUCTION: bool = True
     MAX_CONCURRENT_TTS_USERS: int = int(_perf_default("MAX_CONCURRENT_TTS_USERS", 2))
-    MAX_CONCURRENT_AI: int = int(resource_default("MAX_CONCURRENT_AI", 3))
-    MAX_CONCURRENT_GEMINI: int = int(resource_default("MAX_CONCURRENT_GEMINI", 3))
-    MAX_CONCURRENT_BROADCAST: int = int(resource_default("MAX_CONCURRENT_BROADCAST", 3))
+    MAX_CONCURRENT_AI: int = 3
+    MAX_CONCURRENT_GEMINI: int = 3
+    MAX_CONCURRENT_BROADCAST: int = 3
     BROADCAST_BATCH_SIZE: int = 3
     BROADCAST_INTER_BATCH_DELAY: float = 0.20
     TTS_RESOLVER_AI_ENABLED: bool = False
@@ -497,7 +473,7 @@ class AppSettings(BaseSettings):
     APP_TIMEZONE_UTC_LABEL: str = "UTC+7"
     BOT_SETTINGS_CACHE_TTL_S: float = 30.0
     WEB_BROADCAST_JOBS_MAX: int = 50
-    WEB_BROADCAST_WORKERS: int = int(resource_default("WEB_BROADCAST_WORKERS", 3))
+    WEB_BROADCAST_WORKERS: int = 3
     WEB_BROADCAST_DELAY_S: float = 0.05
     WEB_TABLE_PAGE_SIZE: int = 50
     WEB_COUNTS_CACHE_TTL_S: float = 30.0
@@ -523,8 +499,8 @@ class AppSettings(BaseSettings):
     # local/minimal .env deployments safely default to polling.
     BOT_MODE: str = (
         "WEBHOOK"
-        if (os.environ.get("TELEGRAM_WEBHOOK_URL") and "://" in str(os.environ.get("TELEGRAM_WEBHOOK_URL")))
-        or (os.environ.get("RENDER_EXTERNAL_URL") and "onrender.com" in str(os.environ.get("RENDER_EXTERNAL_URL")) and "your-service" not in str(os.environ.get("RENDER_EXTERNAL_URL")))
+        if os.environ.get("TELEGRAM_WEBHOOK_URL")
+        or os.environ.get("RENDER_EXTERNAL_URL")
         else "POLLING"
     )
     TELEGRAM_WEBHOOK_URL: str | None = None
@@ -588,21 +564,6 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if isinstance(raw, bool):
         return raw
     return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
-
-
-def _redis_enabled() -> bool:
-    if _env_bool("DISABLE_REDIS", False):
-        return False
-    configured = os.environ.get("REDIS_ENABLED")
-    if configured is None:
-        return bool(
-            str(
-                os.environ.get("REDIS_URL")
-                or getattr(SETTINGS, "REDIS_URL", "")
-                or ""
-            ).strip()
-        )
-    return str(configured).strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
 def _env_int(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
@@ -700,8 +661,6 @@ def _web_secret_redis_key() -> str:
 
 
 def _web_secret_redis_url() -> str:
-    if not _redis_enabled():
-        return ""
     return str(
         os.environ.get("REDIS_URL")
         or getattr(SETTINGS, "REDIS_URL", "")
@@ -718,10 +677,6 @@ def _web_secret_redis_client() -> Any | None:
     the normal redis_client exists, this helper reuses it.
     """
     global _WEB_SESSION_SECRET_REDIS_CLIENT, _WEB_SESSION_SECRET_REDIS_LAST_ERROR
-
-    if not _redis_enabled():
-        _WEB_SESSION_SECRET_REDIS_LAST_ERROR = "Redis is explicitly disabled"
-        return None
 
     shared_client = globals().get("redis_client")
     if shared_client is not None:
@@ -855,14 +810,25 @@ def _web_session_secret_fingerprint() -> str:
 
 
 def _web_stable_secret_configured() -> bool:
-    if _WEB_SESSION_SECRET_CACHE and _WEB_SESSION_SECRET_SOURCE_CACHE in {
-        "redis",
-        "redis-generated",
-        "redis-race-winner",
-    }:
-        return True
-    redis_value, _redis_source = _web_secret_get_from_redis()
-    return bool(redis_value)
+    return bool(_web_session_secret_key())
+
+
+def _derived_runtime_secret(purpose: str) -> str:
+    """Derive a stable 64-char secret from the Telegram bot token.
+
+    Explicit environment secrets still win. The derivation keeps single-process
+    deployments stable without an extra secret database and uses domain
+    separation so session and webhook values are different.
+    """
+    token = str(
+        os.environ.get("TELEGRAM_BOT_TOKEN")
+        or globals().get("TELEGRAM_BOT_TOKEN")
+        or getattr(SETTINGS, "TELEGRAM_BOT_TOKEN", "")
+        or ""
+    ).strip()
+    if token:
+        return hashlib.sha256(f"bot-voice:{purpose}:{token}".encode("utf-8")).hexdigest()
+    return ""
 
 
 def _web_session_secret_key() -> str:
@@ -870,32 +836,32 @@ def _web_session_secret_key() -> str:
 
     if _WEB_SESSION_SECRET_CACHE:
         return _WEB_SESSION_SECRET_CACHE
-
-    from app.core.security import bootstrap_runtime_secrets_sync
-
-    state = bootstrap_runtime_secrets_sync(
-        redis_client=globals().get("redis_client"),
-        redis_url=_web_secret_redis_url(),
-        redis_prefix=str(os.environ.get("REDIS_CACHE_PREFIX") or "tgbot"),
-        strict=_redis_enabled(),
-        disable_redis=not _redis_enabled(),
-    )
-    record = state.records["WEB_SECRET_KEY"]
-    _WEB_SESSION_SECRET_CACHE = record.value
-    _WEB_SESSION_SECRET_SOURCE_CACHE = record.source
-    return _WEB_SESSION_SECRET_CACHE
+    explicit = str(
+        os.environ.get("WEB_SECRET_KEY")
+        or os.environ.get("FLASK_SECRET_KEY")
+        or ""
+    ).strip()
+    if len(explicit) >= 32:
+        value, source = explicit, "environment"
+    else:
+        derived = _derived_runtime_secret("web-session")
+        if derived:
+            value, source = derived, "telegram-token-derived"
+        else:
+            value, source = _generate_web_secret_value(), "process-local"
+            logging.getLogger(__name__).warning(
+                "No WEB_SECRET_KEY or TELEGRAM_BOT_TOKEN is configured; web sessions "
+                "will reset on process restart."
+            )
+    _WEB_SESSION_SECRET_CACHE = value
+    _WEB_SESSION_SECRET_SOURCE_CACHE = source
+    globals()["WEB_SECRET_KEY"] = value
+    return value
 
 
 def _flask_secret_key() -> str:
-    from app.core.security import get_runtime_secret_manager
-
-    state = get_runtime_secret_manager().current()
-    if state is None:
-        _web_session_secret_key()
-        state = get_runtime_secret_manager().current()
-    if state is None:
-        raise RuntimeError("Runtime secret manager was not initialized.")
-    return state.value("FLASK_SECRET_KEY")
+    explicit = str(os.environ.get("FLASK_SECRET_KEY") or "").strip()
+    return explicit if len(explicit) >= 32 else _web_session_secret_key()
 
 
 _request_ctx: contextvars.ContextVar[Any] = contextvars.ContextVar("fastapi_request_ctx")
@@ -1553,11 +1519,8 @@ app_flask.config["MAX_CONTENT_LENGTH"] = _web_max_content_length()
 # These are intentionally env-tunable so Render small instances can stay stable.
 WEB_SLOW_REQUEST_MS = _env_float("WEB_SLOW_REQUEST_MS", 1500.0, minimum=100.0, maximum=60_000.0)
 WEB_ADMIN_AUDIT_MAX = _env_int("WEB_ADMIN_AUDIT_MAX", 300, minimum=50, maximum=5_000)
-TELEGRAM_CONCURRENT_UPDATES = int(resource_value("TELEGRAM_CONCURRENT_UPDATES", _env_int("TELEGRAM_CONCURRENT_UPDATES", int(_perf_default("TELEGRAM_CONCURRENT_UPDATES", 4)), minimum=1, maximum=64)))
-TELEGRAM_CONNECTION_POOL_SIZE = int(resource_value(
-    "TELEGRAM_CONNECTION_POOL_SIZE",
-    _env_int("TELEGRAM_CONNECTION_POOL_SIZE", int(_perf_default("TELEGRAM_CONNECTION_POOL_SIZE", 24)), minimum=4, maximum=256),
-))
+TELEGRAM_CONCURRENT_UPDATES = _env_int("TELEGRAM_CONCURRENT_UPDATES", int(_perf_default("TELEGRAM_CONCURRENT_UPDATES", 4)), minimum=1, maximum=64)
+TELEGRAM_CONNECTION_POOL_SIZE = _env_int("TELEGRAM_CONNECTION_POOL_SIZE", int(_perf_default("TELEGRAM_CONNECTION_POOL_SIZE", 24)), minimum=4, maximum=256)
 _WEB_ACTIVE_REQUESTS = 0
 _WEB_ACTIVE_REQUESTS_LOCK = threading.Lock()
 _WEB_SLOW_REQUESTS = deque(maxlen=200)
@@ -1697,11 +1660,12 @@ def _admin_diagnostics_payload() -> dict[str, Any]:
         "web": True,
         "telegram_token_configured": bool(globals().get("TELEGRAM_BOT_TOKEN")),
         "supabase_configured": bool(globals().get("supabase")),
-        "redis_configured": bool(globals().get("redis_client")),
+        "redis_configured": False,
+        "redis_removed": True,
         "ffmpeg_ok": bool(ffmpeg_path and os.path.exists(str(ffmpeg_path))),
         "web_secret_configured": _web_stable_secret_configured(),
         "web_secret_source": _web_session_secret_source(),
-        "web_secret_redis_key": _web_secret_redis_key(),
+        "web_secret_fingerprint": _web_session_secret_fingerprint(),
         "frontend_allowed_origins": _frontend_allowed_origins(),
         "origin_guard_enabled": _admin_origin_guard_enabled(),
         "release": ADMIN_BACKEND_RELEASE,
@@ -1764,12 +1728,11 @@ def generate_new_webhook_token() -> str:
 
 
 def _runtime_webhook_base_url() -> str:
-    """Return this service's discovered public webhook base URL.
+    """Return this Render service's public webhook base URL.
 
     In two-server mode, TELEGRAM_WEBHOOK_URL / RENDER_EXTERNAL_URL is
     intentionally treated as service-local.  Redis RUN_STATE may contain the
     other Render service's URL, so local env must win before persisted state.
-    Common platform-provided domains are used as a final safe fallback.
     """
     env_value = str(
         os.environ.get("TELEGRAM_WEBHOOK_URL")
@@ -1786,12 +1749,7 @@ def _runtime_webhook_base_url() -> str:
         value = run_state.get("TELEGRAM_WEBHOOK_URL")
         if value:
             return str(value).strip().rstrip("/")
-    configured = env_value or str(globals().get("TELEGRAM_WEBHOOK_URL") or "").strip().rstrip("/")
-    if configured:
-        return configured
-    from app.services.monitoring import discover_public_url
-
-    return str(discover_public_url().get("url") or "")
+    return env_value or str(globals().get("TELEGRAM_WEBHOOK_URL") or "").strip().rstrip("/")
 
 
 def _telegram_webhook_target_url_for_secret(secret_token: str) -> str:
@@ -1803,10 +1761,13 @@ def _telegram_webhook_target_url_for_secret(secret_token: str) -> str:
     failed setWebhook call from making the app reject Telegram's still-active
     old webhook path with 403 Invalid path secret.
     """
-    return _telegram_webhook_client.build_webhook_target_url(
-        _runtime_webhook_base_url(),
-        secret_token,
-    )
+    base_url = _runtime_webhook_base_url()
+    secret_token = str(secret_token or "").strip()
+    if not base_url:
+        raise RuntimeError("BOT_MODE=WEBHOOK requires TELEGRAM_WEBHOOK_URL.")
+    if not secret_token:
+        raise RuntimeError("BOT_MODE=WEBHOOK requires TELEGRAM_WEBHOOK_SECRET_TOKEN.")
+    return f"{base_url}/tg-webhook-{quote(secret_token, safe='')}"
 
 
 def _telegram_webhook_target_url() -> str:
@@ -1830,69 +1791,150 @@ def _telegram_allowed_updates() -> list[str]:
         or getattr(SETTINGS, "TELEGRAM_ALLOWED_UPDATES", "message,callback_query")
         or "message,callback_query"
     )
-    return _telegram_webhook_client.parse_allowed_updates(raw)
+    allowed = []
+    for item in raw.split(","):
+        item = item.strip()
+        if item and re.fullmatch(r"[a-z_]+", item) and item not in allowed:
+            allowed.append(item)
+    return allowed or ["message", "callback_query"]
 
 
-_telegram_deduplication.configure_webhook_deduplicator(
-    redis_client_provider=lambda: globals().get("redis_client"),
-    replay_key_builder=lambda uid: (
-        _redis_key("tg_update_seen", uid)
-        if "_redis_key" in globals()
-        else f"tg_update_seen:{uid}"
-    ),
-)
-_WEBHOOK_UPDATE_MEMORY = _telegram_deduplication.WEBHOOK_UPDATE_MEMORY
-_WEBHOOK_UPDATE_MEMORY_LOCK = _telegram_deduplication.WEBHOOK_UPDATE_MEMORY_LOCK
-_webhook_replay_ttl_seconds = _telegram_deduplication._webhook_replay_ttl_seconds
-_webhook_processing_ttl_seconds = (
-    _telegram_deduplication._webhook_processing_ttl_seconds
-)
-_telegram_webhook_update_id = _telegram_deduplication._telegram_webhook_update_id
-_telegram_webhook_replay_key = (
-    _telegram_deduplication._telegram_webhook_replay_key
-)
-_trim_webhook_memory_locked = _telegram_deduplication._trim_webhook_memory_locked
-_telegram_webhook_update_claim = (
-    _telegram_deduplication._telegram_webhook_update_claim
-)
-_telegram_webhook_update_complete = (
-    _telegram_deduplication._telegram_webhook_update_complete
-)
-_telegram_webhook_update_release = (
-    _telegram_deduplication._telegram_webhook_update_release
+from app.services.telegram.deduplication import (
+    _telegram_webhook_update_claim,
+    _telegram_webhook_update_complete,
+    _telegram_webhook_update_release,
 )
 
 
-_telegram_api_transport.configure_telegram_webhook_transport(
-    bot_mode_provider=lambda: (
-        _run_state_bot_mode()
-        if "_run_state_bot_mode" in globals()
-        else globals().get("BOT_MODE", "POLLING")
-    ),
-    secret_provider=_runtime_webhook_secret_token,
-    application_provider=lambda: (
-        globals().get("telegram_application") or globals().get("_TELEGRAM_APP")
-    ),
-    ready_provider=lambda: bool(globals().get("_TELEGRAM_APP_READY", False)),
-    active_owner_provider=lambda: _telegram_should_process_webhook_update(),
-    owner_snapshot_provider=lambda: _telegram_leader_snapshot(),
-    max_body_provider=_web_max_content_length,
-    json_loader=_json_loads_fast,
-    response_factory=lambda payload, status_code: _FastJSONResponse(
-        payload,
-        status_code=status_code,
-    ),
-    metric_callback=lambda name: _metric_inc(name),
-)
-_read_limited_webhook_body = _telegram_api_transport._read_limited_webhook_body
-_process_telegram_webhook_request = (
-    _telegram_api_transport._process_telegram_webhook_request
-)
+async def _read_limited_webhook_body(req: FastAPIRequest, max_body: int) -> bytes:
+    """Read Telegram webhook payloads with a hard body cap.
+
+    Content-Length is rejected before body streaming.  The chunked stream path
+    also enforces the cap so a missing/lying header cannot flood memory.
+    """
+    content_length = req.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > max_body:
+                raise HTTPException(status_code=413, detail=f"Request body too large. Max {max_body} bytes.")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length header.")
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in req.stream():
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > max_body:
+            raise HTTPException(status_code=413, detail=f"Request body too large. Max {max_body} bytes.")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _process_telegram_webhook_request(req: FastAPIRequest, path_secret_token: str | None = None):
+    """Validate, parse, claim, and process a Telegram webhook update safely."""
+    if "_run_state_bot_mode" in globals() and _run_state_bot_mode() != "WEBHOOK":
+        webhook_logger.info("Webhook update ignored because BOT_MODE=%s.", _run_state_bot_mode())
+        return _FastJSONResponse({"status": "ignored", "reason": "not_webhook_mode"}, status_code=200)
+
+    expected_secret = _runtime_webhook_secret_token()
+    if not expected_secret:
+        webhook_logger.error("Rejected Telegram webhook request because TELEGRAM_WEBHOOK_SECRET_TOKEN is not configured.")
+        raise HTTPException(status_code=503, detail="Telegram webhook secret is not configured.")
+    if path_secret_token is not None and not hmac.compare_digest(str(path_secret_token), expected_secret):
+        webhook_logger.warning("Rejected Telegram webhook request with invalid path secret from %s", req.client.host if req.client else "unknown")
+        raise HTTPException(status_code=403, detail="Invalid webhook path secret.")
+
+    got_secret = (req.headers.get("X-Telegram-Bot-Api-Secret-Token") or "").strip()
+    if not hmac.compare_digest(got_secret, expected_secret):
+        webhook_logger.warning("Rejected Telegram webhook request with invalid secret header from %s", req.client.host if req.client else "unknown")
+        raise HTTPException(status_code=403, detail="Invalid webhook secret.")
+
+    app_obj = globals().get("telegram_application") or globals().get("_TELEGRAM_APP")
+    if app_obj is None or not bool(globals().get("_TELEGRAM_APP_READY", False)):
+        webhook_logger.warning("Telegram webhook rejected with 503 because application is not ready yet.")
+        raise HTTPException(status_code=503, detail="Telegram application is starting. Please retry.")
+    if not _telegram_should_process_webhook_update():
+        webhook_logger.info("Webhook update acknowledged by standby instance; active owner=%s", _telegram_leader_snapshot().get("owner"))
+        return _FastJSONResponse({"status": "ignored", "reason": "standby_instance"}, status_code=200)
+
+    max_body = min(_web_max_content_length(), 2 * 1024 * 1024)
+    try:
+        raw = await _read_limited_webhook_body(req, max_body)
+        data = _json_loads_fast(raw)
+        if not isinstance(data, dict):
+            raise ValueError("Telegram webhook JSON must be an object.")
+        update = Update.de_json(data, app_obj.bot)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Telegram itself should never send malformed JSON. Acknowledge an
+        # invalid payload once so a permanently bad body cannot create a retry
+        # storm, while keeping real handler failures retryable below.
+        error_id = secrets.token_hex(6)
+        webhook_logger.warning(
+            "Invalid Telegram webhook payload ignored error_id=%s: %s",
+            error_id,
+            exc,
+            exc_info=True,
+        )
+        return _FastJSONResponse({
+            "status": "ignored",
+            "reason": "invalid_payload",
+            "reference": error_id,
+        }, status_code=200)
+
+    update_id = getattr(update, "update_id", None)
+    claimed = False
+    claim_token: str | None = None
+    try:
+        claim_state, claim_token = await _telegram_webhook_update_claim(
+            update_id,
+            include_token=True,
+        )
+        if claim_state == "completed":
+            webhook_logger.info("Completed Telegram webhook update ignored update_id=%s", update_id)
+            _metric_inc("replay_dropped")
+            return _FastJSONResponse({"status": "ok", "duplicate": True}, status_code=200)
+        if claim_state == "processing":
+            response = _FastJSONResponse({"status": "retry", "reason": "already_processing"}, status_code=503)
+            response.headers["Retry-After"] = "2"
+            return response
+        claimed = claim_state == "claimed"
+        await app_obj.process_update(update)
+        await _telegram_webhook_update_complete(
+            update_id,
+            claim_token=claim_token,
+        )
+    except Exception as exc:
+        if claimed:
+            await _telegram_webhook_update_release(
+                update_id,
+                claim_token=claim_token,
+            )
+        error_id = secrets.token_hex(6)
+        webhook_logger.error(
+            "Telegram webhook processing failed error_id=%s update_id=%s: %s",
+            error_id,
+            update_id,
+            exc,
+            exc_info=True,
+        )
+        response = _FastJSONResponse({
+            "status": "retry",
+            "reason": "processing_failed",
+            "reference": error_id,
+        }, status_code=503)
+        response.headers["Retry-After"] = "2"
+        return response
+
+    return _FastJSONResponse({"status": "ok"}, status_code=200)
 
 
 @app.post("/tg-webhook-{secret_token}", include_in_schema=False)
 async def telegram_webhook_ingest(secret_token: str, req: FastAPIRequest):
-    return await _telegram_api_transport.telegram_webhook_ingest(secret_token, req)
+    return await _process_telegram_webhook_request(req, secret_token)
 
 
 @app.post("/telegram/webhook", include_in_schema=False)
@@ -1903,108 +1945,106 @@ async def telegram_webhook(req: FastAPIRequest):
     New deployments should use /tg-webhook-{secret_token}; setWebhook now
     registers that canonical route automatically.
     """
-    return await _telegram_api_transport.telegram_webhook(req)
+    return await _process_telegram_webhook_request(req, None)
 
 
-_telegram_webhook_client.configure_telegram_webhook_client(
-    bot_token_provider=lambda: globals().get("TELEGRAM_BOT_TOKEN", ""),
-    target_url_builder=_telegram_webhook_target_url_for_secret,
-    current_secret_provider=_runtime_webhook_secret_token,
-    allowed_updates_provider=_telegram_allowed_updates,
-    drop_pending_provider=lambda: _env_bool(
-        "TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES",
-        False,
-    ),
-    limits_provider=lambda: _make_httpx_limits_from_run_state(),
-    set_max_attempts_provider=lambda: _env_int(
-        "TELEGRAM_SETWEBHOOK_MAX_RETRIES",
-        3,
-        minimum=1,
-        maximum=10,
-    ),
-    pool_snapshot_provider=lambda: {
-        "max_connections": _run_state_http_max_connections(),
-        "keepalive_connections": _run_state_http_keepalive_connections(),
-    },
-    json_loader=_json_loads_fast,
-    sleep=lambda seconds: asyncio.sleep(seconds),
-)
-_configure_telegram_webhook_via_http_for_secret = (
-    _telegram_webhook_client._configure_telegram_webhook_via_http_for_secret
-)
-_configure_telegram_webhook_via_http = (
-    _telegram_webhook_client._configure_telegram_webhook_via_http
-)
-set_telegram_webhook = _telegram_webhook_client.set_telegram_webhook
+async def _configure_telegram_webhook_via_http_for_secret(secret_token: str) -> None:
+    """Configure Telegram webhook for an explicit secret token with 429 retry.
+
+    Used by rotation so the remote Telegram webhook is updated first.  Only
+    after this function succeeds should the new token be saved to RUN_STATE.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
+
+    secret_token = str(secret_token or "").strip()
+    target_url = _telegram_webhook_target_url_for_secret(secret_token)
+
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+    payload = {
+        "url": target_url,
+        "allowed_updates": _telegram_allowed_updates(),
+        # Keep pending updates by default so a Render restart/deploy does not
+        # silently lose user messages. Set TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES=true
+        # only when intentionally clearing a broken backlog.
+        "drop_pending_updates": _env_bool("TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES", False),
+        "secret_token": secret_token,
+    }
+    timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
+    max_attempts = _env_int("TELEGRAM_SETWEBHOOK_MAX_RETRIES", 3, minimum=1, maximum=10)
+    last_error: str | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        async with httpx.AsyncClient(timeout=timeout, limits=_make_httpx_limits_from_run_state()) as client:
+            resp = await client.post(api_url, json=payload)
+        try:
+            data = _json_loads_fast(resp.content)
+        except Exception:
+            data = {"ok": False, "description": resp.text[:500]}
+
+        if resp.status_code == 429:
+            retry_after = 1
+            try:
+                retry_after = int((data.get("parameters") or {}).get("retry_after") or 1)
+            except Exception:
+                retry_after = 1
+            last_error = f"Telegram setWebhook rate-limited status=429 response={str(data)[:500]}"
+            if attempt < max_attempts:
+                webhook_logger.warning(
+                    "Telegram setWebhook rate-limited; retrying after %ss attempt=%s/%s",
+                    retry_after,
+                    attempt,
+                    max_attempts,
+                )
+                await asyncio.sleep(max(1, retry_after))
+                continue
+
+        if resp.status_code >= 400 or not bool(data.get("ok")):
+            raise RuntimeError(f"Telegram setWebhook failed status={resp.status_code} response={str(data)[:500]}")
+
+        webhook_logger.info(
+            "Telegram webhook configured via HTTPX url=%s max_connections=%s keepalive=%s",
+            target_url,
+            _run_state_http_max_connections(),
+            min(max(2, int(HTTP_MAX_KEEPALIVE_CONNECTIONS or 20)), _run_state_http_max_connections()),
+        )
+        return
+
+    raise RuntimeError(last_error or "Telegram setWebhook rate-limited after retries.")
+
+
+async def _configure_telegram_webhook_via_http() -> None:
+    """Configure Telegram webhook using the currently persisted runtime token."""
+    await _configure_telegram_webhook_via_http_for_secret(_runtime_webhook_secret_token())
+
+
+async def set_telegram_webhook() -> None:
+    """Public compatibility wrapper used by runtime admin orchestration."""
+    await _configure_telegram_webhook_via_http()
 
 
 async def _bootstrap_runtime_security() -> dict[str, Any]:
-    """Load persistent secrets and synchronize webhook state before serving."""
+    """Compatibility bridge to the extracted single-process secret policy."""
 
     global TELEGRAM_WEBHOOK_SECRET_TOKEN
     global _WEB_SESSION_SECRET_CACHE, _WEB_SESSION_SECRET_SOURCE_CACHE
 
-    from app.core.security import (
-        bootstrap_runtime_secrets,
-        get_runtime_secret_manager,
+    from app.core.security import bootstrap_runtime_security
+    from app.services.settings.store import get_settings_store
+
+    state = await bootstrap_runtime_security(
+        str(TELEGRAM_BOT_TOKEN or getattr(SETTINGS, "TELEGRAM_BOT_TOKEN", "") or ""),
+        settings_store=get_settings_store(),
     )
-
-    redis_enabled = _redis_enabled()
-    state = await bootstrap_runtime_secrets(
-        redis_client=globals().get("redis_client"),
-        redis_url=str(
-            (
-                globals().get("REDIS_URL")
-                or os.environ.get("REDIS_URL")
-                or getattr(SETTINGS, "REDIS_URL", "")
-                or ""
-            )
-            if redis_enabled
-            else ""
-        ),
-        redis_prefix=str(os.environ.get("REDIS_CACHE_PREFIX") or "tgbot"),
-        strict=redis_enabled,
-        disable_redis=not redis_enabled,
-    )
-    persistent_web_secret = state.value("WEB_SECRET_KEY")
-    if (
-        _WEB_SESSION_SECRET_CACHE
-        and not hmac.compare_digest(_WEB_SESSION_SECRET_CACHE, persistent_web_secret)
-    ):
-        raise RuntimeError(
-            "The FastAPI session middleware was created before persistent Redis "
-            "secrets were available. Ensure REDIS_URL is present in .env before "
-            "the process imports app.main, then restart."
-        )
-
-    _WEB_SESSION_SECRET_CACHE = persistent_web_secret
-    _WEB_SESSION_SECRET_SOURCE_CACHE = state.records["WEB_SECRET_KEY"].source
-    globals()["WEB_SECRET_KEY"] = persistent_web_secret
-    globals()["FLASK_SECRET_KEY"] = state.value("FLASK_SECRET_KEY")
-    app_flask.config["SECRET_KEY"] = state.value("FLASK_SECRET_KEY")
-
-    TELEGRAM_WEBHOOK_SECRET_TOKEN = state.value("TELEGRAM_WEBHOOK_SECRET_TOKEN")
+    _WEB_SESSION_SECRET_CACHE = state.web_secret_key
+    _WEB_SESSION_SECRET_SOURCE_CACHE = state.web_source
+    globals()["WEB_SECRET_KEY"] = state.web_secret_key
+    globals()["FLASK_SECRET_KEY"] = state.flask_secret_key
+    app_flask.config["SECRET_KEY"] = state.flask_secret_key
+    TELEGRAM_WEBHOOK_SECRET_TOKEN = state.webhook_secret_token
     if isinstance(globals().get("RUN_STATE"), dict):
-        RUN_STATE["TELEGRAM_WEBHOOK_SECRET_TOKEN"] = TELEGRAM_WEBHOOK_SECRET_TOKEN
-
-    webhook_registered = False
-    if _run_state_bot_mode() == "WEBHOOK":
-        if not redis_enabled:
-            await _configure_telegram_webhook_via_http_for_secret(
-                state.value("TELEGRAM_WEBHOOK_SECRET_TOKEN")
-            )
-            webhook_registered = True
-        elif state.webhook_registration_required:
-            webhook_registered = await get_runtime_secret_manager().ensure_webhook_registered(
-                _configure_telegram_webhook_via_http_for_secret
-            )
-    current_state = get_runtime_secret_manager().current() or state
-
-    return {
-        "secrets": current_state.redacted_status(),
-        "webhook_registration_required": current_state.webhook_registration_required,
-        "webhook_registered": webhook_registered,
-    }
+        RUN_STATE["TELEGRAM_WEBHOOK_SECRET_TOKEN"] = state.webhook_secret_token
+    return state.as_dict()
 
 
 # Webhook secret rotation guard.  Telegram rate-limits setWebhook calls, and
@@ -2062,55 +2102,25 @@ def _webhook_rotate_finish(success: bool) -> None:
 async def run_fastapi():
     """Run the FastAPI dashboard inside the main asyncio runtime."""
     import uvicorn
-
-    port = web_server_port()
-    logger.info("FastAPI dashboard starting on http://0.0.0.0:%s", port)
+    port = _env_int("PORT", 8080, minimum=1, maximum=65535)
     config = uvicorn.Config(
         app,
         host="0.0.0.0",
         port=port,
         log_level=os.environ.get("UVICORN_LOG_LEVEL", "info").lower(),
-        access_log=_env_bool("UVICORN_ACCESS_LOG", False),
-        timeout_keep_alive=_env_int(
-            "WEB_KEEP_ALIVE_SECONDS",
-            15,
-            minimum=1,
-            maximum=120,
-        ),
         proxy_headers=_env_bool("WEB_TRUST_PROXY", _env_bool("RENDER", False)),
         forwarded_allow_ips="*" if _env_bool("WEB_TRUST_PROXY", _env_bool("RENDER", False)) else None,
     )
     server = uvicorn.Server(config)
-    serve_task = asyncio.create_task(server.serve(), name=f"uvicorn-server-{port}")
-    try:
-        # Shield Uvicorn's task so cancellation of the combined runtime can
-        # request an orderly shutdown before the listening socket is reused.
-        await asyncio.shield(serve_task)
-    except asyncio.CancelledError:
-        server.should_exit = True
-        try:
-            await asyncio.wait_for(asyncio.shield(serve_task), timeout=10.0)
-        except TimeoutError:
-            logger.warning(
-                "Uvicorn did not stop within 10 seconds; forcing shutdown on port %s.",
-                port,
-            )
-            server.force_exit = True
-            serve_task.cancel()
-            await asyncio.gather(serve_task, return_exceptions=True)
-        except Exception:
-            logger.warning("Uvicorn failed during graceful shutdown.", exc_info=True)
-        raise
+    await server.serve()
 
 
 async def keep_alive_async(stop_event: asyncio.Event | None = None):
     """Self-ping every 4 min with non-blocking HTTPX instead of requests."""
     logger_ka = logging.getLogger("keep_alive")
-    from app.services.monitoring import discover_public_url
-
-    render_url = str(discover_public_url().get("url") or "").strip().rstrip("/")
+    render_url = (os.environ.get("RENDER_EXTERNAL_URL") or getattr(SETTINGS, "RENDER_EXTERNAL_URL", "") or "").strip().rstrip("/")
     if not render_url:
-        logger_ka.warning("Public server URL not detected — self-ping disabled.")
+        logger_ka.warning("RENDER_EXTERNAL_URL not set — self-ping disabled.")
         return
 
     await asyncio.sleep(10)
@@ -2204,9 +2214,9 @@ _AI_SYSTEM_PROMPT = (
 # ---------------------------------------------------------------------------
 # Concurrency limits
 # ---------------------------------------------------------------------------
-MAX_CONCURRENT_TTS_USERS   = int(resource_value("MAX_CONCURRENT_TTS_USERS", _env_int("MAX_CONCURRENT_TTS_USERS", int(_perf_default("MAX_CONCURRENT_TTS_USERS", 2)), minimum=1, maximum=50)))
-MAX_CONCURRENT_AI          = int(resource_value("MAX_CONCURRENT_AI", _env_int("MAX_CONCURRENT_AI", _env_int("MAX_CONCURRENT_GEMINI", int(resource_default("MAX_CONCURRENT_GEMINI", 3)), minimum=1), minimum=1, maximum=50)))
-MAX_CONCURRENT_BROADCAST   = int(resource_value("MAX_CONCURRENT_BROADCAST", _env_int("MAX_CONCURRENT_BROADCAST", int(resource_default("MAX_CONCURRENT_BROADCAST", 3)), minimum=1, maximum=50)))
+MAX_CONCURRENT_TTS_USERS   = _env_int("MAX_CONCURRENT_TTS_USERS", int(_perf_default("MAX_CONCURRENT_TTS_USERS", 2)), minimum=1, maximum=50)
+MAX_CONCURRENT_AI          = _env_int("MAX_CONCURRENT_AI", _env_int("MAX_CONCURRENT_GEMINI", 3, minimum=1), minimum=1, maximum=50)
+MAX_CONCURRENT_BROADCAST   = _env_int("MAX_CONCURRENT_BROADCAST", 3, minimum=1, maximum=50)
 BROADCAST_BATCH_SIZE       = _env_int("BROADCAST_BATCH_SIZE", MAX_CONCURRENT_BROADCAST, minimum=1, maximum=500)
 BROADCAST_INTER_BATCH_DELAY = _env_float("BROADCAST_INTER_BATCH_DELAY", 0.20, minimum=0.0, maximum=30.0)
 TTS_RESOLVER_AI_ENABLED    = _env_bool("TTS_RESOLVER_AI_ENABLED", False)
@@ -2363,7 +2373,7 @@ _AI_API_KEY_RANDOM_BYTES = 32
 _AI_API_KEY_DISPLAY_CHARS = 18
 _AI_API_KEY_VALIDATION_CACHE_TTL_S = _env_float("AI_API_KEY_CACHE_TTL_S", 60.0, minimum=1.0, maximum=3600.0)
 _AI_API_KEY_TOUCH_INTERVAL_S = _env_float("AI_API_KEY_TOUCH_INTERVAL_S", 60.0, minimum=1.0, maximum=3600.0)
-_AI_API_KEY_CACHE_MAX = int(resource_default("AI_API_KEY_CACHE_MAX", 10_000))
+_AI_API_KEY_CACHE_MAX = 10_000
 
 _api_key_validation_cache: OrderedDict[str, tuple[bool, int | None, float]] = OrderedDict()
 _api_key_validation_cache_lock = threading.Lock()
@@ -2473,7 +2483,29 @@ insert into public.bot_settings (key, value) values
   ('WEB_STATUS_POLL_SECONDS', '30'),
   ('WEB_LIVE_POLL_SECONDS', '30')
 on conflict (key) do nothing;
-""" + BOT_LOCKS_SQL
+
+-- Distributed scheduler lock. Required for safe scheduled broadcasts when
+-- Render restarts quickly or when more than one worker/instance is running.
+create table if not exists public.bot_locks (
+  lock_key text primary key,
+  owner text not null,
+  locked_until timestamptz not null,
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists bot_locks_locked_until_idx
+  on public.bot_locks (locked_until);
+
+alter table public.bot_locks enable row level security;
+
+drop policy if exists "service_role_bot_locks_all" on public.bot_locks;
+create policy "service_role_bot_locks_all"
+on public.bot_locks
+for all
+to service_role
+using (true)
+with check (true);
+"""
 
 def _extract_ai_request_key() -> str:
     """Extract AI API key without leaking credentials through URLs by default."""
@@ -2978,14 +3010,14 @@ async def ai_assistant():
                 ))
             contents = _build_gemini_contents(message, history, image_data, audio_data, image_mime, audio_mime)
 
-            async def _generate_audio_reply():
-                return await _gemini.aio.models.generate_content(
+            def _generate_audio_reply():
+                return _gemini.models.generate_content(
                     model=GEMINI_MODEL,
                     contents=contents,
                     config=_ai_gen_config(),
                 )
 
-            response = await _generate_audio_reply()
+            response = await _run_ai_api_blocking(_generate_audio_reply)
             reply_text = (response.text or "").strip()
             return _ai_cors(jsonify({
                 "ok": True,
@@ -3041,8 +3073,8 @@ async def ai_transcribe():
 
     from google.genai import types as _gtypes
 
-    async def _transcribe_audio():
-        return await _gemini.aio.models.generate_content(
+    def _transcribe_audio():
+        return _gemini.models.generate_content(
             model=GEMINI_MODEL,
             contents=[
                 _gtypes.Part.from_bytes(data=audio_data, mime_type=audio_mime),
@@ -3056,7 +3088,7 @@ async def ai_transcribe():
         )
 
     try:
-        response = await _transcribe_audio()
+        response = await _run_ai_api_blocking(_transcribe_audio)
         transcript = (response.text or "").strip()
         return _ai_cors(jsonify({
             "ok": True,
@@ -3174,7 +3206,7 @@ def ai_info():
 _WEB_BROADCAST_JOBS: OrderedDict[str, dict] = OrderedDict()
 _WEB_BROADCAST_JOBS_LOCK = threading.Lock()
 _WEB_BROADCAST_JOBS_MAX = _env_int("WEB_BROADCAST_JOBS_MAX", 50, minimum=10, maximum=2000)
-WEB_BROADCAST_WORKERS = max(1, int(resource_value("WEB_BROADCAST_WORKERS", _env_int("WEB_BROADCAST_WORKERS", int(resource_default("WEB_BROADCAST_WORKERS", MAX_CONCURRENT_BROADCAST))))))
+WEB_BROADCAST_WORKERS = max(1, _env_int("WEB_BROADCAST_WORKERS", MAX_CONCURRENT_BROADCAST))
 WEB_BROADCAST_DELAY_S = max(0.0, _env_float("WEB_BROADCAST_DELAY_S", 0.05))
 WEB_BROADCAST_MAX_ACTIVE_JOBS = max(1, _env_int("WEB_BROADCAST_MAX_ACTIVE_JOBS", 2, minimum=1, maximum=10))
 _WEB_BROADCAST_EXECUTOR = ThreadPoolExecutor(
@@ -3536,7 +3568,14 @@ KHMER_UI_TRANSLATIONS: dict[str, str] = {
     "Enable HF Now": "បើក HF ឥឡូវនេះ",
     "Disable HF 5m": "បិទ HF ៥ នាទី",
     "Clear HF Client": "សម្អាត HF Client",
+    "VoxCPM2 Health": "សុខភាព VoxCPM2",
+    "Enable VoxCPM2": "បើក VoxCPM2",
     "Cooldown 5m": "ផ្អាក ៥ នាទី",
+    "Clear Vox Client": "សម្អាត Vox Client",
+    "Upload Reference": "បញ្ចូលសំឡេងគំរូ",
+    "Control Instruction": "ការណែនាំសំឡេង",
+    "Clear Control": "លុបការណែនាំ",
+    "Clear Reference": "លុបសំឡេងគំរូ",
     "OK": "ដំណើរការល្អ",
     "MEMORY": "អង្គចងចាំ",
     "Ready": "រួចរាល់",
@@ -3586,6 +3625,7 @@ KHMER_UI_TRANSLATIONS: dict[str, str] = {
     "Invalid audio transcript id.": "លេខសម្គាល់អត្ថបទសំឡេងមិនត្រឹមត្រូវ។",
     'រកសំណើមិនឃើញ។': "រកសំណើមិនឃើញ។",
     "No operation to cancel.": "មិនមានប្រតិបត្តិការដែលត្រូវបោះបង់ទេ។",
+    "VoxCPM2 setup cancelled.": "បានបោះបង់ការដំឡើង VoxCPM2។",
     "PDF report generated and sent.": "បានបង្កើត និងផ្ញើរបាយការណ៍ PDF រួចរាល់។",
     "SQL setup message sent. After running it in Supabase, feature requests will persist permanently.": "បានផ្ញើសារ SQL រួចរាល់។ បន្ទាប់ពីដំណើរការវានៅ Supabase សំណើមុខងារនឹងត្រូវរក្សាទុកជាអចិន្ត្រៃយ៍។",
     "Search text is empty. Press /users and try again.": "ពាក្យស្វែងរកទទេ។ សូមចុច /users ហើយព្យាយាមម្ដងទៀត។",
@@ -3625,7 +3665,7 @@ KHMER_UI_TRANSLATIONS: dict[str, str] = {
     "Common admin tasks. Dangerous actions still require confirmation on their pages.": "សកម្មភាពអ្នកគ្រប់គ្រងដែលប្រើញឹកញាប់។ សកម្មភាពមានហានិភ័យនៅតែត្រូវការការបញ្ជាក់។"
 }
 KHMER_UI_TRANSLATIONS.update({'Prev': 'មុន', 'Inbox': 'ប្រអប់សារ', 'Modify Rate Limit': 'កែសម្រួលកម្រិតសំណើ', 'Rate Limit': 'កម្រិតសំណើ', 'Rotate Webhook Secret': 'ប្ដូរសោសម្ងាត់ Webhook', 'Webhook Secret': 'សោសម្ងាត់ Webhook', 'Template': 'គំរូ', 'Apply saved values now': 'អនុវត្តតម្លៃដែលបានរក្សាទុកឥឡូវនេះ', 'Reset to code defaults': 'កំណត់ឡើងវិញតាមតម្លៃដើមរបស់កូដ', 'Request': 'សំណើ', 'Client': 'កម្មវិធីភ្ជាប់', 'Previous 14d': '១៤ ថ្ងៃមុន', 'Next 14d': '១៤ ថ្ងៃបន្ទាប់', 'List': 'បញ្ជី', 'Clear This Group': 'សម្អាតក្រុមនេះ', 'Mute Group': 'បិទការជូនដំណឹងក្រុមនេះ', 'Error Groups': 'ក្រុមកំហុស', 'Group': 'ក្រុម', 'Groups': 'ក្រុម', 'Mute': 'បិទការជូនដំណឹង', 'End Chat': 'បញ្ចប់ការជជែក', 'Working…': 'កំពុងដំណើរការ…', 'Are you sure?': 'តើអ្នកប្រាកដទេ?', 'Jobs': 'ការងារ', 'Registered': 'បានចុះឈ្មោះ', 'Registered users': 'អ្នកប្រើប្រាស់ដែលបានចុះឈ្មោះ'})
-KHMER_UI_TRANSLATIONS.update({'Admin Insights & Roadmap': 'ការយល់ដឹង និងផែនការអភិវឌ្ឍសម្រាប់អ្នកគ្រប់គ្រង', 'Smart warnings plus recommended next features for this bot admin panel.': 'ការព្រមានឆ្លាតវៃ និងមុខងារបន្ទាប់ដែលបានណែនាំសម្រាប់ផ្ទាំងគ្រប់គ្រងបូត។', 'Current warnings': 'ការព្រមានបច្ចុប្បន្ន', 'Recommended new features': 'មុខងារថ្មីដែលបានណែនាំ', 'Prioritized for your current bot system: admin safety, broadcast reliability, CRM, and smoother mobile control.': 'រៀបចំអាទិភាពសម្រាប់ប្រព័ន្ធបូតបច្ចុប្បន្ន៖ សុវត្ថិភាពអ្នកគ្រប់គ្រង ភាពជឿជាក់នៃការផ្សាយសារ ការគ្រប់គ្រងអ្នកប្រើប្រាស់ និងការប្រើលើទូរស័ព្ទកាន់តែងាយ។', 'Priority': 'អាទិភាព', 'Recommended implementation': 'វិធីអនុវត្តដែលបានណែនាំ', 'Best next update package': 'កញ្ចប់បច្ចុប្បន្នភាពបន្ទាប់ដែលល្អបំផុត', 'Admin V9 Pro': 'Admin V9 Pro', 'Insights, Smart Error Inbox Pro, broadcast checker, backup center.': 'ការយល់ដឹង ប្រអប់កំហុសឆ្លាតវៃ ការត្រួតពិនិត្យការផ្សាយសារ និងមជ្ឈមណ្ឌលបម្រុងទុក។', 'Safe Operations': 'ប្រតិបត្តិការមានសុវត្ថិភាព', 'Group errors, retry failed, pause pressure, audit timeline, lock safety.': 'ដាក់ក្រុមកំហុស សាកល្បងការងារបរាជ័យម្ដងទៀត ផ្អាកពេលប្រព័ន្ធរវល់ មើលប្រវត្តិសវនកម្ម និងគ្រប់គ្រងសោដោយសុវត្ថិភាព។', 'Mobile Friendly': 'ងាយប្រើលើទូរស័ព្ទ', 'Error Inbox in bottom nav, compact pages, sticky filters.': 'ប្រអប់កំហុសនៅម៉ឺនុយខាងក្រោម ទំព័រខ្លី និងតម្រងដែលនៅជាប់អេក្រង់។', 'Implementation order': 'លំដាប់អនុវត្ត', 'Smart Error Inbox Pro is added. Open': 'ប្រអប់កំហុសឆ្លាតវៃត្រូវបានបន្ថែម។ បើក', 'Add Broadcast Quality Checker before every send.': 'បន្ថែមការត្រួតពិនិត្យគុណភាពការផ្សាយសារ មុនផ្ញើរាល់លើក។', 'Persist admin audit timeline to Supabase.': 'រក្សាទុកប្រវត្តិសវនកម្មអ្នកគ្រប់គ្រងក្នុង Supabase។', 'Add Backup & Restore Center for settings/schedules.': 'បន្ថែមមជ្ឈមណ្ឌលបម្រុងទុក និងស្ដារការកំណត់/កាលវិភាគ។', 'Add compact mode for small screens.': 'បន្ថែមរបៀបខ្លីសម្រាប់អេក្រង់តូច។', 'Admin PDF Report': 'របាយការណ៍ PDF សម្រាប់អ្នកគ្រប់គ្រង', 'Generate a PDF with graphs, selected-day/range analytics, system status, runtime settings, feature toggles, Smart Error Inbox summary, and recent errors.': 'បង្កើត PDF ដែលមានក្រាហ្វ ការវិភាគតាមថ្ងៃ/ចន្លោះពេល ស្ថានភាពប្រព័ន្ធ ការកំណត់ពេលដំណើរការ មុខងារបើក/បិទ សង្ខេបប្រអប់កំហុស និងកំហុសថ្មីៗ។', 'Last 7 Days': '៧ ថ្ងៃចុងក្រោយ', 'Last 30 Days': '៣០ ថ្ងៃចុងក្រោយ', 'Custom day URL example:': 'ឧទាហរណ៍ URL សម្រាប់ថ្ងៃកំណត់ផ្ទាល់ខ្លួន៖', 'System health': 'សុខភាពប្រព័ន្ធ', 'Uptime': 'រយៈពេលដំណើរការ', 'Supabase': 'Supabase', 'Redis': 'Redis', 'Scheduler lock': 'សោ Scheduler', 'Settings DB': 'មូលដ្ឋានទិន្នន័យការកំណត់', 'Runtime metrics': 'សូចនាករពេលដំណើរការ', 'Live schedules': 'កាលវិភាគផ្ទាល់', 'Time': 'ពេលវេលា', 'Content': 'មាតិកា', 'Progress': 'វឌ្ឍនភាព', 'Started': 'បានចាប់ផ្ដើម', 'Feature settings': 'ការកំណត់មុខងារ', 'Open settings': 'បើកការកំណត់', 'Manage Users': 'គ្រប់គ្រងអ្នកប្រើប្រាស់', 'Analytics V2': 'ការវិភាគទិន្នន័យ V2', 'Health Center': 'មជ្ឈមណ្ឌលសុខភាពប្រព័ន្ធ', 'System V4 Health Center': 'មជ្ឈមណ្ឌលសុខភាពប្រព័ន្ធ V4', 'safe local checks': 'ការត្រួតពិនិត្យក្នុងប្រព័ន្ធដោយសុវត្ថិភាព', 'Environment Checklist': 'បញ្ជីត្រួតពិនិត្យ Environment', 'This page does not show secrets. It only shows SET/MISSING.': 'ទំព័រនេះមិនបង្ហាញសោសម្ងាត់ទេ។ វាបង្ហាញតែ បានកំណត់/ខ្វះ។', 'Runtime Metrics': 'សូចនាករពេលដំណើរការ', 'Feature Switches': 'ការបើក/បិទមុខងារ', 'System V4 Notes': 'កំណត់ចំណាំប្រព័ន្ធ V4', 'Mobile V4': 'ទូរស័ព្ទ V4', 'bottom nav, touch buttons, sticky actions': 'ម៉ឺនុយខាងក្រោម ប៊ូតុងងាយចុច និងសកម្មភាពជាប់អេក្រង់', 'User Detail+': 'ព័ត៌មានអ្នកប្រើប្រាស់+', 'profile, usage cards, recent text_cache': 'ប្រវត្តិរូប កាតការប្រើប្រាស់ និង text_cache ថ្មីៗ', 'Cleaner UI': 'ផ្ទាំងកាន់តែស្អាត', 'Tailwind powered layout and responsive cards': 'ប្លង់ Tailwind និងកាតដែលសម្របតាមទំហំអេក្រង់', 'No CRM users found for this filter.': 'រកមិនឃើញអ្នកប្រើប្រាស់សម្រាប់តម្រងនេះទេ។', 'Calendar View': 'ទិដ្ឋភាពប្រតិទិន', 'Search user ID or username': 'ស្វែងរកលេខសម្គាល់ ឬឈ្មោះអ្នកប្រើប្រាស់', 'Enter': 'បញ្ចូល', 'Rows per page': 'ចំនួនជួរនៅមួយទំព័រ', 'Username': 'ឈ្មោះអ្នកប្រើប្រាស់', 'Voice': 'សំឡេង', 'Speed': 'ល្បឿន', 'Last active': 'សកម្មចុងក្រោយ', 'Send direct message': 'ផ្ញើសារផ្ទាល់', 'User ID': 'លេខសម្គាល់អ្នកប្រើប្រាស់', 'Send': 'ផ្ញើ', 'Export CSV': 'នាំចេញ CSV', 'User Quality / CRM Panel': 'ផ្ទាំងគុណភាព និងការគ្រប់គ្រងអ្នកប្រើប្រាស់', 'Scores users from': 'វាយតម្លៃអ្នកប្រើប្រាស់ពី', 'with batched queries and short cache.': 'ដោយប្រើការសួរទិន្នន័យជាក្រុម និង Cache រយៈពេលខ្លី។', 'Clear CRM Cache': 'សម្អាត Cache CRM', 'Segment': 'ក្រុមអ្នកប្រើប្រាស់', 'Limit': 'កំណត់ចំនួន', 'Apply Filter': 'អនុវត្តតម្រង', 'CRM Users': 'អ្នកប្រើប្រាស់ CRM', 'Sorted by quality score': 'តម្រៀបតាមពិន្ទុគុណភាព', 'Quality': 'គុណភាព', 'Recent Usage': 'ការប្រើប្រាស់ថ្មីៗ', 'Last Seen': 'ឃើញចុងក្រោយ', 'Latest Text': 'អត្ថបទចុងក្រោយ', 'How score works': 'របៀបគណនាពិន្ទុ', 'Recency': 'ភាពថ្មី', 'Recent last_active / last text_cache activity increases score.': 'សកម្មភាព last_active ឬ text_cache ថ្មីៗធ្វើឱ្យពិន្ទុកើន។', 'Engagement': 'ការចូលរួម', 'More recent text_cache messages and characters increase score.': 'សារ និងចំនួនតួអក្សរ text_cache ថ្មីៗកាន់តែច្រើន ពិន្ទុកាន់តែខ្ពស់។', 'Risk': 'ហានិភ័យ', 'Blocked users score 0; inactive users appear in risk segments.': 'អ្នកប្រើប្រាស់ដែលត្រូវបានបិទមានពិន្ទុ 0; អ្នកមិនសកម្មនឹងបង្ហាញក្នុងក្រុមហានិភ័យ។', 'CRM Actions': 'សកម្មភាព CRM', 'Use this panel to find high-value users, inactive users, blocked users, and users who need follow-up. For mass sends, open Broadcast and use a test message first.': 'ប្រើផ្ទាំងនេះដើម្បីរកអ្នកប្រើប្រាស់សំខាន់ អ្នកមិនសកម្ម អ្នកត្រូវបានបិទ និងអ្នកដែលត្រូវតាមដាន។ សម្រាប់ការផ្ញើច្រើន សូមបើកការផ្សាយសារ និងសាកល្បងសារជាមុន។', 'Open Broadcast': 'បើកការផ្សាយសារ', 'Open Users': 'បើកអ្នកប្រើប្រាស់', '← Back': '← ត្រឡប់ក្រោយ', 'Search ID': 'ស្វែងរកលេខសម្គាល់', 'Open Telegram': 'បើក Telegram', 'Copy ID': 'ចម្លងលេខសម្គាល់', 'User Detail Upgrade': 'ព័ត៌មានអ្នកប្រើប្រាស់កម្រិតខ្ពស់', 'Profile, usage summary, and text_cache history': 'ប្រវត្តិរូប សង្ខេបការប្រើប្រាស់ និងប្រវត្តិ text_cache', 'Messages': 'សារ', 'loaded from text_cache': 'បានផ្ទុកពី text_cache', 'Text size': 'ទំហំអត្ថបទ', 'characters loaded': 'តួអក្សរដែលបានផ្ទុក', 'First cached message': 'សារ Cache ដំបូង', 'Last cached message': 'សារ Cache ចុងក្រោយ', 'Mobile Quick Actions': 'សកម្មភាពរហ័សលើទូរស័ព្ទ', 'Large touch controls for phone admin work.': 'ប៊ូតុងធំ ងាយចុច សម្រាប់ការងារអ្នកគ្រប់គ្រងលើទូរស័ព្ទ។', 'Reset prefs': 'កំណត់ចំណូលចិត្តឡើងវិញ', 'Clear history': 'លុបប្រវត្តិ', 'Direct message': 'សារផ្ទាល់', 'Send Message': 'ផ្ញើសារ', 'Latest Message Preview': 'មើលសារចុងក្រោយជាមុន', 'Admin Notes': 'កំណត់ចំណាំអ្នកគ្រប់គ្រង', 'History source': 'ប្រភពប្រវត្តិ', 'Recent history uses': 'ប្រវត្តិថ្មីៗប្រើ', 'not conversation_history.': 'មិនមែន conversation_history ទេ។', 'Broadcast safety': 'សុវត្ថិភាពការផ្សាយសារ', 'Blocked users are skipped automatically during sends.': 'អ្នកប្រើប្រាស់ដែលត្រូវបានបិទ នឹងត្រូវរំលងដោយស្វ័យប្រវត្តិពេលផ្ញើ។', 'Recent text_cache history': 'ប្រវត្តិ text_cache ថ្មីៗ', 'Open in users list': 'បើកក្នុងបញ្ជីអ្នកប្រើប្រាស់', '7 days': '៧ ថ្ងៃ', '30 days': '៣០ ថ្ងៃ', '90 days': '៩០ ថ្ងៃ', 'Counts are grouped using Phnom Penh local dates.': 'ចំនួនត្រូវបានដាក់ក្រុមតាមកាលបរិច្ឆេទម៉ោងភ្នំពេញ។', 'Delivery Breakdown': 'សង្ខេបលទ្ធផលការផ្ញើ', 'Status Mix': 'សមាមាត្រស្ថានភាព', 'Recent Failed / Warning Schedules': 'កាលវិភាគបរាជ័យ/ព្រមានថ្មីៗ', 'Open failed': 'បើកការងារបរាជ័យ', '← Previous': '← មុន', 'This Month': 'ខែនេះ', 'Next →': 'បន្ទាប់ →', 'List View': 'ទិដ្ឋភាពបញ្ជី', 'Create Schedule': 'បង្កើតកាលវិភាគ', 'Mobile note': 'សម្គាល់សម្រាប់ទូរស័ព្ទ', 'On phone, swipe horizontally inside the calendar card. Tap any schedule card to open it in the list view.': 'លើទូរស័ព្ទ សូមអូសផ្ដេកនៅក្នុងកាតប្រតិទិន។ ចុចកាតកាលវិភាគណាមួយ ដើម្បីបើកក្នុងទិដ្ឋភាពបញ្ជី។', 'Search ID/text': 'ស្វែងរកលេខសម្គាល់/អត្ថបទ', 'Filter': 'តម្រង', 'Broadcast Phnom Penh time': 'ពេលវេលាផ្សាយសារតាមម៉ោងភ្នំពេញ', 'Mode': 'របៀប', 'Preview first': 'មើលជាមុនសិន', 'Confirm immediately': 'បញ្ជាក់ភ្លាមៗ', 'Format mode': 'ទម្រង់សារ', 'Supports Telegram HTML, MarkdownV2, Markdown, and plain text. First-line directives also work:': 'គាំទ្រ Telegram HTML, MarkdownV2, Markdown និងអត្ថបទធម្មតា។ ការកំណត់ទម្រង់នៅជួរទី១ក៏អាចប្រើបាន៖', 'Text message': 'សារអត្ថបទ', 'Telegram photo_file_id optional': 'Telegram photo_file_id (មិនចាំបាច់)', 'Photo caption optional': 'ចំណងជើងរូបភាព (មិនចាំបាច់)', 'Immediate text broadcast': 'ផ្សាយសារអត្ថបទភ្លាមៗ', 'Safer broadcast system: bounded workers, blocked-user skip, live progress, pause, resume, cancel, Telegram 403 auto-block, and Telegram formatting fallback.': 'ប្រព័ន្ធផ្សាយសារមានសុវត្ថិភាព៖ កំណត់ចំនួនការងារ រំលងអ្នកត្រូវបានបិទ បង្ហាញវឌ្ឍនភាព ផ្អាក បន្ត បោះបង់ បិទសិទ្ធិដោយស្វ័យប្រវត្តិពេល Telegram 403 និងប្ដូរទៅអត្ថបទធម្មតាបើទម្រង់មានបញ្ហា។', 'Supports Telegram HTML, MarkdownV2, Markdown, and plain text. You can also prefix the first line with': 'គាំទ្រ Telegram HTML, MarkdownV2, Markdown និងអត្ថបទធម្មតា។ អ្នកក៏អាចដាក់នៅជួរទី១៖', 'For scheduled sending, use the Schedules page instead. If formatting is malformed, the bot retries as plain text instead of failing the whole job.': 'សម្រាប់ការផ្ញើតាមពេលកំណត់ សូមប្រើទំព័រកាលវិភាគ។ ប្រសិនបើទម្រង់មិនត្រឹមត្រូវ បូតនឹងសាកល្បងជាអត្ថបទធម្មតា ជំនួសឱ្យធ្វើឱ្យការងារទាំងមូលបរាជ័យ។', 'Recent web broadcast jobs': 'ការងារផ្សាយសារតាមវេបថ្មីៗ', 'Auto-refresh every 5 seconds': 'ផ្ទុកឡើងវិញរៀងរាល់ ៥ វិនាទី', 'Use Telegram /admin → Settings → Performance Settings for quick mobile edits, or open Runtime for advanced web tuning.': 'ប្រើ Telegram /admin → ការកំណត់ → ការកំណត់ប្រសិទ្ធភាព សម្រាប់កែរហ័សលើទូរស័ព្ទ ឬបើកការដំណើរការបច្ចុប្បន្ន សម្រាប់ការកែសម្រួលកម្រិតខ្ពស់។', 'The raw key is shown once in the success message. Store it in your frontend/backend env immediately.': 'សោដើមនឹងបង្ហាញតែមួយលើកក្នុងសារជោគជ័យ។ សូមរក្សាទុកវាក្នុង Environment របស់ Frontend/Backend ភ្លាមៗ។', 'Create key': 'បង្កើតសោ', 'Prefix': 'បុព្វបទ', 'Created': 'បានបង្កើត', 'Distributed Scheduler Lock': 'សោ Scheduler ចែកចាយ', 'Required': 'ចាំបាច់', 'Current row': 'ជួរបច្ចុប្បន្ន', 'Force release scheduler lock': 'បង្ខំដោះសោ Scheduler', 'Only force release when the old owner is dead or Render restarted.': 'សូមបង្ខំដោះសោតែពេលម៉ាស៊ីនមេចាស់ឈប់ដំណើរការ ឬ Render បានចាប់ផ្ដើមឡើងវិញ។', 'Required / Recommended SQL': 'SQL ចាំបាច់/បានណែនាំ', 'Run in Supabase SQL Editor.': 'ដំណើរការក្នុង Supabase SQL Editor។', 'Admin V9 tables': 'តារាង Admin V9', 'Schedule indexes': 'Index សម្រាប់កាលវិភាគ', 'Optimization Score': 'ពិន្ទុប្រសិទ្ធភាព', 'Live score from web load, queues, caches, stores, and concurrency.': 'ពិន្ទុផ្ទាល់ពីបន្ទុកវេប ជួររង់ចាំ Cache កន្លែងរក្សាទុក និងការងារដំណើរការព្រមគ្នា។', 'Runtime Config Center': 'មជ្ឈមណ្ឌលកំណត់ពេលដំណើរការ', 'Use this page to move performance and runtime tuning out of your .env. Values save to Redis and restore after Render/Railway restarts. Keep only secrets and connection URLs in environment variables.': 'ប្រើទំព័រនេះដើម្បីផ្លាស់ការកំណត់ប្រសិទ្ធភាព និងពេលដំណើរការចេញពី .env។ តម្លៃត្រូវរក្សាទុកក្នុង Redis និងស្ដារឡើងវិញបន្ទាប់ពី Render/Railway ចាប់ផ្ដើមឡើងវិញ។ ទុកតែសោសម្ងាត់ និង URL តភ្ជាប់ក្នុង Environment។', 'Dashboard-controlled Settings': 'ការកំណត់គ្រប់គ្រងពីផ្ទាំង', 'Save Runtime Config': 'រក្សាទុកការកំណត់ពេលដំណើរការ', 'Rotate the webhook secret without editing env. If the bot is in WEBHOOK mode, Telegram is re-registered immediately.': 'ប្ដូរសោសម្ងាត់ Webhook ដោយមិនកែ Environment។ ប្រសិនបើបូតប្រើរបៀប WEBHOOK Telegram នឹងត្រូវចុះឈ្មោះឡើងវិញភ្លាមៗ។', 'Minimal env after using this page': 'Environment អប្បបរមាបន្ទាប់ពីប្រើទំព័រនេះ', 'Optimization Actions': 'សកម្មភាពបង្កើនប្រសិទ្ធភាព', 'Safe cleanup and admin-poll tuning without restarting the bot.': 'សម្អាត និងកែការផ្ទុកទិន្នន័យអ្នកគ្រប់គ្រងដោយសុវត្ថិភាព ដោយមិនចាប់ផ្ដើមបូតឡើងវិញ។', 'Current Runtime Core': 'ស្នូលដំណើរការបច្ចុប្បន្ន', 'Advanced runtime config': 'ការកំណត់ពេលដំណើរការកម្រិតខ្ពស់', 'JSON snapshot': 'ទិន្នន័យសង្ខេប JSON', 'Cache Snapshot': 'សង្ខេប Cache', 'Shows rebuildable in-memory cache sizes before you run cleanup.': 'បង្ហាញទំហំ Cache ក្នុងអង្គចងចាំដែលអាចបង្កើតឡើងវិញ មុនពេលសម្អាត។', 'Recent Slow Requests': 'សំណើយឺតថ្មីៗ', 'Useful for finding heavy admin pages or browser polling storms.': 'មានប្រយោជន៍សម្រាប់រកទំព័រគ្រប់គ្រងធ្ងន់ ឬការស្នើសុំញឹកញាប់ពី Browser។', 'Method': 'វិធីស្នើសុំ', 'Path': 'ផ្លូវ', 'Latency': 'រយៈពេលឆ្លើយតប', 'Full Performance Snapshot': 'ទិន្នន័យប្រសិទ្ធភាពពេញលេញ', 'Admin Control Actions': 'សកម្មភាពបញ្ជារបស់អ្នកគ្រប់គ្រង', 'High-impact actions are protected by CSRF and confirmation. They affect this running process immediately.': 'សកម្មភាពមានឥទ្ធិពលខ្ពស់ត្រូវបានការពារដោយ CSRF និងការបញ្ជាក់។ វាមានឥទ្ធិពលលើប្រព័ន្ធកំពុងដំណើរការភ្លាមៗ។', 'Performance Snapshot': 'សង្ខេបប្រសិទ្ធភាព', 'Open JSON': 'បើក JSON', 'Recent Admin Audit': 'សវនកម្មអ្នកគ្រប់គ្រងថ្មីៗ', 'Detail': 'ព័ត៌មានលម្អិត', 'Smart Error Inbox Pro': 'ប្រអប់កំហុសឆ្លាតវៃ Pro', 'Grouped recent ERROR/CRITICAL logs by fingerprint. Memory-based, safe, no database migration required.': 'ដាក់ក្រុមកំណត់ហេតុ ERROR/CRITICAL ថ្មីៗតាមស្នាមសម្គាល់។ ប្រើអង្គចងចាំ មានសុវត្ថិភាព និងមិនត្រូវការ Migration មូលដ្ឋានទិន្នន័យ។', 'Use Open for details, Copy for Claude/AI debugging, Mute for noisy known issues, Clear after fixing.': 'ប្រើ បើក សម្រាប់ព័ត៌មានលម្អិត ចម្លង សម្រាប់ដោះស្រាយជាមួយ Claude/AI បិទការជូនដំណឹង សម្រាប់បញ្ហាដែលស្គាល់ និងសម្អាត បន្ទាប់ពីជួសជុល។', 'Test Capture': 'សាកល្បងចាប់យកកំហុស', 'Unmute All': 'បើកការជូនដំណឹងទាំងអស់', 'Clear All': 'សម្អាតទាំងអស់', 'Required production env:': 'Environment ចាំបាច់សម្រាប់ Production៖', 'plus': 'បូក', '. Restart after changing deployment environment variables.': '។ សូមចាប់ផ្ដើមឡើងវិញ បន្ទាប់ពីកែ Environment របស់ការដាក់ប្រើប្រាស់។'})
+KHMER_UI_TRANSLATIONS.update({'Admin Insights & Roadmap': 'ការយល់ដឹង និងផែនការអភិវឌ្ឍសម្រាប់អ្នកគ្រប់គ្រង', 'Smart warnings plus recommended next features for this bot admin panel.': 'ការព្រមានឆ្លាតវៃ និងមុខងារបន្ទាប់ដែលបានណែនាំសម្រាប់ផ្ទាំងគ្រប់គ្រងបូត។', 'Current warnings': 'ការព្រមានបច្ចុប្បន្ន', 'Recommended new features': 'មុខងារថ្មីដែលបានណែនាំ', 'Prioritized for your current bot system: admin safety, broadcast reliability, CRM, and smoother mobile control.': 'រៀបចំអាទិភាពសម្រាប់ប្រព័ន្ធបូតបច្ចុប្បន្ន៖ សុវត្ថិភាពអ្នកគ្រប់គ្រង ភាពជឿជាក់នៃការផ្សាយសារ ការគ្រប់គ្រងអ្នកប្រើប្រាស់ និងការប្រើលើទូរស័ព្ទកាន់តែងាយ។', 'Priority': 'អាទិភាព', 'Recommended implementation': 'វិធីអនុវត្តដែលបានណែនាំ', 'Best next update package': 'កញ្ចប់បច្ចុប្បន្នភាពបន្ទាប់ដែលល្អបំផុត', 'Admin V9 Pro': 'Admin V9 Pro', 'Insights, Smart Error Inbox Pro, broadcast checker, backup center.': 'ការយល់ដឹង ប្រអប់កំហុសឆ្លាតវៃ ការត្រួតពិនិត្យការផ្សាយសារ និងមជ្ឈមណ្ឌលបម្រុងទុក។', 'Safe Operations': 'ប្រតិបត្តិការមានសុវត្ថិភាព', 'Group errors, retry failed, pause pressure, audit timeline, lock safety.': 'ដាក់ក្រុមកំហុស សាកល្បងការងារបរាជ័យម្ដងទៀត ផ្អាកពេលប្រព័ន្ធរវល់ មើលប្រវត្តិសវនកម្ម និងគ្រប់គ្រងសោដោយសុវត្ថិភាព។', 'Mobile Friendly': 'ងាយប្រើលើទូរស័ព្ទ', 'Error Inbox in bottom nav, compact pages, sticky filters.': 'ប្រអប់កំហុសនៅម៉ឺនុយខាងក្រោម ទំព័រខ្លី និងតម្រងដែលនៅជាប់អេក្រង់។', 'Implementation order': 'លំដាប់អនុវត្ត', 'Smart Error Inbox Pro is added. Open': 'ប្រអប់កំហុសឆ្លាតវៃត្រូវបានបន្ថែម។ បើក', 'Add Broadcast Quality Checker before every send.': 'បន្ថែមការត្រួតពិនិត្យគុណភាពការផ្សាយសារ មុនផ្ញើរាល់លើក។', 'Persist admin audit timeline to Supabase.': 'រក្សាទុកប្រវត្តិសវនកម្មអ្នកគ្រប់គ្រងក្នុង Supabase។', 'Add Backup & Restore Center for settings/schedules.': 'បន្ថែមមជ្ឈមណ្ឌលបម្រុងទុក និងស្ដារការកំណត់/កាលវិភាគ។', 'Add compact mode for small screens.': 'បន្ថែមរបៀបខ្លីសម្រាប់អេក្រង់តូច។', 'Admin PDF Report': 'របាយការណ៍ PDF សម្រាប់អ្នកគ្រប់គ្រង', 'Generate a PDF with graphs, selected-day/range analytics, system status, runtime settings, feature toggles, Smart Error Inbox summary, and recent errors.': 'បង្កើត PDF ដែលមានក្រាហ្វ ការវិភាគតាមថ្ងៃ/ចន្លោះពេល ស្ថានភាពប្រព័ន្ធ ការកំណត់ពេលដំណើរការ មុខងារបើក/បិទ សង្ខេបប្រអប់កំហុស និងកំហុសថ្មីៗ។', 'Last 7 Days': '៧ ថ្ងៃចុងក្រោយ', 'Last 30 Days': '៣០ ថ្ងៃចុងក្រោយ', 'Custom day URL example:': 'ឧទាហរណ៍ URL សម្រាប់ថ្ងៃកំណត់ផ្ទាល់ខ្លួន៖', 'System health': 'សុខភាពប្រព័ន្ធ', 'Uptime': 'រយៈពេលដំណើរការ', 'Supabase': 'Supabase', 'Redis': 'Redis', 'Scheduler lock': 'សោ Scheduler', 'Settings DB': 'មូលដ្ឋានទិន្នន័យការកំណត់', 'Runtime metrics': 'សូចនាករពេលដំណើរការ', 'Live schedules': 'កាលវិភាគផ្ទាល់', 'Time': 'ពេលវេលា', 'Content': 'មាតិកា', 'Progress': 'វឌ្ឍនភាព', 'Started': 'បានចាប់ផ្ដើម', 'Feature settings': 'ការកំណត់មុខងារ', 'Open settings': 'បើកការកំណត់', 'Manage Users': 'គ្រប់គ្រងអ្នកប្រើប្រាស់', 'Analytics V2': 'ការវិភាគទិន្នន័យ V2', 'Health Center': 'មជ្ឈមណ្ឌលសុខភាពប្រព័ន្ធ', 'System V4 Health Center': 'មជ្ឈមណ្ឌលសុខភាពប្រព័ន្ធ V4', 'safe local checks': 'ការត្រួតពិនិត្យក្នុងប្រព័ន្ធដោយសុវត្ថិភាព', 'Environment Checklist': 'បញ្ជីត្រួតពិនិត្យ Environment', 'This page does not show secrets. It only shows SET/MISSING.': 'ទំព័រនេះមិនបង្ហាញសោសម្ងាត់ទេ។ វាបង្ហាញតែ បានកំណត់/ខ្វះ។', 'Runtime Metrics': 'សូចនាករពេលដំណើរការ', 'Feature Switches': 'ការបើក/បិទមុខងារ', 'System V4 Notes': 'កំណត់ចំណាំប្រព័ន្ធ V4', 'Mobile V4': 'ទូរស័ព្ទ V4', 'bottom nav, touch buttons, sticky actions': 'ម៉ឺនុយខាងក្រោម ប៊ូតុងងាយចុច និងសកម្មភាពជាប់អេក្រង់', 'User Detail+': 'ព័ត៌មានអ្នកប្រើប្រាស់+', 'profile, usage cards, recent text_cache': 'ប្រវត្តិរូប កាតការប្រើប្រាស់ និង text_cache ថ្មីៗ', 'Cleaner UI': 'ផ្ទាំងកាន់តែស្អាត', 'Tailwind powered layout and responsive cards': 'ប្លង់ Tailwind និងកាតដែលសម្របតាមទំហំអេក្រង់', 'No CRM users found for this filter.': 'រកមិនឃើញអ្នកប្រើប្រាស់សម្រាប់តម្រងនេះទេ។', 'Calendar View': 'ទិដ្ឋភាពប្រតិទិន', 'Search user ID or username': 'ស្វែងរកលេខសម្គាល់ ឬឈ្មោះអ្នកប្រើប្រាស់', 'Enter': 'បញ្ចូល', 'Rows per page': 'ចំនួនជួរនៅមួយទំព័រ', 'Username': 'ឈ្មោះអ្នកប្រើប្រាស់', 'Voice': 'សំឡេង', 'Speed': 'ល្បឿន', 'Last active': 'សកម្មចុងក្រោយ', 'Send direct message': 'ផ្ញើសារផ្ទាល់', 'User ID': 'លេខសម្គាល់អ្នកប្រើប្រាស់', 'Send': 'ផ្ញើ', 'Export CSV': 'នាំចេញ CSV', 'User Quality / CRM Panel': 'ផ្ទាំងគុណភាព និងការគ្រប់គ្រងអ្នកប្រើប្រាស់', 'Scores users from': 'វាយតម្លៃអ្នកប្រើប្រាស់ពី', 'with batched queries and short cache.': 'ដោយប្រើការសួរទិន្នន័យជាក្រុម និង Cache រយៈពេលខ្លី។', 'Clear CRM Cache': 'សម្អាត Cache CRM', 'Segment': 'ក្រុមអ្នកប្រើប្រាស់', 'Limit': 'កំណត់ចំនួន', 'Apply Filter': 'អនុវត្តតម្រង', 'CRM Users': 'អ្នកប្រើប្រាស់ CRM', 'Sorted by quality score': 'តម្រៀបតាមពិន្ទុគុណភាព', 'Quality': 'គុណភាព', 'Recent Usage': 'ការប្រើប្រាស់ថ្មីៗ', 'Last Seen': 'ឃើញចុងក្រោយ', 'Latest Text': 'អត្ថបទចុងក្រោយ', 'How score works': 'របៀបគណនាពិន្ទុ', 'Recency': 'ភាពថ្មី', 'Recent last_active / last text_cache activity increases score.': 'សកម្មភាព last_active ឬ text_cache ថ្មីៗធ្វើឱ្យពិន្ទុកើន។', 'Engagement': 'ការចូលរួម', 'More recent text_cache messages and characters increase score.': 'សារ និងចំនួនតួអក្សរ text_cache ថ្មីៗកាន់តែច្រើន ពិន្ទុកាន់តែខ្ពស់។', 'Risk': 'ហានិភ័យ', 'Blocked users score 0; inactive users appear in risk segments.': 'អ្នកប្រើប្រាស់ដែលត្រូវបានបិទមានពិន្ទុ 0; អ្នកមិនសកម្មនឹងបង្ហាញក្នុងក្រុមហានិភ័យ។', 'CRM Actions': 'សកម្មភាព CRM', 'Use this panel to find high-value users, inactive users, blocked users, and users who need follow-up. For mass sends, open Broadcast and use a test message first.': 'ប្រើផ្ទាំងនេះដើម្បីរកអ្នកប្រើប្រាស់សំខាន់ អ្នកមិនសកម្ម អ្នកត្រូវបានបិទ និងអ្នកដែលត្រូវតាមដាន។ សម្រាប់ការផ្ញើច្រើន សូមបើកការផ្សាយសារ និងសាកល្បងសារជាមុន។', 'Open Broadcast': 'បើកការផ្សាយសារ', 'Open Users': 'បើកអ្នកប្រើប្រាស់', '← Back': '← ត្រឡប់ក្រោយ', 'Search ID': 'ស្វែងរកលេខសម្គាល់', 'Open Telegram': 'បើក Telegram', 'Copy ID': 'ចម្លងលេខសម្គាល់', 'User Detail Upgrade': 'ព័ត៌មានអ្នកប្រើប្រាស់កម្រិតខ្ពស់', 'Profile, usage summary, and text_cache history': 'ប្រវត្តិរូប សង្ខេបការប្រើប្រាស់ និងប្រវត្តិ text_cache', 'Messages': 'សារ', 'loaded from text_cache': 'បានផ្ទុកពី text_cache', 'Text size': 'ទំហំអត្ថបទ', 'characters loaded': 'តួអក្សរដែលបានផ្ទុក', 'First cached message': 'សារ Cache ដំបូង', 'Last cached message': 'សារ Cache ចុងក្រោយ', 'Mobile Quick Actions': 'សកម្មភាពរហ័សលើទូរស័ព្ទ', 'Large touch controls for phone admin work.': 'ប៊ូតុងធំ ងាយចុច សម្រាប់ការងារអ្នកគ្រប់គ្រងលើទូរស័ព្ទ។', 'Reset prefs': 'កំណត់ចំណូលចិត្តឡើងវិញ', 'Clear history': 'លុបប្រវត្តិ', 'Direct message': 'សារផ្ទាល់', 'Send Message': 'ផ្ញើសារ', 'Latest Message Preview': 'មើលសារចុងក្រោយជាមុន', 'Admin Notes': 'កំណត់ចំណាំអ្នកគ្រប់គ្រង', 'History source': 'ប្រភពប្រវត្តិ', 'Recent history uses': 'ប្រវត្តិថ្មីៗប្រើ', 'not conversation_history.': 'មិនមែន conversation_history ទេ។', 'Broadcast safety': 'សុវត្ថិភាពការផ្សាយសារ', 'Blocked users are skipped automatically during sends.': 'អ្នកប្រើប្រាស់ដែលត្រូវបានបិទ នឹងត្រូវរំលងដោយស្វ័យប្រវត្តិពេលផ្ញើ។', 'Recent text_cache history': 'ប្រវត្តិ text_cache ថ្មីៗ', 'Open in users list': 'បើកក្នុងបញ្ជីអ្នកប្រើប្រាស់', '7 days': '៧ ថ្ងៃ', '30 days': '៣០ ថ្ងៃ', '90 days': '៩០ ថ្ងៃ', 'Counts are grouped using Phnom Penh local dates.': 'ចំនួនត្រូវបានដាក់ក្រុមតាមកាលបរិច្ឆេទម៉ោងភ្នំពេញ។', 'Delivery Breakdown': 'សង្ខេបលទ្ធផលការផ្ញើ', 'Status Mix': 'សមាមាត្រស្ថានភាព', 'Recent Failed / Warning Schedules': 'កាលវិភាគបរាជ័យ/ព្រមានថ្មីៗ', 'Open failed': 'បើកការងារបរាជ័យ', '← Previous': '← មុន', 'This Month': 'ខែនេះ', 'Next →': 'បន្ទាប់ →', 'List View': 'ទិដ្ឋភាពបញ្ជី', 'Create Schedule': 'បង្កើតកាលវិភាគ', 'Mobile note': 'សម្គាល់សម្រាប់ទូរស័ព្ទ', 'On phone, swipe horizontally inside the calendar card. Tap any schedule card to open it in the list view.': 'លើទូរស័ព្ទ សូមអូសផ្ដេកនៅក្នុងកាតប្រតិទិន។ ចុចកាតកាលវិភាគណាមួយ ដើម្បីបើកក្នុងទិដ្ឋភាពបញ្ជី។', 'Search ID/text': 'ស្វែងរកលេខសម្គាល់/អត្ថបទ', 'Filter': 'តម្រង', 'Broadcast Phnom Penh time': 'ពេលវេលាផ្សាយសារតាមម៉ោងភ្នំពេញ', 'Mode': 'របៀប', 'Preview first': 'មើលជាមុនសិន', 'Confirm immediately': 'បញ្ជាក់ភ្លាមៗ', 'Format mode': 'ទម្រង់សារ', 'Supports Telegram HTML, MarkdownV2, Markdown, and plain text. First-line directives also work:': 'គាំទ្រ Telegram HTML, MarkdownV2, Markdown និងអត្ថបទធម្មតា។ ការកំណត់ទម្រង់នៅជួរទី១ក៏អាចប្រើបាន៖', 'Text message': 'សារអត្ថបទ', 'Telegram photo_file_id optional': 'Telegram photo_file_id (មិនចាំបាច់)', 'Photo caption optional': 'ចំណងជើងរូបភាព (មិនចាំបាច់)', 'Immediate text broadcast': 'ផ្សាយសារអត្ថបទភ្លាមៗ', 'Safer broadcast system: bounded workers, blocked-user skip, live progress, pause, resume, cancel, Telegram 403 auto-block, and Telegram formatting fallback.': 'ប្រព័ន្ធផ្សាយសារមានសុវត្ថិភាព៖ កំណត់ចំនួនការងារ រំលងអ្នកត្រូវបានបិទ បង្ហាញវឌ្ឍនភាព ផ្អាក បន្ត បោះបង់ បិទសិទ្ធិដោយស្វ័យប្រវត្តិពេល Telegram 403 និងប្ដូរទៅអត្ថបទធម្មតាបើទម្រង់មានបញ្ហា។', 'Supports Telegram HTML, MarkdownV2, Markdown, and plain text. You can also prefix the first line with': 'គាំទ្រ Telegram HTML, MarkdownV2, Markdown និងអត្ថបទធម្មតា។ អ្នកក៏អាចដាក់នៅជួរទី១៖', 'For scheduled sending, use the Schedules page instead. If formatting is malformed, the bot retries as plain text instead of failing the whole job.': 'សម្រាប់ការផ្ញើតាមពេលកំណត់ សូមប្រើទំព័រកាលវិភាគ។ ប្រសិនបើទម្រង់មិនត្រឹមត្រូវ បូតនឹងសាកល្បងជាអត្ថបទធម្មតា ជំនួសឱ្យធ្វើឱ្យការងារទាំងមូលបរាជ័យ។', 'Recent web broadcast jobs': 'ការងារផ្សាយសារតាមវេបថ្មីៗ', 'Auto-refresh every 5 seconds': 'ផ្ទុកឡើងវិញរៀងរាល់ ៥ វិនាទី', 'Use Telegram /admin → Settings → Performance Settings for quick mobile edits, or open Runtime for advanced web tuning.': 'ប្រើ Telegram /admin → ការកំណត់ → ការកំណត់ប្រសិទ្ធភាព សម្រាប់កែរហ័សលើទូរស័ព្ទ ឬបើកការដំណើរការបច្ចុប្បន្ន សម្រាប់ការកែសម្រួលកម្រិតខ្ពស់។', 'The raw key is shown once in the success message. Store it in your frontend/backend env immediately.': 'សោដើមនឹងបង្ហាញតែមួយលើកក្នុងសារជោគជ័យ។ សូមរក្សាទុកវាក្នុង Environment របស់ Frontend/Backend ភ្លាមៗ។', 'Create key': 'បង្កើតសោ', 'Prefix': 'បុព្វបទ', 'Created': 'បានបង្កើត', 'Distributed Scheduler Lock': 'សោ Scheduler ចែកចាយ', 'Required': 'ចាំបាច់', 'Current row': 'ជួរបច្ចុប្បន្ន', 'Force release scheduler lock': 'បង្ខំដោះសោ Scheduler', 'Only force release when the old owner is dead or Render restarted.': 'សូមបង្ខំដោះសោតែពេលម៉ាស៊ីនមេចាស់ឈប់ដំណើរការ ឬ Render បានចាប់ផ្ដើមឡើងវិញ។', 'Required / Recommended SQL': 'SQL ចាំបាច់/បានណែនាំ', 'Run in Supabase SQL Editor.': 'ដំណើរការក្នុង Supabase SQL Editor។', 'Admin V9 tables': 'តារាង Admin V9', 'Schedule indexes': 'Index សម្រាប់កាលវិភាគ', 'Optimization Score': 'ពិន្ទុប្រសិទ្ធភាព', 'Live score from web load, queues, caches, stores, and concurrency.': 'ពិន្ទុផ្ទាល់ពីបន្ទុកវេប ជួររង់ចាំ Cache កន្លែងរក្សាទុក និងការងារដំណើរការព្រមគ្នា។', 'Runtime Config Center': 'មជ្ឈមណ្ឌលកំណត់ពេលដំណើរការ', 'Use this page to move performance and runtime tuning out of your .env. Values save to Supabase bot_settings and restore after Render/Railway restarts. Keep only secrets and connection URLs in environment variables.': 'ប្រើទំព័រនេះដើម្បីផ្លាស់ការកំណត់ប្រសិទ្ធភាព និងពេលដំណើរការចេញពី .env។ តម្លៃត្រូវរក្សាទុកក្នុង Redis និងស្ដារឡើងវិញបន្ទាប់ពី Render/Railway ចាប់ផ្ដើមឡើងវិញ។ ទុកតែសោសម្ងាត់ និង URL តភ្ជាប់ក្នុង Environment។', 'Dashboard-controlled Settings': 'ការកំណត់គ្រប់គ្រងពីផ្ទាំង', 'Save Runtime Config': 'រក្សាទុកការកំណត់ពេលដំណើរការ', 'Rotate the webhook secret without editing env. If the bot is in WEBHOOK mode, Telegram is re-registered immediately.': 'ប្ដូរសោសម្ងាត់ Webhook ដោយមិនកែ Environment។ ប្រសិនបើបូតប្រើរបៀប WEBHOOK Telegram នឹងត្រូវចុះឈ្មោះឡើងវិញភ្លាមៗ។', 'Minimal env after using this page': 'Environment អប្បបរមាបន្ទាប់ពីប្រើទំព័រនេះ', 'Optimization Actions': 'សកម្មភាពបង្កើនប្រសិទ្ធភាព', 'Safe cleanup and admin-poll tuning without restarting the bot.': 'សម្អាត និងកែការផ្ទុកទិន្នន័យអ្នកគ្រប់គ្រងដោយសុវត្ថិភាព ដោយមិនចាប់ផ្ដើមបូតឡើងវិញ។', 'Current Runtime Core': 'ស្នូលដំណើរការបច្ចុប្បន្ន', 'Advanced runtime config': 'ការកំណត់ពេលដំណើរការកម្រិតខ្ពស់', 'JSON snapshot': 'ទិន្នន័យសង្ខេប JSON', 'Cache Snapshot': 'សង្ខេប Cache', 'Shows rebuildable in-memory cache sizes before you run cleanup.': 'បង្ហាញទំហំ Cache ក្នុងអង្គចងចាំដែលអាចបង្កើតឡើងវិញ មុនពេលសម្អាត។', 'Recent Slow Requests': 'សំណើយឺតថ្មីៗ', 'Useful for finding heavy admin pages or browser polling storms.': 'មានប្រយោជន៍សម្រាប់រកទំព័រគ្រប់គ្រងធ្ងន់ ឬការស្នើសុំញឹកញាប់ពី Browser។', 'Method': 'វិធីស្នើសុំ', 'Path': 'ផ្លូវ', 'Latency': 'រយៈពេលឆ្លើយតប', 'Full Performance Snapshot': 'ទិន្នន័យប្រសិទ្ធភាពពេញលេញ', 'Admin Control Actions': 'សកម្មភាពបញ្ជារបស់អ្នកគ្រប់គ្រង', 'High-impact actions are protected by CSRF and confirmation. They affect this running process immediately.': 'សកម្មភាពមានឥទ្ធិពលខ្ពស់ត្រូវបានការពារដោយ CSRF និងការបញ្ជាក់។ វាមានឥទ្ធិពលលើប្រព័ន្ធកំពុងដំណើរការភ្លាមៗ។', 'Performance Snapshot': 'សង្ខេបប្រសិទ្ធភាព', 'Open JSON': 'បើក JSON', 'Recent Admin Audit': 'សវនកម្មអ្នកគ្រប់គ្រងថ្មីៗ', 'Detail': 'ព័ត៌មានលម្អិត', 'Smart Error Inbox Pro': 'ប្រអប់កំហុសឆ្លាតវៃ Pro', 'Grouped recent ERROR/CRITICAL logs by fingerprint. Memory-based, safe, no database migration required.': 'ដាក់ក្រុមកំណត់ហេតុ ERROR/CRITICAL ថ្មីៗតាមស្នាមសម្គាល់។ ប្រើអង្គចងចាំ មានសុវត្ថិភាព និងមិនត្រូវការ Migration មូលដ្ឋានទិន្នន័យ។', 'Use Open for details, Copy for Claude/AI debugging, Mute for noisy known issues, Clear after fixing.': 'ប្រើ បើក សម្រាប់ព័ត៌មានលម្អិត ចម្លង សម្រាប់ដោះស្រាយជាមួយ Claude/AI បិទការជូនដំណឹង សម្រាប់បញ្ហាដែលស្គាល់ និងសម្អាត បន្ទាប់ពីជួសជុល។', 'Test Capture': 'សាកល្បងចាប់យកកំហុស', 'Unmute All': 'បើកការជូនដំណឹងទាំងអស់', 'Clear All': 'សម្អាតទាំងអស់', 'Required production env:': 'Environment ចាំបាច់សម្រាប់ Production៖', 'plus': 'បូក', '. Restart after changing deployment environment variables.': '។ សូមចាប់ផ្ដើមឡើងវិញ បន្ទាប់ពីកែ Environment របស់ការដាក់ប្រើប្រាស់។'})
 _KHMER_UI_PHRASES = tuple(sorted(KHMER_UI_TRANSLATIONS.items(), key=lambda item: len(item[0]), reverse=True))
 
 
@@ -4820,7 +4860,7 @@ async def _web_broadcast_queue_consumer(worker_id: int) -> None:
             else:
                 job_id, admin_id, text = item
                 parse_mode = _BROADCAST_PARSE_MODE_AUTO
-            await _web_broadcast_worker(job_id, admin_id, text, parse_mode)
+            await asyncio.to_thread(_web_broadcast_worker, job_id, admin_id, text, parse_mode)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -4914,14 +4954,13 @@ def _web_broadcast_job_rows_html(csrf: str | None = None, *, include_actions: bo
             controls += f"<form class='inline-form' method='post' action='/admin/broadcast/action' data-confirm='Cancel this running broadcast job?'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='job_id' value='{_web_h(jid)}'><input type='hidden' name='action' value='cancel'><button class='danger'>Cancel</button></form>"
         mode_label = _broadcast_parse_mode_label(row.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO)
         link_preview = _broadcast_normalize_link_preview(row.get("link_preview"), True)
-        controls_html = controls or '<span class="muted">-</span>'
         rows.append(
             f"<tr><td><code>{_web_h(jid)}</code><br><span class='muted'>{_web_h(row.get('error') or row.get('note') or '')}</span><br>{_web_badge(mode_label, 'info')} {_web_badge('URL preview' if link_preview else 'No URL preview', 'ok' if link_preview else 'muted')}</td>"
             f"<td>{_web_status_badge(status)}</td>"
             f"<td><span class='nowrap'>{sent}/{total}</span><br>{_web_progress_bar(processed, total)}</td>"
             f"<td>{blocked}</td><td>{failed}</td>"
             f"<td>{_web_h(_web_dt(row.get('started_at') or row.get('created_at') or ''))}</td>"
-            f"<td><div class='actions job-controls'>{controls_html}</div></td></tr>"
+            f"<td><div class='actions job-controls'>{controls or '<span class=\"muted\">-</span>'}</div></td></tr>"
         )
     return "".join(rows) or '<tr><td colspan=7><div class="empty">No jobs yet.</div></td></tr>'
 
@@ -5112,10 +5151,9 @@ def _web_env_check_rows() -> str:
         ("TELEGRAM_BOT_TOKEN", bool(TELEGRAM_BOT_TOKEN), "Required"),
         ("ADMIN_IDS", bool(ADMIN_IDS), "Recommended"),
         ("ADMIN_WEB_PASSWORD / WEB_ADMIN_PASSWORD", bool(_web_admin_password()), "Required for dashboard"),
-        ("Redis WEB_SECRET_KEY", _web_stable_secret_configured(), f"Stored at {_web_secret_redis_key()}"),
+        ("Web session secret", _web_stable_secret_configured(), f"Source: {_web_session_secret_source()}"),
         ("SUPABASE_URL", bool(os.environ.get("SUPABASE_URL") or globals().get("SB_URL")), "Recommended"),
         ("SUPABASE_SERVICE_ROLE_KEY / SUPABASE_KEY", bool(os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY") or globals().get("SB_KEY")), "Recommended"),
-        ("REDIS_URL", bool(os.environ.get("REDIS_URL") or globals().get("REDIS_URL")), "Optional cache"),
         ("HF_TOKEN / GEMINI_API_KEY", bool(os.environ.get("HF_TOKEN") or os.environ.get("GEMINI_API_KEY")), "Required for AI/OCR"),
         ("gradio_client", GradioClient is not None, "Required for Khmer HF Space TTS"),
         ("HF_TTS_SPACE", bool(HF_TTS_SPACE), "Default: mrrtmob/khmer-tts"),
@@ -5437,7 +5475,7 @@ def web_admin_home():
     setting_rows = "".join(
         f"<tr><td>{_web_h(BOT_SETTING_LABELS.get(k,k))}<br><span class='muted'>{_web_h(BOT_SETTING_DESCRIPTIONS.get(k,''))}</span></td>"
         f"<td>{_web_badge('ON' if _setting_bool_from(settings,k) else 'OFF', 'ok' if _setting_bool_from(settings,k) else 'muted')}</td></tr>"
-        for k in BOT_FEATURE_SETTING_KEYS
+        for k in BOT_SETTING_DEFAULTS
     )
     live_schedule_rows = _web_schedule_rows_html(_web_live_schedules(), _web_csrf_token(), "")
     live_job_rows = _web_broadcast_job_rows_html(_web_csrf_token(), include_actions=False)
@@ -5500,7 +5538,7 @@ def web_admin_health():
     settings_rows = "".join(
         f"<tr><td>{_web_h(BOT_SETTING_LABELS.get(k,k))}<br><span class='muted'>{_web_h(BOT_SETTING_DESCRIPTIONS.get(k,''))}</span></td>"
         f"<td>{_web_badge('ON' if _setting_bool_from(settings,k) else 'OFF', 'ok' if _setting_bool_from(settings,k) else 'muted')}</td></tr>"
-        for k in BOT_FEATURE_SETTING_KEYS
+        for k in BOT_SETTING_DEFAULTS
     )
     body = f"""
     <div data-live-status></div>
@@ -5902,8 +5940,6 @@ def _web_send_telegram_message(
     parse_mode: str | None = "plain",
     link_preview: bool = True,
 ) -> tuple[bool, str]:
-    """Send one web-admin message through the legacy synchronous API."""
-
     if not TELEGRAM_BOT_TOKEN:
         return False, "TELEGRAM_BOT_TOKEN missing."
 
@@ -5928,94 +5964,6 @@ def _web_send_telegram_message(
             created_client = True
 
         last_error = ""
-        for telegram_parse_mode in _broadcast_candidate_parse_modes(
-            prepared_text,
-            prepared_mode,
-        ):
-            payload = {
-                "chat_id": int(chat_id),
-                "text": prepared_text,
-                "disable_web_page_preview": not prepared_link_preview,
-            }
-            if telegram_parse_mode:
-                payload["parse_mode"] = telegram_parse_mode
-
-            resp = tg_client.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json=payload,
-                timeout=20,
-            )
-            if resp.status_code == 403:
-                blocker_admin_id = int(admin_id or 0)
-                if not blocker_admin_id:
-                    with suppress(Exception):
-                        blocker_admin_id = _web_current_admin_id()
-                db_user_set_blocked(
-                    int(chat_id),
-                    blocker_admin_id,
-                    True,
-                    "Telegram Forbidden from web send",
-                )
-            if not (200 <= resp.status_code < 300):
-                response_text = str(getattr(resp, "text", ""))
-                last_error = f"Telegram HTTP {resp.status_code}: {response_text[:300]}"
-                if telegram_parse_mode and _is_telegram_parse_error(last_error):
-                    continue
-                return False, last_error
-
-            try:
-                response_payload = resp.json()
-            except Exception:
-                response_payload = {}
-            if response_payload.get("ok"):
-                return True, "sent"
-
-            last_error = str(response_payload)[:300]
-            if telegram_parse_mode and _is_telegram_parse_error(last_error):
-                continue
-            return False, last_error or "Telegram send failed."
-
-        return False, last_error or "Telegram parse mode rejected message."
-    except Exception as exc:
-        return False, str(exc)
-    finally:
-        if created_client and tg_client is not None:
-            tg_client.close()
-
-
-async def _web_send_telegram_message_async(
-    chat_id: int,
-    text: str,
-    *,
-    admin_id: int | None = None,
-    client: httpx.AsyncClient | None = None,
-    parse_mode: str | None = "plain",
-    link_preview: bool = True,
-) -> tuple[bool, str]:
-    if not TELEGRAM_BOT_TOKEN:
-        return False, "TELEGRAM_BOT_TOKEN missing."
-
-    try:
-        prepared_text, prepared_mode, prepared_link_preview = _broadcast_prepare_text(
-            text,
-            parse_mode,
-            max_chars=TELE_MSG_LIMIT,
-            default_link_preview=link_preview,
-        )
-    except ValueError as exc:
-        return False, str(exc)
-
-    if not prepared_text:
-        return False, "Message is empty."
-
-    created_client = False
-    tg_client = client
-    try:
-        if tg_client is None:
-            tg_client = httpx.AsyncClient(timeout=20)
-            created_client = True
-
-        last_error = ""
         for telegram_parse_mode in _broadcast_candidate_parse_modes(prepared_text, prepared_mode):
             payload = {
                 "chat_id": int(chat_id),
@@ -6025,7 +5973,7 @@ async def _web_send_telegram_message_async(
             if telegram_parse_mode:
                 payload["parse_mode"] = telegram_parse_mode
 
-            resp = await tg_client.post(
+            resp = tg_client.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                 json=payload,
                 timeout=20,
@@ -6059,7 +6007,8 @@ async def _web_send_telegram_message_async(
         return False, str(exc)
     finally:
         if created_client and tg_client is not None:
-            await tg_client.aclose()
+            with suppress(Exception):
+                tg_client.close()
 
 
 @app_flask.route("/admin/users")
@@ -6258,11 +6207,10 @@ def web_admin_user_detail(user_id: int):
         chat_id = h.get("chat_id") or user_id
         content_raw = _history_compact_text(h.get("content") or h.get("original_text") or "", 1100)
         content = _web_h(content_raw)
-        content_html = content or '<span class="muted">empty</span>'
         history_html.append(
             "<div class='history-item'>"
             f"<div class='history-meta'><span>{_web_h(created)}</span><span>chat <code>{_web_h(chat_id)}</code></span><span>msg <code>{_web_h(msg_id)}</code></span><span>{_web_badge('text_cache','info')}</span></div>"
-            f"<div class='whitespace-pre-wrap'>{content_html}</div>"
+            f"<div class='whitespace-pre-wrap'>{content or '<span class=\"muted\">empty</span>'}</div>"
             "</div>"
         )
     if not history_html:
@@ -6336,7 +6284,7 @@ def web_admin_user_detail(user_id: int):
 
 @app_flask.route("/admin/users/action", methods=["POST"])
 @web_admin_required
-async def web_admin_users_action():
+def web_admin_users_action():
     _web_check_csrf()
     admin_id = _web_current_admin_id()
     user_id = _web_int(request.form.get("user_id"), 0)
@@ -6354,7 +6302,7 @@ async def web_admin_users_action():
         db_history_clear(user_id)
         ok, msg = True, "history clear queued"
     elif action == "send_message":
-        ok, msg = await _web_send_telegram_message_async(user_id, request.form.get("message") or "", admin_id=_web_current_admin_id())
+        ok, msg = _web_send_telegram_message(user_id, request.form.get("message") or "", admin_id=_web_current_admin_id())
     else:
         ok, msg = False, "Unknown action."
     flask_flash(("OK: " if ok else "ERROR: ") + msg, "success" if ok else "error")
@@ -7236,7 +7184,7 @@ def _web_broadcast_job_set(job_id: str, **updates) -> None:
             _WEB_BROADCAST_JOBS.popitem(last=False)
 
 
-async def _web_broadcast_worker(
+def _web_broadcast_worker(
     job_id: str,
     admin_id: int,
     text: str,
@@ -7245,7 +7193,7 @@ async def _web_broadcast_worker(
     """Run web dashboard broadcast in bounded concurrent batches with pause/cancel."""
     parse_mode = _broadcast_normalize_parse_mode(parse_mode)
     try:
-        raw_users = await asyncio.to_thread(get_all_user_ids)
+        raw_users = get_all_user_ids()
     except Exception as exc:
         logger.error("web broadcast could not load users: %s", exc, exc_info=True)
         _web_broadcast_job_set(job_id, status="failed", error=str(exc)[:500], finished_at=_sched_iso())
@@ -7282,12 +7230,12 @@ async def _web_broadcast_worker(
         _web_broadcast_job_set(job_id, status="done", finished_at=_sched_iso())
         return
 
-    blocked_ids = await asyncio.to_thread(_web_blocked_ids_for_users, users)
+    blocked_ids = _web_blocked_ids_for_users(users)
 
     def _control_state() -> str:
         return str(_web_broadcast_job_get(job_id).get("control") or "run").lower()
 
-    async def _wait_if_paused() -> bool:
+    def _wait_if_paused() -> bool:
         while True:
             control = _control_state()
             if control == "cancel":
@@ -7295,33 +7243,32 @@ async def _web_broadcast_worker(
             if control != "pause":
                 return True
             _web_broadcast_job_set(job_id, status="paused")
-            await asyncio.sleep(0.5)
+            time.sleep(0.5)
 
-    async def _send_one(uid: int, client: httpx.AsyncClient, semaphore: asyncio.Semaphore) -> str:
-        async with semaphore:
-            try:
-                if _control_state() == "cancel":
-                    return "skipped"
-                if uid in blocked_ids:
-                    return "blocked"
-                ok, send_msg = await _web_send_telegram_message_async(
-                    uid,
-                    text,
-                    admin_id=admin_id,
-                    client=client,
-                    parse_mode=parse_mode,
-                )
-                if ok:
-                    return "sent"
-                low = str(send_msg or "").lower()
-                if "403" in low or "forbidden" in low or "bot was blocked" in low:
-                    await asyncio.to_thread(db_user_set_blocked, uid, admin_id, True, "Telegram blocked during web broadcast")
-                    return "blocked"
-                logger.warning("web broadcast failed uid=%s: %s", uid, str(send_msg)[:240])
-                return "failed"
-            except Exception as exc:
-                logger.warning("web broadcast exception uid=%s: %s", uid, exc)
-                return "failed"
+    def _send_one(uid: int) -> str:
+        try:
+            if _control_state() == "cancel":
+                return "skipped"
+            if uid in blocked_ids:
+                return "blocked"
+            ok, send_msg = _web_send_telegram_message(
+                uid,
+                text,
+                admin_id=admin_id,
+                client=tg_client,
+                parse_mode=parse_mode,
+            )
+            if ok:
+                return "sent"
+            low = str(send_msg or "").lower()
+            if "403" in low or "forbidden" in low or "bot was blocked" in low:
+                db_user_set_blocked(uid, admin_id, True, "Telegram blocked during web broadcast")
+                return "blocked"
+            logger.warning("web broadcast failed uid=%s: %s", uid, str(send_msg)[:240])
+            return "failed"
+        except Exception as exc:
+            logger.warning("web broadcast exception uid=%s: %s", uid, exc)
+            return "failed"
 
     workers = max(1, min(WEB_BROADCAST_WORKERS, _run_state_max_concurrent_broadcast(), max(1, len(users))))
     batch_size = max(1, max(_run_state_broadcast_batch_size(), workers))
@@ -7330,49 +7277,46 @@ async def _web_broadcast_worker(
         max_keepalive_connections=max(_run_state_http_keepalive_connections(), workers),
         max_connections=max(_run_state_http_max_connections(), workers * 2),
     )
-    semaphore = asyncio.Semaphore(workers)
     try:
-        async with httpx.AsyncClient(timeout=20, limits=limits) as tg_client:
-            for start in range(0, total, batch_size):
-                if not await _wait_if_paused():
-                    skipped += max(0, total - start)
-                    _web_broadcast_job_set(job_id, status="cancelled", skipped=skipped, sent=sent, failed=failed, blocked=blocked, finished_at=_sched_iso())
-                    return
-                _web_broadcast_job_set(job_id, status="running")
-                batch = users[start:start + batch_size]
-                
-                tasks = [asyncio.create_task(_send_one(uid, tg_client, semaphore)) for uid in batch]
-                last_progress_update = 0.0
-                
-                for task in asyncio.as_completed(tasks):
-                    try:
-                        result = await task
-                    except Exception as exc:
-                        logger.warning("web broadcast task failed job=%s: %s", job_id, exc)
-                        result = "failed"
+        with httpx.Client(timeout=20, limits=limits) as tg_client:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="web_broadcast") as pool:
+                for start in range(0, total, batch_size):
+                    if not _wait_if_paused():
+                        skipped += max(0, total - start)
+                        _web_broadcast_job_set(job_id, status="cancelled", skipped=skipped, sent=sent, failed=failed, blocked=blocked, finished_at=_sched_iso())
+                        return
+                    _web_broadcast_job_set(job_id, status="running")
+                    batch = users[start:start + batch_size]
+                    futures = [pool.submit(_send_one, uid) for uid in batch]
+                    last_progress_update = 0.0
+                    for future in as_completed(futures):
+                        try:
+                            result = future.result()
+                        except Exception as exc:
+                            logger.warning("web broadcast future failed job=%s: %s", job_id, exc)
+                            result = "failed"
 
-                    if result == "sent":
-                        sent += 1
-                    elif result == "blocked":
-                        blocked += 1
-                    elif result == "skipped":
-                        skipped += 1
-                    else:
-                        failed += 1
+                        if result == "sent":
+                            sent += 1
+                        elif result == "blocked":
+                            blocked += 1
+                        elif result == "skipped":
+                            skipped += 1
+                        else:
+                            failed += 1
 
-                    now = time.monotonic()
-                    if now - last_progress_update >= 1.0:
-                        _web_broadcast_job_set(job_id, sent=sent, failed=failed, blocked=blocked, skipped=skipped)
-                        last_progress_update = now
+                        now = time.monotonic()
+                        if now - last_progress_update >= 1.0:
+                            _web_broadcast_job_set(job_id, sent=sent, failed=failed, blocked=blocked, skipped=skipped)
+                            last_progress_update = now
 
-                _web_broadcast_job_set(job_id, sent=sent, failed=failed, blocked=blocked, skipped=skipped)
-                if _control_state() == "cancel":
-                    skipped += max(0, total - (start + len(batch)))
-                    _web_broadcast_job_set(job_id, status="cancelled", skipped=skipped, sent=sent, failed=failed, blocked=blocked, finished_at=_sched_iso())
-                    return
-
-                if start + len(batch) < total and delay_s:
-                    await asyncio.sleep(delay_s)
+                    _web_broadcast_job_set(job_id, sent=sent, failed=failed, blocked=blocked, skipped=skipped)
+                    if _control_state() == "cancel":
+                        skipped += max(0, total - (start + len(batch)))
+                        _web_broadcast_job_set(job_id, status="cancelled", skipped=skipped, sent=sent, failed=failed, blocked=blocked, finished_at=_sched_iso())
+                        return
+                    if start + len(batch) < total and delay_s:
+                        time.sleep(delay_s)
 
         _web_broadcast_job_set(job_id, status="done", control="done", sent=sent, failed=failed, blocked=blocked, skipped=skipped, finished_at=_sched_iso())
     except Exception as exc:
@@ -7542,7 +7486,24 @@ def web_admin_locks():
 @app_flask.route("/admin/sql")
 @web_admin_required
 def web_admin_sql():
-    locks_sql = BOT_LOCKS_SQL
+    locks_sql = """create table if not exists public.bot_locks (
+  lock_key text primary key,
+  owner text not null,
+  locked_until timestamptz not null,
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists bot_locks_locked_until_idx on public.bot_locks (locked_until);
+
+alter table public.bot_locks enable row level security;
+
+drop policy if exists "service_role_bot_locks_all" on public.bot_locks;
+create policy "service_role_bot_locks_all"
+on public.bot_locks
+for all
+to service_role
+using (true)
+with check (true);"""
     schedule_indexes = """create index if not exists scheduled_broadcasts_due_idx
 on public.scheduled_broadcasts (broadcast_at)
 where status = 'pending' and error_msg is null;
@@ -7767,7 +7728,7 @@ def _admin_runtime_update_many_sync(values: dict[str, Any], *, timeout: float = 
     """Persist multiple runtime knobs from sync admin routes."""
     changed: list[str] = []
     for key, value in values.items():
-        if key not in globals().get("_RUN_STATE_REDIS_KEYS", ()):  # safe guard for future edits
+        if key not in globals().get("_RUN_STATE_PERSISTED_KEYS", ()):  # safe guard for future edits
             continue
         current = RUN_STATE.get(key, globals().get(key))
         coerced = _coerce_run_state_value(key, value)
@@ -8267,12 +8228,12 @@ def web_admin_runtime_config():
         return redirect(url_for("web_admin_runtime_config"))
 
     webhook_ready = bool(_runtime_webhook_base_url() and _runtime_webhook_secret_token())
-    minimal_env_text = 'PORT=8080\nRENDER=true\nRENDER_EXTERNAL_URL=https://your-service.onrender.com\nTELEGRAM_BOT_TOKEN=CHANGE_ME\nADMIN_IDS=1272791365\nADMIN_WEB_PASSWORD=CHANGE_ME\nSUPABASE_URL=https://your-project.supabase.co\nSUPABASE_SERVICE_ROLE_KEY=CHANGE_ME\nREDIS_URL=redis://default:password@host:6379\nHF_TOKEN=CHANGE_ME_OPTIONAL\nGEMINI_API_KEY=CHANGE_ME_OPTIONAL'
+    minimal_env_text = 'PORT=8080\nRENDER=true\nRENDER_EXTERNAL_URL=https://your-service.onrender.com\nTELEGRAM_BOT_TOKEN=CHANGE_ME\nADMIN_IDS=1272791365\nADMIN_WEB_PASSWORD=CHANGE_ME\nSUPABASE_URL=https://your-project.supabase.co\nSUPABASE_SERVICE_ROLE_KEY=CHANGE_ME\nHF_TOKEN=CHANGE_ME_OPTIONAL\nGEMINI_API_KEY=CHANGE_ME_OPTIONAL'
     body = f"""
     <div data-live-status></div>
     <div class='card'>
       <h2>Runtime Config Center</h2>
-      <p class='muted'>Use this page to move performance and runtime tuning out of your .env. Values save to Redis and restore after Render/Railway restarts. Keep only secrets and connection URLs in environment variables.</p>
+      <p class='muted'>Use this page to move performance and runtime tuning out of your .env. Values save to Supabase bot_settings and restore after Render/Railway restarts. Keep only secrets and connection URLs in environment variables.</p>
       <div class='grid'>
         {_web_status_card('Current mode', _run_state_bot_mode(), 'runtime state', 'ok' if _run_state_bot_mode() == 'POLLING' else 'info')}
         {_web_status_card('Webhook ready', 'YES' if webhook_ready else 'NO', 'base URL + secret', 'ok' if webhook_ready else 'warn')}
@@ -8550,6 +8511,10 @@ try:
     from gradio_client import Client as GradioClient
 except Exception:
     GradioClient = None
+try:
+    from gradio_client import handle_file as GradioHandleFile
+except Exception:
+    GradioHandleFile = None
 load_dotenv = _early_load_dotenv
 try:
     from telegram.request import HTTPXRequest
@@ -8618,8 +8583,8 @@ def _admin_error_feature(source: str, message: str) -> str:
     if "supabase" in hay or "postgrest" in hay or "pgrst" in hay or "database" in hay:
         return "Supabase / DB"
     if "redis" in hay or "lock" in hay:
-        return "Redis / Locks"
-    if "edge-tts" in hay or "speech.platform.bing" in hay or "tts" in hay:
+        return "Coordination / Locks"
+    if "edge-tts" in hay or "speech.platform.bing" in hay or "tts" in hay or "voxcpm" in hay:
         return "TTS Engine"
     if "gemini" in hay or "huggingface" in hay or "hf_" in hay or "ai-assistant" in hay:
         return "AI / OCR"
@@ -8641,7 +8606,7 @@ def _admin_error_recommended_fix(feature: str, message: str) -> str:
     if "supabase" in feature.lower() or "column" in hay or "pgrst" in hay:
         return "Open SQL Setup, run missing table/column migration, then retest Health Center."
     if "redis" in feature.lower() or "lock" in feature.lower():
-        return "Check REDIS_URL, Redis connection limits, and release stale locks only when no worker is active."
+        return "Redis is removed. Check Supabase lock/leader state and clear only confirmed stale coordination rows."
     if "webhook" in feature.lower():
         return "Open Control Center, verify WEBHOOK mode, TELEGRAM_WEBHOOK_URL, secret token, and active leader."
     if "tts" in feature.lower() or "403" in hay:
@@ -8969,8 +8934,8 @@ REDIS_TEXT_CACHE_TTL_S   = _env_int("REDIS_TEXT_CACHE_TTL_S", 86400, minimum=60,
 REDIS_HISTORY_TTL_S      = _env_int("REDIS_HISTORY_TTL_S", 86400, minimum=60, maximum=604800)
 REDIS_SOCKET_TIMEOUT_S   = _env_float("REDIS_SOCKET_TIMEOUT_S", 3.0, minimum=0.2, maximum=30.0)
 CACHE_ASIDE_DEFAULT_TTL_S = _env_int("CACHE_ASIDE_DEFAULT_TTL_S", 3600, minimum=30, maximum=86400)
-HTTP_MAX_CONNECTIONS = int(resource_value("HTTP_MAX_CONNECTIONS", _env_int("HTTP_MAX_CONNECTIONS", int(_perf_default("HTTP_MAX_CONNECTIONS", 100)), minimum=10, maximum=1000)))
-HTTP_MAX_KEEPALIVE_CONNECTIONS = int(resource_value("HTTP_MAX_KEEPALIVE_CONNECTIONS", _env_int("HTTP_MAX_KEEPALIVE_CONNECTIONS", int(_perf_default("HTTP_MAX_KEEPALIVE_CONNECTIONS", 20)), minimum=2, maximum=500)))
+HTTP_MAX_CONNECTIONS = _env_int("HTTP_MAX_CONNECTIONS", int(_perf_default("HTTP_MAX_CONNECTIONS", 100)), minimum=10, maximum=1000)
+HTTP_MAX_KEEPALIVE_CONNECTIONS = _env_int("HTTP_MAX_KEEPALIVE_CONNECTIONS", int(_perf_default("HTTP_MAX_KEEPALIVE_CONNECTIONS", 20)), minimum=2, maximum=500)
 REDIS_MAX_CONNECTIONS = _env_int("REDIS_MAX_CONNECTIONS", 100, minimum=2, maximum=1000)
 HTTPX_HIGH_CONCURRENCY_LIMITS = httpx.Limits(
     max_connections=HTTP_MAX_CONNECTIONS,
@@ -8993,17 +8958,10 @@ TELEGRAM_WEBHOOK_SECRET_TOKEN = ""
 # code is deployed as two Render Web Services, both processes must NOT call
 # setWebhook/process webhook updates at the same time.  This leader lease lets
 # both web dashboards stay online while only one service owns Telegram traffic.
-_IS_WISPBYTE_ENV = bool(
-    str(os.environ.get("SERVER_PORT") or "").strip()
-    or str(os.environ.get("WISPBYTE_PORT") or "").strip()
-)
 _IS_RENDER_ENV = (
-    not _IS_WISPBYTE_ENV
-    and (
-        _env_bool("RENDER", False)
-        or bool(os.environ.get("RENDER_SERVICE_ID"))
-        or bool(os.environ.get("RENDER_EXTERNAL_URL"))
-    )
+    _env_bool("RENDER", False)
+    or bool(os.environ.get("RENDER_SERVICE_ID"))
+    or bool(os.environ.get("RENDER_EXTERNAL_URL"))
 )
 TELEGRAM_MULTI_SERVER_ENABLED = _env_bool("TELEGRAM_MULTI_SERVER_ENABLED", _IS_RENDER_ENV)
 TELEGRAM_ACTIVE_LOCK_ENABLED = _env_bool("TELEGRAM_ACTIVE_LOCK_ENABLED", TELEGRAM_MULTI_SERVER_ENABLED)
@@ -9085,14 +9043,13 @@ ACTIVE_ADMIN_CONVERSATIONS: dict[int, dict[str, Any]] = {}
 ACTIVE_ADMIN_CONVERSATIONS_LOCK = threading.RLock()
 _TELEGRAM_POLLING_ACTIVE = False
 _TELEGRAM_POLLING_LOCK: asyncio.Lock | None = None
-_TELEGRAM_CONFLICT_RECOVERY_TASK: asyncio.Task | None = None
 # Tracks the single active long-polling lifecycle guard.  It prevents duplicate
 # getUpdates workers and gives runtime mode switches one concrete task to
 # cancel before Telegram webhook operations, avoiding 409 polling/webhook
 # conflicts.
 ACTIVE_POLLING_TASK: asyncio.Task | None = None
-_RUNTIME_STATE_RESTORED_FROM_REDIS = False
-_RUN_STATE_REDIS_KEYS = (
+_RUNTIME_STATE_RESTORED_FROM_STORE = False
+_RUN_STATE_PERSISTED_KEYS = (
     "BOT_MODE",
     "TELEGRAM_WEBHOOK_URL",
     "TELEGRAM_WEBHOOK_SECRET_TOKEN",
@@ -9168,92 +9125,6 @@ def _run_state_get(key: str, default: Any = None) -> Any:
 def _run_state_bot_mode() -> str:
     mode = str(RUN_STATE.get("BOT_MODE") or BOT_MODE or _perf_default("BOT_MODE", "WEBHOOK")).strip().upper()
     return mode if mode in {"POLLING", "WEBHOOK"} else str(_perf_default("BOT_MODE", "WEBHOOK")).upper()
-
-
-def _wispbyte_runtime_detected() -> bool:
-    """Return whether this process has a Wispbyte/Pterodactyl allocation."""
-
-    return bool(
-        str(os.environ.get("SERVER_PORT") or "").strip()
-        or str(os.environ.get("WISPBYTE_PORT") or "").strip()
-    )
-
-
-def _deployment_bot_mode_override() -> str:
-    """Return an explicit deployment mode, including Wispbyte's safe default."""
-
-    configured = str(os.environ.get("BOT_MODE") or "").strip().upper()
-    if configured in {"POLLING", "WEBHOOK"}:
-        return configured
-    if _wispbyte_runtime_detected():
-        return "POLLING"
-    return ""
-
-
-def _ensure_startup_telegram_mode() -> str:
-    """Return a bootable Telegram mode for the service-local environment.
-
-    A Redis admin override may request WEBHOOK even when this service has no
-    public URL.  Long polling is the safe operational fallback in that case.
-    The Redis value is intentionally left unchanged so adding the URL on a
-    future deployment restores the requested webhook mode automatically.
-    """
-    global BOT_MODE
-
-    mode = _run_state_bot_mode()
-    deployment_override = _deployment_bot_mode_override()
-    if deployment_override:
-        if mode != deployment_override:
-            webhook_logger.warning(
-                "Deployment mode overrides persisted BOT_MODE=%s with %s.",
-                mode,
-                deployment_override,
-            )
-        with RUN_STATE_LOCK:
-            RUN_STATE["BOT_MODE"] = deployment_override
-            BOT_MODE = deployment_override
-        mode = deployment_override
-    base_url = _runtime_webhook_base_url()
-
-    # Telegram only allows ports 80, 88, 443, or 8443 for webhooks.
-    # If the discovered URL uses a non-standard port, we must fallback to POLLING.
-    is_valid_webhook_url = False
-    if mode == "WEBHOOK" and base_url:
-        try:
-            from urllib.parse import urlparse
-            parsed = urlparse(base_url)
-            # If no port is specified, it's 443 (https) or 80 (http), which are fine.
-            # If a port is specified, it MUST be one of the Telegram-approved ports.
-            port = parsed.port
-            if not port or port in {80, 88, 443, 8443}:
-                is_valid_webhook_url = True
-            else:
-                webhook_logger.warning(
-                    "BOT_MODE=WEBHOOK detected non-standard port %s in URL %s. "
-                    "Telegram only supports 80, 88, 443, 8443. Falling back to POLLING.",
-                    port, base_url
-                )
-        except Exception as exc:
-            webhook_logger.warning("Failed to validate webhook URL port: %s", exc)
-
-    if mode != "WEBHOOK" or is_valid_webhook_url:
-        return mode
-
-    with RUN_STATE_LOCK:
-        RUN_STATE["BOT_MODE"] = "POLLING"
-        BOT_MODE = "POLLING"
-    
-    if not base_url:
-        webhook_logger.warning(
-            "BOT_MODE=WEBHOOK has no TELEGRAM_WEBHOOK_URL/RENDER_EXTERNAL_URL; "
-            "using POLLING for this startup."
-        )
-    else:
-        webhook_logger.warning(
-            "BOT_MODE=WEBHOOK using POLLING due to port restrictions or invalid URL."
-        )
-        
-    return "POLLING"
 
 
 def _run_state_user_rate_limit() -> int:
@@ -9356,13 +9227,46 @@ def _make_httpx_limits_from_run_state() -> httpx.Limits:
 
 
 def _coerce_run_state_value(key: str, value: Any) -> Any:
-    from app.services.settings.runtime import coerce_runtime_value
-
-    return coerce_runtime_value(key, value, _RUNTIME_CONFIG_SPECS.get(key, {}))
+    spec = _RUNTIME_CONFIG_SPECS.get(key, {})
+    kind = spec.get("kind", "str")
+    if kind == "mode":
+        mode = str(value or "POLLING").strip().upper()
+        if mode not in {"POLLING", "WEBHOOK"}:
+            raise ValueError("BOT_MODE must be POLLING or WEBHOOK")
+        return mode
+    if kind == "int":
+        v = int(str(value).strip())
+        return max(int(spec.get("min", v)), min(int(spec.get("max", v)), v))
+    if kind == "float":
+        v = float(str(value).strip())
+        return max(float(spec.get("min", v)), min(float(spec.get("max", v)), v))
+    if kind == "bool":
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "on", "enable", "enabled"}:
+            return True
+        if text in {"0", "false", "no", "off", "disable", "disabled"}:
+            return False
+        raise ValueError(f"{key} must be true/false or 1/0")
+    if kind == "url":
+        return str(value or "").strip().rstrip("/")
+    if kind == "secret":
+        token = str(value or "").strip()
+        if key == "TELEGRAM_WEBHOOK_SECRET_TOKEN":
+            if not re.fullmatch(r"[A-Za-z0-9_-]{64}", token):
+                raise ValueError(
+                    "TELEGRAM_WEBHOOK_SECRET_TOKEN must contain exactly "
+                    "64 URL-safe characters."
+                )
+        elif not token:
+            raise ValueError(f"{key} cannot be empty")
+        return token
+    return str(value if value is not None else "").strip()
 
 
 def _sync_run_state_from_globals() -> None:
-    for key in _RUN_STATE_REDIS_KEYS:
+    for key in _RUN_STATE_PERSISTED_KEYS:
         if key in globals():
             try:
                 RUN_STATE[key] = _coerce_run_state_value(key, globals().get(key))
@@ -9371,146 +9275,73 @@ def _sync_run_state_from_globals() -> None:
 
 
 async def _persist_run_state_key(key: str, value: Any) -> bool:
-    """Persist runtime admin overrides so container restarts keep the last value.
-
-    The colon key is the primary format.  The underscore key is written as a
-    compatibility mirror because earlier deployment notes referenced that name.
-    """
-    if redis_client is None:
-        return False
-    raw_value = str(value)
-    primary_key = f"RUN_STATE:{key}"
-    compat_key = f"RUN_STATE_{key}"
-    extra_keys: list[str] = []
-    if key == "TELEGRAM_WEBHOOK_SECRET_TOKEN":
-        # Required stable alias for webhook secret rotation persistence.
-        extra_keys.append("RUN_STATE_WEBHOOK_SECRET")
-
-    def _run():
-        pipe = redis_client.pipeline(transaction=False)
-        pipe.set(primary_key, raw_value)
-        pipe.set(compat_key, raw_value)
-        for extra_key in extra_keys:
-            pipe.set(extra_key, raw_value)
-        pipe.execute()
-        return True
-
+    """Persist a hot runtime override to Supabase bot_settings."""
     try:
-        ok = await redis_call(
-            f"run_state_set:{key}",
-            _run,
-            default=False,
-            attempts=2,
-            timeout=2.0,
-            critical=False,
+        from app.services.settings.store import get_settings_store
+        persistent = await get_settings_store().set_text(
+            f"runtime:{key}",
+            str(value),
         )
-        if ok:
-            safe_value = "<redacted>" if key == "TELEGRAM_WEBHOOK_SECRET_TOKEN" else raw_value
-            webhook_logger.info("Runtime state persisted to Redis keys=%s,%s value=%s", primary_key, compat_key, safe_value)
-        return bool(ok)
-    except Exception as exc:
-        webhook_logger.warning("Runtime state Redis persist failed key=%s: %s", key, exc)
+        webhook_logger.info(
+            "Runtime state persisted key=%s backend=%s",
+            key,
+            get_settings_store().status.backend,
+        )
+        return bool(persistent)
+    except Exception as exc:  # noqa: BLE001 - live value still remains active
+        webhook_logger.warning("Runtime state persistence failed key=%s: %s", key, exc)
         return False
 
 
-async def _restore_run_state_from_redis() -> bool:
-    """Load persisted runtime/admin dashboard overrides after Redis is initialised.
-
-    Redis is optional. Startup pings Redis before key reads. If Redis is down,
-    the app keeps .env/SETTINGS defaults and continues booting.
-    """
-    global _RUNTIME_STATE_RESTORED_FROM_REDIS
-    if redis_client is None:
-        webhook_logger.info("Runtime state restore skipped: Redis is not configured.")
-        return False
-
-    keys = list(_RUN_STATE_REDIS_KEYS)
-    primary_keys = [f"RUN_STATE:{key}" for key in keys]
-    compat_keys = [f"RUN_STATE_{key}" for key in keys]
-    extra_restore_keys = ["RUN_STATE_WEBHOOK_SECRET"]
-
-    def _ping():
-        return redis_client.ping()
-
-    def _fetch_values():
-        pipe = redis_client.pipeline(transaction=False)
-        for redis_key in primary_keys + compat_keys + extra_restore_keys:
-            pipe.get(redis_key)
-        return pipe.execute()
-
+async def _restore_run_state() -> bool:
+    """Restore runtime overrides from the Supabase-backed settings store."""
     try:
-        await asyncio.wait_for(asyncio.to_thread(_ping), timeout=2.5)
-        values = await redis_call(
-            "run_state_restore",
-            _fetch_values,
-            default=None,
-            attempts=2,
-            timeout=3.0,
-            critical=False,
-        )
-    except Exception as rexc:
-        webhook_logger.warning("Redis fallback triggered. Connection not ready during boot recovery: %s", rexc)
+        from app.services.settings.store import get_settings_store
+        store = get_settings_store()
+    except Exception as exc:  # noqa: BLE001
+        webhook_logger.warning("Runtime settings store unavailable: %s", exc)
         return False
 
-    if not values:
-        webhook_logger.info("Runtime state restore found no Redis overrides; using env defaults.")
-        return False
-
-    n = len(keys)
-    primary_values = list(values[:n])
-    compat_values = list(values[n:n * 2])
     restored: dict[str, Any] = {}
-
-    for idx, key in enumerate(keys):
-        raw = primary_values[idx] if idx < len(primary_values) else None
-        if raw in (None, "") and idx < len(compat_values):
-            raw = compat_values[idx]
-        if raw in (None, "") and key == "TELEGRAM_WEBHOOK_SECRET_TOKEN":
-            extra_idx = n * 2
-            if extra_idx < len(values):
-                raw = values[extra_idx]
-        if raw is None or raw == "":
+    for key in _RUN_STATE_PERSISTED_KEYS:
+        raw = await store.get_text(f"runtime:{key}", "")
+        if raw == "":
             continue
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", errors="ignore")
         try:
             coerced = _coerce_run_state_value(key, raw)
             await _update_run_state(key, coerced, persist=False)
             restored[key] = "<redacted>" if key == "TELEGRAM_WEBHOOK_SECRET_TOKEN" else coerced
-        except Exception as exc:
-            webhook_logger.warning("Ignoring invalid persisted runtime state %s=%r: %s", key, raw, exc)
-
-    _RUNTIME_STATE_RESTORED_FROM_REDIS = bool(restored)
+        except Exception as exc:  # noqa: BLE001
+            webhook_logger.warning("Ignoring invalid stored runtime state %s: %s", key, exc)
+    global _RUNTIME_STATE_RESTORED_FROM_STORE
+    _RUNTIME_STATE_RESTORED_FROM_STORE = bool(restored)
     if restored:
-        webhook_logger.info("Runtime state recovered from Redis before startup activation: %s", restored)
-    else:
-        webhook_logger.info("Runtime state restore completed with no valid overrides.")
+        webhook_logger.info("Runtime state restored from Supabase: %s", restored)
     return bool(restored)
+
+
+async def _restore_run_state_from_redis() -> bool:
+    """Deprecated compatibility alias; Redis is no longer used."""
+
+    return await _restore_run_state()
 
 
 async def _update_run_state(key: str, value: Any, *, persist: bool = True) -> None:
     """Update runtime config from Telegram admin or Web Admin Dashboard.
 
-    Values are persisted to Redis when available, mirrored into legacy globals,
-    and applied to hot runtime objects where safe. Secrets are never logged in
-    clear text.
+    Values are persisted through the Supabase-backed settings store, mirrored into
+    legacy globals, and applied to hot runtime objects where safe. Secrets are
+    never logged in clear text.
     """
     global HTTPX_HIGH_CONCURRENCY_LIMITS
     global _AI_SEMAPHORE, _AI_SEMAPHORE_LOOP, _AI_SEMAPHORE_CAPACITY
     global _BROADCAST_SEMAPHORE, _TTS_CHUNK_SEMAPHORE, _DB_EXECUTOR, _AI_EXECUTOR
     global TTS_AUDIO_CACHE_MAX_BYTES, TTS_AUDIO_CACHE_ITEM_MAX_BYTES
 
-    if key not in _RUN_STATE_REDIS_KEYS:
+    if key not in _RUN_STATE_PERSISTED_KEYS:
         raise ValueError(f"Unsupported runtime setting: {key}")
 
-    persisted_value = resource_value(key, _coerce_run_state_value(key, value))
-    if key == "TELEGRAM_WEBHOOK_SECRET_TOKEN" and persist:
-        from app.core.security import get_runtime_secret_manager
-
-        await asyncio.to_thread(
-            get_runtime_secret_manager().persist_registered_webhook_secret_sync,
-            str(persisted_value),
-        )
+    persisted_value = _coerce_run_state_value(key, value)
     with RUN_STATE_LOCK:
         RUN_STATE[key] = persisted_value
         globals()[key] = persisted_value
@@ -9556,11 +9387,28 @@ async def _update_run_state(key: str, value: Any, *, persist: bool = True) -> No
         await _persist_run_state_key(key, persisted_value)
 
 def _runtime_admin_text() -> str:
+    from app.services.telegram.deduplication import get_webhook_replay_snapshot
+    from app.services.telegram.workloads import get_telegram_workload_limiter
+
     mode = _run_state_bot_mode()
     rate_limit = _run_state_user_rate_limit()
     http_conn = _run_state_http_max_connections()
     polling_status = "ON" if globals().get("_TELEGRAM_POLLING_ACTIVE") else "OFF"
     webhook_ready = "YES" if TELEGRAM_WEBHOOK_URL and _runtime_webhook_secret_token() else "NO"
+    workloads = get_telegram_workload_limiter().snapshot()
+    replay = get_webhook_replay_snapshot()
+
+    pressure_lines: list[str] = []
+    for label, kind in (("OCR", "ocr"), ("Transcribe", "transcribe"), ("Audio", "audio")):
+        item = workloads.get(kind, {})
+        if not isinstance(item, dict):
+            continue
+        pressure_lines.append(
+            f"• {label}: <b>{int(item.get('in_use', 0))}/{int(item.get('capacity', 0))}</b> active"
+            f" · wait {int(item.get('waiting', 0))} · reject {int(item.get('rejected', 0))}"
+        )
+    pressure_text = "\n".join(pressure_lines) or "• Workloads: <b>idle</b>"
+
     return (
         "🛠️ <b>ផ្ទាំងគ្រប់គ្រង Admin Runtime</b>\n\n"
         "តម្លៃសំខាន់ៗបច្ចុប្បន្ន៖\n"
@@ -9568,7 +9416,11 @@ def _runtime_admin_text() -> str:
         f"• Polling Active: <b>{html.escape(polling_status)}</b>\n"
         f"• Webhook Config Ready: <b>{html.escape(webhook_ready)}</b>\n"
         f"• User Rate Limit: <b>{rate_limit} req/{_run_state_user_rate_window():g}s</b>\n"
-        f"• HTTP Max Connections: <b>{http_conn}</b>\n\n"
+        f"• HTTP Max Connections: <b>{http_conn}</b>\n"
+        f"• Webhook Replay: <b>{int(replay.get('entries', 0))}</b> entries"
+        f" · duplicates {int(replay.get('duplicates', 0))}\n\n"
+        "⚙️ <b>Workload pressure</b>\n"
+        f"{pressure_text}\n\n"
         "ជ្រើសរើសសកម្មភាពខាងក្រោម ដើម្បីកែប្រែ Runtime ដោយមិនបាច់ Restart។"
     )
 
@@ -9660,11 +9512,7 @@ def _telegram_app_updater(app_obj: Any) -> Any:
     return getattr(app_obj, "updater", None) if app_obj is not None else None
 
 
-async def _telegram_start_polling_runtime(
-    app_obj: Any,
-    *,
-    webhook_prepared: bool = False,
-) -> bool:
+async def _telegram_start_polling_runtime(app_obj: Any) -> bool:
     global _TELEGRAM_POLLING_ACTIVE, ACTIVE_POLLING_TASK
     updater = _telegram_app_updater(app_obj)
     if updater is None:
@@ -9683,15 +9531,9 @@ async def _telegram_start_polling_runtime(
             if ACTIVE_POLLING_TASK is None or ACTIVE_POLLING_TASK.done():
                 ACTIVE_POLLING_TASK = asyncio.create_task(_telegram_polling_task_guard(app_obj), name="telegram-polling-guard")
             return True
-        if not webhook_prepared:
-            # Never start getUpdates until Telegram confirms that no webhook is
-            # registered. Suppressing this failure creates an endless Conflict
-            # loop inside python-telegram-bot's updater.
-            await _delete_telegram_webhook_via_http(drop_pending=False)
         await updater.start_polling(
             allowed_updates=_telegram_allowed_updates(),
             drop_pending_updates=_env_bool("TELEGRAM_POLLING_DROP_PENDING_UPDATES", True),
-            error_callback=_telegram_polling_error_callback,
         )
         _TELEGRAM_POLLING_ACTIVE = True
         ACTIVE_POLLING_TASK = asyncio.create_task(_telegram_polling_task_guard(app_obj), name="telegram-polling-guard")
@@ -9700,15 +9542,8 @@ async def _telegram_start_polling_runtime(
 
 
 async def _telegram_stop_polling_runtime(app_obj: Any, *, cancel_task: bool = True) -> bool:
-    global _TELEGRAM_POLLING_ACTIVE, _TELEGRAM_CONFLICT_RECOVERY_TASK
+    global _TELEGRAM_POLLING_ACTIVE
     updater = _telegram_app_updater(app_obj)
-    recovery_task = _TELEGRAM_CONFLICT_RECOVERY_TASK
-    if recovery_task is not None and recovery_task is not asyncio.current_task():
-        if not recovery_task.done():
-            recovery_task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await recovery_task
-        _TELEGRAM_CONFLICT_RECOVERY_TASK = None
     if cancel_task:
         await _cancel_active_polling_task("stop_polling")
     if updater is None:
@@ -9725,67 +9560,19 @@ async def _telegram_stop_polling_runtime(app_obj: Any, *, cancel_task: bool = Tr
 
 
 async def _delete_telegram_webhook_via_http(drop_pending: bool = True) -> None:
-    await _telegram_webhook_client._delete_telegram_webhook_via_http(
-        drop_pending=drop_pending
-    )
-
-
-async def _recover_polling_webhook_conflict() -> None:
-    """Remove a webhook that appeared after polling was already activated."""
-    global _TELEGRAM_CONFLICT_RECOVERY_TASK
-
-    from app.services.incidents import record_component_event, send_incident_alert
-
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
+    timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout, limits=_make_httpx_limits_from_run_state()) as client:
+        resp = await client.post(api_url, json={"drop_pending_updates": bool(drop_pending)})
     try:
-        if _run_state_bot_mode() != "POLLING":
-            return
-        await _delete_telegram_webhook_via_http(drop_pending=False)
-        webhook_logger.warning(
-            "Recovered Telegram polling after an unexpected active webhook."
-        )
-        recovered_event = record_component_event(
-            "telegram_webhook",
-            "conflict_recovered",
-            severity="info",
-            message=(
-                "An unexpected active webhook was deleted and polling recovered."
-            ),
-            state="running",
-        )
-        await send_incident_alert(recovered_event)
-    except Exception as exc:
-        webhook_logger.error(
-            "Could not recover Telegram polling webhook conflict.",
-            exc_info=True,
-        )
-        failed_event = record_component_event(
-            "telegram_webhook",
-            "conflict_recovery_failed",
-            severity="critical",
-            message=f"{type(exc).__name__}: {exc}",
-            state="failed",
-        )
-        await send_incident_alert(failed_event)
-    finally:
-        _TELEGRAM_CONFLICT_RECOVERY_TASK = None
-
-
-def _telegram_polling_error_callback(error: TelegramError) -> None:
-    """Schedule one self-healing deleteWebhook operation for Conflict errors."""
-    global _TELEGRAM_CONFLICT_RECOVERY_TASK
-
-    if not isinstance(error, Conflict):
-        return
-    task = _TELEGRAM_CONFLICT_RECOVERY_TASK
-    if task is not None and not task.done():
-        return
-    webhook_logger.warning(
-        "Telegram getUpdates found an active webhook; scheduling verified cleanup."
-    )
-    _TELEGRAM_CONFLICT_RECOVERY_TASK = asyncio.create_task(
-        _recover_polling_webhook_conflict(),
-        name="telegram-webhook-conflict-recovery",
-    )
+        data = _json_loads_fast(resp.content)
+    except Exception:
+        data = {"ok": False, "description": resp.text[:500]}
+    if resp.status_code >= 400 or not bool(data.get("ok")):
+        raise RuntimeError(f"Telegram deleteWebhook failed status={resp.status_code} response={str(data)[:500]}")
+    webhook_logger.info("Telegram webhook deleted via HTTPX.")
 
 
 async def _switch_telegram_runtime_mode(target_mode: str, admin_id: int = 0) -> str:
@@ -9817,7 +9604,7 @@ async def _switch_telegram_runtime_mode(target_mode: str, admin_id: int = 0) -> 
     # 409 Conflict errors when polling starts immediately.
     await asyncio.sleep(1.5)
     await _update_run_state("BOT_MODE", "POLLING")
-    await _telegram_start_polling_runtime(app_obj, webhook_prepared=True)
+    await _telegram_start_polling_runtime(app_obj)
     _runtime_admin_log_state("switch_polling", admin_id)
     return "POLLING"
 
@@ -9831,200 +9618,9 @@ def _is_runtime_admin_callback(data: str) -> bool:
 
 
 async def _runtime_admin_callback(update: Any, context: Any) -> None:
-    query = update.callback_query
-    if query is None:
-        return
-    admin_id = query.from_user.id if query.from_user else 0
-    data = query.data or ""
-    if not _is_admin(admin_id):
-        with suppress(Exception):
-            await query.answer("⛔ អ្នកមិនមានសិទ្ធិ។", show_alert=True)
-        return
-    if query.message is None:
-        with suppress(Exception):
-            await query.answer()
-        return
-
-    if data == "rtadmin_close":
-        with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
-            ACTIVE_ADMIN_CONVERSATIONS.pop(admin_id, None)
-        with suppress(Exception):
-            await query.answer('បានបិទ')
-        with suppress(Exception):
-            await query.message.delete()
-        return
-
-    if data == "rtadmin_rate":
-        with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
-            ACTIVE_ADMIN_CONVERSATIONS[admin_id] = {"state": "awaiting_rate_limit", "ts": time.monotonic()}
-        with suppress(Exception):
-            await query.answer('សូមផ្ញើជាលេខ', show_alert=False)
-        await safe_send(lambda: query.message.edit_text(
-            "⚡ <b>កែប្រែ Rate Limit</b>\n\n"
-            f"តម្លៃបច្ចុប្បន្ន: <b>{_run_state_user_rate_limit()} req/{_run_state_user_rate_window():g}s</b>\n\n"
-            "សូមផ្ញើលេខគត់ថ្មី ឧទាហរណ៍ <code>3</code> ឬ <code>5</code>។\n"
-            "បើចង់កែ HTTP pool សូមផ្ញើ <code>http 120</code>។",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="rtadmin_cancel")]]),
-        ))
-        return
-
-    if data == "rtadmin_cancel":
-        with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
-            ACTIVE_ADMIN_CONVERSATIONS.pop(admin_id, None)
-        with suppress(Exception):
-            await query.answer('បានបោះបង់')
-        await safe_send(lambda: query.message.edit_text(
-            _runtime_admin_text(),
-            parse_mode="HTML",
-            reply_markup=_refresh_runtime_admin_markup(),
-        ))
-        return
-
-    if data == "rtadmin_rotate_secret":
-        with suppress(Exception):
-            await query.answer('កំពុងប្ដូរសោសម្ងាត់…', show_alert=False)
-
-        async with _webhook_rotate_lock():
-            remaining = _webhook_rotate_begin_or_remaining()
-            if remaining < 0:
-                await safe_send(lambda: query.message.edit_text(
-                    _runtime_admin_text()
-                    + "\n\n⚠️ Webhook secret rotation is already running. Please wait.",
-                    parse_mode="HTML",
-                    reply_markup=_refresh_runtime_admin_markup(),
-                    disable_web_page_preview=True,
-                ))
-                return
-            if remaining > 0:
-                await safe_send(lambda: query.message.edit_text(
-                    _runtime_admin_text()
-                    + f"\n\n⚠️ Please wait {int(remaining) + 1}s before rotating the webhook secret again.",
-                    parse_mode="HTML",
-                    reply_markup=_refresh_runtime_admin_markup(),
-                    disable_web_page_preview=True,
-                ))
-                return
-
-            success = False
-            new_token = generate_new_webhook_token()
-            try:
-                # Important order: ask Telegram to accept the new webhook first.
-                # Only persist RUN_STATE after setWebhook succeeds.
-                if _run_state_bot_mode() == "WEBHOOK":
-                    await _configure_telegram_webhook_via_http_for_secret(new_token)
-
-                await _update_run_state("TELEGRAM_WEBHOOK_SECRET_TOKEN", new_token, persist=True)
-                success = True
-
-                logger.info("Admin %s rotated Webhook Secret Token.", admin_id)
-                webhook_logger.info("Webhook secret rotated by admin_id=%s mode=%s", admin_id, _run_state_bot_mode())
-
-                new_path = f"/tg-webhook-{new_token}"
-                await safe_send(lambda: query.message.edit_text(
-                    _runtime_admin_text()
-                    + "\n\n✅ Webhook secret updated!"
-                    + f"\nNew URL path: <code>{html.escape(new_path)}</code>",
-                    parse_mode="HTML",
-                    reply_markup=_refresh_runtime_admin_markup(),
-                    disable_web_page_preview=True,
-                ))
-            except Exception as exc:
-                webhook_logger.error("Webhook secret rotation failed admin_id=%s: %s", admin_id, exc, exc_info=True)
-                error_text = html.escape(str(exc)[:800])
-                await safe_send(lambda: query.message.edit_text(
-                    _runtime_admin_text() + f"\n\n❌ Rotate secret failed: <code>{error_text}</code>",
-                    parse_mode="HTML",
-                    reply_markup=_refresh_runtime_admin_markup(),
-                    disable_web_page_preview=True,
-                ))
-            finally:
-                _webhook_rotate_finish(success)
-        return
-
-    if data.startswith("rtadmin_switch:"):
-        target = data.split(":", 1)[1].strip().upper()
-        with suppress(Exception):
-            await query.answer('កំពុងប្ដូរ…', show_alert=False)
-        try:
-            mode = await _switch_telegram_runtime_mode(target, admin_id=admin_id)
-            await safe_send(lambda: query.message.edit_text(
-                _runtime_admin_text() + f"\n\n✅ បានប្ដូរទៅ <b>{html.escape(mode)}</b> រួចរាល់។",
-                parse_mode="HTML",
-                reply_markup=_refresh_runtime_admin_markup(),
-                disable_web_page_preview=True,
-            ))
-        except Exception as exc:
-            webhook_logger.error("Runtime mode switch failed admin_id=%s target=%s: %s", admin_id, target, exc, exc_info=True)
-            error_text = html.escape(str(exc)[:800])
-            await safe_send(lambda: query.message.edit_text(
-                _runtime_admin_text() + f"\n\n❌ ប្ដូរ Mode មិនបាន: <code>{error_text}</code>",
-                parse_mode="HTML",
-                reply_markup=_refresh_runtime_admin_markup(),
-                disable_web_page_preview=True,
-            ))
-        return
-
-    with suppress(Exception):
-        await query.answer(
-            "This runtime button is no longer available. Please reopen the menu.",
-            show_alert=False,
-        )
-
-
-async def _handle_runtime_admin_photo(update: Any, _context: Any) -> bool:
-    """Capture a photo only while an admin is editing the welcome content."""
-    msg = update.message
-    user = update.effective_user
-    if not msg or not user or not _is_admin(user.id):
-        return False
-    with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
-        state = dict(ACTIVE_ADMIN_CONVERSATIONS.get(user.id) or {})
-    if state.get("state") != "awaiting_welcome_message":
-        return False
-
-    photos = list(getattr(msg, "photo", None) or [])
-    image_file_id = _normalize_welcome_image_file_id(
-        getattr(photos[-1], "file_id", "") if photos else ""
-    )
-    if not image_file_id:
-        await safe_send(lambda: msg.reply_text(
-            "⚠️ មិនអាចអាន Telegram image file ID បានទេ។ សូមផ្ញើរូបភាពម្ដងទៀត។"
-        ))
-        return True
-
-    caption = str(getattr(msg, "caption", "") or "").replace("\x00", "").strip()
-    if len(caption) > WELCOME_MESSAGE_MAX_CHARS:
-        await safe_send(lambda: msg.reply_text(
-            f"⚠️ Caption វែងពេក។ អតិបរមា {WELCOME_MESSAGE_MAX_CHARS} តួអក្សរ; "
-            f"អ្នកបានផ្ញើ {len(caption)} តួអក្សរ។"
-        ))
-        return True
-
-    message_update = caption if caption and caption != str(state.get("current") or "") else None
-    ok, info = await asyncio.get_running_loop().run_in_executor(
-        _DB_EXECUTOR,
-        lambda: db_welcome_content_set(message_update, image_file_id, user.id),
-    )
-    if not ok:
-        await safe_send(lambda: msg.reply_text(
-            "⚠️ មិនអាចរក្សាទុក Welcome Image បានទេ៖ "
-            f"<code>{html.escape(str(info)[:500])}</code>\n\n"
-            "សូមព្យាយាមម្ដងទៀត ឬ /cancel។",
-            parse_mode="HTML",
-        ))
-        return True
-
-    with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
-        ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
-    caption_notice = " និង Caption ជា Welcome Message" if message_update else ""
-    await safe_send(lambda: msg.reply_text(
-        f"✅ <b>Welcome Image បានរក្សាទុក{caption_notice}។</b>\n\n"
-        "ប្រើ /start ដើម្បីសាកល្បង។",
-        parse_mode="HTML",
-        reply_markup=get_admin_dashboard_kb(),
-    ))
-    return True
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.callbacks import _runtime_admin_callback as _impl
+    return await _impl(update, context)
 
 
 async def _handle_runtime_admin_text(update: Any, context: Any) -> bool:
@@ -10057,65 +9653,6 @@ async def _handle_runtime_admin_text(update: Any, context: Any) -> bool:
                 parse_mode="HTML",
                 reply_markup=get_admin_dashboard_kb(),
             ))
-        return True
-
-    if state.get("state") == "awaiting_welcome_message":
-        raw = (msg.text or "").replace("\x00", "").strip()
-        if raw.lower() in {"/cancel", "cancel", "បោះបង់"}:
-            with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
-                ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
-            await safe_send(lambda: msg.reply_text(
-                "បានបោះបង់ការកែ Welcome Message។",
-                reply_markup=get_admin_dashboard_kb(),
-            ))
-            return True
-        if not raw:
-            await safe_send(lambda: msg.reply_text("⚠️ Welcome Message មិនអាចទទេបានទេ។"))
-            return True
-        if len(raw) > WELCOME_MESSAGE_MAX_CHARS:
-            await safe_send(lambda: msg.reply_text(
-                f"⚠️ សារវែងពេក។ អតិបរមា {WELCOME_MESSAGE_MAX_CHARS} តួអក្សរ; "
-                f"អ្នកបានផ្ញើ {len(raw)} តួអក្សរ។"
-            ))
-            return True
-
-        if raw == str(state.get("current") or ""):
-            with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
-                ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
-            await safe_send(lambda: msg.reply_text(
-                "ℹ️ Welcome Message មិនមានការផ្លាស់ប្ដូរទេ។",
-                reply_markup=get_admin_dashboard_kb(),
-            ))
-            return True
-
-        ok, info = await asyncio.get_running_loop().run_in_executor(
-            _DB_EXECUTOR,
-            lambda: db_bot_setting_value_set(
-                WELCOME_MESSAGE_SETTING_KEY,
-                raw,
-                user.id,
-            ),
-        )
-        if not ok:
-            await safe_send(lambda: msg.reply_text(
-                f"⚠️ មិនអាចរក្សាទុក Welcome Message បានទេ៖ "
-                f"<code>{html.escape(str(info)[:500])}</code>\n\nសូមព្យាយាមម្ដងទៀត ឬ /cancel។",
-                parse_mode="HTML",
-            ))
-            return True
-
-        with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
-            ACTIVE_ADMIN_CONVERSATIONS.pop(user.id, None)
-        preview_raw, preview_rest = _take_escaped_prefix(raw, 2400)
-        preview = html.escape(preview_raw) + ("…" if preview_rest else "")
-        await safe_send(lambda: msg.reply_text(
-            "✅ <b>Welcome Message បានកែរួចរាល់។</b>\n\n"
-            f"<pre>{preview}</pre>\n\n"
-            "ប្រើ /start ដើម្បីសាកល្បង។",
-            parse_mode="HTML",
-            reply_markup=get_admin_dashboard_kb(),
-            disable_web_page_preview=True,
-        ))
         return True
 
     if state.get("state") != "awaiting_rate_limit":
@@ -10179,13 +9716,13 @@ def _runtime_admin_bootstrap_state() -> None:
     with suppress(Exception):
         _restore_tts_provider_runtime_overrides_sync()
     logger.info(
-        "Runtime admin state ready mode=%s user_rate_limit=%s http_max_connections=%s tts_provider=%s khmer_tts=%s restored_from_redis=%s",
+        "Runtime admin state ready mode=%s user_rate_limit=%s http_max_connections=%s tts_provider=%s khmer_tts=%s restored_from_store=%s",
         _run_state_bot_mode(),
         _run_state_user_rate_limit(),
         _run_state_http_max_connections(),
         globals().get("TTS_PROVIDER", "auto"),
         globals().get("KHMER_TTS_PROVIDER", "hf_space"),
-        bool(globals().get("_RUNTIME_STATE_RESTORED_FROM_REDIS")),
+        bool(globals().get("_RUNTIME_STATE_RESTORED_FROM_STORE")),
     )
 
 
@@ -10205,8 +9742,8 @@ def _refresh_arch_runtime_settings() -> None:
     global WEB_BROADCAST_QUEUE_MAXSIZE
 
     CACHE_ASIDE_DEFAULT_TTL_S = _env_int("CACHE_ASIDE_DEFAULT_TTL_S", 3600, minimum=30, maximum=86400)
-    HTTP_MAX_CONNECTIONS = int(resource_value("HTTP_MAX_CONNECTIONS", _env_int("HTTP_MAX_CONNECTIONS", int(_perf_default("HTTP_MAX_CONNECTIONS", 100)), minimum=10, maximum=1000)))
-    HTTP_MAX_KEEPALIVE_CONNECTIONS = int(resource_value("HTTP_MAX_KEEPALIVE_CONNECTIONS", _env_int("HTTP_MAX_KEEPALIVE_CONNECTIONS", int(_perf_default("HTTP_MAX_KEEPALIVE_CONNECTIONS", 20)), minimum=2, maximum=500)))
+    HTTP_MAX_CONNECTIONS = _env_int("HTTP_MAX_CONNECTIONS", 100, minimum=10, maximum=1000)
+    HTTP_MAX_KEEPALIVE_CONNECTIONS = _env_int("HTTP_MAX_KEEPALIVE_CONNECTIONS", 20, minimum=2, maximum=500)
     REDIS_MAX_CONNECTIONS = _env_int("REDIS_MAX_CONNECTIONS", 100, minimum=2, maximum=1000)
     HTTPX_HIGH_CONCURRENCY_LIMITS = httpx.Limits(
         max_connections=HTTP_MAX_CONNECTIONS,
@@ -10287,11 +9824,11 @@ EDGE_TTS_STREAM_TIMEOUT_S = _env_float("EDGE_TTS_STREAM_TIMEOUT_S", 45.0, minimu
 EDGE_TTS_CROSS_LANG_FALLBACK = _env_bool("EDGE_TTS_CROSS_LANG_FALLBACK", False)
 # Smooth performance knobs. Keep Edge chunk parallelism conservative because
 # too many websocket calls can trigger throttling/403 on small Render services.
-EDGE_TTS_PARALLEL_CHUNKS   = int(resource_value("EDGE_TTS_PARALLEL_CHUNKS", _env_int("EDGE_TTS_PARALLEL_CHUNKS", int(_perf_default("EDGE_TTS_PARALLEL_CHUNKS", 1)), minimum=1, maximum=4)))
+EDGE_TTS_PARALLEL_CHUNKS   = _env_int("EDGE_TTS_PARALLEL_CHUNKS", int(_perf_default("EDGE_TTS_PARALLEL_CHUNKS", 1)), minimum=1, maximum=4)
 TTS_AUDIO_CACHE_ENABLED    = _env_bool("TTS_AUDIO_CACHE_ENABLED", bool(_perf_default("TTS_AUDIO_CACHE_ENABLED", True)))
 TTS_AUDIO_CACHE_TTL_S      = _env_float("TTS_AUDIO_CACHE_TTL_S", float(_perf_default("TTS_AUDIO_CACHE_TTL_S", 1200.0)), minimum=30.0, maximum=86400.0)
-TTS_AUDIO_CACHE_MAX_MB     = int(resource_value("TTS_AUDIO_CACHE_MAX_MB", _env_int("TTS_AUDIO_CACHE_MAX_MB", int(_perf_default("TTS_AUDIO_CACHE_MAX_MB", 64)), minimum=4, maximum=512)))
-TTS_AUDIO_CACHE_ITEM_MAX_MB = int(resource_value("TTS_AUDIO_CACHE_ITEM_MAX_MB", _env_int("TTS_AUDIO_CACHE_ITEM_MAX_MB", int(_perf_default("TTS_AUDIO_CACHE_ITEM_MAX_MB", 8)), minimum=1, maximum=64)))
+TTS_AUDIO_CACHE_MAX_MB     = _env_int("TTS_AUDIO_CACHE_MAX_MB", int(_perf_default("TTS_AUDIO_CACHE_MAX_MB", 64)), minimum=4, maximum=512)
+TTS_AUDIO_CACHE_ITEM_MAX_MB = _env_int("TTS_AUDIO_CACHE_ITEM_MAX_MB", int(_perf_default("TTS_AUDIO_CACHE_ITEM_MAX_MB", 8)), minimum=1, maximum=64)
 TTS_AUDIO_CACHE_MAX_BYTES  = TTS_AUDIO_CACHE_MAX_MB * 1024 * 1024
 TTS_AUDIO_CACHE_ITEM_MAX_BYTES = TTS_AUDIO_CACHE_ITEM_MAX_MB * 1024 * 1024
 PAGED_TTS_SEND_DELAY_S     = _env_float("PAGED_TTS_SEND_DELAY_S", float(_perf_default("PAGED_TTS_SEND_DELAY_S", 0.10)), minimum=0.0, maximum=2.0)
@@ -10325,11 +9862,48 @@ HF_TTS_NO_AUDIO_COOLDOWN_S = _env_float("HF_TTS_NO_AUDIO_COOLDOWN_S", 600.0, min
 HF_TTS_CLIENT_CACHE      = _env_bool("HF_TTS_CLIENT_CACHE", True)
 HF_TTS_SERIALIZE_CALLS   = _env_bool("HF_TTS_SERIALIZE_CALLS", True)
 
-GRADIO_CLIENT_MAX_WORKERS   = int(resource_value("GRADIO_CLIENT_MAX_WORKERS", _env_int("GRADIO_CLIENT_MAX_WORKERS", int(resource_default("GRADIO_CLIENT_MAX_WORKERS", 4)), minimum=1, maximum=16)))
+# VoxCPM2 — voice cloning through the official openbmb Gradio demo.
+# The public Space exposes api_name="generate" with the inputs:
+# text, control instruction, reference audio, ultimate-mode flag, prompt text,
+# CFG, normalize-text flag, denoise-reference flag, and inference timesteps.
+# Both Controllable Cloning and transcript-guided Ultimate Cloning are supported.
+VOXCPM2_ENABLED             = _env_bool("VOXCPM2_ENABLED", True)
+VOXCPM2_SPACE               = (os.environ.get("VOXCPM2_SPACE") or "openbmb/VoxCPM-Demo").strip()
+VOXCPM2_API_NAME            = (os.environ.get("VOXCPM2_API_NAME") or "/generate").strip()
+VOXCPM2_TOKEN               = (os.environ.get("VOXCPM2_TOKEN") or os.environ.get("HF_TOKEN") or "").strip()
+VOXCPM2_CFG_VALUE           = _env_float("VOXCPM2_CFG_VALUE", 2.0, minimum=1.0, maximum=3.0)
+VOXCPM2_INFERENCE_TIMESTEPS = _env_int("VOXCPM2_INFERENCE_TIMESTEPS", 10, minimum=1, maximum=50)
+VOXCPM2_NORMALIZE_TEXT      = _env_bool("VOXCPM2_NORMALIZE_TEXT", False)
+VOXCPM2_DENOISE_REFERENCE   = _env_bool("VOXCPM2_DENOISE_REFERENCE", False)
+VOXCPM2_TIMEOUT_S           = _env_float("VOXCPM2_TIMEOUT_S", 180.0, minimum=30.0, maximum=900.0)
+VOXCPM2_RETRIES             = _env_int("VOXCPM2_RETRIES", 2, minimum=1, maximum=5)
+VOXCPM2_RETRY_DELAY_S       = _env_float("VOXCPM2_RETRY_DELAY_S", 3.0, minimum=0.5, maximum=30.0)
+# Public Hugging Face/Gradio Spaces may reject immediately with
+# "Queue is full! Please try again." A normal 3-second retry only hammers the
+# same full queue, so handle this separately with a longer backoff and a short
+# local cooldown after the final retry. These are code defaults; env overrides
+# remain available for emergency tuning.
+VOXCPM2_QUEUE_RETRY_DELAY_S = _env_float("VOXCPM2_QUEUE_RETRY_DELAY_S", 45.0, minimum=5.0, maximum=300.0)
+VOXCPM2_QUEUE_COOLDOWN_S    = _env_float("VOXCPM2_QUEUE_COOLDOWN_S", 180.0, minimum=30.0, maximum=3600.0)
+VOXCPM2_AUTO_FALLBACK_ON_QUEUE = _env_bool("VOXCPM2_AUTO_FALLBACK_ON_QUEUE", True)
+VOXCPM2_FALLBACK_NOTICE_ENABLED = _env_bool("VOXCPM2_FALLBACK_NOTICE_ENABLED", True)
+VOXCPM2_MAX_CHARS           = _env_int("VOXCPM2_MAX_CHARS", 500, minimum=80, maximum=1200)
+VOXCPM2_MAX_REFERENCE_BYTES = _env_int("VOXCPM2_MAX_REFERENCE_MB", 20, minimum=1, maximum=50) * 1024 * 1024
+VOXCPM2_MAX_REFERENCE_SECONDS = _env_float("VOXCPM2_MAX_REFERENCE_SECONDS", 50.0, minimum=5.0, maximum=120.0)
+VOXCPM2_PROFILE_TTL_S       = _env_int("VOXCPM2_PROFILE_TTL_S", 30 * 86400, minimum=3600, maximum=365 * 86400)
+VOXCPM2_PROFILE_MEMORY_TTL_S = _env_float("VOXCPM2_PROFILE_MEMORY_TTL_S", 300.0, minimum=10.0, maximum=86400.0)
+VOXCPM2_CONTROL_MAX_CHARS   = _env_int("VOXCPM2_CONTROL_MAX_CHARS", 300, minimum=20, maximum=1000)
+VOXCPM2_PROMPT_MAX_CHARS    = _env_int("VOXCPM2_PROMPT_MAX_CHARS", 2000, minimum=100, maximum=8000)
+VOXCPM2_SERIALIZE_CALLS     = _env_bool("VOXCPM2_SERIALIZE_CALLS", True)
+VOXCPM2_CLIENT_CACHE        = _env_bool("VOXCPM2_CLIENT_CACHE", True)
+VOXCPM2_FAILURE_LIMIT       = _env_int("VOXCPM2_FAILURE_LIMIT", 3, minimum=1, maximum=20)
+VOXCPM2_COOLDOWN_S          = _env_float("VOXCPM2_COOLDOWN_S", 300.0, minimum=30.0, maximum=3600.0)
+VOXCPM2_QUOTA_COOLDOWN_S    = _env_float("VOXCPM2_QUOTA_COOLDOWN_S", 1800.0, minimum=300.0, maximum=86400.0)
+GRADIO_CLIENT_MAX_WORKERS   = _env_int("GRADIO_CLIENT_MAX_WORKERS", 4, minimum=1, maximum=16)
 GRADIO_CLIENT_CONNECT_TIMEOUT_S = _env_float("GRADIO_CLIENT_CONNECT_TIMEOUT_S", 10.0, minimum=2.0, maximum=60.0)
 GRADIO_CLIENT_READ_TIMEOUT_S = _env_float(
     "GRADIO_CLIENT_READ_TIMEOUT_S",
-    float(HF_TTS_TIMEOUT_S),
+    max(float(HF_TTS_TIMEOUT_S), float(VOXCPM2_TIMEOUT_S)),
     minimum=10.0,
     maximum=900.0,
 )
@@ -10339,7 +9913,6 @@ AUDIO_TO_VOICE_MAX_CONCURRENT = _env_int("AUDIO_TO_VOICE_MAX_CONCURRENT", 2, min
 DEFAULT_SPEED           = 1.0
 TELE_MSG_LIMIT          = 4000
 USER_COOLDOWN_S         = 3.0
-BOT_IMMEDIATE_TASKS     = _env_bool("BOT_IMMEDIATE_TASKS", True)
 _STALE_GRACE_S          = 30.0
 _KHMER_RE               = re.compile(r"[\u1780-\u17FF]")
 _SPEED_MIN              = 0.25
@@ -10385,20 +9958,19 @@ def _audio_mime_for_gemini(filename: str | None, mime_type: str | None) -> str:
 
 
 _DB_EXECUTOR = ThreadPoolExecutor(
-    # Three DB workers keep Supabase responsive without excess thread stacks on
-    # small hosts. Larger profiles can override this through the admin setting.
-    max_workers=int(resource_value(
+    # Keep Supabase writes bounded. Too many SDK threads can trigger
+    # [Errno 11] Resource temporarily unavailable on small Render instances.
+    max_workers=_env_int(
         "DB_EXECUTOR_MAX_WORKERS",
-        _env_int(
-            "DB_EXECUTOR_MAX_WORKERS",
-            int(_perf_default("DB_EXECUTOR_MAX_WORKERS", 3)),
-            minimum=1,
-            maximum=32,
-        ),
-    )),
+        int(_perf_default("DB_EXECUTOR_MAX_WORKERS", 3)),
+        minimum=1,
+        maximum=16,
+    ),
     thread_name_prefix="db_write",
 )
-_AI_EXECUTOR = ThreadPoolExecutor(max_workers=max(2, MAX_CONCURRENT_AI), thread_name_prefix="ai")
+_AI_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(2, MAX_CONCURRENT_AI), thread_name_prefix="ai"
+)
 
 
 def _shutdown_thread_executors() -> None:
@@ -10632,7 +10204,7 @@ def retry_call_sync(
 
 async def retry_call(
     name: str,
-    factory: Callable[[], Any | Awaitable[Any]],
+    factory: Callable[[], Any],
     *,
     default: Any = None,
     attempts: int = 3,
@@ -10642,12 +10214,7 @@ async def retry_call(
     breaker: CircuitBreaker | None = None,
     critical: bool = False,
 ) -> Any:
-    """High-performance async-native retry wrapper.
-
-    Automatically handles both synchronous blocking SDK calls (via thread offloading)
-    and native asynchronous coroutines without redundant executor overhead.
-    """
-    from typing import Awaitable
+    """Async-safe retry wrapper. Blocking SDK calls run in a thread."""
     if breaker and breaker.is_open():
         _log_once(logging.WARNING, f"{name}:breaker_open", "%s skipped: circuit breaker is open", name)
         if critical:
@@ -10655,44 +10222,39 @@ async def retry_call(
         return default
 
     last_exc: BaseException | None = None
-    is_async_factory = inspect.iscoroutinefunction(factory)
-
     for attempt in range(1, max(1, attempts) + 1):
         try:
-            if is_async_factory:
-                # Native async path: zero thread overhead
-                result = await asyncio.wait_for(factory(), timeout=timeout)
-            else:
-                # Hybrid/Sync path: offload blocking calls but resolve awaitables correctly
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(lambda: _resolve_maybe_awaitable_sync(factory())),
-                    timeout=timeout,
-                )
-
+            result = await asyncio.wait_for(
+                asyncio.to_thread(lambda: _resolve_maybe_awaitable_sync(factory())),
+                timeout=timeout,
+            )
             if breaker:
                 breaker.record_success()
             return result
         except asyncio.TimeoutError as exc:
+            # asyncio cannot stop work that is already running in a worker
+            # thread. Retrying here can duplicate writes and multiply stuck
+            # workers, so a timed-out operation is never started again.
             last_exc = exc
             if breaker:
                 breaker.record_failure(exc)
             _log_once(
                 logging.WARNING,
                 f"{name}:timeout",
-                "%s timed out after %.2fs",
+                "%s timed out after %.2fs; not retrying because the worker may still be running",
                 name,
                 timeout,
             )
-            # Safety: stop retrying on timeout to prevent worker pool exhaustion
             break
         except Exception as exc:
             last_exc = exc
-            if not _is_retryable_store_error(exc):
+            retryable = _is_retryable_store_error(exc)
+            if not retryable:
                 if breaker:
                     breaker.record_failure(exc)
                 _log_once(
                     logging.ERROR,
-                    f"{name}:non_retryable:{type(exc).__name__}",
+                    f"{name}:non_retryable:{type(exc).__name__}:{str(exc)[:120]}",
                     "%s failed with non-retryable error: %s",
                     name,
                     _format_exception_detail(exc),
@@ -10704,9 +10266,18 @@ async def retry_call(
             if attempt >= attempts:
                 if breaker:
                     breaker.record_failure(exc)
+                _log_once(
+                    logging.WARNING,
+                    f"{name}:failed:{type(exc).__name__}:{str(exc)[:120]}",
+                    "%s failed after %d attempt(s): %s",
+                    name,
+                    attempts,
+                    _format_exception_detail(exc),
+                )
                 break
 
             delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+            logger.warning("%s temporary error attempt %d/%d: %s", name, attempt, attempts, _format_exception_detail(exc))
             await asyncio.sleep(delay)
 
     if critical and last_exc:
@@ -10725,17 +10296,7 @@ def db_call_sync(name: str, factory: Callable[[], Any], *, default: Any = None, 
     )
 
 
-async def db_call(
-    name: str,
-    factory: Callable[[], Any | Awaitable[Any]],
-    *,
-    default: Any = None,
-    attempts: int = 3,
-    timeout: float = 8.0,
-    critical: bool = False
-) -> Any:
-    """Async Supabase wrapper with health-aware routing."""
-    from typing import Awaitable
+async def db_call(name: str, factory: Callable[[], Any], *, default: Any = None, attempts: int = 3, timeout: float = 8.0, critical: bool = False) -> Any:
     return await retry_call(
         f"Supabase:{name}",
         factory,
@@ -11165,15 +10726,10 @@ async def _rate_limit_check(key: str, limit: int, window_s: float) -> tuple[bool
                 dq.append(now)
             if len(_RATE_LIMIT_MEMORY) > 100_000:
                 stale_before = now - max(window * 4, 60.0)
-                # Use iterator to avoid full key list copy; trim up to 5000 entries
-                count = 0
-                for old_key in _RATE_LIMIT_MEMORY:
+                for old_key in list(_RATE_LIMIT_MEMORY.keys())[:5000]:
                     old_dq = _RATE_LIMIT_MEMORY.get(old_key)
                     if not old_dq or old_dq[-1] < stale_before:
                         _RATE_LIMIT_MEMORY.pop(old_key, None)
-                    count += 1
-                    if count >= 5000:
-                        break
             return allowed, max(0, limit_i - len(dq))
 
 
@@ -11188,31 +10744,9 @@ def _update_rate_limit_key(update: Any) -> str:
 
 
 async def _telegram_rate_limit_guard(update: Any, context: Any) -> None:
-    if not isinstance(update, Update):
-        return
-    key = _update_rate_limit_key(update)
-    allowed, _remaining = await _rate_limit_check(key, _run_state_user_rate_limit(), _run_state_user_rate_window())
-    if allowed:
-        return
-    _metric_inc("rate_limited")
-    now = time.monotonic()
-    should_send_notice = False
-    with _RATE_LIMIT_MEMORY_THREAD_LOCK:
-        last = _RATE_LIMIT_NOTICE_MEMORY.get(key, 0.0)
-        if now - last >= USER_RATE_LIMIT_NOTICE_COOLDOWN_S:
-            _RATE_LIMIT_NOTICE_MEMORY[key] = now
-            should_send_notice = True
-            if len(_RATE_LIMIT_NOTICE_MEMORY) > 50_000:
-                stale_before = now - max(USER_RATE_LIMIT_NOTICE_COOLDOWN_S * 4, 300.0)
-                for old_key, old_ts in list(_RATE_LIMIT_NOTICE_MEMORY.items())[:5000]:
-                    if old_ts < stale_before:
-                        _RATE_LIMIT_NOTICE_MEMORY.pop(old_key, None)
-    if should_send_notice:
-        msg = getattr(update, "effective_message", None)
-        if msg is not None:
-            with suppress(Exception):
-                await msg.reply_text(_runtime_admin_notice_text())
-    raise ApplicationHandlerStop
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.guards import _telegram_rate_limit_guard as _impl
+    return await _impl(update, context)
 
 
 _ADMIN_ONLY_COMMANDS = {
@@ -11255,49 +10789,9 @@ async def _security_notice_once(update: Update, key: str, text: str, *, alert: b
 
 
 async def _telegram_user_security_guard(update: Any, context: Any) -> None:
-    """Cheap global user-safety gate before expensive handlers.
-
-    - Blocks non-admin access to admin commands/callbacks.
-    - Stops blocked users before OCR/TTS/AI work begins.
-    - Uses cached blocked lookups to avoid DB pressure under normal traffic.
-    """
-    if not isinstance(update, Update):
-        return
-    user = update.effective_user
-    if user is None:
-        return
-    user_id = int(user.id)
-    if _is_admin(user_id):
-        return
-
-    query = update.callback_query
-    data = str(getattr(query, "data", "") or "") if query is not None else ""
-    admin_callback_prefixes = ("admin_", "needs_", "api_", "rtadmin_", "user_", "users_", "history_", "sched_", "bc_", "admin_report_")
-    if _env_bool("ADMIN_CALLBACK_GUARD_ENABLED", True) and data.startswith(admin_callback_prefixes):
-        _metric_inc("admin_denied")
-        await _security_notice_once(update, f"admin_cb:{user_id}", '⛔ សម្រាប់អ្នកគ្រប់គ្រងប៉ុណ្ណោះ។', alert=True)
-        raise ApplicationHandlerStop
-
-    cmd = _telegram_command_name(update)
-    if cmd in _ADMIN_ONLY_COMMANDS:
-        _metric_inc("admin_denied")
-        await _security_notice_once(update, f"admin_cmd:{user_id}", "⛔ ពាក្យបញ្ជានេះសម្រាប់ Admin ប៉ុណ្ណោះ។")
-        raise ApplicationHandlerStop
-    if cmd in {"security", "privacy", "deleteme"}:
-        # Privacy/self-service commands stay available even if the user is blocked.
-        return
-
-    # Blocked-user guard.  db_user_is_blocked() has memory cache; executor keeps
-    # the event loop safe if Supabase fallback is needed.
-    try:
-        blocked = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_is_blocked(user_id))
-    except Exception as exc:
-        blocked = False
-        _log_once(logging.WARNING, f"blocked_guard_failed:{user_id}", "Blocked-user guard skipped user=%s: %s", user_id, exc)
-    if blocked:
-        _metric_inc("blocked_hits")
-        await _security_notice_once(update, f"blocked:{user_id}", "⛔ អ្នកត្រូវបាន Block មិនអាចប្រើ Bot នេះបានទេ។")
-        raise ApplicationHandlerStop
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.guards import _telegram_user_security_guard as _impl
+    return await _impl(update, context)
 
 
 async def _api_rate_limit_allowed(req: FastAPIRequest) -> bool:
@@ -11458,18 +10952,25 @@ def _normalise_ocr_provider(value: Any, *, default: str | None = None) -> str:
     Keeping this in one helper avoids older call sites silently switching to HF
     or auto when a bad env/runtime value is supplied.
     """
-    from app.services.ai.ocr import normalize_ocr_provider
-
-    return normalize_ocr_provider(value, default=default or DEFAULT_OCR_PROVIDER)
+    default = (default or DEFAULT_OCR_PROVIDER or "gemini").lower().strip()
+    provider = str(value or default).lower().strip()
+    aliases = {
+        "huggingface": "hf",
+        "hugging_face": "hf",
+        "hf_ocr": "hf",
+        "google": "gemini",
+        "google_gemini": "gemini",
+        "gemini_ocr": "gemini",
+    }
+    provider = aliases.get(provider, provider)
+    return provider if provider in {"gemini", "auto", "hf"} else "gemini"
 
 
 def _normalise_ocr_prefer_provider(value: Any, *, default: str | None = None) -> str:
-    from app.services.ai.ocr import normalize_preferred_ocr_provider
-
-    return normalize_preferred_ocr_provider(
-        value,
-        default=default or DEFAULT_OCR_AUTO_PREFER_PROVIDER,
-    )
+    prefer = str(value or default or DEFAULT_OCR_AUTO_PREFER_PROVIDER or "gemini").lower().strip()
+    if prefer in {"hf", "huggingface", "hugging_face", "hf_ocr"}:
+        return "hf"
+    return "gemini"
 
 
 def _ocr_provider_remaining_s(provider: str) -> int:
@@ -11897,7 +11398,7 @@ def ask_huggingface_ocr(image_data: bytes) -> str:
     raise _friendly_ocr_error(errors)
 
 
-async def ask_gemini_ocr(image_data: bytes, mime_type: str = "image/jpeg") -> str:
+def ask_gemini_ocr(image_data: bytes, mime_type: str = "image/jpeg") -> str:
     if _gemini is None:
         raise RuntimeError("Gemini OCR is not configured. Set GEMINI_API_KEY; GEMINI_MODEL optional.")
     if not image_data:
@@ -11908,7 +11409,7 @@ async def ask_gemini_ocr(image_data: bytes, mime_type: str = "image/jpeg") -> st
         "and Japanese exactly. Keep useful line breaks. If there is no readable text, "
         "output only NOTEXT. Do not describe the image and do not add explanations."
     )
-    response = await _gemini.aio.models.generate_content(
+    response = _gemini.models.generate_content(
         model=GEMINI_MODEL,
         contents=[
             _gtypes.Part.from_bytes(data=image_data, mime_type=mime_type or "image/jpeg"),
@@ -11919,39 +11420,16 @@ async def ask_gemini_ocr(image_data: bytes, mime_type: str = "image/jpeg") -> st
     return text or "NOTEXT"
 
 
-def ask_local_ocr(image_data: bytes) -> str:
-    """Local OCR fallback supporting pytesseract (Tesseract) safely without blocking or high RAM consumption."""
-    if not image_data:
-        raise RuntimeError("Empty image data.")
-    
-    # Try pytesseract first (lightweight C++ binary wrapper, safe for low-RAM Pterodactyl hosting)
-    try:
-        import pytesseract
-        from PIL import Image
-        import io
-        img = Image.open(io.BytesIO(image_data))
-        try:
-            text = pytesseract.image_to_string(img, lang='khm+eng')
-        except Exception:
-            try:
-                text = pytesseract.image_to_string(img, lang='eng')
-            except Exception:
-                text = pytesseract.image_to_string(img)
-        text = (text or "").strip()
-        if text:
-            return text
-    except ImportError:
-        pass
-    except Exception as e:
-        logger.warning("Pytesseract local OCR failed: %s", e)
+def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tuple[str, str, str]:
+    """Unified OCR with provider fallback. Returns (text, provider, model).
 
-    # Note: EasyOCR is intentionally disabled by default in low-RAM environments (Pterodactyl)
-    # because PyTorch model loading consumes > 1GB RAM and causes container OOM crashes.
-    raise RuntimeError("Local OCR (Tesseract) failed or is not installed. Please install tesseract-ocr and tesseract-ocr-khm on your server.")
-
-
-async def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tuple[str, str, str]:
-    """Unified OCR with provider fallback (including local offline OCR). Returns (text, provider, model)."""
+    v27 fixes:
+    - auto mode can prefer Gemini first to avoid Render/HF DNS failures.
+    - unavailable providers are recorded clearly instead of producing confusing
+      fallback logs when a fallback is not configured.
+    - temporarily disabled providers are skipped quickly until cooldown ends.
+    - unknown runtime provider values fall back to the safe Gemini default.
+    """
     if not image_data:
         raise RuntimeError("Empty image data.")
 
@@ -11961,17 +11439,6 @@ async def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tup
     from app.services.ai.providers import get_provider_manager
 
     provider_manager = get_provider_manager()
-    
-    # If user wants local or explicitly forces local
-    if provider in {"local", "tesseract", "easyocr"}:
-        try:
-            started = time.perf_counter()
-            text = await asyncio.to_thread(ask_local_ocr, image_data)
-            return text, "local", "tesseract-or-easyocr"
-        except Exception as e:
-            errors.append(f"local={type(e).__name__}: {e!r}")
-            raise _friendly_ocr_error(errors)
-
     configured_order = _ocr_provider_order(provider)
     manager_names = [
         "huggingface" if name == "hf" else name
@@ -11985,24 +11452,12 @@ async def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tup
         order = [
             "hf" if name == "huggingface" else name
             for name in routed_names
-            if name in {"gemini", "huggingface", "local"}
+            if name in {"gemini", "huggingface"}
         ]
-        # Always allow local as a final offline fallback in auto mode
-        if "local" not in order:
-            order.append("local")
     else:
         order = configured_order
 
     for item in order:
-        if item == "local":
-            try:
-                started = time.perf_counter()
-                text = await asyncio.to_thread(ask_local_ocr, image_data)
-                return text, "local", "tesseract-or-easyocr"
-            except Exception as e:
-                errors.append(f"local={type(e).__name__}: {e!r}")
-                continue
-
         if item == "gemini":
             if _gemini is None or not GEMINI_MODEL:
                 errors.append("gemini=not configured: set GEMINI_API_KEY; GEMINI_MODEL optional")
@@ -12012,7 +11467,7 @@ async def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tup
                 continue
             try:
                 started = time.perf_counter()
-                text = await ask_gemini_ocr(image_data, mime_type)
+                text = ask_gemini_ocr(image_data, mime_type)
                 _mark_ocr_provider_success("gemini")
                 provider_manager.record_success(
                     "gemini",
@@ -12065,16 +11520,15 @@ async def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tup
     raise _friendly_ocr_error(errors)
 
 
-async def ai_text_reply(prompt: str, history: list[dict] | None = None) -> tuple[str, str, int | None]:
-    """Return (reply, model_used, tokens_used) for text-only chat (Async)."""
+def ai_text_reply(prompt: str, history: list[dict] | None = None) -> tuple[str, str, int | None]:
+    """Return (reply, model_used, tokens_used) for text-only chat."""
     from app.services.ai.providers import get_provider_manager
 
     configured = (AI_PROVIDER or "hf").lower().strip()
     preferred = ["huggingface" if configured == "hf" else "gemini"]
 
-    async def execute(provider_name: str) -> tuple[str, str, int | None]:
+    def execute(provider_name: str) -> tuple[str, str, int | None]:
         if provider_name == "huggingface":
-            # For now, HF remains sync but run in thread by ProviderManager.execute
             reply = ask_huggingface(prompt, history)
             return reply, HF_MODEL, None
         if provider_name != "gemini":
@@ -12089,7 +11543,7 @@ async def ai_text_reply(prompt: str, history: list[dict] | None = None) -> tuple
             image_mime="",
             audio_mime="",
         )
-        response = await _gemini.aio.models.generate_content(
+        response = _gemini.models.generate_content(
             model=GEMINI_MODEL,
             contents=contents,
             config=_ai_gen_config(),
@@ -12102,7 +11556,7 @@ async def ai_text_reply(prompt: str, history: list[dict] | None = None) -> tuple
             raise RuntimeError("Gemini returned an empty response.")
         return reply, GEMINI_MODEL, tokens_used
 
-    result, _provider_name = await get_provider_manager().execute(
+    result, _provider_name = get_provider_manager().execute_sync(
         "ai",
         execute,
         preferred=preferred,
@@ -12118,7 +11572,7 @@ def _init_clients() -> None:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     SB_URL             = os.getenv("SUPABASE_URL", "")
     SB_KEY             = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY", "")
-    REDIS_URL          = os.getenv("REDIS_URL", "").strip() if _redis_enabled() else ""
+    REDIS_URL          = os.getenv("REDIS_URL", "").strip()
     GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
     # Code default: DEFAULT_GEMINI_MODEL. Env values are optional overrides only.
     GEMINI_MODEL       = (os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_GENAI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
@@ -12174,29 +11628,12 @@ def _init_clients() -> None:
     else:
         supabase = None
 
+    # Redis has been removed. Old REDIS_URL values are ignored so existing
+    # deployments can roll forward without an immediate environment cleanup.
     redis_client = None
     if REDIS_URL:
-        if redis_lib is None:
-            logger.warning("REDIS_URL is set but package `redis` is not installed. Install: pip install redis")
-        else:
-            try:
-                redis_client = redis_lib.from_url(
-                    REDIS_URL,
-                    decode_responses=True,
-                    socket_timeout=REDIS_SOCKET_TIMEOUT_S,
-                    socket_connect_timeout=REDIS_SOCKET_TIMEOUT_S,
-                    health_check_interval=30,
-                    retry_on_timeout=True,
-                    max_connections=REDIS_MAX_CONNECTIONS,
-                )
-                redis_client.ping()
-                logger.info("Redis cache initialised with max_connections=%s.", REDIS_MAX_CONNECTIONS)
-            except Exception as e:
-                logger.warning(f"Redis init failed — cache disabled: {e}")
-                redis_client = None
-    else:
-        reason = "REDIS_ENABLED=false" if not _redis_enabled() else "REDIS_URL not set"
-        logger.info("%s — Redis disabled; using memory + Supabase fallback.", reason)
+        logger.warning("REDIS_URL is configured but ignored; runtime state now uses Supabase bot_settings.")
+
 
     gemini_sdk_available = bool(GEMINI_API_KEY and GEMINI_MODEL and _load_google_genai_sdk())
     if GEMINI_API_KEY and GEMINI_MODEL and gemini_sdk_available:
@@ -12264,8 +11701,6 @@ SPEED_OPTIONS = {
     "spd_1.5": ("x1.5", 1.5),
     "spd_2.0": ("x2.0", 2.0),
 }
-CHANNEL_URL = "https://t.me/m11mmm112"
-SUPPORT_URL = "https://pay-coffee-topaz.vercel.app/"
 WELCOME_TEXT = (
     "🎵 សួស្តី! ខ្ញុំជាបូតបម្លែងអត្ថបទទៅជាសំឡេងដោយ AI។\n\n"
     "📌 វាយអត្ថបទជាភាសាណាមួយ ហើយផ្ញើមកបូត។ បូតនឹងបង្កើតសំឡេងដោយស្វ័យប្រវត្តិ។\n"
@@ -12274,7 +11709,9 @@ WELCOME_TEXT = (
     "🇰🇭 ខ្មែរ | 🇺🇸 អង់គ្លេស | 🇨🇳 ចិន | 🇰🇷 កូរ៉េ | 🇯🇵 ជប៉ុន\n"
     "🇮🇳 ហិណ្ឌី | 🇲🇾 ម៉ាឡេ | 🇮🇩 ឥណ្ឌូណេស៊ី | 🇵🇭 ហ្វីលីពីន | 🇸🇦 អារ៉ាប់\n"
     "💡 បូតស្គាល់ភាសា និងជ្រើសសំឡេងដែលសមស្របដោយស្វ័យប្រវត្តិ ១០០%។\n\n"
-    "👇 ប្រើប៊ូតុងខាងក្រោម ដើម្បីមើលការកំណត់ ចូលរួមឆានែល ឬគាំទ្របូត។"
+    "⚙️ ប្រើ /myprefs ដើម្បីមើលការកំណត់របស់អ្នក។\n"
+    "🎙️ ប្រើ /voxcpm2 ដើម្បីចម្លងសំឡេង និងកំណត់អារម្មណ៍ ឬស្ទីលនៃការនិយាយ។\n"
+    "📢 ចូលរួមឆានែល៖ https://t.me/m11mmm112"
 )
 BOT_TAG = "@voicekhaibot"
 
@@ -12282,12 +11719,12 @@ BOT_TAG = "@voicekhaibot"
 # Prefs cache — memory -> Redis -> Supabase -> safe defaults
 # ---------------------------------------------------------------------------
 _PREFS_TTL      = _env_float("PREFS_CACHE_TTL_S", float(_perf_default("PREFS_CACHE_TTL_S", 600.0)), minimum=30.0, maximum=86400.0)
-_PREFS_MAX_SIZE = _env_int("PREFS_CACHE_MAX_SIZE", int(resource_default("PREFS_CACHE_MAX_SIZE", 10_000)), minimum=500, maximum=200_000)
+_PREFS_MAX_SIZE = _env_int("PREFS_CACHE_MAX_SIZE", 10_000, minimum=500, maximum=200_000)
 _prefs_cache: OrderedDict[int, tuple[dict, float]] = OrderedDict()
 _prefs_cache_lock: asyncio.Lock | None = None
 _prefs_cache_lock_loop: asyncio.AbstractEventLoop | None = None
 _prefs_cache_thread_lock = threading.RLock()
-_PREFS_LOAD_LOCKS_MAX = _env_int("PREFS_LOAD_LOCKS_MAX", int(resource_default("PREFS_LOAD_LOCKS_MAX", 5000)), minimum=100, maximum=50000)
+_PREFS_LOAD_LOCKS_MAX = _env_int("PREFS_LOAD_LOCKS_MAX", 5000, minimum=100, maximum=50000)
 _prefs_load_locks: OrderedDict[int, asyncio.Lock] = OrderedDict()
 _prefs_load_locks_guard = threading.RLock()
 
@@ -12322,6 +11759,7 @@ TTS_MODEL_OPTIONS = {
     "auto": ("ស្វ័យប្រវត្តិ", "Kiri → Edge TTS"),
     "hf_space": ("សំឡេងខ្មែរ Kiri", ""),
     "edge": ("Edge TTS ពហុភាសា", ""),
+    "voxcpm2": ("ចម្លងសំឡេង VoxCPM2", "សំឡេងគំរូ + កំណត់ស្ទីល"),
 }
 TTS_MODEL_ALIASES = {
     "auto": "auto",
@@ -12336,18 +11774,18 @@ TTS_MODEL_ALIASES = {
     "edge": "edge",
     "edge_tts": "edge",
     "msedge": "edge",
+    "voxcpm2": "voxcpm2",
+    "vox_cpm2": "voxcpm2",
+    "vox": "voxcpm2",
+    "voice_clone": "voxcpm2",
+    "clone": "voxcpm2",
 }
 DEFAULT_TTS_MODEL = (os.environ.get("DEFAULT_TTS_MODEL") or os.environ.get("USER_DEFAULT_TTS_MODEL") or "auto").strip().lower()
 
 
 def _normalize_tts_model(value: Any) -> str:
-    from app.services.ai.tts import normalize_tts_model
-
-    return normalize_tts_model(
-        value,
-        aliases=TTS_MODEL_ALIASES,
-        default=DEFAULT_TTS_MODEL,
-    )
+    raw = str(value or DEFAULT_TTS_MODEL or "auto").strip().lower().replace("-", "_")
+    return TTS_MODEL_ALIASES.get(raw, "auto")
 
 
 def _tts_model_label(value: Any) -> str:
@@ -12359,6 +11797,179 @@ def _tts_model_label(value: Any) -> str:
 DEFAULT_USER_PREFS: dict = {"gender": "female", "speed": DEFAULT_SPEED, "tts_model": _normalize_tts_model(DEFAULT_TTS_MODEL)}
 
 
+# VoxCPM2 profile data stores reusable Telegram file identifiers, clone mode,
+# optional style instruction, and optional Ultimate-mode transcript. Raw
+# reference-audio bytes exist only during validation or generation.
+VOXCPM2_WAIT_REFERENCE = "await_reference"
+VOXCPM2_WAIT_CONTROL = "await_control"
+VOXCPM2_WAIT_PROMPT_TEXT = "await_prompt_text"
+VOXCPM2_MODE_CONTROLLABLE = "controllable"
+VOXCPM2_MODE_ULTIMATE = "ultimate"
+_VOXCPM2_PROFILE_MEMORY: OrderedDict[int, tuple[dict[str, Any], float]] = OrderedDict()
+_VOXCPM2_PROFILE_MEMORY_LOCK = threading.RLock()
+_VOXCPM2_PROFILE_MEMORY_MAX = _env_int("VOXCPM2_PROFILE_MEMORY_MAX", 5000, minimum=100, maximum=50000)
+
+
+def _voxcpm2_profile_redis_key(user_id: int) -> str:
+    return _redis_key("voxcpm2", "profile", int(user_id))
+
+
+def _voxcpm2_normalize_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower().replace("-", "_")
+    if mode in {"ultimate", "continuation", "prompt", "prompt_text", "transcript"}:
+        return VOXCPM2_MODE_ULTIMATE
+    return VOXCPM2_MODE_CONTROLLABLE
+
+
+def _voxcpm2_normalize_profile(value: Any) -> dict[str, Any]:
+    raw = dict(value) if isinstance(value, dict) else {}
+    profile = {
+        "file_id": str(raw.get("file_id") or "").strip(),
+        "file_unique_id": str(raw.get("file_unique_id") or "").strip(),
+        "filename": str(raw.get("filename") or "reference_audio").strip()[:160],
+        "mime_type": str(raw.get("mime_type") or "audio/ogg").strip()[:100],
+        "suffix": str(raw.get("suffix") or ".ogg").strip()[:12],
+        "duration": float(raw.get("duration") or 0.0),
+        "file_size": int(raw.get("file_size") or 0),
+        "control": str(raw.get("control") or "").strip()[:VOXCPM2_CONTROL_MAX_CHARS],
+        "mode": _voxcpm2_normalize_mode(raw.get("mode")),
+        "prompt_text": str(raw.get("prompt_text") or raw.get("transcript") or "").strip()[:VOXCPM2_PROMPT_MAX_CHARS],
+        "updated_at": str(raw.get("updated_at") or "").strip(),
+    }
+    if not profile["suffix"].startswith(".") or not re.fullmatch(r"\.[a-z0-9]{1,8}", profile["suffix"], re.I):
+        profile["suffix"] = ".ogg"
+    return profile
+
+
+def _voxcpm2_profile_memory_get(user_id: int) -> dict[str, Any] | None:
+    user_id = int(user_id)
+    now = time.monotonic()
+    with _VOXCPM2_PROFILE_MEMORY_LOCK:
+        item = _VOXCPM2_PROFILE_MEMORY.get(user_id)
+        if not item:
+            return None
+        profile, created = item
+        # Without Redis this LRU is the only profile store, so expiring it after
+        # five minutes made a configured clone unexpectedly disappear. Apply
+        # the short cache TTL only when a persistent Redis copy can be reloaded.
+        if redis_client is not None and now - float(created or 0.0) > VOXCPM2_PROFILE_MEMORY_TTL_S:
+            _VOXCPM2_PROFILE_MEMORY.pop(user_id, None)
+            return None
+        _VOXCPM2_PROFILE_MEMORY.move_to_end(user_id)
+        return dict(profile)
+
+
+def _voxcpm2_profile_memory_set(user_id: int, profile: dict[str, Any]) -> None:
+    user_id = int(user_id)
+    normalized = _voxcpm2_normalize_profile(profile)
+    with _VOXCPM2_PROFILE_MEMORY_LOCK:
+        _VOXCPM2_PROFILE_MEMORY[user_id] = (normalized, time.monotonic())
+        _VOXCPM2_PROFILE_MEMORY.move_to_end(user_id)
+        while len(_VOXCPM2_PROFILE_MEMORY) > _VOXCPM2_PROFILE_MEMORY_MAX:
+            _VOXCPM2_PROFILE_MEMORY.popitem(last=False)
+
+
+async def _voxcpm2_profile_get(user_id: int, *, force: bool = False) -> dict[str, Any]:
+    user_id = int(user_id)
+    if not force:
+        cached = _voxcpm2_profile_memory_get(user_id)
+        if cached is not None:
+            return cached
+    profile: dict[str, Any] = {}
+    if redis_client is not None:
+        try:
+            loaded = await asyncio.to_thread(
+                _redis_get_json_sync,
+                _voxcpm2_profile_redis_key(user_id),
+                {},
+            )
+            if isinstance(loaded, dict):
+                profile = loaded
+        except Exception as exc:
+            logger.warning("VoxCPM2 profile Redis read failed user=%s: %s", user_id, exc)
+    normalized = _voxcpm2_normalize_profile(profile)
+    _voxcpm2_profile_memory_set(user_id, normalized)
+    return normalized
+
+
+async def _voxcpm2_profile_set(user_id: int, profile: dict[str, Any]) -> dict[str, Any]:
+    user_id = int(user_id)
+    normalized = _voxcpm2_normalize_profile(profile)
+    if not normalized.get("updated_at"):
+        normalized["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _voxcpm2_profile_memory_set(user_id, normalized)
+    if redis_client is not None:
+        try:
+            await asyncio.to_thread(
+                _redis_set_json_sync,
+                _voxcpm2_profile_redis_key(user_id),
+                normalized,
+                int(VOXCPM2_PROFILE_TTL_S),
+            )
+        except Exception as exc:
+            logger.warning("VoxCPM2 profile Redis write failed user=%s: %s", user_id, exc)
+    return normalized
+
+
+async def _voxcpm2_profile_delete(user_id: int) -> None:
+    user_id = int(user_id)
+    with _VOXCPM2_PROFILE_MEMORY_LOCK:
+        _VOXCPM2_PROFILE_MEMORY.pop(user_id, None)
+    if redis_client is not None:
+        with suppress(Exception):
+            await asyncio.to_thread(_redis_delete_sync, _voxcpm2_profile_redis_key(user_id))
+
+
+def _voxcpm2_reference_ready(profile: dict[str, Any] | None) -> bool:
+    return bool(isinstance(profile, dict) and str(profile.get("file_id") or "").strip())
+
+
+def _voxcpm2_profile_missing(profile: dict[str, Any] | None) -> list[str]:
+    normalized = _voxcpm2_normalize_profile(profile)
+    missing: list[str] = []
+    if not _voxcpm2_reference_ready(normalized):
+        missing.append("reference")
+    if (
+        normalized["mode"] == VOXCPM2_MODE_ULTIMATE
+        and not str(normalized.get("prompt_text") or "").strip()
+    ):
+        missing.append("prompt_text")
+    return missing
+
+
+def _voxcpm2_profile_ready(profile: dict[str, Any] | None) -> bool:
+    return not _voxcpm2_profile_missing(profile)
+
+
+def _voxcpm2_unavailable_reason(*, include_cooldown: bool = True) -> str:
+    """Return a Khmer explanation suitable for user-facing VoxCPM2 screens."""
+    if not VOXCPM2_ENABLED:
+        return "សេវា VoxCPM2 ត្រូវបានបិទដោយការកំណត់របស់ម៉ាស៊ីនមេ។"
+    if GradioClient is None:
+        return "ម៉ាស៊ីនមេមិនទាន់ដំឡើង gradio_client ទេ។"
+    if GradioHandleFile is None:
+        return "កំណែ gradio_client ចាស់ពេក និងមិនគាំទ្រការបញ្ចូលឯកសារ។"
+    if not VOXCPM2_SPACE:
+        return "អ្នកគ្រប់គ្រងមិនទាន់កំណត់ VOXCPM2_SPACE ទេ។"
+    if include_cooldown:
+        remaining = _voxcpm2_disabled_remaining_s() if "_voxcpm2_disabled_remaining_s" in globals() else 0
+        if remaining > 0:
+            return f"សេវា VoxCPM2 កំពុងសម្រាកបណ្ដោះអាសន្ន។ សូមសាកម្ដងទៀតក្រោយ {remaining} វិនាទី។"
+    return ""
+
+
+def _voxcpm2_reference_suffix(filename: str, mime_type: str, fallback: str = ".ogg") -> str:
+    suffix = os.path.splitext(str(filename or ""))[1].lower()
+    if suffix in _AUDIO_EXTENSIONS:
+        return suffix
+    mt = str(mime_type or "").lower()
+    mapping = {
+        "audio/ogg": ".ogg", "audio/opus": ".opus", "audio/mpeg": ".mp3",
+        "audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/wav": ".wav",
+        "audio/x-wav": ".wav", "audio/flac": ".flac", "audio/aac": ".aac",
+        "video/mp4": ".mp4", "video/webm": ".webm",
+    }
+    return mapping.get(mt, fallback)
 
 # Optional Supabase column state. Older deployments may not have
 # user_prefs.tts_model yet, and PostgREST may keep a stale schema cache right
@@ -12640,36 +12251,30 @@ async def get_user_prefs_async(user_id: int) -> dict:
 _USER_LOCK_MAX = 5_000
 _user_locks: OrderedDict[int, asyncio.Lock] = OrderedDict()
 _user_locks_guard = threading.RLock()
-_tts_request_reservations: dict[int, int] = {}
+_tts_request_reservations: set[int] = set()
 _tts_request_reservations_guard = threading.RLock()
 
 
 def _reserve_tts_request(user_id: int) -> bool:
-    """Reserve a request while allowing immediate-mode tasks to stack safely."""
+    """Reserve the preparation window before the per-user async lock is held."""
 
     user_id = int(user_id)
     lock = _get_user_lock(user_id)
     with _tts_request_reservations_guard:
-        current = _tts_request_reservations.get(user_id, 0)
-        if not BOT_IMMEDIATE_TASKS and (lock.locked() or current > 0):
+        if lock.locked() or user_id in _tts_request_reservations:
             return False
-        _tts_request_reservations[user_id] = current + 1
+        _tts_request_reservations.add(user_id)
         return True
 
 
 def _release_tts_request(user_id: int) -> None:
     with _tts_request_reservations_guard:
-        user_id = int(user_id)
-        remaining = _tts_request_reservations.get(user_id, 0) - 1
-        if remaining > 0:
-            _tts_request_reservations[user_id] = remaining
-        else:
-            _tts_request_reservations.pop(user_id, None)
+        _tts_request_reservations.discard(int(user_id))
 
 
 def _tts_request_reserved(user_id: int) -> bool:
     with _tts_request_reservations_guard:
-        return _tts_request_reservations.get(int(user_id), 0) > 0
+        return int(user_id) in _tts_request_reservations
 
 
 def _evict_idle_user_locks() -> int:
@@ -13121,7 +12726,7 @@ async def _periodic_temp_sweep(stop_event: asyncio.Event) -> None:
 # Database helpers — user prefs
 # ---------------------------------------------------------------------------
 _USER_SYNC_TTL = _env_float("USER_SYNC_TTL_S", float(_perf_default("USER_SYNC_TTL_S", 1800.0)), minimum=60.0, maximum=86400.0)
-_USER_SYNC_MAX = _env_int("USER_SYNC_MAX", int(resource_default("USER_SYNC_MAX", 20_000)), minimum=1000, maximum=500_000)
+_USER_SYNC_MAX = _env_int("USER_SYNC_MAX", 20_000, minimum=1000, maximum=500_000)
 _user_sync_seen: OrderedDict[int, float] = OrderedDict()
 _user_sync_seen_lock = threading.RLock()
 
@@ -13444,7 +13049,7 @@ def update_user_tts_model(user_id: int, tts_model: str) -> str:
 _rls_warned = False
 
 # Fast cache for callback buttons: memory -> Redis -> Supabase.
-_TEXT_CACHE_MEMORY_MAX = _env_int("TEXT_CACHE_MEMORY_MAX", int(resource_default("TEXT_CACHE_MEMORY_MAX", 20_000)), minimum=500, maximum=200_000)
+_TEXT_CACHE_MEMORY_MAX = 20_000
 _TEXT_CACHE_MEMORY_TTL_S = _env_float("TEXT_CACHE_MEMORY_TTL_S", 3600.0, minimum=60.0, maximum=86400.0)
 _text_cache_memory: OrderedDict[tuple[int, int], tuple[str, float]] = OrderedDict()
 _TEXT_CACHE_MEMORY_LOCK = threading.RLock()
@@ -13771,17 +13376,18 @@ def ensure_tts_model_column() -> None:
 def startup_self_check() -> None:
     """Log actionable setup problems once at startup without crashing the bot."""
     checks: list[str] = []
-    redis_enabled = _redis_enabled()
     if not TELEGRAM_BOT_TOKEN:
         checks.append("TELEGRAM_BOT_TOKEN is missing")
     if not ADMIN_IDS:
         checks.append("ADMIN_IDS is empty; admin-only commands will reject everyone")
     if not _web_admin_password() and _web_admin_enabled():
         checks.append("ADMIN_WEB_PASSWORD / WEB_ADMIN_PASSWORD is missing; /admin web dashboard is locked")
-    if redis_enabled and not _web_stable_secret_configured():
-        checks.append("Redis WEB_SECRET_KEY is not available; set REDIS_URL so web admin sessions persist across restarts/two servers")
+    if _web_session_secret_source() == "process-local":
+        checks.append("WEB_SECRET_KEY and TELEGRAM_BOT_TOKEN are both unavailable; web admin sessions will reset after restart")
     if supabase and not os.environ.get("SUPABASE_SERVICE_ROLE_KEY"):
         checks.append("SUPABASE_SERVICE_ROLE_KEY is not set; admin tables may fail under RLS/publishable key")
+    if supabase and not SUPABASE_DB_POOLER_URL:
+        checks.append("SUPABASE_DB_POOLER_URL is not set; direct PostgreSQL workloads should use the Supabase pooler/Supavisor transaction URL on port 6543")
     if BOT_MODE == "WEBHOOK" and not TELEGRAM_WEBHOOK_URL:
         checks.append("BOT_MODE=WEBHOOK but TELEGRAM_WEBHOOK_URL is missing; /telegram-webhook will receive updates only after setWebhook is configured")
     if AI_PROVIDER == "hf" and not HF_TOKEN:
@@ -13796,8 +13402,10 @@ def startup_self_check() -> None:
         checks.append("gradio_client is missing; Khmer HF Space TTS will fall back to Edge. Add `gradio_client` to requirements.txt")
     if _should_try_hf_khmer_tts("សាកល្បង", "hf_space") and not HF_TTS_SPACE:
         checks.append("HF_TTS_SPACE is empty; Khmer HF Space TTS is disabled")
-    if redis_enabled and not REDIS_URL:
-        checks.append("REDIS_URL is missing; cache/history fallback will use memory + Supabase only")
+    if VOXCPM2_ENABLED and (GradioClient is None or GradioHandleFile is None):
+        checks.append("VoxCPM2 requires a Gradio 6-compatible client with handle_file. Add `gradio_client>=2,<3` to requirements.txt")
+    if VOXCPM2_ENABLED and not VOXCPM2_SPACE:
+        checks.append("VOXCPM2_SPACE is empty; VoxCPM2 controllable cloning is unavailable")
 
     if checks:
         logger.warning("Startup self-check warnings:\n- %s", "\n- ".join(checks))
@@ -13846,8 +13454,6 @@ BOT_SETTING_DEFAULTS: dict[str, str] = {
     "audio_transcribe_enabled": "1",
     "audio_to_voice_enabled": "1",
     "ai_resolver_enabled": "1",
-    WELCOME_MESSAGE_SETTING_KEY: WELCOME_TEXT,
-    WELCOME_IMAGE_SETTING_KEY: "",
     **{key: str(_perf_default(key, spec.get("default", ""))) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 BOT_SETTING_LABELS: dict[str, str] = {
@@ -13858,8 +13464,6 @@ BOT_SETTING_LABELS: dict[str, str] = {
     "audio_transcribe_enabled": "🎵 Audio File Transcribe",
     "audio_to_voice_enabled": "🎙️ MP3/Audio → Voice Record",
     "ai_resolver_enabled": "🧠 AI Text Resolver",
-    WELCOME_MESSAGE_SETTING_KEY: "👋 Welcome Message",
-    WELCOME_IMAGE_SETTING_KEY: "🖼️ Welcome Image",
     **{key: str(spec.get("label", key)) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 BOT_SETTING_DESCRIPTIONS: dict[str, str] = {
@@ -13870,8 +13474,6 @@ BOT_SETTING_DESCRIPTIONS: dict[str, str] = {
     "audio_transcribe_enabled": "Allow uploaded audio-file transcription.",
     "audio_to_voice_enabled": "Convert uploaded MP3/audio files to Telegram OGG/Opus voice records.",
     "ai_resolver_enabled": "Allow AI to rewrite/resolve text before TTS when enabled by env.",
-    WELCOME_MESSAGE_SETTING_KEY: "Message shown by /start and /help.",
-    WELCOME_IMAGE_SETTING_KEY: "Optional Telegram image shown by /start and /help.",
     **{key: str(spec.get("help", "")) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 _SETTINGS_CACHE_TTL_S = _env_float("BOT_SETTINGS_CACHE_TTL_S", 30.0, minimum=0.0, maximum=3600.0)
@@ -13886,7 +13488,7 @@ _blocked_users_memory: set[int] = set()
 _blocked_user_cache: OrderedDict[int, tuple[bool, float]] = OrderedDict()
 _BLOCKED_USER_CACHE_LOCK = threading.RLock()
 _BLOCKED_USER_CACHE_TTL_S = 60.0
-_BLOCKED_USER_CACHE_MAX = _env_int("BLOCKED_USER_CACHE_MAX", int(resource_default("BLOCKED_USER_CACHE_MAX", 20_000)), minimum=500, maximum=200_000)
+_BLOCKED_USER_CACHE_MAX = 20_000
 
 _RUNTIME_METRICS: OrderedDict[str, int] = OrderedDict([
     ("tts", 0),
@@ -13898,6 +13500,7 @@ _RUNTIME_METRICS: OrderedDict[str, int] = OrderedDict([
     ("disabled_hits", 0),
     ("admin_denied", 0),
     ("replay_dropped", 0),
+    ("busy_rejected", 0),
     ("errors", 0),
 ])
 
@@ -13965,7 +13568,7 @@ def _coerce_bot_perf_setting(key: str, raw: Any) -> Any:
             raise ValueError(f"Minimum is {spec['min']}.")
         if "max" in spec and value > int(spec["max"]):
             raise ValueError(f"Maximum is {spec['max']}.")
-        return resource_value(key, value)
+        return value
     if kind == "float":
         try:
             value = float(str(raw).strip())
@@ -13975,7 +13578,7 @@ def _coerce_bot_perf_setting(key: str, raw: Any) -> Any:
             raise ValueError(f"Minimum is {spec['min']}.")
         if "max" in spec and value > float(spec["max"]):
             raise ValueError(f"Maximum is {spec['max']}.")
-        return resource_value(key, value)
+        return value
     return str(raw).strip()
 
 
@@ -14037,33 +13640,6 @@ async def get_bot_settings_async(force: bool = False) -> tuple[dict[str, str], d
     return data, status
 
 
-def _normalize_welcome_message(value: Any) -> str:
-    """Return a bounded plain-text welcome message."""
-    return _normalize_welcome_message_service(value, default_text=WELCOME_TEXT)
-
-
-def _normalize_welcome_image_file_id(value: Any) -> str:
-    """Return a bounded Telegram photo file ID or an empty string."""
-    return _normalize_welcome_image_file_id_service(value)
-
-
-async def get_welcome_content_async(force: bool = False) -> tuple[str, str]:
-    settings, _status = await get_bot_settings_async(force=force)
-    return (
-        _normalize_welcome_message(
-            settings.get(WELCOME_MESSAGE_SETTING_KEY, WELCOME_TEXT)
-        ),
-        _normalize_welcome_image_file_id(
-            settings.get(WELCOME_IMAGE_SETTING_KEY, "")
-        ),
-    )
-
-
-async def get_welcome_message_async(force: bool = False) -> str:
-    message, _image_file_id = await get_welcome_content_async(force=force)
-    return message
-
-
 def _cache_bot_setting_runtime_value(key: str, value: str) -> None:
     """Make a successful setting write visible to handlers immediately."""
     data = dict(BOT_SETTING_DEFAULTS)
@@ -14114,29 +13690,6 @@ def db_bot_setting_value_set(key: str, value: Any, admin_id: int) -> tuple[bool,
         return True, "saved"
     except Exception as e:
         return False, str(e)
-
-
-def db_welcome_content_set(
-    message: Any | None,
-    image_file_id: Any | None,
-    admin_id: int,
-) -> tuple[bool, str]:
-    """Persist one or both welcome fields through the normal setting path."""
-    changes: list[tuple[str, str]] = []
-    if message is not None:
-        changes.append((WELCOME_MESSAGE_SETTING_KEY, _normalize_welcome_message(message)))
-    if image_file_id is not None:
-        changes.append((WELCOME_IMAGE_SETTING_KEY, _normalize_welcome_image_file_id(image_file_id)))
-    if not changes:
-        return True, "no changes"
-
-    details: list[str] = []
-    for key, value in changes:
-        ok, info = db_bot_setting_value_set(key, value, admin_id)
-        if not ok:
-            return False, f"{key}: {info}"
-        details.append(str(info))
-    return True, "; ".join(details)
 
 
 def db_bot_setting_set(key: str, enabled: bool, admin_id: int) -> tuple[bool, str]:
@@ -14370,7 +13923,7 @@ ADMIN_DETAIL_HISTORY_TURNS = _env_int("ADMIN_DETAIL_HISTORY_TURNS", 10, minimum=
 ADMIN_FULL_HISTORY_TURNS   = _env_int("ADMIN_FULL_HISTORY_TURNS", 50, minimum=10, maximum=100)
 ADMIN_HISTORY_PAGE_SIZE    = _env_int("ADMIN_HISTORY_PAGE_SIZE", 10, minimum=5, maximum=20)
 
-_HIST_CACHE_MAX_USERS = _env_int("HISTORY_CACHE_MAX_USERS", int(resource_default("HISTORY_CACHE_MAX_USERS", 5_000)), minimum=500, maximum=100_000)
+_HIST_CACHE_MAX_USERS = 5_000
 _HIST_CACHE_TURNS     = max(ADMIN_FULL_HISTORY_TURNS, 50)
 _hist_cache: OrderedDict[int, deque] = OrderedDict()
 _HIST_CACHE_LOCK = threading.RLock()
@@ -14484,57 +14037,31 @@ def db_history_append(user_id: int, role: str, content: str) -> None:
     _submit_db(_run)
 
 
-async def db_history_fetch(user_id: int, limit: int = CONV_HISTORY_LIMIT) -> list[dict]:
-    """Fetch conversation history with Redis cache and Supabase fallback (Async)."""
-    user_id = int(user_id)
-    cache_key = _hist_redis_key(user_id)
-    
-    # Try async Redis first
-    if redis_client_async:
-        try:
-            raw = await redis_client_async.get(cache_key)
-            if raw:
-                redis_rows = _json_loads_fast(raw)
-                if isinstance(redis_rows, list):
-                    return _hist_rows_normalized(redis_rows)[-limit:]
-        except Exception as e:
-            logger.warning("Async Redis history fetch failed: %s", e)
-    else:
-        redis_rows = _redis_get_json_sync(cache_key, default=None)
-        if isinstance(redis_rows, list) and redis_rows:
-            return _hist_rows_normalized(redis_rows)[-limit:]
+def db_history_fetch(user_id: int, limit: int = CONV_HISTORY_LIMIT) -> list[dict]:
+    redis_rows = _redis_get_json_sync(_hist_redis_key(user_id), default=None)
+    if isinstance(redis_rows, list) and redis_rows:
+        return _hist_rows_normalized(redis_rows)[-limit:]
 
-    if not supabase_async and not supabase:
+    if not supabase:
         return []
 
-    # Fallback to Supabase (prefer async)
-    async def _fetch():
-        if supabase_async:
-            return await supabase_async.table("conversation_history") \
-                .select("role, content, created_at") \
-                .eq("user_id", user_id) \
-                .order("created_at", desc=True) \
-                .limit(limit) \
-                .execute()
-        return supabase.table("conversation_history") \
-            .select("role, content, created_at") \
-            .eq("user_id", user_id) \
-            .order("created_at", desc=True) \
-            .limit(limit) \
-            .execute()
-
-    res = await db_call(f"history_fetch:{user_id}", _fetch, default=None, attempts=3)
+    res = db_call_sync(
+        f"history_fetch:{user_id}",
+        lambda: supabase.table("conversation_history")
+            .select("role, content, created_at")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute(),
+        default=None,
+        attempts=3,
+        critical=False,
+    )
 
     rows = list(reversed(getattr(res, "data", None) or [])) if res else []
     clean = _hist_rows_normalized(rows)[-limit:]
     if clean:
-        if redis_client_async:
-            try:
-                await redis_client_async.set(cache_key, _json_dumps_fast(clean).decode("utf-8"), ex=3600)
-            except Exception:
-                pass
-        else:
-            _hist_redis_save_sync(user_id, clean)
+        _hist_redis_save_sync(user_id, clean)
     return clean
 
 
@@ -14843,32 +14370,17 @@ async def _init_async_clients() -> None:
     the guarded DB executor. New FastAPI-native routes can use supabase_async
     when the installed supabase-py version exposes acreate_client().
     """
-    global supabase_async, redis_client_async
+    global supabase_async
     if not SB_URL or not SB_KEY or not _load_supabase_sdk() or acreate_client is None:
         supabase_async = None
-    else:
-        try:
-            maybe_client = acreate_client(SB_URL, SB_KEY)
-            supabase_async = await maybe_client if inspect.isawaitable(maybe_client) else maybe_client
-            logger.info("Async Supabase client initialised.")
-        except Exception as e:
-            supabase_async = None
-            logger.warning(f"Async Supabase init unavailable; using guarded sync DB executor: {e}")
-
-    if not REDIS_URL:
-        redis_client_async = None
-    else:
-        try:
-            import redis.asyncio as aioredis
-            redis_client_async = aioredis.from_url(
-                REDIS_URL,
-                max_connections=int(os.environ.get("REDIS_MAX_CONNECTIONS", 100)),
-                decode_responses=True,
-            )
-            logger.info("Async Redis client initialised.")
-        except Exception as e:
-            redis_client_async = None
-            logger.warning(f"Async Redis init unavailable: {e}")
+        return
+    try:
+        maybe_client = acreate_client(SB_URL, SB_KEY)
+        supabase_async = await maybe_client if inspect.isawaitable(maybe_client) else maybe_client
+        logger.info("Async Supabase client initialised.")
+    except Exception as e:
+        supabase_async = None
+        logger.warning(f"Async Supabase init unavailable; using guarded sync DB executor: {e}")
 
 # ---------------------------------------------------------------------------
 # TTS text resolver (history-aware)
@@ -14886,7 +14398,7 @@ async def resolve_tts_text(
     history = _hist_cache_get(user_id)
     if history is None:
         try:
-            db_rows = await db_history_fetch(user_id)
+            db_rows = await loop.run_in_executor(_DB_EXECUTOR, db_history_fetch, user_id)
             for row in db_rows:
                 _hist_cache_append(user_id, row.get("role", "user"), row.get("content", ""))
             history = db_rows
@@ -14985,7 +14497,9 @@ async def resolve_tts_text(
 
     async def _guarded_call():
         async with semaphore:
-            return await _gemini.aio.models.generate_content(model=GEMINI_MODEL, contents=combined)
+            def _call():
+                return _gemini.models.generate_content(model=GEMINI_MODEL, contents=combined)
+            return await loop.run_in_executor(_AI_EXECUTOR, _call)
 
     try:
         response = await asyncio.wait_for(_guarded_call(), timeout=CONV_RESOLVE_TIMEOUT_S)
@@ -15011,22 +14525,67 @@ async def resolve_tts_text(
 # ---------------------------------------------------------------------------
 # Distributed lock helpers — scheduler ownership across bot instances
 # ---------------------------------------------------------------------------
-_SUPABASE_LOCK_SERVICE = SupabaseLockService()
+def _lock_until_iso(ttl_s: int | float) -> str:
+    return _sched_iso(datetime.now(timezone.utc) + timedelta(seconds=max(1, int(ttl_s))))
 
 
 def db_lock_acquire(lock_key: str = _SCHED_LOCK_KEY, owner: str = _BOT_LOCK_OWNER, ttl_s: int = _SCHED_LOCK_TTL_S) -> bool:
-    """Acquire or renew the scheduler lease without tripping DB breakers."""
+    """Acquire or renew a lightweight Supabase lock.
+
+    This intentionally does NOT use db_call_sync, because a missing bot_locks
+    table should not trip the global Supabase circuit breaker and break the bot.
+
+    Flow:
+    1) renew if this process already owns the lock
+    2) steal only if locked_until is in the past
+    3) insert if the lock row does not exist yet
+    """
     if not _SCHED_LOCK_ENABLED:
         return True
     if not supabase:
         return not _SCHED_LOCK_REQUIRED
+
+    lock_key = str(lock_key or _SCHED_LOCK_KEY)
+    owner = str(owner or _BOT_LOCK_OWNER)[:240]
+    now_iso = _sched_iso()
+    until_iso = _lock_until_iso(ttl_s)
+    update = {"owner": owner, "locked_until": until_iso, "updated_at": now_iso}
+
     try:
-        return _SUPABASE_LOCK_SERVICE.acquire(
-            supabase,
-            str(lock_key or _SCHED_LOCK_KEY),
-            str(owner or _BOT_LOCK_OWNER),
-            ttl_s,
+        # Fast path: renew our own lock.
+        res = (
+            supabase.table("bot_locks")
+            .update(update)
+            .eq("lock_key", lock_key)
+            .eq("owner", owner)
+            .execute()
         )
+        if getattr(res, "data", None):
+            return True
+
+        # Safe takeover: only expired rows are updateable. Postgres re-checks
+        # this predicate after row locking, so two instances should not both win.
+        res = (
+            supabase.table("bot_locks")
+            .update(update)
+            .eq("lock_key", lock_key)
+            .lt("locked_until", now_iso)
+            .execute()
+        )
+        if getattr(res, "data", None):
+            return True
+
+        # First boot path: create the lock row. If another instance inserts
+        # first, the unique constraint fails and we simply do not own it.
+        try:
+            res = supabase.table("bot_locks").insert({"lock_key": lock_key, **update}).execute()
+            return bool(getattr(res, "data", None))
+        except Exception as insert_exc:
+            # Unique violation means another instance already owns/created it.
+            low = str(insert_exc).lower()
+            if "duplicate" in low or "23505" in low or "unique" in low:
+                return False
+            raise
     except Exception as exc:
         _log_once(
             logging.WARNING,
@@ -15041,11 +14600,14 @@ def db_lock_release(lock_key: str = _SCHED_LOCK_KEY, owner: str = _BOT_LOCK_OWNE
     if not _SCHED_LOCK_ENABLED or not supabase:
         return True
     try:
-        return _SUPABASE_LOCK_SERVICE.release(
-            supabase,
-            str(lock_key),
-            str(owner),
+        res = (
+            supabase.table("bot_locks")
+            .delete()
+            .eq("lock_key", str(lock_key))
+            .eq("owner", str(owner)[:240])
+            .execute()
         )
+        return bool(getattr(res, "data", None))
     except Exception as exc:
         _log_once(logging.WARNING, "sched_lock_release_failed", "Scheduler lock release failed: %s", exc)
         return False
@@ -15055,7 +14617,15 @@ def db_lock_read(lock_key: str = _SCHED_LOCK_KEY) -> dict | None:
     if not supabase:
         return None
     try:
-        return _SUPABASE_LOCK_SERVICE.read(supabase, str(lock_key))
+        res = (
+            supabase.table("bot_locks")
+            .select("lock_key, owner, locked_until, updated_at")
+            .eq("lock_key", str(lock_key))
+            .limit(1)
+            .execute()
+        )
+        rows = list(getattr(res, "data", None) or [])
+        return rows[0] if rows else None
     except Exception:
         return None
 
@@ -15064,20 +14634,46 @@ def db_named_lock_acquire(lock_key: str, owner: str, ttl_s: int | float) -> bool
     """Acquire/renew a named lock in Supabase without depending on scheduler flags."""
     if not supabase:
         return False
+    lock_key = str(lock_key or "lock")[:240]
+    owner = str(owner or "unknown")[:240]
+    now_iso = _sched_iso()
+    until_iso = _lock_until_iso(ttl_s)
+    update = {"owner": owner, "locked_until": until_iso, "updated_at": now_iso}
     try:
-        return _SUPABASE_LOCK_SERVICE.acquire(
-            supabase,
-            str(lock_key or "lock"),
-            str(owner or "unknown"),
-            ttl_s,
+        res = (
+            supabase.table("bot_locks")
+            .update(update)
+            .eq("lock_key", lock_key)
+            .eq("owner", owner)
+            .execute()
         )
+        if getattr(res, "data", None):
+            return True
+
+        res = (
+            supabase.table("bot_locks")
+            .update(update)
+            .eq("lock_key", lock_key)
+            .lt("locked_until", now_iso)
+            .execute()
+        )
+        if getattr(res, "data", None):
+            return True
+
+        try:
+            res = supabase.table("bot_locks").insert({"lock_key": lock_key, **update}).execute()
+            return bool(getattr(res, "data", None))
+        except Exception as insert_exc:
+            low = str(insert_exc).lower()
+            if "duplicate" in low or "23505" in low or "unique" in low:
+                return False
+            raise
     except Exception as exc:
-        safe_key = str(lock_key or "lock")[:240]
         _log_once(
             logging.WARNING,
-            f"named_lock_unavailable:{safe_key}:{type(exc).__name__}:{str(exc)[:120]}",
+            f"named_lock_unavailable:{lock_key}:{type(exc).__name__}:{str(exc)[:120]}",
             "Named distributed lock unavailable key=%s error=%s",
-            safe_key,
+            lock_key,
             exc,
         )
         return False
@@ -15087,7 +14683,14 @@ def db_named_lock_release(lock_key: str, owner: str) -> bool:
     if not supabase:
         return False
     try:
-        return _SUPABASE_LOCK_SERVICE.release(supabase, lock_key, owner)
+        res = (
+            supabase.table("bot_locks")
+            .delete()
+            .eq("lock_key", str(lock_key)[:240])
+            .eq("owner", str(owner)[:240])
+            .execute()
+        )
+        return bool(getattr(res, "data", None))
     except Exception as exc:
         _log_once(logging.WARNING, f"named_lock_release_failed:{lock_key}", "Named lock release failed key=%s: %s", lock_key, exc)
         return False
@@ -15097,20 +14700,10 @@ def db_named_lock_release(lock_key: str, owner: str) -> bool:
 # Telegram active-owner lease for two Render Web Services
 # ---------------------------------------------------------------------------
 def _telegram_leader_lock_enabled() -> bool:
-    if (
-        _wispbyte_runtime_detected()
-        and "TELEGRAM_ACTIVE_LOCK_ENABLED" not in os.environ
-    ):
-        return False
     return bool(globals().get("TELEGRAM_ACTIVE_LOCK_ENABLED", False))
 
 
 def _telegram_leader_require_store() -> bool:
-    if (
-        _wispbyte_runtime_detected()
-        and "TELEGRAM_ACTIVE_LOCK_REQUIRED" not in os.environ
-    ):
-        return False
     return bool(globals().get("TELEGRAM_ACTIVE_LOCK_REQUIRED", False))
 
 
@@ -15171,113 +14764,82 @@ def _telegram_leader_store_available() -> bool:
     return bool(globals().get("redis_client") is not None or globals().get("supabase") is not None)
 
 
-def _telegram_leader_failure_is_transient() -> bool:
-    error = str(globals().get("_TELEGRAM_LEADER_LAST_ERROR", "") or "")
-    return error.startswith(("redis:", "supabase:unavailable", "no_store"))
-
-
-def _telegram_leader_grace_remaining(now: float | None = None) -> float:
-    """Return safe lease time remaining after a transient store failure."""
-    if not bool(globals().get("_TELEGRAM_LEADER_OWNED", False)):
-        return 0.0
-    last_renew = float(
-        globals().get("_TELEGRAM_LEADER_LAST_RENEW_AT", 0.0) or 0.0
-    )
-    if last_renew <= 0:
-        return 0.0
-    current = time.monotonic() if now is None else float(now)
-    # Stop before the database lease can expire to avoid overlapping owners.
-    safe_deadline = last_renew + _telegram_leader_ttl_s() - 5.0
-    return max(0.0, safe_deadline - current)
-
-
-async def _telegram_leader_acquire() -> bool:
-    """Acquire/renew active Telegram ownership (Async). Redis is preferred; Supabase is fallback."""
+def _telegram_leader_acquire_sync() -> bool:
+    """Acquire/renew active Telegram ownership. Redis is preferred; Supabase is fallback."""
     global _TELEGRAM_LEADER_LAST_ERROR
     if not _telegram_leader_lock_enabled():
         return True
 
     owner = _telegram_leader_owner_id()
     ttl = _telegram_leader_ttl_s()
-    leader_store = str(os.environ.get("TELEGRAM_LEADER_STORE", "auto")).lower().strip()
 
-    # 1. Try Redis (prefer async client)
-    r_client = redis_client_async or redis_client
-    if r_client is not None and leader_store in {"auto", "redis"}:
+    if redis_client is not None:
         key = _telegram_leader_redis_lock_key()
         meta_key = _telegram_leader_redis_meta_key()
         try:
-            # Atomic SET NX
-            if hasattr(r_client, "set"):
-                if inspect.iscoroutinefunction(r_client.set):
-                    ok = await r_client.set(key, owner, ex=ttl, nx=True)
-                else:
-                    ok = r_client.set(key, owner, ex=ttl, nx=True)
+            ok = redis_call_sync(
+                "telegram_leader_set_nx",
+                lambda: redis_client.set(key, owner, ex=ttl, nx=True),
+                default=False,
+                attempts=2,
+                critical=False,
+            )
+            current = None
+            if ok:
+                current = owner
             else:
-                ok = False
-
-            current = owner if ok else None
-            if not ok:
-                if hasattr(r_client, "get"):
-                    if inspect.iscoroutinefunction(r_client.get):
-                        current = await r_client.get(key)
-                    else:
-                        current = r_client.get(key)
+                current = redis_call_sync(
+                    "telegram_leader_get",
+                    lambda: redis_client.get(key),
+                    default=None,
+                    attempts=2,
+                    critical=False,
+                )
                 if isinstance(current, bytes):
                     current = current.decode("utf-8", errors="ignore")
 
             if hmac.compare_digest(str(current or ""), owner):
-                # Renew
-                meta = _json_dumps_fast(_telegram_leader_meta()).decode("utf-8")
-                if inspect.iscoroutinefunction(r_client.expire):
-                    await r_client.expire(key, ttl)
-                    await r_client.set(meta_key, meta, ex=ttl)
-                else:
-                    r_client.expire(key, ttl)
-                    r_client.set(meta_key, meta, ex=ttl)
+                # Renew only if the lock still belongs to this process.
+                redis_call_sync(
+                    "telegram_leader_expire",
+                    lambda: redis_client.expire(key, ttl),
+                    default=False,
+                    attempts=2,
+                    critical=False,
+                )
+                redis_call_sync(
+                    "telegram_leader_meta",
+                    lambda: redis_client.set(meta_key, _json_dumps_fast(_telegram_leader_meta()).decode("utf-8"), ex=ttl),
+                    default=False,
+                    attempts=1,
+                    critical=False,
+                )
                 _TELEGRAM_LEADER_LAST_ERROR = ""
                 return True
             _TELEGRAM_LEADER_LAST_ERROR = f"owned_by:{str(current or '')[:120]}"
             return False
         except Exception as exc:
-            _TELEGRAM_LEADER_LAST_ERROR = f"redis:{type(exc).__name__}"
+            _TELEGRAM_LEADER_LAST_ERROR = f"redis:{type(exc).__name__}:{str(exc)[:160]}"
             _log_once(logging.WARNING, "telegram_leader_redis_failed", "Telegram leader Redis lock failed: %s", exc)
 
-    # 2. Try Supabase (prefer async client)
-    s_client = supabase_async or supabase
-    if s_client is not None and leader_store in {"auto", "supabase"}:
-        lock_key = _telegram_leader_lock_key()
-
-        async def _db_acquire():
-            if supabase_async:
-                # Use the stored procedure for atomic lock
-                res = await supabase_async.rpc(
-                    "acquire_bot_lock",
-                    {
-                        "p_lock_key": lock_key,
-                        "p_owner": owner,
-                        "p_ttl_seconds": ttl,
-                    },
-                ).execute()
-                return bool(getattr(res, "data", False))
-            return db_named_lock_acquire(lock_key, owner, ttl)
-
-        ok = await db_call(
-            "leader_acquire",
-            _db_acquire,
-            default=None,
-            attempts=2,
-        )
-        if ok is None:
-            _TELEGRAM_LEADER_LAST_ERROR = "supabase:unavailable"
-            return False
+    if supabase is not None:
+        ok = db_named_lock_acquire(_telegram_leader_lock_key(), owner, ttl)
         _TELEGRAM_LEADER_LAST_ERROR = "" if ok else "supabase:not_owner"
         return bool(ok)
 
-    _TELEGRAM_LEADER_LAST_ERROR = "no_store"
+    _TELEGRAM_LEADER_LAST_ERROR = "no_redis_or_supabase"
     if _telegram_leader_require_store():
+        _log_once(
+            logging.ERROR,
+            "telegram_leader_no_store_required",
+            "Two-server Telegram mode requires REDIS_URL or Supabase bot_locks table. This instance stays standby.",
+        )
         return False
-    _TELEGRAM_LEADER_LAST_ERROR = ""
+    _log_once(
+        logging.WARNING,
+        "telegram_leader_no_store_single",
+        "Telegram leader lock store unavailable; continuing as single active instance because TELEGRAM_ACTIVE_LOCK_REQUIRED=0.",
+    )
     return True
 
 
@@ -15315,14 +14877,6 @@ def _telegram_leader_release_sync() -> bool:
     elif supabase is not None:
         released = db_named_lock_release(_telegram_leader_lock_key(), owner)
     return bool(released)
-
-
-async def _telegram_leader_release() -> bool:
-    """Release the active-owner lock without blocking the event loop."""
-    return await asyncio.get_running_loop().run_in_executor(
-        _DB_EXECUTOR,
-        _telegram_leader_release_sync,
-    )
 
 
 def _telegram_leader_snapshot() -> dict[str, Any]:
@@ -15381,34 +14935,6 @@ def _telegram_webhook_signature() -> tuple[Any, ...]:
     )
 
 
-async def _clean_memory_caches_task():
-    """Periodically clear expired entries from in-memory caches to prevent leaks."""
-    while True:
-        try:
-            await asyncio.sleep(60)
-            now = time.time()
-            now_mono = time.monotonic()
-            
-            # 1. Clean Rate Limit Memory
-            with _RATE_LIMIT_MEMORY_LOCK:
-                with _RATE_LIMIT_MEMORY_THREAD_LOCK:
-                    stale_keys = [
-                        k for k, dq in _RATE_LIMIT_MEMORY.items() 
-                        if not dq or dq[-1] < (now - 600) # 10 min stale
-                    ]
-                    for k in stale_keys:
-                        _RATE_LIMIT_MEMORY.pop(k, None)
-            
-            # 2. Clean Webhook Replay Memory
-            with _WEBHOOK_UPDATE_MEMORY_LOCK:
-                ttl = _webhook_replay_ttl_seconds()
-                _trim_webhook_memory_locked(now_mono, ttl)
-                
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error("Memory cleanup task error: %s", e)
-
 async def _telegram_leader_refresh_once(app_obj: Any | None = None) -> bool:
     """Renew/acquire Telegram active ownership and configure webhook once per owner."""
     global _TELEGRAM_LEADER_OWNED, _TELEGRAM_LEADER_LAST_CHANGE_AT, _TELEGRAM_LEADER_LAST_RENEW_AT
@@ -15443,19 +14969,10 @@ async def _telegram_leader_refresh_once(app_obj: Any | None = None) -> bool:
 
         return True
 
-    acquired = await _telegram_leader_acquire()
+    loop = asyncio.get_running_loop()
+    acquired = await loop.run_in_executor(None, _telegram_leader_acquire_sync)
     now = time.monotonic()
     if not acquired:
-        grace_remaining = _telegram_leader_grace_remaining(now)
-        if _telegram_leader_failure_is_transient() and grace_remaining > 0:
-            _log_once(
-                logging.WARNING,
-                "telegram_leader_renewal_grace",
-                "Telegram leader store is temporarily unavailable; retaining "
-                "active ownership for up to %.1fs within the current lease.",
-                grace_remaining,
-            )
-            return True
         if _TELEGRAM_LEADER_OWNED:
             webhook_logger.warning("This Render instance lost Telegram active ownership; switching to standby.")
             if app_obj is not None:
@@ -16305,7 +15822,6 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("⚡ Optimize", callback_data="admin_optimize")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings"),
          InlineKeyboardButton("🛠 Runtime", callback_data="admin_runtime")],
-        [InlineKeyboardButton("✏️ Edit Welcome Message", callback_data="admin_welcome_edit")],
         [InlineKeyboardButton("📄 Report", callback_data="admin_report"),
          InlineKeyboardButton("🔐 WEB_KEY", callback_data="admin_web_key")],
         [InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
@@ -16313,8 +15829,6 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔑 API Keys", callback_data="admin_api"),
          InlineKeyboardButton("🕘 History", callback_data="admin_history")],
         [InlineKeyboardButton("📱 Compact", callback_data="admin_compact"),
-         InlineKeyboardButton("🧹 Clean Redis", callback_data="admin_clean_redis")],
-        [InlineKeyboardButton("👷 Active Tasks", callback_data="admin_active_tasks"),
          InlineKeyboardButton("🔄 Refresh", callback_data="admin_home")],
         [InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ]
@@ -16367,7 +15881,7 @@ def get_admin_report_day_kb() -> InlineKeyboardMarkup:
 
 
 def generate_web_secret_key() -> str:
-    """Return a strong WEB_SECRET_KEY value for Redis-backed web sessions."""
+    """Return a strong candidate for an explicit WEB_SECRET_KEY override."""
     return _generate_web_secret_value()
 
 
@@ -16376,62 +15890,50 @@ def _web_secret_key_fingerprint(secret_value: str) -> str:
 
 
 def _configured_web_secret_source() -> tuple[str, str]:
-    """Return (source, value) for the configured web session secret.
+    """Return the active web-session secret source/value for admin diagnostics.
 
-    Redis is the only persistent source. This never exposes the secret to logs
-    or public API responses.
+    V4+ no longer stores the session key in Redis. The supported sources are an
+    explicit environment secret, a stable bot-token-derived secret, or a
+    process-local fallback when neither is configured.
     """
-    redis_value, redis_source = _web_secret_get_from_redis()
-    if redis_value:
-        return redis_source, redis_value
-    if _WEB_SESSION_SECRET_CACHE:
-        return _web_session_secret_source(), _WEB_SESSION_SECRET_CACHE
-    return "missing", ""
+    value = _web_session_secret_key()
+    return _web_session_secret_source(), value
 
 
 def _web_key_private_message(new_key: str) -> str:
-    stored_source, stored_value = _configured_web_secret_source()
-    stored_status = "stored in Redis" if stored_value else "missing"
-    active_source = _web_session_secret_source()
-    active_fp = _web_session_secret_fingerprint()
-    stored_fp = _web_secret_key_fingerprint(stored_value or new_key)
+    active_source, active_value = _configured_web_secret_source()
+    active_fp = _web_secret_key_fingerprint(active_value)
+    candidate_fp = _web_secret_key_fingerprint(new_key)
     generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     return (
-        "🔐 <b>New WEB_SECRET_KEY stored in Redis</b>\n\n"
-        "You do <b>not</b> need to put <code>WEB_SECRET_KEY</code> in Render/Railway env anymore. "
-        "Keep <code>REDIS_URL</code> configured so every backend server reads the same session secret.\n\n"
-        f"Redis key: <code>{html.escape(_web_secret_redis_key())}</code>\n"
-        f"Stored source: <code>{html.escape(stored_source)}</code>\n"
-        f"Stored status: <code>{html.escape(stored_status)}</code>\n"
-        f"Stored fingerprint: <code>{html.escape(stored_fp)}</code>\n"
-        f"Active running source: <code>{html.escape(active_source)}</code>\n"
-        f"Active running fingerprint: <code>{html.escape(active_fp)}</code>\n\n"
+        "🔐 <b>WEB_SECRET_KEY candidate</b>\n\n"
+        "V4.2 does not use Redis for web-session secrets. Your currently running "
+        f"secret source is <code>{html.escape(active_source)}</code> with fingerprint "
+        f"<code>{html.escape(active_fp)}</code>.\n\n"
+        "If you want an explicit independently rotatable key, set this value in the "
+        "backend environment and restart the single app service:\n\n"
+        f"<code>WEB_SECRET_KEY={html.escape(new_key)}</code>\n\n"
+        f"Candidate fingerprint: <code>{html.escape(candidate_fp)}</code>\n\n"
         "Important:\n"
-        "• Restart/deploy <b>all</b> backend instances after rotation so SessionMiddleware uses the Redis key.\n"
-        "• Existing admin browser sessions will be logged out after rotation.\n"
-        "• The raw secret is not shown because it is already persisted in Redis.\n"
-        "• Recommended cookie defaults are already in code: <code>WEB_COOKIE_SAMESITE=none</code>, <code>WEB_COOKIE_SECURE=true</code>.\n\n"
+        "• Keep this value private; it signs administrator browser sessions.\n"
+        "• Do not add REDIS_URL; Redis is not part of the supported runtime.\n"
+        "• The candidate is not active until WEB_SECRET_KEY is configured and the app restarts.\n"
+        "• Existing browser admin sessions will be invalid after the key changes.\n"
+        "• If the active source is telegram-token-derived, sessions are already stable across restarts while the bot token stays unchanged.\n\n"
         f"Generated UTC: <code>{html.escape(generated_at)}</code>"
     )
 
 
 async def _admin_generate_web_key(query, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Generate and store the web session secret in Redis from Telegram /admin.
+    """Generate a private explicit session-secret candidate for a Telegram admin.
 
-    The raw secret is not displayed.  The admin receives only fingerprints and
-    restart guidance, because Redis is now the source of truth.
+    Redis-backed rotation was removed with the single-process migration. The
+    candidate is delivered only to the administrator's private Telegram chat
+    and becomes active only after it is configured as WEB_SECRET_KEY + restart.
     """
     new_key = generate_web_secret_key()
     fingerprint = _web_secret_key_fingerprint(new_key)
-    ok, store_message = await asyncio.to_thread(_web_secret_set_in_redis_sync, new_key, overwrite=True)
-    if not ok:
-        await safe_send(lambda: query.message.edit_text(
-            f'⚠️ <b>រក្សាទុក WEB_KEY ក្នុង Redis មិនបានសម្រេច។</b>\n\nមូលហេតុ៖ <code>{html.escape(str(store_message)[:500])}</code>\n\nសូមកំណត់ <code>REDIS_URL</code> ជាមុន ចាប់ផ្ដើម Backend ឡើងវិញ ហើយចុច <b>WEB_KEY</b> ម្ដងទៀត។',
-            parse_mode="HTML",
-            reply_markup=get_admin_dashboard_kb(),
-            disable_web_page_preview=True,
-        ))
-        return
+    active_source = _web_session_secret_source()
     try:
         await context.bot.send_message(
             chat_id=int(user_id),
@@ -16441,26 +15943,37 @@ async def _admin_generate_web_key(query, user_id: int, context: ContextTypes.DEF
         )
     except Forbidden:
         await safe_send(lambda: query.message.edit_text(
-            '⚠️ <b>មិនអាចផ្ញើ WEB_KEY ជាឯកជនបានទេ។</b>\n\nសូមបើកការជជែកឯកជនជាមួយបូតនេះ ចុច /start បន្ទាប់មកត្រឡប់ទៅ /admin ហើយចុច <b>WEB_KEY</b> ម្ដងទៀត។\n\nសោត្រូវបានរក្សាទុកក្នុង Redis រួចហើយ។ សូមចាប់ផ្ដើមម៉ាស៊ីនមេ Backend ទាំងអស់ឡើងវិញ ដើម្បីអនុវត្តសោថ្មី។',
+            '⚠️ <b>មិនអាចផ្ញើ WEB_KEY ជាឯកជនបានទេ។</b>\n\nសូមបើកការជជែកឯកជនជាមួយបូតនេះ ចុច /start បន្ទាប់មកត្រឡប់ទៅ /admin ហើយចុច <b>WEB_KEY</b> ម្ដងទៀត។\n\nRedis មិនត្រូវបានប្រើទៀតទេ ហើយមិនមានសោណាមួយត្រូវបានរក្សាទុកដោយស្វ័យប្រវត្តិទេ។',
             parse_mode="HTML",
             reply_markup=get_admin_dashboard_kb(),
             disable_web_page_preview=True,
         ))
         return
     except Exception as exc:
-        logger.error("WEB_SECRET_KEY private delivery failed admin_id=%s fingerprint=%s: %s", user_id, fingerprint, exc, exc_info=True)
+        logger.error(
+            "WEB_SECRET_KEY candidate delivery failed admin_id=%s fingerprint=%s: %s",
+            user_id,
+            fingerprint,
+            exc,
+            exc_info=True,
+        )
         error_text = html.escape(str(exc)[:300])
         await safe_send(lambda: query.message.edit_text(
-            f'⚠️ <b>បានបង្កើត WEB_KEY ប៉ុន្តែមិនអាចផ្ញើបាន។</b>\n\nមូលហេតុ៖ <code>{error_text}</code>\n\nសោត្រូវបានរក្សាទុកក្នុង Redis រួចហើយ។ សូមចាប់ផ្ដើម Backend ទាំងអស់ឡើងវិញ ដើម្បីអនុវត្តសោនេះ។',
+            f'⚠️ <b>បានបង្កើត WEB_KEY ប៉ុន្តែមិនអាចផ្ញើបាន។</b>\n\nមូលហេតុ៖ <code>{error_text}</code>\n\nមិនមានសោណាមួយត្រូវបានរក្សាទុកទេ។ សូមសាកម្ដងទៀតពីការជជែកឯកជន។',
             parse_mode="HTML",
             reply_markup=get_admin_dashboard_kb(),
             disable_web_page_preview=True,
         ))
         return
 
-    logger.info("WEB_SECRET_KEY stored in Redis for admin_id=%s fingerprint=%s", user_id, fingerprint)
+    logger.info(
+        "WEB_SECRET_KEY candidate delivered admin_id=%s fingerprint=%s active_source=%s",
+        user_id,
+        fingerprint,
+        active_source,
+    )
     await safe_send(lambda: query.message.edit_text(
-        f'✅ <b>បានរក្សាទុក WEB_KEY ក្នុង Redis រួចរាល់។</b>\n\nខ្ញុំបានផ្ញើស្ថានភាព Redis និងការណែនាំចាប់ផ្ដើមប្រព័ន្ធឡើងវិញ ទៅការជជែក Telegram ឯកជនរបស់អ្នក។\nឥឡូវនេះមិនចាំបាច់កំណត់ <code>WEB_SECRET_KEY</code> ក្នុង Environment ទេ។ សូមចាប់ផ្ដើម ឬដាក់ប្រើ Backend ទាំងអស់ឡើងវិញ ដើម្បីប្រើសោ Redis ថ្មី។\n\nសោ Redis៖ <code>{html.escape(_web_secret_redis_key())}</code>\nស្នាមសម្គាល់៖ <code>{html.escape(fingerprint)}</code>',
+        f'✅ <b>បានបង្កើត WEB_KEY candidate រួចរាល់។</b>\n\nសោពេញត្រូវបានផ្ញើទៅការជជែកឯកជនរបស់អ្នក។ វា <b>មិនទាន់សកម្ម</b> និងមិនត្រូវបានរក្សាទុកក្នុង Redis/Supabase ទេ។\n\nដើម្បីប្រើវា សូមកំណត់ <code>WEB_SECRET_KEY</code> ក្នុង Environment ហើយ restart app service មួយ។\n\nActive source: <code>{html.escape(active_source)}</code>\nCandidate fingerprint: <code>{html.escape(fingerprint)}</code>',
         parse_mode="HTML",
         reply_markup=get_admin_dashboard_kb(),
         disable_web_page_preview=True,
@@ -17101,9 +16614,13 @@ def _detect_voice(text: str, gender: str) -> str:
 
 def _clean_tts_text_for_edge(text: str) -> str:
     """Remove hidden and control characters without rewriting user content."""
-    from app.services.ai.tts import clean_tts_text
-
-    return clean_tts_text(text)
+    text = (text or "")
+    for ch in ("\ufeff", "\u200b", "\u200c", "\u200d"):
+        text = text.replace(ch, "")
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text)
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def _tts_voice_candidates(text: str, gender: str) -> list[str]:
@@ -17184,6 +16701,18 @@ _HF_TTS_DISABLED_UNTIL = 0.0
 _HF_TTS_CLIENT = None
 _HF_TTS_CLIENT_KEY: tuple[str, str] | None = None
 
+# VoxCPM2 Gradio client state is separate from the Khmer HF Space client.
+_VOXCPM2_CLIENT_LOCK = threading.Lock()
+_VOXCPM2_CLIENT_CALL_LOCK = threading.Lock()
+_VOXCPM2_STATE_LOCK = threading.Lock()
+_VOXCPM2_CLIENT = None
+_VOXCPM2_CLIENT_KEY: tuple[str, str] | None = None
+_VOXCPM2_FAILURES = 0
+_VOXCPM2_DISABLED_UNTIL = 0.0
+_VOXCPM2_LAST_ERROR = ""
+_VOXCPM2_LAST_ERROR_AT = 0.0
+_VOXCPM2_LAST_SUCCESS_AT = 0.0
+_VOXCPM2_QUEUE_FULL_HITS = 0
 
 
 def _tts_provider_summary() -> str:
@@ -17191,6 +16720,7 @@ def _tts_provider_summary() -> str:
         f"provider={TTS_PROVIDER}, khmer={KHMER_TTS_PROVIDER}, "
         f"hf_space={HF_TTS_SPACE}{HF_TTS_API_NAME}, "
         f"gradio_client={'on' if GradioClient is not None else 'missing'}, "
+        f"voxcpm2={'on' if VOXCPM2_ENABLED else 'off'}:{VOXCPM2_SPACE}{VOXCPM2_API_NAME}, "
         f"edge_fallback={'on' if HF_TTS_EDGE_FALLBACK else 'off'}"
     )
 
@@ -18159,6 +17689,229 @@ async def _convert_uploaded_audio_to_telegram_voice(input_path: str, output_path
     return voice_bytes
 
 
+def _voxcpm2_disabled_remaining_s() -> int:
+    with _VOXCPM2_STATE_LOCK:
+        return max(0, int(_VOXCPM2_DISABLED_UNTIL - time.monotonic()))
+
+
+def _voxcpm2_is_temporarily_disabled() -> bool:
+    return _voxcpm2_disabled_remaining_s() > 0
+
+
+def _voxcpm2_reset_client_sync() -> None:
+    global _VOXCPM2_CLIENT, _VOXCPM2_CLIENT_KEY
+    with _VOXCPM2_CLIENT_LOCK:
+        _VOXCPM2_CLIENT = None
+        _VOXCPM2_CLIENT_KEY = None
+
+
+def _voxcpm2_record_success() -> None:
+    global _VOXCPM2_FAILURES, _VOXCPM2_DISABLED_UNTIL, _VOXCPM2_LAST_SUCCESS_AT
+    with _VOXCPM2_STATE_LOCK:
+        _VOXCPM2_FAILURES = 0
+        _VOXCPM2_DISABLED_UNTIL = 0.0
+        _VOXCPM2_LAST_SUCCESS_AT = time.monotonic()
+
+
+def _reset_voxcpm2_cooldown() -> None:
+    """Clear the circuit breaker without recording a synthetic success."""
+
+    global _VOXCPM2_FAILURES, _VOXCPM2_DISABLED_UNTIL
+    with _VOXCPM2_STATE_LOCK:
+        _VOXCPM2_FAILURES = 0
+        _VOXCPM2_DISABLED_UNTIL = 0.0
+
+
+def _voxcpm2_is_queue_full_error(exc: Exception | str) -> bool:
+    msg = str(exc).lower()
+    return any(token in msg for token in (
+        "queue is full",
+        "queue full",
+        "too many requests in queue",
+        "max queue",
+        "queue size",
+    ))
+
+
+def _voxcpm2_record_failure(exc: Exception | str) -> None:
+    """Apply a circuit breaker for repeated public-Space failures."""
+    global _VOXCPM2_FAILURES, _VOXCPM2_DISABLED_UNTIL, _VOXCPM2_LAST_ERROR, _VOXCPM2_LAST_ERROR_AT, _VOXCPM2_QUEUE_FULL_HITS
+    msg = str(exc).lower()
+    queue_full = _voxcpm2_is_queue_full_error(exc)
+    quota_error = any(token in msg for token in (
+        "quota", "daily limit", "gpu quota", "zero gpu", "zerogpu",
+        "resource exhausted", "exceeded your", "exceeded the",
+    ))
+    if queue_full:
+        cooldown = float(VOXCPM2_QUEUE_COOLDOWN_S)
+    elif quota_error:
+        cooldown = float(VOXCPM2_QUOTA_COOLDOWN_S)
+    else:
+        cooldown = float(VOXCPM2_COOLDOWN_S)
+    should_reset = any(token in msg for token in (
+        "connection", "timeout", "timed out", "502", "503", "504",
+        "server disconnected", "protocol", "transport",
+    ))
+    with _VOXCPM2_STATE_LOCK:
+        _VOXCPM2_FAILURES += 1
+        _VOXCPM2_LAST_ERROR = str(exc)[:500]
+        _VOXCPM2_LAST_ERROR_AT = time.monotonic()
+        if queue_full:
+            _VOXCPM2_QUEUE_FULL_HITS += 1
+        # Queue-full is not a broken reference or code bug; it is public Space
+        # capacity. Cool down immediately so all users do not keep submitting
+        # into the same full queue while the service is saturated.
+        if queue_full or quota_error or _VOXCPM2_FAILURES >= int(VOXCPM2_FAILURE_LIMIT):
+            _VOXCPM2_DISABLED_UNTIL = max(
+                _VOXCPM2_DISABLED_UNTIL,
+                time.monotonic() + cooldown,
+            )
+    if should_reset:
+        _voxcpm2_reset_client_sync()
+
+
+def _voxcpm2_force_cooldown(seconds: float) -> None:
+    global _VOXCPM2_DISABLED_UNTIL
+    seconds = max(1.0, float(seconds or 0.0))
+    with _VOXCPM2_STATE_LOCK:
+        _VOXCPM2_DISABLED_UNTIL = max(_VOXCPM2_DISABLED_UNTIL, time.monotonic() + seconds)
+
+
+def _voxcpm2_is_fallbackable_queue_error(exc: Exception | str) -> bool:
+    msg = str(exc).lower()
+    return (
+        _voxcpm2_is_queue_full_error(exc)
+        or ("voxcpm2" in msg and "cooldown active" in msg)
+        or ("voxcpm2" in msg and any(token in msg for token in ("queue", "busy", "temporarily")))
+    )
+
+
+def _voxcpm2_fallback_model_for_text(text: str) -> str:
+    # Khmer gets the Khmer HF provider first; other languages use Edge directly.
+    return "hf_space" if _detect_tts_lang_key(text or "") == "km" else "edge"
+
+
+def _voxcpm2_fallback_model_label(model: str) -> str:
+    key = _normalize_tts_model(model)
+    if key == "hf_space":
+        return "Kiri / Khmer TTS"
+    if key == "edge":
+        return "Edge TTS"
+    return TTS_MODEL_OPTIONS.get(key, TTS_MODEL_OPTIONS["auto"])[0]
+
+
+def _voxcpm2_fallback_notice_text(exc: Exception | str, fallback_model: str) -> str:
+    msg = str(exc).lower()
+    fallback_label = html.escape(_voxcpm2_fallback_model_label(fallback_model))
+    if _voxcpm2_is_queue_full_error(exc):
+        reason = "ជួរ VoxCPM2 ពេញ ព្រោះមានអ្នកប្រើច្រើន"
+    elif "cooldown" in msg:
+        reason = "VoxCPM2 កំពុងសម្រាកបណ្ដោះអាសន្ន"
+    elif "quota" in msg or "zerogpu" in msg or "zero gpu" in msg:
+        reason = "VoxCPM2 អស់ quota បណ្ដោះអាសន្ន"
+    else:
+        reason = "VoxCPM2 កំពុងរវល់"
+    return (
+        f"⚠️ <b>{reason}</b>។\n"
+        f"✅ Bot នឹងប្រើសំឡេងបម្រុង <b>{fallback_label}</b> ជំនួសសិន។\n"
+        "🔁 សូមសាក VoxCPM2 ម្តងទៀតក្រោយ 2–3 នាទី។"
+    )
+
+
+async def _send_voxcpm2_fallback_notice(bot: Any, chat_id: int | None, exc: Exception | str, fallback_model: str) -> None:
+    if not VOXCPM2_FALLBACK_NOTICE_ENABLED or bot is None or not chat_id:
+        return
+    text = _voxcpm2_fallback_notice_text(exc, fallback_model)
+    with suppress(Exception):
+        await safe_send(lambda: bot.send_message(
+            chat_id=int(chat_id),
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        ))
+
+
+def _voxcpm2_age_text(monotonic_ts: float) -> str:
+    if not monotonic_ts:
+        return "never"
+    age = max(0, int(time.monotonic() - float(monotonic_ts)))
+    if age < 60:
+        return f"{age}s ago"
+    if age < 3600:
+        return f"{age // 60}m {age % 60}s ago"
+    return f"{age // 3600}h {(age % 3600) // 60}m ago"
+
+
+def _voxcpm2_health_snapshot() -> dict[str, Any]:
+    with _VOXCPM2_STATE_LOCK:
+        remaining = max(0, int(_VOXCPM2_DISABLED_UNTIL - time.monotonic()))
+        failures = int(_VOXCPM2_FAILURES)
+        queue_hits = int(_VOXCPM2_QUEUE_FULL_HITS)
+        last_error = str(_VOXCPM2_LAST_ERROR or "")
+        last_error_at = float(_VOXCPM2_LAST_ERROR_AT or 0.0)
+        last_success_at = float(_VOXCPM2_LAST_SUCCESS_AT or 0.0)
+    if not VOXCPM2_ENABLED:
+        status = "OFF"
+    elif GradioClient is None or GradioHandleFile is None:
+        status = "MISSING DEPENDENCY"
+    elif remaining > 0 and _voxcpm2_is_queue_full_error(last_error):
+        status = "QUEUE FULL / COOLDOWN"
+    elif remaining > 0:
+        status = "COOLDOWN"
+    else:
+        status = "READY"
+    return {
+        "status": status,
+        "enabled": bool(VOXCPM2_ENABLED),
+        "cooldown_s": remaining,
+        "failures": failures,
+        "queue_full_hits": queue_hits,
+        "last_error": last_error,
+        "last_error_age": _voxcpm2_age_text(last_error_at),
+        "last_success_age": _voxcpm2_age_text(last_success_at),
+        "client_cached": bool(_VOXCPM2_CLIENT is not None),
+        "auto_fallback": bool(VOXCPM2_AUTO_FALLBACK_ON_QUEUE),
+    }
+
+
+def _voxcpm2_make_client_sync():
+    if not VOXCPM2_ENABLED:
+        raise RuntimeError("VoxCPM2 is disabled by VOXCPM2_ENABLED=false.")
+    if GradioHandleFile is None:
+        raise RuntimeError("gradio_client.handle_file is unavailable. Upgrade `gradio_client`.")
+    if not VOXCPM2_SPACE:
+        raise RuntimeError("VOXCPM2_SPACE is empty.")
+    return _make_gradio_client_sync(VOXCPM2_SPACE, VOXCPM2_TOKEN)
+
+
+def _voxcpm2_get_client_sync():
+    global _VOXCPM2_CLIENT, _VOXCPM2_CLIENT_KEY
+    if not VOXCPM2_CLIENT_CACHE:
+        return _voxcpm2_make_client_sync()
+    key = (VOXCPM2_SPACE, "token" if VOXCPM2_TOKEN else "public")
+    with _VOXCPM2_CLIENT_LOCK:
+        if _VOXCPM2_CLIENT is not None and _VOXCPM2_CLIENT_KEY == key:
+            return _VOXCPM2_CLIENT
+        _VOXCPM2_CLIENT = _voxcpm2_make_client_sync()
+        _VOXCPM2_CLIENT_KEY = key
+        return _VOXCPM2_CLIENT
+
+
+def _voxcpm2_should_retry(exc: Exception | str) -> bool:
+    msg = str(exc).lower()
+    if any(token in msg for token in (
+        "401", "403", "unauthorized", "forbidden", "invalid token",
+        "invalid api", "api_name", "not found", "reference audio is too long",
+        "cooldown active",
+    )):
+        return False
+    return any(token in msg for token in (
+        "429", "500", "502", "503", "504", "busy", "queue", "queued",
+        "timeout", "timed out", "temporarily", "connection", "cold start",
+        "backend_retry", "backend is busy", "backend request timed out",
+        "quota", "daily limit", "gpu quota", "zero gpu", "zerogpu",
+        "resource exhausted", "exceeded your", "exceeded the",
+    ))
 
 
 def _probe_audio_duration_seconds_sync(path: str) -> float:
@@ -18187,6 +17940,370 @@ def _probe_audio_duration_seconds_sync(path: str) -> float:
     return (int(hours) * 3600.0) + (int(minutes) * 60.0) + float(seconds)
 
 
+async def _validate_voxcpm2_reference_path(reference_path: str) -> float:
+    """Validate the actual downloaded reference, including document uploads."""
+    try:
+        size = await asyncio.to_thread(os.path.getsize, reference_path)
+    except OSError as exc:
+        raise RuntimeError(f"Could not inspect VoxCPM2 reference audio: {exc}") from exc
+    if size <= 0:
+        raise RuntimeError("VoxCPM2 reference audio is empty.")
+    if size > VOXCPM2_MAX_REFERENCE_BYTES:
+        raise RuntimeError(
+            f"VoxCPM2 reference audio is too large. "
+            f"Max {VOXCPM2_MAX_REFERENCE_BYTES // 1024 // 1024}MB."
+        )
+    duration = await asyncio.to_thread(_probe_audio_duration_seconds_sync, reference_path)
+    if duration > float(VOXCPM2_MAX_REFERENCE_SECONDS):
+        raise RuntimeError(
+            f"VoxCPM2 reference audio is too long ({duration:.1f}s). "
+            f"Max {VOXCPM2_MAX_REFERENCE_SECONDS:g}s."
+        )
+    return duration
+
+
+def _voxcpm2_api_inputs(
+    text: str,
+    control: str,
+    reference_upload: Any,
+    mode: str,
+    prompt_text: str,
+) -> tuple[Any, ...]:
+    """Build the official nine-input VoxCPM2 Gradio payload."""
+    normalized_mode = _voxcpm2_normalize_mode(mode)
+    use_prompt_text = normalized_mode == VOXCPM2_MODE_ULTIMATE
+    clean_prompt = str(prompt_text or "").strip() if use_prompt_text else ""
+    if use_prompt_text and not clean_prompt:
+        raise ValueError("Ultimate Cloning requires the reference-audio transcript.")
+    effective_control = "" if use_prompt_text else str(control or "").strip()
+    return (
+        str(text or "").strip(),
+        effective_control,
+        reference_upload,
+        use_prompt_text,
+        clean_prompt,
+        VOXCPM2_CFG_VALUE,
+        VOXCPM2_NORMALIZE_TEXT,
+        VOXCPM2_DENOISE_REFERENCE,
+        VOXCPM2_INFERENCE_TIMESTEPS,
+    )
+
+
+def _voxcpm2_predict_sync(
+    text: str,
+    control: str,
+    reference_path: str,
+    mode: str = VOXCPM2_MODE_CONTROLLABLE,
+    prompt_text: str = "",
+) -> bytes:
+    if not reference_path or not os.path.isfile(reference_path):
+        raise RuntimeError("VoxCPM2 reference audio is missing. Use /voxcpm2 to upload it again.")
+    remaining = _voxcpm2_disabled_remaining_s()
+    if remaining > 0:
+        raise RuntimeError(f"VoxCPM2 cooldown active ({remaining}s remaining).")
+    if os.path.getsize(reference_path) > VOXCPM2_MAX_REFERENCE_BYTES:
+        raise RuntimeError(
+            f"VoxCPM2 reference audio is too large. Max {VOXCPM2_MAX_REFERENCE_BYTES // 1024 // 1024}MB."
+        )
+    client = _voxcpm2_get_client_sync()
+
+    def _predict_once() -> bytes:
+        reference_upload = GradioHandleFile(reference_path)
+        api_inputs = _voxcpm2_api_inputs(
+            text,
+            control,
+            reference_upload,
+            mode,
+            prompt_text,
+        )
+
+        def _call():
+            return _gradio_predict_with_timeout_sync(
+                client,
+                *api_inputs,
+                api_name=VOXCPM2_API_NAME,
+                timeout_s=VOXCPM2_TIMEOUT_S,
+                label="VoxCPM2",
+            )
+        if VOXCPM2_SERIALIZE_CALLS:
+            with _VOXCPM2_CLIENT_CALL_LOCK:
+                result = _call()
+        else:
+            result = _call()
+
+        data = _extract_hf_audio_bytes_from_result(result)
+        if data:
+            return data
+        path_or_url = _extract_hf_audio_path_or_url(result)
+        if not path_or_url:
+            preview = _web_short(result, 300) if "_web_short" in globals() else str(result)[:300]
+            raise RuntimeError(
+                f"VoxCPM2 returned no valid audio. result_type={type(result).__name__} result={preview!r}"
+            )
+        data = _read_generated_audio_path_or_url_sync(
+            path_or_url,
+            max_bytes=MAX_AUDIO_FILE_BYTES,
+            timeout_s=VOXCPM2_TIMEOUT_S,
+            label="VoxCPM2",
+        )
+        if not data:
+            raise RuntimeError("VoxCPM2 returned empty audio.")
+        return data
+
+    last_exc: Exception | None = None
+    retries = max(1, int(VOXCPM2_RETRIES))
+    for attempt in range(1, retries + 1):
+        try:
+            data = _predict_once()
+            _voxcpm2_record_success()
+            return data
+        except Exception as exc:
+            last_exc = exc
+            retryable = _voxcpm2_should_retry(exc)
+            if attempt >= retries or not retryable:
+                if retryable:
+                    _voxcpm2_record_failure(exc)
+                raise
+            queue_full = _voxcpm2_is_queue_full_error(exc)
+            delay_s = (
+                min(float(VOXCPM2_QUEUE_RETRY_DELAY_S) * attempt, float(VOXCPM2_TIMEOUT_S))
+                if queue_full
+                else min(VOXCPM2_RETRY_DELAY_S * (2 ** (attempt - 1)), 30.0)
+            )
+            logger.warning(
+                "VoxCPM2 call failed attempt=%s/%s; retrying in %.1fs: %s",
+                attempt, retries, delay_s, exc,
+            )
+            if not queue_full:
+                _voxcpm2_reset_client_sync()
+                client = _voxcpm2_get_client_sync()
+            time.sleep(delay_s)
+    if last_exc is not None:
+        _voxcpm2_record_failure(last_exc)
+    raise RuntimeError(f"VoxCPM2 failed after retries: {last_exc}")
+
+
+async def _generate_voice_voxcpm2(
+    text: str,
+    control: str,
+    reference_path: str,
+    speed: float,
+    output_path: str,
+    *,
+    mode: str = VOXCPM2_MODE_CONTROLLABLE,
+    prompt_text: str = "",
+    validate_reference: bool = True,
+) -> bytes:
+    text = _clean_tts_text_for_edge(text)
+    if not text:
+        raise ValueError("VoxCPM2 target text must not be empty.")
+    if validate_reference:
+        await _validate_voxcpm2_reference_path(reference_path)
+    chunks = _split_text_chunks(text, max_chars=VOXCPM2_MAX_CHARS)
+    if not chunks:
+        raise ValueError("VoxCPM2 found no speakable text chunks.")
+    loop = asyncio.get_running_loop()
+    with tempfile.TemporaryDirectory(prefix="voxcpm2_tts_") as tmpdir:
+        input_paths: list[str] = []
+        for index, chunk in enumerate(chunks, 1):
+            try:
+                timeout_budget = (VOXCPM2_TIMEOUT_S * max(1, VOXCPM2_RETRIES)) + 30.0
+                audio_data = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        _AI_EXECUTOR,
+                        _voxcpm2_predict_sync,
+                        chunk,
+                        str(control or "").strip(),
+                        reference_path,
+                        _voxcpm2_normalize_mode(mode),
+                        str(prompt_text or "").strip(),
+                    ),
+                    timeout=timeout_budget,
+                )
+            except Exception as exc:
+                preview = chunk[:100].replace("\n", " ")
+                raise RuntimeError(
+                    f"VoxCPM2 failed at chunk {index}/{len(chunks)} ({preview!r}): {exc}"
+                ) from exc
+            suffix = _audio_suffix_from_bytes(audio_data)
+            source_path = os.path.join(tmpdir, f"chunk_{index:03d}{suffix}")
+            await asyncio.to_thread(_write_file_bytes_sync, source_path, audio_data)
+            input_paths.append(source_path)
+        converted = await _convert_audio_files_to_telegram_voice(input_paths, speed, output_path)
+        if not converted:
+            raise RuntimeError("VoxCPM2 produced empty converted audio.")
+        logger.info(
+            "VoxCPM2 %s cloning generated %s chunk(s) via %s%s control=%s transcript=%s",
+            _voxcpm2_normalize_mode(mode),
+            len(chunks),
+            VOXCPM2_SPACE,
+            VOXCPM2_API_NAME,
+            bool(str(control or "").strip()),
+            bool(str(prompt_text or "").strip()),
+        )
+        return converted
+
+
+def _voxcpm2_provider_context(profile: dict[str, Any]) -> str:
+    reference_id = str(
+        profile.get("file_unique_id")
+        or profile.get("file_id")
+        or profile.get("updated_at")
+        or ""
+    )
+    control = str(profile.get("control") or "").strip()
+    mode = _voxcpm2_normalize_mode(profile.get("mode"))
+    prompt_text = str(profile.get("prompt_text") or "").strip()
+    payload = {
+        "reference": reference_id,
+        "control": control,
+        "mode": mode,
+        "prompt_text": prompt_text,
+        "space": VOXCPM2_SPACE,
+        "api": VOXCPM2_API_NAME,
+        "cfg": VOXCPM2_CFG_VALUE,
+        "normalize": VOXCPM2_NORMALIZE_TEXT,
+        "denoise": VOXCPM2_DENOISE_REFERENCE,
+        "inference_timesteps": VOXCPM2_INFERENCE_TIMESTEPS,
+    }
+    return hashlib.sha256(
+        _json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+async def _prepare_voxcpm2_session(user_id: int, bot) -> dict[str, Any]:
+    """Download and validate one user's reference once for a generation batch."""
+    if not VOXCPM2_ENABLED:
+        raise RuntimeError("VoxCPM2 is disabled by VOXCPM2_ENABLED=false.")
+    remaining = _voxcpm2_disabled_remaining_s()
+    if remaining > 0:
+        raise RuntimeError(f"VoxCPM2 cooldown active ({remaining}s remaining).")
+
+    profile = await _voxcpm2_profile_get(user_id)
+    missing = _voxcpm2_profile_missing(profile)
+    if "reference" in missing:
+        raise RuntimeError(
+            "VoxCPM2 reference audio is not configured. "
+            "Use /voxcpm2 and upload a 5-30 second clean voice clip."
+        )
+    if "prompt_text" in missing:
+        raise RuntimeError(
+            "VoxCPM2 Ultimate Cloning requires the exact reference-audio transcript. "
+            "Use /voxcpm2 and add the transcript."
+        )
+
+    telegram_file = await safe_send(lambda: bot.get_file(str(profile.get("file_id"))))
+    if not telegram_file:
+        raise RuntimeError(
+            "Telegram could not retrieve the saved VoxCPM2 reference audio. "
+            "Upload it again with /voxcpm2."
+        )
+
+    suffix = str(profile.get("suffix") or ".ogg")
+    reference_path: str | None = None
+    try:
+        reference_path = await _download_telegram_file_to_temp_path(
+            telegram_file,
+            VOXCPM2_MAX_REFERENCE_BYTES,
+            suffix=suffix,
+        )
+        duration = await _validate_voxcpm2_reference_path(reference_path)
+        # Document uploads do not always expose Telegram duration metadata.
+        if duration > 0 and abs(float(profile.get("duration") or 0.0) - duration) > 0.05:
+            profile["duration"] = round(duration, 3)
+            profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+            await _voxcpm2_profile_set(user_id, profile)
+        return {
+            "profile": profile,
+            "reference_path": reference_path,
+            "control": str(profile.get("control") or "").strip(),
+            "mode": _voxcpm2_normalize_mode(profile.get("mode")),
+            "prompt_text": str(profile.get("prompt_text") or "").strip(),
+            "provider_context": _voxcpm2_provider_context(profile),
+        }
+    except Exception:
+        if reference_path:
+            _cleanup(reference_path)
+        raise
+
+
+def _cleanup_voxcpm2_session(session_data: dict[str, Any] | None) -> None:
+    if not isinstance(session_data, dict):
+        return
+    reference_path = str(session_data.get("reference_path") or "")
+    if reference_path:
+        _cleanup(reference_path)
+        session_data["reference_path"] = ""
+
+
+async def _generate_user_voice_voxcpm2_session(
+    text: str,
+    gender: str,
+    speed: float,
+    output_path: str,
+    session_data: dict[str, Any],
+) -> bytes:
+    cleaned = _clean_tts_text_for_edge(text)
+    if not cleaned:
+        raise ValueError("VoxCPM2 target text must not be empty.")
+    reference_path = str(session_data.get("reference_path") or "")
+    if not reference_path or not await asyncio.to_thread(os.path.isfile, reference_path):
+        raise RuntimeError("VoxCPM2 reference session expired. Upload the reference again.")
+
+    provider_context = str(session_data.get("provider_context") or "")
+    control = str(session_data.get("control") or "").strip()
+    mode = _voxcpm2_normalize_mode(session_data.get("mode"))
+    prompt_text = str(session_data.get("prompt_text") or "").strip()
+    cache_key = _tts_audio_cache_key(
+        cleaned,
+        gender,
+        speed,
+        "voxcpm2",
+        provider_context=provider_context,
+    )
+    cached = _tts_audio_cache_get(cache_key)
+    if cached is not None:
+        await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
+        return cached
+
+    from app.services.ai.providers import get_provider_manager
+
+    provider_manager = get_provider_manager()
+
+    async def render() -> bytes:
+        started = time.perf_counter()
+        try:
+            generated = await _generate_voice_voxcpm2(
+                cleaned,
+                control,
+                reference_path,
+                speed,
+                output_path,
+                mode=mode,
+                prompt_text=prompt_text,
+                validate_reference=False,
+            )
+        except Exception as exc:
+            provider_manager.record_failure("voxcpm2", exc)
+            raise
+        provider_manager.record_success(
+            "voxcpm2",
+            (time.perf_counter() - started) * 1_000,
+        )
+        return generated
+
+    sem = _TTS_CHUNK_SEMAPHORE
+    if sem is None:
+        audio = await render()
+    else:
+        async with sem:
+            cached = _tts_audio_cache_get(cache_key)
+            if cached is not None:
+                await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
+                return cached
+            audio = await render()
+    _tts_audio_cache_set(cache_key, audio)
+    return audio
 
 
 async def generate_user_voice_limited(
@@ -18198,13 +18315,80 @@ async def generate_user_voice_limited(
     *,
     user_id: int,
     bot,
+    voxcpm2_session: dict[str, Any] | None = None,
     chat_id: int | None = None,
     progress: TelegramProgress | None = None,
 ) -> bytes:
-    """Generate user TTS through the supported Khmer HF or Edge providers."""
-    del user_id, bot, chat_id, progress
+    """Generate user TTS and report only real provider milestones.
+
+    VoxCPM2 queue fallback is shown inside the same progress message when one is
+    supplied, avoiding an extra notification message in normal user workflows.
+    """
     model = _normalize_tts_model(tts_model)
-    return await generate_voice_limited(text, gender, speed, output_path, model)
+    if model != "voxcpm2":
+        return await generate_voice_limited(text, gender, speed, output_path, model)
+
+    owned_session = voxcpm2_session is None
+    session_data = voxcpm2_session
+    if session_data is None:
+        if progress is not None:
+            await progress.update(
+                stage="កំពុងរៀបចំសំឡេងគំរូ VoxCPM2",
+                detail="កំពុងទាញយក និងពិនិត្យសំឡេងគំរូរបស់អ្នក។",
+                force=True,
+            )
+        session_data = await _prepare_voxcpm2_session(user_id, bot)
+    try:
+        try:
+            return await _generate_user_voice_voxcpm2_session(
+                text,
+                gender,
+                speed,
+                output_path,
+                session_data,
+            )
+        except Exception as exc:
+            if not VOXCPM2_AUTO_FALLBACK_ON_QUEUE or not _voxcpm2_is_fallbackable_queue_error(exc):
+                raise
+
+            fallback_model = _voxcpm2_fallback_model_for_text(text)
+            fallback_label = TTS_MODEL_OPTIONS.get(
+                fallback_model,
+                TTS_MODEL_OPTIONS.get("auto", (fallback_model, "")),
+            )[0]
+            if progress is not None:
+                await progress.update(
+                    stage="VoxCPM2 កំពុងរវល់ — កំពុងប្ដូរទៅសំឡេងបម្រុង",
+                    detail=f"ប្រើ {fallback_label} ដើម្បីបញ្ចប់ការងាររបស់អ្នក។",
+                    force=True,
+                )
+                if isinstance(session_data, dict):
+                    session_data["fallback_notice_sent"] = True
+            elif isinstance(session_data, dict) and not session_data.get("fallback_notice_sent"):
+                await _send_voxcpm2_fallback_notice(
+                    bot,
+                    chat_id if chat_id is not None else user_id,
+                    exc,
+                    fallback_model,
+                )
+                session_data["fallback_notice_sent"] = True
+            elif not isinstance(session_data, dict):
+                await _send_voxcpm2_fallback_notice(
+                    bot,
+                    chat_id if chat_id is not None else user_id,
+                    exc,
+                    fallback_model,
+                )
+            logger.warning(
+                "VoxCPM2 fallback activated user_id=%s fallback_model=%s reason=%s",
+                user_id,
+                fallback_model,
+                str(exc)[:300],
+            )
+            return await generate_voice_limited(text, gender, speed, output_path, fallback_model)
+    finally:
+        if owned_session:
+            _cleanup_voxcpm2_session(session_data)
 
 
 
@@ -18260,6 +18444,24 @@ async def _generate_voice_hf_space(text: str, speed: float, output_path: str) ->
 
 def _tts_user_error_message(exc: Exception | str) -> str:
     msg = str(exc).lower()
+    if "voxcpm2 reference audio" in msg or "use /voxcpm2" in msg:
+        return "❌ VoxCPM2 ត្រូវការ Reference Audio។ ប្រើ /voxcpm2 ហើយ Upload សំឡេងស្អាត 5–30 វិនាទី។"
+    if "voxcpm2" in msg and "too long" in msg:
+        return f"❌ Reference Audio វែងពេក។ អតិបរមា {VOXCPM2_MAX_REFERENCE_SECONDS:g} វិនាទី។"
+    if "voxcpm2" in msg and any(token in msg for token in ("disabled", "not installed", "unavailable", "api_name", "401", "403")):
+        return "❌ VoxCPM2 មិនទាន់ត្រូវបានកំណត់ត្រឹមត្រូវនៅលើ server ទេ។ សូមទាក់ទង Admin។"
+    if "voxcpm2" in msg and "queue is full" in msg:
+        return (
+            "⚠️ VoxCPM2 កំពុងមានអ្នកប្រើច្រើនពេក។\n"
+            "✅ Bot នឹងប្រើសំឡេងបម្រុងជំនួសសិន ប្រសិនបើអាចធ្វើបាន។\n"
+            "🔁 សូមសាក VoxCPM2 ម្តងទៀតក្រោយ 2–3 នាទី។"
+        )
+    if "voxcpm2" in msg and any(token in msg for token in ("busy", "queue", "timeout", "temporarily", "503", "cooldown", "quota", "zerogpu")):
+        return (
+            "⚠️ VoxCPM2 កំពុងរវល់ ឬស្ថិតក្នុង cooldown។\n"
+            "✅ Bot នឹងព្យាយាមប្រើសំឡេងបម្រុងជំនួស។\n"
+            "🔁 សូមរង់ចាំបន្តិច ហើយសាកម្តងទៀត។"
+        )
     if "no audio" in msg or "edge-tts failed" in msg:
         return (
             "❌ TTS service មិនបានបញ្ជូនសំឡេងមកវិញ។\n"
@@ -18606,11 +18808,14 @@ async def _gemini_generate_with_retry(
     for attempt in range(1, attempts + 1):
         try:
             async with semaphore:
-                return await asyncio.wait_for(
-                    _gemini.aio.models.generate_content(
+                def _call():
+                    return _gemini.models.generate_content(
                         model=GEMINI_MODEL,
                         contents=contents,
-                    ),
+                    )
+
+                return await asyncio.wait_for(
+                    loop.run_in_executor(_AI_EXECUTOR, _call),
                     timeout=timeout_s,
                 )
         except asyncio.TimeoutError as exc:
@@ -18645,7 +18850,7 @@ async def transcribe_voice(ogg_path: str) -> str:
         raise RuntimeError(f"Cannot read voice file: {exc}") from exc
 
     prompt = (
-        "Transcribe this audio exactly as spoken, with special emphasis on accurate Khmer vocabulary, grammar, and loanwords. "
+        "Transcribe this audio exactly as spoken. "
         "Output ONLY the transcribed text — no labels, no explanation. "
         "Support Khmer, English, Chinese, Korean, Japanese, Hindi, Malay, Indonesian, Filipino, and Arabic."
     )
@@ -18655,7 +18860,7 @@ async def transcribe_voice(ogg_path: str) -> str:
             prompt,
         ],
         timeout_s=60,
-        operation="Gemini Khmer voice transcription",
+        operation="Gemini voice transcription",
     )
     return (response.text or "").strip()
 
@@ -18669,7 +18874,7 @@ async def transcribe_audio_file(file_path: str, mime_type: str) -> str:
         raise RuntimeError(f"Cannot read audio file: {exc}") from exc
 
     prompt = (
-        "Transcribe this audio exactly as spoken, with special emphasis on accurate Khmer vocabulary, grammar, and loanwords. "
+        "Transcribe this audio exactly as spoken. "
         "Output ONLY the transcribed text — no labels, no explanation. "
         "Support Khmer, English, Chinese, Korean, Japanese, Hindi, Malay, Indonesian, Filipino, and Arabic."
     )
@@ -18679,7 +18884,7 @@ async def transcribe_audio_file(file_path: str, mime_type: str) -> str:
             prompt,
         ],
         timeout_s=90,
-        operation="Gemini Khmer audio transcription",
+        operation="Gemini audio transcription",
     )
     return (response.text or "").strip()
 
@@ -18740,9 +18945,20 @@ def _split_text_chunks(text: str, max_chars: int = TTS_CHUNK_CHARS) -> list[str]
 # Detect image MIME type from magic bytes
 # ---------------------------------------------------------------------------
 def _detect_image_mime(path: str) -> str:
-    from app.services.ai.ocr import detect_image_mime
-
-    return detect_image_mime(path)
+    try:
+        with open(path, "rb") as f:
+            header = f.read(12)
+        if header[:8] == b"\x89PNG\r\n\x1a\n":
+            return "image/png"
+        if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+            return "image/webp"
+        if header[:2] == b"\xff\xd8":
+            return "image/jpeg"
+        if header[:6] in (b"GIF87a", b"GIF89a"):
+            return "image/gif"
+    except Exception:
+        pass
+    return "image/jpeg"
 
 
 # ---------------------------------------------------------------------------
@@ -18763,8 +18979,9 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
 
     async def _guarded_call():
         async with semaphore:
-            text_tuple = await ask_ocr_image(image_bytes, mime_type)
-            return text_tuple[0]
+            return await loop.run_in_executor(
+                _AI_EXECUTOR, lambda: ask_ocr_image(image_bytes, mime_type)[0]
+            )
 
     try:
         return await asyncio.wait_for(_guarded_call(), timeout=OCR_TIMEOUT_SECONDS)
@@ -18776,8 +18993,6 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
 # Cooldown check
 # ---------------------------------------------------------------------------
 async def _check_cooldown(reply_target, user_id: int) -> bool:
-    if BOT_IMMEDIATE_TASKS:
-        return False
     lock = _get_user_lock(user_id)
     if lock.locked() or _tts_request_reserved(user_id):
         await safe_send(lambda: reply_target.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
@@ -18830,6 +19045,7 @@ async def _deliver_paged_tts(
     total = len(chunks)
     model = _normalize_tts_model(tts_model)
     model_label = TTS_MODEL_OPTIONS.get(model, TTS_MODEL_OPTIONS["auto"])[0]
+    voxcpm2_session: dict[str, Any] | None = None
     sent_count = 0
     failed_count = 0
     first_error: Exception | None = None
@@ -18838,6 +19054,16 @@ async def _deliver_paged_tts(
     span = max(1, end_pct - start_pct)
 
     try:
+        if model == "voxcpm2":
+            if progress is not None:
+                await progress.update(
+                    start_pct,
+                    "កំពុងរៀបចំសំឡេងគំរូ VoxCPM2",
+                    f"មាន {total} ផ្នែកត្រូវបង្កើត។",
+                    force=True,
+                )
+            voxcpm2_session = await _prepare_voxcpm2_session(user_id, bot)
+
         for i, chunk in enumerate(chunks, 1):
             before_pct = start_pct + int(((i - 1) / total) * span)
             after_pct = start_pct + int((i / total) * span)
@@ -18860,6 +19086,7 @@ async def _deliver_paged_tts(
                     model,
                     user_id=user_id,
                     bot=bot,
+                    voxcpm2_session=voxcpm2_session,
                     chat_id=chat_id,
                     progress=progress,
                 )
@@ -18913,12 +19140,15 @@ async def _deliver_paged_tts(
                             text=f"{_tts_user_error_message(err)}\nផ្នែកទី {ci}/{ct}",
                         )
                     )
+                if model == "voxcpm2":
+                    break
             finally:
                 _cleanup(file_path)
 
             if i < total:
                 await asyncio.sleep(float(PAGED_TTS_SEND_DELAY_S))
     finally:
+        _cleanup_voxcpm2_session(voxcpm2_session)
         _set_last_tts(user_id)
 
     if sent_count == 0 and first_error is not None:
@@ -18930,95 +19160,16 @@ async def _deliver_paged_tts(
 # ---------------------------------------------------------------------------
 # Keyboard builders
 # ---------------------------------------------------------------------------
-def get_welcome_kb() -> InlineKeyboardMarkup:
-    """Polished, structured welcome keyboard with clear visual hierarchy."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚙️ ការកំណត់ និងកែសំឡេង", callback_data="myprefs_open")],
-        [InlineKeyboardButton("📢 ឆានែលផ្លូវការ", url=CHANNEL_URL),
-         InlineKeyboardButton("💖 ជំនួយ & គាំទ្រ", url=SUPPORT_URL)],
-    ])
-
-
-def _myprefs_text(prefs: dict[str, Any], notice: str = "") -> str:
-    gender = str(prefs.get("gender") or "female")
-    gender_label = "👩 សំឡេងស្រី" if gender == "female" else "👨 សំឡេងប្រុស"
-    try:
-        speed = float(prefs.get("speed") or DEFAULT_SPEED)
-    except (TypeError, ValueError):
-        speed = DEFAULT_SPEED
-    speed_label = next(
-        (label for _key, (label, value) in SPEED_OPTIONS.items() if abs(value - speed) < 0.01),
-        f"{speed:g}x",
-    )
-    model_label = _tts_model_label(prefs.get("tts_model", "auto"))
-    prefix = f"{html.escape(str(notice).strip())}\n\n" if str(notice).strip() else ""
-    return (
-        f"{prefix}⚙️ <b>ការកំណត់របស់អ្នក</b>\n\n"
-        f"🗣️ ប្រភេទសំឡេង៖ <b>{gender_label}</b>\n"
-        f"🎚️ ល្បឿនសំឡេង៖ <b>{html.escape(speed_label)}</b>\n"
-        f"🤖 ម៉ូដែល TTS៖ <b>{html.escape(model_label)}</b>\n\n"
-        "ចុចប៊ូតុងខាងក្រោមដើម្បីកែការកំណត់។ "
-        "ការកែប្រែនឹងប្រើសម្រាប់សំឡេងដែលបង្កើតបន្ទាប់។"
-    )
-
-
-def get_myprefs_kb(prefs: dict[str, Any]) -> InlineKeyboardMarkup:
-    """Clean, well-structured preference keyboard with intuitive grid layout."""
-    gender = str(prefs.get("gender") or "female")
-    try:
-        speed = float(prefs.get("speed") or DEFAULT_SPEED)
-    except (TypeError, ValueError):
-        speed = DEFAULT_SPEED
-    model_key = _normalize_tts_model(prefs.get("tts_model", "auto"))
-    speed_row = [
-        InlineKeyboardButton(
-            label + (" ✅" if abs(value - speed) < 0.01 else ""),
-            callback_data=f"myprefs_speed:{callback}",
-        )
-        for callback, (label, value) in SPEED_OPTIONS.items()
-    ]
-    model_label = TTS_MODEL_OPTIONS.get(model_key, TTS_MODEL_OPTIONS["auto"])[0]
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            "👩 សំឡេងស្រី" + (" ✅" if gender == "female" else ""),
-            callback_data="myprefs_gender:female",
-        ), InlineKeyboardButton(
-            "👨 សំឡេងប្រុស" + (" ✅" if gender == "male" else ""),
-            callback_data="myprefs_gender:male",
-        )],
-        speed_row,
-        [InlineKeyboardButton(f"🤖 ម៉ូដែល TTS: {model_label}", callback_data="myprefs_models")],
-        [InlineKeyboardButton("📢 ឆានែលផ្លូវការ", url=CHANNEL_URL),
-         InlineKeyboardButton("💖 ជំនួយ & គាំទ្រ", url=SUPPORT_URL)],
-        [InlineKeyboardButton("🔄 ផ្ទុកឡើងវិញ", callback_data="myprefs_open"),
-         InlineKeyboardButton("❌ បិទ", callback_data="myprefs_close")],
-    ])
-
-
-def get_myprefs_model_kb(current_model: str = "auto") -> InlineKeyboardMarkup:
-    current = _normalize_tts_model(current_model)
-    rows: list[list[InlineKeyboardButton]] = []
-    for key, (label, hint) in TTS_MODEL_OPTIONS.items():
-        detail = f" — {hint}" if hint else ""
-        rows.append([InlineKeyboardButton(
-            f"{label}{' ✅' if key == current else ''}{detail}",
-            callback_data=f"myprefs_model:{key}",
-        )])
-    rows.append([InlineKeyboardButton("🔙 ត្រឡប់", callback_data="myprefs_open")])
-    return InlineKeyboardMarkup(rows)
-
-
 def get_main_kb(gender: str, tts_model: str = "auto") -> InlineKeyboardMarkup:
-    """Clean 2x2 grid layout for primary bot controls."""
     f_btn = "👩 សំឡេងស្រី" + (" ✅" if gender == "female" else "")
     m_btn = "👨 សំឡេងប្រុស" + (" ✅" if gender == "male" else "")
     model_key = _normalize_tts_model(tts_model)
-    model_name = TTS_MODEL_OPTIONS.get(model_key, TTS_MODEL_OPTIONS['auto'])[0]
+    model_btn = f"🤖 ម៉ូដែល TTS: {TTS_MODEL_OPTIONS.get(model_key, TTS_MODEL_OPTIONS['auto'])[0]}"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f_btn, callback_data="tg_female"),
          InlineKeyboardButton(m_btn, callback_data="tg_male")],
-        [InlineKeyboardButton("🎚️ ល្បឿនសំឡេង", callback_data="show_speed"),
-         InlineKeyboardButton(f"🤖 {model_name}", callback_data="show_tts_model")],
+        [InlineKeyboardButton("🎚️ ល្បឿនសំឡេង", callback_data="show_speed")],
+        [InlineKeyboardButton(model_btn, callback_data="show_tts_model")],
     ])
 
 
@@ -19802,7 +19953,6 @@ def get_bot_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
             state = "ON ✅" if enabled else "OFF ⚠️"
         rows.append([InlineKeyboardButton(f"{label}: {state}", callback_data=f"admin_set:{key}")])
 
-    rows.append([InlineKeyboardButton("✏️ Edit Welcome Message", callback_data="admin_welcome_edit")])
     rows.append([InlineKeyboardButton("⚡ Performance Settings", callback_data="admin_perf")])
     rows.extend([
         [InlineKeyboardButton("🔄 Refresh", callback_data="admin_settings_refresh"),
@@ -19811,16 +19961,6 @@ def get_bot_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
          InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
     return InlineKeyboardMarkup(rows)
-
-
-def get_admin_welcome_editor_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👁️ Preview", callback_data="admin_welcome_preview"),
-         InlineKeyboardButton("🗑️ Remove Image", callback_data="admin_welcome_image_remove")],
-        [InlineKeyboardButton("♻️ Reset to Default", callback_data="admin_welcome_reset")],
-        [InlineKeyboardButton("⬅️ Settings", callback_data="admin_settings"),
-         InlineKeyboardButton("❌ Cancel", callback_data="admin_cancel_state")],
-    ])
 
 
 def get_bot_perf_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
@@ -19962,19 +20102,21 @@ _BROADCAST_MD_HINT_RE = re.compile(r"(\*[^*\n]+\*|_[^_\n]+_|`[^`\n]+`|\[[^\]\n]+
 
 
 def _broadcast_normalize_parse_mode(mode: str | None, default: str = _BROADCAST_PARSE_MODE_AUTO) -> str:
-    from app.services.telegram.broadcast import normalize_parse_mode
-
-    return normalize_parse_mode(
-        mode,
-        aliases=_BROADCAST_PARSE_MODE_ALIASES,
-        default=default,
-    )
+    key = str(mode or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if key in _BROADCAST_PARSE_MODE_ALIASES:
+        return _BROADCAST_PARSE_MODE_ALIASES[key]
+    return _BROADCAST_PARSE_MODE_ALIASES.get(str(default or "").strip().lower(), _BROADCAST_PARSE_MODE_AUTO)
 
 
 def _broadcast_normalize_link_preview(value: Any, default: bool = True) -> bool:
-    from app.services.telegram.broadcast import normalize_link_preview
-
-    return normalize_link_preview(value, default=default)
+    if isinstance(value, bool):
+        return value
+    text = str(value if value is not None else "").strip().lower()
+    if text in {"1", "true", "yes", "on", "enabled", "preview", "link_preview", "url_preview"}:
+        return True
+    if text in {"0", "false", "no", "off", "disabled", "nopreview", "no_preview", "no-preview"}:
+        return False
+    return bool(default)
 
 
 def _broadcast_strip_directives(
@@ -20460,13 +20602,9 @@ async def _run_broadcast_to_all(
 # ===========================================================================
 @admin_only
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _pending_broadcast.pop(update.effective_user.id, None)
-    context.user_data["bc_state"] = BROADCAST_WAIT_MESSAGE
-    await safe_send(lambda: update.message.reply_text(
-        '🛡️ <b>សុវត្ថិភាពការផ្សាយសារ V2</b>\n\n📨 <b>របៀបប្រើ</b>\n• ផ្ញើ <b>អត្ថបទ</b> ឬ <b>រូបភាព + ចំណងជើង</b> ដែលចង់ផ្សាយ\n• បូតនឹងបង្ហាញសារមើលជាមុនចុងក្រោយ មុនពេលផ្ញើពិត\n• គាំទ្រទម្រង់សារ Telegram, HTML, MarkdownV2, Markdown និងអត្ថបទធម្មតា\n• ដើម្បីបង្ខំទម្រង់ សូមដាក់ <code>::html</code>, <code>::mdv2</code>, <code>::md</code> ឬ <code>::plain</code> នៅជួរទី១\n\n🔐 <b>ការការពារ</b>\n✅ បញ្ជាក់សារមើលជាមុន មុនពេលផ្ញើ\n✅ រំលងអ្នកប្រើប្រាស់ដែលបានបិទបូត ឬមិនអាចទាក់ទងបាន\n✅ គ្រប់គ្រងល្បឿនផ្ញើ និង RetryAfter\n\nវាយ /cancel ដើម្បីបោះបង់។',
-        parse_mode="HTML",
-        reply_markup=get_broadcast_entry_kb(),
-    ))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import broadcast_start as _impl
+    return await _impl(update, context)
 
 
 async def _admin_summary_counts(admin_id: int) -> dict:
@@ -21737,51 +21875,6 @@ async def _admin_smart_alert_lines(counts: dict | None = None) -> list[str]:
     return list(dict.fromkeys(alerts))[:5]
 
 
-def get_admin_active_tasks_kb(broadcast_jobs: list[tuple[str, dict]]) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    for jid, row in broadcast_jobs[:8]:
-        status = str(row.get("status") or "").lower()
-        short_id = jid[:8]
-        rows.append([
-            InlineKeyboardButton(f"❌ Cancel #{short_id}", callback_data=f"admin_cancel_task:{jid}")
-        ])
-    rows.append([
-        InlineKeyboardButton("🔄 Refresh", callback_data="admin_active_tasks"),
-        InlineKeyboardButton("⬅️ Admin Home", callback_data="admin_home"),
-    ])
-    return InlineKeyboardMarkup(rows)
-
-
-async def _admin_active_tasks_data() -> tuple[str, InlineKeyboardMarkup]:
-    """Show currently running broadcast jobs, schedules, DB queue status, and background loops with cancel actions."""
-    broadcast_jobs = []
-    with suppress(Exception):
-        active_states = {"queued", "running", "paused", "cancelling"}
-        with _WEB_BROADCAST_JOBS_LOCK:
-            for jid, row in _WEB_BROADCAST_JOBS.items():
-                if str(row.get("status") or "").lower() in active_states:
-                    broadcast_jobs.append((jid, row))
-
-    bc_text = "\n".join(
-        f"• <code>{jid[:8]}</code>: <b>{row.get('status')}</b> (Sent: {row.get('sent', 0)}/{row.get('total', 0)})"
-        for jid, row in broadcast_jobs[:10]
-    ) if broadcast_jobs else "• No active broadcast jobs"
-
-    db_queue = 0
-    with suppress(Exception):
-        db_queue = int(_db_executor_queue_size())
-
-    text = (
-        "👷 <b>Active Bot Tasks & Workflows</b>\n\n"
-        f"🧵 DB Executor Queue: <b>{db_queue} pending</b>\n"
-        f"📢 Active Broadcast Jobs: <b>{len(broadcast_jobs)}</b>\n\n"
-        "<b>Broadcast Queue Details:</b>\n"
-        f"{bc_text}\n\n"
-        "Click cancel below to terminate any running broadcast job."
-    )
-    return text, get_admin_active_tasks_kb(broadcast_jobs)
-
-
 async def _admin_compact_text(admin_id: int) -> str:
     counts = await _admin_summary_counts(admin_id)
     mode = _run_state_bot_mode() if "_run_state_bot_mode" in globals() else str(globals().get("BOT_MODE", "POLLING"))
@@ -22445,29 +22538,9 @@ async def _save_user_feature_request(update: Update, context: ContextTypes.DEFAU
 
 
 async def cmd_feature_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User command: /need, /feedback, /request_feature."""
-    user = update.effective_user
-    msg = update.message
-    if not user or not msg:
-        return
-    if not await _ensure_user_allowed(update, context):
-        return
-    detail = " ".join(context.args or []).strip()
-    if detail:
-        await _save_user_feature_request(update, context, detail)
-        return
-    context.user_data[FEATURE_REQUEST_WAIT_TEXT] = True
-    await safe_send(lambda: msg.reply_text(
-        "💬 <b>Open Answer</b>\n\n"
-        "សូមសរសេរ Feature ថ្មី ឬការកែលម្អដែលអ្នកចង់បាន។\n\n"
-        "ឧទាហរណ៍:\n"
-        "• ចង់បានសង្ខេប PDF ជាខ្មែរ\n"
-        "• ចង់បាន Khmer female voice ច្បាស់ជាងមុន\n"
-        "• ចង់ឲ្យ OCR អានអក្សរខ្មែរពីរូបភាពបានល្អ\n\n"
-        "Safety: អត្ថបទអតិបរមា 500 តួអក្សរ។ វាយ <code>cancel</code> ដើម្បីបោះបង់។",
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    ))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import cmd_feature_request as _impl
+    return await _impl(update, context)
 
 
 async def _handle_feature_request_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -22807,7 +22880,8 @@ def _tts_provider_control_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🇰🇭 Khmer → Edge", callback_data="admin_tts_set:khmer_edge")],
         [InlineKeyboardButton("✅ Enable HF Now", callback_data="admin_tts_hf_enable"),
          InlineKeyboardButton("⏸ Disable HF 5m", callback_data="admin_tts_hf_5m")],
-        [InlineKeyboardButton("🧹 Clear HF Client", callback_data="admin_tts_hf_clear")],
+        [InlineKeyboardButton("🧹 Clear HF Client", callback_data="admin_tts_hf_clear"),
+         InlineKeyboardButton("🎙 VoxCPM2 Health", callback_data="admin_voxcpm2_health")],
         [InlineKeyboardButton("🔄 Refresh", callback_data="admin_tts")],
         [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
          InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
@@ -22829,6 +22903,9 @@ def _admin_tts_provider_text(notice: str = "") -> str:
         f"Default user model: <code>{html.escape(_normalize_tts_model(DEFAULT_TTS_MODEL))}</code>",
         f"HF Space: <code>{html.escape(str(HF_TTS_SPACE))}{html.escape(str(HF_TTS_API_NAME))}</code>",
         f"Gradio client: <b>{'READY' if GradioClient is not None else 'MISSING'}</b>",
+        f"VoxCPM2: <b>{'ON' if VOXCPM2_ENABLED else 'OFF'}</b> · <code>{html.escape(str(VOXCPM2_SPACE))}{html.escape(str(VOXCPM2_API_NAME))}</code>",
+        f"Vox upload helper: <b>{'READY' if GradioHandleFile is not None else 'MISSING'}</b>",
+        f"Vox status: <b>{html.escape(str(_voxcpm2_health_snapshot().get('status')))}</b> · cooldown: <b>{_voxcpm2_health_snapshot().get('cooldown_s')}s</b> · fallback: <b>{'ON' if VOXCPM2_AUTO_FALLBACK_ON_QUEUE else 'OFF'}</b>",
         f"HF cached client: <b>{'YES' if hf_client_ready else 'NO'}</b>",
         f"HF cooldown: <b>{hf_remaining}s</b> {'⚠️' if hf_disabled else '✅'}",
         f"Edge fallback: <b>{'ON' if HF_TTS_EDGE_FALLBACK else 'OFF'}</b>",
@@ -22854,6 +22931,68 @@ async def _admin_open_tts_provider_panel(query, notice: str = "") -> None:
     ))
 
 
+def _voxcpm2_health_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh", callback_data="admin_voxcpm2_health")],
+        [InlineKeyboardButton("✅ Enable VoxCPM2", callback_data="admin_voxcpm2_enable"),
+         InlineKeyboardButton("⏸ Cooldown 5m", callback_data="admin_voxcpm2_5m")],
+        [InlineKeyboardButton("🧹 Clear Vox Client", callback_data="admin_voxcpm2_clear")],
+        [InlineKeyboardButton("⬅️ TTS Provider", callback_data="admin_tts"),
+         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
+    ])
+
+
+def _admin_voxcpm2_health_text(notice: str = "") -> str:
+    snap = _voxcpm2_health_snapshot()
+    last_error = str(snap.get("last_error") or "")
+    if len(last_error) > 450:
+        last_error = last_error[:447] + "..."
+    status_icon = "✅" if snap.get("status") == "READY" else "⚠️"
+    lines: list[str] = []
+    if notice:
+        lines.append(f"{html.escape(notice)}\n")
+    lines.extend([
+        "🎙 <b>VoxCPM2 Provider Health</b>",
+        "",
+        f"Service: <b>{status_icon} {html.escape(str(snap.get('status') or 'UNKNOWN'))}</b>",
+        f"Enabled: <b>{'YES' if snap.get('enabled') else 'NO'}</b>",
+        f"Space: <code>{html.escape(str(VOXCPM2_SPACE))}{html.escape(str(VOXCPM2_API_NAME))}</code>",
+        f"Client cached: <b>{'YES' if snap.get('client_cached') else 'NO'}</b>",
+        f"Upload helper: <b>{'READY' if GradioHandleFile is not None else 'MISSING'}</b>",
+        "",
+        f"Cooldown remaining: <b>{int(snap.get('cooldown_s') or 0)}s</b>",
+        f"Failure count: <b>{int(snap.get('failures') or 0)}</b>",
+        f"Queue-full hits: <b>{int(snap.get('queue_full_hits') or 0)}</b>",
+        f"Last success: <b>{html.escape(str(snap.get('last_success_age')))}</b>",
+        f"Last error: <b>{html.escape(str(snap.get('last_error_age')))}</b>",
+        "",
+        f"Auto fallback on queue-full: <b>{'ON' if snap.get('auto_fallback') else 'OFF'}</b>",
+        f"Fallback route: <code>Khmer → Kiri/HF, other languages → Edge</code>",
+        f"Retry: <b>{VOXCPM2_RETRIES}</b> · queue delay: <b>{VOXCPM2_QUEUE_RETRY_DELAY_S:g}s</b> · queue cooldown: <b>{VOXCPM2_QUEUE_COOLDOWN_S:g}s</b>",
+    ])
+    if last_error:
+        lines.extend([
+            "",
+            "<b>Last error preview</b>",
+            f"<code>{html.escape(last_error)}</code>",
+        ])
+    lines.extend([
+        "",
+        "<b>Khmer user behavior</b>",
+        "• Queue full: បង្ហាញសារ Khmer ជាមុន",
+        "• បន្ទាប់មកបង្កើតសំឡេងបម្រុងដោយស្វ័យប្រវត្តិ",
+        "• អ្នកប្រើអាចសាក VoxCPM2 ម្តងទៀតក្រោយ cooldown",
+    ])
+    return "\n".join(lines)
+
+
+async def _admin_open_voxcpm2_health_panel(query, notice: str = "") -> None:
+    await safe_send(lambda: query.message.edit_text(
+        _admin_voxcpm2_health_text(notice),
+        parse_mode="HTML",
+        reply_markup=_voxcpm2_health_kb(),
+        disable_web_page_preview=True,
+    ))
 
 
 async def _admin_set_tts_provider(mode: str) -> str:
@@ -23133,7 +23272,7 @@ async def _apply_bot_performance_setting(key: str, raw_value: Any, *, admin_id: 
         return False, info
 
     try:
-        await _update_run_state(key, coerced, persist=persist_runtime and key in _RUN_STATE_REDIS_KEYS)
+        await _update_run_state(key, coerced, persist=persist_runtime and key in _RUN_STATE_PERSISTED_KEYS)
     except Exception:
         # Some startup-only settings are still saved and will apply on restart.
         globals()[key] = coerced
@@ -23207,37 +23346,6 @@ async def _admin_open_settings_panel(query, force: bool = False, notice: str = "
         "\n".join(lines),
         parse_mode="HTML",
         reply_markup=get_bot_settings_kb(settings),
-        disable_web_page_preview=True,
-    ))
-
-
-async def _admin_open_welcome_editor(query, user_id: int) -> None:
-    settings, status = await get_bot_settings_async(force=True)
-    current = _normalize_welcome_message(
-        settings.get(WELCOME_MESSAGE_SETTING_KEY, WELCOME_TEXT)
-    )
-    current_image = _normalize_welcome_image_file_id(
-        settings.get(WELCOME_IMAGE_SETTING_KEY, "")
-    )
-    preview_raw, preview_rest = _take_escaped_prefix(current, 2400)
-    preview = html.escape(preview_raw) + ("…" if preview_rest else "")
-    with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
-        ACTIVE_ADMIN_CONVERSATIONS[int(user_id)] = {
-            "state": "awaiting_welcome_message",
-            "current": current,
-            "current_image": current_image,
-            "ts": time.monotonic(),
-        }
-    await safe_send(lambda: query.message.edit_text(
-        "✏️ <b>Edit Welcome Message</b>\n\n"
-        "ផ្ញើសារថ្មី ឬផ្ញើរូបភាពដែលត្រូវបង្ហាញពេលអ្នកប្រើ /start ឬ /help។\n"
-        "អ្នកអាចដាក់ Caption ជាមួយរូបភាព ដើម្បីកែរូបភាព និងសារក្នុងពេលតែមួយ។\n"
-        f"អតិបរមា៖ <b>{WELCOME_MESSAGE_MAX_CHARS}</b> តួអក្សរ · "
-        f"Storage៖ <b>{_ok_bad(bool(status.get('db_ok')), 'Supabase', 'Memory / Redis')}</b>\n"
-        f"រូបភាព៖ <b>{'បានកំណត់ ✅' if current_image else 'មិនទាន់មាន'}</b>\n\n"
-        f"<b>សារបច្ចុប្បន្ន៖</b>\n<pre>{preview}</pre>",
-        parse_mode="HTML",
-        reply_markup=get_admin_welcome_editor_kb(),
         disable_web_page_preview=True,
     ))
 
@@ -23330,124 +23438,23 @@ async def _admin_start_schedule_from_button(query, context: ContextTypes.DEFAULT
 
 @admin_only
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Telegram /admin entry point with mobile shortcuts.
-
-    Supported shortcuts:
-      /admin compact, /admin health, /admin errors, /admin broadcast,
-      /admin report, /admin optimize, /admin users, /admin settings, /admin runtime, /admin needs
-    """
-    user_id = update.effective_user.id if update.effective_user else 0
-    arg = ""
-    with suppress(Exception):
-        arg = str((context.args or [""])[0]).strip().lower()
-
-    if arg in {"needs", "userneeds", "user_needs", "feedback"}:
-        text = await _user_needs_home_text(user_id)
-        await safe_send(lambda: update.message.reply_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=get_user_needs_home_kb(),
-            disable_web_page_preview=True,
-        ))
-        return
-
-    if arg in {"compact", "mobile", "mini"}:
-        text = await _admin_compact_text(user_id)
-        await safe_send(lambda: update.message.reply_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=get_admin_compact_kb(),
-            disable_web_page_preview=True,
-        ))
-        return
-    if arg in {"health", "status"}:
-        text = await _admin_health_text()
-        await safe_send(lambda: update.message.reply_text(text, parse_mode="HTML", reply_markup=get_admin_dashboard_kb(), disable_web_page_preview=True))
-        return
-    if arg in {"errors", "error"}:
-        await safe_send(lambda: update.message.reply_text(_error_center_text(), parse_mode="HTML", reply_markup=_error_center_kb(), disable_web_page_preview=True))
-        return
-    if arg in {"optimize", "perf", "performance"}:
-        await safe_send(lambda: update.message.reply_text(_admin_optimize_text(), parse_mode="HTML", reply_markup=get_admin_optimize_kb(), disable_web_page_preview=True))
-        return
-    if arg in {"report", "pdf"}:
-        await safe_send(lambda: update.message.reply_text('📄 <b>របាយការណ៍ PDF</b>\n\nសូមជ្រើសរើសចន្លោះពេលរបាយការណ៍៖', parse_mode="HTML", reply_markup=get_admin_report_day_kb(), disable_web_page_preview=True))
-        return
-    if arg in {"users", "user"}:
-        await safe_send(lambda: update.message.reply_text('👥 កំពុងបើកផ្ទាំងអ្នកប្រើប្រាស់...', reply_markup=get_admin_dashboard_kb()))
-        return
-    if arg in {"broadcast", "bc"}:
-        context.user_data["bc_state"] = BROADCAST_WAIT_MESSAGE
-        await safe_send(lambda: update.message.reply_text(
-            '📢 <b>ដំណើរការផ្សាយសារដោយសុវត្ថិភាព</b>\n\nសូមផ្ញើអត្ថបទ ឬរូបភាព + ចំណងជើងឥឡូវនេះ។ បូតនឹងបង្ហាញសារមើលជាមុន មុនពេលផ្ញើពិត។\n\nប្រើ /cancel ដើម្បីបោះបង់។',
-            parse_mode="HTML",
-            reply_markup=get_admin_action_kb(),
-        ))
-        return
-    if arg in {"settings", "setting"}:
-        settings, _status = await get_bot_settings_async(force=True)
-        await safe_send(lambda: update.message.reply_text('⚙️ <b>ការកំណត់បូត</b>', parse_mode="HTML", reply_markup=get_bot_settings_kb(settings)))
-        return
-    if arg in {"runtime", "run"}:
-        await safe_send(lambda: update.message.reply_text(_runtime_admin_text(), parse_mode="HTML", reply_markup=get_runtime_admin_kb(), disable_web_page_preview=True))
-        return
-
-    text = await _admin_home_text(user_id)
-    await safe_send(lambda: update.message.reply_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=get_admin_dashboard_kb(),
-        disable_web_page_preview=True,
-    ))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import cmd_admin as _impl
+    return await _impl(update, context)
 
 
 @admin_only
 async def cmd_runtime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Direct shortcut for runtime operations without replacing /admin.
-    await safe_send(lambda: update.message.reply_text(
-        _runtime_admin_text(),
-        parse_mode="HTML",
-        reply_markup=get_runtime_admin_kb(),
-        disable_web_page_preview=True,
-    ))
-
-
-async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    del context
-    from app.services.monitoring import discover_public_url
-    from app.services.build_info import get_build_info
-
-    build = get_build_info(role=os.getenv("PROCESS_ROLE", "combined"))
-    public_url = discover_public_url().get("url") or "not detected"
-    message = (
-        "<b>Bot version</b>\n\n"
-        f"Version: <code>{html.escape(str(build['version']))}</code>\n"
-        f"Commit: <code>{html.escape(str(build.get('commit_short') or '-'))}</code>\n"
-        f"Role: <code>{html.escape(str(build['process_role']))}</code>\n"
-        f"Mode: <code>{html.escape(str(_run_state_bot_mode()))}</code>\n"
-        f"Built at: <code>{html.escape(str(build.get('deployed_at') or '-'))}</code>\n"
-        f"Public URL: <code>{html.escape(str(public_url))}</code>"
-    )
-    await safe_send(lambda: update.effective_message.reply_text(
-        message,
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    ))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import cmd_runtime as _impl
+    return await _impl(update, context)
 
 
 @admin_only
 async def cmd_botsettings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    settings, status = await get_bot_settings_async(force=True)
-    text = (
-        "⚙️ <b>Bot Settings Panel</b>\n\n"
-        f"Storage: <b>{_ok_bad(bool(status.get('db_ok')), 'Supabase', 'Memory / setup needed')}</b>\n"
-        "Use /admin → ⚙️ Settings for button controls."
-    )
-    await safe_send(lambda: update.message.reply_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=get_bot_settings_kb(settings),
-    ))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import cmd_botsettings as _impl
+    return await _impl(update, context)
 
 
 @admin_only
@@ -23490,139 +23497,9 @@ async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
-    user_id = query.from_user.id
-    data    = query.data or ""
-
-    if not _is_admin(user_id):
-        with suppress(Exception):
-            await query.answer("⛔ អ្នកមិនមានសិទ្ធិ។", show_alert=True)
-        return
-    with suppress(Exception):
-        await query.answer()
-
-    if data == "bc_templates":
-        await _admin_open_broadcast_templates(query, context, user_id)
-        return
-
-    if data == "bc_save_template":
-        pending = _pending_broadcast.get(user_id)
-        if not pending:
-            await safe_send(lambda: query.message.reply_text(
-                '⚠️ មិនមានសារមើលជាមុនសម្រាប់រក្សាទុកទេ។ សូមបង្កើតការផ្សាយសារជាមុនសិន។'
-            ))
-            return
-        ok, info, tpl = await asyncio.get_running_loop().run_in_executor(
-            _DB_EXECUTOR,
-            lambda: db_broadcast_template_save(pending, user_id),
-        )
-        if ok and str(info).startswith("updated existing"):
-            notice = "♻️ Template មានរួចហើយ — បាន Update និងដាក់ឡើងលើ។"
-        else:
-            notice = "✅ បាន Save Template។" if ok else f"⚠️ Save Template មិនជោគជ័យ: {info}"
-        await _admin_open_broadcast_templates(query, context, user_id, notice=notice)
-        return
-
-    if data.startswith("bc_tpl_use:"):
-        tpl_id = data.split(":", 1)[1]
-        tpl = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_broadcast_template_get(tpl_id))
-        if not tpl:
-            await _admin_open_broadcast_templates(query, context, user_id, notice="⚠️ រក Template មិនឃើញ។")
-            return
-        pending = _broadcast_template_payload_from_template(tpl)
-        _pending_broadcast[user_id] = pending
-        context.user_data["bc_state"] = BROADCAST_WAIT_MESSAGE
-        with suppress(Exception):
-            await query.message.edit_reply_markup(reply_markup=None)
-        await safe_send(lambda: query.message.reply_text(
-            f'📚 បានជ្រើសគំរូ៖ <b>{html.escape(_broadcast_template_button_title(tpl))}</b>',
-            parse_mode="HTML",
-        ))
-        ok = await _admin_show_broadcast_preview_message(query.message, context.bot, user_id, pending)
-        if not ok:
-            _pending_broadcast.pop(user_id, None)
-            context.user_data.pop("bc_state", None)
-        return
-
-    if data.startswith("bc_tpl_delask:"):
-        tpl_id = data.split(":", 1)[1]
-        tpl = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_broadcast_template_get(tpl_id))
-        if not tpl:
-            await _admin_open_broadcast_templates(query, context, user_id, notice="⚠️ រក Template មិនឃើញ។")
-            return
-        await safe_send(lambda: query.message.edit_text(
-            _broadcast_template_delete_confirm_text(tpl),
-            parse_mode="HTML",
-            reply_markup=get_broadcast_template_delete_confirm_kb(tpl_id),
-            disable_web_page_preview=True,
-        ))
-        return
-
-    if data.startswith("bc_tpl_del:"):
-        tpl_id = data.split(":", 1)[1]
-        ok, info = await asyncio.get_running_loop().run_in_executor(
-            _DB_EXECUTOR,
-            lambda: db_broadcast_template_delete(tpl_id, user_id),
-        )
-        notice = "🗑️ បានលុប Template។" if ok else f"⚠️ លុបមិនជោគជ័យ: {info}"
-        await _admin_open_broadcast_templates(query, context, user_id, notice=notice)
-        return
-
-    if data.startswith("bc_del_sent_ask:"):
-        job_id = data.split(":", 1)[1]
-        job = _broadcast_sent_delete_get(job_id, user_id)
-        await safe_send(lambda: query.message.reply_text(
-            _broadcast_sent_delete_confirm_text(job),
-            parse_mode="HTML",
-            reply_markup=get_broadcast_sent_delete_confirm_kb(job_id) if job else None,
-            disable_web_page_preview=True,
-        ))
-        return
-
-    if data.startswith("bc_del_sent_run:"):
-        job_id = data.split(":", 1)[1]
-        job = _broadcast_sent_delete_get(job_id, user_id, pop=True)
-        if not job:
-            await safe_send(lambda: query.message.reply_text(
-                '⚠️ ការងារលុបនេះមិនមានទៀតទេ។ វាអាចផុតកំណត់ ឬម៉ាស៊ីនមេបានចាប់ផ្ដើមឡើងវិញ។'
-            ))
-            return
-        with suppress(Exception):
-            await query.message.edit_reply_markup(reply_markup=None)
-        context.application.create_task(_delete_broadcast_sent_messages(context.bot, user_id, job))
-        await safe_send(lambda: query.message.reply_text("🗑️ បានចាប់ផ្ដើមលុបសារ Broadcast ដែលបានផ្ញើ..."))
-        return
-
-    if data == "bc_del_sent_keep":
-        with suppress(Exception):
-            await query.message.edit_reply_markup(reply_markup=None)
-        await safe_send(lambda: query.message.reply_text('✅ បានរក្សាទុកសារផ្សាយនៅដដែល។'))
-        return
-
-    if data == "bc_cancel":
-        _pending_broadcast.pop(user_id, None)
-        context.user_data.pop("bc_state", None)
-        with suppress(Exception):
-            await query.message.edit_reply_markup(reply_markup=None)
-        await safe_send(lambda: query.message.reply_text('❌ បានបោះបង់ការផ្សាយសារ។'))
-        return
-
-    if data == "bc_confirm":
-        pending = _pending_broadcast.pop(user_id, None)
-        context.user_data.pop("bc_state", None)
-        with suppress(Exception):
-            await query.message.edit_reply_markup(reply_markup=None)
-        if not pending:
-            await safe_send(lambda: query.message.reply_text("⚠️ រកទិន្នន័យ Broadcast មិនឃើញ។ សូមចាប់ផ្ដើមថ្មី។"))
-            return
-        context.application.create_task(
-            _run_broadcast_to_all(context.bot, user_id, pending, label="ការផ្សាយសារ")
-        )
-        return
-
-    await safe_send(lambda: query.message.reply_text(
-        "This broadcast button is no longer available. Please reopen the menu."
-    ))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.callbacks import broadcast_callback as _impl
+    return await _impl(update, context)
 
 
 # ===========================================================================
@@ -23630,60 +23507,23 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ===========================================================================
 @admin_only
 async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_id = update.effective_user.id
-    _sched_payload.pop(admin_id, None)
-    context.user_data["sched_state"] = SCHED_WAIT_MSG
-    await safe_send(lambda: update.message.reply_text(
-        '📅 <b>ការផ្សាយតាមកាលវិភាគ</b>\n\nសូមផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + ចំណងជើង</b> ដែលចង់កំណត់ពេលផ្ញើ។\n✅ គាំទ្រទម្រង់ដើមរបស់ Telegram, HTML, MarkdownV2, Markdown និងអត្ថបទធម្មតា។\nដើម្បីបង្ខំទម្រង់ សូមដាក់ <code>::html</code>, <code>::mdv2</code>, <code>::md</code> ឬ <code>::plain</code> នៅជួរទី១។\n\nវាយ /cancel ដើម្បីបោះបង់។',
-        parse_mode="HTML",
-    ))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import cmd_schedule as _impl
+    return await _impl(update, context)
 
 
 @admin_only
 async def cmd_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_id = update.effective_user.id
-    loop     = asyncio.get_running_loop()
-    rows     = await loop.run_in_executor(None, db_sched_fetch_admin_pending, admin_id)
-    if not rows:
-        await safe_send(lambda: update.message.reply_text('📭 មិនមានការផ្សាយតាមកាលវិភាគទេ។'))
-        return
-    await safe_send(lambda: update.message.reply_text(
-        f'📋 <b>ការផ្សាយតាមកាលវិភាគ ({len(rows)} កំពុងរង់ចាំ)</b>\nចុចលើកាលវិភាគ ដើម្បីមើលព័ត៌មានលម្អិត ឬបោះបង់។',
-        parse_mode="HTML",
-        reply_markup=get_schedules_list_kb(rows, page=0),
-    ))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import cmd_schedules as _impl
+    return await _impl(update, context)
 
 
 @admin_only
 async def cmd_cancelschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_id = update.effective_user.id
-    args     = context.args or []
-    if not args or not args[0].isdigit():
-        await safe_send(lambda: update.message.reply_text(
-            '❌ របៀបប្រើ៖ /cancelschedule &lt;id&gt;\nឬប្រើ /schedules ដើម្បីជ្រើស។',
-            parse_mode="HTML",
-        ))
-        return
-    row_id = int(args[0])
-    loop   = asyncio.get_running_loop()
-    row    = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
-    if not row:
-        await safe_send(lambda: update.message.reply_text(f"❌ រកមិនឃើញ Schedule #{row_id}។"))
-        return
-    if row["admin_id"] != admin_id:
-        await safe_send(lambda: update.message.reply_text("⛔ Schedule នេះមិនមែនជារបស់អ្នកទេ។"))
-        return
-    if row["status"] != "pending":
-        st = row["status"]
-        await safe_send(lambda: update.message.reply_text(
-            f"⚠️ Schedule #{row_id} មានស្ថានភាព <b>{st}</b> — មិនអាច cancel ។",
-            parse_mode="HTML",
-        ))
-        return
-    await loop.run_in_executor(None, db_sched_set_status, row_id, "cancelled")
-    await safe_send(lambda: update.message.reply_text(
-        f'✅ កាលវិភាគ <b>#{row_id}</b> បានបោះបង់។', parse_mode="HTML"
-    ))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import cmd_cancelschedule as _impl
+    return await _impl(update, context)
 
 
 async def _handle_sched_content(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -23984,39 +23824,6 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         ))
         return
 
-    if data == "admin_active_tasks":
-        text, kb = await _admin_active_tasks_data()
-        await safe_send(lambda: query.message.edit_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=kb,
-            disable_web_page_preview=True,
-        ))
-        return
-
-    if data.startswith("admin_cancel_task:"):
-        target_jid = data.split(":", 1)[1].strip()
-        cancelled_ok = False
-        with suppress(Exception):
-            with _WEB_BROADCAST_JOBS_LOCK:
-                if target_jid in _WEB_BROADCAST_JOBS:
-                    _WEB_BROADCAST_JOBS[target_jid]["status"] = "cancelled"
-                    _WEB_BROADCAST_JOBS[target_jid]["finished_at"] = _sched_iso()
-                    cancelled_ok = True
-        
-        with suppress(Exception):
-            await query.answer("✅ កិច្ចការត្រូវបានលុបចោល (Cancelled)!" if cancelled_ok else "⚠️ រកមិនឃើញកិច្ចการនេះទេ", show_alert=True)
-
-        text, kb = await _admin_active_tasks_data()
-        with suppress(Exception):
-            await query.message.edit_text(
-                text,
-                parse_mode="HTML",
-                reply_markup=kb,
-                disable_web_page_preview=True,
-            )
-        return
-
     if data == "admin_stats":
         text = await _admin_stats_text(user_id)
         await safe_send(lambda: query.message.edit_text(
@@ -24077,100 +23884,6 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
             reply_markup=get_runtime_admin_kb(),
             disable_web_page_preview=True,
         ))
-        return
-
-    if data == "admin_clean_redis":
-        try:
-            client = redis_client_async or redis_client
-            count = 0
-            if client is not None:
-                keys_to_del = []
-                try:
-                    if hasattr(client, "scan_iter"):
-                        # Check if redis_client_async or sync redis client
-                        try:
-                            # Try async iteration first if client is async
-                            async for k in client.scan_iter(match="tgbot:*", count=100):
-                                keys_to_del.append(k)
-                        except TypeError:
-                            # Fallback to sync iteration
-                            for k in client.scan_iter(match="tgbot:*", count=100):
-                                keys_to_del.append(k)
-                    elif hasattr(client, "keys"):
-                        res = client.keys("tgbot:*")
-                        if inspect.iscoroutine(res):
-                            keys_to_del = await res
-                        else:
-                            keys_to_del = res
-                    
-                    if keys_to_del:
-                        try:
-                            if inspect.iscoroutinefunction(getattr(client, "delete", None)):
-                                await client.delete(*keys_to_del)
-                            else:
-                                res_del = client.delete(*keys_to_del)
-                                if inspect.iscoroutine(res_del):
-                                    await res_del
-                        except Exception:
-                            for k in keys_to_del:
-                                with suppress(Exception):
-                                    res_one = client.delete(k)
-                                    if inspect.iscoroutine(res_one):
-                                        await res_one
-                        count = len(keys_to_del)
-                except Exception as ex:
-                    logger.warning("Redis scan/delete error: %s", ex)
-
-            with suppress(Exception):
-                await query.answer(f"🧹 បានសម្អាត Redis Cache រួចរាល់ ({count} keys)!", show_alert=True)
-            text = await _admin_home_text(user_id, title=f"🧹 Redis Cleaned Successfully ({count} keys removed)")
-            await safe_send(lambda: query.message.edit_text(
-                text,
-                parse_mode="HTML",
-                reply_markup=get_admin_dashboard_kb(),
-            ))
-        except Exception as e:
-            with suppress(Exception):
-                await query.answer(f"⚠️ សម្អាតမកើត: {e}", show_alert=True)
-        return
-
-    if data == "admin_welcome_edit":
-        await _admin_open_welcome_editor(query, user_id)
-        return
-
-    if data == "admin_welcome_preview":
-        welcome_message, image_file_id = await get_welcome_content_async(force=True)
-        await _send_welcome_content(query.message, welcome_message, image_file_id)
-        return
-
-    if data == "admin_welcome_image_remove":
-        with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
-            ACTIVE_ADMIN_CONVERSATIONS.pop(int(user_id), None)
-        ok, info = await asyncio.get_running_loop().run_in_executor(
-            _DB_EXECUTOR,
-            lambda: db_bot_setting_value_set(
-                WELCOME_IMAGE_SETTING_KEY,
-                "",
-                user_id,
-            ),
-        )
-        notice = "✅ Welcome image removed." if ok else f"⚠️ Remove failed: {info}"
-        await _admin_open_settings_panel(query, force=True, notice=notice)
-        return
-
-    if data == "admin_welcome_reset":
-        with ACTIVE_ADMIN_CONVERSATIONS_LOCK:
-            ACTIVE_ADMIN_CONVERSATIONS.pop(int(user_id), None)
-        ok, info = await asyncio.get_running_loop().run_in_executor(
-            _DB_EXECUTOR,
-            lambda: db_welcome_content_set(
-                WELCOME_TEXT,
-                "",
-                user_id,
-            ),
-        )
-        notice = "✅ Welcome message and image reset to the default." if ok else f"⚠️ Reset failed: {info}"
-        await _admin_open_settings_panel(query, force=True, notice=notice)
         return
 
     if data in ("admin_settings", "admin_settings_refresh"):
@@ -24259,6 +23972,25 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
             _HF_TTS_CLIENT = None
             _HF_TTS_CLIENT_KEY = None
         await _admin_open_tts_provider_panel(query, notice="🧹 HF cached client cleared.")
+        return
+
+    if data == "admin_voxcpm2_health":
+        await _admin_open_voxcpm2_health_panel(query)
+        return
+
+    if data == "admin_voxcpm2_enable":
+        _reset_voxcpm2_cooldown()
+        await _admin_open_voxcpm2_health_panel(query, notice="✅ VoxCPM2 cooldown cleared.")
+        return
+
+    if data == "admin_voxcpm2_5m":
+        _voxcpm2_force_cooldown(300)
+        await _admin_open_voxcpm2_health_panel(query, notice="⏸ VoxCPM2 disabled for 5 minutes.")
+        return
+
+    if data == "admin_voxcpm2_clear":
+        _voxcpm2_reset_client_sync()
+        await _admin_open_voxcpm2_health_panel(query, notice="🧹 VoxCPM2 cached client cleared.")
         return
 
     if data == "admin_calendar" or data.startswith("admin_calendar:"):
@@ -24359,232 +24091,9 @@ def _callback_int_arg(data: str, prefix: str) -> int | None:
 
 
 async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-    user_id = query.from_user.id
-    data = query.data or ""
-
-    if not _is_admin(user_id):
-        with suppress(Exception):
-            await query.answer("⛔ អ្នកមិនមានសិទ្ធិ។", show_alert=True)
-        return
-    with suppress(Exception):
-        await query.answer()
-
-    if query.message is None:
-        return
-
-    loop = asyncio.get_running_loop()
-
-    if data.startswith(("sched_repeat_once:", "sched_repeat_daily:")):
-        recurrence = (
-            SCHED_RECURRENCE_DAILY
-            if data.startswith("sched_repeat_daily:")
-            else SCHED_RECURRENCE_ONCE
-        )
-        try:
-            row_id = int(data.rsplit(":", 1)[1])
-        except (TypeError, ValueError, IndexError):
-            await safe_send(lambda: query.message.reply_text("❌ Invalid schedule ID."))
-            return
-        ok, reason, saved = await loop.run_in_executor(
-            None,
-            db_sched_update_recurrence,
-            row_id,
-            user_id,
-            recurrence,
-        )
-        if not ok:
-            await safe_send(lambda: query.message.reply_text(
-                _sched_edit_error_text(row_id, reason),
-                parse_mode="HTML",
-            ))
-            return
-        await safe_send(lambda: query.message.reply_text(
-            f"🔁 Schedule <b>#{row_id}</b> repeat changed to "
-            f"<b>{html.escape(_sched_recurrence_label(_sched_row_recurrence(saved)))}</b>.",
-            parse_mode="HTML",
-            reply_markup=get_sched_detail_kb(saved or {}),
-        ))
-        return
-
-    if data.startswith("sched_ok:"):
-        row_id = _callback_int_arg(data, "sched_ok:")
-        if row_id is None:
-            await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
-            return
-
-        ok, reason, row = await loop.run_in_executor(None, db_sched_confirm, row_id, user_id)
-        if not ok:
-            if reason == "not_found":
-                text = "❌ រកមិនឃើញ Schedule ។"
-            elif reason == "not_owner":
-                text = "⛔ Schedule នេះមិនមែនជារបស់អ្នកទេ។"
-            elif reason == "expired":
-                text = f"⚠️ Schedule #{row_id} ផុតពេលមុនពេលបញ្ជាក់ ដូច្នេះបានបោះបង់។"
-            else:
-                text = f"⚠️ Schedule #{row_id} មានស្ថានភាព <b>{html.escape(str(reason))}</b> — មិនអាចបញ្ជាក់ទេ។"
-            with suppress(Exception):
-                await query.message.edit_reply_markup(reply_markup=None)
-            await safe_send(lambda: query.message.reply_text(text, parse_mode="HTML"))
-            return
-
-        try:
-            dt_str = _fmt_dt(datetime.fromisoformat(str(row["broadcast_at"]).replace("Z", "+00:00")))
-        except Exception:
-            dt_str = str(row.get("broadcast_at", "?")) if row else "?"
-        with suppress(Exception):
-            await query.message.edit_reply_markup(reply_markup=None)
-        status_note = "បានបញ្ជាក់រួចហើយ" if reason == "already_confirmed" else "បានបញ្ជាក់"
-        await safe_send(lambda: query.message.reply_text(
-            f'✅ <b>កាលវិភាគ #{row_id} {status_note}!</b>\n'
-            f'⏰ នឹងផ្សាយសារនៅ {dt_str}\n'
-            f'🔁 Repeat: <b>{html.escape(_sched_recurrence_label(_sched_row_recurrence(row)))}</b>',
-            parse_mode="HTML",
-        ))
-        return
-
-    if data.startswith("sched_no:"):
-        row_id = _callback_int_arg(data, "sched_no:")
-        if row_id is None:
-            await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
-            return
-        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
-        if not row:
-            await safe_send(lambda: query.message.reply_text('❌ រកកាលវិភាគមិនឃើញ។'))
-            return
-        if int(row.get("admin_id") or 0) != int(user_id):
-            await safe_send(lambda: query.message.reply_text("⛔ Schedule នេះមិនមែនជារបស់អ្នកទេ។"))
-            return
-        if str(row.get("status")) in (SCHED_STATUS_DRAFT, SCHED_STATUS_PENDING):
-            await loop.run_in_executor(None, db_sched_set_status, row_id, SCHED_STATUS_CANCELLED)
-        with suppress(Exception):
-            await query.message.edit_reply_markup(reply_markup=None)
-        await safe_send(lambda: query.message.reply_text(
-            f"❌ Schedule <b>#{row_id}</b> បានបោះបង់។", parse_mode="HTML"
-        ))
-        return
-
-    if data == "sched_close":
-        with suppress(Exception):
-            await query.message.delete()
-        return
-
-    if data == "sched_noop":
-        return
-
-    if data.startswith("sched_page:"):
-        page = _callback_int_arg(data, "sched_page:")
-        if page is None:
-            return
-        rows = await loop.run_in_executor(None, db_sched_fetch_admin_pending, user_id)
-        with suppress(Exception):
-            await query.message.edit_reply_markup(reply_markup=get_schedules_list_kb(rows, page=page))
-        return
-
-    if data.startswith("sched_view:"):
-        row_id = _callback_int_arg(data, "sched_view:")
-        if row_id is None:
-            await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
-            return
-        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
-        if not row:
-            await safe_send(lambda: query.message.reply_text('❌ រកកាលវិភាគមិនឃើញ។'))
-            return
-        if int(row.get("admin_id") or 0) != int(user_id):
-            await safe_send(lambda: query.message.reply_text("⛔ Schedule នេះមិនមែនជារបស់អ្នកទេ។"))
-            return
-        await safe_send(lambda: query.message.reply_text(
-            _sched_detail_text(row),
-            parse_mode="HTML",
-            reply_markup=get_sched_detail_kb(row),
-        ))
-        return
-
-    if data.startswith("sched_edit_time:"):
-        row_id = _callback_int_arg(data, "sched_edit_time:")
-        if row_id is None:
-            await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
-            return
-        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
-        ok, reason = _sched_can_edit(row, user_id)
-        if not ok:
-            await safe_send(lambda: query.message.reply_text(_sched_edit_error_text(row_id, reason), parse_mode="HTML"))
-            return
-        context.user_data["sched_state"] = SCHED_EDIT_WAIT_TIME
-        context.user_data["sched_edit_row_id"] = row_id
-        await safe_send(lambda: query.message.reply_text(
-            f'✏️ <b>កែម៉ោងកាលវិភាគ #{row_id}</b>\n\nសូមផ្ញើពេលវេលាថ្មីតាមម៉ោងភ្នំពេញ (ICT, UTC+7)។\nទម្រង់៖ <code>YYYY-MM-DD HH:MM AM/PM</code> ឬ <code>YYYY-MM-DD HH:MM</code>\nតំបន់ម៉ោង៖ ភ្នំពេញ កម្ពុជា — ICT (UTC+7)\nឧទាហរណ៍៖ <code>2026-12-25 09:00 AM</code> ឬ <code>2026-12-25 21:00</code>\n\nវាយ /cancel ដើម្បីបោះបង់ការកែសម្រួល។',
-            parse_mode="HTML",
-        ))
-        return
-
-    if data.startswith("sched_edit_text:"):
-        row_id = _callback_int_arg(data, "sched_edit_text:")
-        if row_id is None:
-            await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
-            return
-        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
-        ok, reason = _sched_can_edit(row, user_id)
-        if not ok:
-            await safe_send(lambda: query.message.reply_text(_sched_edit_error_text(row_id, reason), parse_mode="HTML"))
-            return
-        context.user_data["sched_state"] = SCHED_EDIT_WAIT_TEXT
-        context.user_data["sched_edit_row_id"] = row_id
-        target = "caption" if row.get("photo_file_id") else "text"
-        await safe_send(lambda: query.message.reply_text(
-            f"📝 <b>Edit Schedule #{row_id} {target}</b>\n\n"
-            "ផ្ញើអត្ថបទថ្មី។ វាយ /cancel ដើម្បីបោះបង់ edit។",
-            parse_mode="HTML",
-        ))
-        return
-
-    if data.startswith("sched_edit_photo:"):
-        row_id = _callback_int_arg(data, "sched_edit_photo:")
-        if row_id is None:
-            await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
-            return
-        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
-        ok, reason = _sched_can_edit(row, user_id)
-        if not ok:
-            await safe_send(lambda: query.message.reply_text(_sched_edit_error_text(row_id, reason), parse_mode="HTML"))
-            return
-        context.user_data["sched_state"] = SCHED_EDIT_WAIT_PHOTO
-        context.user_data["sched_edit_row_id"] = row_id
-        await safe_send(lambda: query.message.reply_text(
-            f'🖼 <b>ប្ដូររូបភាពកាលវិភាគ #{row_id}</b>\n\nសូមផ្ញើរូបភាពថ្មី + ចំណងជើង (មិនចាំបាច់)។ វាយ /cancel ដើម្បីបោះបង់ការកែសម្រួល។',
-            parse_mode="HTML",
-        ))
-        return
-
-    if data.startswith("sched_cancel_confirm:"):
-        row_id = _callback_int_arg(data, "sched_cancel_confirm:")
-        if row_id is None:
-            await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
-            return
-        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
-        if not row or int(row.get("admin_id") or 0) != int(user_id):
-            await safe_send(lambda: query.message.reply_text('⛔ អ្នកមិនមានសិទ្ធិបោះបង់កាលវិភាគនេះទេ។'))
-            return
-        if row.get("status") not in (SCHED_STATUS_DRAFT, SCHED_STATUS_PENDING):
-            st = html.escape(str(row.get("status") or "?"))
-            await safe_send(lambda: query.message.reply_text(
-                f"⚠️ Schedule #{row_id} មានស្ថានភាព <b>{st}</b> — មិនអាច cancel ។",
-                parse_mode="HTML",
-            ))
-            return
-        await loop.run_in_executor(None, db_sched_set_status, row_id, SCHED_STATUS_CANCELLED)
-        with suppress(Exception):
-            await query.message.edit_reply_markup(reply_markup=None)
-        await safe_send(lambda: query.message.reply_text(
-            f'✅ កាលវិភាគ <b>#{row_id}</b> បានបោះបង់។', parse_mode="HTML"
-        ))
-        return
-
-    await safe_send(lambda: query.message.reply_text(
-        "This schedule button is no longer available. Please reopen the menu."
-    ))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.callbacks import sched_callback as _impl
+    return await _impl(update, context)
 
 # ---------------------------------------------------------------------------
 # Subtitle/text document helpers
@@ -25011,77 +24520,23 @@ async def _scheduler_loop(bot, stop_event: asyncio.Event) -> None:
 # ===========================================================================
 @admin_only
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args or []
-    if args:
-        query_text = " ".join(args).strip()
-        results = await asyncio.get_running_loop().run_in_executor(
-            _DB_EXECUTOR,
-            lambda: search_users_by_query(query_text),
-        )
-        context.user_data["users_search_query"] = query_text
-        context.user_data["users_search_results"] = results
-        if not results:
-            await safe_send(lambda: update.message.reply_text(
-                f'🔎 <b>ស្វែងរកអ្នកប្រើប្រាស់</b>\n\nរកមិនឃើញអ្នកប្រើប្រាស់សម្រាប់៖ <code>{html.escape(query_text)}</code>',
-                parse_mode="HTML",
-                reply_markup=get_user_search_prompt_kb(),
-            ))
-            return
-        await safe_send(lambda: update.message.reply_text(
-            f'🔎 <b>លទ្ធផលស្វែងរកអ្នកប្រើប្រាស់</b>\n\nពាក្យស្វែងរក៖ <code>{html.escape(query_text)}</code>\nរកឃើញ៖ <b>{len(results)}</b> នាក់\n\nសូមជ្រើសរើសអ្នកប្រើប្រាស់ ដើម្បីមើលព័ត៌មានលម្អិត។',
-            parse_mode="HTML",
-            reply_markup=get_user_search_page_kb(results, page=0),
-        ))
-        return
-
-    users = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, get_all_users_with_names)
-    if not users:
-        await safe_send(lambda: update.message.reply_text("❌ គ្មានអ្នកប្រើប្រាស់ registered ទេ។"))
-        return
-    await safe_send(lambda: update.message.reply_text(
-        f"👥 <b>អ្នកប្រើប្រាស់ ({len(users)} នាក់)</b>\nចុចលើឈ្មោះ ដើម្បីមើល Detail ឬប្រើ 🔎 Search User ។",
-        parse_mode="HTML",
-        reply_markup=get_users_page_kb(users, page=0),
-    ))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import cmd_users as _impl
+    return await _impl(update, context)
 
 
 @admin_only
 async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_id = update.effective_user.id
-    args     = context.args or []
-    if not args or not args[0].isdigit():
-        await safe_send(lambda: update.message.reply_text(
-            '❌ របៀបប្រើ៖ /chat <user_id>\nឬប្រើ /users ដើម្បីជ្រើសអ្នកប្រើប្រាស់។'
-        ))
-        return
-    target_id = int(args[0])
-    exists    = await asyncio.get_running_loop().run_in_executor(None, user_exists_in_db, target_id)
-    if not exists:
-        await safe_send(lambda: update.message.reply_text(
-            f'❌ អ្នកប្រើប្រាស់ <code>{target_id}</code> មិនមាននៅក្នុងមូលដ្ឋានទិន្នន័យទេ។', parse_mode="HTML"
-        ))
-        return
-    await _open_chat_session(context.bot, admin_id, target_id, context)
-    await safe_send(lambda: update.message.reply_text(
-        f"💬 <b>Chat Mode បើក</b>\n\nកំពុង Chat ជាមួយ User <code>{target_id}</code>\n"
-        "សារ/រូបភាព/Voice ផ្ញើនឹងទៅដល់ User ។\n\nវាយ /endchat ឬ /cancel ដើម្បីបញ្ចប់។",
-        parse_mode="HTML",
-    ))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import cmd_chat as _impl
+    return await _impl(update, context)
 
 
 @admin_only
 async def cmd_endchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_id  = update.effective_user.id
-    target_id = _close_session(admin_id)
-    context.user_data.pop("chat_state", None)
-    if target_id is None:
-        await safe_send(lambda: update.message.reply_text("ℹ️ អ្នកមិនទាន់ open Chat ណាមួយទេ។"))
-        return
-    await safe_send(lambda: update.message.reply_text(
-        f'✅ បានបញ្ចប់ការជជែកជាមួយអ្នកប្រើប្រាស់ <code>{target_id}</code>។', parse_mode="HTML"
-    ))
-    with suppress(Exception):
-        await context.bot.send_message(chat_id=target_id, text="ℹ️ Admin បានបញ្ចប់ Session Chat ។")
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import cmd_endchat as _impl
+    return await _impl(update, context)
 
 
 async def _open_chat_session(bot, admin_id: int, target_id: int, context):
@@ -25147,335 +24602,47 @@ async def _show_user_full_history(query, user_id: int, back_ref: str = "p0", pag
 
 
 async def _handle_user_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-        if context.user_data.get("user_search_state") != USER_SEARCH_WAIT_QUERY:
-            return False
-
-        msg = update.message
-        query_text = (msg.text or "").strip()
-        context.user_data.pop("user_search_state", None)
-
-        if not query_text:
-            await safe_send(lambda: msg.reply_text(
-                '⚠️ ពាក្យស្វែងរកទទេ។ សូមចុច /users ហើយព្យាយាមម្ដងទៀត។',
-                reply_markup=get_user_search_prompt_kb(),
-            ))
-            return True
-
-        results = await asyncio.get_running_loop().run_in_executor(
-            _DB_EXECUTOR,
-            lambda: search_users_by_query(query_text),
-        )
-        context.user_data["users_search_query"] = query_text
-        context.user_data["users_search_results"] = results
-
-        if not results:
-            await safe_send(lambda: msg.reply_text(
-                f'🔎 <b>ស្វែងរកអ្នកប្រើប្រាស់</b>\n\nរកមិនឃើញអ្នកប្រើប្រាស់សម្រាប់៖ <code>{html.escape(query_text)}</code>\n\nការស្វែងរកគាំទ្រលេខសម្គាល់ និងឈ្មោះអ្នកប្រើប្រាស់ Telegram។',
-                parse_mode="HTML",
-                reply_markup=get_user_search_prompt_kb(),
-            ))
-            return True
-
-        await safe_send(lambda: msg.reply_text(
-            f'🔎 <b>លទ្ធផលស្វែងរកអ្នកប្រើប្រាស់</b>\n\nពាក្យស្វែងរក៖ <code>{html.escape(query_text)}</code>\nរកឃើញ៖ <b>{len(results)}</b> នាក់\n\nសូមជ្រើសរើសអ្នកប្រើប្រាស់ ដើម្បីមើលព័ត៌មានលម្អិត។',
-            parse_mode="HTML",
-            reply_markup=get_user_search_page_kb(results, page=0),
-        ))
-        return True
-
-
-# ---------------------------------------------------------------------------
-# Admin-Only AI Chat Assistant & Message Edit/Delete Management
-# ---------------------------------------------------------------------------
-ADMIN_AI_CHAT_STATE = "admin_ai_chat_waiting"
-
-async def admin_ai_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Exclusive AI chat assistant for administrators only."""
-    user = update.effective_user
-    if not user or not _is_admin(user.id):
-        if update.message:
-            await safe_send(lambda: update.message.reply_text("⛔ មុខងារនេះសម្រាប់តែ Administrator ប៉ុណ្ណោះ។"))
-        return
-
-    context.user_data[ADMIN_AI_CHAT_STATE] = True
-    await safe_send(lambda: update.message.reply_text(
-        "🤖 <b>Admin AI Chat Assistant (Private Mode)</b>\n\n"
-        "សូមផ្ញើសំណួរ ឬបញ្ជាមកកាន់ AI ខាងក្រោម។ មានតែអ្នកជា Admin ប៉ុណ្ណោះដែលមើលឃើញ និងប្រើប្រាស់បាន។\n\n"
-        "ចុច /cancelforadmin ដើម្បីចាកចេញពីរបៀបជជែកជាមួយ AI។",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ បិទ / ចាកចេញ", callback_data="admin_ai_exit")]]),
-    ))
-
-async def handle_admin_ai_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if not context.user_data.get(ADMIN_AI_CHAT_STATE):
-        return False
-    user = update.effective_user
-    if not user or not _is_admin(user.id):
-        context.user_data.pop(ADMIN_AI_CHAT_STATE, None)
+    if context.user_data.get("user_search_state") != USER_SEARCH_WAIT_QUERY:
         return False
 
     msg = update.message
-    if not msg or not msg.text:
-        return False
+    query_text = (msg.text or "").strip()
+    context.user_data.pop("user_search_state", None)
 
-    text = msg.text.strip()
-    if text in {"/cancel", "/cancelforadmin", "exit"}:
-        context.user_data.pop(ADMIN_AI_CHAT_STATE, None)
-        await safe_send(lambda: msg.reply_text("✅ បានចាកចេញពី Admin AI Chat Assistant."))
+    if not query_text:
+        await safe_send(lambda: msg.reply_text(
+            '⚠️ ពាក្យស្វែងរកទទេ។ សូមចុច /users ហើយព្យាយាមម្ដងទៀត។',
+            reply_markup=get_user_search_prompt_kb(),
+        ))
         return True
 
-    # Send processing status and reply via AI
-    sent = await safe_send(lambda: msg.reply_text("🤖 AI កំពុងគិត..."))
-    try:
-        reply, model, tokens = await ai_text_reply(text)
-        response_text = f"🤖 <b>Admin AI ({model}):</b>\n\n{reply}"
-        if sent:
-            await safe_send(lambda: sent.edit_text(response_text, parse_mode="HTML"))
-        else:
-            await safe_send(lambda: msg.reply_text(response_text, parse_mode="HTML"))
-    except Exception as e:
-        err_msg = f"⚠️ AI Error: {e}"
-        if sent:
-            await safe_send(lambda: sent.edit_text(err_msg))
-        else:
-            await safe_send(lambda: msg.reply_text(err_msg))
+    results = await asyncio.get_running_loop().run_in_executor(
+        _DB_EXECUTOR,
+        lambda: search_users_by_query(query_text),
+    )
+    context.user_data["users_search_query"] = query_text
+    context.user_data["users_search_results"] = results
+
+    if not results:
+        await safe_send(lambda: msg.reply_text(
+            f'🔎 <b>ស្វែងរកអ្នកប្រើប្រាស់</b>\n\nរកមិនឃើញអ្នកប្រើប្រាស់សម្រាប់៖ <code>{html.escape(query_text)}</code>\n\nការស្វែងរកគាំទ្រលេខសម្គាល់ និងឈ្មោះអ្នកប្រើប្រាស់ Telegram។',
+            parse_mode="HTML",
+            reply_markup=get_user_search_prompt_kb(),
+        ))
+        return True
+
+    await safe_send(lambda: msg.reply_text(
+        f'🔎 <b>លទ្ធផលស្វែងរកអ្នកប្រើប្រាស់</b>\n\nពាក្យស្វែងរក៖ <code>{html.escape(query_text)}</code>\nរកឃើញ៖ <b>{len(results)}</b> នាក់\n\nសូមជ្រើសរើសអ្នកប្រើប្រាស់ ដើម្បីមើលព័ត៌មានលម្អិត។',
+        parse_mode="HTML",
+        reply_markup=get_user_search_page_kb(results, page=0),
+    ))
     return True
 
 
-async def admin_message_edit_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin tool to edit or delete bot messages dynamically."""
-    query = update.callback_query
-    if not query:
-        return
-    user = query.from_user
-    if not user or not _is_admin(user.id):
-        with suppress(Exception):
-            await query.answer("⛔ អ្នកមិនមានសិទ្ធិគ្រប់គ្រងសារទេ។", show_alert=True)
-        return
-
-    data = query.data or ""
-    if data == "admin_ai_exit":
-        context.user_data.pop(ADMIN_AI_CHAT_STATE, None)
-        with suppress(Exception):
-            await query.message.edit_text("✅ បានបិទ Admin AI Assistant។")
-        return
-
-    if data.startswith("admin_del_msg:"):
-        try:
-            with suppress(Exception):
-                await query.message.delete()
-            await query.answer("🗑️ បានលុបសារដោយជោគជ័យ។")
-        except Exception as e:
-            await query.answer(f"⚠️ លុបមិនកើត: {e}", show_alert=True)
-
-
 async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-
-    user_id = query.from_user.id if query.from_user else 0
-    data = query.data or ""
-
-    if not _is_admin(user_id):
-        with suppress(Exception):
-            await query.answer("⛔ អ្នកមិនមានសិទ្ធិ។", show_alert=True)
-        return
-
-    with suppress(Exception):
-        await query.answer()
-
-    if query.message is None:
-        return
-
-    def _int_part(parts: list[str], index: int, default: int = 0) -> int:
-        try:
-            return int(parts[index])
-        except Exception:
-            return int(default)
-
-    async def _invalid_callback() -> None:
-        await safe_send(lambda: query.message.reply_text('⚠️ ទិន្នន័យប៊ូតុងមិនត្រឹមត្រូវ ឬផុតកំណត់។ សូមផ្ទុកផ្ទាំងនេះឡើងវិញ។'))
-
-    try:
-        if data == "users_close":
-            context.user_data.pop("user_search_state", None)
-            with suppress(Exception):
-                await query.message.delete()
-            return
-
-        if data == "noop":
-            return
-
-        if data in ("history_refresh", "history_page:0"):
-            await _admin_open_recent_history_panel(query, page=0)
-            return
-
-        if data == "history_close":
-            with suppress(Exception):
-                await query.message.delete()
-            return
-
-        if data.startswith("history_page:"):
-            page = _web_int(data.split(":", 1)[1], 0)
-            await _admin_open_recent_history_panel(query, page=page)
-            return
-
-        if data.startswith("history_user:"):
-            parts = data.split(":")
-            target_id = _int_part(parts, 1, 0)
-            page = _int_part(parts, 2, 0)
-            if target_id <= 0:
-                await _invalid_callback()
-                return
-            row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
-            await safe_send(lambda: query.message.edit_text(
-                _format_user_detail_text(row),
-                parse_mode="HTML",
-                reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=f"h{page}"),
-            ))
-            return
-
-        if data == "users_search":
-            context.user_data["user_search_state"] = USER_SEARCH_WAIT_QUERY
-            await safe_send(lambda: query.message.edit_text(
-                '🔎 <b>ស្វែងរកអ្នកប្រើប្រាស់</b>\n\nសូមផ្ញើលេខសម្គាល់អ្នកប្រើប្រាស់ Telegram ឬឈ្មោះអ្នកប្រើប្រាស់។\n\nឧទាហរណ៍៖\n<code>1272791365</code>\n<code>heng</code>\n<code>@username</code>\n\nប្រើ /cancel ដើម្បីបញ្ឈប់ការស្វែងរក។',
-                parse_mode="HTML",
-                reply_markup=get_user_search_prompt_kb(),
-            ))
-            return
-
-        if data.startswith("users_search_page:"):
-            page = _web_int(data.split(":", 1)[1], 0)
-            await _show_user_search_results(query, context, page=page)
-            return
-
-        if data.startswith("users_page:"):
-            page = _web_int(data.split(":", 1)[1], 0)
-            users = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, get_all_users_with_names)
-            page = _clamp_users_page(users, page)
-            await safe_send(lambda: query.message.edit_text(
-                f'👥 <b>ការគ្រប់គ្រងអ្នកប្រើប្រាស់ ({len(users)} នាក់)</b>\nសូមជ្រើសរើសអ្នកប្រើប្រាស់ ឬចុច 🔎 ស្វែងរកអ្នកប្រើប្រាស់ ដើម្បីស្វែងរកតាមលេខសម្គាល់ ឬឈ្មោះអ្នកប្រើប្រាស់។',
-                parse_mode="HTML",
-                reply_markup=get_users_page_kb(users, page=page),
-            ))
-            return
-
-        if data.startswith("user_view:"):
-            parts = data.split(":")
-            target_id = _int_part(parts, 1, 0)
-            back_ref = parts[2] if len(parts) > 2 else "p0"
-            if target_id <= 0:
-                await _invalid_callback()
-                return
-            row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
-            await safe_send(lambda: query.message.edit_text(
-                _format_user_detail_text(row),
-                parse_mode="HTML",
-                reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
-            ))
-            return
-
-        if data.startswith("user_history:"):
-            parts = data.split(":")
-            target_id = _int_part(parts, 1, 0)
-            back_ref = parts[2] if len(parts) > 2 else "p0"
-            page = _int_part(parts, 3, 0)
-            if target_id <= 0:
-                await _invalid_callback()
-                return
-            await _show_user_full_history(query, target_id, back_ref=back_ref, page=page)
-            return
-
-        if data.startswith("user_chat:"):
-            target_id = _web_int(data.split(":", 1)[1], 0)
-            if target_id <= 0:
-                await _invalid_callback()
-                return
-            exists = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: user_exists_in_db(target_id))
-            if not exists:
-                await safe_send(lambda: query.message.edit_text(
-                    f'❌ អ្នកប្រើប្រាស់ <code>{target_id}</code> មិនមាននៅក្នុងមូលដ្ឋានទិន្នន័យទេ។',
-                    parse_mode="HTML",
-                    reply_markup=get_admin_dashboard_kb(),
-                ))
-                return
-            await _open_chat_session(context.bot, user_id, target_id, context)
-            await safe_send(lambda: query.message.edit_text(
-                f"💬 <b>Chat Mode បើក</b>\n\nកំពុង Chat ជាមួយ User <code>{target_id}</code>\n"
-                "សារ/រូបភាព/Voice ផ្ញើនឹងទៅដល់ User ។\n\n"
-                "វាយ /endchat ឬ /cancel ដើម្បីបញ្ចប់។",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
-                    InlineKeyboardButton("❌ End Chat", callback_data="admin_cancel_state"),
-                ]]),
-            ))
-            return
-
-        if data.startswith(("user_block:", "user_unblock:")):
-            parts = data.split(":")
-            action = parts[0]
-            target_id = _int_part(parts, 1, 0)
-            back_ref = parts[2] if len(parts) > 2 else "p0"
-            if target_id <= 0:
-                await _invalid_callback()
-                return
-            blocked = action == "user_block"
-            ok, info = await asyncio.get_running_loop().run_in_executor(
-                _DB_EXECUTOR,
-                lambda: db_user_set_blocked(target_id, user_id, blocked),
-            )
-            row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
-            notice = "✅ User blocked." if blocked else "✅ User unblocked."
-            if not ok:
-                notice = f"⚠️ Saved memory only / DB issue: {info[:500]}"
-            await safe_send(lambda: query.message.edit_text(
-                notice + "\n\n" + _format_user_detail_text(row),
-                parse_mode="HTML",
-                reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
-            ))
-            return
-
-        if data.startswith("user_resetprefs:"):
-            parts = data.split(":")
-            target_id = _int_part(parts, 1, 0)
-            back_ref = parts[2] if len(parts) > 2 else "p0"
-            if target_id <= 0:
-                await _invalid_callback()
-                return
-            ok, info = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_reset_prefs(target_id))
-            row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
-            notice = "✅ User preferences reset." if ok else f"❌ Reset failed: {info[:500]}"
-            await safe_send(lambda: query.message.edit_text(
-                notice + "\n\n" + _format_user_detail_text(row),
-                parse_mode="HTML",
-                reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
-            ))
-            return
-
-        if data.startswith("user_clearhist:"):
-            parts = data.split(":")
-            target_id = _int_part(parts, 1, 0)
-            back_ref = parts[2] if len(parts) > 2 else "p0"
-            if target_id <= 0:
-                await _invalid_callback()
-                return
-            await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_history_clear(target_id))
-            row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
-            await safe_send(lambda: query.message.edit_text(
-                "✅ User conversation history cleared.\n\n" + _format_user_detail_text(row),
-                parse_mode="HTML",
-                reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
-            ))
-            return
-
-        logger.debug("users_page_callback: unhandled data=%r", data)
-
-    except Exception as exc:
-        logger.error("users_page_callback failed [data=%s]: %s", data, exc, exc_info=True)
-        with suppress(Exception):
-            await safe_send(lambda: query.message.reply_text('⚠️ ផ្ទាំងអ្នកប្រើប្រាស់មានបញ្ហា។ សូមផ្ទុកឡើងវិញ ហើយព្យាយាមម្ដងទៀត។'))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.callbacks import users_page_callback as _impl
+    return await _impl(update, context)
 
 async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
     async def _do():
@@ -25586,155 +24753,9 @@ def _format_api_key_row(row: dict) -> str:
 
 @admin_only
 async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command to create/list/revoke API keys for /ai-assistant."""
-    msg = update.message
-    admin_id = update.effective_user.id
-    args = list(context.args or [])
-
-    if not args or args[0].lower() in ("help", "-h", "--help"):
-        await safe_send(lambda: msg.reply_text(
-            _api_help_text(),
-            parse_mode="HTML",
-            reply_markup=get_api_admin_kb(),
-            disable_web_page_preview=True,
-        ))
-        return
-
-    action = args[0].lower().strip()
-    loop = asyncio.get_running_loop()
-
-    if action == "sql":
-        pages = _paginate_pre_html(
-            AI_API_KEYS_TABLE_SQL,
-            limit=3800,
-            header="🧩 <b>Supabase SQL for API keys</b>\n\n",
-        )
-        for page in pages:
-            await safe_send(lambda p=page: msg.reply_text(
-                p,
-                parse_mode="HTML",
-                reply_markup=get_api_admin_kb(),
-            ))
-        return
-
-    if action == "create":
-        note = " ".join(args[1:]).strip()
-        try:
-            raw_key, row, storage = await loop.run_in_executor(
-                _DB_EXECUTOR,
-                lambda: db_ai_api_key_create(admin_id=admin_id, note=note),
-            )
-        except Exception as e:
-            logger.error(f"/api create failed: {e}", exc_info=True)
-            err = str(e)
-            pages = _paginate_pre_html(
-                err,
-                limit=3500,
-                header=(
-                    "❌ Cannot create API key.\n"
-                    "If this is first setup, press <b>🧩 Setup SQL</b> or run <code>/api sql</code> "
-                    "and execute it in Supabase.\n\n"
-                ),
-            )
-            for page in pages:
-                await safe_send(lambda p=page: msg.reply_text(
-                    p,
-                    parse_mode="HTML",
-                    reply_markup=get_api_admin_kb(),
-                ))
-            return
-
-        warning = ""
-        if storage == "memory":
-            warning = (
-                "\n\n⚠️ Supabase is not configured, so this key is stored in memory only "
-                "and will stop working after restart/deploy."
-            )
-
-        await safe_send(lambda: msg.reply_text(
-            f"""✅ <b>បានបង្កើតសោ API សម្រាប់ AI ថ្មី</b>\n\nសូមចម្លងសោនេះឥឡូវនេះ។ វានឹងមិនត្រូវបានបង្ហាញម្ដងទៀតទេ។\n\n<code>{html.escape(raw_key)}</code>\n\nបុព្វបទ៖ <code>{html.escape(str(row.get('key_prefix') or _api_key_prefix(raw_key)))}</code>\nកន្លែងរក្សាទុក៖ <b>{html.escape(storage)}</b>\n\nឧទាហរណ៍៖\n<pre>curl -X POST https://YOUR-APP.onrender.com/ai-assistant \\\n  -H 'Content-Type: application/json' \\\n  -H 'X-Api-Key: {html.escape(raw_key)}' \\\n  -d '{{"message":"Hello"}}'</pre>{warning}""",
-            parse_mode="HTML",
-            reply_markup=get_api_admin_kb(),
-            disable_web_page_preview=True,
-        ))
-        return
-
-    if action == "list":
-        try:
-            rows = await loop.run_in_executor(_DB_EXECUTOR, lambda: db_ai_api_key_list(limit=20))
-        except Exception as exc:
-            logger.error("/api list failed: %s", exc, exc_info=True)
-            error_text = html.escape(str(exc)[:3500])
-            await safe_send(lambda: msg.reply_text(
-                f'❌ មិនអាចបង្ហាញបញ្ជីសោ API បានទេ។\n<pre>{error_text}</pre>',
-                parse_mode="HTML",
-                reply_markup=get_api_admin_kb(),
-            ))
-            return
-
-        if not rows:
-            await safe_send(lambda: msg.reply_text(
-                'ℹ️ មិនមានសោ API ទេ។ សូមចុច <b>➕ បង្កើតសោ API</b> ឬប្រើ <code>/api create</code>។',
-                parse_mode="HTML",
-                reply_markup=get_api_admin_kb(),
-            ))
-            return
-
-        body = "\n\n".join(_format_api_key_row(r) for r in rows)
-        for page in _paginate_html(body, limit=3900, header="🔑 <b>AI API Keys</b>\n\n"):
-            await safe_send(lambda p=page: msg.reply_text(
-                p,
-                parse_mode="HTML",
-                reply_markup=get_api_list_kb(rows),
-                disable_web_page_preview=True,
-            ))
-        return
-
-    if action == "revoke":
-        if len(args) < 2:
-            await safe_send(lambda: msg.reply_text(
-                '⚠️ របៀបប្រើ៖ <code>/api revoke KEY_PREFIX_OR_ID</code>\n\nឬចុច <b>📋 បញ្ជីសោ API</b> ហើយដកសិទ្ធិតាមប៊ូតុង។',
-                parse_mode="HTML",
-                reply_markup=get_api_admin_kb(),
-            ))
-            return
-
-        identifier = args[1].strip()
-        try:
-            ok, info = await loop.run_in_executor(
-                _DB_EXECUTOR,
-                lambda: db_ai_api_key_revoke(identifier),
-            )
-        except Exception as exc:
-            logger.error("/api revoke failed: %s", exc, exc_info=True)
-            error_text = html.escape(str(exc)[:3500])
-            await safe_send(lambda: msg.reply_text(
-                f'❌ មិនអាចដកសិទ្ធិសោ API បានទេ។\n<pre>{error_text}</pre>',
-                parse_mode="HTML",
-                reply_markup=get_api_admin_kb(),
-            ))
-            return
-
-        if ok:
-            await safe_send(lambda: msg.reply_text(
-                f'✅ បានដកសិទ្ធិសោ API៖ <code>{html.escape(info)}</code>',
-                parse_mode="HTML",
-                reply_markup=get_api_admin_kb(),
-            ))
-        else:
-            await safe_send(lambda: msg.reply_text(
-                f"❌ {html.escape(info)}",
-                parse_mode="HTML",
-                reply_markup=get_api_admin_kb(),
-            ))
-        return
-
-    await safe_send(lambda: msg.reply_text(
-        _api_help_text(),
-        parse_mode="HTML",
-        reply_markup=get_api_admin_kb(),
-        disable_web_page_preview=True,
-    ))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import cmd_api as _impl
+    return await _impl(update, context)
 
 def _api_status_text(status: dict, notice: str = "") -> str:
     static_key = "✅ ON" if status.get("static_key") else "⚠️ OFF"
@@ -25966,27 +24987,16 @@ async def _cb_api_dashboard(query, user_id: int, context: ContextTypes.DEFAULT_T
 
 @admin_only
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    loop   = asyncio.get_running_loop()
-    user_ids, pending_scheds = await asyncio.gather(
-        loop.run_in_executor(_DB_EXECUTOR, get_all_user_ids),
-        loop.run_in_executor(_DB_EXECUTOR, db_sched_fetch_admin_pending, update.effective_user.id),
-    )
-    await safe_send(lambda: update.message.reply_text(
-        f"📊 <b>ស្ថិតិបូត</b>\n\n👥 អ្នកប្រើប្រាស់សរុប៖ <b>{len(user_ids)}</b>\n💬 ការជជែកសកម្មរបស់អ្នកគ្រប់គ្រង៖ <b>{len(_admin_chat_target)}</b>\n📅 កាលវិភាគកំពុងរង់ចាំ៖ <b>{len(pending_scheds)}</b>\n🔒 សោអ្នកប្រើប្រាស់សកម្ម៖ <b>{len(_user_locks)}</b>\n💭 ចំនួនធាតុប្រវត្តិក្នុង Cache៖ <b>{len(_hist_cache)}</b>\n🔑 ការផ្ទៀងផ្ទាត់ API បែប Dynamic៖ <b>{('ON' if _dynamic_ai_auth_configured() else 'OFF')}</b>\n🤗 ម៉ូដែល HF៖ <b>{HF_MODEL}</b>\nOCR៖ <b>{HF_OCR_MODEL}</b>",
-        parse_mode="HTML",
-    ))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import admin_stats as _impl
+    return await _impl(update, context)
 
 
 @admin_only
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Telegram admin shortcut for the full bot health panel."""
-    text = await _admin_health_text()
-    await safe_send(lambda: update.message.reply_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=get_admin_dashboard_kb(),
-        disable_web_page_preview=True,
-    ))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import cmd_health as _impl
+    return await _impl(update, context)
 
 
 async def _clear_admin_transient_state(context: Any, admin_id: int) -> list[str]:
@@ -26050,34 +25060,9 @@ async def _clear_admin_transient_state(context: Any, admin_id: int) -> list[str]
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not _is_admin(uid):
-        await safe_send(lambda: update.message.reply_text('ℹ️ មិនមានប្រតិបត្តិការដែលត្រូវបោះបង់ទេ។'))
-        return
-
-    # Preserve the old admin-chat notification behavior while still using the
-    # unified cleanup helper for every other transient state.
-    target_id = None
-    with suppress(Exception):
-        if context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
-            target_id = _admin_chat_target.get(uid)
-
-    cleared = await _clear_admin_transient_state(context, uid)
-
-    if target_id:
-        with suppress(Exception):
-            await context.bot.send_message(chat_id=target_id, text="ℹ️ Admin បានបញ្ចប់ Session Chat ។")
-
-    if cleared:
-        labels = ", ".join(cleared[:8])
-        await safe_send(lambda: update.message.reply_text(
-            f"✅ បានបោះបង់/សម្អាត state រួច: <code>{html.escape(labels)}</code>",
-            parse_mode="HTML",
-            reply_markup=get_admin_dashboard_kb(),
-        ))
-        return
-
-    await safe_send(lambda: update.message.reply_text('ℹ️ មិនមានប្រតិបត្តិការដែលត្រូវបោះបង់ទេ។'))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import cmd_cancel as _impl
+    return await _impl(update, context)
 
 
 # ===========================================================================
@@ -26087,57 +25072,28 @@ _BOT_START_TIME: float = 0.0
 
 
 async def _drop_stale_updates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Drop old message updates received before bot started.
-
-    FIX: For callback_query updates, we intentionally do NOT drop them based on
-    message date — the message date is when the original message was sent, not
-    when the user tapped the button. Dropping callbacks based on message age
-    would break buttons on messages sent before the bot restarted. We only drop
-    stale *message* updates.
-    """
-    # Webhook mode must not drop old message timestamps. During cold starts,
-    # this app returns 503 until Telegram is ready, and Telegram may retry the
-    # same update later with the original message date.  Dropping it here would
-    # lose user messages after a slow Render restart/deploy.
-    if "_run_state_bot_mode" in globals() and _run_state_bot_mode() == "WEBHOOK":
-        return
-
-    if _BOT_START_TIME == 0.0:
-        return
-
-    # Only filter plain messages (not callbacks)
-    msg = update.message or update.edited_message
-    if msg and getattr(msg, "date", None):
-        if msg.date.timestamp() < (_BOT_START_TIME - _STALE_GRACE_S):
-            logger.debug(f"Dropping stale message update (id={update.update_id})")
-            raise ApplicationHandlerStop
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.guards import _drop_stale_updates as _impl
+    return await _impl(update, context)
 
 
 async def cmd_security(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not update.effective_message:
-        return
-    blocked = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_is_blocked(int(user.id)))
-    status = "blocked" if blocked else "active"
-    await safe_send(lambda: update.effective_message.reply_text(
-        f'🔐 <b>សុវត្ថិភាព និងឯកជនភាព</b>\n\nលេខសម្គាល់អ្នកប្រើប្រាស់៖ <code>{int(user.id)}</code>\nស្ថានភាព៖ <b>{html.escape(status)}</b>\n\n✅ ពាក្យបញ្ជារបស់អ្នកគ្រប់គ្រងត្រូវបានការពារ។\n✅ ការការពារ Spam និងការផ្ញើសារច្រើនពេកត្រូវបានបើក។\n✅ តាមលំនាំដើម សោ API ត្រូវទទួលពី Header មិនមែនពី URL Query String ទេ។\n✅ ប្រើ /clear ដើម្បីសម្អាតបរិបទការជជែក។\n🗑️ ប្រើ /deleteme ដើម្បីលុបប្រវត្តិបូត និងចំណូលចិត្តដែលបានរក្សាទុក។',
-        parse_mode="HTML",
-    ))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import cmd_security as _impl
+    return await _impl(update, context)
 
 
 async def cmd_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_message:
-        return
-    await safe_send(lambda: update.effective_message.reply_text(
-        '🔒 <b>ឯកជនភាព</b>\n\nបូតនេះរក្សាទុកតែទិន្នន័យដែលចាំបាច់សម្រាប់ចំណូលចិត្ត ដំណើរការ Cache អត្ថបទ/សំឡេង បរិបទការសន្ទនា សុវត្ថិភាពអ្នកគ្រប់គ្រង និងកំណត់ហេតុការផ្ញើ។\n\nអ្នកអាចប្រើ /clear ដើម្បីលុបបរិបទការសន្ទនាបច្ចុប្បន្ន ឬ /deleteme ដើម្បីលុបប្រវត្តិបូត និងចំណូលចិត្តដែលបានរក្សាទុកពី Cache/មូលដ្ឋានទិន្នន័យ តាមការកំណត់របស់ប្រព័ន្ធ។',
-        parse_mode="HTML",
-    ))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import cmd_privacy as _impl
+    return await _impl(update, context)
 
 
 async def _delete_user_personal_data(user_id: int) -> None:
     user_id = int(user_id)
     db_history_clear(user_id)
     _invalidate_prefs(user_id)
+    await _voxcpm2_profile_delete(user_id)
 
     def _run():
         with suppress(Exception):
@@ -26147,9 +25103,6 @@ async def _delete_user_personal_data(user_id: int) -> None:
                 _redis_delete_sync(_prefs_redis_key(user_id))
                 _redis_delete_sync(_hist_redis_key(user_id))
                 _redis_delete_sync(_text_cache_user_history_redis_key(user_id))
-                # Removal migration: honor /deleteme for profiles written by
-                # releases that supported the retired voice-cloning feature.
-                _redis_delete_sync(_redis_key("voxcpm2", "profile", user_id))
         if supabase:
             db_call_sync(
                 f"user_prefs_delete:{user_id}",
@@ -26177,1014 +25130,627 @@ async def _delete_user_personal_data(user_id: int) -> None:
 
 
 async def cmd_delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not update.effective_message:
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import cmd_delete_my_data as _impl
+    return await _impl(update, context)
+
+
+def _voxcpm2_panel_kb(profile: dict[str, Any], selected: bool = False) -> InlineKeyboardMarkup:
+    mode = _voxcpm2_normalize_mode(profile.get("mode"))
+    control_label = "✅ ក្លូនអាចកំណត់ស្ទីល" if mode == VOXCPM2_MODE_CONTROLLABLE else "🎛 ក្លូនអាចកំណត់ស្ទីល"
+    ultimate_label = "✅ ក្លូនដូចដើមបំផុត" if mode == VOXCPM2_MODE_ULTIMATE else "🎙 ក្លូនដូចដើមបំផុត"
+    select_label = "✅ បានជ្រើស VoxCPM2" if selected else "✅ ជ្រើស VoxCPM2"
+    mode_action = (
+        [InlineKeyboardButton("📝 បញ្ចូលអត្ថបទសំឡេងគំរូ", callback_data="voxcpm2:set_prompt"),
+         InlineKeyboardButton("🧹 លុបអត្ថបទគំរូ", callback_data="voxcpm2:clear_prompt")]
+        if mode == VOXCPM2_MODE_ULTIMATE
+        else
+        [InlineKeyboardButton("🎚 កំណត់អារម្មណ៍/ស្ទីល", callback_data="voxcpm2:set_control"),
+         InlineKeyboardButton("🧹 លុបការណែនាំ", callback_data="voxcpm2:clear_control")]
+    )
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(control_label, callback_data="voxcpm2:mode_control"),
+         InlineKeyboardButton(ultimate_label, callback_data="voxcpm2:mode_ultimate")],
+        [InlineKeyboardButton("🎤 បញ្ចូលសំឡេងគំរូ", callback_data="voxcpm2:set_ref"),
+         InlineKeyboardButton("🗑 លុបសំឡេងគំរូ", callback_data="voxcpm2:clear_ref")],
+        mode_action,
+        [InlineKeyboardButton(select_label, callback_data="voxcpm2:select"),
+         InlineKeyboardButton("🔄 ផ្ទុកឡើងវិញ", callback_data="voxcpm2:refresh")],
+        [InlineKeyboardButton("🤖 ជ្រើសម៉ូដែលសំឡេង", callback_data="show_tts_model"),
+         InlineKeyboardButton("❌ បិទ", callback_data="voxcpm2:close")],
+    ])
+
+
+def _voxcpm2_input_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("↩️ ត្រឡប់ទៅផ្ទាំង VoxCPM2", callback_data="voxcpm2:refresh")],
+        [InlineKeyboardButton("❌ បិទ", callback_data="voxcpm2:close")],
+    ])
+
+
+_VOXCPM2_PANEL_CHAT_KEY = "voxcpm2_panel_chat_id"
+_VOXCPM2_PANEL_MESSAGE_KEY = "voxcpm2_panel_message_id"
+
+
+def _voxcpm2_remember_panel(context: Any, message: Any) -> None:
+    if context is None or message is None:
         return
-    if _is_admin(int(user.id)) and "--confirm-admin" not in context.args:
-        await safe_send(lambda: update.effective_message.reply_text(
-            '⚠️ បានរកឃើញគណនីអ្នកគ្រប់គ្រង។ ដើម្បីលុបទិន្នន័យអ្នកប្រើប្រាស់របស់ខ្លួន សូមប្រើ៖\n<code>/deleteme --confirm-admin</code>',
-            parse_mode="HTML",
-        ))
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    message_id = getattr(message, "message_id", None)
+    if chat_id is None or message_id is None:
         return
-    await _delete_user_personal_data(int(user.id))
-    await safe_send(lambda: update.effective_message.reply_text(
-        '✅ បានសម្អាតប្រវត្តិបូត Cache អត្ថបទ និងចំណូលចិត្តរបស់អ្នក។\nសម្គាល់៖ កំណត់ត្រាបិទសិទ្ធិសុវត្ថិភាព និងកំណត់ហេតុការផ្ញើ/សវនកម្មចាំបាច់ អាចត្រូវរក្សាទុកដោយអ្នកគ្រប់គ្រង ដើម្បីការពារការប្រើប្រាស់ខុសគោលបំណង។'
-    ))
+    context.user_data[_VOXCPM2_PANEL_CHAT_KEY] = int(chat_id)
+    context.user_data[_VOXCPM2_PANEL_MESSAGE_KEY] = int(message_id)
 
 
+def _voxcpm2_forget_panel(context: Any) -> None:
+    if context is None:
+        return
+    context.user_data.pop(_VOXCPM2_PANEL_CHAT_KEY, None)
+    context.user_data.pop(_VOXCPM2_PANEL_MESSAGE_KEY, None)
 
 
-async def _send_welcome_content(
-    message: Any,
-    welcome_message: Any,
-    image_file_id: Any = "",
-) -> Any:
-    return await _send_welcome_content_service(
-        message,
-        welcome_message,
-        image_file_id,
-        default_text=WELCOME_TEXT,
-        reply_markup=get_welcome_kb(),
-        safe_sender=safe_send,
-        logger=logger,
+def _voxcpm2_panel_text(profile: dict[str, Any], selected: bool, notice: str = "") -> str:
+    profile = _voxcpm2_normalize_profile(profile)
+    reference_ready = _voxcpm2_reference_ready(profile)
+    ready = _voxcpm2_profile_ready(profile)
+    mode = _voxcpm2_normalize_mode(profile.get("mode"))
+    duration = float(profile.get("duration") or 0.0)
+    ref_name = html.escape(str(profile.get("filename") or "សំឡេងគំរូ")[:80])
+    reference_line = f"✅ <code>{ref_name}</code>" if reference_ready else "❌ មិនទាន់បញ្ចូល"
+    if reference_ready and duration > 0:
+        reference_line += f" · {duration:g} វិនាទី"
+
+    control = str(profile.get("control") or "").strip()
+    control_line = html.escape(control[:220]) if control else "ប្រើអារម្មណ៍ និងស្ទីលដើមពីសំឡេងគំរូ"
+    prompt_text = str(profile.get("prompt_text") or "").strip()
+    prompt_line = html.escape(prompt_text[:260]) if prompt_text else "❌ មិនទាន់បញ្ចូលអត្ថបទដែលនិយាយក្នុងសំឡេងគំរូ"
+    if mode == VOXCPM2_MODE_ULTIMATE:
+        mode_line = "🎙 <b>ក្លូនដូចដើមបំផុត (Ultimate)</b>"
+        mode_detail = (
+            f"អត្ថបទសំឡេងគំរូ៖ <i>{prompt_line}</i>\n"
+            "ការណែនាំស្ទីល៖ <i>មិនប្រើក្នុង Ultimate mode</i>"
+        )
+    else:
+        mode_line = "🎛 <b>ក្លូនអាចកំណត់ស្ទីល (Controllable)</b>"
+        mode_detail = f"អារម្មណ៍/ស្ទីល៖ <i>{control_line}</i>"
+
+    missing = _voxcpm2_profile_missing(profile)
+    missing_labels = {
+        "reference": "សំឡេងគំរូ",
+        "prompt_text": "អត្ថបទសំឡេងគំរូ",
+    }
+    setup_line = (
+        "✅ រួចរាល់សម្រាប់បង្កើតសំឡេង"
+        if ready
+        else "⏳ ត្រូវបំពេញ៖ " + ", ".join(missing_labels[item] for item in missing)
+    )
+    unavailable = _voxcpm2_unavailable_reason()
+    status_line = f"⚠️ {html.escape(unavailable)}" if unavailable else "✅ រួចរាល់"
+    selected_line = "បានជ្រើស" if selected else "មិនទាន់ជ្រើស"
+    prefix = f"✅ {html.escape(notice)}\n\n" if notice else ""
+
+    return (
+        prefix
+        + "🎙 <b>VoxCPM2 — ក្លូនសំឡេង</b>\n\n"
+        + f"សេវាកម្ម៖ {status_line}\n"
+        + f"របៀប៖ {mode_line}\n"
+        + f"សំឡេងគំរូ៖ {reference_line}\n"
+        + mode_detail + "\n"
+        + f"ការរៀបចំ៖ {setup_line}\n"
+        + f"ម៉ូដែលដែលបានជ្រើស៖ <b>{selected_line}</b>\n\n"
+        + "• Controllable៖ រក្សាសូរសំឡេង ហើយអាចកំណត់អារម្មណ៍ ល្បឿន និងស្ទីលថ្មី។\n"
+        + "• Ultimate៖ បន្តពីសំឡេងគំរូ ដើម្បីរក្សាលម្អិតសំឡេងឱ្យដូចដើមបំផុត; ត្រូវការអត្ថបទត្រឹមត្រូវនៃសំឡេងគំរូ។\n\n"
+        + f"💡 ប្រើអ្នកនិយាយម្នាក់ សំឡេងច្បាស់ គ្មានតន្ត្រីខាងក្រោយ និងប្រហែល ៥–៣០ វិនាទី "
+          f"(អតិបរមា {VOXCPM2_MAX_REFERENCE_SECONDS:g} វិនាទី)។\n"
+        + "⚠️ សូមប្រើតែសំឡេងរបស់ខ្លួនឯង ឬសំឡេងដែលអ្នកមានការអនុញ្ញាតឱ្យចម្លង។ សំឡេងគំរូនឹងត្រូវផ្ញើទៅសេវា VoxCPM2 ដែលបានកំណត់ ដើម្បីបង្កើតសំឡេង។"
     )
 
 
-async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        sync_user_data(update.effective_user)
-        if not await _ensure_user_allowed(update, context):
-            return
-        welcome_message, image_file_id = await get_welcome_content_async()
-        await _send_welcome_content(update.message, welcome_message, image_file_id)
-    except Exception as e:
-        logger.error(f"on_start error: {e}")
+async def _voxcpm2_send_panel(
+    target_message,
+    user_id: int,
+    notice: str = "",
+    *,
+    edit: bool = False,
+    context: Any | None = None,
+    prefer_saved: bool = False,
+) -> Any:
+    """Render one reusable VoxCPM2 panel instead of adding a new bot message.
 
+    The panel message id is stored in user_data. Uploads, control text, cancel,
+    refresh and validation errors edit that same panel whenever possible.
+    """
+    profile, prefs = await asyncio.gather(
+        _voxcpm2_profile_get(user_id),
+        get_user_prefs_async(user_id),
+    )
+    selected = _normalize_tts_model(prefs.get("tts_model", "auto")) == "voxcpm2"
+    text = _voxcpm2_panel_text(profile, selected, notice)
+    reply_markup = _voxcpm2_panel_kb(profile, selected)
 
-async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await on_start(update, context)
+    if context is not None and (prefer_saved or edit):
+        chat_id = context.user_data.get(_VOXCPM2_PANEL_CHAT_KEY)
+        message_id = context.user_data.get(_VOXCPM2_PANEL_MESSAGE_KEY)
+        if chat_id is not None and message_id is not None:
+            try:
+                edited = await safe_send(lambda: context.bot.edit_message_text(
+                    chat_id=int(chat_id),
+                    message_id=int(message_id),
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True,
+                ))
+                if edited is not None:
+                    _voxcpm2_remember_panel(context, edited)
+                    return edited
+                # A stale/deleted stored message is treated as non-fatal by
+                # safe_send and returns None. Fall back to a new panel so the
+                # user never loses the setup screen.
+                _voxcpm2_forget_panel(context)
+            except Exception as exc:
+                logger.debug("Saved VoxCPM2 panel could not be edited; creating a new panel: %s", exc)
+                _voxcpm2_forget_panel(context)
 
+    if edit and target_message is not None:
+        try:
+            edited = await safe_send(lambda: target_message.edit_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            ))
+            _voxcpm2_remember_panel(context, edited or target_message)
+            return edited or target_message
+        except Exception as exc:
+            logger.debug("Current VoxCPM2 panel could not be edited; creating a new panel: %s", exc)
 
-async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    prefs = await get_user_prefs_async(user_id)
-    await safe_send(lambda: update.message.reply_text(
-        _myprefs_text(prefs),
+    sent = await safe_send(lambda: target_message.reply_text(
+        text,
         parse_mode="HTML",
-        reply_markup=get_myprefs_kb(prefs),
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
+    ))
+    _voxcpm2_remember_panel(context, sent)
+    return sent
+
+
+async def _voxcpm2_edit_prompt(query, context: Any, text: str) -> None:
+    _voxcpm2_remember_panel(context, query.message)
+    await safe_send(lambda: query.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=_voxcpm2_input_kb(),
         disable_web_page_preview=True,
     ))
 
 
-async def cmd_ttsmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _ensure_user_allowed(update, context, "tts_enabled", "Text to voice"):
+async def _ensure_voxcpm2_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    allowed = await _ensure_user_allowed(update, context, "tts_enabled", "VoxCPM2 TTS")
+    if not allowed:
+        context.user_data.pop("voxcpm2_state", None)
+    return allowed
+
+
+async def cmd_voxcpm2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import cmd_voxcpm2 as _impl
+    return await _impl(update, context)
+
+
+async def _voxcpm2_accept_reference(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    file_id: str,
+    file_unique_id: str,
+    filename: str,
+    mime_type: str,
+    file_size: int,
+    duration: float,
+) -> None:
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
         return
-    user_id = update.effective_user.id
-    prefs = await get_user_prefs_async(user_id)
-    await safe_send(lambda: update.message.reply_text(
-        '🤖 <b>ជ្រើសរើសម៉ូដែល TTS</b>\n\nស្វ័យប្រវត្តិ៖ ប្រើ Khmer HF Space សម្រាប់ភាសាខ្មែរ និងប្ដូរទៅ Edge ប្រសិនបើចាំបាច់\nKhmer HF៖ ប្រើ mrrtmob/khmer-tts សម្រាប់អត្ថបទខ្មែរ\nEdge៖ ប្រើ Microsoft Edge TTS សម្រាប់គ្រប់ភាសា',
-        parse_mode="HTML",
-        reply_markup=get_tts_model_kb(prefs.get("tts_model", "auto")),
-    ))
+    user_id = int(user.id)
+
+    if file_size and file_size > VOXCPM2_MAX_REFERENCE_BYTES:
+        await _voxcpm2_send_panel(
+            msg,
+            user_id,
+            f"ឯកសារសំឡេងគំរូធំពេក។ អតិបរមា {VOXCPM2_MAX_REFERENCE_BYTES // 1024 // 1024} MB។",
+            context=context,
+            prefer_saved=True,
+        )
+        return
+    if duration and duration > VOXCPM2_MAX_REFERENCE_SECONDS:
+        await _voxcpm2_send_panel(
+            msg,
+            user_id,
+            f"សំឡេងគំរូវែងពេក។ អតិបរមា {VOXCPM2_MAX_REFERENCE_SECONDS:g} វិនាទី។",
+            context=context,
+            prefer_saved=True,
+        )
+        return
+
+    suffix = _voxcpm2_reference_suffix(filename, mime_type)
+    validation_path = ""
+    try:
+        telegram_file = await safe_send(lambda: context.bot.get_file(str(file_id)))
+        if not telegram_file:
+            raise RuntimeError("Telegram could not retrieve the reference audio.")
+        validation_path = await _download_telegram_file_to_temp_path(
+            telegram_file,
+            VOXCPM2_MAX_REFERENCE_BYTES,
+            suffix=suffix,
+        )
+        actual_duration = await _validate_voxcpm2_reference_path(validation_path)
+        if actual_duration > 0:
+            duration = round(actual_duration, 3)
+        file_size = int(await asyncio.to_thread(os.path.getsize, validation_path))
+    except Exception as exc:
+        await _voxcpm2_send_panel(
+            msg,
+            user_id,
+            f"មិនអាចប្រើសំឡេងគំរូនេះបានទេ៖ {str(exc)[:220]}",
+            context=context,
+            prefer_saved=True,
+        )
+        return
+    finally:
+        if validation_path:
+            _cleanup(validation_path)
+
+    profile = await _voxcpm2_profile_get(user_id)
+    profile.update({
+        "file_id": str(file_id),
+        "file_unique_id": str(file_unique_id or ""),
+        "filename": str(filename or "reference_audio")[:160],
+        "mime_type": str(mime_type or "audio/ogg")[:100],
+        "suffix": suffix,
+        "duration": float(duration or 0.0),
+        "file_size": int(file_size or 0),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+    await _voxcpm2_profile_set(user_id, profile)
+    context.user_data.pop("voxcpm2_state", None)
+
+    unavailable = _voxcpm2_unavailable_reason()
+    missing = _voxcpm2_profile_missing(profile)
+    if unavailable:
+        notice = f"បានរក្សាទុកសំឡេងគំរូ។ ប៉ុន្តែមិនទាន់អាចជ្រើស VoxCPM2 បានទេ៖ {unavailable}"
+    elif "prompt_text" in missing:
+        notice = "បានរក្សាទុកសំឡេងគំរូ។ សូមបញ្ចូលអត្ថបទដែលបាននិយាយក្នុងសំឡេងគំរូ ដើម្បីបញ្ចប់ Ultimate Clone។"
+    else:
+        update_user_tts_model(user_id, "voxcpm2")
+        notice = "បានរក្សាទុកសំឡេងគំរូ និងជ្រើស VoxCPM2 រួចរាល់។"
+
+    await _voxcpm2_send_panel(
+        msg,
+        user_id,
+        notice,
+        context=context,
+        prefer_saved=True,
+    )
+
+
+async def _voxcpm2_save_control_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    user_id = int(user.id)
+    control = str(text or "").strip()
+    if control.lower() in {"clear", "none", "default", "-", "លុប", "សម្អាត"}:
+        control = ""
+    if len(control) > VOXCPM2_CONTROL_MAX_CHARS:
+        await _voxcpm2_send_panel(
+            msg,
+            user_id,
+            f"ការណែនាំសំឡេងវែងពេក។ អតិបរមា {VOXCPM2_CONTROL_MAX_CHARS} តួអក្សរ។",
+            context=context,
+            prefer_saved=True,
+        )
+        return
+
+    profile = await _voxcpm2_profile_get(user_id)
+    profile["control"] = control
+    profile["mode"] = VOXCPM2_MODE_CONTROLLABLE
+    profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await _voxcpm2_profile_set(user_id, profile)
+    context.user_data.pop("voxcpm2_state", None)
+    notice = "បានរក្សាទុកអារម្មណ៍/ស្ទីលសំឡេង។" if control else "បានលុបការណែនាំអារម្មណ៍/ស្ទីលសំឡេង។"
+    await _voxcpm2_send_panel(
+        msg,
+        user_id,
+        notice,
+        context=context,
+        prefer_saved=True,
+    )
+
+
+async def _voxcpm2_save_prompt_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    user_id = int(user.id)
+    prompt_text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if prompt_text.lower() in {"clear", "none", "default", "-", "លុប", "សម្អាត"}:
+        prompt_text = ""
+    if len(prompt_text) > VOXCPM2_PROMPT_MAX_CHARS:
+        await _voxcpm2_send_panel(
+            msg,
+            user_id,
+            f"អត្ថបទសំឡេងគំរូវែងពេក។ អតិបរមា {VOXCPM2_PROMPT_MAX_CHARS} តួអក្សរ។",
+            context=context,
+            prefer_saved=True,
+        )
+        return
+
+    profile = await _voxcpm2_profile_get(user_id)
+    profile["prompt_text"] = prompt_text
+    profile["mode"] = VOXCPM2_MODE_ULTIMATE
+    profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+    profile = await _voxcpm2_profile_set(user_id, profile)
+    context.user_data.pop("voxcpm2_state", None)
+
+    if prompt_text and _voxcpm2_profile_ready(profile) and not _voxcpm2_unavailable_reason():
+        update_user_tts_model(user_id, "voxcpm2")
+        notice = "បានរក្សាទុកអត្ថបទសំឡេងគំរូ និងជ្រើស Ultimate Clone រួចរាល់។"
+    elif prompt_text:
+        notice = "បានរក្សាទុកអត្ថបទសំឡេងគំរូ។ សូមបញ្ចូលសំឡេងគំរូ ដើម្បីបញ្ចប់ Ultimate Clone។"
+    else:
+        notice = "បានលុបអត្ថបទសំឡេងគំរូ។ Ultimate Clone មិនទាន់រួចរាល់ទេ។"
+    await _voxcpm2_send_panel(
+        msg,
+        user_id,
+        notice,
+        context=context,
+        prefer_saved=True,
+    )
+
+
+async def _cb_voxcpm2(query, user_id: int, context, data: str) -> None:
+    action = data.split(":", 1)[1] if ":" in data else "refresh"
+    _voxcpm2_remember_panel(context, query.message)
+
+    if action in {"mode_control", "mode_ultimate"}:
+        context.user_data.pop("voxcpm2_state", None)
+        profile = await _voxcpm2_profile_get(user_id)
+        profile["mode"] = (
+            VOXCPM2_MODE_ULTIMATE
+            if action == "mode_ultimate"
+            else VOXCPM2_MODE_CONTROLLABLE
+        )
+        profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+        profile = await _voxcpm2_profile_set(user_id, profile)
+        notice = (
+            "បានជ្រើស Ultimate Clone។ សូមបញ្ចូលសំឡេងគំរូ និងអត្ថបទត្រឹមត្រូវដែលបាននិយាយក្នុងសំឡេងនោះ។"
+            if profile["mode"] == VOXCPM2_MODE_ULTIMATE
+            else "បានជ្រើស Controllable Clone។ អ្នកអាចកំណត់អារម្មណ៍ និងស្ទីលថ្មីបាន។"
+        )
+        await _voxcpm2_send_panel(
+            query.message,
+            user_id,
+            notice,
+            edit=True,
+            context=context,
+        )
+        return
+
+    if action == "set_ref":
+        context.user_data["voxcpm2_state"] = VOXCPM2_WAIT_REFERENCE
+        await _voxcpm2_edit_prompt(
+            query,
+            context,
+            "🎙 <b>បញ្ចូលសំឡេងគំរូ</b>\n\n"
+            "សូមផ្ញើសារជាសំឡេង Telegram ឬឯកសារ WAV, MP3, OGG ឬ FLAC។\n\n"
+            "💡 ដើម្បីបានលទ្ធផលល្អ សូមប្រើអ្នកនិយាយម្នាក់ សំឡេងច្បាស់ គ្មានតន្ត្រីខាងក្រោយ និងរយៈពេលប្រហែល ៥–៣០ វិនាទី។\n\n"
+            "ប្រើ /cancel ដើម្បីបោះបង់។",
+        )
+        return
+
+    if action == "set_control":
+        profile = await _voxcpm2_profile_get(user_id)
+        profile["mode"] = VOXCPM2_MODE_CONTROLLABLE
+        profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await _voxcpm2_profile_set(user_id, profile)
+        context.user_data["voxcpm2_state"] = VOXCPM2_WAIT_CONTROL
+        await _voxcpm2_edit_prompt(
+            query,
+            context,
+            "🎛 <b>កំណត់អារម្មណ៍ និងស្ទីលនៃការនិយាយ</b>\n\n"
+            "សូមផ្ញើការណែនាំជាអត្ថបទ។\n\n"
+            "ឧទាហរណ៍៖\n"
+            "• កក់ក្ដៅ រីករាយ និងលឿនបន្តិច\n"
+            "• ស្ងប់ស្ងាត់ យឺត និងមានវិជ្ជាជីវៈ\n"
+            "• រំភើប មានថាមពល និងច្បាស់\n\n"
+            "ផ្ញើ <code>clear</code> ឬ <code>លុប</code> ដើម្បីលុបការណែនាំ។ ប្រើ /cancel ដើម្បីបោះបង់។",
+        )
+        return
+
+    if action == "set_prompt":
+        profile = await _voxcpm2_profile_get(user_id)
+        profile["mode"] = VOXCPM2_MODE_ULTIMATE
+        profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await _voxcpm2_profile_set(user_id, profile)
+        context.user_data["voxcpm2_state"] = VOXCPM2_WAIT_PROMPT_TEXT
+        await _voxcpm2_edit_prompt(
+            query,
+            context,
+            "📝 <b>បញ្ចូលអត្ថបទសំឡេងគំរូ</b>\n\n"
+            "សូមសរសេរអត្ថបទត្រឹមត្រូវដែលអ្នកនិយាយនៅក្នុងសំឡេងគំរូ។ "
+            "Ultimate Clone ប្រើអត្ថបទនេះដើម្បីបន្តសំឡេង និងរក្សាលម្អិតសំឡេងឱ្យដូចដើមបំផុត។\n\n"
+            "អត្ថបទត្រូវតែស្របតាមសំឡេងគំរូ។ ផ្ញើ <code>clear</code> ឬ <code>លុប</code> ដើម្បីលុប។ "
+            "ប្រើ /cancel ដើម្បីបោះបង់។",
+        )
+        return
+
+    context.user_data.pop("voxcpm2_state", None)
+
+    if action == "clear_control":
+        profile = await _voxcpm2_profile_get(user_id)
+        profile["control"] = ""
+        profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await _voxcpm2_profile_set(user_id, profile)
+        await _voxcpm2_send_panel(
+            query.message,
+            user_id,
+            "បានលុបការណែនាំអារម្មណ៍/ស្ទីលសំឡេង។",
+            edit=True,
+            context=context,
+        )
+        return
+
+    if action == "clear_prompt":
+        profile = await _voxcpm2_profile_get(user_id)
+        profile["prompt_text"] = ""
+        profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await _voxcpm2_profile_set(user_id, profile)
+        await _voxcpm2_send_panel(
+            query.message,
+            user_id,
+            "បានលុបអត្ថបទសំឡេងគំរូ។ Ultimate Clone ត្រូវការអត្ថបទនេះមុនពេលប្រើ។",
+            edit=True,
+            context=context,
+        )
+        return
+
+    if action == "clear_ref":
+        profile = await _voxcpm2_profile_get(user_id)
+        for key in ("file_id", "file_unique_id", "filename", "mime_type", "suffix", "duration", "file_size"):
+            profile.pop(key, None)
+        profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await _voxcpm2_profile_set(user_id, profile)
+        await _voxcpm2_send_panel(
+            query.message,
+            user_id,
+            "បានលុបសំឡេងគំរូ។",
+            edit=True,
+            context=context,
+        )
+        return
+
+    if action == "select":
+        unavailable = _voxcpm2_unavailable_reason()
+        if unavailable:
+            await _voxcpm2_send_panel(
+                query.message,
+                user_id,
+                f"មិនអាចជ្រើស VoxCPM2 បានទេ៖ {unavailable}",
+                edit=True,
+                context=context,
+            )
+            return
+        profile = await _voxcpm2_profile_get(user_id)
+        missing = _voxcpm2_profile_missing(profile)
+        if missing:
+            labels = {
+                "reference": "សំឡេងគំរូ",
+                "prompt_text": "អត្ថបទសំឡេងគំរូ",
+            }
+            await _voxcpm2_send_panel(
+                query.message,
+                user_id,
+                "មិនទាន់អាចជ្រើស VoxCPM2 បានទេ។ សូមបំពេញ៖ "
+                + ", ".join(labels[item] for item in missing),
+                edit=True,
+                context=context,
+            )
+            return
+        update_user_tts_model(user_id, "voxcpm2")
+        notice = "បានជ្រើស VoxCPM2 រួចរាល់។"
+        await _voxcpm2_send_panel(
+            query.message,
+            user_id,
+            notice,
+            edit=True,
+            context=context,
+        )
+        return
+
+    if action == "close":
+        _voxcpm2_forget_panel(context)
+        with suppress(Exception):
+            await query.message.delete()
+        return
+
+    await _voxcpm2_send_panel(
+        query.message,
+        user_id,
+        "បានផ្ទុកព័ត៌មានថ្មីរួច។" if action == "refresh" else "",
+        edit=True,
+        context=context,
+    )
+
+
+async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import on_start as _impl
+    return await _impl(update, context)
+
+
+async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import on_help as _impl
+    return await _impl(update, context)
+
+
+async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import cmd_myprefs as _impl
+    return await _impl(update, context)
+
+
+async def cmd_ttsmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import cmd_ttsmodel as _impl
+    return await _impl(update, context)
 
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    _hist_cache_clear(user_id)
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(_DB_EXECUTOR, db_history_clear, user_id)
-    await safe_send(lambda: update.message.reply_text(
-        "🗑️ ប្រវត្តិការសន្ទនារបស់អ្នកបានលុបចេញហើយ។\nBot នឹងចាប់ផ្ដើមការសន្ទនាថ្មី។"
-    ))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.commands import cmd_clear as _impl
+    return await _impl(update, context)
 
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    user = update.effective_user
-    user_id = user.id if user else None
-    if user_id is None or msg is None:
-        return
-
-    if _is_admin(user_id):
-        if await _handle_runtime_admin_photo(update, context):
-            return
-        sched_state = context.user_data.get("sched_state")
-        if sched_state == SCHED_EDIT_WAIT_PHOTO:
-            await _handle_sched_edit_photo(update, context)
-            return
-        if sched_state == SCHED_WAIT_MSG:
-            await _handle_sched_content(update, context)
-            return
-        if context.user_data.get("bc_state") == BROADCAST_WAIT_MESSAGE:
-            await broadcast_receive(update, context)
-            return
-        if context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
-            target_id = _admin_chat_target.get(user_id)
-            if target_id:
-                ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
-                reply = (
-                    f"✅ បានផ្ញើរូបភាពទៅអ្នកប្រើប្រាស់ <code>{target_id}</code>។"
-                    if ok else
-                    f"❌ អ្នកប្រើប្រាស់ <code>{target_id}</code> បានបិទបូត។"
-                )
-                await safe_send(lambda: msg.reply_text(reply, parse_mode="HTML"))
-                if not ok:
-                    _close_session(user_id)
-                    context.user_data.pop("chat_state", None)
-            return
-
-    admin_id = _get_admin_for_user(user_id)
-    if admin_id is not None:
-        uname = user.username or user.first_name or str(user_id)
-        await _fwd_user_to_admin(context.bot, admin_id, user_id, uname, msg)
-        await safe_send(lambda: msg.reply_text("✅ បានផ្ញើរូបភាពទៅអ្នកគ្រប់គ្រង។"))
-        return
-
-    if not await _ensure_user_allowed(update, context, "ocr_enabled", "អានអត្ថបទពីរូបភាព"):
-        return
-    if not _ocr_configured():
-        await safe_send(lambda: msg.reply_text(_ocr_status_for_user()))
-        return
-    if await _check_cooldown(msg, user_id):
-        return
-
-    _metric_inc("ocr")
-    sync_user_data(user)
-    uname = user.username or user.first_name or str(user_id)
-    progress = await TelegramProgress.start(
-        bot=context.bot,
-        chat_id=msg.chat_id,
-        reply_target=msg,
-        title="កំពុងអានអត្ថបទពីរូបភាព",
-        percent=5,
-        stage="កំពុងពិនិត្យរូបភាព",
-        detail="កំពុងរៀបចំឯកសាររូបភាព។",
-    )
-    if _env_bool("DURABLE_OCR_ENABLED", True):
-        try:
-            from app.services.jobs.submission import submit_ocr_job
-
-            job, created = await submit_ocr_job(
-                chat_id=msg.chat_id,
-                user_id=user_id,
-                username=uname,
-                file_id=msg.photo[-1].file_id,
-                mime_type="image/jpeg",
-                suffix=".jpg",
-                progress_message_id=progress.message_id,
-                reply_to_message_id=int(msg.message_id),
-                idempotency_key=(
-                    f"telegram:ocr:{int(getattr(update, 'update_id', 0) or 0)}:"
-                    f"{msg.photo[-1].file_unique_id}"
-                ),
-            )
-            await progress.update(
-                10,
-                "បានដាក់ចូលជួររង់ចាំ",
-                f"Job {job.id[:12]} · {'ថ្មី' if created else 'មានរួចហើយ'}",
-                force=True,
-            )
-        except Exception as exc:
-            logger.error("Could not enqueue durable OCR job: %s", exc, exc_info=True)
-            await progress.fail(
-                "❌ មិនអាចដាក់ការងារ OCR ចូលជួររង់ចាំបានទេ។ សូមសាកម្ដងទៀត។"
-            )
-        return
-    img_path: str | None = None
-    try:
-        await progress.update(12, "កំពុងទាញយករូបភាព", "កំពុងទទួលរូបភាពគុណភាពខ្ពស់ពី Telegram។", force=True)
-        img_path = _make_temp_img(suffix=".jpg")
-        tg_file = await safe_send(lambda: context.bot.get_file(msg.photo[-1].file_id))
-        if not tg_file:
-            raise RuntimeError("Could not download photo.")
-        await tg_file.download_to_drive(img_path)
-
-        await progress.update(35, "បានទាញយករូបភាព", "កំពុងស្គាល់ប្រភេទរូបភាព។", force=True)
-        mime_type = _detect_image_mime(img_path)
-
-        await progress.update(50, "កំពុងស្វែងរកអត្ថបទ", "រូបភាពកំពុងត្រូវបានផ្ញើទៅម៉ាស៊ីន OCR។", force=True)
-        ocr_text = await ocr_image(img_path, mime_type=mime_type)
-        if not ocr_text or ocr_text.upper() == "NOTEXT":
-            await progress.finish("🖼️ រូបភាពនេះមិនមានអត្ថបទដែលអាចអានបានទេ។")
-            return
-
-        await progress.update(85, "បានអានអត្ថបទរួច", f"រកឃើញ {len(ocr_text)} តួអក្សរ។", force=True)
-        record_turn(user_id, "user", f"[Image OCR]: {ocr_text[:500]}")
-        lang_key = _detect_lang(ocr_text)
-        lang_flag, lang_name = _language_display(lang_key)
-        header = f"🔍 <b>អត្ថបទពីរូបភាព {lang_flag} {html.escape(lang_name)}</b>\n\n"
-        plain_pages = _paginate_plain(ocr_text, limit=max(500, TELE_MSG_LIMIT - len(header) - 64))
-        if not plain_pages:
-            await progress.fail("❌ មិនអាចរៀបចំអត្ថបទដែលបានអានទេ។")
-            return
-
-        first_page = header + html.escape(plain_pages[0])
-        await progress.finish(first_page, parse_mode="HTML")
-        result_id = progress.message_id or int(msg.message_id)
-        save_text_cache(
-            result_id,
-            ocr_text,
-            chat_id=msg.chat_id,
-            user_id=user_id,
-            username=uname,
-        )
-        if progress.message is not None:
-            await safe_send(lambda: progress.message.edit_reply_markup(
-                reply_markup=get_ocr_confirm_kb(result_id)
-            ))
-
-        total_pages = len(plain_pages)
-        for idx, plain_page in enumerate(plain_pages[1:], 2):
-            page_body = (
-                f"🔍 <b>អត្ថបទពីរូបភាព — ទំព័រ {idx}/{total_pages}</b>\n\n"
-                + html.escape(plain_page)
-            )
-            await safe_send(lambda pb=page_body: msg.reply_text(pb, parse_mode="HTML"))
-            await asyncio.sleep(0.15)
-    except Exception as exc:
-        err_msg = str(exc) or repr(exc)
-        if _is_expected_ocr_outage_error(err_msg):
-            logger.warning("on_photo OCR unavailable: %s: %s", type(exc).__name__, err_msg[:700])
-        else:
-            logger.error("on_photo OCR error: %s: %r", type(exc).__name__, exc, exc_info=True)
-        if _is_dns_or_network_error(err_msg):
-            user_msg = "❌ មិនអាចភ្ជាប់ទៅសេវា OCR បានទេ។ សូមសាកម្ដងទៀតបន្តិចក្រោយ។"
-        elif "temporarily disabled" in err_msg.lower():
-            user_msg = "⚠️ សេវា OCR ត្រូវបានផ្អាកបណ្ដោះអាសន្ន។ សូមសាកម្ដងទៀតក្រោយពេលខ្លី។"
-        else:
-            user_msg = "❌ មិនអាចអានអត្ថបទពីរូបភាពនេះបានទេ។ សូមប្រើរូបភាពច្បាស់ជាងនេះ ហើយសាកម្ដងទៀត។"
-        await progress.fail(user_msg)
-    finally:
-        if img_path:
-            _cleanup(img_path)
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.media import on_photo as _impl
+    return await _impl(update, context)
 
 
 async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Convert and/or transcribe audio using one progress message."""
-    msg = update.message
-    user = update.effective_user
-    user_id = user.id if user else None
-    if user_id is None or msg is None:
-        return
-
-    if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
-        target_id = _admin_chat_target.get(user_id)
-        if target_id:
-            ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
-            reply = (
-                f"✅ បានផ្ញើឯកសារទៅអ្នកប្រើប្រាស់ <code>{target_id}</code>។"
-                if ok else
-                f"❌ អ្នកប្រើប្រាស់ <code>{target_id}</code> បានបិទបូត។"
-            )
-            await safe_send(lambda: msg.reply_text(reply, parse_mode="HTML"))
-            if not ok:
-                _close_session(user_id)
-                context.user_data.pop("chat_state", None)
-        return
-
-    admin_id = _get_admin_for_user(user_id)
-    if admin_id is not None:
-        uname = user.username or user.first_name or str(user_id)
-        await _fwd_user_to_admin(context.bot, admin_id, user_id, uname, msg)
-        await safe_send(lambda: msg.reply_text("✅ បានផ្ញើឯកសារទៅអ្នកគ្រប់គ្រង។"))
-        return
-
-    doc = msg.document
-    audio = msg.audio
-    if doc is not None:
-        filename = doc.file_name or ""
-        mime_type = doc.mime_type or ""
-        file_id = doc.file_id
-        file_unique_id = doc.file_unique_id
-        file_size = int(doc.file_size or 0)
-        duration = 0.0
-        if _is_subtitle_file(filename) or not _is_audio_file(filename, mime_type):
-            await on_document(update, context)
-            return
-    elif audio is not None:
-        filename = audio.file_name or ""
-        mime_type = audio.mime_type or ""
-        file_id = audio.file_id
-        file_unique_id = audio.file_unique_id
-        file_size = int(audio.file_size or 0)
-        duration = float(audio.duration or 0.0)
-    else:
-        return
-
-    if not await _ensure_user_allowed(update, context):
-        return
-    settings, _settings_status = await get_bot_settings_async()
-    convert_enabled = _setting_bool_from(settings, "audio_to_voice_enabled", True)
-    transcribe_enabled = _setting_bool_from(settings, "audio_transcribe_enabled", True)
-    if not convert_enabled and not transcribe_enabled:
-        _metric_inc("disabled_hits")
-        await safe_send(lambda: msg.reply_text(
-            "⚠️ មុខងារបម្លែងឯកសារអូឌីយ៉ូត្រូវបានបិទបណ្ដោះអាសន្នដោយអ្នកគ្រប់គ្រង។"
-        ))
-        return
-    if file_size > MAX_AUDIO_FILE_BYTES:
-        await safe_send(lambda: msg.reply_text(
-            f"❌ ឯកសារអូឌីយ៉ូធំពេក។ អតិបរមា {MAX_AUDIO_FILE_BYTES // 1024 // 1024} MB។"
-        ))
-        return
-    if await _check_cooldown(msg, user_id):
-        return
-
-    sync_user_data(user)
-    uname = user.username or user.first_name or str(user_id)
-    ext = os.path.splitext(filename)[1].lower() if filename else ".mp3"
-    if ext not in _AUDIO_EXTENSIONS:
-        ext = ".mp3"
-    gemini_mime = _audio_mime_for_gemini(filename, mime_type)
-    audio_path: str | None = None
-    voice_path: str | None = None
-    voice_sent = False
-    transcript = ""
-    conversion_error: Exception | None = None
-    transcription_error: Exception | None = None
-
-    progress = await TelegramProgress.start(
-        bot=context.bot,
-        chat_id=msg.chat_id,
-        reply_target=msg,
-        title="កំពុងដំណើរការឯកសារអូឌីយ៉ូ",
-        percent=5,
-        stage="កំពុងពិនិត្យឯកសារ",
-        detail=filename or "ឯកសារអូឌីយ៉ូ",
-    )
-    if (
-        transcribe_enabled
-        and not convert_enabled
-        and _env_bool("DURABLE_TRANSCRIPTION_ENABLED", True)
-    ):
-        try:
-            from app.services.jobs.submission import submit_transcription_job
-
-            job, created = await submit_transcription_job(
-                chat_id=msg.chat_id,
-                user_id=user_id,
-                username=uname,
-                file_id=file_id,
-                mime_type=gemini_mime,
-                suffix=ext,
-                source_kind="audio_file",
-                filename=filename,
-                progress_message_id=progress.message_id,
-                reply_to_message_id=int(msg.message_id),
-                idempotency_key=(
-                    f"telegram:transcription:{int(getattr(update, 'update_id', 0) or 0)}:"
-                    f"{file_unique_id}"
-                ),
-            )
-            await progress.update(
-                10,
-                "បានដាក់ចូលជួររង់ចាំ",
-                f"Job {job.id[:12]} · {'ថ្មី' if created else 'មានរួចហើយ'}",
-                force=True,
-            )
-        except Exception as exc:
-            logger.error(
-                "Could not enqueue durable audio transcription job: %s",
-                exc,
-                exc_info=True,
-            )
-            await progress.fail(
-                "❌ មិនអាចដាក់ការងារបម្លែងអូឌីយ៉ូចូលជួររង់ចាំបានទេ។"
-            )
-        return
-    try:
-        await progress.update(12, "កំពុងទាញយកឯកសារ", "កំពុងទទួលទិន្នន័យពី Telegram។", force=True)
-        tg_file = await safe_send(lambda: context.bot.get_file(file_id))
-        if not tg_file:
-            raise RuntimeError("Could not download audio file.")
-        audio_path = await _download_telegram_file_to_temp_path(
-            tg_file,
-            MAX_AUDIO_FILE_BYTES,
-            suffix=ext,
-        )
-        await progress.update(30, "បានទាញយកឯកសារ", "កំពុងរៀបចំប្រតិបត្តិការដែលបានបើក។", force=True)
-
-        if convert_enabled:
-            voice_path = _make_temp_ogg()
-            try:
-                await progress.update(38, "កំពុងបម្លែងទៅសារសំឡេង", "កំពុងបម្លែងទៅទម្រង់ OGG/Opus។", force=True)
-                voice_bytes = await _convert_uploaded_audio_to_telegram_voice(audio_path, voice_path)
-                await progress.update(52, "បានបម្លែងសំឡេង", "កំពុងផ្ញើសារសំឡេង។", force=True)
-                display_name = html.escape((filename or "audio")[:80])
-                sent_voice = await safe_send(lambda vb=voice_bytes, dn=display_name: msg.reply_voice(
-                    voice=vb,
-                    caption=f"🎙️ <b>សារសំឡេង</b> — <code>{dn}</code>",
-                    parse_mode="HTML",
-                ))
-                voice_sent = sent_voice is not None
-                if voice_sent:
-                    _metric_inc("audio_to_voice")
-                    await progress.update(60, "បានផ្ញើសារសំឡេង", "ការបម្លែងទៅសារសំឡេងបានជោគជ័យ។", force=True)
-            except Exception as exc:
-                conversion_error = exc
-                logger.error("Audio-to-voice conversion failed: %s", exc, exc_info=True)
-                await progress.update(60, "មិនអាចបម្លែងទៅសារសំឡេង", "កំពុងព្យាយាមបម្លែងទៅអត្ថបទ ប្រសិនបើមុខងារនេះបានបើក។", force=True)
-
-        if transcribe_enabled and _env_bool("DURABLE_TRANSCRIPTION_ENABLED", True):
-            try:
-                from app.services.jobs.submission import submit_transcription_job
-
-                job, created = await submit_transcription_job(
-                    chat_id=msg.chat_id,
-                    user_id=user_id,
-                    username=uname,
-                    file_id=file_id,
-                    mime_type=gemini_mime,
-                    suffix=ext,
-                    source_kind="audio_file",
-                    filename=filename,
-                    progress_message_id=progress.message_id,
-                    reply_to_message_id=int(msg.message_id),
-                    idempotency_key=(
-                        f"telegram:transcription:{int(getattr(update, 'update_id', 0) or 0)}:"
-                        f"{file_unique_id}"
-                    ),
-                )
-                await progress.update(
-                    68,
-                    "ការបម្លែងសំឡេងទៅអត្ថបទស្ថិតក្នុងជួររង់ចាំ",
-                    f"Job {job.id[:12]} · {'ថ្មី' if created else 'មានរួចហើយ'}",
-                    force=True,
-                )
-            except Exception as exc:
-                logger.error(
-                    "Could not enqueue durable audio transcription job: %s",
-                    exc,
-                    exc_info=True,
-                )
-                if voice_sent:
-                    await progress.finish(
-                        "⚠️ បានបង្កើតសារសំឡេងរួច ប៉ុន្តែមិនអាចដាក់ការបម្លែងអត្ថបទចូលជួររង់ចាំបានទេ។"
-                    )
-                else:
-                    await progress.fail(
-                        "❌ មិនអាចដាក់ការងារបម្លែងអូឌីយ៉ូចូលជួររង់ចាំបានទេ។"
-                    )
-            return
-
-        if transcribe_enabled:
-            if _gemini is None:
-                transcription_error = RuntimeError("Gemini API is not active.")
-            else:
-                try:
-                    await progress.update(68, "កំពុងបម្លែងសំឡេងទៅជាអត្ថបទ", "កំពុងផ្ញើអូឌីយ៉ូទៅម៉ាស៊ីនស្គាល់សំឡេង។", force=True)
-                    transcript = await transcribe_audio_file(audio_path, gemini_mime)
-                    if not transcript:
-                        raise RuntimeError("No transcript was found.")
-                    _metric_inc("audio")
-                    record_turn(user_id, "user", f"[Audio File Transcript]: {transcript[:500]}")
-                    await progress.update(88, "បានបម្លែងទៅអត្ថបទ", f"រកឃើញ {len(transcript)} តួអក្សរ។", force=True)
-                except Exception as exc:
-                    transcription_error = exc
-                    logger.error("Audio transcription failed: %s", exc, exc_info=True)
-
-        if transcript:
-            detected_lang = _detect_lang(transcript)
-            lang_flag, lang_name = _language_display(detected_lang)
-            fname_display = html.escape(filename[:50]) if filename else "audio"
-            conversion_note = (
-                "✅ បានបង្កើតសារសំឡេងរួចរាល់។"
-                if voice_sent else
-                "⚠️ មិនអាចបង្កើតសារសំឡេងបាន ប៉ុន្តែបានបម្លែងទៅអត្ថបទ។"
-            )
-            header = (
-                f"🎵 <b>អត្ថបទពីឯកសារអូឌីយ៉ូ</b> {lang_flag} "
-                f"{html.escape(lang_name)} — <code>{fname_display}</code>\n"
-                f"{conversion_note}\n\n"
-            )
-            pages = _paginate_plain(transcript, limit=max(500, TELE_MSG_LIMIT - len(header) - 64))
-            if not pages:
-                raise RuntimeError("Could not paginate transcript.")
-            await progress.finish(header + html.escape(pages[0]), parse_mode="HTML")
-            result_id = progress.message_id or int(msg.message_id)
-            save_text_cache(
-                result_id,
-                transcript,
-                chat_id=msg.chat_id,
-                user_id=user_id,
-                username=uname,
-            )
-            if progress.message is not None:
-                await safe_send(lambda: progress.message.edit_reply_markup(
-                    reply_markup=get_audio_file_kb(result_id)
-                ))
-            total_pages = len(pages)
-            for idx, page in enumerate(pages[1:], 2):
-                body = f"🎵 <b>អត្ថបទពីអូឌីយ៉ូ — ទំព័រ {idx}/{total_pages}</b>\n\n{html.escape(page)}"
-                await safe_send(lambda b=body: msg.reply_text(b, parse_mode="HTML"))
-                await asyncio.sleep(0.15)
-            return
-
-        if voice_sent:
-            if transcribe_enabled and transcription_error is not None:
-                await progress.finish(
-                    "⚠️ បានបង្កើតសារសំឡេងរួចរាល់ ប៉ុន្តែមិនអាចបម្លែងអូឌីយ៉ូទៅជាអត្ថបទបានទេ។"
-                )
-            else:
-                await progress.finish("✅ បានបម្លែង និងផ្ញើសារសំឡេងរួចរាល់។", delete_after_s=5.0)
-            return
-
-        logger.warning(
-            "Audio processing produced no output conversion_error=%s transcription_error=%s",
-            conversion_error,
-            transcription_error,
-        )
-        await progress.fail(
-            "❌ មិនអាចដំណើរការឯកសារអូឌីយ៉ូនេះបានទេ។ សូមពិនិត្យថាឯកសារមានសំឡេង និងប្រើទម្រង់ MP3, WAV, OGG ឬ FLAC។"
-        )
-    except ValueError as exc:
-        logger.warning("Audio upload rejected: %s", exc)
-        await progress.fail("❌ ឯកសារអូឌីយ៉ូមិនត្រឹមត្រូវ ឬធំពេក។ សូមជ្រើសឯកសារថ្មី។")
-    except Exception as exc:
-        logger.error("on_audio_file error: %s", exc, exc_info=True)
-        await progress.fail("❌ មានបញ្ហាក្នុងការទាញយក ឬដំណើរការឯកសារអូឌីយ៉ូ។ សូមសាកម្ដងទៀត។")
-    finally:
-        if audio_path:
-            _cleanup(audio_path)
-        if voice_path:
-            _cleanup(voice_path)
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.media import on_audio_file as _impl
+    return await _impl(update, context)
 
 
 async def on_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg     = update.message
-    user    = update.effective_user
-    user_id = user.id if user else None
-    if user_id is None:
-        return
-
-    if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
-        target_id = _admin_chat_target.get(user_id)
-        if target_id:
-            ok    = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
-            reply = (
-                f"✅ ផ្ញើដល់ User <code>{target_id}</code> ។"
-                if ok else
-                f"❌ User <code>{target_id}</code> blocked bot ។"
-            )
-            await safe_send(lambda: msg.reply_text(reply, parse_mode="HTML"))
-            if not ok:
-                _close_session(user_id)
-                context.user_data.pop("chat_state", None)
-        return
-
-    admin_id = _get_admin_for_user(user_id)
-    if admin_id is not None:
-        uname = user.username or user.first_name or str(user_id)
-        await _fwd_user_to_admin(context.bot, admin_id, user_id, uname, msg)
-        await safe_send(lambda: msg.reply_text('✅ បានផ្ញើទៅអ្នកគ្រប់គ្រង។'))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.media import on_any_media as _impl
+    return await _impl(update, context)
 
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    user = update.effective_user
-    if msg is None or user is None or msg.voice is None:
-        return
-    user_id = int(user.id)
-
-    if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
-        target_id = _admin_chat_target.get(user_id)
-        if target_id:
-            ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
-            reply = (
-                f"✅ បានផ្ញើសារសំឡេងទៅអ្នកប្រើប្រាស់ <code>{target_id}</code>។"
-                if ok else
-                f"❌ អ្នកប្រើប្រាស់ <code>{target_id}</code> បានបិទបូត។"
-            )
-            await safe_send(lambda: msg.reply_text(reply, parse_mode="HTML"))
-            if not ok:
-                _close_session(user_id)
-                context.user_data.pop("chat_state", None)
-        return
-
-    admin_id = _get_admin_for_user(user_id)
-    if admin_id is not None:
-        uname = user.username or user.first_name or str(user_id)
-        await _fwd_user_to_admin(context.bot, admin_id, user_id, uname, msg)
-        await safe_send(lambda: msg.reply_text("✅ បានផ្ញើសារសំឡេងទៅអ្នកគ្រប់គ្រង។"))
-        return
-
-    if not await _ensure_user_allowed(update, context, "voice_transcribe_enabled", "បម្លែងសំឡេងទៅជាអត្ថបទ"):
-        return
-    if not _gemini:
-        await safe_send(lambda: msg.reply_text("❌ សេវាបម្លែងសំឡេងទៅអត្ថបទមិនទាន់បានបើកទេ។"))
-        return
-    if msg.voice.file_size and msg.voice.file_size > MAX_VOICE_BYTES:
-        await safe_send(lambda: msg.reply_text("❌ ឯកសារសំឡេងធំពេក។ អតិបរមា 20 MB។"))
-        return
-    if await _check_cooldown(msg, user_id):
-        return
-
-    _metric_inc("voice")
-    sync_user_data(user)
-    progress = await TelegramProgress.start(
-        bot=context.bot,
-        chat_id=msg.chat_id,
-        reply_target=msg,
-        title="កំពុងបម្លែងសារសំឡេងទៅជាអត្ថបទ",
-        percent=5,
-        stage="កំពុងពិនិត្យសារសំឡេង",
-        detail=f"រយៈពេល {float(msg.voice.duration or 0):g} វិនាទី។",
-    )
-    if _env_bool("DURABLE_TRANSCRIPTION_ENABLED", True):
-        try:
-            from app.services.jobs.submission import submit_transcription_job
-
-            job, created = await submit_transcription_job(
-                chat_id=msg.chat_id,
-                user_id=user_id,
-                username=user.username or user.first_name or str(user_id),
-                file_id=msg.voice.file_id,
-                mime_type=msg.voice.mime_type or "audio/ogg",
-                suffix=".ogg",
-                source_kind="voice",
-                progress_message_id=progress.message_id,
-                reply_to_message_id=int(msg.message_id),
-                idempotency_key=(
-                    f"telegram:transcription:{int(getattr(update, 'update_id', 0) or 0)}:"
-                    f"{msg.voice.file_unique_id}"
-                ),
-            )
-            await progress.update(
-                10,
-                "បានដាក់ចូលជួររង់ចាំ",
-                f"Job {job.id[:12]} · {'ថ្មី' if created else 'មានរួចហើយ'}",
-                force=True,
-            )
-        except Exception as exc:
-            logger.error(
-                "Could not enqueue durable voice transcription job: %s",
-                exc,
-                exc_info=True,
-            )
-            await progress.fail(
-                "❌ មិនអាចដាក់ការងារបម្លែងសំឡេងចូលជួររង់ចាំបានទេ។ សូមសាកម្ដងទៀត។"
-            )
-        return
-    ogg_path = _make_temp_ogg()
-    try:
-        await progress.update(15, "កំពុងទាញយកសារសំឡេង", "កំពុងទទួលឯកសារពី Telegram។", force=True)
-        voice_file = await safe_send(lambda: context.bot.get_file(msg.voice.file_id))
-        if not voice_file:
-            raise RuntimeError("Could not get voice file")
-        await voice_file.download_to_drive(ogg_path)
-
-        await progress.update(40, "បានទាញយកសារសំឡេង", "កំពុងផ្ញើទៅម៉ាស៊ីនស្គាល់សំឡេង។", force=True)
-        transcript = await transcribe_voice(ogg_path)
-        if not transcript:
-            await progress.fail("❌ មិនអាចស្គាល់អត្ថបទនៅក្នុងសារសំឡេងនេះបានទេ។")
-            return
-
-        await progress.update(85, "បានស្គាល់អត្ថបទ", f"រកឃើញ {len(transcript)} តួអក្សរ។", force=True)
-        record_turn(user_id, "user", f"[Voice Transcript]: {transcript[:500]}")
-        detected_lang = _detect_lang(transcript)
-        lang_flag, lang_name = _language_display(detected_lang)
-        header = (
-            f"📝 <b>អត្ថបទពីសារសំឡេង</b> {lang_flag} "
-            f"{html.escape(lang_name)}\n\n"
-        )
-        pages = _paginate_plain(transcript, limit=max(500, TELE_MSG_LIMIT - len(header) - 64))
-        if not pages:
-            raise RuntimeError("Could not paginate transcript")
-        await progress.finish(header + html.escape(pages[0]), parse_mode="HTML")
-        result_id = progress.message_id or int(msg.message_id)
-        save_text_cache(
-            result_id,
-            transcript,
-            chat_id=msg.chat_id,
-            user_id=user_id,
-            username=user.username or user.first_name,
-        )
-        if progress.message is not None:
-            await safe_send(lambda: progress.message.edit_reply_markup(
-                reply_markup=get_transcription_kb(result_id)
-            ))
-        total_pages = len(pages)
-        for idx, page in enumerate(pages[1:], 2):
-            body = f"📝 <b>អត្ថបទពីសារសំឡេង — ទំព័រ {idx}/{total_pages}</b>\n\n{html.escape(page)}"
-            await safe_send(lambda b=body: msg.reply_text(b, parse_mode="HTML"))
-            await asyncio.sleep(0.15)
-    except Exception as exc:
-        logger.error("on_voice error: %s", exc, exc_info=True)
-        await progress.fail("❌ មិនអាចបម្លែងសារសំឡេងទៅជាអត្ថបទបានទេ។ សូមសាកម្ដងទៀត។")
-    finally:
-        _cleanup(ogg_path)
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.media import on_voice as _impl
+    return await _impl(update, context)
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg or not msg.text:
-        return
-    text = msg.text
-    user = update.effective_user
-    if not user:
-        return
-    user_id = int(user.id)
-
-    if _is_admin(user_id):
-        if await handle_admin_ai_chat_message(update, context):
-            return
-        if await _handle_feature_request_admin_reply_text(update, context):
-            return
-        if await _handle_runtime_admin_text(update, context):
-            return
-        if await _handle_user_search_text(update, context):
-            return
-        if await _handle_admin_report_day_text(update, context):
-            return
-        sched_state = context.user_data.get("sched_state")
-        if sched_state == SCHED_WAIT_MSG:
-            await _handle_sched_content(update, context)
-            return
-        if sched_state == SCHED_WAIT_TIME:
-            await _handle_sched_datetime(update, context)
-            return
-        if sched_state == SCHED_EDIT_WAIT_TIME:
-            await _handle_sched_edit_time(update, context)
-            return
-        if sched_state == SCHED_EDIT_WAIT_TEXT:
-            await _handle_sched_edit_text(update, context)
-            return
-        if sched_state == SCHED_EDIT_WAIT_PHOTO:
-            await safe_send(lambda: msg.reply_text("⚠️ សូមផ្ញើរូបភាពថ្មី ឬ /cancel។"))
-            return
-        if context.user_data.get("bc_state") == BROADCAST_WAIT_MESSAGE:
-            await broadcast_receive(update, context)
-            return
-        if context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
-            target_id = _admin_chat_target.get(user_id)
-            if target_id:
-                ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
-                if ok:
-                    await safe_send(lambda: msg.reply_text(
-                        f"✅ បានផ្ញើទៅអ្នកប្រើប្រាស់ <code>{target_id}</code>។",
-                        parse_mode="HTML",
-                    ))
-                else:
-                    await safe_send(lambda: msg.reply_text(
-                        f"❌ អ្នកប្រើប្រាស់ <code>{target_id}</code> បានបិទបូត។ វគ្គជជែកត្រូវបានបញ្ចប់។",
-                        parse_mode="HTML",
-                    ))
-                    _close_session(user_id)
-                    context.user_data.pop("chat_state", None)
-            return
-
-    if await _handle_feature_request_user_text(update, context):
-        return
-
-    admin_id = _get_admin_for_user(user_id)
-    if admin_id is not None:
-        uname = user.username or user.first_name or str(user_id)
-        await _fwd_user_to_admin(context.bot, admin_id, user_id, uname, msg)
-        await safe_send(lambda: msg.reply_text("✅ សាររបស់អ្នកបានផ្ញើទៅអ្នកគ្រប់គ្រង។"))
-        return
-
-    if not await _ensure_user_allowed(update, context, "tts_enabled", "បម្លែងអត្ថបទទៅជាសំឡេង"):
-        return
-    if text.strip() == "🎵 សួស្តី!":
-        await on_start(update, context)
-        return
-    stripped = text.strip()
-    if not stripped:
-        return
-    if len(stripped) > MAX_INPUT_CHARS:
-        await safe_send(lambda: msg.reply_text(
-            f"❌ អត្ថបទវែងពេក។ អតិបរមា {MAX_INPUT_CHARS} តួអក្សរ។\n"
-            f"អ្នកបានផ្ញើ {len(stripped)} តួអក្សរ។"
-        ))
-        return
-    if await _check_cooldown(msg, user_id):
-        return
-    if not _reserve_tts_request(user_id):
-        await safe_send(lambda: msg.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
-        return
-
-    try:
-        _metric_inc("tts")
-        sync_user_data(user)
-        progress = await TelegramProgress.start(
-            bot=context.bot,
-            chat_id=msg.chat_id,
-            reply_target=msg,
-            title="កំពុងបម្លែងអត្ថបទទៅជាសំឡេង",
-            percent=5,
-            stage="កំពុងពិនិត្យអត្ថបទ",
-            detail=f"មាន {len(stripped)} តួអក្សរ។",
-        )
-    except BaseException:
-        _release_tts_request(user_id)
-        raise
-
-    if _env_bool("DURABLE_TTS_ENABLED", True):
-        try:
-            from app.services.jobs.submission import submit_tts_job
-            loop = asyncio.get_running_loop()
-            tts_text = await resolve_tts_text(user_id, stripped, loop)
-            prefs = await get_user_prefs_async(user_id)
-            job, created = await submit_tts_job(
-                chat_id=msg.chat_id,
-                user_id=user_id,
-                username=user.username or user.first_name or str(user_id),
-                text=tts_text or stripped,
-                original_text=stripped,
-                gender=prefs["gender"],
-                speed=prefs["speed"],
-                tts_model=prefs.get("tts_model", "auto"),
-                progress_message_id=progress.message_id,
-                reply_to_message_id=int(msg.message_id),
-                idempotency_key=f"telegram:tts:{int(getattr(update, 'update_id', 0) or 0)}:{user_id}",
-            )
-        except Exception as exc:
-            logger.error("Failed to submit durable TTS job: %s", exc)
-        else:
-            # Once enqueue succeeds the worker owns this request. A Telegram
-            # progress-edit failure must never fall through and generate a
-            # duplicate voice in the request process.
-            _set_last_tts(user_id)
-            _release_tts_request(user_id)
-            try:
-                await progress.update(
-                    10,
-                    "បានទទួល · កំពុងដំណើរការដោយស្វ័យប្រវត្តិ",
-                    f"Job {job.id[:12]} · {'ថ្មី' if created else 'មានរួចហើយ'}",
-                    force=True,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "TTS job %s was queued, but its progress message could not be updated: %s",
-                    job.id,
-                    exc,
-                )
-            return
-
-    file_path: str | None = None
-    try:
-        await progress.update(12, "កំពុងអានការកំណត់របស់អ្នក", "កំពុងជ្រើសសំឡេង ល្បឿន និងម៉ូដែល។", force=True)
-        loop = asyncio.get_running_loop()
-        prefs, tts_text = await asyncio.gather(
-            get_user_prefs_async(user_id),
-            resolve_tts_text(user_id, stripped, loop),
-        )
-        gender = prefs["gender"]
-        speed = prefs["speed"]
-        tts_model = prefs.get("tts_model", "auto")
-        tts_text = tts_text.strip() or stripped
-        model_key = _normalize_tts_model(tts_model)
-        model_label = TTS_MODEL_OPTIONS.get(model_key, TTS_MODEL_OPTIONS["auto"])[0]
-        await progress.update(
-            25,
-            "បានរៀបចំអត្ថបទ និងការកំណត់",
-            f"ម៉ូដែល៖ {model_label} • អត្ថបទ {len(tts_text)} តួអក្សរ។",
-            force=True,
-        )
-
-        lock = _get_user_lock(user_id)
-        async with lock:
-            if len(tts_text) > TTS_SINGLE_VOICE_MAX_CHARS:
-                uname = user.username or user.first_name or str(user_id)
-                sent_count, failed_count = await _deliver_paged_tts(
-                    chat_id=msg.chat_id,
-                    bot=context.bot,
-                    text=tts_text,
-                    gender=gender,
-                    speed=speed,
-                    user_id=user_id,
-                    username=uname,
-                    tts_model=tts_model,
-                    progress=progress,
-                    progress_start=25,
-                    progress_end=95,
-                )
-                record_turn(user_id, "user", stripped)
-                record_turn(user_id, "assistant", tts_text[:CONV_CONTEXT_MAX_CHARS])
-                _set_last_tts(user_id)
-                if failed_count:
-                    await progress.finish(
-                        f"⚠️ បានផ្ញើសំឡេង {sent_count} ផ្នែក ប៉ុន្តែមាន {failed_count} ផ្នែកមិនបានជោគជ័យ។"
-                    )
-                else:
-                    await progress.finish(
-                        f"✅ បានបង្កើត និងផ្ញើសំឡេងរួចរាល់ ({sent_count} ផ្នែក)។",
-                        delete_after_s=5.0,
-                    )
-                return
-
-            file_path = _make_temp_ogg()
-            await progress.update(35, "កំពុងបង្កើតសំឡេង", f"កំពុងប្រើ {model_label}។", force=True)
-            audio_bytes = await generate_user_voice_limited(
-                tts_text,
-                gender,
-                speed,
-                file_path,
-                tts_model,
-                user_id=user_id,
-                bot=context.bot,
-                chat_id=msg.chat_id,
-                progress=progress,
-            )
-            await progress.update(88, "បានបង្កើតសំឡេង", "កំពុងផ្ញើសារសំឡេងទៅអ្នក។", force=True)
-            sent_msg = await safe_send(lambda ab=audio_bytes: msg.reply_voice(
-                voice=io.BytesIO(ab),
-                caption=f"🗣️ {BOT_TAG}",
-                reply_markup=get_main_kb(gender, tts_model),
-            ))
-            if sent_msg is None:
-                raise RuntimeError("Telegram មិនអាចផ្ញើសារសំឡេងបាន។")
-            save_text_cache(
-                sent_msg.message_id,
-                tts_text,
-                chat_id=msg.chat_id,
-                user_id=user_id,
-                username=user.username or user.first_name,
-            )
-            set_last_tts_text(user_id, tts_text)
-            record_turn(user_id, "user", stripped)
-            record_turn(user_id, "assistant", tts_text)
-            _set_last_tts(user_id)
-            await progress.finish("✅ បានបង្កើត និងផ្ញើសំឡេងរួចរាល់។", delete_after_s=5.0)
-    except Exception as exc:
-        logger.error("on_text TTS error: %s", exc, exc_info=True)
-        await progress.fail(_tts_user_error_message(exc))
-    finally:
-        _release_tts_request(user_id)
-        if file_path:
-            _cleanup(file_path)
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.media import on_text as _impl
+    return await _impl(update, context)
 
 
 # ---------------------------------------------------------------------------
 # Callback helpers
 # ---------------------------------------------------------------------------
-async def _edit_or_reply_menu_text(
-    message: Any,
-    text: str,
-    **kwargs: Any,
-) -> Any:
-    """Edit text menus, but reply when the callback originated from media."""
-    if getattr(message, "text", None) is not None:
-        try:
-            return await safe_send(lambda: message.edit_text(text, **kwargs))
-        except BadRequest as exc:
-            if "no text in the message to edit" not in str(exc).lower():
-                raise
-    return await safe_send(lambda: message.reply_text(text, **kwargs))
-
-
-async def _cb_myprefs(query, user_id: int, context, data: str) -> None:
-    del context
-    if query.message is None:
-        return
-    if data == "myprefs_close":
-        with suppress(Exception):
-            await query.message.delete()
-        return
-
-    prefs = dict(await get_user_prefs_async(user_id))
-    notice = ""
-    if data.startswith("myprefs_gender:"):
-        gender = data.split(":", 1)[1].strip().lower()
-        if gender not in {"female", "male"}:
-            return
-        if str(prefs.get("gender") or "female") != gender:
-            update_user_gender(user_id, gender)
-            prefs["gender"] = gender
-            notice = "✅ បានកែប្រភេទសំឡេងរួចរាល់។"
-    elif data.startswith("myprefs_speed:"):
-        speed_key = data.split(":", 1)[1].strip()
-        option = SPEED_OPTIONS.get(speed_key)
-        if option is None:
-            return
-        current_speed = float(prefs.get("speed") or DEFAULT_SPEED)
-        if abs(current_speed - option[1]) >= 0.01:
-            update_user_speed(user_id, option[1])
-            prefs["speed"] = option[1]
-            notice = f"✅ បានកែល្បឿនទៅ {option[0]}។"
-    elif data.startswith("myprefs_model:"):
-        model_key = data.split(":", 1)[1].strip()
-        if model_key not in TTS_MODEL_OPTIONS:
-            return
-        if _normalize_tts_model(prefs.get("tts_model", "auto")) != model_key:
-            update_user_tts_model(user_id, model_key)
-            prefs["tts_model"] = model_key
-            notice = f"✅ បានកែម៉ូដែលទៅ {TTS_MODEL_OPTIONS[model_key][0]}។"
-
-    markup = (
-        get_myprefs_model_kb(prefs.get("tts_model", "auto"))
-        if data == "myprefs_models"
-        else get_myprefs_kb(prefs)
-    )
-    await _edit_or_reply_menu_text(
-        query.message,
-        _myprefs_text(prefs, notice=notice),
-        parse_mode="HTML",
-        reply_markup=markup,
-        disable_web_page_preview=True,
-    )
-
-
 async def _cb_show_speed(query, user_id: int, context):
     prefs = await get_user_prefs_async(user_id)
     await safe_send(lambda: query.message.edit_reply_markup(
@@ -27310,6 +25876,11 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
     if query.message is None:
         return
     requested_key = _normalize_tts_model(data.replace("ttsmodel_", "", 1))
+    if requested_key == "voxcpm2":
+        unavailable = _voxcpm2_unavailable_reason()
+        if unavailable:
+            await _voxcpm2_send_panel(query.message, user_id, f"មិនអាចជ្រើស VoxCPM2 បានទេ៖ {unavailable}")
+            return
 
     original_text, prefs = await asyncio.gather(
         get_callback_original_text(query, user_id),
@@ -27318,6 +25889,19 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
     model = requested_key
     gender = prefs["gender"]
     speed = prefs["speed"]
+
+    if model == "voxcpm2":
+        profile = await _voxcpm2_profile_get(user_id)
+        if not _voxcpm2_reference_ready(profile):
+            model = update_user_tts_model(user_id, model)
+            with suppress(Exception):
+                await query.message.edit_reply_markup(reply_markup=get_main_kb(gender, model))
+            await _voxcpm2_send_panel(
+                query.message,
+                user_id,
+                "បានជ្រើស VoxCPM2។ សូមបញ្ចូលសំឡេងគំរូ មុនពេលបង្កើតសំឡេង។",
+            )
+            return
 
     if not original_text:
         model = update_user_tts_model(user_id, model)
@@ -27380,7 +25964,7 @@ async def get_callback_original_text(query, user_id: int) -> str | None:
     try:
         history = _hist_cache_get(user_id)
         if history is None:
-            history = await db_history_fetch(user_id)
+            history = await loop.run_in_executor(_DB_EXECUTOR, db_history_fetch, user_id)
             for row in history or []:
                 _hist_cache_append(user_id, row.get("role", "user"), row.get("content", ""))
 
@@ -27573,172 +26157,29 @@ async def _cb_audio_tts(query, user_id: int, context, data: str):
         _release_tts_request(user_id)
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if query is None:
-        return
-
-    user_id = query.from_user.id
-    data    = (query.data or "").strip()
-
-    if not data:
-        with suppress(Exception):
-            await query.answer()
-        return
-
-    if query.message is None:
-        logger.debug(f"on_callback: no message for data={data!r}")
-        with suppress(Exception):
-            await query.answer()
-        return
-
-    action = classify_callback(data, speed_callbacks=SPEED_OPTIONS)
-    if action is None:
-        logger.info("Ignored unknown or expired callback data=%r user=%s", data, user_id)
-        with suppress(Exception):
-            await query.answer(
-                "This button is no longer available. Please reopen the menu.",
-                show_alert=False,
-            )
-        return
-
-    with suppress(Exception):
-        await query.answer()
-
-    try:
-        if callback_requires_tts_access(action, data) and not await _ensure_user_allowed(
-            update,
-            context,
-            "tts_enabled",
-            "បម្លែងអត្ថបទទៅជាសំឡេង",
-        ):
-            return
-
-        if action == "myprefs":
-            await _cb_myprefs(query, user_id, context, data)
-        elif action == "show_speed":
-            await _cb_show_speed(query, user_id, context)
-        elif action == "hide_speed":
-            await _cb_hide_speed(query, user_id, context)
-        elif action == "show_tts_model":
-            await _cb_show_tts_model(query, user_id, context)
-        elif action == "hide_tts_model":
-            await _cb_hide_tts_model(query, user_id, context)
-        elif action == "tts_model":
-            await _cb_tts_model(query, user_id, context, data)
-        elif action == "speed":
-            await _cb_speed(query, user_id, context, data)
-        elif action == "gender":
-            await _cb_gender(query, user_id, context, data)
-        elif action == "tts_transcript":
-            await _cb_tts_transcript(query, user_id, context, data)
-        elif action == "delete":
-            with suppress(Exception):
-                await query.message.delete()
-        elif action == "doc_read":
-            await _cb_doc_read(query, user_id, context, data)
-        elif action == "audio_tts":
-            await _cb_audio_tts(query, user_id, context, data)
-        elif action == "needs_admin":
-            await _cb_user_needs_admin(query, user_id, context, data)
-        elif action == "api_admin":
-            await _cb_api_dashboard(query, user_id, context, data)
-        elif action == "admin":
-            await _cb_admin_dashboard(query, user_id, context, data)
-    except Exception as exc:
-        _metric_inc("errors")
-        logger.error("on_callback failed action=%s data=%r: %s", action, data, exc, exc_info=True)
-        await safe_send(lambda: query.message.reply_text(
-            "⚠️ Something went wrong while processing this button. Please try again."
-        ))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.callbacks import on_callback as _impl
+    return await _impl(update, context)
 
 
 # ---------------------------------------------------------------------------
 # Global error handler
 # ---------------------------------------------------------------------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    err = getattr(context, "error", None)
-    if err is None:
-        return
-
-    if isinstance(err, ApplicationHandlerStop) or _is_nonfatal_telegram_edit_error(err):
-        logger.debug("Ignored non-fatal Telegram handler condition: %s", err)
-        return
-
-    _metric_inc("errors")
-    _record_admin_error("telegram_error_handler", str(err), level="ERROR", context=type(update).__name__)
-    logger.error(
-        "Unhandled exception: %s",
-        err,
-        exc_info=(type(err), err, getattr(err, "__traceback__", None)),
-    )
-
-    if isinstance(update, Update) and update.effective_message:
-        with suppress(Exception):
-            await safe_send(lambda: update.effective_message.reply_text(
-                "⚠️ មានបញ្ហាបច្ចេកទេស។ Bot នៅដំណើរការ — សូមព្យាយាមម្តងទៀត។"
-            ))
+    """Compatibility wrapper; live implementation moved in V4.1."""
+    from app.services.telegram.guards import error_handler as _impl
+    return await _impl(update, context)
 
 
 # ---------------------------------------------------------------------------
 # Bot runner
 # ---------------------------------------------------------------------------
-async def _activate_telegram_application(app_obj: Any) -> tuple[bool, bool]:
-    """Activate webhook or polling after the PTB Application has started."""
-    active_owner = await _telegram_leader_refresh_once(app_obj)
-    polling_started = False
-
-    if not active_owner:
-        webhook_logger.warning(
-            "Telegram application is running in STANDBY mode. Web/Admin routes "
-            "are online, but this service will not process Telegram updates "
-            "until it owns the active lock."
-        )
-    elif _run_state_bot_mode() == "WEBHOOK":
-        await _cancel_active_polling_task("startup_webhook_mode")
-        webhook_logger.info(
-            "Telegram polling updater is disabled because BOT_MODE=WEBHOOK "
-            "and this instance owns the active lock."
-        )
-    else:
-        # _telegram_start_polling_runtime verifies deleteWebhook before it
-        # allows getUpdates to start.
-        polling_started = await _telegram_start_polling_runtime(app_obj)
-        logger.info("Telegram polling started by active owner.")
-
-    return active_owner, polling_started
-
-
-async def _start_telegram_application(app_obj: Any) -> tuple[bool, bool]:
-    """Start and activate PTB, stopping it if activation cannot complete."""
-    global _TELEGRAM_APP_READY
-
-    started = False
-    try:
-        await app_obj.start()
-        started = True
-        _TELEGRAM_APP_READY = True
-        return await _activate_telegram_application(app_obj)
-    except BaseException:
-        _TELEGRAM_APP_READY = False
-        if started or bool(getattr(app_obj, "running", False)):
-            try:
-                await app_obj.stop()
-            except Exception:
-                logger.error(
-                    "Telegram Application failed to stop after startup activation error.",
-                    exc_info=True,
-                )
-        raise
-
-
 async def _run_bot():
     global _BOT_START_TIME, _AI_SEMAPHORE, _BROADCAST_SEMAPHORE
     global _prefs_cache_lock, _prefs_cache_lock_loop, _TTS_CHUNK_SEMAPHORE, _TELEGRAM_APP, _TELEGRAM_APP_READY, telegram_application
 
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
-
-    _ensure_startup_telegram_mode()
 
     # This application lifecycle supports both webhook and polling.  The
     # getUpdates worker itself is guarded separately by ACTIVE_POLLING_TASK;
@@ -27762,7 +26203,7 @@ async def _run_bot():
         _prefs_cache, _user_last_tts, _sched_payload,
         _hist_cache, _user_locks,
         # FIX: These two were missing from the original reset list:
-        _last_tts_text, _text_cache_memory,
+        _last_tts_text, _text_cache_memory, _VOXCPM2_PROFILE_MEMORY,
     ):
         store.clear()
     with _tts_request_reservations_guard:
@@ -27795,74 +26236,13 @@ async def _run_bot():
     _TELEGRAM_APP = app
     telegram_application = app
 
-    # Anti-flood/security guards must run before stale-drop and expensive handlers.
-    app.add_handler(TypeHandler(Update, _telegram_rate_limit_guard), group=-3)
-    app.add_handler(TypeHandler(Update, _telegram_user_security_guard), group=-2)
-    if _run_state_bot_mode() != "WEBHOOK":
-        app.add_handler(TypeHandler(Update, _drop_stale_updates), group=-1)
-    else:
-        webhook_logger.info("Stale update drop handler skipped in WEBHOOK mode to preserve Telegram retries after cold starts.")
+    # V4.1: live Telegram routing and handler implementations are native modules.
+    from app.services.telegram.routing import register_telegram_handlers
 
-    # Commands
-    app.add_handler(CommandHandler("start",           on_start))
-    app.add_handler(CommandHandler("adminai",         admin_ai_chat_command))
-    app.add_handler(CommandHandler("cancelforadmin",  admin_ai_chat_command))
-    app.add_handler(CommandHandler("help",            on_help))
-    app.add_handler(CommandHandler("myprefs",         cmd_myprefs))
-    app.add_handler(CommandHandler("ttsmodel",        cmd_ttsmodel))
-    app.add_handler(CommandHandler("clear",           cmd_clear))
-    app.add_handler(CommandHandler("security",        cmd_security))
-    app.add_handler(CommandHandler("privacy",         cmd_privacy))
-    app.add_handler(CommandHandler("deleteme",        cmd_delete_my_data))
-    app.add_handler(CommandHandler("broadcast",       broadcast_start))
-    app.add_handler(CommandHandler("schedule",        cmd_schedule))
-    app.add_handler(CommandHandler("schedules",       cmd_schedules))
-    app.add_handler(CommandHandler("cancelschedule",  cmd_cancelschedule))
-    app.add_handler(CommandHandler("cancel",          cmd_cancel))
-    app.add_handler(CommandHandler("stats",           admin_stats))
-    app.add_handler(CommandHandler("health",          cmd_health))
-    app.add_handler(CommandHandler("admin",           cmd_admin))
-    app.add_handler(CommandHandler("need",            cmd_feature_request))
-    app.add_handler(CommandHandler("feedback",        cmd_feature_request))
-    app.add_handler(CommandHandler("request_feature", cmd_feature_request))
-    app.add_handler(CommandHandler("runtime",         cmd_runtime))
-    app.add_handler(CommandHandler("version",         cmd_version))
-    app.add_handler(CommandHandler("api",             cmd_api))
-    app.add_handler(CommandHandler("botsettings",     cmd_botsettings))
-    app.add_handler(CommandHandler("users",           cmd_users))
-    app.add_handler(CommandHandler("chat",            cmd_chat))
-    app.add_handler(CommandHandler("endchat",         cmd_endchat))
-
-    # Callback handlers (priority order matters)
-    app.add_handler(CallbackQueryHandler(broadcast_callback,  pattern=r"^bc_"))
-    app.add_handler(CallbackQueryHandler(
-        users_page_callback,
-        # Route every admin user/history button here, including paged callbacks like
-        # user_history:<id>:p0:<page>. The callback function validates IDs safely.
-        pattern=r"^(?:users_(?:page:\d+|search(?:_page:\d+)?|close)|noop|history_(?:page:\d+|refresh|close|user:\d+(?::\d+)?)|user_(?:view|chat|block|unblock|resetprefs|clearhist|history):\d+(?::[psh]\d+)?(?::\d+)?)$",
-    ))
-    app.add_handler(CallbackQueryHandler(sched_callback,      pattern=r"^sched_"))
-    app.add_handler(CallbackQueryHandler(_runtime_admin_callback, pattern=r"^rtadmin_"))
-    app.add_handler(CallbackQueryHandler(admin_message_edit_delete_callback, pattern=r"^admin_(?:ai_exit|del_msg:|cancel_task:)"))
-    app.add_handler(CallbackQueryHandler(on_callback))
-
-    # Message handlers
-    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    app.add_handler(MessageHandler(filters.VOICE, on_voice))
-    app.add_handler(MessageHandler(
-        (filters.Document.ALL | filters.AUDIO) & ~filters.VOICE,
-        on_audio_file,
-    ))
-    app.add_handler(MessageHandler(
-        filters.Sticker.ALL | filters.VIDEO | filters.VIDEO_NOTE,
-        on_any_media,
-    ))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    app.add_error_handler(error_handler)
+    register_telegram_handlers(app, bot_mode=_run_state_bot_mode())
 
     logger.info(
         f"Bot starting in {_run_state_bot_mode()} mode. Admins: {ADMIN_IDS or 'none configured'} | "
-        f"Resources: {resource_profile()} | "
         f"HF: {HF_MODEL} | OCR provider: {OCR_PROVIDER} | "
         f"HF OCR: {HF_OCR_MODEL} | Gemini: {_gemini is not None} | "
         f"TTS: {_tts_provider_summary()}"
@@ -27877,9 +26257,28 @@ async def _run_bot():
         # Application.__aenter__() already calls initialize(). Calling
         # initialize() again can raise "Application is already initialized"
         # on python-telegram-bot v20/v21 and break deploy restarts.
-        active_owner, polling_started = await _start_telegram_application(app)
+        await app.start()
+        _TELEGRAM_APP_READY = True
+        polling_started = False
         leader_refresh_due = 0.0
+        active_owner = await _telegram_leader_refresh_once(app)
         leader_refresh_due = time.monotonic() + _telegram_leader_renew_interval_s()
+
+        if not active_owner:
+            webhook_logger.warning(
+                "Telegram application is running in STANDBY mode. Web/Admin routes are online, but this Render service will not process Telegram updates until it owns the active lock."
+            )
+        elif _run_state_bot_mode() == "WEBHOOK":
+            await _cancel_active_polling_task("startup_webhook_mode")
+            webhook_logger.info("Telegram polling updater is disabled because BOT_MODE=WEBHOOK and this instance owns the active lock.")
+        else:
+            # Startup may follow a previous webhook deployment; delete it before
+            # long polling to prevent Telegram 409 Conflict. Only the active
+            # owner may do this in two-server mode.
+            with suppress(Exception):
+                await _delete_telegram_webhook_via_http(drop_pending=True)
+            polling_started = await _telegram_start_polling_runtime(app)
+            logger.info("Telegram polling started by active owner.")
 
         # Start background jobs only after the Telegram application is fully ready.
         # Scheduler itself has its own distributed lock, so both Render services
@@ -27891,12 +26290,7 @@ async def _run_bot():
                 now = time.monotonic()
                 if now >= leader_refresh_due:
                     active_owner = await _telegram_leader_refresh_once(app)
-                    retry_delay = (
-                        min(5.0, _telegram_leader_renew_interval_s())
-                        if _telegram_leader_failure_is_transient()
-                        else _telegram_leader_renew_interval_s()
-                    )
-                    leader_refresh_due = time.monotonic() + retry_delay
+                    leader_refresh_due = now + _telegram_leader_renew_interval_s()
                 else:
                     active_owner = _telegram_should_run_telegram_workers()
 
@@ -27918,6 +26312,8 @@ async def _run_bot():
                     await _telegram_stop_polling_runtime(app)
                     polling_started = False
                 elif not polling_started and mode == "POLLING":
+                    with suppress(Exception):
+                        await _delete_telegram_webhook_via_http(drop_pending=True)
                     polling_started = await _telegram_start_polling_runtime(app)
 
                 await asyncio.sleep(1.0)
@@ -27928,7 +26324,7 @@ async def _run_bot():
                 with suppress(Exception):
                     await _telegram_stop_polling_runtime(app)
             with suppress(Exception):
-                await _telegram_leader_release()
+                await asyncio.to_thread(_telegram_leader_release_sync)
             for task in (sched_task, sweep_task):
                 if task is None:
                     continue
@@ -27978,15 +26374,13 @@ async def _async_main_once():
     _init_clients()
     await _init_async_clients()
     try:
-        await _restore_run_state_from_redis()
+        await _restore_run_state()
     except Exception as rexc:
-        webhook_logger.warning("Redis fallback triggered. Runtime state restore failed during boot: %s", rexc)
-    _ensure_startup_telegram_mode()
+        webhook_logger.warning("Runtime state restore failed during boot: %s", rexc)
     await _bootstrap_runtime_security()
     from app.core.telegram_auth import configure_telegram_admin_authorizer
 
     admin_authorizer = configure_telegram_admin_authorizer(
-        redis_client=redis_client,
         fallback_admin_ids=ADMIN_IDS,
     )
     ADMIN_IDS.update(await admin_authorizer.load_ids(force=True))
@@ -27994,21 +26388,20 @@ async def _async_main_once():
 
     if not ADMIN_IDS:
         logger.warning(
-            "No Telegram administrators are authorized. Add at least one user ID "
-            "to Redis set tgbot:security:admin_user_ids:v1."
+            "No Telegram administrators are authorized. Configure ADMIN_IDS once; "
+            "the Mini App will persist subsequent changes in Supabase."
         )
 
     print(
         f"Bot + FastAPI are starting... (AI: {AI_PROVIDER} | HF: {HF_MODEL} | "
         f"OCR: {OCR_PROVIDER} | HF OCR: {HF_OCR_MODEL} | "
         f"TTS: {TTS_PROVIDER}/{KHMER_TTS_PROVIDER} | user_model_default: {_normalize_tts_model(DEFAULT_TTS_MODEL)} | "
-        f"Redis: {'on' if redis_client is not None else 'off'} | "
-        f"Resources: {resource_profile()} | TG mode: {_run_state_bot_mode()} | TG leader-lock: {'on' if TELEGRAM_ACTIVE_LOCK_ENABLED else 'off'} | TG updates: {TELEGRAM_CONCURRENT_UPDATES} | TG pool: {TELEGRAM_CONNECTION_POOL_SIZE} | "
+        "Storage: Supabase + memory fallback | "
+        f"TG mode: {_run_state_bot_mode()} | TG leader-lock: {'on' if TELEGRAM_ACTIVE_LOCK_ENABLED else 'off'} | TG updates: {TELEGRAM_CONCURRENT_UPDATES} | TG pool: {_run_state_http_max_connections()} | "
         f"HTTP pool: {HTTP_MAX_CONNECTIONS}/{HTTP_MAX_KEEPALIVE_CONNECTIONS})"
     )
 
     _start_web_broadcast_queue_workers()
-    asyncio.create_task(_clean_memory_caches_task(), name="memory-cleanup")
     keepalive_stop = asyncio.Event()
     telegram_app_task = asyncio.create_task(_run_bot(), name="telegram-bot")
     startup_checks_task = asyncio.create_task(_run_startup_background_checks(), name="startup-background-checks")

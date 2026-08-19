@@ -1,45 +1,35 @@
-"""Telegram Mini App init-data validation and administrator authorization."""
+"""Telegram Mini App authentication and Supabase-backed administrator policy."""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import hmac
-import inspect
 import json
-import logging
-import re
-import threading
 import time
-from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl
 
 from fastapi import Request
 
-logger = logging.getLogger(__name__)
+from app.services.settings.store import SettingsStore, get_settings_store
 
-_HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
-_MAX_INIT_DATA_BYTES = 16_384
-_MAX_FIELDS = 32
-_MAX_USER_JSON_BYTES = 8_192
-_DEFAULT_MAX_AGE_SECONDS = 3_600
-_DEFAULT_FUTURE_SKEW_SECONDS = 30
+_ADMIN_KEY = "security:admin_user_ids:v2"
 
 
 class TelegramInitDataError(ValueError):
-    """Raised when Telegram Mini App data is malformed or untrusted."""
+    """Telegram Mini App initData is malformed, stale or has an invalid hash."""
 
 
 class TelegramAdminStoreError(RuntimeError):
-    """Raised when the Redis-backed administrator allowlist is unavailable."""
+    """Administrator policy could not be loaded."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class TelegramMiniAppUser:
     id: int
-    first_name: str
+    first_name: str = ""
     last_name: str = ""
     username: str = ""
     language_code: str = ""
@@ -58,386 +48,195 @@ class TelegramMiniAppUser:
         }
 
 
-@dataclass(frozen=True, slots=True)
-class ValidatedTelegramInitData:
+@dataclass(frozen=True)
+class TelegramInitData:
     user: TelegramMiniAppUser
     auth_date: int
-    query_id: str
-    fields: Mapping[str, str]
+    query_id: str = ""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class TelegramAdminSession:
     user: TelegramMiniAppUser
     auth_date: int
-    query_id: str
+    query_id: str = ""
 
 
-def _required_text(value: Any, field: str, *, max_length: int) -> str:
-    if not isinstance(value, str):
-        raise TelegramInitDataError(f"Telegram user field {field!r} must be text.")
-    value = value.strip()
-    if not value:
-        raise TelegramInitDataError(f"Telegram user field {field!r} is required.")
-    if len(value) > max_length:
-        raise TelegramInitDataError(f"Telegram user field {field!r} is too long.")
-    return value
-
-
-def _optional_text(value: Any, field: str, *, max_length: int) -> str:
-    if value is None:
-        return ""
-    if not isinstance(value, str):
-        raise TelegramInitDataError(f"Telegram user field {field!r} must be text.")
-    value = value.strip()
-    if len(value) > max_length:
-        raise TelegramInitDataError(f"Telegram user field {field!r} is too long.")
-    return value
-
-
-def _parse_user(raw_user: str) -> TelegramMiniAppUser:
-    if not raw_user or len(raw_user.encode("utf-8")) > _MAX_USER_JSON_BYTES:
-        raise TelegramInitDataError("Telegram Mini App user data is missing or too large.")
-    try:
-        value = json.loads(raw_user)
-    except (TypeError, ValueError) as exc:
-        raise TelegramInitDataError("Telegram Mini App user data is invalid JSON.") from exc
-    if not isinstance(value, dict):
-        raise TelegramInitDataError("Telegram Mini App user data must be a JSON object.")
-    try:
-        user_id = int(value.get("id"))
-    except (TypeError, ValueError) as exc:
-        raise TelegramInitDataError("Telegram Mini App user id is invalid.") from exc
-    if user_id <= 0 or user_id >= 2**63:
-        raise TelegramInitDataError("Telegram Mini App user id is outside the valid range.")
-    if value.get("is_bot") is True:
-        raise TelegramInitDataError("Bot accounts cannot authorize the admin Mini App.")
-    return TelegramMiniAppUser(
-        id=user_id,
-        first_name=_required_text(value.get("first_name"), "first_name", max_length=256),
-        last_name=_optional_text(value.get("last_name"), "last_name", max_length=256),
-        username=_optional_text(value.get("username"), "username", max_length=64),
-        language_code=_optional_text(
-            value.get("language_code"),
-            "language_code",
-            max_length=35,
-        ),
-        photo_url=_optional_text(value.get("photo_url"), "photo_url", max_length=2_048),
-        is_premium=value.get("is_premium") is True,
-    )
+def _parse_fields(raw: str) -> dict[str, str]:
+    pairs = parse_qsl(str(raw or ""), keep_blank_values=True, strict_parsing=False)
+    fields: dict[str, str] = {}
+    for key, value in pairs:
+        if key in fields:
+            raise TelegramInitDataError(f"Telegram initData contains duplicate field {key!r}.")
+        fields[key] = value
+    return fields
 
 
 def validate_telegram_init_data(
-    init_data: str,
+    raw: str,
     bot_token: str,
     *,
-    max_age_seconds: int = _DEFAULT_MAX_AGE_SECONDS,
-    future_skew_seconds: int = _DEFAULT_FUTURE_SKEW_SECONDS,
-    now: float | None = None,
-) -> ValidatedTelegramInitData:
-    """Validate Telegram ``WebApp.initData`` using Telegram's bot-token HMAC.
-
-    The URL-decoded fields are sorted into the documented data-check string.
-    The supplied hash is excluded, and every other received field is covered.
-    """
-
-    if not isinstance(init_data, str) or not init_data:
-        raise TelegramInitDataError("Telegram Mini App init data is required.")
-    if len(init_data.encode("utf-8")) > _MAX_INIT_DATA_BYTES:
-        raise TelegramInitDataError("Telegram Mini App init data is too large.")
+    now: int | None = None,
+    max_age_seconds: int = 3600,
+) -> TelegramInitData:
+    fields = _parse_fields(raw)
+    received_hash = str(fields.pop("hash", "") or "").strip().lower()
+    if not received_hash or len(received_hash) != 64:
+        raise TelegramInitDataError("Telegram initData signature is missing or invalid.")
     token = str(bot_token or "").strip()
-    # Render and some dotenv loaders preserve literal surrounding quotes when
-    # a secret is entered as `"123:ABC"`; Telegram tokens never contain quote
-    # characters, so normalize that common deployment mistake safely.
-    if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"}:
-        token = token[1:-1].strip()
     if not token:
         raise TelegramInitDataError("Telegram bot token is not configured.")
 
-    try:
-        pairs = parse_qsl(
-            init_data,
-            keep_blank_values=True,
-            strict_parsing=True,
-            encoding="utf-8",
-            errors="strict",
-            max_num_fields=_MAX_FIELDS,
-        )
-    except (UnicodeError, ValueError) as exc:
-        raise TelegramInitDataError("Telegram Mini App init data is malformed.") from exc
-
-    fields: dict[str, str] = {}
-    for key, value in pairs:
-        if not key or key in fields:
-            raise TelegramInitDataError(
-                "Telegram Mini App init data contains a missing or duplicate field."
-            )
-        fields[key] = value
-
-    received_hash = fields.get("hash", "")
-    if not _HASH_RE.fullmatch(received_hash):
-        raise TelegramInitDataError("Telegram Mini App hash is missing or invalid.")
-
-    data_check_string = "\n".join(
-        f"{key}={value}"
-        for key, value in sorted(fields.items())
-        if key != "hash"
-    )
-    secret_key = hmac.new(
-        b"WebAppData",
-        token.encode("utf-8"),
-        hashlib.sha256,
-    ).digest()
-    calculated_hash = hmac.new(
+    data_check_string = "\n".join(f"{key}={value}" for key, value in sorted(fields.items()))
+    secret_key = hmac.new(b"WebAppData", token.encode("utf-8"), hashlib.sha256).digest()
+    expected_hash = hmac.new(
         secret_key,
         data_check_string.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
-    if not hmac.compare_digest(calculated_hash, received_hash.lower()):
-        raise TelegramInitDataError("Telegram Mini App signature is invalid.")
+    if not hmac.compare_digest(received_hash, expected_hash):
+        raise TelegramInitDataError("Telegram initData signature is invalid.")
 
     try:
-        auth_date = int(fields.get("auth_date", ""))
+        auth_date = int(fields.get("auth_date") or 0)
     except (TypeError, ValueError) as exc:
-        raise TelegramInitDataError("Telegram Mini App auth_date is invalid.") from exc
-    current_time = int(time.time() if now is None else now)
-    if auth_date > current_time + max(0, int(future_skew_seconds)):
-        raise TelegramInitDataError("Telegram Mini App init data is from the future.")
-    if max_age_seconds > 0 and current_time - auth_date > int(max_age_seconds):
-        raise TelegramInitDataError("Telegram Mini App init data has expired.")
+        raise TelegramInitDataError("Telegram initData auth_date is invalid.") from exc
+    current = int(time.time() if now is None else now)
+    if auth_date > current + 30:
+        raise TelegramInitDataError("Telegram initData auth_date is in the future.")
+    if auth_date <= 0 or current - auth_date > max(60, int(max_age_seconds)):
+        raise TelegramInitDataError("Telegram initData has expired.")
 
-    user = _parse_user(fields.get("user", ""))
-    query_id = str(fields.get("query_id") or "")
-    if len(query_id) > 256:
-        raise TelegramInitDataError("Telegram Mini App query id is too long.")
-    return ValidatedTelegramInitData(
+    try:
+        user_payload = json.loads(fields.get("user") or "{}")
+        user_id = int(user_payload.get("id") or 0)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise TelegramInitDataError("Telegram initData user is invalid.") from exc
+    if user_id <= 0:
+        raise TelegramInitDataError("Telegram initData user ID is invalid.")
+
+    user = TelegramMiniAppUser(
+        id=user_id,
+        first_name=str(user_payload.get("first_name") or ""),
+        last_name=str(user_payload.get("last_name") or ""),
+        username=str(user_payload.get("username") or ""),
+        language_code=str(user_payload.get("language_code") or ""),
+        photo_url=str(user_payload.get("photo_url") or ""),
+        is_premium=bool(user_payload.get("is_premium")),
+    )
+    return TelegramInitData(
         user=user,
         auth_date=auth_date,
-        query_id=query_id,
-        fields=fields,
+        query_id=str(fields.get("query_id") or ""),
     )
 
 
 def telegram_init_data_from_request(request: Request) -> tuple[str, bool]:
-    """Return init data and whether a Telegram credential was explicitly sent."""
-
-    header_value = str(request.headers.get("x-telegram-init-data") or "").strip()
-    if header_value:
-        return header_value, True
-
+    header = str(request.headers.get("x-telegram-init-data") or "").strip()
+    if header:
+        return header, True
     authorization = str(request.headers.get("authorization") or "").strip()
-    if not authorization.lower().startswith("bearer "):
-        return "", False
-    bearer = authorization.split(None, 1)[1].strip()
-    # Preserve compatibility with the existing opaque admin bearer tokens.
-    looks_like_init_data = (
-        "auth_date=" in bearer
-        and "hash=" in bearer
-        and "user=" in bearer
-        and "&" in bearer
-    )
-    return (bearer, True) if looks_like_init_data else ("", False)
+    for prefix in ("tma ", "bearer "):
+        if authorization.lower().startswith(prefix):
+            credential = authorization[len(prefix):].strip()
+            if credential:
+                return credential, True
+    return "", False
 
 
 class TelegramAdminAuthorizer:
-    """Resolve authorized Telegram user IDs from a persistent Redis set."""
-
-    def __init__(
-        self,
-        *,
-        redis_prefix: str = "tgbot",
-        cache_ttl_seconds: float = 5.0,
-    ) -> None:
-        prefix = str(redis_prefix or "tgbot").strip().strip(":")
-        self.redis_key = f"{prefix or 'tgbot'}:security:admin_user_ids:v1"
+    def __init__(self, *, cache_ttl_seconds: float = 5.0) -> None:
+        self.store: SettingsStore = get_settings_store()
+        self.fallback_admin_ids: frozenset[int] = frozenset()
         self.cache_ttl_seconds = max(0.5, float(cache_ttl_seconds))
-        self._redis: Any | None = None
-        self._fallback_ids: frozenset[int] = frozenset()
-        self._cached_ids: frozenset[int] = frozenset()
-        self._cache_deadline = 0.0
-        self._lock = threading.RLock()
-        self._load_lock = threading.Lock()
+        self._cache: frozenset[int] | None = None
+        self._cache_at = 0.0
+        self._lock = asyncio.Lock()
 
     def configure(
         self,
         *,
-        redis_client: Any | None,
-        fallback_admin_ids: Iterable[int] = (),
-    ) -> TelegramAdminAuthorizer:
-        clean_ids: set[int] = set()
-        for value in fallback_admin_ids:
-            try:
-                user_id = int(value)
-            except (TypeError, ValueError):
-                continue
-            if user_id > 0:
-                clean_ids.add(user_id)
-        with self._load_lock, self._lock:
-            self._redis = redis_client
-            self._fallback_ids = frozenset(clean_ids)
-            self._cached_ids = frozenset()
-            self._cache_deadline = 0.0
+        settings_store: SettingsStore | None = None,
+        fallback_admin_ids: set[int] | frozenset[int] | list[int] | tuple[int, ...] = (),
+        redis_client: Any | None = None,
+        **_ignored: Any,
+    ) -> "TelegramAdminAuthorizer":
+        # redis_client is accepted temporarily so older call sites do not crash;
+        # it is intentionally unused after the single-process migration.
+        del redis_client
+        self.store = settings_store or get_settings_store()
+        self.fallback_admin_ids = frozenset(
+            int(value) for value in fallback_admin_ids if int(value) > 0
+        )
+        self.invalidate()
         return self
 
-    @staticmethod
-    def _decode_id(value: Any) -> int | None:
-        if isinstance(value, bytes):
-            value = value.decode("utf-8", errors="strict")
-        try:
-            user_id = int(str(value).strip())
-        except (TypeError, ValueError):
-            return None
-        return user_id if user_id > 0 else None
+    def invalidate(self) -> None:
+        self._cache = None
+        self._cache_at = 0.0
 
     async def load_ids(self, *, force: bool = False) -> frozenset[int]:
         now = time.monotonic()
-        with self._lock:
-            if not force and now < self._cache_deadline:
-                return self._cached_ids
-
-        # A thread lock works across the async API and the synchronous
-        # compatibility entry point.  Acquire it off-loop, then re-check the
-        # cache so concurrent misses collapse into one Redis lookup.
-        await asyncio.to_thread(self._load_lock.acquire)
-        try:
+        if not force and self._cache is not None and now - self._cache_at < self.cache_ttl_seconds:
+            return self._cache
+        async with self._lock:
             now = time.monotonic()
-            with self._lock:
-                if not force and now < self._cache_deadline:
-                    return self._cached_ids
-                client = self._redis
-                fallback = self._fallback_ids
+            if not force and self._cache is not None and now - self._cache_at < self.cache_ttl_seconds:
+                return self._cache
+            payload = await self.store.get_json(_ADMIN_KEY, [])
+            ids: set[int] = set()
+            if isinstance(payload, list):
+                for value in payload:
+                    try:
+                        admin_id = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if admin_id > 0:
+                        ids.add(admin_id)
+            if not ids and self.fallback_admin_ids:
+                ids.update(self.fallback_admin_ids)
+                await self.store.set_json(_ADMIN_KEY, sorted(ids))
+            self._cache = frozenset(ids)
+            self._cache_at = now
+            return self._cache
 
-            if client is None:
-                allowed = fallback
-            else:
-                try:
-                    members = await self._redis_call(client, "smembers", self.redis_key)
-                    allowed = frozenset(
-                        user_id
-                        for user_id in (
-                            self._decode_id(value)
-                            for value in members or ()
-                        )
-                        if user_id is not None
-                    )
-                    if not allowed and fallback:
-                        await self._redis_call(
-                            client,
-                            "sadd",
-                            self.redis_key,
-                            *(str(value) for value in sorted(fallback)),
-                        )
-                        allowed = fallback
-                        logger.warning(
-                            "Migrated %s configured Telegram admin id(s) to Redis key=%s.",
-                            len(fallback),
-                            self.redis_key,
-                        )
-                except Exception as exc:
-                    if fallback:
-                        logger.warning(
-                            "Redis admin allowlist unavailable; using configured fallback IDs: %s",
-                            exc,
-                        )
-                        allowed = fallback
-                    else:
-                        raise TelegramAdminStoreError(
-                            "The Telegram administrator allowlist is unavailable."
-                        ) from exc
+    async def save_ids(self, ids: set[int] | frozenset[int], *, updated_by: int | None = None) -> bool:
+        clean = sorted({int(value) for value in ids if int(value) > 0})
+        persistent = await self.store.set_json(_ADMIN_KEY, clean, updated_by=updated_by)
+        self._cache = frozenset(clean)
+        self._cache_at = time.monotonic()
+        return persistent
 
-            with self._lock:
-                self._cached_ids = allowed
-                self._cache_deadline = time.monotonic() + self.cache_ttl_seconds
-            return allowed
-        finally:
-            self._load_lock.release()
-
-    @staticmethod
-    async def _redis_call(client: Any, method: str, *args: Any) -> Any:
-        operation = getattr(client, method)
-        if inspect.iscoroutinefunction(operation):
-            return await operation(*args)
-        result = await asyncio.to_thread(operation, *args)
-        if inspect.isawaitable(result):
-            return await result
-        return result
-
-    def _load_ids_sync(self, *, force: bool = False) -> frozenset[int]:
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        if loop and loop.is_running():
-            with self._lock:
-                return self._cached_ids or self._fallback_ids
-        else:
-            try:
-                return asyncio.run(self.load_ids(force=force))
-            except RuntimeError:
-                with self._lock:
-                    return self._cached_ids or self._fallback_ids
-
-    def invalidate(self) -> None:
-        """Expire the local allowlist after an administrator mutation."""
-
-        with self._lock:
-            self._cache_deadline = 0.0
-
-    def is_admin_sync(self, user_id: int) -> bool:
-        try:
-            candidate = int(user_id)
-        except (TypeError, ValueError):
-            return False
-        return candidate > 0 and candidate in self._load_ids_sync()
-
-    async def authorize(
-        self,
-        init_data: str,
-        bot_token: str,
-        *,
-        max_age_seconds: int = _DEFAULT_MAX_AGE_SECONDS,
-    ) -> TelegramAdminSession:
-        validated = validate_telegram_init_data(
-            init_data,
-            bot_token,
-            max_age_seconds=max_age_seconds,
-        )
-        allowed_ids = await self.load_ids()
-        if validated.user.id not in allowed_ids:
-            raise PermissionError("This Telegram account is not an authorized administrator.")
+    async def authorize(self, raw_init_data: str, bot_token: str) -> TelegramAdminSession:
+        data = validate_telegram_init_data(raw_init_data, bot_token)
+        admin_ids = await self.load_ids()
+        if data.user.id not in admin_ids:
+            raise PermissionError("This Telegram account is not an administrator.")
         return TelegramAdminSession(
-            user=validated.user,
-            auth_date=validated.auth_date,
-            query_id=validated.query_id,
+            user=data.user,
+            auth_date=data.auth_date,
+            query_id=data.query_id,
         )
 
 
-_TELEGRAM_ADMIN_AUTHORIZER = TelegramAdminAuthorizer()
+_AUTHORIZER = TelegramAdminAuthorizer()
 
 
-def configure_telegram_admin_authorizer(
-    *,
-    redis_client: Any | None,
-    fallback_admin_ids: Iterable[int] = (),
-) -> TelegramAdminAuthorizer:
-    return _TELEGRAM_ADMIN_AUTHORIZER.configure(
-        redis_client=redis_client,
-        fallback_admin_ids=fallback_admin_ids,
-    )
+def configure_telegram_admin_authorizer(**kwargs: Any) -> TelegramAdminAuthorizer:
+    return _AUTHORIZER.configure(**kwargs)
 
 
 def get_telegram_admin_authorizer() -> TelegramAdminAuthorizer:
-    return _TELEGRAM_ADMIN_AUTHORIZER
+    return _AUTHORIZER
 
 
 __all__ = [
     "TelegramAdminAuthorizer",
     "TelegramAdminSession",
     "TelegramAdminStoreError",
+    "TelegramInitData",
     "TelegramInitDataError",
     "TelegramMiniAppUser",
-    "ValidatedTelegramInitData",
     "configure_telegram_admin_authorizer",
     "get_telegram_admin_authorizer",
     "telegram_init_data_from_request",

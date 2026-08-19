@@ -9,8 +9,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg libopus-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.lock .
-RUN pip install --disable-pip-version-check --no-cache-dir -r requirements.lock \
+COPY requirements.txt .
+RUN pip install --disable-pip-version-check --no-cache-dir -r requirements.txt \
     && python -m pip check
 
 RUN useradd --create-home --uid 10001 appuser

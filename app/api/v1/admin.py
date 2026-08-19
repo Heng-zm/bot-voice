@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
-import time
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -14,12 +12,6 @@ from pydantic import BaseModel, ConfigDict
 
 from app._legacy_bridge import legacy_module
 from app.api.dependencies import AdminPrincipal, require_admin, require_admin_write
-from app.runtime import get_runtime_context
-from app.services.build_info import get_build_info
-from app.services.settings.runtime import (
-    build_runtime_settings_payload,
-    coerce_runtime_updates,
-)
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 logger = logging.getLogger(__name__)
@@ -46,36 +38,22 @@ class AdminSettingsPayload(BaseModel):
     runtime: dict[str, Any] | None = None
 
 
-async def _redis_health(
-    redis_client: Any | None,
-    *,
-    enabled: bool = True,
-) -> dict[str, Any]:
-    if not enabled:
-        return {"ok": True, "latency_ms": None, "status": "disabled"}
-    if redis_client is None:
-        return {"ok": False, "latency_ms": None, "status": "not_configured"}
-    started = time.perf_counter()
-    try:
-        if inspect.iscoroutinefunction(redis_client.ping):
-            operation = redis_client.ping()
-        else:
-            operation = asyncio.to_thread(redis_client.ping)
-        pong = await asyncio.wait_for(operation, timeout=2.5)
-        if inspect.isawaitable(pong):
-            pong = await asyncio.wait_for(pong, timeout=2.5)
-    except Exception as exc:  # noqa: BLE001 - health output is intentionally safe
-        logger.warning("Admin Mini App Redis health check failed: %s", exc)
-        return {"ok": False, "latency_ms": None, "status": "unavailable"}
-    return {
-        "ok": bool(pong),
-        "latency_ms": round((time.perf_counter() - started) * 1_000, 1),
-        "status": "healthy" if pong else "unavailable",
-    }
-
-
 def _runtime_settings_payload(legacy: Any) -> dict[str, dict[str, Any]]:
-    return build_runtime_settings_payload(legacy, MINI_APP_RUNTIME_KEYS)
+    values: dict[str, dict[str, Any]] = {}
+    specs = getattr(legacy, "_RUNTIME_CONFIG_SPECS", {})
+    run_state = getattr(legacy, "RUN_STATE", {})
+    for key in MINI_APP_RUNTIME_KEYS:
+        spec = dict(specs.get(key) or {})
+        value = run_state.get(key, getattr(legacy, key, None))
+        values[key] = {
+            "value": value,
+            "kind": str(spec.get("kind") or "str"),
+            "label": str(spec.get("label") or key.replace("_", " ").title()),
+            "help": str(spec.get("help") or ""),
+            "min": spec.get("min"),
+            "max": spec.get("max"),
+        }
+    return values
 
 
 @router.get("/me")
@@ -108,14 +86,9 @@ async def get_admin_stats(
 ) -> dict[str, Any]:
     del principal
     legacy = legacy_module()
-    runtime_snapshot = get_runtime_context().snapshot()
-    counts_result, settings_result, redis_health = await asyncio.gather(
+    counts_result, settings_result = await asyncio.gather(
         asyncio.to_thread(legacy._web_counts, False),
         legacy.get_bot_settings_async(),
-        _redis_health(
-            getattr(legacy, "redis_client", None),
-            enabled=bool(runtime_snapshot.get("redis_enabled", True)),
-        ),
         return_exceptions=True,
     )
 
@@ -125,9 +98,6 @@ async def get_admin_stats(
     else:
         settings = dict(getattr(legacy, "BOT_SETTING_DEFAULTS", {}))
         settings_status = {"db_ok": False, "memory": True}
-    if not isinstance(redis_health, dict):
-        redis_health = {"ok": False, "latency_ms": None, "status": "unavailable"}
-
     metrics = dict(getattr(legacy, "_RUNTIME_METRICS", {}))
     message_count = sum(
         int(metrics.get(key) or 0)
@@ -139,13 +109,10 @@ async def get_admin_stats(
     bot_mode = str(legacy._run_state_bot_mode())
     polling_active = bool(getattr(legacy, "_TELEGRAM_POLLING_ACTIVE", False))
     telegram_app_ready = bool(getattr(legacy, "_TELEGRAM_APP", None))
+
     return {
         "ok": True,
-        "generated_at": datetime.now(UTC).isoformat(),
-        "build": get_build_info(
-            role=runtime_snapshot.get("role"),
-            started_at=runtime_snapshot.get("started_at"),
-        ),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "bot": {
             "active": telegram_app_ready or polling_active,
             "mode": bot_mode,
@@ -159,25 +126,13 @@ async def get_admin_stats(
             "message_count": message_count,
             "metrics": metrics,
         },
-        "redis": redis_health,
+        "storage": {
+            "backend": "supabase" if bool(settings_status.get("db_ok")) else "memory",
+            "persistent": bool(settings_status.get("db_ok")),
+        },
         "database": {
             "ok": bool(settings_status.get("db_ok")),
             "memory_fallback": bool(settings_status.get("memory")),
-        },
-        "runtime": {
-            "role": runtime_snapshot.get("role") or "combined",
-            "redis_enabled": bool(
-                runtime_snapshot.get("redis_enabled", True)
-            ),
-            "queue": {
-                "backend": runtime_snapshot.get(
-                    "job_queue_backend",
-                    "unconfigured",
-                ),
-                "durable": bool(
-                    runtime_snapshot.get("job_queue_durable", False)
-                ),
-            },
         },
     }
 
@@ -222,16 +177,15 @@ async def update_admin_settings(
             detail=f"Unsupported runtime setting(s): {', '.join(unsupported)}",
         )
 
-    try:
-        coerced_runtime = coerce_runtime_updates(
-            requested_runtime,
-            getattr(legacy, "_RUNTIME_CONFIG_SPECS", {}),
-        )
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        ) from exc
+    coerced_runtime: dict[str, Any] = {}
+    for key, value in requested_runtime.items():
+        try:
+            coerced_runtime[key] = legacy._coerce_run_state_value(key, value)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{key}: {exc}",
+            ) from exc
 
     changed: list[str] = []
     if payload.maintenance_mode is not None:

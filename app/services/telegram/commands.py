@@ -1,0 +1,652 @@
+"""Extracted Telegram handler implementations.
+
+These are live runtime handlers; app.legacy now contains compatibility wrappers only.
+"""
+
+from __future__ import annotations
+
+# Transitional V4.1 modules bind remaining legacy helpers at runtime.
+# ruff: noqa: F821
+
+from app.services.telegram._legacy_runtime import legacy_bound_handler
+
+@legacy_bound_handler
+async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        sync_user_data(update.effective_user)
+        if not await _ensure_user_allowed(update, context):
+            return
+        await safe_send(lambda: update.message.reply_text(
+            WELCOME_TEXT,
+            reply_markup=ReplyKeyboardRemove(),
+            disable_web_page_preview=True,
+        ))
+    except Exception as e:
+        logger.error(f"on_start error: {e}")
+
+
+@legacy_bound_handler
+async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await on_start(update, context)
+
+
+@legacy_bound_handler
+async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    prefs   = await get_user_prefs_async(user_id)
+    gender_label = "👩 សំឡេងស្រី" if prefs["gender"] == "female" else "👨 សំឡេងប្រុស"
+    speed_label  = next(
+        (lbl for _, (lbl, val) in SPEED_OPTIONS.items() if abs(val - prefs["speed"]) < 0.01),
+        f"{prefs['speed']}x",
+    )
+    model_label = _tts_model_label(prefs.get("tts_model", "auto"))
+    await safe_send(lambda: update.message.reply_text(
+        f"⚙️ <b>ការកំណត់របស់អ្នក</b>\n\n"
+        f"🗣️ សំឡេង: <b>{gender_label}</b>\n"
+        f"🎚️ ល្បឿន: <b>{speed_label}</b>\n"
+        f"🤖 ម៉ូដែល TTS: <b>{html.escape(model_label)}</b>\n"
+        f"🎙️ ការកំណត់ VoxCPM2៖ <b>{'ប្រើ /voxcpm2 ដើម្បីកែប្រែ' if _normalize_tts_model(prefs.get('tts_model', 'auto')) == 'voxcpm2' else 'មិនចាំបាច់'}</b>\n\n"
+        "ផ្ញើអត្ថបទណាមួយ។ បូតស្គាល់ភាសា និងជ្រើសសំឡេងដោយស្វ័យប្រវត្តិ; "
+        "ប៊ូតុងក្រោមសារសំឡេងប្រើសម្រាប់ប្តូរម៉ូដែល ល្បឿន ឬប្រភេទសំឡេង។",
+        parse_mode="HTML",
+        reply_markup=get_main_kb(prefs["gender"], prefs.get("tts_model", "auto")),
+    ))
+
+
+@legacy_bound_handler
+async def cmd_ttsmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _ensure_user_allowed(update, context, "tts_enabled", "Text to voice"):
+        return
+    user_id = update.effective_user.id
+    prefs = await get_user_prefs_async(user_id)
+    await safe_send(lambda: update.message.reply_text(
+        '🤖 <b>ជ្រើសរើសម៉ូដែល TTS</b>\n\nស្វ័យប្រវត្តិ៖ ប្រើ Khmer HF Space សម្រាប់ភាសាខ្មែរ និងប្ដូរទៅ Edge ប្រសិនបើចាំបាច់\nKhmer HF៖ ប្រើ mrrtmob/khmer-tts សម្រាប់អត្ថបទខ្មែរ\nEdge៖ ប្រើ Microsoft Edge TTS សម្រាប់គ្រប់ភាសា\nVoxCPM2 Clone៖ បញ្ចូលសំឡេងគំរូ និងការណែនាំរចនាប័ទ្មសំឡេង (មិនចាំបាច់) តាម /voxcpm2',
+        parse_mode="HTML",
+        reply_markup=get_tts_model_kb(prefs.get("tts_model", "auto")),
+    ))
+
+
+@legacy_bound_handler
+async def cmd_voxcpm2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.effective_message:
+        return
+    if not await _ensure_voxcpm2_allowed(update, context):
+        return
+    context.user_data.pop("voxcpm2_state", None)
+    await _voxcpm2_send_panel(
+        update.effective_message,
+        int(update.effective_user.id),
+        context=context,
+    )
+
+
+@legacy_bound_handler
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    _hist_cache_clear(user_id)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(_DB_EXECUTOR, db_history_clear, user_id)
+    await safe_send(lambda: update.message.reply_text(
+        "🗑️ ប្រវត្តិការសន្ទនារបស់អ្នកបានលុបចេញហើយ។\nBot នឹងចាប់ផ្ដើមការសន្ទនាថ្មី។"
+    ))
+
+
+@legacy_bound_handler
+async def cmd_security(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not update.effective_message:
+        return
+    blocked = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_is_blocked(int(user.id)))
+    status = "blocked" if blocked else "active"
+    await safe_send(lambda: update.effective_message.reply_text(
+        f'🔐 <b>សុវត្ថិភាព និងឯកជនភាព</b>\n\nលេខសម្គាល់អ្នកប្រើប្រាស់៖ <code>{int(user.id)}</code>\nស្ថានភាព៖ <b>{html.escape(status)}</b>\n\n✅ ពាក្យបញ្ជារបស់អ្នកគ្រប់គ្រងត្រូវបានការពារ។\n✅ ការការពារ Spam និងការផ្ញើសារច្រើនពេកត្រូវបានបើក។\n✅ តាមលំនាំដើម សោ API ត្រូវទទួលពី Header មិនមែនពី URL Query String ទេ។\n✅ ប្រើ /clear ដើម្បីសម្អាតបរិបទការជជែក។\n🗑️ ប្រើ /deleteme ដើម្បីលុបប្រវត្តិបូត និងចំណូលចិត្តដែលបានរក្សាទុក។',
+        parse_mode="HTML",
+    ))
+
+
+@legacy_bound_handler
+async def cmd_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_message:
+        return
+    await safe_send(lambda: update.effective_message.reply_text(
+        '🔒 <b>ឯកជនភាព</b>\n\nបូតនេះរក្សាទុកតែទិន្នន័យដែលចាំបាច់សម្រាប់ចំណូលចិត្ត ដំណើរការ Cache អត្ថបទ/សំឡេង បរិបទការសន្ទនា សុវត្ថិភាពអ្នកគ្រប់គ្រង កំណត់ហេតុការផ្ញើ និង—នៅពេលបានកំណត់ VoxCPM2—លេខសម្គាល់ឯកសារសំឡេងគំរូ Telegram ដែលអាចប្រើឡើងវិញ រួមជាមួយការណែនាំរចនាប័ទ្មសំឡេងដែលអ្នកអាចបញ្ចូល។ ទិន្នន័យសំឡេងគំរូដើមត្រូវបានទាញយកទៅកន្លែងបណ្ដោះអាសន្ន និងផ្ញើទៅសេវា VoxCPM2 ដែលបានកំណត់ តែក្នុងពេលបង្កើតសំឡេងប៉ុណ្ណោះ។\n\nអ្នកអាចប្រើ /clear ដើម្បីលុបបរិបទការសន្ទនាបច្ចុប្បន្ន ឬ /deleteme ដើម្បីលុបប្រវត្តិបូត និងចំណូលចិត្តដែលបានរក្សាទុកពី Cache/មូលដ្ឋានទិន្នន័យ តាមការកំណត់របស់ប្រព័ន្ធ។',
+        parse_mode="HTML",
+    ))
+
+
+@legacy_bound_handler
+async def cmd_delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not update.effective_message:
+        return
+    if _is_admin(int(user.id)) and "--confirm-admin" not in context.args:
+        await safe_send(lambda: update.effective_message.reply_text(
+            '⚠️ បានរកឃើញគណនីអ្នកគ្រប់គ្រង។ ដើម្បីលុបទិន្នន័យអ្នកប្រើប្រាស់របស់ខ្លួន សូមប្រើ៖\n<code>/deleteme --confirm-admin</code>',
+            parse_mode="HTML",
+        ))
+        return
+    await _delete_user_personal_data(int(user.id))
+    await safe_send(lambda: update.effective_message.reply_text(
+        '✅ បានសម្អាតប្រវត្តិបូត Cache អត្ថបទ ចំណូលចិត្ត និងទម្រង់សំឡេងគំរូ VoxCPM2 របស់អ្នក។\nសម្គាល់៖ កំណត់ត្រាបិទសិទ្ធិសុវត្ថិភាព និងកំណត់ហេតុការផ្ញើ/សវនកម្មចាំបាច់ អាចត្រូវរក្សាទុកដោយអ្នកគ្រប់គ្រង ដើម្បីការពារការប្រើប្រាស់ខុសគោលបំណង។'
+    ))
+
+
+@legacy_bound_handler
+async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _pending_broadcast.pop(update.effective_user.id, None)
+    context.user_data["bc_state"] = BROADCAST_WAIT_MESSAGE
+    await safe_send(lambda: update.message.reply_text(
+        '🛡️ <b>សុវត្ថិភាពការផ្សាយសារ V2</b>\n\n📨 <b>របៀបប្រើ</b>\n• ផ្ញើ <b>អត្ថបទ</b> ឬ <b>រូបភាព + ចំណងជើង</b> ដែលចង់ផ្សាយ\n• បូតនឹងបង្ហាញសារមើលជាមុនចុងក្រោយ មុនពេលផ្ញើពិត\n• គាំទ្រទម្រង់សារ Telegram, HTML, MarkdownV2, Markdown និងអត្ថបទធម្មតា\n• ដើម្បីបង្ខំទម្រង់ សូមដាក់ <code>::html</code>, <code>::mdv2</code>, <code>::md</code> ឬ <code>::plain</code> នៅជួរទី១\n\n🔐 <b>ការការពារ</b>\n✅ បញ្ជាក់សារមើលជាមុន មុនពេលផ្ញើ\n✅ រំលងអ្នកប្រើប្រាស់ដែលបានបិទបូត ឬមិនអាចទាក់ទងបាន\n✅ គ្រប់គ្រងល្បឿនផ្ញើ និង RetryAfter\n\nវាយ /cancel ដើម្បីបោះបង់។',
+        parse_mode="HTML",
+        reply_markup=get_broadcast_entry_kb(),
+    ))
+
+
+@legacy_bound_handler
+async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    _sched_payload.pop(admin_id, None)
+    context.user_data["sched_state"] = SCHED_WAIT_MSG
+    await safe_send(lambda: update.message.reply_text(
+        '📅 <b>ការផ្សាយតាមកាលវិភាគ</b>\n\nសូមផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + ចំណងជើង</b> ដែលចង់កំណត់ពេលផ្ញើ។\n✅ គាំទ្រទម្រង់ដើមរបស់ Telegram, HTML, MarkdownV2, Markdown និងអត្ថបទធម្មតា។\nដើម្បីបង្ខំទម្រង់ សូមដាក់ <code>::html</code>, <code>::mdv2</code>, <code>::md</code> ឬ <code>::plain</code> នៅជួរទី១។\n\nវាយ /cancel ដើម្បីបោះបង់។',
+        parse_mode="HTML",
+    ))
+
+
+@legacy_bound_handler
+async def cmd_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    loop     = asyncio.get_running_loop()
+    rows     = await loop.run_in_executor(None, db_sched_fetch_admin_pending, admin_id)
+    if not rows:
+        await safe_send(lambda: update.message.reply_text('📭 មិនមានការផ្សាយតាមកាលវិភាគទេ។'))
+        return
+    await safe_send(lambda: update.message.reply_text(
+        f'📋 <b>ការផ្សាយតាមកាលវិភាគ ({len(rows)} កំពុងរង់ចាំ)</b>\nចុចលើកាលវិភាគ ដើម្បីមើលព័ត៌មានលម្អិត ឬបោះបង់។',
+        parse_mode="HTML",
+        reply_markup=get_schedules_list_kb(rows, page=0),
+    ))
+
+
+@legacy_bound_handler
+async def cmd_cancelschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    args     = context.args or []
+    if not args or not args[0].isdigit():
+        await safe_send(lambda: update.message.reply_text(
+            '❌ របៀបប្រើ៖ /cancelschedule &lt;id&gt;\nឬប្រើ /schedules ដើម្បីជ្រើស។',
+            parse_mode="HTML",
+        ))
+        return
+    row_id = int(args[0])
+    loop   = asyncio.get_running_loop()
+    row    = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
+    if not row:
+        await safe_send(lambda: update.message.reply_text(f"❌ រកមិនឃើញ Schedule #{row_id}។"))
+        return
+    if row["admin_id"] != admin_id:
+        await safe_send(lambda: update.message.reply_text("⛔ Schedule នេះមិនមែនជារបស់អ្នកទេ។"))
+        return
+    if row["status"] != "pending":
+        st = row["status"]
+        await safe_send(lambda: update.message.reply_text(
+            f"⚠️ Schedule #{row_id} មានស្ថានភាព <b>{st}</b> — មិនអាច cancel ។",
+            parse_mode="HTML",
+        ))
+        return
+    await loop.run_in_executor(None, db_sched_set_status, row_id, "cancelled")
+    await safe_send(lambda: update.message.reply_text(
+        f'✅ កាលវិភាគ <b>#{row_id}</b> បានបោះបង់។', parse_mode="HTML"
+    ))
+
+
+@legacy_bound_handler
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    vox_state = context.user_data.pop("voxcpm2_state", None)
+    if not _is_admin(uid):
+        if vox_state:
+            await _voxcpm2_send_panel(
+                update.message,
+                int(uid),
+                "បានបោះបង់ការបញ្ចូលព័ត៌មាន VoxCPM2។",
+                context=context,
+                prefer_saved=True,
+            )
+        else:
+            await safe_send(lambda: update.message.reply_text('ℹ️ មិនមានប្រតិបត្តិការដែលត្រូវបោះបង់ទេ។'))
+        return
+
+    # Preserve the old admin-chat notification behavior while still using the
+    # unified cleanup helper for every other transient state.
+    target_id = None
+    with suppress(Exception):
+        if context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
+            target_id = _admin_chat_target.get(uid)
+
+    cleared = await _clear_admin_transient_state(context, uid)
+    if vox_state:
+        cleared.insert(0, "voxcpm2-setup")
+        cleared = list(dict.fromkeys(cleared))
+
+    if target_id:
+        with suppress(Exception):
+            await context.bot.send_message(chat_id=target_id, text="ℹ️ Admin បានបញ្ចប់ Session Chat ។")
+
+    if cleared:
+        labels = ", ".join(cleared[:8])
+        await safe_send(lambda: update.message.reply_text(
+            f"✅ បានបោះបង់/សម្អាត state រួច: <code>{html.escape(labels)}</code>",
+            parse_mode="HTML",
+            reply_markup=get_admin_dashboard_kb(),
+        ))
+        return
+
+    await safe_send(lambda: update.message.reply_text('ℹ️ មិនមានប្រតិបត្តិការដែលត្រូវបោះបង់ទេ។'))
+
+
+@legacy_bound_handler
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    loop   = asyncio.get_running_loop()
+    user_ids, pending_scheds = await asyncio.gather(
+        loop.run_in_executor(_DB_EXECUTOR, get_all_user_ids),
+        loop.run_in_executor(_DB_EXECUTOR, db_sched_fetch_admin_pending, update.effective_user.id),
+    )
+    await safe_send(lambda: update.message.reply_text(
+        f"📊 <b>ស្ថិតិបូត</b>\n\n👥 អ្នកប្រើប្រាស់សរុប៖ <b>{len(user_ids)}</b>\n💬 ការជជែកសកម្មរបស់អ្នកគ្រប់គ្រង៖ <b>{len(_admin_chat_target)}</b>\n📅 កាលវិភាគកំពុងរង់ចាំ៖ <b>{len(pending_scheds)}</b>\n🔒 សោអ្នកប្រើប្រាស់សកម្ម៖ <b>{len(_user_locks)}</b>\n💭 ចំនួនធាតុប្រវត្តិក្នុង Cache៖ <b>{len(_hist_cache)}</b>\n🔑 ការផ្ទៀងផ្ទាត់ API បែប Dynamic៖ <b>{('ON' if _dynamic_ai_auth_configured() else 'OFF')}</b>\n🤗 ម៉ូដែល HF៖ <b>{HF_MODEL}</b>\nOCR៖ <b>{HF_OCR_MODEL}</b>",
+        parse_mode="HTML",
+    ))
+
+
+@legacy_bound_handler
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Telegram admin shortcut for the full bot health panel."""
+    text = await _admin_health_text()
+    await safe_send(lambda: update.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=get_admin_dashboard_kb(),
+        disable_web_page_preview=True,
+    ))
+
+
+@legacy_bound_handler
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Telegram /admin entry point with mobile shortcuts.
+
+    Supported shortcuts:
+      /admin compact, /admin health, /admin errors, /admin broadcast,
+      /admin report, /admin optimize, /admin users, /admin settings, /admin runtime, /admin needs
+    """
+    user_id = update.effective_user.id if update.effective_user else 0
+    arg = ""
+    with suppress(Exception):
+        arg = str((context.args or [""])[0]).strip().lower()
+
+    if arg in {"needs", "userneeds", "user_needs", "feedback"}:
+        text = await _user_needs_home_text(user_id)
+        await safe_send(lambda: update.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=get_user_needs_home_kb(),
+            disable_web_page_preview=True,
+        ))
+        return
+
+    if arg in {"compact", "mobile", "mini"}:
+        text = await _admin_compact_text(user_id)
+        await safe_send(lambda: update.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=get_admin_compact_kb(),
+            disable_web_page_preview=True,
+        ))
+        return
+    if arg in {"health", "status"}:
+        text = await _admin_health_text()
+        await safe_send(lambda: update.message.reply_text(text, parse_mode="HTML", reply_markup=get_admin_dashboard_kb(), disable_web_page_preview=True))
+        return
+    if arg in {"errors", "error"}:
+        await safe_send(lambda: update.message.reply_text(_error_center_text(), parse_mode="HTML", reply_markup=_error_center_kb(), disable_web_page_preview=True))
+        return
+    if arg in {"optimize", "perf", "performance"}:
+        await safe_send(lambda: update.message.reply_text(_admin_optimize_text(), parse_mode="HTML", reply_markup=get_admin_optimize_kb(), disable_web_page_preview=True))
+        return
+    if arg in {"report", "pdf"}:
+        await safe_send(lambda: update.message.reply_text('📄 <b>របាយការណ៍ PDF</b>\n\nសូមជ្រើសរើសចន្លោះពេលរបាយការណ៍៖', parse_mode="HTML", reply_markup=get_admin_report_day_kb(), disable_web_page_preview=True))
+        return
+    if arg in {"users", "user"}:
+        await safe_send(lambda: update.message.reply_text('👥 កំពុងបើកផ្ទាំងអ្នកប្រើប្រាស់...', reply_markup=get_admin_dashboard_kb()))
+        return
+    if arg in {"broadcast", "bc"}:
+        context.user_data["bc_state"] = BROADCAST_WAIT_MESSAGE
+        await safe_send(lambda: update.message.reply_text(
+            '📢 <b>ដំណើរការផ្សាយសារដោយសុវត្ថិភាព</b>\n\nសូមផ្ញើអត្ថបទ ឬរូបភាព + ចំណងជើងឥឡូវនេះ។ បូតនឹងបង្ហាញសារមើលជាមុន មុនពេលផ្ញើពិត។\n\nប្រើ /cancel ដើម្បីបោះបង់។',
+            parse_mode="HTML",
+            reply_markup=get_admin_action_kb(),
+        ))
+        return
+    if arg in {"settings", "setting"}:
+        settings, _status = await get_bot_settings_async(force=True)
+        await safe_send(lambda: update.message.reply_text('⚙️ <b>ការកំណត់បូត</b>', parse_mode="HTML", reply_markup=get_bot_settings_kb(settings)))
+        return
+    if arg in {"runtime", "run"}:
+        await safe_send(lambda: update.message.reply_text(_runtime_admin_text(), parse_mode="HTML", reply_markup=get_runtime_admin_kb(), disable_web_page_preview=True))
+        return
+
+    text = await _admin_home_text(user_id)
+    await safe_send(lambda: update.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=get_admin_dashboard_kb(),
+        disable_web_page_preview=True,
+    ))
+
+
+@legacy_bound_handler
+async def cmd_feature_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User command: /need, /feedback, /request_feature."""
+    user = update.effective_user
+    msg = update.message
+    if not user or not msg:
+        return
+    if not await _ensure_user_allowed(update, context):
+        return
+    detail = " ".join(context.args or []).strip()
+    if detail:
+        await _save_user_feature_request(update, context, detail)
+        return
+    context.user_data[FEATURE_REQUEST_WAIT_TEXT] = True
+    await safe_send(lambda: msg.reply_text(
+        "💬 <b>Open Answer</b>\n\n"
+        "សូមសរសេរ Feature ថ្មី ឬការកែលម្អដែលអ្នកចង់បាន។\n\n"
+        "ឧទាហរណ៍:\n"
+        "• ចង់បានសង្ខេប PDF ជាខ្មែរ\n"
+        "• ចង់បាន Khmer female voice ច្បាស់ជាងមុន\n"
+        "• ចង់ឲ្យ OCR អានអក្សរខ្មែរពីរូបភាពបានល្អ\n\n"
+        "Safety: អត្ថបទអតិបរមា 500 តួអក្សរ។ វាយ <code>cancel</code> ដើម្បីបោះបង់។",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    ))
+
+
+@legacy_bound_handler
+async def cmd_runtime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Direct shortcut for runtime operations without replacing /admin.
+    await safe_send(lambda: update.message.reply_text(
+        _runtime_admin_text(),
+        parse_mode="HTML",
+        reply_markup=get_runtime_admin_kb(),
+        disable_web_page_preview=True,
+    ))
+
+
+@legacy_bound_handler
+async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to create/list/revoke API keys for /ai-assistant."""
+    msg = update.message
+    admin_id = update.effective_user.id
+    args = list(context.args or [])
+
+    if not args or args[0].lower() in ("help", "-h", "--help"):
+        await safe_send(lambda: msg.reply_text(
+            _api_help_text(),
+            parse_mode="HTML",
+            reply_markup=get_api_admin_kb(),
+            disable_web_page_preview=True,
+        ))
+        return
+
+    action = args[0].lower().strip()
+    loop = asyncio.get_running_loop()
+
+    if action == "sql":
+        pages = _paginate_pre_html(
+            AI_API_KEYS_TABLE_SQL,
+            limit=3800,
+            header="🧩 <b>Supabase SQL for API keys</b>\n\n",
+        )
+        for page in pages:
+            await safe_send(lambda p=page: msg.reply_text(
+                p,
+                parse_mode="HTML",
+                reply_markup=get_api_admin_kb(),
+            ))
+        return
+
+    if action == "create":
+        note = " ".join(args[1:]).strip()
+        try:
+            raw_key, row, storage = await loop.run_in_executor(
+                _DB_EXECUTOR,
+                lambda: db_ai_api_key_create(admin_id=admin_id, note=note),
+            )
+        except Exception as e:
+            logger.error(f"/api create failed: {e}", exc_info=True)
+            err = str(e)
+            pages = _paginate_pre_html(
+                err,
+                limit=3500,
+                header=(
+                    "❌ Cannot create API key.\n"
+                    "If this is first setup, press <b>🧩 Setup SQL</b> or run <code>/api sql</code> "
+                    "and execute it in Supabase.\n\n"
+                ),
+            )
+            for page in pages:
+                await safe_send(lambda p=page: msg.reply_text(
+                    p,
+                    parse_mode="HTML",
+                    reply_markup=get_api_admin_kb(),
+                ))
+            return
+
+        warning = ""
+        if storage == "memory":
+            warning = (
+                "\n\n⚠️ Supabase is not configured, so this key is stored in memory only "
+                "and will stop working after restart/deploy."
+            )
+
+        await safe_send(lambda: msg.reply_text(
+            f"""✅ <b>បានបង្កើតសោ API សម្រាប់ AI ថ្មី</b>\n\nសូមចម្លងសោនេះឥឡូវនេះ។ វានឹងមិនត្រូវបានបង្ហាញម្ដងទៀតទេ។\n\n<code>{html.escape(raw_key)}</code>\n\nបុព្វបទ៖ <code>{html.escape(str(row.get('key_prefix') or _api_key_prefix(raw_key)))}</code>\nកន្លែងរក្សាទុក៖ <b>{html.escape(storage)}</b>\n\nឧទាហរណ៍៖\n<pre>curl -X POST https://YOUR-APP.onrender.com/ai-assistant \\\n  -H 'Content-Type: application/json' \\\n  -H 'X-Api-Key: {html.escape(raw_key)}' \\\n  -d '{{"message":"Hello"}}'</pre>{warning}""",
+            parse_mode="HTML",
+            reply_markup=get_api_admin_kb(),
+            disable_web_page_preview=True,
+        ))
+        return
+
+    if action == "list":
+        try:
+            rows = await loop.run_in_executor(_DB_EXECUTOR, lambda: db_ai_api_key_list(limit=20))
+        except Exception as exc:
+            logger.error("/api list failed: %s", exc, exc_info=True)
+            error_text = html.escape(str(exc)[:3500])
+            await safe_send(lambda: msg.reply_text(
+                f'❌ មិនអាចបង្ហាញបញ្ជីសោ API បានទេ។\n<pre>{error_text}</pre>',
+                parse_mode="HTML",
+                reply_markup=get_api_admin_kb(),
+            ))
+            return
+
+        if not rows:
+            await safe_send(lambda: msg.reply_text(
+                'ℹ️ មិនមានសោ API ទេ។ សូមចុច <b>➕ បង្កើតសោ API</b> ឬប្រើ <code>/api create</code>។',
+                parse_mode="HTML",
+                reply_markup=get_api_admin_kb(),
+            ))
+            return
+
+        body = "\n\n".join(_format_api_key_row(r) for r in rows)
+        for page in _paginate_html(body, limit=3900, header="🔑 <b>AI API Keys</b>\n\n"):
+            await safe_send(lambda p=page: msg.reply_text(
+                p,
+                parse_mode="HTML",
+                reply_markup=get_api_list_kb(rows),
+                disable_web_page_preview=True,
+            ))
+        return
+
+    if action == "revoke":
+        if len(args) < 2:
+            await safe_send(lambda: msg.reply_text(
+                '⚠️ របៀបប្រើ៖ <code>/api revoke KEY_PREFIX_OR_ID</code>\n\nឬចុច <b>📋 បញ្ជីសោ API</b> ហើយដកសិទ្ធិតាមប៊ូតុង។',
+                parse_mode="HTML",
+                reply_markup=get_api_admin_kb(),
+            ))
+            return
+
+        identifier = args[1].strip()
+        try:
+            ok, info = await loop.run_in_executor(
+                _DB_EXECUTOR,
+                lambda: db_ai_api_key_revoke(identifier),
+            )
+        except Exception as exc:
+            logger.error("/api revoke failed: %s", exc, exc_info=True)
+            error_text = html.escape(str(exc)[:3500])
+            await safe_send(lambda: msg.reply_text(
+                f'❌ មិនអាចដកសិទ្ធិសោ API បានទេ។\n<pre>{error_text}</pre>',
+                parse_mode="HTML",
+                reply_markup=get_api_admin_kb(),
+            ))
+            return
+
+        if ok:
+            await safe_send(lambda: msg.reply_text(
+                f'✅ បានដកសិទ្ធិសោ API៖ <code>{html.escape(info)}</code>',
+                parse_mode="HTML",
+                reply_markup=get_api_admin_kb(),
+            ))
+        else:
+            await safe_send(lambda: msg.reply_text(
+                f"❌ {html.escape(info)}",
+                parse_mode="HTML",
+                reply_markup=get_api_admin_kb(),
+            ))
+        return
+
+    await safe_send(lambda: msg.reply_text(
+        _api_help_text(),
+        parse_mode="HTML",
+        reply_markup=get_api_admin_kb(),
+        disable_web_page_preview=True,
+    ))
+
+
+@legacy_bound_handler
+async def cmd_botsettings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    settings, status = await get_bot_settings_async(force=True)
+    text = (
+        "⚙️ <b>Bot Settings Panel</b>\n\n"
+        f"Storage: <b>{_ok_bad(bool(status.get('db_ok')), 'Supabase', 'Memory / setup needed')}</b>\n"
+        "Use /admin → ⚙️ Settings for button controls."
+    )
+    await safe_send(lambda: update.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=get_bot_settings_kb(settings),
+    ))
+
+
+@legacy_bound_handler
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    if args:
+        query_text = " ".join(args).strip()
+        results = await asyncio.get_running_loop().run_in_executor(
+            _DB_EXECUTOR,
+            lambda: search_users_by_query(query_text),
+        )
+        context.user_data["users_search_query"] = query_text
+        context.user_data["users_search_results"] = results
+        if not results:
+            await safe_send(lambda: update.message.reply_text(
+                f'🔎 <b>ស្វែងរកអ្នកប្រើប្រាស់</b>\n\nរកមិនឃើញអ្នកប្រើប្រាស់សម្រាប់៖ <code>{html.escape(query_text)}</code>',
+                parse_mode="HTML",
+                reply_markup=get_user_search_prompt_kb(),
+            ))
+            return
+        await safe_send(lambda: update.message.reply_text(
+            f'🔎 <b>លទ្ធផលស្វែងរកអ្នកប្រើប្រាស់</b>\n\nពាក្យស្វែងរក៖ <code>{html.escape(query_text)}</code>\nរកឃើញ៖ <b>{len(results)}</b> នាក់\n\nសូមជ្រើសរើសអ្នកប្រើប្រាស់ ដើម្បីមើលព័ត៌មានលម្អិត។',
+            parse_mode="HTML",
+            reply_markup=get_user_search_page_kb(results, page=0),
+        ))
+        return
+
+    users = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, get_all_users_with_names)
+    if not users:
+        await safe_send(lambda: update.message.reply_text("❌ គ្មានអ្នកប្រើប្រាស់ registered ទេ។"))
+        return
+    await safe_send(lambda: update.message.reply_text(
+        f"👥 <b>អ្នកប្រើប្រាស់ ({len(users)} នាក់)</b>\nចុចលើឈ្មោះ ដើម្បីមើល Detail ឬប្រើ 🔎 Search User ។",
+        parse_mode="HTML",
+        reply_markup=get_users_page_kb(users, page=0),
+    ))
+
+
+@legacy_bound_handler
+async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    args     = context.args or []
+    if not args or not args[0].isdigit():
+        await safe_send(lambda: update.message.reply_text(
+            '❌ របៀបប្រើ៖ /chat <user_id>\nឬប្រើ /users ដើម្បីជ្រើសអ្នកប្រើប្រាស់។'
+        ))
+        return
+    target_id = int(args[0])
+    exists    = await asyncio.get_running_loop().run_in_executor(None, user_exists_in_db, target_id)
+    if not exists:
+        await safe_send(lambda: update.message.reply_text(
+            f'❌ អ្នកប្រើប្រាស់ <code>{target_id}</code> មិនមាននៅក្នុងមូលដ្ឋានទិន្នន័យទេ។', parse_mode="HTML"
+        ))
+        return
+    await _open_chat_session(context.bot, admin_id, target_id, context)
+    await safe_send(lambda: update.message.reply_text(
+        f"💬 <b>Chat Mode បើក</b>\n\nកំពុង Chat ជាមួយ User <code>{target_id}</code>\n"
+        "សារ/រូបភាព/Voice ផ្ញើនឹងទៅដល់ User ។\n\nវាយ /endchat ឬ /cancel ដើម្បីបញ្ចប់។",
+        parse_mode="HTML",
+    ))
+
+
+@legacy_bound_handler
+async def cmd_endchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id  = update.effective_user.id
+    target_id = _close_session(admin_id)
+    context.user_data.pop("chat_state", None)
+    if target_id is None:
+        await safe_send(lambda: update.message.reply_text("ℹ️ អ្នកមិនទាន់ open Chat ណាមួយទេ។"))
+        return
+    await safe_send(lambda: update.message.reply_text(
+        f'✅ បានបញ្ចប់ការជជែកជាមួយអ្នកប្រើប្រាស់ <code>{target_id}</code>។', parse_mode="HTML"
+    ))
+    with suppress(Exception):
+        await context.bot.send_message(chat_id=target_id, text="ℹ️ Admin បានបញ្ចប់ Session Chat ។")
+
+
+__all__ = [
+    'on_start',
+    'on_help',
+    'cmd_myprefs',
+    'cmd_ttsmodel',
+    'cmd_voxcpm2',
+    'cmd_clear',
+    'cmd_security',
+    'cmd_privacy',
+    'cmd_delete_my_data',
+    'broadcast_start',
+    'cmd_schedule',
+    'cmd_schedules',
+    'cmd_cancelschedule',
+    'cmd_cancel',
+    'admin_stats',
+    'cmd_health',
+    'cmd_admin',
+    'cmd_feature_request',
+    'cmd_runtime',
+    'cmd_api',
+    'cmd_botsettings',
+    'cmd_users',
+    'cmd_chat',
+    'cmd_endchat'
+]

@@ -1,334 +1,146 @@
-"""Redis-backed administrator management with confirmation and audit records."""
+"""Single-process administrator management persisted in Supabase bot_settings."""
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import secrets
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
-_ADD_SCRIPT = """
--- bot_voice:admin_add_v1
-local confirmation = redis.call('GET', KEYS[1])
-if not confirmation or confirmation ~= ARGV[1] then
-  return {-2, 0}
-end
-redis.call('DEL', KEYS[1])
-local changed = redis.call('SADD', KEYS[2], ARGV[3])
-redis.call(
-  'XADD', KEYS[3], 'MAXLEN', '~', ARGV[5], '*',
-  'timestamp', ARGV[2],
-  'actor_id', ARGV[4],
-  'action', 'admin_add',
-  'target_id', ARGV[3],
-  'changed', tostring(changed)
-)
-return {1, changed}
-""".strip()
+from app.core.telegram_auth import TelegramAdminAuthorizer, get_telegram_admin_authorizer
+from app.services.settings.store import SettingsStore, get_settings_store
 
-_REMOVE_SCRIPT = """
--- bot_voice:admin_remove_v1
-local confirmation = redis.call('GET', KEYS[1])
-if not confirmation or confirmation ~= ARGV[1] then
-  return {-2, 0}
-end
-redis.call('DEL', KEYS[1])
-if redis.call('SISMEMBER', KEYS[2], ARGV[3]) == 0 then
-  redis.call(
-    'XADD', KEYS[3], 'MAXLEN', '~', ARGV[5], '*',
-    'timestamp', ARGV[2],
-    'actor_id', ARGV[4],
-    'action', 'admin_remove',
-    'target_id', ARGV[3],
-    'changed', '0'
-  )
-  return {1, 0}
-end
-if redis.call('SCARD', KEYS[2]) <= 1 then
-  redis.call(
-    'XADD', KEYS[3], 'MAXLEN', '~', ARGV[5], '*',
-    'timestamp', ARGV[2],
-    'actor_id', ARGV[4],
-    'action', 'admin_remove_denied_final',
-    'target_id', ARGV[3],
-    'changed', '0'
-  )
-  return {-1, 0}
-end
-local changed = redis.call('SREM', KEYS[2], ARGV[3])
-redis.call(
-  'XADD', KEYS[3], 'MAXLEN', '~', ARGV[5], '*',
-  'timestamp', ARGV[2],
-  'actor_id', ARGV[4],
-  'action', 'admin_remove',
-  'target_id', ARGV[3],
-  'changed', tostring(changed)
-)
-return {1, changed}
-""".strip()
+_AUDIT_KEY = "security:admin_audit:v2"
 
 
 class AdminManagementError(RuntimeError):
-    """Base error for administrator management failures."""
+    pass
 
 
 class AdminConfirmationError(AdminManagementError):
-    """Raised when a confirmation token is missing, expired, or mismatched."""
+    pass
 
 
 class LastAdministratorError(AdminManagementError):
-    """Raised when an operation would remove the final administrator."""
+    pass
 
 
-@dataclass(frozen=True, slots=True)
-class AdminMutation:
+@dataclass(frozen=True)
+class AdminMutationResult:
     action: str
-    actor_id: int
     target_id: int
     changed: bool
+    persistent: bool
 
 
-class RedisAdminManager:
-    """Atomically manage the Telegram administrator set and its audit stream."""
+class SupabaseAdminManager:
+    """Admin mutations with short-lived, process-local confirmation tokens."""
+
+    _confirmations: dict[str, tuple[str, int, int, float]] = {}
+    _confirmation_lock = asyncio.Lock()
+    _audit_memory: deque[dict[str, Any]] = deque(maxlen=200)
 
     def __init__(
         self,
-        redis_client: Any,
+        settings_store: SettingsStore | None = None,
+        authorizer: TelegramAdminAuthorizer | None = None,
         *,
-        redis_prefix: str = "tgbot",
-        confirmation_ttl_seconds: int = 300,
-        audit_max_length: int = 10_000,
+        confirmation_ttl_seconds: int = 120,
     ) -> None:
-        prefix = str(redis_prefix or "tgbot").strip().strip(":") or "tgbot"
-        self.redis = redis_client
-        self.admins_key = f"{prefix}:security:admin_user_ids:v1"
-        self.confirmation_prefix = f"{prefix}:security:admin_confirm:v1"
-        self.audit_key = f"{prefix}:security:admin_audit:v1"
-        self.confirmation_ttl_seconds = max(
-            30,
-            min(900, int(confirmation_ttl_seconds)),
-        )
-        self.audit_max_length = max(100, min(100_000, int(audit_max_length)))
-
-    @staticmethod
-    def _user_id(value: Any) -> int:
-        try:
-            user_id = int(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Administrator user ID must be an integer.") from exc
-        if user_id <= 0 or user_id >= 2**63:
-            raise ValueError("Administrator user ID is outside the valid range.")
-        return user_id
-
-    @staticmethod
-    def _decode(value: Any) -> str:
-        if isinstance(value, bytes):
-            return value.decode("utf-8", errors="strict")
-        return str(value)
-
-    def _confirmation_key(self, token: str) -> str:
-        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
-        return f"{self.confirmation_prefix}:{digest}"
-
-    @staticmethod
-    def _confirmation_value(action: str, actor_id: int, target_id: int) -> str:
-        return f"{action}:{actor_id}:{target_id}"
-
-    def _require_redis(self) -> Any:
-        if self.redis is None:
-            raise AdminManagementError(
-                "Redis is required for administrator management."
-            )
-        return self.redis
-
-    def create_confirmation_sync(
-        self,
-        *,
-        action: str,
-        actor_id: int,
-        target_id: int,
-    ) -> tuple[str, int]:
-        action = str(action or "").strip().lower()
-        if action not in {"add", "remove"}:
-            raise ValueError("Administrator action must be add or remove.")
-        actor = self._user_id(actor_id)
-        target = self._user_id(target_id)
-        client = self._require_redis()
-        try:
-            for _attempt in range(3):
-                token = secrets.token_urlsafe(32)
-                stored = client.set(
-                    self._confirmation_key(token),
-                    self._confirmation_value(action, actor, target),
-                    nx=True,
-                    ex=self.confirmation_ttl_seconds,
-                )
-                if stored:
-                    return token, self.confirmation_ttl_seconds
-        except Exception as exc:
-            raise AdminManagementError(
-                "Redis could not create an administrator confirmation."
-            ) from exc
-        raise AdminManagementError("Could not create a unique confirmation token.")
-
-    async def create_confirmation(
-        self,
-        *,
-        action: str,
-        actor_id: int,
-        target_id: int,
-    ) -> tuple[str, int]:
-        return await asyncio.to_thread(
-            self.create_confirmation_sync,
-            action=action,
-            actor_id=actor_id,
-            target_id=target_id,
-        )
-
-    @staticmethod
-    def _mutation_result(raw: Any) -> tuple[int, bool]:
-        values = list(raw or ())
-        if len(values) != 2:
-            raise AdminManagementError(
-                "Redis returned an invalid administrator mutation result."
-            )
-        return int(values[0]), bool(int(values[1]))
-
-    def _mutate_sync(
-        self,
-        *,
-        action: str,
-        actor_id: int,
-        target_id: int,
-        confirmation_token: str,
-    ) -> AdminMutation:
-        actor = self._user_id(actor_id)
-        target = self._user_id(target_id)
-        token = str(confirmation_token or "").strip()
-        if len(token) < 32 or len(token) > 256:
-            raise AdminConfirmationError("Confirmation token is invalid or expired.")
-        expected = self._confirmation_value(action, actor, target)
-        client = self._require_redis()
-        script = _ADD_SCRIPT if action == "add" else _REMOVE_SCRIPT
-        try:
-            raw = client.eval(
-                script,
-                3,
-                self._confirmation_key(token),
-                self.admins_key,
-                self.audit_key,
-                expected,
-                str(time.time_ns()),
-                str(target),
-                str(actor),
-                str(self.audit_max_length),
-            )
-        except Exception as exc:
-            raise AdminManagementError(
-                "Redis could not update the administrator allowlist."
-            ) from exc
-        status, changed = self._mutation_result(raw)
-        if status == -2:
-            raise AdminConfirmationError(
-                "Confirmation token is invalid, expired, or belongs to another action."
-            )
-        if status == -1:
-            raise LastAdministratorError(
-                "The final administrator cannot be removed."
-            )
-        if status != 1:
-            raise AdminManagementError("Administrator mutation failed.")
-        return AdminMutation(action, actor, target, changed)
-
-    async def add(
-        self,
-        *,
-        actor_id: int,
-        target_id: int,
-        confirmation_token: str,
-    ) -> AdminMutation:
-        return await asyncio.to_thread(
-            self._mutate_sync,
-            action="add",
-            actor_id=actor_id,
-            target_id=target_id,
-            confirmation_token=confirmation_token,
-        )
-
-    async def remove(
-        self,
-        *,
-        actor_id: int,
-        target_id: int,
-        confirmation_token: str,
-    ) -> AdminMutation:
-        return await asyncio.to_thread(
-            self._mutate_sync,
-            action="remove",
-            actor_id=actor_id,
-            target_id=target_id,
-            confirmation_token=confirmation_token,
-        )
-
-    def list_ids_sync(self) -> tuple[int, ...]:
-        try:
-            members = self._require_redis().smembers(self.admins_key) or ()
-        except Exception as exc:
-            raise AdminManagementError(
-                "Redis could not load the administrator allowlist."
-            ) from exc
-        ids: set[int] = set()
-        for value in members:
-            try:
-                ids.add(self._user_id(self._decode(value)))
-            except ValueError:
-                continue
-        return tuple(sorted(ids))
+        self.store = settings_store or get_settings_store()
+        self.authorizer = authorizer or get_telegram_admin_authorizer()
+        self.confirmation_ttl_seconds = max(30, min(600, int(confirmation_ttl_seconds)))
 
     async def list_ids(self) -> tuple[int, ...]:
-        return await asyncio.to_thread(self.list_ids_sync)
+        return tuple(sorted(await self.authorizer.load_ids(force=True)))
 
-    def audit_sync(self, *, limit: int = 100) -> list[dict[str, Any]]:
-        safe_limit = max(1, min(500, int(limit)))
-        try:
-            entries = self._require_redis().xrevrange(
-                self.audit_key,
-                max="+",
-                min="-",
-                count=safe_limit,
-            )
-        except Exception as exc:
-            raise AdminManagementError(
-                "Redis could not load the administrator audit trail."
-            ) from exc
-        result: list[dict[str, Any]] = []
-        for entry_id, fields in entries or ():
-            decoded = {
-                self._decode(key): self._decode(value)
-                for key, value in dict(fields).items()
-            }
-            result.append(
-                {
-                    "id": self._decode(entry_id),
-                    "timestamp_ns": int(decoded.get("timestamp") or 0),
-                    "actor_id": int(decoded.get("actor_id") or 0),
-                    "action": decoded.get("action", ""),
-                    "target_id": int(decoded.get("target_id") or 0),
-                    "changed": decoded.get("changed") == "1",
-                }
-            )
-        return result
+    async def create_confirmation(self, *, action: str, actor_id: int, target_id: int) -> tuple[str, int]:
+        action = str(action or "").strip().lower()
+        if action not in {"add", "remove"}:
+            raise AdminConfirmationError("Unsupported administrator action.")
+        actor_id, target_id = int(actor_id), int(target_id)
+        if actor_id <= 0 or target_id <= 0:
+            raise AdminConfirmationError("Administrator IDs must be positive integers.")
+        current = set(await self.authorizer.load_ids(force=True))
+        if actor_id not in current:
+            raise AdminConfirmationError("The requesting administrator is no longer authorized.")
+        if action == "remove" and target_id in current and len(current) <= 1:
+            raise LastAdministratorError("The last administrator cannot be removed.")
+        token = secrets.token_urlsafe(32)
+        expires_at = time.monotonic() + self.confirmation_ttl_seconds
+        async with self._confirmation_lock:
+            self._prune_confirmations_locked()
+            self._confirmations[token] = (action, actor_id, target_id, expires_at)
+        return token, self.confirmation_ttl_seconds
+
+    async def add(self, *, actor_id: int, target_id: int, confirmation_token: str) -> AdminMutationResult:
+        await self._consume_confirmation("add", actor_id, target_id, confirmation_token)
+        current = set(await self.authorizer.load_ids(force=True))
+        changed = int(target_id) not in current
+        current.add(int(target_id))
+        persistent = await self.authorizer.save_ids(current, updated_by=int(actor_id))
+        await self._audit("add", actor_id, target_id, changed, persistent)
+        return AdminMutationResult("add", int(target_id), changed, persistent)
+
+    async def remove(self, *, actor_id: int, target_id: int, confirmation_token: str) -> AdminMutationResult:
+        await self._consume_confirmation("remove", actor_id, target_id, confirmation_token)
+        current = set(await self.authorizer.load_ids(force=True))
+        target_id = int(target_id)
+        if target_id in current and len(current) <= 1:
+            raise LastAdministratorError("The last administrator cannot be removed.")
+        changed = target_id in current
+        current.discard(target_id)
+        if not current:
+            raise LastAdministratorError("The last administrator cannot be removed.")
+        persistent = await self.authorizer.save_ids(current, updated_by=int(actor_id))
+        await self._audit("remove", actor_id, target_id, changed, persistent)
+        return AdminMutationResult("remove", target_id, changed, persistent)
 
     async def audit(self, *, limit: int = 100) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self.audit_sync, limit=limit)
+        payload = await self.store.get_json(_AUDIT_KEY, [])
+        if isinstance(payload, list):
+            return list(payload)[-max(1, min(500, int(limit))):][::-1]
+        return list(self._audit_memory)[-max(1, min(500, int(limit))):][::-1]
+
+    async def _consume_confirmation(self, action: str, actor_id: int, target_id: int, token: str) -> None:
+        token = str(token or "").strip()
+        if not token:
+            raise AdminConfirmationError("Confirmation token is required.")
+        async with self._confirmation_lock:
+            self._prune_confirmations_locked()
+            record = self._confirmations.pop(token, None)
+        expected = (action, int(actor_id), int(target_id))
+        if record is None or record[:3] != expected:
+            raise AdminConfirmationError("Confirmation token is invalid, expired, or already used.")
+
+    def _prune_confirmations_locked(self) -> None:
+        now = time.monotonic()
+        expired = [token for token, record in self._confirmations.items() if record[3] <= now]
+        for token in expired:
+            self._confirmations.pop(token, None)
+
+    async def _audit(self, action: str, actor_id: int, target_id: int, changed: bool, persistent: bool) -> None:
+        entry = {
+            "action": action,
+            "actor_id": int(actor_id),
+            "target_id": int(target_id),
+            "changed": bool(changed),
+            "persistent": bool(persistent),
+            "timestamp": int(time.time()),
+        }
+        self._audit_memory.append(entry)
+        previous = await self.store.get_json(_AUDIT_KEY, [])
+        rows = list(previous) if isinstance(previous, list) else []
+        rows.append(entry)
+        await self.store.set_json(_AUDIT_KEY, rows[-200:], updated_by=int(actor_id))
 
 
 __all__ = [
     "AdminConfirmationError",
     "AdminManagementError",
-    "AdminMutation",
+    "AdminMutationResult",
     "LastAdministratorError",
-    "RedisAdminManager",
+    "SupabaseAdminManager",
 ]

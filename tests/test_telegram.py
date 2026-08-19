@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import os
 import unittest
 import warnings
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -12,11 +11,13 @@ from fastapi import FastAPI
 from app import legacy
 from app.main import app
 from app.services.telegram.deduplication import (
+    WebhookReplayStore,
     _telegram_webhook_replay_key,
     _telegram_webhook_update_claim,
     _telegram_webhook_update_complete,
     _telegram_webhook_update_id,
     _telegram_webhook_update_release,
+    reset_webhook_replay_store,
 )
 from app.services.telegram.flow import (
     callback_requires_tts_access,
@@ -64,106 +65,48 @@ class TelegramWebhookTests(unittest.TestCase):
 
 
 class TelegramDeduplicationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        reset_webhook_replay_store()
+
+    def tearDown(self) -> None:
+        reset_webhook_replay_store()
+
     async def test_memory_claim_release_and_completion_lifecycle(self) -> None:
         update_id = 9_876_543_210
-        with patch.object(legacy, "redis_client", None):
-            with legacy._WEBHOOK_UPDATE_MEMORY_LOCK:
-                legacy._WEBHOOK_UPDATE_MEMORY.pop(update_id, None)
-            try:
-                self.assertEqual("claimed", await _telegram_webhook_update_claim(update_id))
-                self.assertEqual("processing", await _telegram_webhook_update_claim(update_id))
+        self.assertEqual("claimed", await _telegram_webhook_update_claim(update_id))
+        self.assertEqual("processing", await _telegram_webhook_update_claim(update_id))
 
-                await _telegram_webhook_update_release(update_id)
-                self.assertEqual("claimed", await _telegram_webhook_update_claim(update_id))
+        self.assertTrue(await _telegram_webhook_update_release(update_id))
+        self.assertEqual("claimed", await _telegram_webhook_update_claim(update_id))
 
-                await _telegram_webhook_update_complete(update_id)
-                self.assertEqual("completed", await _telegram_webhook_update_claim(update_id))
-            finally:
-                with legacy._WEBHOOK_UPDATE_MEMORY_LOCK:
-                    legacy._WEBHOOK_UPDATE_MEMORY.pop(update_id, None)
+        self.assertTrue(await _telegram_webhook_update_complete(update_id))
+        self.assertEqual("completed", await _telegram_webhook_update_claim(update_id))
 
-    async def test_expired_worker_cannot_modify_reclaimed_redis_lease(self) -> None:
-        class LeaseRedis:
-            def __init__(self) -> None:
-                self.values: dict[str, str] = {}
+    def test_expired_processing_lease_can_be_reclaimed_without_redis(self) -> None:
+        store = WebhookReplayStore()
+        with patch.dict("os.environ", {"WEBHOOK_PROCESSING_TTL_S": "15"}):
+            with patch(
+                "app.services.telegram.deduplication.time.monotonic",
+                side_effect=[100.0, 116.0, 116.0, 116.0],
+            ):
+                first_state, first_token = store.claim(9_876_543_211, include_token=True)
+                second_state, second_token = store.claim(9_876_543_211, include_token=True)
+                self.assertEqual("claimed", first_state)
+                self.assertEqual("claimed", second_state)
+                self.assertNotEqual(first_token, second_token)
+                self.assertFalse(store.release(9_876_543_211, claim_token=first_token))
+                self.assertFalse(store.complete(9_876_543_211, claim_token=first_token))
 
-            def set(
-                self,
-                key: str,
-                value: str,
-                *,
-                ex: int | None = None,
-                nx: bool = False,
-            ) -> bool:
-                del ex
-                if nx and key in self.values:
-                    return False
-                self.values[key] = value
-                return True
-
-            def get(self, key: str) -> str | None:
-                return self.values.get(key)
-
-            def eval(
-                self,
-                script: str,
-                _key_count: int,
-                key: str,
-                expected: str,
-                *args: str,
-            ) -> int:
-                if self.values.get(key) != expected:
-                    return 0
-                if "'done'" in script:
-                    self.values[key] = "done"
-                else:
-                    self.values.pop(key, None)
-                return 1
-
-        redis = LeaseRedis()
-        update_id = 9_876_543_211
-        key = _telegram_webhook_replay_key(update_id)
-        with patch.object(legacy, "redis_client", redis):
-            first_state, first_token = await _telegram_webhook_update_claim(
-                update_id,
-                include_token=True,
-            )
-            self.assertEqual("claimed", first_state)
-            self.assertIsNotNone(first_token)
-
-            # Model expiry of the first worker's processing lease, followed by
-            # a retry being claimed by a different worker.
-            redis.values.pop(key)
-            second_state, second_token = await _telegram_webhook_update_claim(
-                update_id,
-                include_token=True,
-            )
-            self.assertEqual("claimed", second_state)
-            self.assertNotEqual(first_token, second_token)
-            second_lease = redis.values[key]
-
-            self.assertFalse(
-                await _telegram_webhook_update_release(
-                    update_id,
-                    claim_token=first_token,
-                )
-            )
-            self.assertEqual(second_lease, redis.values[key])
-            self.assertFalse(
-                await _telegram_webhook_update_complete(
-                    update_id,
-                    claim_token=first_token,
-                )
-            )
-            self.assertEqual(second_lease, redis.values[key])
-
-            self.assertTrue(
-                await _telegram_webhook_update_complete(
-                    update_id,
-                    claim_token=second_token,
-                )
-            )
-            self.assertEqual("done", redis.values[key])
+    def test_claim_token_prevents_old_owner_from_completing_new_lease(self) -> None:
+        store = WebhookReplayStore()
+        first_state, first_token = store.claim(101, include_token=True)
+        self.assertEqual("claimed", first_state)
+        self.assertTrue(store.release(101, claim_token=first_token))
+        second_state, second_token = store.claim(101, include_token=True)
+        self.assertEqual("claimed", second_state)
+        self.assertNotEqual(first_token, second_token)
+        self.assertFalse(store.complete(101, claim_token=first_token))
+        self.assertTrue(store.complete(101, claim_token=second_token))
 
 
 class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -184,14 +127,6 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
             classify_callback("ttsmodel_auto", speed_callbacks=speeds),
         )
         self.assertEqual(
-            "myprefs",
-            classify_callback("myprefs_open", speed_callbacks=speeds),
-        )
-        self.assertEqual(
-            "myprefs",
-            classify_callback("myprefs_speed:spd_1.0", speed_callbacks=speeds),
-        )
-        self.assertEqual(
             "delete",
             classify_callback("audio_del:42", speed_callbacks=speeds),
         )
@@ -199,329 +134,9 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
             classify_callback("user_broken", speed_callbacks=speeds)
         )
         self.assertTrue(callback_requires_tts_access("speed", "spd_1.0"))
-        self.assertIsNone(
-            classify_callback("voxcpm2:refresh", speed_callbacks=speeds)
+        self.assertFalse(
+            callback_requires_tts_access("voxcpm2", "voxcpm2:refresh")
         )
-
-    def test_welcome_and_preferences_keyboards_expose_requested_links(self) -> None:
-        self.assertNotIn("/myprefs", legacy.WELCOME_TEXT)
-        self.assertNotIn(legacy.CHANNEL_URL, legacy.WELCOME_TEXT)
-        self.assertEqual(
-            legacy.WELCOME_TEXT,
-            legacy.BOT_SETTING_DEFAULTS[legacy.WELCOME_MESSAGE_SETTING_KEY],
-        )
-        self.assertEqual(
-            "",
-            legacy.BOT_SETTING_DEFAULTS[legacy.WELCOME_IMAGE_SETTING_KEY],
-        )
-
-        welcome_buttons = [
-            button
-            for row in legacy.get_welcome_kb().inline_keyboard
-            for button in row
-        ]
-        self.assertIn("myprefs_open", {button.callback_data for button in welcome_buttons})
-        self.assertIn(legacy.CHANNEL_URL, {button.url for button in welcome_buttons})
-        self.assertIn(legacy.SUPPORT_URL, {button.url for button in welcome_buttons})
-
-        prefs_buttons = [
-            button
-            for row in legacy.get_myprefs_kb(
-                {"gender": "female", "speed": 1.0, "tts_model": "auto"}
-            ).inline_keyboard
-            for button in row
-        ]
-        self.assertIn("myprefs_gender:female", {button.callback_data for button in prefs_buttons})
-        self.assertIn("myprefs_speed:spd_1.0", {button.callback_data for button in prefs_buttons})
-        self.assertIn(legacy.SUPPORT_URL, {button.url for button in prefs_buttons})
-
-        admin_callbacks = {
-            button.callback_data
-            for row in legacy.get_admin_dashboard_kb().inline_keyboard
-            for button in row
-            if button.callback_data
-        }
-        self.assertIn("admin_welcome_edit", admin_callbacks)
-
-        welcome_editor_callbacks = {
-            button.callback_data
-            for row in legacy.get_admin_welcome_editor_kb().inline_keyboard
-            for button in row
-            if button.callback_data
-        }
-        self.assertIn("admin_welcome_preview", welcome_editor_callbacks)
-        self.assertIn("admin_welcome_image_remove", welcome_editor_callbacks)
-
-    async def test_myprefs_updates_only_changed_preferences_without_tts(self) -> None:
-        message = SimpleNamespace(text="preferences", edit_text=AsyncMock())
-        query = SimpleNamespace(message=message)
-        prefs = {"gender": "female", "speed": 1.0, "tts_model": "auto"}
-        with (
-            patch.object(legacy, "update_user_speed") as update_speed,
-            patch.object(
-                legacy,
-                "get_user_prefs_async",
-                AsyncMock(return_value=prefs),
-            ),
-            patch.object(legacy, "generate_user_voice_limited") as generate_voice,
-        ):
-            await legacy._cb_myprefs(
-                query,
-                42,
-                SimpleNamespace(),
-                "myprefs_speed:spd_1.5",
-            )
-            await legacy._cb_myprefs(
-                query,
-                42,
-                SimpleNamespace(),
-                "myprefs_speed:spd_1.0",
-            )
-
-        update_speed.assert_called_once_with(42, 1.5)
-        generate_voice.assert_not_called()
-        self.assertEqual(2, message.edit_text.await_count)
-
-    async def test_myprefs_from_welcome_photo_replies_with_text_menu(self) -> None:
-        message = SimpleNamespace(
-            text=None,
-            caption="Welcome",
-            edit_text=AsyncMock(),
-            reply_text=AsyncMock(),
-        )
-        query = SimpleNamespace(message=message)
-        prefs = {"gender": "female", "speed": 1.0, "tts_model": "auto"}
-
-        with patch.object(
-            legacy,
-            "get_user_prefs_async",
-            AsyncMock(return_value=prefs),
-        ):
-            await legacy._cb_myprefs(
-                query,
-                42,
-                SimpleNamespace(),
-                "myprefs_open",
-            )
-
-        message.edit_text.assert_not_awaited()
-        message.reply_text.assert_awaited_once()
-        self.assertIn("ការកំណត់", message.reply_text.await_args.args[0])
-
-    async def test_admin_welcome_preview_stays_within_telegram_limit(self) -> None:
-        message = SimpleNamespace(edit_text=AsyncMock())
-        query = SimpleNamespace(message=message)
-        long_escaped_message = "&" * legacy.WELCOME_MESSAGE_MAX_CHARS
-        with patch.object(
-            legacy,
-            "get_bot_settings_async",
-            AsyncMock(return_value=(
-                {legacy.WELCOME_MESSAGE_SETTING_KEY: long_escaped_message},
-                {"db_ok": True},
-            )),
-        ):
-            await legacy._admin_open_welcome_editor(query, 42)
-        try:
-            rendered = message.edit_text.await_args.args[0]
-            self.assertLessEqual(len(rendered), legacy.TELE_MSG_LIMIT)
-        finally:
-            with legacy.ACTIVE_ADMIN_CONVERSATIONS_LOCK:
-                legacy.ACTIVE_ADMIN_CONVERSATIONS.pop(42, None)
-
-    async def test_admin_welcome_message_input_is_persisted_and_cleared(self) -> None:
-        admin_id = 42
-        message = SimpleNamespace(text="Welcome from admin", reply_text=AsyncMock())
-        update = SimpleNamespace(
-            message=message,
-            effective_user=SimpleNamespace(id=admin_id),
-        )
-        with legacy.ACTIVE_ADMIN_CONVERSATIONS_LOCK:
-            legacy.ACTIVE_ADMIN_CONVERSATIONS[admin_id] = {
-                "state": "awaiting_welcome_message",
-                "current": "Old welcome",
-                "ts": 0.0,
-            }
-        try:
-            with (
-                patch.object(legacy, "_is_admin", return_value=True),
-                patch.object(
-                    legacy,
-                    "db_bot_setting_value_set",
-                    return_value=(True, "saved"),
-                ) as persist,
-            ):
-                handled = await legacy._handle_runtime_admin_text(
-                    update,
-                    SimpleNamespace(user_data={}),
-                )
-
-            self.assertTrue(handled)
-            persist.assert_called_once_with(
-                legacy.WELCOME_MESSAGE_SETTING_KEY,
-                "Welcome from admin",
-                admin_id,
-            )
-            with legacy.ACTIVE_ADMIN_CONVERSATIONS_LOCK:
-                self.assertNotIn(admin_id, legacy.ACTIVE_ADMIN_CONVERSATIONS)
-            message.reply_text.assert_awaited_once()
-        finally:
-            with legacy.ACTIVE_ADMIN_CONVERSATIONS_LOCK:
-                legacy.ACTIVE_ADMIN_CONVERSATIONS.pop(admin_id, None)
-
-    async def test_admin_welcome_photo_and_caption_are_persisted(self) -> None:
-        admin_id = 42
-        message = SimpleNamespace(
-            photo=[SimpleNamespace(file_id="small"), SimpleNamespace(file_id="large-photo-id")],
-            caption="Welcome with an image",
-            reply_text=AsyncMock(),
-        )
-        update = SimpleNamespace(
-            message=message,
-            effective_user=SimpleNamespace(id=admin_id),
-        )
-        with legacy.ACTIVE_ADMIN_CONVERSATIONS_LOCK:
-            legacy.ACTIVE_ADMIN_CONVERSATIONS[admin_id] = {
-                "state": "awaiting_welcome_message",
-                "current": "Old welcome",
-                "current_image": "",
-                "ts": 0.0,
-            }
-        try:
-            with (
-                patch.object(legacy, "_is_admin", return_value=True),
-                patch.object(
-                    legacy,
-                    "db_welcome_content_set",
-                    return_value=(True, "saved"),
-                ) as persist,
-            ):
-                handled = await legacy._handle_runtime_admin_photo(
-                    update,
-                    SimpleNamespace(user_data={}),
-                )
-
-            self.assertTrue(handled)
-            persist.assert_called_once_with(
-                "Welcome with an image",
-                "large-photo-id",
-                admin_id,
-            )
-            with legacy.ACTIVE_ADMIN_CONVERSATIONS_LOCK:
-                self.assertNotIn(admin_id, legacy.ACTIVE_ADMIN_CONVERSATIONS)
-            message.reply_text.assert_awaited_once()
-        finally:
-            with legacy.ACTIVE_ADMIN_CONVERSATIONS_LOCK:
-                legacy.ACTIVE_ADMIN_CONVERSATIONS.pop(admin_id, None)
-
-    async def test_welcome_image_uses_caption_when_text_fits(self) -> None:
-        message = SimpleNamespace(
-            reply_photo=AsyncMock(return_value=SimpleNamespace(message_id=1)),
-            reply_text=AsyncMock(),
-        )
-
-        await legacy._send_welcome_content(message, "Short welcome", "photo-id")
-
-        message.reply_photo.assert_awaited_once()
-        kwargs = message.reply_photo.await_args.kwargs
-        self.assertEqual("photo-id", kwargs["photo"])
-        self.assertEqual("Short welcome", kwargs["caption"])
-        self.assertIsNotNone(kwargs["reply_markup"])
-        message.reply_text.assert_not_awaited()
-
-    async def test_long_welcome_text_is_sent_after_image(self) -> None:
-        message = SimpleNamespace(
-            reply_photo=AsyncMock(return_value=SimpleNamespace(message_id=1)),
-            reply_text=AsyncMock(return_value=SimpleNamespace(message_id=2)),
-        )
-        long_welcome = "x" * (legacy.WELCOME_IMAGE_CAPTION_MAX_CHARS + 1)
-
-        await legacy._send_welcome_content(message, long_welcome, "photo-id")
-
-        message.reply_photo.assert_awaited_once_with(photo="photo-id")
-        message.reply_text.assert_awaited_once()
-        self.assertEqual(long_welcome, message.reply_text.await_args.args[0])
-        self.assertIsNotNone(message.reply_text.await_args.kwargs["reply_markup"])
-
-    async def test_invalid_welcome_image_falls_back_to_text(self) -> None:
-        message = SimpleNamespace(
-            reply_photo=AsyncMock(side_effect=legacy.BadRequest("wrong file identifier")),
-            reply_text=AsyncMock(return_value=SimpleNamespace(message_id=2)),
-        )
-
-        await legacy._send_welcome_content(message, "Fallback welcome", "invalid-photo")
-
-        message.reply_photo.assert_awaited_once()
-        message.reply_text.assert_awaited_once()
-        self.assertEqual("Fallback welcome", message.reply_text.await_args.args[0])
-
-    async def test_queued_tts_is_not_generated_twice_when_progress_edit_fails(self) -> None:
-        user_id = 42
-        message = SimpleNamespace(
-            text="Generate this voice",
-            chat_id=100,
-            message_id=200,
-            reply_text=AsyncMock(),
-        )
-        update = SimpleNamespace(
-            message=message,
-            effective_user=SimpleNamespace(
-                id=user_id,
-                username="tester",
-                first_name="Test",
-            ),
-            update_id=300,
-        )
-        context = SimpleNamespace(bot=SimpleNamespace(), user_data={})
-        progress = SimpleNamespace(
-            message_id=400,
-            update=AsyncMock(side_effect=RuntimeError("Telegram edit failed")),
-        )
-        queued_job = SimpleNamespace(id="queued-job-123456")
-
-        with (
-            patch.object(legacy, "_is_admin", return_value=False),
-            patch.object(
-                legacy,
-                "_handle_feature_request_user_text",
-                AsyncMock(return_value=False),
-            ),
-            patch.object(legacy, "_get_admin_for_user", return_value=None),
-            patch.object(legacy, "_ensure_user_allowed", AsyncMock(return_value=True)),
-            patch.object(legacy, "_check_cooldown", AsyncMock(return_value=False)),
-            patch.object(legacy, "_reserve_tts_request", return_value=True),
-            patch.object(legacy, "_release_tts_request") as release_request,
-            patch.object(legacy, "_set_last_tts") as set_last_tts,
-            patch.object(legacy, "sync_user_data"),
-            patch.object(legacy, "_metric_inc"),
-            patch.object(legacy.TelegramProgress, "start", AsyncMock(return_value=progress)),
-            patch.object(legacy, "_env_bool", return_value=True),
-            patch.object(legacy, "resolve_tts_text", AsyncMock(return_value="Resolved text")),
-            patch.object(
-                legacy,
-                "get_user_prefs_async",
-                AsyncMock(return_value={
-                    "gender": "female",
-                    "speed": 1.0,
-                    "tts_model": "auto",
-                }),
-            ),
-            patch(
-                "app.services.jobs.submission.submit_tts_job",
-                AsyncMock(return_value=(queued_job, True)),
-            ) as submit,
-            patch.object(
-                legacy,
-                "generate_user_voice_limited",
-                AsyncMock(),
-            ) as generate_direct,
-        ):
-            await legacy.on_text(update, context)
-
-        submit.assert_awaited_once()
-        progress.update.assert_awaited_once()
-        set_last_tts.assert_called_once_with(user_id)
-        release_request.assert_called_once_with(user_id)
-        generate_direct.assert_not_awaited()
 
     def test_broadcast_markdown_link_and_preview_directives(self) -> None:
         stored = legacy._broadcast_apply_option_directives(
@@ -582,8 +197,8 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(payload["disable_web_page_preview"])
 
     def test_daily_schedule_time_uses_next_phnom_penh_occurrence(self) -> None:
-        before_eight = datetime(2026, 8, 3, 0, 30, tzinfo=UTC)
-        after_eight = datetime(2026, 8, 3, 2, 0, tzinfo=UTC)
+        before_eight = datetime(2026, 8, 3, 0, 30, tzinfo=timezone.utc)
+        after_eight = datetime(2026, 8, 3, 2, 0, tzinfo=timezone.utc)
 
         first_run, recurrence = legacy._parse_schedule_request(
             "daily 08:00",
@@ -596,8 +211,8 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("daily", recurrence)
         self.assertEqual("daily", next_recurrence)
-        self.assertEqual(datetime(2026, 8, 3, 1, 0, tzinfo=UTC), first_run)
-        self.assertEqual(datetime(2026, 8, 4, 1, 0, tzinfo=UTC), next_day)
+        self.assertEqual(datetime(2026, 8, 3, 1, 0, tzinfo=timezone.utc), first_run)
+        self.assertEqual(datetime(2026, 8, 4, 1, 0, tzinfo=timezone.utc), next_day)
 
     def test_daily_schedule_marker_round_trip_preserves_broadcast_format(self) -> None:
         stored = legacy._sched_apply_recurrence_directive(
@@ -618,7 +233,7 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(link_preview)
 
     async def test_daily_schedule_reschedules_instead_of_finishing(self) -> None:
-        next_run = datetime(2026, 8, 4, 1, 0, tzinfo=UTC)
+        next_run = datetime(2026, 8, 4, 1, 0, tzinfo=timezone.utc)
         bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=1)))
         row = {
             "id": 77,
@@ -657,33 +272,6 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
             "This button is no longer available. Please reopen the menu.",
             show_alert=False,
         )
-
-    async def test_version_command_reports_build_metadata(self) -> None:
-        message = SimpleNamespace(reply_text=AsyncMock())
-        update = SimpleNamespace(message=message, effective_message=message)
-
-        with (
-            patch.dict(
-                os.environ,
-                {
-                    "BOT_BUILD_VERSION": "2026.08.12",
-                    "RELEASE_SHA": "abcdef1234567890fedcba",
-                    "PROCESS_ROLE": "web",
-                },
-                clear=False,
-            ),
-            patch.object(legacy, "_run_state_bot_mode", return_value="WEBHOOK"),
-            patch(
-                "app.services.monitoring.discover_public_url",
-                return_value={"url": "https://bot.example.com"},
-            ),
-        ):
-            await legacy.cmd_version(update, SimpleNamespace())
-
-        rendered = message.reply_text.await_args.args[0]
-        self.assertIn("2026.08.12", rendered)
-        self.assertIn("abcdef123456", rendered)
-        self.assertIn("https://bot.example.com", rendered)
 
     async def test_tts_callback_honors_runtime_access_policy(self) -> None:
         query = SimpleNamespace(
@@ -735,6 +323,23 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(allowed)
         message.reply_text.assert_awaited_once()
+
+    async def test_disabling_tts_clears_pending_voxcpm2_input(self) -> None:
+        context = SimpleNamespace(
+            user_data={"voxcpm2_state": legacy.VOXCPM2_WAIT_CONTROL},
+        )
+        with patch.object(
+            legacy,
+            "_ensure_user_allowed",
+            AsyncMock(return_value=False),
+        ):
+            allowed = await legacy._ensure_voxcpm2_allowed(
+                SimpleNamespace(),
+                context,
+            )
+
+        self.assertFalse(allowed)
+        self.assertNotIn("voxcpm2_state", context.user_data)
 
     async def test_setting_toggle_updates_runtime_cache_immediately(self) -> None:
         old_memory = dict(legacy._bot_settings_memory)
@@ -861,32 +466,18 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(key, context.user_data)
         save.assert_not_awaited()
 
-    async def test_immediate_tasks_accept_back_to_back_requests(self) -> None:
+    async def test_tts_reservation_closes_preparation_race(self) -> None:
         user_id = 9_999_001
         self.assertTrue(legacy._reserve_tts_request(user_id))
         self.assertTrue(legacy._tts_request_reserved(user_id))
-        self.assertTrue(legacy._reserve_tts_request(user_id))
+        self.assertFalse(legacy._reserve_tts_request(user_id))
 
         reply_target = SimpleNamespace(reply_text=AsyncMock())
-        self.assertFalse(await legacy._check_cooldown(reply_target, user_id))
-        reply_target.reply_text.assert_not_awaited()
+        self.assertTrue(await legacy._check_cooldown(reply_target, user_id))
+        reply_target.reply_text.assert_awaited_once()
 
-        legacy._release_tts_request(user_id)
-        self.assertTrue(legacy._tts_request_reserved(user_id))
         legacy._release_tts_request(user_id)
         self.assertFalse(legacy._tts_request_reserved(user_id))
-
-    async def test_immediate_tasks_can_be_disabled_for_legacy_throttling(self) -> None:
-        user_id = 9_999_002
-        reply_target = SimpleNamespace(reply_text=AsyncMock())
-
-        with patch.object(legacy, "BOT_IMMEDIATE_TASKS", False):
-            self.assertTrue(legacy._reserve_tts_request(user_id))
-            self.assertFalse(legacy._reserve_tts_request(user_id))
-            self.assertTrue(await legacy._check_cooldown(reply_target, user_id))
-
-        reply_target.reply_text.assert_awaited_once()
-        legacy._release_tts_request(user_id)
 
     async def test_gender_and_speed_updates_remain_in_local_preferences(self) -> None:
         user_id = 9_999_003
@@ -995,21 +586,22 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
                 legacy.TelegramProgress,
                 "start",
                 AsyncMock(side_effect=RuntimeError("cannot start progress")),
-            ),self.assertRaisesRegex(RuntimeError, "cannot start progress")
+            ),
         ):
-            await legacy._regenerate_tts_voice_with_progress(
-                query=query,
-                context=context,
-                user_id=user_id,
-                original_text="hello",
-                gender="female",
-                speed=1.0,
-                tts_model="auto",
-                title="title",
-                final_text="done",
-                error_text="failed",
-                delete_source=False,
-            )
+            with self.assertRaisesRegex(RuntimeError, "cannot start progress"):
+                await legacy._regenerate_tts_voice_with_progress(
+                    query=query,
+                    context=context,
+                    user_id=user_id,
+                    original_text="hello",
+                    gender="female",
+                    speed=1.0,
+                    tts_model="auto",
+                    title="title",
+                    final_text="done",
+                    error_text="failed",
+                    delete_source=False,
+                )
 
         self.assertFalse(legacy._tts_request_reserved(user_id))
 

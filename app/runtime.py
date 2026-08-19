@@ -1,4 +1,9 @@
-"""Single idempotent startup/shutdown boundary for web and worker roles."""
+"""Single-process application runtime.
+
+The dedicated Redis queue/worker topology has been removed.  FastAPI, Telegram,
+admin controls and provider execution now share one process; small control-plane
+state is persisted through the Supabase-backed settings store.
+"""
 
 from __future__ import annotations
 
@@ -13,79 +18,43 @@ from fastapi import FastAPI
 
 from app import legacy as _legacy
 from app.core.cors import configure_dynamic_cors_store, get_dynamic_cors_store
-from app.core.resources import resource_default, resource_value
-from app.core.security import get_runtime_secret_manager
 from app.core.telegram_auth import configure_telegram_admin_authorizer
 from app.services.ai.providers import get_provider_manager
-from app.services.artifacts.storage import (
-    ArtifactService,
-    configure_artifact_service,
-    reset_artifact_service,
+from app.services.telegram.deduplication import get_webhook_replay_snapshot
+from app.services.telegram.workloads import get_telegram_workload_limiter
+from app.services.settings.store import (
+    SettingsStore,
+    configure_settings_store,
+    reset_settings_store,
 )
-from app.services.build_info import get_build_info
-from app.services.jobs.handlers import BotJobHandlers, build_bot_job_handlers
-from app.services.jobs.runtime import (
-    configure_job_queue,
-    job_worker_snapshot,
-    start_job_workers,
-    stop_job_workers,
-)
-from app.services.telegram.delivery import (
-    IdempotentTelegramDelivery,
-    configure_telegram_delivery,
-)
-from app.utils.env import bounded_env_int
 
 logger = logging.getLogger(__name__)
-RuntimeRole = Literal["web", "worker", "combined"]
+RuntimeRole = Literal["web", "combined"]
 
 
 def _clean_role(value: str) -> RuntimeRole:
     role = str(value or "combined").strip().lower()
-    if role not in {"web", "worker", "combined"}:
-        raise ValueError("Runtime role must be web, worker, or combined.")
+    if role == "worker":
+        raise ValueError(
+            "PROCESS_ROLE=worker is no longer supported. Remove the worker service "
+            "and run app.main as a single web/Telegram process."
+        )
+    if role not in {"web", "combined"}:
+        raise ValueError("Runtime role must be web or combined.")
     return role  # type: ignore[return-value]
 
 
-def _role_has_workers(role: RuntimeRole) -> bool:
-    return role in {"worker", "combined"}
-
-
-def _role_has_web(role: RuntimeRole) -> bool:
-    return role in {"web", "combined"}
-
-
-def redis_runtime_enabled() -> bool:
-    """Return whether this deployment should connect to Redis."""
-
-    disabled = str(os.getenv("DISABLE_REDIS", "") or "").strip().lower()
-    if disabled in {"1", "true", "yes", "on"}:
-        return False
-    configured = os.getenv("REDIS_ENABLED")
-    if configured is None:
-        return bool(str(os.getenv("REDIS_URL", "") or "").strip())
-    enabled = str(configured).strip().lower()
-    return enabled not in {"0", "false", "no", "off"}
-
-
 class RuntimeContext:
-    """Own external clients, queues, artifacts, delivery, and workers once."""
+    """Own startup/shutdown of the single-process runtime exactly once."""
 
     def __init__(self, legacy: Any = _legacy) -> None:
         self.legacy = legacy
         self.settings: Any | None = None
-        self.redis_enabled = True
-        self.redis: Any | None = None
         self.supabase: Any | None = None
         self.security: dict[str, Any] = {}
+        self.settings_store: SettingsStore | None = None
         self.cors_store: Any | None = None
         self.admin_authorizer: Any | None = None
-        self.job_queue: Any | None = None
-        self.artifacts: ArtifactService | None = None
-        self.delivery: IdempotentTelegramDelivery | None = None
-        self.job_handlers: BotJobHandlers | None = None
-        self.artifact_cleanup_task: asyncio.Task[None] | None = None
-        self.artifact_cleanup_stop: asyncio.Event | None = None
         self.role: RuntimeRole | None = None
         self.started = False
         self.started_at = 0.0
@@ -100,29 +69,15 @@ class RuntimeContext:
         role: str | None = None,
     ) -> None:
         clean_owner = str(owner or "runtime").strip()[:64] or "runtime"
-        requested_role = _clean_role(
-            role or os.getenv("PROCESS_ROLE", "combined") or "combined"
-        )
+        requested_role = _clean_role(role or os.getenv("PROCESS_ROLE", "combined"))
         async with self._lock:
+            if clean_owner in self._owners:
+                return
             if self.started:
-                previous_role = self._owners.get(clean_owner)
                 self._owners[clean_owner] = requested_role
-                try:
-                    if _role_has_workers(requested_role):
-                        await self._ensure_workers()
-                    if _role_has_web(requested_role) and application is not None:
-                        await self._ensure_web_services(application)
-                except BaseException:
-                    # Register ownership only after this owner's required
-                    # services are ready. A failed upgrade must remain
-                    # retryable and must not change the effective role.
-                    if previous_role is None:
-                        self._owners.pop(clean_owner, None)
-                    else:
-                        self._owners[clean_owner] = previous_role
-                    self.role = self._effective_role()
-                    raise
                 self.role = self._effective_role()
+                if application is not None:
+                    await self._ensure_web_services(application)
                 return
 
             try:
@@ -130,125 +85,64 @@ class RuntimeContext:
                 self.legacy._refresh_arch_runtime_settings()
                 self.legacy._init_clients()
                 await self.legacy._init_async_clients()
-                try:
-                    await self.legacy._restore_run_state_from_redis()
-                except Exception as exc:  # noqa: BLE001 - optional persisted state
-                    self.legacy.webhook_logger.warning(
-                        "Runtime state restore failed during startup: %s",
-                        exc,
-                    )
 
-                self.legacy._ensure_startup_telegram_mode()
-
-                security_status = await self.legacy._bootstrap_runtime_security()
-                secret_manager = get_runtime_secret_manager()
-                self.redis_enabled = redis_runtime_enabled()
-                if requested_role == "worker" and not self.redis_enabled:
-                    raise RuntimeError(
-                        "A standalone worker requires Redis; use PROCESS_ROLE=combined "
-                        "for process-local Redis-disabled mode."
-                    )
-                # Prefer the async client for the modern runtime components.
-                redis_client = getattr(self.legacy, "redis_client_async", None) or self.legacy.redis_client or secret_manager.redis_client
-                if self.redis_enabled and redis_client is None:
-                    raise RuntimeError("Redis is required for the durable runtime.")
-                redis_prefix = str(
-                    getattr(self.legacy, "REDIS_CACHE_PREFIX", "") or "tgbot"
-                )
+                # Redis is intentionally disabled even when an old deployment
+                # still has REDIS_URL configured. Existing cache helpers degrade
+                # to memory/Supabase paths in legacy.py.
+                redis_client = getattr(self.legacy, "redis_client", None)
+                if redis_client is not None:
+                    close = getattr(redis_client, "close", None)
+                    if callable(close):
+                        with suppress(Exception):
+                            close()
+                    self.legacy.redis_client = None
+                    logger.warning("REDIS_URL is ignored by the single-process runtime.")
 
                 self.settings = self.legacy.SETTINGS
-                self.redis = redis_client
                 self.supabase = self.legacy.supabase
-                self.security = dict(security_status or {})
-                self.job_queue = configure_job_queue(
-                    redis_client,
-                    redis_prefix=redis_prefix,
-                    max_queued_jobs=bounded_env_int(
-                        "BOT_JOB_QUEUE_MAX",
-                        1_000,
-                        minimum=1,
-                        maximum=1_000_000,
-                    ),
-                    memory_fallback=not self.redis_enabled,
-                )
-                if self.job_queue is None:
-                    raise RuntimeError("Could not configure the durable job queue.")
-                self.artifacts = configure_artifact_service(
-                    supabase_client=self.supabase,
-                    redis_client=self.redis,
-                    redis_prefix=redis_prefix,
-                    role=requested_role,
-                )
-                self.delivery = configure_telegram_delivery(
-                    redis_client,
-                    redis_prefix=redis_prefix,
-                    memory_fallback=not self.redis_enabled,
-                )
-                if self.delivery is None:
-                    raise RuntimeError("Could not configure Telegram delivery.")
+                self.settings_store = configure_settings_store(self.supabase)
+
+                # Compatibility name now restores from Supabase bot_settings.
+                with suppress(Exception):
+                    await self.legacy._restore_run_state()
+                self.security = dict(await self.legacy._bootstrap_runtime_security() or {})
 
                 self.started_at = time.time()
                 self.started = True
                 self._owners[clean_owner] = requested_role
                 self.role = requested_role
 
-                if _role_has_web(requested_role) and application is not None:
+                if application is not None:
                     await self._ensure_web_services(application)
-                if _role_has_workers(requested_role):
-                    await self._ensure_workers()
 
                 logger.info(
-                    "Runtime started owner=%s role=%s workers=%s artifact_backend=%s",
+                    "Single-process runtime started owner=%s role=%s settings_backend=%s",
                     clean_owner,
                     requested_role,
-                    job_worker_snapshot().get("count"),
-                    self.artifacts.backend,
+                    self.settings_store.status.backend,
                 )
-                if not self.redis_enabled:
-                    logger.warning(
-                        "Redis is disabled; jobs, delivery leases, secrets, and caches "
-                        "are process-local and are lost on restart."
-                    )
             except BaseException:
                 await self._stop_unlocked()
                 raise
 
     def _effective_role(self) -> RuntimeRole:
-        roles = set(self._owners.values())
-        if "combined" in roles or {"web", "worker"}.issubset(roles):
-            return "combined"
-        if "worker" in roles:
-            return "worker"
-        return "web"
+        return "combined" if "combined" in self._owners.values() else "web"
 
     async def _ensure_web_services(self, application: FastAPI) -> None:
-        if self.redis_enabled and self.redis is None:
-            raise RuntimeError("Runtime Redis is unavailable.")
+        if self.settings_store is None:
+            raise RuntimeError("Runtime settings store is unavailable.")
         if self.cors_store is None:
-            redis_url = str(
-                getattr(self.legacy, "REDIS_URL", "")
-                or getattr(self.legacy.SETTINGS, "REDIS_URL", "")
-                or ""
-            )
-            # CORS uses synchronous transactions in worker threads. Prefer the
-            # sync client so an asyncio Redis pool is not moved across loops.
-            cors_redis_client = (
-                getattr(self.legacy, "redis_client", None) or self.redis
-            )
             self.cors_store = configure_dynamic_cors_store(
-                redis_client=cors_redis_client,
-                redis_url=redis_url if self.redis_enabled else "",
-                supabase_client=self.supabase,
-                disable_redis=not self.redis_enabled,
+                settings_store=self.settings_store,
             )
             cors_snapshot = await self.cors_store.load(force=True)
             self.admin_authorizer = configure_telegram_admin_authorizer(
-                redis_client=self.redis,
+                settings_store=self.settings_store,
                 fallback_admin_ids=getattr(self.legacy, "ADMIN_IDS", set()),
             )
-            redis_admin_ids = await self.admin_authorizer.load_ids(force=True)
-            if redis_admin_ids:
-                self.legacy.ADMIN_IDS.update(redis_admin_ids)
+            admin_ids = await self.admin_authorizer.load_ids(force=True)
+            if admin_ids:
+                self.legacy.ADMIN_IDS.update(admin_ids)
             bootstrap_admin = getattr(self.legacy, "_runtime_admin_bootstrap_state", None)
             if callable(bootstrap_admin):
                 bootstrap_admin()
@@ -256,82 +150,8 @@ class RuntimeContext:
 
         application.state.runtime = self
         application.state.runtime_security = self.security
-        application.state.job_queue = self.job_queue
         application.state.provider_scope = get_provider_manager().metadata()
-        application.state.artifact_storage = {
-            "backend": self.artifacts.backend if self.artifacts else "unconfigured",
-            "shared": self.artifacts.shared if self.artifacts else False,
-        }
-
-    async def _ensure_workers(self) -> None:
-        if self.job_handlers is not None and job_worker_snapshot().get("count", 0):
-            self._ensure_artifact_cleanup()
-            return
-        if self.artifacts is None or self.delivery is None:
-            raise RuntimeError("Worker dependencies are not configured.")
-        handlers = build_bot_job_handlers(
-            self.legacy,
-            artifacts=self.artifacts,
-            delivery=self.delivery,
-        )
-        self.job_handlers = handlers
-        await start_job_workers(
-            handlers.mapping(),
-            worker_count=int(
-                resource_value(
-                    "BOT_JOB_WORKERS",
-                    bounded_env_int(
-                        "BOT_JOB_WORKERS",
-                        int(resource_default("BOT_JOB_WORKERS", 2)),
-                        minimum=1,
-                        maximum=32,
-                    ),
-                )
-            ),
-        )
-        self._ensure_artifact_cleanup()
-
-    def _ensure_artifact_cleanup(self) -> None:
-        if self.artifact_cleanup_task is not None and not self.artifact_cleanup_task.done():
-            return
-        self.artifact_cleanup_stop = asyncio.Event()
-        self.artifact_cleanup_task = asyncio.create_task(
-            self._artifact_cleanup_loop(self.artifact_cleanup_stop),
-            name="artifact-expiration-cleanup",
-        )
-
-    async def _artifact_cleanup_loop(self, stop_event: asyncio.Event) -> None:
-        try:
-            interval = float(
-                os.getenv(
-                    "BOT_ARTIFACT_CLEANUP_SECONDS",
-                    str(resource_default("BOT_ARTIFACT_CLEANUP_SECONDS", 300)),
-                )
-                or 300
-            )
-        except ValueError:
-            interval = 300.0
-        interval = max(30.0, min(86_400.0, interval))
-        while not stop_event.is_set():
-            artifacts = self.artifacts
-            if artifacts is not None:
-                try:
-                    cleanup_limit = int(
-                        os.getenv(
-                            "BOT_ARTIFACT_CLEANUP_LIMIT",
-                            str(resource_default("BOT_ARTIFACT_CLEANUP_LIMIT", 500)),
-                        )
-                        or 500
-                    )
-                    result = await artifacts.cleanup_expired(
-                        limit=max(10, min(5_000, cleanup_limit))
-                    )
-                    if result["deleted"] or result["errors"]:
-                        logger.info("Artifact cleanup result=%s", result)
-                except Exception:
-                    logger.warning("Artifact cleanup iteration failed.", exc_info=True)
-            with suppress(TimeoutError):
-                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        application.state.settings_store = self.settings_store.status.as_dict()
 
     async def stop(self, *, owner: str) -> None:
         clean_owner = str(owner or "runtime").strip()[:64] or "runtime"
@@ -343,85 +163,44 @@ class RuntimeContext:
             await self._stop_unlocked()
 
     async def _stop_unlocked(self) -> None:
-        if self.artifact_cleanup_stop is not None:
-            self.artifact_cleanup_stop.set()
-        cleanup_task, self.artifact_cleanup_task = self.artifact_cleanup_task, None
-        self.artifact_cleanup_stop = None
-        if cleanup_task is not None:
-            cleanup_task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await cleanup_task
-        await stop_job_workers()
-        handlers, self.job_handlers = self.job_handlers, None
-        if handlers is not None:
-            await handlers.close()
-        configure_job_queue(None)
-        configure_telegram_delivery(None)
-        reset_artifact_service()
-
         if self.cors_store is not None:
             with suppress(Exception):
                 self.cors_store.close()
         else:
             with suppress(Exception):
                 get_dynamic_cors_store().close()
-        with suppress(Exception):
-            get_runtime_secret_manager().close()
-
-        redis_client = self.redis
-        if redis_client is not None:
-            close = getattr(redis_client, "close", None)
-            if callable(close):
-                with suppress(Exception):
-                    result = close()
-                    if asyncio.iscoroutine(result):
-                        await result
-
+        reset_settings_store()
         self.settings = None
-        self.redis_enabled = True
-        self.redis = None
         self.supabase = None
         self.security = {}
+        self.settings_store = None
         self.cors_store = None
         self.admin_authorizer = None
-        self.job_queue = None
-        self.artifacts = None
-        self.delivery = None
         self.role = None
         self.started = False
         self.started_at = 0.0
         self._owners.clear()
 
     def snapshot(self) -> dict[str, Any]:
-        workers = job_worker_snapshot()
-        expects_workers = bool(self.role and _role_has_workers(self.role))
+        store_status = (
+            self.settings_store.status.as_dict()
+            if self.settings_store is not None
+            else {"backend": "unconfigured", "persistent": False, "configured": False}
+        )
         return {
             "started": self.started,
             "started_at": self.started_at or None,
             "role": self.role,
             "owners": sorted(self._owners),
-            "redis": self.redis is not None,
-            "redis_enabled": self.redis_enabled,
             "supabase": self.supabase is not None,
             "security": bool(self.security),
-            "job_queue": self.job_queue is not None,
-            "job_queue_backend": getattr(
-                self.job_queue,
-                "backend",
-                "unconfigured",
-            ),
-            "job_queue_durable": bool(
-                getattr(self.job_queue, "durable", False)
-            ),
-            "artifacts": {
-                "configured": self.artifacts is not None,
-                **(self.artifacts.snapshot() if self.artifacts else {}),
-            },
-            "delivery": self.delivery is not None,
-            "expects_workers": expects_workers,
-            "workers": workers,
+            "settings_store": store_status,
+            "architecture": "single_process",
+            "worker_removed": True,
+            "redis_removed": True,
             "providers": get_provider_manager().metadata(),
-            "build": get_build_info(role=self.role, started_at=self.started_at),
+            "telegram_workloads": get_telegram_workload_limiter().snapshot(),
+            "webhook_replay": get_webhook_replay_snapshot(),
         }
 
 
@@ -432,9 +211,4 @@ def get_runtime_context() -> RuntimeContext:
     return _RUNTIME
 
 
-__all__ = [
-    "RuntimeContext",
-    "RuntimeRole",
-    "get_runtime_context",
-    "redis_runtime_enabled",
-]
+__all__ = ["RuntimeContext", "get_runtime_context"]

@@ -10,7 +10,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from app._legacy_bridge import legacy_module
 from app.api.dependencies import (
     AdminPrincipal,
-    get_redis,
     require_admin,
     require_admin_write,
 )
@@ -18,7 +17,7 @@ from app.core.admin_management import (
     AdminConfirmationError,
     AdminManagementError,
     LastAdministratorError,
-    RedisAdminManager,
+    SupabaseAdminManager,
 )
 from app.core.telegram_auth import get_telegram_admin_authorizer
 
@@ -39,14 +38,8 @@ class AdminMutationPayload(BaseModel):
     confirmation_token: str = Field(min_length=32, max_length=256)
 
 
-def _manager() -> RedisAdminManager:
-    redis_client = get_redis()
-    if redis_client is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Redis is required for administrator management.",
-        )
-    return RedisAdminManager(redis_client)
+def _manager() -> SupabaseAdminManager:
+    return SupabaseAdminManager()
 
 
 def _translate_error(exc: AdminManagementError) -> HTTPException:
@@ -121,6 +114,7 @@ async def add_administrator(
         "action": result.action,
         "user_id": result.target_id,
         "changed": result.changed,
+        "persistent": result.persistent,
     }
 
 
@@ -145,6 +139,7 @@ async def remove_administrator(
         "action": result.action,
         "user_id": result.target_id,
         "changed": result.changed,
+        "persistent": result.persistent,
     }
 
 
