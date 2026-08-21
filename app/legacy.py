@@ -16559,11 +16559,11 @@ class TelegramProgress:
             f"⏳ {self.title}",
             "",
             f"{_progress_bar(self.percent)}  {self.percent}%",
-            f"📌 {self.stage}",
+            f" {self.stage}",
         ]
         if self.detail:
             parts.append(f"ℹ️ {self.detail}")
-        parts.append(f"⏱ {_progress_elapsed_text(self.started_at)}")
+        parts.append(f"⏱️ {_progress_elapsed_text(self.started_at)}")
         return "\n".join(parts)
 
     async def _edit_or_send(
