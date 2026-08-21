@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from types import SimpleNamespace
 
 from app.core.admin_management import (
     AdminConfirmationError,
@@ -11,6 +12,53 @@ from app.core.admin_management import (
 from app.core.telegram_auth import TelegramAdminAuthorizer
 from app.services.ai.providers import NoProviderAvailable, ProviderManager
 from app.services.settings.store import SettingsStore
+
+
+class SettingsStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_batch_read_uses_one_supabase_request(self) -> None:
+        class Query:
+            def __init__(self) -> None:
+                self.execute_calls = 0
+                self.keys: list[str] = []
+
+            def select(self, _columns: str):
+                return self
+
+            def in_(self, _column: str, keys: list[str]):
+                self.keys = keys
+                return self
+
+            def execute(self):
+                self.execute_calls += 1
+                return SimpleNamespace(
+                    data=[
+                        {"key": "runtime:one", "value": "1"},
+                        {"key": "runtime:two", "value": "2"},
+                    ]
+                )
+
+        query = Query()
+        client = SimpleNamespace(table=lambda _name: query)
+        store = SettingsStore(client)
+
+        values = await store.get_many_text(
+            ["runtime:one", "runtime:two", "runtime:missing"],
+            "fallback",
+        )
+
+        self.assertEqual(1, query.execute_calls)
+        self.assertEqual(
+            ["runtime:one", "runtime:two", "runtime:missing"],
+            query.keys,
+        )
+        self.assertEqual(
+            {
+                "runtime:one": "1",
+                "runtime:two": "2",
+                "runtime:missing": "fallback",
+            },
+            values,
+        )
 
 
 class AdminManagementTests(unittest.IsolatedAsyncioTestCase):

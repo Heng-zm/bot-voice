@@ -8,6 +8,7 @@ from __future__ import annotations
 # Transitional V4.1 modules bind remaining legacy helpers at runtime.
 # ruff: noqa: F821
 from app.services.telegram._legacy_runtime import legacy_bound_handler
+from app.services.telegram.security import is_user_blocked
 
 
 @legacy_bound_handler
@@ -73,10 +74,10 @@ async def _telegram_user_security_guard(update: Any, context: Any) -> None:
         # Privacy/self-service commands stay available even if the user is blocked.
         return
 
-    # Blocked-user guard.  db_user_is_blocked() has memory cache; executor keeps
-    # the event loop safe if Supabase fallback is needed.
+    # Cache hits stay on the event loop; only a Supabase miss enters the bounded
+    # database executor.
     try:
-        blocked = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_is_blocked(user_id))
+        blocked = await is_user_blocked(user_id)
     except Exception as exc:
         blocked = False
         _log_once(logging.WARNING, f"blocked_guard_failed:{user_id}", "Blocked-user guard skipped user=%s: %s", user_id, exc)

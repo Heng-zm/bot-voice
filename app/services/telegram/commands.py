@@ -8,6 +8,7 @@ from __future__ import annotations
 # Transitional V4.1 modules bind remaining legacy helpers at runtime.
 # ruff: noqa: F821
 from app.services.telegram._legacy_runtime import legacy_bound_handler
+from app.services.telegram.security import is_user_blocked
 
 
 @legacy_bound_handler
@@ -82,7 +83,7 @@ async def cmd_security(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not update.effective_message:
         return
-    blocked = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_is_blocked(int(user.id)))
+    blocked = await is_user_blocked(int(user.id))
     status = "blocked" if blocked else "active"
     await safe_send(lambda: update.effective_message.reply_text(
         f'🔐 <b>សុវត្ថិភាព និងឯកជនភាព</b>\n\nលេខសម្គាល់អ្នកប្រើប្រាស់៖ <code>{int(user.id)}</code>\nស្ថានភាព៖ <b>{html.escape(status)}</b>\n\n✅ ពាក្យបញ្ជារបស់អ្នកគ្រប់គ្រងត្រូវបានការពារ។\n✅ ការការពារ Spam និងការផ្ញើសារច្រើនពេកត្រូវបានបើក។\n✅ តាមលំនាំដើម សោ API ត្រូវទទួលពី Header មិនមែនពី URL Query String ទេ។\n✅ ប្រើ /clear ដើម្បីសម្អាតបរិបទការជជែក។\n🗑️ ប្រើ /deleteme ដើម្បីលុបប្រវត្តិបូត និងចំណូលចិត្តដែលបានរក្សាទុក។',
@@ -143,7 +144,7 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_id = update.effective_user.id
     loop     = asyncio.get_running_loop()
-    rows     = await loop.run_in_executor(None, db_sched_fetch_admin_pending, admin_id)
+    rows     = await loop.run_in_executor(_DB_EXECUTOR, db_sched_fetch_admin_pending, admin_id)
     if not rows:
         await safe_send(lambda: update.message.reply_text('📭 មិនមានការផ្សាយតាមកាលវិភាគទេ។'))
         return
@@ -166,7 +167,7 @@ async def cmd_cancelschedule(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     row_id = int(args[0])
     loop   = asyncio.get_running_loop()
-    row    = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
+    row    = await loop.run_in_executor(_DB_EXECUTOR, db_sched_fetch_one, row_id)
     if not row:
         await safe_send(lambda: update.message.reply_text(f"❌ រកមិនឃើញ Schedule #{row_id}។"))
         return
@@ -180,7 +181,7 @@ async def cmd_cancelschedule(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode="HTML",
         ))
         return
-    await loop.run_in_executor(None, db_sched_set_status, row_id, "cancelled")
+    await loop.run_in_executor(_DB_EXECUTOR, db_sched_set_status, row_id, "cancelled")
     await safe_send(lambda: update.message.reply_text(
         f'✅ កាលវិភាគ <b>#{row_id}</b> បានបោះបង់។', parse_mode="HTML"
     ))
@@ -568,7 +569,7 @@ async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ))
         return
     target_id = int(args[0])
-    exists    = await asyncio.get_running_loop().run_in_executor(None, user_exists_in_db, target_id)
+    exists    = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, user_exists_in_db, target_id)
     if not exists:
         await safe_send(lambda: update.message.reply_text(
             f'❌ អ្នកប្រើប្រាស់ <code>{target_id}</code> មិនមាននៅក្នុងមូលដ្ឋានទិន្នន័យទេ។', parse_mode="HTML"

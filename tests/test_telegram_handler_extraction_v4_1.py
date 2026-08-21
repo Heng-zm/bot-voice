@@ -114,3 +114,9 @@ def test_heavy_media_handlers_use_native_workload_admission() -> None:
     assert '"transcribe"' in source
     assert '"audio"' in source
     assert "busy_rejected" in source
+
+
+def test_telegram_database_calls_use_the_bounded_executor() -> None:
+    for filename in ("commands.py", "callbacks.py", "guards.py"):
+        source = (TELEGRAM_DIR / filename).read_text(encoding="utf-8")
+        assert "run_in_executor(None" not in source

@@ -9261,9 +9261,11 @@ async def _restore_run_state() -> bool:
         webhook_logger.warning("Runtime settings store unavailable: %s", exc)
         return False
 
+    setting_keys = tuple(f"runtime:{key}" for key in _RUN_STATE_PERSISTED_KEYS)
+    raw_values = await store.get_many_text(setting_keys, "")
     restored: dict[str, Any] = {}
     for key in _RUN_STATE_PERSISTED_KEYS:
-        raw = await store.get_text(f"runtime:{key}", "")
+        raw = raw_values.get(f"runtime:{key}", "")
         if raw == "":
             continue
         try:
@@ -14002,7 +14004,9 @@ async def _ensure_user_allowed(update: Update, context: ContextTypes.DEFAULT_TYP
         return True
 
     if not is_admin:
-        blocked = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_is_blocked(user.id))
+        from app.services.telegram.security import is_user_blocked
+
+        blocked = await is_user_blocked(user.id)
         if blocked:
             _metric_inc("blocked_hits")
             await safe_send(lambda: msg.reply_text("⛔ អ្នកត្រូវបាន Block មិនអាចប្រើ Bot នេះបានទេ។"))

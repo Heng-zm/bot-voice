@@ -19,6 +19,8 @@ the dedicated worker service are no longer part of the runtime.
 - Admin-editable `/start` welcome text and image with Support, Channel, and User Profile actions
 - Process-local webhook replay protection with ownership-aware leases
 - Bounded OCR, transcription, and audio workload admission
+- Batched runtime-setting startup reads and cache-first blocked-user checks
+- Dedicated bounded database execution for Telegram admin and schedule actions
 - English and Khmer administration interface
 - Polling startup that preserves queued Telegram updates by default
 

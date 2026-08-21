@@ -415,7 +415,7 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
             return
 
-        ok, reason, row = await loop.run_in_executor(None, db_sched_confirm, row_id, user_id)
+        ok, reason, row = await loop.run_in_executor(_DB_EXECUTOR, db_sched_confirm, row_id, user_id)
         if not ok:
             if reason == "not_found":
                 text = "❌ រកមិនឃើញ Schedule ។"
@@ -450,7 +450,7 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if row_id is None:
             await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
             return
-        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
+        row = await loop.run_in_executor(_DB_EXECUTOR, db_sched_fetch_one, row_id)
         if not row:
             await safe_send(lambda: query.message.reply_text('❌ រកកាលវិភាគមិនឃើញ។'))
             return
@@ -458,7 +458,7 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_send(lambda: query.message.reply_text("⛔ Schedule នេះមិនមែនជារបស់អ្នកទេ។"))
             return
         if str(row.get("status")) in (SCHED_STATUS_DRAFT, SCHED_STATUS_PENDING):
-            await loop.run_in_executor(None, db_sched_set_status, row_id, SCHED_STATUS_CANCELLED)
+            await loop.run_in_executor(_DB_EXECUTOR, db_sched_set_status, row_id, SCHED_STATUS_CANCELLED)
         with suppress(Exception):
             await query.message.edit_reply_markup(reply_markup=None)
         await safe_send(lambda: query.message.reply_text(
@@ -478,7 +478,7 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = _callback_int_arg(data, "sched_page:")
         if page is None:
             return
-        rows = await loop.run_in_executor(None, db_sched_fetch_admin_pending, user_id)
+        rows = await loop.run_in_executor(_DB_EXECUTOR, db_sched_fetch_admin_pending, user_id)
         with suppress(Exception):
             await query.message.edit_reply_markup(reply_markup=get_schedules_list_kb(rows, page=page))
         return
@@ -488,7 +488,7 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if row_id is None:
             await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
             return
-        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
+        row = await loop.run_in_executor(_DB_EXECUTOR, db_sched_fetch_one, row_id)
         if not row:
             await safe_send(lambda: query.message.reply_text('❌ រកកាលវិភាគមិនឃើញ។'))
             return
@@ -507,7 +507,7 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if row_id is None:
             await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
             return
-        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
+        row = await loop.run_in_executor(_DB_EXECUTOR, db_sched_fetch_one, row_id)
         ok, reason = _sched_can_edit(row, user_id)
         if not ok:
             await safe_send(lambda: query.message.reply_text(_sched_edit_error_text(row_id, reason), parse_mode="HTML"))
@@ -525,7 +525,7 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if row_id is None:
             await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
             return
-        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
+        row = await loop.run_in_executor(_DB_EXECUTOR, db_sched_fetch_one, row_id)
         ok, reason = _sched_can_edit(row, user_id)
         if not ok:
             await safe_send(lambda: query.message.reply_text(_sched_edit_error_text(row_id, reason), parse_mode="HTML"))
@@ -545,7 +545,7 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if row_id is None:
             await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
             return
-        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
+        row = await loop.run_in_executor(_DB_EXECUTOR, db_sched_fetch_one, row_id)
         ok, reason = _sched_can_edit(row, user_id)
         if not ok:
             await safe_send(lambda: query.message.reply_text(_sched_edit_error_text(row_id, reason), parse_mode="HTML"))
@@ -563,7 +563,7 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if row_id is None:
             await safe_send(lambda: query.message.reply_text('❌ លេខសម្គាល់កាលវិភាគមិនត្រឹមត្រូវ។'))
             return
-        row = await loop.run_in_executor(None, db_sched_fetch_one, row_id)
+        row = await loop.run_in_executor(_DB_EXECUTOR, db_sched_fetch_one, row_id)
         if not row or int(row.get("admin_id") or 0) != int(user_id):
             await safe_send(lambda: query.message.reply_text('⛔ អ្នកមិនមានសិទ្ធិបោះបង់កាលវិភាគនេះទេ។'))
             return
@@ -574,7 +574,7 @@ async def sched_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML",
             ))
             return
-        await loop.run_in_executor(None, db_sched_set_status, row_id, SCHED_STATUS_CANCELLED)
+        await loop.run_in_executor(_DB_EXECUTOR, db_sched_set_status, row_id, SCHED_STATUS_CANCELLED)
         with suppress(Exception):
             await query.message.edit_reply_markup(reply_markup=None)
         await safe_send(lambda: query.message.reply_text(

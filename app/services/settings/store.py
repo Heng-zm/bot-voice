@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -72,6 +73,39 @@ class SettingsStore:
                 logger.warning("Settings read fell back to memory key=%s: %s", clean, exc)
         return self._memory.get(clean, default)
 
+    async def get_many_text(
+        self,
+        keys: Iterable[str],
+        default: str = "",
+    ) -> dict[str, str]:
+        """Load several settings with one Supabase request.
+
+        Runtime startup restores dozens of small settings together. Reading
+        them individually turns database latency into a long serial delay, so
+        this path keeps the same memory fallback semantics while batching the
+        persistent lookup.
+        """
+
+        clean_keys = tuple(dict.fromkeys(self._clean_key(key) for key in keys))
+        if not clean_keys:
+            return {}
+
+        values: dict[str, str] = {}
+        if self.supabase is not None:
+            try:
+                values = await asyncio.to_thread(self._read_many_sync, clean_keys)
+                self._memory.update(values)
+            except Exception as exc:  # noqa: BLE001 - graceful DB degradation
+                logger.warning(
+                    "Settings batch read fell back to memory keys=%s: %s",
+                    len(clean_keys),
+                    exc,
+                )
+        return {
+            key: values.get(key, self._memory.get(key, default))
+            for key in clean_keys
+        }
+
     async def set_text(
         self,
         key: str,
@@ -132,6 +166,20 @@ class SettingsStore:
         if not rows:
             return None
         return str(rows[0].get("value") or "")
+
+    def _read_many_sync(self, keys: tuple[str, ...]) -> dict[str, str]:
+        result = (
+            self.supabase.table("bot_settings")
+            .select("key,value")
+            .in_("key", list(keys))
+            .execute()
+        )
+        values: dict[str, str] = {}
+        for row in list(getattr(result, "data", None) or []):
+            key = str(row.get("key") or "").strip()
+            if key in keys:
+                values[key] = str(row.get("value") or "")
+        return values
 
     def _write_sync(self, key: str, value: str, updated_by: int | None) -> None:
         payload: dict[str, Any] = {
