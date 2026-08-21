@@ -616,6 +616,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             percent=5,
             stage="កំពុងពិនិត្យអត្ថបទ",
             detail=f"មាន {len(stripped)} តួអក្សរ។",
+            minimal=True,
         )
     except BaseException:
         _release_tts_request(user_id)

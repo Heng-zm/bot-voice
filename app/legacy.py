@@ -16496,10 +16496,18 @@ class TelegramProgress:
 
     __slots__ = (
         "bot", "chat_id", "message", "title", "started_at", "percent",
-        "stage", "detail", "last_text", "last_edit_at", "closed", "lock",
+        "stage", "detail", "minimal", "last_text", "last_edit_at", "closed", "lock",
     )
 
-    def __init__(self, bot: Any, chat_id: int, title: str, message: Any | None = None):
+    def __init__(
+        self,
+        bot: Any,
+        chat_id: int,
+        title: str,
+        message: Any | None = None,
+        *,
+        minimal: bool = False,
+    ):
         self.bot = bot
         self.chat_id = int(chat_id)
         self.message = message
@@ -16508,6 +16516,7 @@ class TelegramProgress:
         self.percent = 0
         self.stage = "កំពុងចាប់ផ្ដើម"
         self.detail = ""
+        self.minimal = bool(minimal)
         self.last_text = ""
         self.last_edit_at = 0.0
         self.closed = False
@@ -16531,8 +16540,9 @@ class TelegramProgress:
         percent: int = 0,
         stage: str = "កំពុងចាប់ផ្ដើម",
         detail: str = "",
+        minimal: bool = False,
     ) -> "TelegramProgress":
-        progress = cls(bot, chat_id, title)
+        progress = cls(bot, chat_id, title, minimal=minimal)
         progress.percent = _progress_clamp(percent)
         progress.stage = str(stage or progress.stage)
         progress.detail = str(detail or "")
@@ -16555,6 +16565,11 @@ class TelegramProgress:
         return progress
 
     def render(self) -> str:
+        if self.minimal:
+            return "\n".join((
+                str(self.stage or "កំពុងបង្កើតសំឡេង"),
+                f"[{_progress_bar(self.percent)}] {self.percent}%",
+            ))
         parts = [
             f"⏳ {self.title}",
             "",
