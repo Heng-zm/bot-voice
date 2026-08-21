@@ -149,7 +149,26 @@ clearing Telegram's queue.
 
 ## Run
 
-Preferred command:
+Preferred command for container panels and Linux hosts:
+
+```bash
+chmod +x start.sh
+./start.sh
+```
+
+The launcher selects `python3` (falling back to `python`), requires Python
+3.11+, checks application syntax before startup, enables unbuffered logs, and
+runs from the repository directory. Optional startup controls are:
+
+```env
+PYTHON_BIN=/path/to/python
+INSTALL_REQUIREMENTS_ON_START=false
+STARTUP_COMPILE_CHECK=true
+```
+
+Dependency installation is disabled by default to avoid reinstalling packages
+during every automatic restart. Enable it only when the host does not install
+`requirements.txt` during its build step. The direct command remains supported:
 
 ```bash
 python -m app.main
@@ -223,7 +242,7 @@ node --check static/admin/app.js
 Current verified result:
 
 ```text
-80 passed
+82 passed
 Ruff passed
 Python compilation passed
 Admin JavaScript syntax passed
