@@ -179,6 +179,8 @@ Compatibility launchers are also supported:
 ```bash
 python main.py
 python app/main.py
+# From the parent directory (for panels fixed to /home/container):
+python -m deploy.main
 ```
 
 The Docker image exposes port `8080` and runs `python -m app.main`.
@@ -242,7 +244,7 @@ node --check static/admin/app.js
 Current verified result:
 
 ```text
-82 passed
+83 passed
 Ruff passed
 Python compilation passed
 Admin JavaScript syntax passed
