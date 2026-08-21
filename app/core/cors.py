@@ -33,7 +33,12 @@ def normalize_origin(origin: str) -> str:
     value = str(origin or "").strip().rstrip("/")
     if not value:
         raise InvalidOriginError("Origin is required.")
-    parsed = urlsplit(value)
+    if "\\" in value or any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise InvalidOriginError("Origin contains invalid characters.")
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise InvalidOriginError("Origin is not a valid URL.") from exc
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise InvalidOriginError("Origin must be an absolute http:// or https:// URL.")
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
@@ -43,8 +48,22 @@ def normalize_origin(origin: str) -> str:
     hostname = parsed.hostname or ""
     if not hostname:
         raise InvalidOriginError("Origin hostname is invalid.")
-    port = f":{parsed.port}" if parsed.port is not None else ""
-    return f"{parsed.scheme.lower()}://{hostname.lower()}{port}"
+    try:
+        port_number = parsed.port
+    except ValueError as exc:
+        raise InvalidOriginError("Origin port is invalid.") from exc
+    try:
+        hostname = hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise InvalidOriginError("Origin hostname is invalid.") from exc
+    # urlsplit removes IPv6 brackets from ``hostname``; put them back so the
+    # canonical origin remains a syntactically valid URL.
+    rendered_hostname = f"[{hostname}]" if ":" in hostname else hostname
+    default_port = (parsed.scheme == "http" and port_number == 80) or (
+        parsed.scheme == "https" and port_number == 443
+    )
+    port = f":{port_number}" if port_number is not None and not default_port else ""
+    return f"{parsed.scheme.lower()}://{rendered_hostname}{port}"
 
 
 @dataclass(frozen=True)
@@ -94,33 +113,56 @@ class DynamicCorsStore:
             self._loaded_at = now
             return self._snapshot
 
+    async def _load_origins_for_mutation(self) -> set[str]:
+        """Load the latest origins while the caller holds the mutation lock."""
+
+        payload = await self.settings.get_json(_CORS_KEY, [])
+        origins: set[str] = set()
+        if isinstance(payload, list):
+            for value in payload:
+                try:
+                    origins.add(normalize_origin(str(value)))
+                except InvalidOriginError:
+                    continue
+        return origins
+
     async def add(self, origin: str, *, admin_id: int) -> tuple[CorsSnapshot, bool]:
         normalized = normalize_origin(origin)
-        current = set((await self.load(force=True)).origins)
-        changed = normalized not in current
-        current.add(normalized)
-        persistent = await self.settings.set_json(
-            _CORS_KEY,
-            sorted(current),
-            updated_by=admin_id,
-        )
-        self._snapshot = CorsSnapshot(tuple(sorted(current)), self.settings.status.backend, persistent)
-        self._loaded_at = time.monotonic()
-        return self._snapshot, changed
+        async with self._lock:
+            current = await self._load_origins_for_mutation()
+            changed = normalized not in current
+            current.add(normalized)
+            persistent = await self.settings.set_json(
+                _CORS_KEY,
+                sorted(current),
+                updated_by=admin_id,
+            )
+            self._snapshot = CorsSnapshot(
+                tuple(sorted(current)),
+                self.settings.status.backend,
+                persistent,
+            )
+            self._loaded_at = time.monotonic()
+            return self._snapshot, changed
 
     async def delete(self, origin: str, *, admin_id: int) -> tuple[CorsSnapshot, bool]:
         normalized = normalize_origin(origin)
-        current = set((await self.load(force=True)).origins)
-        changed = normalized in current
-        current.discard(normalized)
-        persistent = await self.settings.set_json(
-            _CORS_KEY,
-            sorted(current),
-            updated_by=admin_id,
-        )
-        self._snapshot = CorsSnapshot(tuple(sorted(current)), self.settings.status.backend, persistent)
-        self._loaded_at = time.monotonic()
-        return self._snapshot, changed
+        async with self._lock:
+            current = await self._load_origins_for_mutation()
+            changed = normalized in current
+            current.discard(normalized)
+            persistent = await self.settings.set_json(
+                _CORS_KEY,
+                sorted(current),
+                updated_by=admin_id,
+            )
+            self._snapshot = CorsSnapshot(
+                tuple(sorted(current)),
+                self.settings.status.backend,
+                persistent,
+            )
+            self._loaded_at = time.monotonic()
+            return self._snapshot, changed
 
     async def is_allowed(self, origin: str) -> bool:
         try:

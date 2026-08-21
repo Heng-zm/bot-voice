@@ -3028,7 +3028,7 @@ async def ai_assistant():
                 "provider": "gemini-legacy",
             }))
 
-        if _hf_client is None and (AI_PROVIDER or "hf").lower().strip() == "hf":
+        if _hf_client is None and (AI_PROVIDER or DEFAULT_AI_PROVIDER).lower().strip() == "hf":
             return _ai_cors(_ai_error("Hugging Face is not configured. Set HF_TOKEN.", 503))
 
         reply_text, model_used, tokens_used = await _run_ai_api_blocking(ai_text_reply, message, history)
@@ -3038,7 +3038,7 @@ async def ai_assistant():
             "detected_language": _detect_lang(reply_text or message or ""),
             "tokens_used": tokens_used,
             "model": model_used,
-            "provider": (AI_PROVIDER or "hf").lower().strip(),
+            "provider": (AI_PROVIDER or DEFAULT_AI_PROVIDER).lower().strip(),
         }))
 
     except Exception as exc:
@@ -9512,6 +9512,11 @@ def _telegram_app_updater(app_obj: Any) -> Any:
     return getattr(app_obj, "updater", None) if app_obj is not None else None
 
 
+def _telegram_polling_drop_pending_updates() -> bool:
+    """Require an explicit opt-in before discarding queued Telegram updates."""
+    return _env_bool("TELEGRAM_POLLING_DROP_PENDING_UPDATES", False)
+
+
 async def _telegram_start_polling_runtime(app_obj: Any) -> bool:
     global _TELEGRAM_POLLING_ACTIVE, ACTIVE_POLLING_TASK
     updater = _telegram_app_updater(app_obj)
@@ -9533,7 +9538,7 @@ async def _telegram_start_polling_runtime(app_obj: Any) -> bool:
             return True
         await updater.start_polling(
             allowed_updates=_telegram_allowed_updates(),
-            drop_pending_updates=_env_bool("TELEGRAM_POLLING_DROP_PENDING_UPDATES", True),
+            drop_pending_updates=_telegram_polling_drop_pending_updates(),
         )
         _TELEGRAM_POLLING_ACTIVE = True
         ACTIVE_POLLING_TASK = asyncio.create_task(_telegram_polling_task_guard(app_obj), name="telegram-polling-guard")
@@ -9559,7 +9564,7 @@ async def _telegram_stop_polling_runtime(app_obj: Any, *, cancel_task: bool = Tr
         return True
 
 
-async def _delete_telegram_webhook_via_http(drop_pending: bool = True) -> None:
+async def _delete_telegram_webhook_via_http(drop_pending: bool = False) -> None:
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
     api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
@@ -9598,7 +9603,9 @@ async def _switch_telegram_runtime_mode(target_mode: str, admin_id: int = 0) -> 
     webhook_logger.info("Runtime switch to POLLING requested by admin_id=%s", admin_id)
     # Remove webhook first, verify Telegram accepted it, then start one polling worker.
     await _cancel_active_polling_task("switch_to_polling_pre_delete")
-    await _delete_telegram_webhook_via_http(drop_pending=True)
+    await _delete_telegram_webhook_via_http(
+        drop_pending=_telegram_polling_drop_pending_updates()
+    )
     # Telegram may still release the previous webhook/getUpdates state shortly
     # after deleteWebhook returns. A short grace delay prevents intermittent
     # 409 Conflict errors when polling starts immediately.
@@ -9780,6 +9787,7 @@ ADMIN_IDS:  set[int]    = set()
 # still override them with env variables, but a missing OCR_PROVIDER,
 # OCR_AUTO_PREFER_PROVIDER, or GEMINI_MODEL now boots with Gemini OCR selected.
 DEFAULT_GEMINI_MODEL             = "gemini-2.5-flash"  # change this one line if you want another default Gemini model
+DEFAULT_AI_PROVIDER              = "gemini"            # gemini | hf
 DEFAULT_OCR_PROVIDER             = "gemini"            # gemini | auto | hf
 DEFAULT_OCR_AUTO_PREFER_PROVIDER = "gemini"            # gemini | hf
 
@@ -9796,7 +9804,7 @@ HF_MODEL_ALIASES = {
     "llama3.2:3b": "meta-llama/Llama-3.2-3B-Instruct",
     "llama3.2-3b": "meta-llama/Llama-3.2-3B-Instruct",
 }
-AI_PROVIDER             = "hf"
+AI_PROVIDER             = DEFAULT_AI_PROVIDER
 OCR_PROVIDER            = DEFAULT_OCR_PROVIDER
 # Gemini is the safe default for OCR because Hugging Face hosted OCR can be
 # unavailable or DNS-blocked on small PaaS networks. Set OCR_PROVIDER=auto/hf
@@ -11524,7 +11532,7 @@ def ai_text_reply(prompt: str, history: list[dict] | None = None) -> tuple[str, 
     """Return (reply, model_used, tokens_used) for text-only chat."""
     from app.services.ai.providers import get_provider_manager
 
-    configured = (AI_PROVIDER or "hf").lower().strip()
+    configured = (AI_PROVIDER or DEFAULT_AI_PROVIDER).lower().strip()
     preferred = ["huggingface" if configured == "hf" else "gemini"]
 
     def execute(provider_name: str) -> tuple[str, str, int | None]:
@@ -11581,10 +11589,14 @@ def _init_clients() -> None:
     HF_MODEL           = HF_MODEL_ALIASES.get(configured_hf_model.lower(), configured_hf_model)
     HF_OCR_MODEL       = os.getenv("HF_OCR_MODEL", "microsoft/trocr-base-printed")
 
-    AI_PROVIDER = os.getenv("AI_PROVIDER", "hf").lower().strip()
+    AI_PROVIDER = os.getenv("AI_PROVIDER", DEFAULT_AI_PROVIDER).lower().strip()
     if AI_PROVIDER not in ("hf", "gemini"):
-        logger.warning(f"Unknown AI_PROVIDER={AI_PROVIDER!r}; falling back to hf.")
-        AI_PROVIDER = "hf"
+        logger.warning(
+            "Unknown AI_PROVIDER=%r; falling back to %s.",
+            AI_PROVIDER,
+            DEFAULT_AI_PROVIDER,
+        )
+        AI_PROVIDER = DEFAULT_AI_PROVIDER
 
     # Code default: OCR_PROVIDER=gemini. Env value is optional override only.
     raw_ocr_provider = os.getenv("OCR_PROVIDER") or DEFAULT_OCR_PROVIDER
@@ -26276,7 +26288,9 @@ async def _run_bot():
             # long polling to prevent Telegram 409 Conflict. Only the active
             # owner may do this in two-server mode.
             with suppress(Exception):
-                await _delete_telegram_webhook_via_http(drop_pending=True)
+                await _delete_telegram_webhook_via_http(
+                    drop_pending=_telegram_polling_drop_pending_updates()
+                )
             polling_started = await _telegram_start_polling_runtime(app)
             logger.info("Telegram polling started by active owner.")
 
@@ -26313,7 +26327,9 @@ async def _run_bot():
                     polling_started = False
                 elif not polling_started and mode == "POLLING":
                     with suppress(Exception):
-                        await _delete_telegram_webhook_via_http(drop_pending=True)
+                        await _delete_telegram_webhook_via_http(
+                            drop_pending=_telegram_polling_drop_pending_updates()
+                        )
                     polling_started = await _telegram_start_polling_runtime(app)
 
                 await asyncio.sleep(1.0)

@@ -31,7 +31,7 @@ def derive_runtime_secret(bot_token: str, purpose: str) -> str:
     label = str(purpose or "runtime").strip().lower()
     if not token:
         return ""
-    return hashlib.sha256(f"bot-voice:{label}:{token}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"bot-voice:{label}:{token}".encode()).hexdigest()
 
 
 @dataclass(frozen=True)

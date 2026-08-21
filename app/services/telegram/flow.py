@@ -19,9 +19,6 @@ def classify_callback(
 
     value = str(data or "").strip()
     exact_actions = {
-        "myprefs_open": "myprefs",
-        "myprefs_models": "myprefs",
-        "myprefs_close": "myprefs",
         "show_speed": "show_speed",
         "hide_speed": "hide_speed",
         "show_tts_model": "show_tts_model",
@@ -35,9 +32,7 @@ def classify_callback(
         return "speed"
 
     prefix_actions = (
-        ("myprefs_gender:", "myprefs"),
-        ("myprefs_speed:", "myprefs"),
-        ("myprefs_model:", "myprefs"),
+        ("voxcpm2:", "voxcpm2"),
         ("ttsmodel_", "tts_model"),
         ("tts_transcript:", "tts_transcript"),
         ("del_transcript:", "delete"),
@@ -58,15 +53,18 @@ def classify_callback(
 def callback_requires_tts_access(action: str, data: str | None) -> bool:
     """Return whether a generic callback changes or generates TTS state."""
 
-    del data
-    return action in {
+    if action in {
         "speed",
         "gender",
         "tts_model",
         "tts_transcript",
         "doc_read",
         "audio_tts",
-    }
+    }:
+        return True
+    if action == "voxcpm2":
+        return str(data or "").strip() not in {"voxcpm2:close", "voxcpm2:refresh"}
+    return False
 
 
 __all__ = ["callback_requires_tts_access", "classify_callback"]

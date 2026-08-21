@@ -109,6 +109,8 @@ def validate_telegram_init_data(
 
     try:
         user_payload = json.loads(fields.get("user") or "{}")
+        if not isinstance(user_payload, dict):
+            raise TypeError("Telegram user payload must be an object.")
         user_id = int(user_payload.get("id") or 0)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise TelegramInitDataError("Telegram initData user is invalid.") from exc
@@ -160,7 +162,7 @@ class TelegramAdminAuthorizer:
         fallback_admin_ids: set[int] | frozenset[int] | list[int] | tuple[int, ...] = (),
         redis_client: Any | None = None,
         **_ignored: Any,
-    ) -> "TelegramAdminAuthorizer":
+    ) -> TelegramAdminAuthorizer:
         # redis_client is accepted temporarily so older call sites do not crash;
         # it is intentionally unused after the single-process migration.
         del redis_client

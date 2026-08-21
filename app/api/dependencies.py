@@ -51,6 +51,14 @@ async def require_admin(request: Request) -> AdminPrincipal:
     """
 
     legacy = legacy_module()
+    authorization = str(request.headers.get("authorization") or "").strip()
+    telegram_header_sent = bool(
+        str(request.headers.get("x-telegram-init-data") or "").strip()
+    )
+    telegram_auth_scheme = authorization.partition(" ")[0].lower()
+    ambiguous_bearer = (
+        not telegram_header_sent and telegram_auth_scheme == "bearer"
+    )
     telegram_init_data, telegram_credential_sent = telegram_init_data_from_request(request)
     if telegram_credential_sent:
         # A separate launcher bot may own the Mini App while the primary bot
@@ -63,37 +71,44 @@ async def require_admin(request: Request) -> AdminPrincipal:
             or getattr(legacy.SETTINGS, "TELEGRAM_BOT_TOKEN", "")
             or ""
         ).strip()
-        if not bot_token:
+        if not bot_token and not ambiguous_bearer:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Telegram administrator authorization is not configured.",
             )
-        try:
-            session = await get_telegram_admin_authorizer().authorize(
-                telegram_init_data,
-                bot_token,
-            )
-        except TelegramInitDataError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=str(exc),
-                headers={"WWW-Authenticate": "Bearer"},
-            ) from exc
-        except PermissionError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=str(exc),
-            ) from exc
-        except TelegramAdminStoreError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=str(exc),
-            ) from exc
-        return AdminPrincipal(
-            session.user.id,
-            "telegram_init_data",
-            session.user,
-        )
+        if bot_token:
+            try:
+                session = await get_telegram_admin_authorizer().authorize(
+                    telegram_init_data,
+                    bot_token,
+                )
+            except TelegramInitDataError as exc:
+                # ``Authorization: Bearer`` is intentionally accepted for
+                # both Telegram Mini App initData and the pre-existing opaque
+                # admin API token. A credential that is not valid initData
+                # must therefore fall through to the API-token verifier.
+                if not ambiguous_bearer:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail=str(exc),
+                        headers={"WWW-Authenticate": "Bearer"},
+                    ) from exc
+            except PermissionError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=str(exc),
+                ) from exc
+            except TelegramAdminStoreError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=str(exc),
+                ) from exc
+            else:
+                return AdminPrincipal(
+                    session.user.id,
+                    "telegram_init_data",
+                    session.user,
+                )
 
     if not bool(legacy._web_admin_enabled()):
         raise HTTPException(
@@ -101,7 +116,6 @@ async def require_admin(request: Request) -> AdminPrincipal:
             detail="Admin backend is disabled.",
         )
 
-    authorization = str(request.headers.get("authorization") or "").strip()
     if authorization.lower().startswith("bearer "):
         token = authorization.split(None, 1)[1].strip()
         admin_id = legacy._admin_verify_api_token(token)

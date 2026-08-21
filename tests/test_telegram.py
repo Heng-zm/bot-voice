@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 import warnings
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -84,18 +84,20 @@ class TelegramDeduplicationTests(unittest.IsolatedAsyncioTestCase):
 
     def test_expired_processing_lease_can_be_reclaimed_without_redis(self) -> None:
         store = WebhookReplayStore()
-        with patch.dict("os.environ", {"WEBHOOK_PROCESSING_TTL_S": "15"}):
-            with patch(
+        with (
+            patch.dict("os.environ", {"WEBHOOK_PROCESSING_TTL_S": "15"}),
+            patch(
                 "app.services.telegram.deduplication.time.monotonic",
                 side_effect=[100.0, 116.0, 116.0, 116.0],
-            ):
-                first_state, first_token = store.claim(9_876_543_211, include_token=True)
-                second_state, second_token = store.claim(9_876_543_211, include_token=True)
-                self.assertEqual("claimed", first_state)
-                self.assertEqual("claimed", second_state)
-                self.assertNotEqual(first_token, second_token)
-                self.assertFalse(store.release(9_876_543_211, claim_token=first_token))
-                self.assertFalse(store.complete(9_876_543_211, claim_token=first_token))
+            ),
+        ):
+            first_state, first_token = store.claim(9_876_543_211, include_token=True)
+            second_state, second_token = store.claim(9_876_543_211, include_token=True)
+            self.assertEqual("claimed", first_state)
+            self.assertEqual("claimed", second_state)
+            self.assertNotEqual(first_token, second_token)
+            self.assertFalse(store.release(9_876_543_211, claim_token=first_token))
+            self.assertFalse(store.complete(9_876_543_211, claim_token=first_token))
 
     def test_claim_token_prevents_old_owner_from_completing_new_lease(self) -> None:
         store = WebhookReplayStore()
@@ -197,8 +199,8 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(payload["disable_web_page_preview"])
 
     def test_daily_schedule_time_uses_next_phnom_penh_occurrence(self) -> None:
-        before_eight = datetime(2026, 8, 3, 0, 30, tzinfo=timezone.utc)
-        after_eight = datetime(2026, 8, 3, 2, 0, tzinfo=timezone.utc)
+        before_eight = datetime(2026, 8, 3, 0, 30, tzinfo=UTC)
+        after_eight = datetime(2026, 8, 3, 2, 0, tzinfo=UTC)
 
         first_run, recurrence = legacy._parse_schedule_request(
             "daily 08:00",
@@ -211,8 +213,8 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("daily", recurrence)
         self.assertEqual("daily", next_recurrence)
-        self.assertEqual(datetime(2026, 8, 3, 1, 0, tzinfo=timezone.utc), first_run)
-        self.assertEqual(datetime(2026, 8, 4, 1, 0, tzinfo=timezone.utc), next_day)
+        self.assertEqual(datetime(2026, 8, 3, 1, 0, tzinfo=UTC), first_run)
+        self.assertEqual(datetime(2026, 8, 4, 1, 0, tzinfo=UTC), next_day)
 
     def test_daily_schedule_marker_round_trip_preserves_broadcast_format(self) -> None:
         stored = legacy._sched_apply_recurrence_directive(
@@ -233,7 +235,7 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(link_preview)
 
     async def test_daily_schedule_reschedules_instead_of_finishing(self) -> None:
-        next_run = datetime(2026, 8, 4, 1, 0, tzinfo=timezone.utc)
+        next_run = datetime(2026, 8, 4, 1, 0, tzinfo=UTC)
         bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=1)))
         row = {
             "id": 77,
@@ -586,22 +588,21 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
                 legacy.TelegramProgress,
                 "start",
                 AsyncMock(side_effect=RuntimeError("cannot start progress")),
-            ),
+            ),self.assertRaisesRegex(RuntimeError, "cannot start progress")
         ):
-            with self.assertRaisesRegex(RuntimeError, "cannot start progress"):
-                await legacy._regenerate_tts_voice_with_progress(
-                    query=query,
-                    context=context,
-                    user_id=user_id,
-                    original_text="hello",
-                    gender="female",
-                    speed=1.0,
-                    tts_model="auto",
-                    title="title",
-                    final_text="done",
-                    error_text="failed",
-                    delete_source=False,
-                )
+            await legacy._regenerate_tts_voice_with_progress(
+                query=query,
+                context=context,
+                user_id=user_id,
+                original_text="hello",
+                gender="female",
+                speed=1.0,
+                tts_model="auto",
+                title="title",
+                final_text="done",
+                error_text="failed",
+                delete_source=False,
+            )
 
         self.assertFalse(legacy._tts_request_reserved(user_id))
 

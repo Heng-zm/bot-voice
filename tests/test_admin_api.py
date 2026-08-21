@@ -43,7 +43,9 @@ class AdminApiAuthenticationTests(unittest.TestCase):
             SETTINGS=SimpleNamespace(TELEGRAM_BOT_TOKEN=BOT_TOKEN),
             _web_admin_enabled=lambda: True,
             _web_valid_admin_id=lambda value: value == 42,
-            _admin_verify_api_token=lambda _token: None,
+            _admin_verify_api_token=lambda token: (
+                42 if token == "legacy-api-token" else None
+            ),
         )
         self.legacy_patch = patch(
             "app.api.dependencies.legacy_module",
@@ -91,6 +93,14 @@ class AdminApiAuthenticationTests(unittest.TestCase):
         self.assertEqual(200, header.status_code)
         self.assertEqual(200, bearer.status_code)
         self.assertEqual(42, bearer.json()["user"]["id"])
+
+    def test_opaque_admin_api_bearer_token_remains_reachable(self) -> None:
+        response = self.client.get(
+            "/api/admin/me",
+            headers={"Authorization": "Bearer legacy-api-token"},
+        )
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(42, response.json()["user"]["id"])
 
 
 if __name__ == "__main__":

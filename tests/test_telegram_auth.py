@@ -8,7 +8,11 @@ import time
 import unittest
 from urllib.parse import urlencode
 
-from app.core.telegram_auth import TelegramAdminAuthorizer, TelegramInitDataError, validate_telegram_init_data
+from app.core.telegram_auth import (
+    TelegramAdminAuthorizer,
+    TelegramInitDataError,
+    validate_telegram_init_data,
+)
 from app.services.settings.store import SettingsStore
 
 BOT_TOKEN = "123456789:TEST_bot_token_for_unit_tests"
@@ -44,6 +48,16 @@ class TelegramInitDataTests(unittest.TestCase):
             validate_telegram_init_data(signed_init_data(42, auth_date=now - 3601), BOT_TOKEN, now=now)
         with self.assertRaisesRegex(TelegramInitDataError, "future"):
             validate_telegram_init_data(signed_init_data(42, auth_date=now + 31), BOT_TOKEN, now=now)
+
+    def test_signed_non_object_user_is_rejected_cleanly(self) -> None:
+        now = int(time.time())
+        malformed = signed_init_data(
+            42,
+            auth_date=now,
+            extra_fields={"user": "[]"},
+        )
+        with self.assertRaisesRegex(TelegramInitDataError, "user is invalid"):
+            validate_telegram_init_data(malformed, BOT_TOKEN, now=now)
 
 
 class TelegramAdminAuthorizerTests(unittest.IsolatedAsyncioTestCase):

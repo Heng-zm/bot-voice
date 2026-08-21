@@ -16,11 +16,10 @@ import dis
 import functools
 import types
 from collections.abc import Awaitable, Callable
-from typing import Any, TypeVar
+from typing import Any
 
 from app._legacy_bridge import legacy_module
 
-_F = TypeVar("_F", bound=Callable[..., Awaitable[Any]])
 _MISSING = object()
 
 
@@ -44,7 +43,7 @@ def _referenced_global_names(code: types.CodeType) -> frozenset[str]:
     return frozenset(names)
 
 
-def legacy_bound_handler(func: _F) -> _F:
+def legacy_bound_handler[F: Callable[..., Awaitable[Any]]](func: F) -> F:
     """Bind referenced legacy helpers immediately before running a handler.
 
     The handler body lives in its native Telegram module.  Only unresolved
@@ -75,6 +74,6 @@ def legacy_bound_handler(func: _F) -> _F:
                 module_globals.pop(name, None)
         return await func(*args, **kwargs)
 
-    setattr(wrapped, "__telegram_extracted_handler__", True)
-    setattr(wrapped, "__legacy_dependencies__", dependency_names)
+    wrapped.__telegram_extracted_handler__ = True
+    wrapped.__legacy_dependencies__ = dependency_names
     return wrapped  # type: ignore[return-value]

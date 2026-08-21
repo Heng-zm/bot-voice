@@ -1,20 +1,8 @@
-"""Backward-compatible root entry point.
+"""Compatibility launcher for deployment panels that run ``python main.py``."""
 
-New code should import :mod:`app.main` or run ``python -m app.main``.
-"""
+from app.main import app, main
 
-from __future__ import annotations
-
-from app import legacy as _legacy
-from app.main import app, create_app, main
-
-__all__ = ["app", "create_app", "main"]
-
-
-def __getattr__(name: str):
-    """Expose legacy symbols for callers of the former root module."""
-
-    return getattr(_legacy, name)
+__all__ = ["app", "main"]
 
 
 if __name__ == "__main__":

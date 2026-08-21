@@ -18,6 +18,8 @@ from collections.abc import Awaitable, Callable, Iterable
 from concurrent.futures import (
     Future,
     ThreadPoolExecutor,
+)
+from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
 from dataclasses import dataclass, field
@@ -350,7 +352,7 @@ class ProviderManager:
                 latency_ms = (time.perf_counter() - started) * 1_000
                 self.record_success(provider_name, latency_ms)
                 return result, provider_name
-            except FutureTimeoutError as exc:
+            except FutureTimeoutError:
                 if future is not None:
                     future.cancel()
                 error = ProviderTimeout(

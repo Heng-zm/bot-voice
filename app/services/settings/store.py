@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -137,7 +137,7 @@ class SettingsStore:
         payload: dict[str, Any] = {
             "key": key,
             "value": value,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
         }
         if updated_by is not None:
             payload["updated_by"] = int(updated_by)

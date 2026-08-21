@@ -7,9 +7,9 @@ from __future__ import annotations
 
 # Transitional V4.1 modules bind remaining legacy helpers at runtime.
 # ruff: noqa: F821
-
 from app.services.telegram._legacy_runtime import legacy_bound_handler
 from app.services.telegram.workloads import WorkloadBusy, run_telegram_workload
+
 
 @legacy_bound_handler
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):

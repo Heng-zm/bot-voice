@@ -1,1 +1,1 @@
-"""Pure utility helpers."""
+"""Package marker."""

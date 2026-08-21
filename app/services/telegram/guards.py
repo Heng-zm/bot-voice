@@ -7,8 +7,8 @@ from __future__ import annotations
 
 # Transitional V4.1 modules bind remaining legacy helpers at runtime.
 # ruff: noqa: F821
-
 from app.services.telegram._legacy_runtime import legacy_bound_handler
+
 
 @legacy_bound_handler
 async def _telegram_rate_limit_guard(update: Any, context: Any) -> None:
@@ -108,10 +108,11 @@ async def _drop_stale_updates(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # Only filter plain messages (not callbacks)
     msg = update.message or update.edited_message
-    if msg and getattr(msg, "date", None):
-        if msg.date.timestamp() < (_BOT_START_TIME - _STALE_GRACE_S):
-            logger.debug(f"Dropping stale message update (id={update.update_id})")
-            raise ApplicationHandlerStop
+    if msg and getattr(msg, "date", None) and msg.date.timestamp() < (
+        _BOT_START_TIME - _STALE_GRACE_S
+    ):
+        logger.debug(f"Dropping stale message update (id={update.update_id})")
+        raise ApplicationHandlerStop
 
 
 @legacy_bound_handler

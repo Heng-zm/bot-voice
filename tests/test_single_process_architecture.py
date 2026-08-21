@@ -42,6 +42,24 @@ class SingleProcessArchitectureTests(unittest.IsolatedAsyncioTestCase):
         requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8").lower().splitlines()
         self.assertFalse(any(line.strip().startswith("redis") for line in requirements))
 
+    def test_polling_preserves_pending_updates_unless_explicitly_enabled(self) -> None:
+        source = (ROOT / "app" / "legacy.py").read_text(encoding="utf-8")
+        env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+        self.assertIn(
+            '_env_bool("TELEGRAM_POLLING_DROP_PENDING_UPDATES", False)',
+            source,
+        )
+        self.assertNotIn("drop_pending=True", source)
+        self.assertIn("TELEGRAM_POLLING_DROP_PENDING_UPDATES=false", env_example)
+
+    def test_live_provider_defaults_are_deployable(self) -> None:
+        source = (ROOT / "app" / "legacy.py").read_text(encoding="utf-8")
+        requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+        env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+        self.assertIn('DEFAULT_AI_PROVIDER              = "gemini"', source)
+        self.assertIn("AI_PROVIDER=gemini", env_example)
+        self.assertIn("edge-tts>=7.2.8,<8", requirements)
+
     def test_dedicated_worker_and_queue_files_are_removed(self) -> None:
         removed = [
             ROOT / "app" / "worker.py",

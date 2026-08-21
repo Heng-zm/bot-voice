@@ -2,6 +2,17 @@
 
 from __future__ import annotations
 
+# Support deployment panels that execute this file directly as
+# ``python app/main.py``. In that mode Python places ``app/`` itself on
+# ``sys.path``; add the repository root before importing the ``app`` package.
+if __package__ in {None, ""}:
+    import sys
+    from pathlib import Path as _BootstrapPath
+
+    _repo_root = str(_BootstrapPath(__file__).resolve().parent.parent)
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+
 import asyncio
 import os
 import time

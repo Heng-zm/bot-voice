@@ -1,163 +1,260 @@
-# bot-voice — single-process v4.2
+# bot-voice v4.2.2
 
-Telegram AI / TTS / OCR bot with a FastAPI backend and Telegram Mini App admin console.
+Telegram AI, text-to-speech, OCR, and audio bot with a FastAPI backend and a
+Telegram Mini App administration console.
 
-This update removes the **dedicated Redis + worker architecture**. The supported production topology is now one application process running FastAPI, Telegram ingestion, provider execution, and small in-process background tasks. Persistent control-plane state uses the existing Supabase `bot_settings` table, with an in-memory fallback for local development.
+The supported architecture is one Python process running FastAPI, Telegram
+ingestion, provider calls, schedulers, and bounded background work. Redis and
+the dedicated worker service are no longer part of the runtime.
 
+## Highlights
 
-## V4.2 production optimizations
-
-V4.2 hardens the single-process topology introduced in v4 and the Telegram handler extraction from v4.1:
-
-- native process-local webhook replay protection replaces the remaining Redis-era webhook lease implementation
-- separate processing and completed-update TTLs let interrupted webhook updates retry quickly without weakening duplicate suppression
-- ownership tokens prevent an expired/stale webhook handler from completing or releasing a newer lease
-- bounded admission for OCR, transcription, and audio conversion prevents traffic bursts from exhausting CPU/RAM/provider capacity
-- the Admin Mini App and Telegram `/runtime` panel show active/waiting/rejected workload pressure and webhook replay state
-- the temporary Telegram legacy bridge now inspects actual `LOAD_GLOBAL` bytecode instead of treating attribute names as dependencies, reducing per-update compatibility overhead
-- the combined-process supervisor restarts when either FastAPI or Telegram stops unexpectedly, including a normal return with no exception
-- the Telegram Admin `WEB_KEY` action now matches the no-Redis architecture and generates a private explicit environment-secret candidate instead of attempting a broken Redis write
-
-The default admission limits are conservative and configurable through `.env.example`.
+- Telegram commands, callbacks, photos, voice, audio, and text handlers
+- Gemini-first AI chat with health-aware provider fallback
+- Gemini and Hugging Face OCR routing
+- Edge TTS 7.2.8+ with optional Hugging Face Khmer TTS and VoxCPM2 support
+- Broadcast and recurring schedule management
+- Supabase-backed preferences, history, administrators, CORS, and runtime settings
+- Signed Telegram Mini App administrator authentication
+- Process-local webhook replay protection with ownership-aware leases
+- Bounded OCR, transcription, and audio workload admission
+- English and Khmer administration interface
+- Polling startup that preserves queued Telegram updates by default
 
 ## Architecture
 
 ```text
 Telegram / Browser
-       │
-       ▼
-   app.main
-       │
-       ├── FastAPI + native admin routers
-       ├── Telegram bot lifecycle
-       ├── AI / TTS / OCR providers
-       ├── Supabase persistence
-       └── in-process background tasks
-
-Supabase
-  ├── bot_settings   runtime overrides, admin IDs, CORS policy
-  ├── user_prefs
-  ├── conversation_history
-  ├── blocked_users
-  └── other existing bot tables
+        |
+        v
+     app.main
+        |
+        +-- FastAPI and native admin routers
+        +-- Telegram bot lifecycle and handlers
+        +-- Gemini / Hugging Face / Edge TTS providers
+        +-- schedulers and bounded background tasks
+        |
+        v
+     Supabase
+        +-- bot_settings
+        +-- user_prefs
+        +-- conversation_history
+        +-- blocked_users
+        +-- scheduled_broadcasts
+        +-- feature_requests
+        +-- text_cache
+        +-- ai_api_keys
 ```
 
-There is no separate `app.worker` process and no Redis package/runtime dependency.
+Deploy one active application instance. Webhook replay state is process-local,
+so horizontal scaling requires a shared replay and coordination design.
 
-## Run
+## Requirements
 
-Python 3.12 is the deployment target.
+- Python 3.12
+- FFmpeg and Opus runtime libraries
+- A Telegram bot token
+- A Supabase project for persistent features
+- A Gemini API key for the default AI and OCR route
+
+Runtime dependencies are installed from `requirements.txt`. Edge TTS is bounded
+to `>=7.2.8,<8` because older endpoint implementations can receive HTTP 403 from
+Microsoft's synthesis service.
+
+## Installation
 
 ```bash
 python -m pip install -r requirements.txt
-python -m app.main
+python -m pip install -r requirements-dev.txt
 ```
 
-For container deployment, the included Dockerfile starts the same command and exposes port `8080`.
-
-Do **not** deploy a second `PROCESS_ROLE=worker` service. If an old deployment still sets `REDIS_URL`, remove it; the v4 runtime ignores it.
+Copy `.env.example` to `.env` and replace the placeholder values. Run
+`supabase_bot_setup.sql` in the target Supabase project if the application
+tables have not been created yet.
 
 ## Minimum environment
 
-Copy `.env.example` and configure at least the integrations you use:
-
 ```env
 SUPABASE_URL=https://YOUR_PROJECT.supabase.co
-SUPABASE_KEY=YOUR_SERVICE_ROLE_KEY
+SUPABASE_SERVICE_ROLE_KEY=YOUR_SERVICE_ROLE_KEY
 TELEGRAM_BOT_TOKEN=123456789:REPLACE_ME
 GEMINI_API_KEY=REPLACE_ME
+AI_PROVIDER=gemini
+GEMINI_MODEL=gemini-2.5-flash
 ADMIN_IDS=123456789
 ```
 
-`WEB_SECRET_KEY`, `FLASK_SECRET_KEY`, and `TELEGRAM_WEBHOOK_SECRET_TOKEN` are optional explicit overrides. Without them, stable domain-separated values are derived from the Telegram bot token. A generated webhook token is persisted to Supabase when possible.
+`SUPABASE_KEY` remains accepted as a compatibility alias, but a server-side
+service-role key is recommended for administrator tables protected by RLS.
+Never expose this key to the Mini App or another frontend.
 
-### Supabase requirement
+`WEB_SECRET_KEY`, `FLASK_SECRET_KEY`, and
+`TELEGRAM_WEBHOOK_SECRET_TOKEN` are optional explicit overrides. Stable,
+domain-separated values are derived from the Telegram bot token when possible,
+and the generated webhook token is persisted through `bot_settings`.
 
-The existing `public.bot_settings` table is used as the small persistent settings store. It must have at least:
+## AI, OCR, and TTS providers
 
-```sql
-create table if not exists public.bot_settings (
-  key text primary key,
-  value text not null,
-  updated_by bigint,
-  updated_at timestamptz not null default now()
-);
+Gemini is the default chat and OCR provider:
+
+```env
+AI_PROVIDER=gemini
+GEMINI_MODEL=gemini-2.5-flash
+OCR_PROVIDER=gemini
 ```
 
-Use a server-side service-role/secret key. Never expose it to the Mini App or frontend.
+Hugging Face is optional. Before setting `AI_PROVIDER=hf`, select an `HF_MODEL`
+that is currently served by an inference provider enabled for the account.
+Provider availability can change independently of this application. When an
+eligible provider fails, the internal provider manager can route to another
+healthy provider.
 
-## Admin Mini App
+Edge TTS is the default general speech path. Optional provider credentials and
+models can be configured with `HF_TOKEN`, `HF_TTS_SPACE`, `GRADIO_TOKEN`,
+`VOXCPM2_ENABLED`, and `VOXCPM2_SPACE`.
 
-Open `/miniapp/admin` from the configured Telegram Mini App launcher. The v4 UI adds:
+## Telegram runtime modes
 
-- English / Khmer switching with persisted preference
-- Telegram theme integration and haptic feedback
-- request timeout and degraded/offline status
-- partial refresh via `Promise.allSettled` so one failed endpoint does not blank the page
-- safe DOM rendering instead of HTML string injection
-- maintenance, runtime limits, provider reset, administrator management, and exact-origin CORS management
-- architecture status showing `Single process · No Redis · No worker`
-- live OCR/transcription/audio workload pressure and webhook replay diagnostics
+### Polling
 
-Telegram init data works through both `X-Telegram-Init-Data` and the Mini App `Authorization: Bearer <initData>` fallback.
+Polling is suitable for one active bot process and local deployments:
 
-## Health
+```env
+BOT_MODE=POLLING
+TELEGRAM_POLLING_DROP_PENDING_UPDATES=false
+```
 
-`GET /readyz` returns readiness for the single-process runtime and reports the settings-store backend. It no longer treats Redis or a worker heartbeat as readiness requirements.
+Pending updates are preserved by default across startup and runtime mode
+transitions. Set `TELEGRAM_POLLING_DROP_PENDING_UPDATES=true` only when an
+operator intentionally wants to discard a stale or broken backlog.
 
-Docker healthcheck:
+Only one process may poll a Telegram bot token at a time. Running multiple
+pollers causes Telegram `409 Conflict` responses.
+
+### Webhook
+
+Webhook mode requires a public HTTPS base URL:
+
+```env
+BOT_MODE=WEBHOOK
+TELEGRAM_WEBHOOK_URL=https://bot.example.com
+# TELEGRAM_WEBHOOK_SECRET_TOKEN=optional-explicit-secret
+```
+
+`RENDER_EXTERNAL_URL` can provide the webhook base URL when
+`TELEGRAM_WEBHOOK_URL` is not set. Webhook updates use process-local replay
+protection, short processing leases, completed-update TTLs, and ownership
+tokens. Keep `TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES=false` unless deliberately
+clearing Telegram's queue.
+
+## Run
+
+Preferred command:
+
+```bash
+python -m app.main
+```
+
+Compatibility launchers are also supported:
+
+```bash
+python main.py
+python app/main.py
+```
+
+The Docker image exposes port `8080` and runs `python -m app.main`.
+
+Do not deploy `PROCESS_ROLE=worker`. If an older environment still defines
+`REDIS_URL`, remove it; v4.2.2 ignores Redis.
+
+## Health and administration
+
+`GET /readyz` reports whether the single-process runtime has started and shows
+the settings backend, runtime role, provider scope, workload pressure, and
+webhook replay state.
 
 ```bash
 python -m app.healthcheck
 ```
 
-## Migration away from `legacy.py`
+The Telegram Mini App is served at `/miniapp/admin`. Its data routes require a
+trusted administrator and accept Telegram init data through either:
 
-The migration is intentionally staged. v4 moves these active responsibilities out of the monolith:
+- `X-Telegram-Init-Data: <initData>`
+- `Authorization: Bearer <initData>`
 
-- runtime ownership: `app/runtime.py`
-- runtime secrets: `app/core/security.py`
-- Telegram Mini App admin authorization: `app/core/telegram_auth.py`
-- administrator persistence/confirmation: `app/core/admin_management.py`
-- dynamic CORS policy: `app/core/cors.py`
-- persistent control-plane settings: `app/services/settings/store.py`
-- native admin runtime API: `app/api/v1/admin_runtime.py`
+The existing opaque administrator API bearer token remains supported. Cookie
+writes require the CSRF header generated for the administrator session.
 
-V4.1 moves the **live Telegram handler layer** out of `app/legacy.py` as well:
+Dynamic CORS accepts only exact HTTP or HTTPS origins. Wildcards, URL paths,
+credentials, queries, fragments, malformed ports, and invalid host syntax are
+rejected.
 
-- command handlers: `app/services/telegram/commands.py`
-- callback handlers: `app/services/telegram/callbacks.py`
-- photo/voice/audio/text handlers: `app/services/telegram/media.py`
-- rate-limit/security/stale-update/error guards: `app/services/telegram/guards.py`
-- deterministic handler registration: `app/services/telegram/routing.py`
+## Workload and replay controls
 
-`app/legacy.py` now keeps thin compatibility wrappers for those public names so older imports continue to work. Shared helper functions, caches, broadcast primitives, database helpers, and some older admin surfaces still live in the monolith. Extracted handlers use a narrow `app/services/telegram/_legacy_runtime.py` bridge to resolve those remaining dependencies until they are migrated to native services. No normal Telegram handler is registered directly from the monolith anymore.
+Conservative defaults are provided in `.env.example`:
 
-V4.2 additionally moves Telegram webhook replay ownership to `app/services/telegram/deduplication.py` and adds `app/services/telegram/workloads.py` for bounded expensive-work admission. The webhook replay store is intentionally **process-local**. Deploy one application instance for this architecture; multi-replica deployments need a shared database-backed replay/coordination design before horizontal scaling.
+```env
+TELEGRAM_OCR_MAX_CONCURRENT=2
+TELEGRAM_TRANSCRIBE_MAX_CONCURRENT=2
+TELEGRAM_AUDIO_MAX_CONCURRENT=2
+TELEGRAM_WORKLOAD_QUEUE_TIMEOUT_S=6
 
-## Removed in v4
+WEBHOOK_PROCESSING_TTL_S=120
+WEBHOOK_REPLAY_TTL_S=600
+WEBHOOK_REPLAY_MAX_ENTRIES=50000
+```
+
+The `/runtime` Telegram panel and Mini App show accepted, active, waiting, and
+rejected workloads plus webhook replay diagnostics.
+
+## Validation
+
+Use pytest as the canonical runner. Some extraction-boundary tests are
+pytest-style functions and are not collected by `unittest discover`.
+
+```bash
+python -m pytest -q
+python -m ruff check app tests
+python -m compileall -q app tests
+node --check static/admin/app.js
+```
+
+Current verified result:
+
+```text
+79 passed
+Ruff passed
+Python compilation passed
+Admin JavaScript syntax passed
+Edge TTS 7.2.8 live synthesis passed
+Gemini chat and OCR live checks passed
+Telegram identity and Supabase schema checks passed
+```
+
+Live broadcasts, destructive user-data actions, and scheduler mutations should
+be tested only in a staging bot/project because they affect real users or
+persistent data.
+
+## Migration status
+
+Runtime ownership, security, Mini App authorization, administrator management,
+dynamic CORS, settings storage, and native admin APIs live outside the legacy
+monolith. Telegram commands, callbacks, media handlers, guards, routing,
+workload admission, and webhook replay protection are also extracted into
+native modules under `app/services/telegram`.
+
+`app/legacy.py` remains a staged compatibility layer for database helpers,
+caches, broadcast primitives, and older administration surfaces. Thin wrappers
+preserve older imports while migration continues.
+
+Removed runtime components include:
 
 - `app/worker.py`
 - `app/services/jobs/`
 - Redis-backed Telegram delivery state
-- Redis dependency / Redis readiness checks
-- Admin job queue / worker controls
-- separate worker deployment instructions
+- Redis readiness and worker heartbeat requirements
+- administrator queue and worker controls
 
-OCR and transcription execute inline in the application process and keep the existing Telegram progress flow.
-
-## Validation
-
-Run:
-
-```bash
-python -m compileall -q app tests
-python -m unittest discover -s tests -v
-node --check static/admin/app.js
-```
-
-The v4.2 update package was validated in the available container with **37 focused tests plus 5 subtests**, along with Python compile checks and `node --check` for the Admin Mini App. Those tests cover authentication, admin management, CORS, runtime security, provider timeout/fallback, Telegram extraction boundaries, workload admission, webhook lease expiry/ownership, UI architecture checks, and single-process supervision.
-
-The container used for this review does not currently have the `python-telegram-bot` package installed, so tests that import the full Telegram SDK cannot be collected here. After applying the updater to the real repository/environment, install `requirements.txt` and run the complete project test suite before deployment.
-
-See `CODE_REVIEW_V4_2.md`, `UPDATE_V4_2_NOTES.md`, and the earlier v4/v4.1 notes for review findings and migration details.
+See `FINAL_RELEASE_V4_2_2.md`, `CODE_REVIEW_V4_2.md`, and
+`UPDATE_V4_2_NOTES.md` for release and migration history.

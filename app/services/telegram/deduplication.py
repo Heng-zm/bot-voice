@@ -139,9 +139,12 @@ class WebhookReplayStore:
             self._trim_locked(now)
             self._expire_uid_locked(uid, now)
             existing = self._items.get(uid)
-            if claim_token is not None:
-                if existing is None or existing.state != "processing" or existing.token != claim_token:
-                    return False
+            if claim_token is not None and (
+                existing is None
+                or existing.state != "processing"
+                or existing.token != claim_token
+            ):
+                return False
             self._items[uid] = _Lease("done", now, None)
             self._items.move_to_end(uid)
             self._trim_locked(now)

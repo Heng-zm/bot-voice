@@ -9,7 +9,10 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
-from app.core.telegram_auth import TelegramAdminAuthorizer, get_telegram_admin_authorizer
+from app.core.telegram_auth import (
+    TelegramAdminAuthorizer,
+    get_telegram_admin_authorizer,
+)
 from app.services.settings.store import SettingsStore, get_settings_store
 
 _AUDIT_KEY = "security:admin_audit:v2"
@@ -40,6 +43,8 @@ class SupabaseAdminManager:
 
     _confirmations: dict[str, tuple[str, int, int, float]] = {}
     _confirmation_lock = asyncio.Lock()
+    _mutation_lock = asyncio.Lock()
+    _audit_lock = asyncio.Lock()
     _audit_memory: deque[dict[str, Any]] = deque(maxlen=200)
 
     def __init__(
@@ -77,24 +82,35 @@ class SupabaseAdminManager:
 
     async def add(self, *, actor_id: int, target_id: int, confirmation_token: str) -> AdminMutationResult:
         await self._consume_confirmation("add", actor_id, target_id, confirmation_token)
-        current = set(await self.authorizer.load_ids(force=True))
-        changed = int(target_id) not in current
-        current.add(int(target_id))
-        persistent = await self.authorizer.save_ids(current, updated_by=int(actor_id))
+        actor_id, target_id = int(actor_id), int(target_id)
+        async with self._mutation_lock:
+            current = set(await self.authorizer.load_ids(force=True))
+            if actor_id not in current:
+                raise AdminConfirmationError(
+                    "The requesting administrator is no longer authorized."
+                )
+            changed = target_id not in current
+            current.add(target_id)
+            persistent = await self.authorizer.save_ids(current, updated_by=actor_id)
         await self._audit("add", actor_id, target_id, changed, persistent)
-        return AdminMutationResult("add", int(target_id), changed, persistent)
+        return AdminMutationResult("add", target_id, changed, persistent)
 
     async def remove(self, *, actor_id: int, target_id: int, confirmation_token: str) -> AdminMutationResult:
         await self._consume_confirmation("remove", actor_id, target_id, confirmation_token)
-        current = set(await self.authorizer.load_ids(force=True))
-        target_id = int(target_id)
-        if target_id in current and len(current) <= 1:
-            raise LastAdministratorError("The last administrator cannot be removed.")
-        changed = target_id in current
-        current.discard(target_id)
-        if not current:
-            raise LastAdministratorError("The last administrator cannot be removed.")
-        persistent = await self.authorizer.save_ids(current, updated_by=int(actor_id))
+        actor_id, target_id = int(actor_id), int(target_id)
+        async with self._mutation_lock:
+            current = set(await self.authorizer.load_ids(force=True))
+            if actor_id not in current:
+                raise AdminConfirmationError(
+                    "The requesting administrator is no longer authorized."
+                )
+            if target_id in current and len(current) <= 1:
+                raise LastAdministratorError("The last administrator cannot be removed.")
+            changed = target_id in current
+            current.discard(target_id)
+            if not current:
+                raise LastAdministratorError("The last administrator cannot be removed.")
+            persistent = await self.authorizer.save_ids(current, updated_by=actor_id)
         await self._audit("remove", actor_id, target_id, changed, persistent)
         return AdminMutationResult("remove", target_id, changed, persistent)
 
@@ -130,11 +146,16 @@ class SupabaseAdminManager:
             "persistent": bool(persistent),
             "timestamp": int(time.time()),
         }
-        self._audit_memory.append(entry)
-        previous = await self.store.get_json(_AUDIT_KEY, [])
-        rows = list(previous) if isinstance(previous, list) else []
-        rows.append(entry)
-        await self.store.set_json(_AUDIT_KEY, rows[-200:], updated_by=int(actor_id))
+        async with self._audit_lock:
+            self._audit_memory.append(entry)
+            previous = await self.store.get_json(_AUDIT_KEY, [])
+            rows = list(previous) if isinstance(previous, list) else []
+            rows.append(entry)
+            await self.store.set_json(
+                _AUDIT_KEY,
+                rows[-200:],
+                updated_by=int(actor_id),
+            )
 
 
 __all__ = [

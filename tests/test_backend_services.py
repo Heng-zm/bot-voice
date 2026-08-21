@@ -3,7 +3,11 @@ from __future__ import annotations
 import asyncio
 import unittest
 
-from app.core.admin_management import LastAdministratorError, SupabaseAdminManager
+from app.core.admin_management import (
+    AdminConfirmationError,
+    LastAdministratorError,
+    SupabaseAdminManager,
+)
 from app.core.telegram_auth import TelegramAdminAuthorizer
 from app.services.ai.providers import NoProviderAvailable, ProviderManager
 from app.services.settings.store import SettingsStore
@@ -53,6 +57,44 @@ class AdminManagementTests(unittest.IsolatedAsyncioTestCase):
                 actor_id=42,
                 target_id=42,
             )
+
+    async def test_removed_actor_cannot_use_an_existing_confirmation(self) -> None:
+        await self.authorizer.save_ids({42, 99})
+        token, _ttl = await self.manager.create_confirmation(
+            action="add",
+            actor_id=42,
+            target_id=7,
+        )
+        await self.authorizer.save_ids({99})
+        with self.assertRaises(AdminConfirmationError):
+            await self.manager.add(
+                actor_id=42,
+                target_id=7,
+                confirmation_token=token,
+            )
+
+    async def test_concurrent_admin_additions_do_not_lose_an_id(self) -> None:
+        class SlowWriteStore(SettingsStore):
+            async def set_json(self, key, value, *, updated_by=None):
+                if key == "security:admin_user_ids:v2":
+                    await asyncio.sleep(0.01)
+                return await super().set_json(key, value, updated_by=updated_by)
+
+        store = SlowWriteStore()
+        await SettingsStore.set_json(store, "security:admin_user_ids:v2", [42])
+        authorizer = TelegramAdminAuthorizer().configure(settings_store=store)
+        manager = SupabaseAdminManager(store, authorizer)
+        first, _ = await manager.create_confirmation(
+            action="add", actor_id=42, target_id=7
+        )
+        second, _ = await manager.create_confirmation(
+            action="add", actor_id=42, target_id=8
+        )
+        await asyncio.gather(
+            manager.add(actor_id=42, target_id=7, confirmation_token=first),
+            manager.add(actor_id=42, target_id=8, confirmation_token=second),
+        )
+        self.assertEqual((7, 8, 42), await manager.list_ids())
 
 
 class ProviderManagerTests(unittest.IsolatedAsyncioTestCase):

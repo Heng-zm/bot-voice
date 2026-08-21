@@ -20,13 +20,13 @@ from app import legacy as _legacy
 from app.core.cors import configure_dynamic_cors_store, get_dynamic_cors_store
 from app.core.telegram_auth import configure_telegram_admin_authorizer
 from app.services.ai.providers import get_provider_manager
-from app.services.telegram.deduplication import get_webhook_replay_snapshot
-from app.services.telegram.workloads import get_telegram_workload_limiter
 from app.services.settings.store import (
     SettingsStore,
     configure_settings_store,
     reset_settings_store,
 )
+from app.services.telegram.deduplication import get_webhook_replay_snapshot
+from app.services.telegram.workloads import get_telegram_workload_limiter
 
 logger = logging.getLogger(__name__)
 RuntimeRole = Literal["web", "combined"]

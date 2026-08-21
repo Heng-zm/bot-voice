@@ -103,7 +103,7 @@ def test_runtime_bridge_does_not_treat_attribute_names_as_legacy_globals() -> No
         namespace,
     )
     sample = namespace["sample"]
-    dependencies = getattr(sample, "__legacy_dependencies__")
+    dependencies = sample.__legacy_dependencies__
     assert "value" not in dependencies
     assert "strip" not in dependencies
 

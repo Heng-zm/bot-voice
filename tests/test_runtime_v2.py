@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from app.services.ai.language import _detect_lang, _language_display
@@ -23,7 +23,7 @@ class ExtractedUtilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("km", _detect_lang("សួស្តី"))
         self.assertEqual("ar", _detect_lang("مرحبا"))
         self.assertEqual(("🇰🇭", "Khmer"), _language_display("km"))
-        utc_value = datetime(2026, 8, 5, 4, 0, tzinfo=timezone.utc)
+        utc_value = datetime(2026, 8, 5, 4, 0, tzinfo=UTC)
         local_value = _to_local_time(utc_value)
         self.assertEqual(11, local_value.hour)
         self.assertEqual(utc_value, _local_to_utc(local_value))
