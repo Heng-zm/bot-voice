@@ -6208,10 +6208,11 @@ def web_admin_user_detail(user_id: int):
         chat_id = h.get("chat_id") or user_id
         content_raw = _history_compact_text(h.get("content") or h.get("original_text") or "", 1100)
         content = _web_h(content_raw)
+        content_html = content or '<span class="muted">empty</span>'
         history_html.append(
             "<div class='history-item'>"
             f"<div class='history-meta'><span>{_web_h(created)}</span><span>chat <code>{_web_h(chat_id)}</code></span><span>msg <code>{_web_h(msg_id)}</code></span><span>{_web_badge('text_cache','info')}</span></div>"
-            f"<div class='whitespace-pre-wrap'>{content or '<span class=\"muted\">empty</span>'}</div>"
+            f"<div class='whitespace-pre-wrap'>{content_html}</div>"
             "</div>"
         )
     if not history_html:

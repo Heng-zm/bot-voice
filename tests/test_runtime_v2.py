@@ -26,6 +26,38 @@ class ExtractedUtilityTests(unittest.IsolatedAsyncioTestCase):
                     feature_version=(3, 11),
                 )
 
+    def test_fstring_expressions_avoid_backslashes_for_python_311(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        sources = [
+            *root.joinpath("app").rglob("*.py"),
+            *root.joinpath("tests").rglob("*.py"),
+        ]
+
+        def source_segment(lines: list[str], node: ast.FormattedValue) -> str:
+            start = node.lineno - 1
+            end = node.end_lineno - 1
+            if start == end:
+                encoded = lines[start].encode()
+                return encoded[node.col_offset : node.end_col_offset].decode()
+            parts = [lines[start].encode()[node.col_offset :].decode()]
+            parts.extend(lines[start + 1 : end])
+            parts.append(lines[end].encode()[: node.end_col_offset].decode())
+            return "\n".join(parts)
+
+        for source_path in sources:
+            source = source_path.read_text(encoding="utf-8")
+            lines = source.splitlines()
+            tree = ast.parse(source, filename=str(source_path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.FormattedValue):
+                    continue
+                expression = source_segment(lines, node)
+                with self.subTest(
+                    source=source_path.relative_to(root),
+                    line=node.lineno,
+                ):
+                    self.assertNotIn("\\", expression)
+
     async def test_atomic_file_helpers_and_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "data.bin"
