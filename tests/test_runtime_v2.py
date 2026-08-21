@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import tempfile
 import unittest
 from datetime import UTC, datetime
@@ -11,6 +12,20 @@ from app.utils.time import _fmt_local_dt, _local_to_utc, _to_local_time
 
 
 class ExtractedUtilityTests(unittest.IsolatedAsyncioTestCase):
+    def test_python_sources_parse_with_deployment_python_311_grammar(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        sources = [
+            *root.joinpath("app").rglob("*.py"),
+            *root.joinpath("tests").rglob("*.py"),
+        ]
+        for source in sources:
+            with self.subTest(source=source.relative_to(root)):
+                ast.parse(
+                    source.read_text(encoding="utf-8"),
+                    filename=str(source),
+                    feature_version=(3, 11),
+                )
+
     async def test_atomic_file_helpers_and_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "data.bin"

@@ -4954,13 +4954,14 @@ def _web_broadcast_job_rows_html(csrf: str | None = None, *, include_actions: bo
             controls += f"<form class='inline-form' method='post' action='/admin/broadcast/action' data-confirm='Cancel this running broadcast job?'><input type='hidden' name='csrf_token' value='{csrf}'><input type='hidden' name='job_id' value='{_web_h(jid)}'><input type='hidden' name='action' value='cancel'><button class='danger'>Cancel</button></form>"
         mode_label = _broadcast_parse_mode_label(row.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO)
         link_preview = _broadcast_normalize_link_preview(row.get("link_preview"), True)
+        controls_html = controls or '<span class="muted">-</span>'
         rows.append(
             f"<tr><td><code>{_web_h(jid)}</code><br><span class='muted'>{_web_h(row.get('error') or row.get('note') or '')}</span><br>{_web_badge(mode_label, 'info')} {_web_badge('URL preview' if link_preview else 'No URL preview', 'ok' if link_preview else 'muted')}</td>"
             f"<td>{_web_status_badge(status)}</td>"
             f"<td><span class='nowrap'>{sent}/{total}</span><br>{_web_progress_bar(processed, total)}</td>"
             f"<td>{blocked}</td><td>{failed}</td>"
             f"<td>{_web_h(_web_dt(row.get('started_at') or row.get('created_at') or ''))}</td>"
-            f"<td><div class='actions job-controls'>{controls or '<span class=\"muted\">-</span>'}</div></td></tr>"
+            f"<td><div class='actions job-controls'>{controls_html}</div></td></tr>"
         )
     return "".join(rows) or '<tr><td colspan=7><div class="empty">No jobs yet.</div></td></tr>'
 

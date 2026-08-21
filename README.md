@@ -51,7 +51,7 @@ so horizontal scaling requires a shared replay and coordination design.
 
 ## Requirements
 
-- Python 3.12
+- Python 3.11 or 3.12
 - FFmpeg and Opus runtime libraries
 - A Telegram bot token
 - A Supabase project for persistent features
@@ -223,7 +223,7 @@ node --check static/admin/app.js
 Current verified result:
 
 ```text
-79 passed
+80 passed
 Ruff passed
 Python compilation passed
 Admin JavaScript syntax passed

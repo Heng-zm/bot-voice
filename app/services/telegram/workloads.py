@@ -13,9 +13,10 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TypeVar
 
 WorkloadKind = Literal["ocr", "transcribe", "audio"]
+_T = TypeVar("_T")
 
 
 def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 32) -> int:
@@ -146,10 +147,10 @@ def get_telegram_workload_limiter() -> TelegramWorkloadLimiter:
     return _LIMITER
 
 
-async def run_telegram_workload[T](
+async def run_telegram_workload(
     kind: WorkloadKind,
-    factory: Callable[[], Awaitable[T]],
-) -> T:
+    factory: Callable[[], Awaitable[_T]],
+) -> _T:
     limiter = get_telegram_workload_limiter()
     async with limiter.slot(kind):
         return await factory()
