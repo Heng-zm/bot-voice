@@ -16457,6 +16457,7 @@ _AUDIO_FILE_FRAMES = [
 _PROGRESS_BAR_WIDTH = 12
 _PROGRESS_EDIT_MIN_INTERVAL_S = 0.9
 _PROGRESS_PERCENT_STEP = 3
+_PROGRESS_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
 
 def _progress_clamp(value: Any, default: int = 0) -> int:
@@ -16496,7 +16497,8 @@ class TelegramProgress:
 
     __slots__ = (
         "bot", "chat_id", "message", "title", "started_at", "percent",
-        "stage", "detail", "minimal", "last_text", "last_edit_at", "closed", "lock",
+        "stage", "detail", "minimal", "spinner_index", "animation_task",
+        "last_text", "last_edit_at", "closed", "lock",
     )
 
     def __init__(
@@ -16517,6 +16519,8 @@ class TelegramProgress:
         self.stage = "កំពុងចាប់ផ្ដើម"
         self.detail = ""
         self.minimal = bool(minimal)
+        self.spinner_index = 0
+        self.animation_task: asyncio.Task | None = None
         self.last_text = ""
         self.last_edit_at = 0.0
         self.closed = False
@@ -16555,6 +16559,8 @@ class TelegramProgress:
             )
         progress.last_text = initial_text
         progress.last_edit_at = time.monotonic()
+        if progress.minimal and progress.message is not None:
+            progress._start_animation()
         return progress
 
     @classmethod
@@ -16567,7 +16573,8 @@ class TelegramProgress:
     def render(self) -> str:
         if self.minimal:
             return "\n".join((
-                str(self.stage or "កំពុងបង្កើតសំឡេង"),
+                f"{_PROGRESS_SPINNER_FRAMES[self.spinner_index % len(_PROGRESS_SPINNER_FRAMES)]} "
+                f"{self.stage or 'កំពុងបង្កើតសំឡេង'}",
                 f"[{_progress_bar(self.percent)}] {self.percent}%",
             ))
         parts = [
@@ -16581,6 +16588,40 @@ class TelegramProgress:
             parts.append(f"ℹ️ {self.detail}")
         parts.append(f"⏱️ {_progress_elapsed_text(self.started_at)}")
         return "\n".join(parts)
+
+    def _start_animation(self) -> None:
+        if self.animation_task is None or self.animation_task.done():
+            self.animation_task = asyncio.create_task(
+                self._animate_minimal(),
+                name="telegram-progress-spinner",
+            )
+
+    async def _animate_minimal(self) -> None:
+        try:
+            while not self.closed:
+                await asyncio.sleep(0.8)
+                async with self.lock:
+                    if self.closed:
+                        return
+                    self.spinner_index += 1
+                    rendered = self.render()
+                    if rendered == self.last_text:
+                        continue
+                    await self._edit_or_send(rendered)
+                    self.last_text = rendered
+                    self.last_edit_at = time.monotonic()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Progress spinner stopped: %s", exc)
+
+    async def _stop_animation(self) -> None:
+        task = self.animation_task
+        self.animation_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await task
 
     async def _edit_or_send(
         self,
@@ -16654,6 +16695,7 @@ class TelegramProgress:
         delete_after_s: float | None = None,
         disable_web_page_preview: bool = True,
     ) -> Any | None:
+        await self._stop_animation()
         async with self.lock:
             if self.closed:
                 return self.message
