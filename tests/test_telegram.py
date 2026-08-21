@@ -367,6 +367,40 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
             legacy._TELEGRAM_RUNTIME_PHASE = original_phase
             legacy._TELEGRAM_RUNTIME_STATUS_CHANGED_AT = original_changed_at
 
+    async def test_admin_home_shows_live_telegram_status(self) -> None:
+        original_status = legacy._TELEGRAM_RUNTIME_STATUS
+        original_phase = legacy._TELEGRAM_RUNTIME_PHASE
+        original_changed_at = legacy._TELEGRAM_RUNTIME_STATUS_CHANGED_AT
+        try:
+            legacy._set_telegram_runtime_status("loading", "starting_polling")
+            settings = dict(legacy.BOT_SETTING_DEFAULTS)
+            with (
+                patch.object(
+                    legacy,
+                    "_admin_summary_counts",
+                    AsyncMock(return_value={"total_users": 3, "blocked_users": 1, "pending_sched": 0, "active_api_keys": 1}),
+                ),
+                patch.object(
+                    legacy,
+                    "get_bot_settings_async",
+                    AsyncMock(return_value=(settings, {"db_ok": True})),
+                ),
+                patch.object(legacy, "_admin_smart_alert_lines", AsyncMock(return_value=[])),
+                patch.object(legacy, "_admin_error_center_total_count", return_value=0),
+                patch.object(legacy, "_runtime_performance_snapshot", return_value={}),
+                patch.object(legacy, "_optimization_score", return_value=(95, "healthy")),
+            ):
+                text = await legacy._admin_home_text(42)
+
+            self.assertIn("Loading", text)
+            self.assertIn("starting_polling", text)
+            self.assertIn("Telegram", text)
+            self.assertNotIn("Redis", text)
+        finally:
+            legacy._TELEGRAM_RUNTIME_STATUS = original_status
+            legacy._TELEGRAM_RUNTIME_PHASE = original_phase
+            legacy._TELEGRAM_RUNTIME_STATUS_CHANGED_AT = original_changed_at
+
     async def test_welcome_message_supports_image_and_navigation_buttons(self) -> None:
         message = SimpleNamespace(
             reply_photo=AsyncMock(return_value=SimpleNamespace(message_id=1)),

@@ -22107,6 +22107,21 @@ async def _admin_home_text(admin_id: int, title: str = ADMIN_UI_TITLE) -> str:
     settings, settings_status = await get_bot_settings_async()
     ffmpeg_ok = bool(_FFMPEG_EXE and os.path.exists(_FFMPEG_EXE))
     mode = _run_state_bot_mode() if "_run_state_bot_mode" in globals() else str(globals().get("BOT_MODE", "POLLING"))
+    telegram_runtime = _telegram_runtime_status_snapshot()
+    telegram_status = str(telegram_runtime.get("status") or "offline").lower()
+    telegram_status_labels = {
+        "loading": "⏳ Loading",
+        "online": "✅ Online",
+        "standby": "🟡 Standby",
+        "stopping": "🛑 Stopping",
+        "error": "❌ Error",
+        "offline": "⚫ Offline",
+    }
+    telegram_status_label = telegram_status_labels.get(
+        telegram_status,
+        f"⚠️ {telegram_status.title()}",
+    )
+    telegram_phase = html.escape(str(telegram_runtime.get("phase") or telegram_status))
     maintenance = _setting_bool_from(settings, "maintenance_mode", False)
     tts_on = _setting_bool_from(settings, "tts_enabled", True)
     ocr_on = _setting_bool_from(settings, "ocr_enabled", True)
@@ -22126,7 +22141,8 @@ async def _admin_home_text(admin_id: int, title: str = ADMIN_UI_TITLE) -> str:
     return (
         f"{title}\n"
         f"<code>/admin › overview</code>\n\n"
-        f"Status: <b>✅ Online</b> · Mode: <code>{html.escape(str(mode))}</code>\n"
+        f"Status: <b>{telegram_status_label}</b> · Mode: <code>{html.escape(str(mode))}</code>\n"
+        f"Telegram phase: <code>{telegram_phase}</code>\n"
         f"Uptime: <b>{html.escape(_format_uptime())}</b>\n"
         f"Optimize: <b>{html.escape(optimize_score)}/100</b> · Errors: <b>{error_count}</b>\n\n"
         "<b>Smart Alerts</b>\n"
@@ -22144,7 +22160,7 @@ async def _admin_home_text(admin_id: int, title: str = ADMIN_UI_TITLE) -> str:
         f"🗄 Supabase: <b>{_ok_bad(bool(supabase))}</b> · "
         f"⚙️ Settings: <b>{_ok_bad(bool(settings_status.get('db_ok')), 'READY', 'MEMORY')}</b>\n"
         f"🎧 FFmpeg: <b>{_ok_bad(ffmpeg_ok, 'OK', 'ERROR')}</b> · "
-        f"🧰 Redis: <b>{_ok_bad(bool(globals().get('redis_client')))}</b>\n\n"
+        f"📡 Telegram: <b>{_ok_bad(bool(telegram_runtime.get('ready')), 'READY', 'STARTING')}</b>\n\n"
         "ចុចប៊ូតុងខាងក្រោម ដើម្បីគ្រប់គ្រង Bot។"
     )
 
