@@ -21,6 +21,7 @@ the dedicated worker service are no longer part of the runtime.
 - Bounded OCR, transcription, and audio workload admission
 - Batched runtime-setting startup reads and cache-first blocked-user checks
 - Dedicated bounded database execution for Telegram admin and schedule actions
+- Fast-path TTS requests skip history I/O unless resolution is needed
 - English and Khmer administration interface
 - Polling startup that preserves queued Telegram updates by default
 

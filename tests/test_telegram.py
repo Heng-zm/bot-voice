@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 import warnings
 from datetime import UTC, datetime
@@ -516,6 +517,23 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
 
         legacy._release_tts_request(user_id)
         self.assertFalse(legacy._tts_request_reserved(user_id))
+
+    async def test_normal_tts_text_skips_history_when_ai_resolver_is_disabled(self) -> None:
+        user_id = 9_999_010
+        with (
+            patch.object(legacy, "TTS_RESOLVER_AI_ENABLED", False),
+            patch.object(legacy, "_hist_cache_get") as history_cache,
+            patch.object(legacy, "db_history_fetch") as history_fetch,
+        ):
+            result = await legacy.resolve_tts_text(
+                user_id,
+                "A normal sentence",
+                asyncio.get_running_loop(),
+            )
+
+        self.assertEqual("A normal sentence", result)
+        history_cache.assert_not_called()
+        history_fetch.assert_not_called()
 
     async def test_gender_and_speed_updates_remain_in_local_preferences(self) -> None:
         user_id = 9_999_003

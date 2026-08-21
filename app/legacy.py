@@ -12311,7 +12311,9 @@ async def get_user_prefs_async(user_id: int) -> dict:
     user_id = int(user_id)
     defaults = dict(DEFAULT_USER_PREFS)
 
-    cached = await _async_get_cached_prefs(user_id)
+    # The cache is protected by a thread lock, so a hit does not need an
+    # asyncio lock/context switch on every incoming Telegram message.
+    cached = _get_cached_prefs_sync(user_id)
     if cached is not None:
         return cached
 
@@ -13563,6 +13565,8 @@ _bot_settings_cache: dict = {
     "status": {"db_ok": False, "error": "not loaded", "memory": True},
     "ts": 0.0,
 }
+_bot_settings_cache_lock: asyncio.Lock | None = None
+_bot_settings_cache_lock_loop: asyncio.AbstractEventLoop | None = None
 
 _blocked_users_memory: set[int] = set()
 _blocked_user_cache: OrderedDict[int, tuple[bool, float]] = OrderedDict()
@@ -13732,27 +13736,39 @@ async def get_bot_settings_async(force: bool = False) -> tuple[dict[str, str], d
     if not force and now - float(_bot_settings_cache.get("ts") or 0.0) < _SETTINGS_CACHE_TTL_S:
         return dict(_bot_settings_cache["data"]), dict(_bot_settings_cache["status"])
 
-    redis_key = _bot_settings_redis_key()
-    if not force:
-        cached_map = await _redis_cache_get_many_json([redis_key])
-        payload = cached_map.get(redis_key)
-        cached_data = _cache_payload_value(payload, None)
-        if isinstance(cached_data, dict):
-            data = dict(BOT_SETTING_DEFAULTS)
-            data.update({k: str(v) for k, v in cached_data.items() if k in BOT_SETTING_DEFAULTS})
-            status = {"db_ok": True, "error": "", "memory": False, "cache": "redis"}
-            _bot_settings_cache["data"] = dict(data)
-            _bot_settings_cache["status"] = dict(status)
-            _bot_settings_cache["ts"] = now
-            return data, status
+    global _bot_settings_cache_lock, _bot_settings_cache_lock_loop
+    loop = asyncio.get_running_loop()
+    if _bot_settings_cache_lock is None or _bot_settings_cache_lock_loop is not loop:
+        _bot_settings_cache_lock = asyncio.Lock()
+        _bot_settings_cache_lock_loop = loop
 
-    data, status = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, db_bot_settings_fetch_all)
-    _bot_settings_cache["data"] = dict(data)
-    _bot_settings_cache["status"] = dict(status)
-    _bot_settings_cache["ts"] = now
-    if status.get("db_ok") or not supabase:
-        await _redis_cache_set_many_json({redis_key: _cache_payload(dict(data))}, CACHE_ASIDE_DEFAULT_TTL_S)
-    return data, status
+    async with _bot_settings_cache_lock:
+        # Another request may have refreshed the cache while this one waited.
+        now = time.monotonic()
+        if not force and now - float(_bot_settings_cache.get("ts") or 0.0) < _SETTINGS_CACHE_TTL_S:
+            return dict(_bot_settings_cache["data"]), dict(_bot_settings_cache["status"])
+
+        redis_key = _bot_settings_redis_key()
+        if not force:
+            cached_map = await _redis_cache_get_many_json([redis_key])
+            payload = cached_map.get(redis_key)
+            cached_data = _cache_payload_value(payload, None)
+            if isinstance(cached_data, dict):
+                data = dict(BOT_SETTING_DEFAULTS)
+                data.update({k: str(v) for k, v in cached_data.items() if k in BOT_SETTING_DEFAULTS})
+                status = {"db_ok": True, "error": "", "memory": False, "cache": "redis"}
+                _bot_settings_cache["data"] = dict(data)
+                _bot_settings_cache["status"] = dict(status)
+                _bot_settings_cache["ts"] = now
+                return data, status
+
+        data, status = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, db_bot_settings_fetch_all)
+        _bot_settings_cache["data"] = dict(data)
+        _bot_settings_cache["status"] = dict(status)
+        _bot_settings_cache["ts"] = now
+        if status.get("db_ok") or not supabase:
+            await _redis_cache_set_many_json({redis_key: _cache_payload(dict(data))}, CACHE_ASIDE_DEFAULT_TTL_S)
+        return data, status
 
 
 def _cache_bot_setting_runtime_value(key: str, value: str) -> None:
@@ -14511,6 +14527,36 @@ async def resolve_tts_text(
     if not raw_text:
         return raw_text
 
+    lower = raw_text.lower()
+    compact = lower.replace(" ", "")
+    repeat_phrases = (
+        "read again", "read that again", "say again", "repeat", "again",
+        "អានម្តងទៀត", "អានម្ដងទៀត", "ម្តងទៀត", "ម្ដងទៀត",
+        "អានឡើងវិញ", "និយាយម្តងទៀត", "និយាយម្ដងទៀត",
+    )
+    repeat_requested = any(p in lower for p in repeat_phrases) or any(
+        p in compact for p in ("អានម្តងទៀត", "អានម្ដងទៀត", "ម្តងទៀត", "ម្ដងទៀត")
+    )
+    what_user_said_phrases = (
+        "what did i say", "what i said", "my last message",
+        "អ្វីដែលខ្ញុំនិយាយ", "ខ្ញុំនិយាយអ្វី", "សារចុងក្រោយរបស់ខ្ញុំ",
+    )
+    last_user_requested = any(p in lower for p in what_user_said_phrases) or any(
+        p in compact for p in ("ខ្ញុំនិយាយអ្វី", "អ្វីដែលខ្ញុំនិយាយ")
+    )
+    ai_resolver_available = bool(
+        TTS_RESOLVER_AI_ENABLED
+        and bot_setting_bool_cached("ai_resolver_enabled", True)
+        and _gemini
+        and _AI_SEMAPHORE is not None
+    )
+
+    # Ordinary text is spoken verbatim by default. Avoid a history DB lookup
+    # unless this message explicitly needs local history resolution or the
+    # optional AI resolver is enabled.
+    if not repeat_requested and not last_user_requested and not ai_resolver_available:
+        return raw_text
+
     # Load history (cache-first, DB fallback)
     history = _hist_cache_get(user_id)
     if history is None:
@@ -14534,37 +14580,19 @@ async def resolve_tts_text(
                 return content
         return None
 
-    lower   = raw_text.lower()
-    compact = lower.replace(" ", "")
-
-    repeat_phrases = (
-        "read again", "read that again", "say again", "repeat", "again",
-        "អានម្តងទៀត", "អានម្ដងទៀត", "ម្តងទៀត", "ម្ដងទៀត",
-        "អានឡើងវិញ", "និយាយម្តងទៀត", "និយាយម្ដងទៀត",
-    )
-    if any(p in lower for p in repeat_phrases) or any(
-        p in compact for p in ("អានម្តងទៀត", "អានម្ដងទៀត", "ម្តងទៀត", "ម្ដងទៀត")
-    ):
+    if repeat_requested:
         last_bot = _last_by_role("assistant")
         if last_bot:
             logger.info(f"resolve_tts_text local repeat for user {user_id}")
             return last_bot
 
-    what_user_said_phrases = (
-        "what did i say", "what i said", "my last message",
-        "អ្វីដែលខ្ញុំនិយាយ", "ខ្ញុំនិយាយអ្វី", "សារចុងក្រោយរបស់ខ្ញុំ",
-    )
-    if any(p in lower for p in what_user_said_phrases) or any(
-        p in compact for p in ("ខ្ញុំនិយាយអ្វី", "អ្វីដែលខ្ញុំនិយាយ")
-    ):
+    if last_user_requested:
         last_user = _last_by_role("user")
         if last_user:
             logger.info(f"resolve_tts_text local last-user for user {user_id}")
             return last_user
 
-    if not TTS_RESOLVER_AI_ENABLED or not bot_setting_bool_cached("ai_resolver_enabled", True):
-        return raw_text
-    if not _gemini:
+    if not ai_resolver_available:
         return raw_text
 
     semaphore = _AI_SEMAPHORE
