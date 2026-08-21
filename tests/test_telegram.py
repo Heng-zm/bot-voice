@@ -136,9 +136,12 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
             classify_callback("user_broken", speed_callbacks=speeds)
         )
         self.assertTrue(callback_requires_tts_access("speed", "spd_1.0"))
-        self.assertFalse(
-            callback_requires_tts_access("voxcpm2", "voxcpm2:refresh")
+        self.assertEqual(
+            "welcome_profile",
+            classify_callback("welcome_profile", speed_callbacks=speeds),
         )
+        self.assertFalse(callback_requires_tts_access("welcome_profile", "welcome_profile"))
+        self.assertIsNone(classify_callback("voxcpm2:refresh", speed_callbacks=speeds))
 
     def test_broadcast_markdown_link_and_preview_directives(self) -> None:
         stored = legacy._broadcast_apply_option_directives(
@@ -326,22 +329,55 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(allowed)
         message.reply_text.assert_awaited_once()
 
-    async def test_disabling_tts_clears_pending_voxcpm2_input(self) -> None:
-        context = SimpleNamespace(
-            user_data={"voxcpm2_state": legacy.VOXCPM2_WAIT_CONTROL},
+    def test_bot_lifecycle_status_distinguishes_loading_from_online(self) -> None:
+        original_status = legacy._TELEGRAM_RUNTIME_STATUS
+        original_phase = legacy._TELEGRAM_RUNTIME_PHASE
+        original_changed_at = legacy._TELEGRAM_RUNTIME_STATUS_CHANGED_AT
+        try:
+            legacy._set_telegram_runtime_status("loading", "starting_polling")
+            loading = legacy._telegram_runtime_status_snapshot()
+            self.assertEqual("loading", loading["status"])
+            self.assertFalse(loading["active"])
+
+            legacy._set_telegram_runtime_status("online", "polling")
+            online = legacy._telegram_runtime_status_snapshot()
+            self.assertEqual("online", online["status"])
+            self.assertTrue(online["active"])
+        finally:
+            legacy._TELEGRAM_RUNTIME_STATUS = original_status
+            legacy._TELEGRAM_RUNTIME_PHASE = original_phase
+            legacy._TELEGRAM_RUNTIME_STATUS_CHANGED_AT = original_changed_at
+
+    async def test_welcome_message_supports_image_and_navigation_buttons(self) -> None:
+        message = SimpleNamespace(
+            reply_photo=AsyncMock(return_value=SimpleNamespace(message_id=1)),
+            reply_text=AsyncMock(),
         )
+        settings = {
+            **legacy.BOT_SETTING_DEFAULTS,
+            "welcome_message": "Welcome to the bot",
+            "welcome_photo_file_id": "telegram-photo-id",
+        }
         with patch.object(
             legacy,
-            "_ensure_user_allowed",
-            AsyncMock(return_value=False),
+            "get_bot_settings_async",
+            AsyncMock(return_value=(settings, {"db_ok": True})),
         ):
-            allowed = await legacy._ensure_voxcpm2_allowed(
-                SimpleNamespace(),
-                context,
-            )
+            await legacy._send_welcome_message(message)
 
-        self.assertFalse(allowed)
-        self.assertNotIn("voxcpm2_state", context.user_data)
+        message.reply_photo.assert_awaited_once()
+        call = message.reply_photo.await_args
+        self.assertEqual("telegram-photo-id", call.kwargs["photo"])
+        self.assertEqual("Welcome to the bot", call.kwargs["caption"])
+        buttons = [
+            button
+            for row in call.kwargs["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        self.assertTrue(any(button.url == "https://pay-coffee-topaz.vercel.app/" for button in buttons))
+        self.assertTrue(any(button.url == "https://t.me/m11mmm112" for button in buttons))
+        self.assertTrue(any(button.callback_data == "welcome_profile" for button in buttons))
+        message.reply_text.assert_not_awaited()
 
     async def test_setting_toggle_updates_runtime_cache_immediately(self) -> None:
         old_memory = dict(legacy._bot_settings_memory)

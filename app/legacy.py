@@ -118,7 +118,6 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardRemove,
     WebAppInfo,
 )
 from telegram.error import (
@@ -2115,51 +2114,9 @@ async def run_fastapi():
     await server.serve()
 
 
-async def keep_alive_async(stop_event: asyncio.Event | None = None):
-    """Self-ping every 4 min with non-blocking HTTPX instead of requests."""
-    logger_ka = logging.getLogger("keep_alive")
-    render_url = (os.environ.get("RENDER_EXTERNAL_URL") or getattr(SETTINGS, "RENDER_EXTERNAL_URL", "") or "").strip().rstrip("/")
-    if not render_url:
-        logger_ka.warning("RENDER_EXTERNAL_URL not set — self-ping disabled.")
-        return
-
-    await asyncio.sleep(10)
-    headers = {"User-Agent": "Mozilla/5.0 (AsyncKeepAlive/2.0)", "Accept": "text/plain,*/*"}
-
-    async with httpx.AsyncClient(timeout=10, follow_redirects=True, limits=_make_httpx_limits_from_run_state()) as client:
-        while stop_event is None or not stop_event.is_set():
-            urls = [render_url]
-            if not render_url.endswith("/ping"):
-                urls.append(f"{render_url}/ping")
-
-            ok = False
-            for url in urls:
-                try:
-                    r = await client.get(url, headers=headers)
-                    if 200 <= r.status_code < 400:
-                        logger_ka.info(f"Keep-alive OK -> {r.status_code} {url}")
-                        ok = True
-                        break
-                    logger_ka.warning(f"Keep-alive non-OK -> {r.status_code} {url}")
-                except Exception as e:
-                    logger_ka.warning(f"Keep-alive failed for {url}: {e}")
-
-            if not ok:
-                logger_ka.warning("Keep-alive failed for all URLs. Check RENDER_EXTERNAL_URL.")
-
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=240) if stop_event else await asyncio.sleep(240)
-            except asyncio.TimeoutError:
-                pass
-
-
 def run_flask():
     """Backward-compatible alias. Prefer run_fastapi()."""
     asyncio.run(run_fastapi())
-
-def keep_alive():
-    """Backward-compatible alias. Prefer keep_alive_async()."""
-    asyncio.run(keep_alive_async())
 
 # ── AI Assistant REST API ──────────────────────────────────────────────────
 
@@ -5158,7 +5115,7 @@ def _web_env_check_rows() -> str:
         ("HF_TOKEN / GEMINI_API_KEY", bool(os.environ.get("HF_TOKEN") or os.environ.get("GEMINI_API_KEY")), "Required for AI/OCR"),
         ("gradio_client", GradioClient is not None, "Required for Khmer HF Space TTS"),
         ("HF_TTS_SPACE", bool(HF_TTS_SPACE), "Default: mrrtmob/khmer-tts"),
-        ("RENDER_EXTERNAL_URL", bool(os.environ.get("RENDER_EXTERNAL_URL")), "Recommended for keep-alive"),
+        ("RENDER_EXTERNAL_URL", bool(os.environ.get("RENDER_EXTERNAL_URL")), "Webhook public base URL"),
     ]
     out = []
     for key, ok, note in checks:
@@ -9632,6 +9589,81 @@ async def _runtime_admin_callback(update: Any, context: Any) -> None:
     return await _impl(update, context)
 
 
+async def _admin_welcome_saved_reply(message: Any, notice: str) -> None:
+    settings, _status = await get_bot_settings_async(force=True)
+    photo_file_id = _setting_raw_from(settings, "welcome_photo_file_id", "")
+    await safe_send(lambda: message.reply_text(
+        _admin_welcome_panel_text(settings, notice),
+        parse_mode="HTML",
+        reply_markup=get_admin_welcome_kb(bool(photo_file_id)),
+        disable_web_page_preview=True,
+    ))
+
+
+async def _handle_admin_welcome_text(update: Any, context: Any) -> bool:
+    message = update.message
+    user = update.effective_user
+    if (
+        message is None
+        or user is None
+        or not _is_admin(user.id)
+        or context.user_data.get("admin_welcome_state") != "awaiting_text"
+    ):
+        return False
+
+    text = str(message.text or "").strip()
+    if text.lower() in {"/cancel", "cancel"}:
+        context.user_data.pop("admin_welcome_state", None)
+        await _admin_welcome_saved_reply(message, "Welcome text edit cancelled.")
+        return True
+    if not text:
+        await safe_send(lambda: message.reply_text("Welcome text cannot be empty."))
+        return True
+    if len(text) > 4096:
+        await safe_send(lambda: message.reply_text(
+            f"Welcome text is too long ({len(text)}/4096). Please send a shorter message."
+        ))
+        return True
+
+    ok, info = await asyncio.get_running_loop().run_in_executor(
+        _DB_EXECUTOR,
+        lambda: db_bot_setting_value_set("welcome_message", text, int(user.id)),
+    )
+    if not ok:
+        await safe_send(lambda: message.reply_text(f"Could not save welcome text: {info}"))
+        return True
+    context.user_data.pop("admin_welcome_state", None)
+    await _admin_welcome_saved_reply(message, "Welcome text saved ✅")
+    return True
+
+
+async def _handle_admin_welcome_photo(update: Any, context: Any) -> bool:
+    message = update.message
+    user = update.effective_user
+    if (
+        message is None
+        or user is None
+        or not _is_admin(user.id)
+        or context.user_data.get("admin_welcome_state") != "awaiting_photo"
+    ):
+        return False
+    if not message.photo:
+        await safe_send(lambda: message.reply_text("Please send a Telegram photo or use /cancel."))
+        return True
+
+    photo_file_id = str(message.photo[-1].file_id)
+    ok, info = await asyncio.get_running_loop().run_in_executor(
+        _DB_EXECUTOR,
+        lambda: db_bot_setting_value_set("welcome_photo_file_id", photo_file_id, int(user.id)),
+    )
+    if not ok:
+        await safe_send(lambda: message.reply_text(f"Could not save welcome image: {info}"))
+        return True
+    context.user_data.pop("admin_welcome_state", None)
+    await _admin_welcome_saved_reply(message, "Welcome image saved ✅")
+    return True
+
+
 async def _handle_runtime_admin_text(update: Any, context: Any) -> bool:
     msg = update.message
     user = update.effective_user
@@ -9877,8 +9909,8 @@ HF_TTS_SERIALIZE_CALLS   = _env_bool("HF_TTS_SERIALIZE_CALLS", True)
 # text, control instruction, reference audio, ultimate-mode flag, prompt text,
 # CFG, normalize-text flag, denoise-reference flag, and inference timesteps.
 # Both Controllable Cloning and transcript-guided Ultimate Cloning are supported.
-VOXCPM2_ENABLED             = _env_bool("VOXCPM2_ENABLED", True)
-VOXCPM2_SPACE               = (os.environ.get("VOXCPM2_SPACE") or "openbmb/VoxCPM-Demo").strip()
+VOXCPM2_ENABLED             = False
+VOXCPM2_SPACE               = ""
 VOXCPM2_API_NAME            = (os.environ.get("VOXCPM2_API_NAME") or "/generate").strip()
 VOXCPM2_TOKEN               = (os.environ.get("VOXCPM2_TOKEN") or os.environ.get("HF_TOKEN") or "").strip()
 VOXCPM2_CFG_VALUE           = _env_float("VOXCPM2_CFG_VALUE", 2.0, minimum=1.0, maximum=3.0)
@@ -10941,9 +10973,45 @@ _gemini    = None
 _hf_client = None
 _TELEGRAM_APP: Any = None
 _TELEGRAM_APP_READY = False
+_TELEGRAM_RUNTIME_STATUS = "offline"
+_TELEGRAM_RUNTIME_PHASE = "not_started"
+_TELEGRAM_RUNTIME_STATUS_CHANGED_AT = time.time()
 # Public alias used by the FastAPI webhook dispatcher. Keep both names for
 # compatibility with older helper code and current Telegram ingestion logic.
 telegram_application: Any = None
+
+
+def _set_telegram_runtime_status(status: str, phase: str) -> None:
+    """Publish a stable bot lifecycle state for health and admin surfaces."""
+    global _TELEGRAM_RUNTIME_STATUS, _TELEGRAM_RUNTIME_PHASE
+    global _TELEGRAM_RUNTIME_STATUS_CHANGED_AT
+
+    clean_status = str(status or "offline").strip().lower()
+    allowed = {"loading", "online", "standby", "stopping", "offline", "error"}
+    if clean_status not in allowed:
+        clean_status = "error"
+    clean_phase = str(phase or clean_status).strip().lower()[:64] or clean_status
+    if (
+        clean_status == _TELEGRAM_RUNTIME_STATUS
+        and clean_phase == _TELEGRAM_RUNTIME_PHASE
+    ):
+        return
+    _TELEGRAM_RUNTIME_STATUS = clean_status
+    _TELEGRAM_RUNTIME_PHASE = clean_phase
+    _TELEGRAM_RUNTIME_STATUS_CHANGED_AT = time.time()
+
+
+def _telegram_runtime_status_snapshot() -> dict[str, Any]:
+    status = str(globals().get("_TELEGRAM_RUNTIME_STATUS", "offline") or "offline")
+    return {
+        "status": status,
+        "phase": str(globals().get("_TELEGRAM_RUNTIME_PHASE", status) or status),
+        "active": status == "online",
+        "ready": bool(globals().get("_TELEGRAM_APP_READY", False)),
+        "polling_active": bool(globals().get("_TELEGRAM_POLLING_ACTIVE", False)),
+        "leader_owned": bool(globals().get("_TELEGRAM_LEADER_OWNED", False)),
+        "changed_at": float(globals().get("_TELEGRAM_RUNTIME_STATUS_CHANGED_AT", 0.0) or 0.0),
+    }
 
 # OCR circuit-breaker state
 _hf_ocr_disabled_until = 0.0
@@ -11724,7 +11792,7 @@ WELCOME_TEXT = (
     "🇮🇳 ហិណ្ឌី | 🇲🇾 ម៉ាឡេ | 🇮🇩 ឥណ្ឌូណេស៊ី | 🇵🇭 ហ្វីលីពីន | 🇸🇦 អារ៉ាប់\n"
     "💡 បូតស្គាល់ភាសា និងជ្រើសសំឡេងដែលសមស្របដោយស្វ័យប្រវត្តិ ១០០%។\n\n"
     "⚙️ ប្រើ /myprefs ដើម្បីមើលការកំណត់របស់អ្នក។\n"
-    "🎙️ ប្រើ /voxcpm2 ដើម្បីចម្លងសំឡេង និងកំណត់អារម្មណ៍ ឬស្ទីលនៃការនិយាយ។\n"
+    "☕ Support: https://pay-coffee-topaz.vercel.app/\n"
     "📢 ចូលរួមឆានែល៖ https://t.me/m11mmm112"
 )
 BOT_TAG = "@voicekhaibot"
@@ -11773,7 +11841,6 @@ TTS_MODEL_OPTIONS = {
     "auto": ("ស្វ័យប្រវត្តិ", "Kiri → Edge TTS"),
     "hf_space": ("សំឡេងខ្មែរ Kiri", ""),
     "edge": ("Edge TTS ពហុភាសា", ""),
-    "voxcpm2": ("ចម្លងសំឡេង VoxCPM2", "សំឡេងគំរូ + កំណត់ស្ទីល"),
 }
 TTS_MODEL_ALIASES = {
     "auto": "auto",
@@ -11788,11 +11855,6 @@ TTS_MODEL_ALIASES = {
     "edge": "edge",
     "edge_tts": "edge",
     "msedge": "edge",
-    "voxcpm2": "voxcpm2",
-    "vox_cpm2": "voxcpm2",
-    "vox": "voxcpm2",
-    "voice_clone": "voxcpm2",
-    "clone": "voxcpm2",
 }
 DEFAULT_TTS_MODEL = (os.environ.get("DEFAULT_TTS_MODEL") or os.environ.get("USER_DEFAULT_TTS_MODEL") or "auto").strip().lower()
 
@@ -13462,6 +13524,8 @@ BOT_PERFORMANCE_SETTING_SPECS: OrderedDict[str, dict[str, Any]] = OrderedDict([
 
 BOT_SETTING_DEFAULTS: dict[str, str] = {
     "maintenance_mode": "0",
+    "welcome_message": WELCOME_TEXT,
+    "welcome_photo_file_id": "",
     "tts_enabled": "1",
     "ocr_enabled": "1",
     "voice_transcribe_enabled": "1",
@@ -13557,6 +13621,41 @@ def _setting_raw_from(settings: dict | None, key: str, default: Any = None) -> s
     if default is None:
         default = BOT_SETTING_DEFAULTS.get(key, "")
     return str(source.get(key, default)).strip()
+
+
+async def _send_welcome_message(message: Any) -> Any:
+    """Send the persisted welcome text with an optional Telegram photo."""
+    try:
+        settings, _status = await get_bot_settings_async()
+    except Exception as exc:
+        logger.warning("Welcome settings could not be loaded; using defaults: %s", exc)
+        settings = BOT_SETTING_DEFAULTS
+
+    text = _setting_raw_from(settings, "welcome_message", WELCOME_TEXT) or WELCOME_TEXT
+    photo_file_id = _setting_raw_from(settings, "welcome_photo_file_id", "")
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("☕ Support", url="https://pay-coffee-topaz.vercel.app/"),
+         InlineKeyboardButton("📢 Channel", url="https://t.me/m11mmm112")],
+        [InlineKeyboardButton("👤 User Profile", callback_data="welcome_profile")],
+    ])
+
+    if photo_file_id:
+        try:
+            if len(text) <= 1024:
+                return await safe_send(lambda: message.reply_photo(
+                    photo=photo_file_id,
+                    caption=text,
+                    reply_markup=keyboard,
+                ))
+            await safe_send(lambda: message.reply_photo(photo=photo_file_id))
+        except Exception as exc:
+            logger.warning("Welcome image could not be sent; falling back to text: %s", exc)
+
+    return await safe_send(lambda: message.reply_text(
+        text,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    ))
 
 
 def _coerce_bot_perf_setting(key: str, raw: Any) -> Any:
@@ -15836,6 +15935,7 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("⚡ Optimize", callback_data="admin_optimize")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings"),
          InlineKeyboardButton("🛠 Runtime", callback_data="admin_runtime")],
+        [InlineKeyboardButton("👋 Welcome Message", callback_data="admin_welcome")],
         [InlineKeyboardButton("📄 Report", callback_data="admin_report"),
          InlineKeyboardButton("🔐 WEB_KEY", callback_data="admin_web_key")],
         [InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
@@ -19956,6 +20056,54 @@ def get_user_detail_kb(user_id: int, blocked: bool, back_ref: str = "p0") -> Inl
     return InlineKeyboardMarkup(rows)
 
 
+def get_admin_welcome_kb(has_photo: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("✏️ Edit Text", callback_data="admin_welcome_edit_text"),
+         InlineKeyboardButton("🖼 Set Image", callback_data="admin_welcome_set_photo")],
+        [InlineKeyboardButton("👁 Preview", callback_data="admin_welcome_preview")],
+    ]
+    if has_photo:
+        rows.append([InlineKeyboardButton("🗑 Remove Image", callback_data="admin_welcome_remove_photo")])
+    rows.append([
+        InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+        InlineKeyboardButton("❌ Close", callback_data="admin_close"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _admin_welcome_panel_text(settings: dict[str, str], notice: str = "") -> str:
+    welcome_text = _setting_raw_from(settings, "welcome_message", WELCOME_TEXT) or WELCOME_TEXT
+    photo_file_id = _setting_raw_from(settings, "welcome_photo_file_id", "")
+    preview = html.escape(welcome_text[:900])
+    if len(welcome_text) > 900:
+        preview += "…"
+    parts = ["👋 <b>Welcome Message</b>"]
+    if notice:
+        parts.extend(["", html.escape(notice)])
+    parts.extend([
+        "",
+        f"Image: <b>{'SET ✅' if photo_file_id else 'NONE'}</b>",
+        f"Text length: <b>{len(welcome_text)}/4096</b>",
+        "",
+        "<b>Current text</b>",
+        preview,
+        "",
+        "Use Preview to verify exactly what /start and /help will send.",
+    ])
+    return "\n".join(parts)
+
+
+async def _admin_open_welcome_panel(query: Any, *, notice: str = "") -> None:
+    settings, _status = await get_bot_settings_async(force=True)
+    photo_file_id = _setting_raw_from(settings, "welcome_photo_file_id", "")
+    await safe_send(lambda: query.message.edit_text(
+        _admin_welcome_panel_text(settings, notice),
+        parse_mode="HTML",
+        reply_markup=get_admin_welcome_kb(bool(photo_file_id)),
+        disable_web_page_preview=True,
+    ))
+
+
 def get_bot_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for key in BOT_FEATURE_SETTING_KEYS:
@@ -22894,8 +23042,7 @@ def _tts_provider_control_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🇰🇭 Khmer → Edge", callback_data="admin_tts_set:khmer_edge")],
         [InlineKeyboardButton("✅ Enable HF Now", callback_data="admin_tts_hf_enable"),
          InlineKeyboardButton("⏸ Disable HF 5m", callback_data="admin_tts_hf_5m")],
-        [InlineKeyboardButton("🧹 Clear HF Client", callback_data="admin_tts_hf_clear"),
-         InlineKeyboardButton("🎙 VoxCPM2 Health", callback_data="admin_voxcpm2_health")],
+        [InlineKeyboardButton("🧹 Clear HF Client", callback_data="admin_tts_hf_clear")],
         [InlineKeyboardButton("🔄 Refresh", callback_data="admin_tts")],
         [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
          InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
@@ -22917,9 +23064,6 @@ def _admin_tts_provider_text(notice: str = "") -> str:
         f"Default user model: <code>{html.escape(_normalize_tts_model(DEFAULT_TTS_MODEL))}</code>",
         f"HF Space: <code>{html.escape(str(HF_TTS_SPACE))}{html.escape(str(HF_TTS_API_NAME))}</code>",
         f"Gradio client: <b>{'READY' if GradioClient is not None else 'MISSING'}</b>",
-        f"VoxCPM2: <b>{'ON' if VOXCPM2_ENABLED else 'OFF'}</b> · <code>{html.escape(str(VOXCPM2_SPACE))}{html.escape(str(VOXCPM2_API_NAME))}</code>",
-        f"Vox upload helper: <b>{'READY' if GradioHandleFile is not None else 'MISSING'}</b>",
-        f"Vox status: <b>{html.escape(str(_voxcpm2_health_snapshot().get('status')))}</b> · cooldown: <b>{_voxcpm2_health_snapshot().get('cooldown_s')}s</b> · fallback: <b>{'ON' if VOXCPM2_AUTO_FALLBACK_ON_QUEUE else 'OFF'}</b>",
         f"HF cached client: <b>{'YES' if hf_client_ready else 'NO'}</b>",
         f"HF cooldown: <b>{hf_remaining}s</b> {'⚠️' if hf_disabled else '✅'}",
         f"Edge fallback: <b>{'ON' if HF_TTS_EDGE_FALLBACK else 'OFF'}</b>",
@@ -22941,70 +23085,6 @@ async def _admin_open_tts_provider_panel(query, notice: str = "") -> None:
         _admin_tts_provider_text(notice),
         parse_mode="HTML",
         reply_markup=_tts_provider_control_kb(),
-        disable_web_page_preview=True,
-    ))
-
-
-def _voxcpm2_health_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Refresh", callback_data="admin_voxcpm2_health")],
-        [InlineKeyboardButton("✅ Enable VoxCPM2", callback_data="admin_voxcpm2_enable"),
-         InlineKeyboardButton("⏸ Cooldown 5m", callback_data="admin_voxcpm2_5m")],
-        [InlineKeyboardButton("🧹 Clear Vox Client", callback_data="admin_voxcpm2_clear")],
-        [InlineKeyboardButton("⬅️ TTS Provider", callback_data="admin_tts"),
-         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
-    ])
-
-
-def _admin_voxcpm2_health_text(notice: str = "") -> str:
-    snap = _voxcpm2_health_snapshot()
-    last_error = str(snap.get("last_error") or "")
-    if len(last_error) > 450:
-        last_error = last_error[:447] + "..."
-    status_icon = "✅" if snap.get("status") == "READY" else "⚠️"
-    lines: list[str] = []
-    if notice:
-        lines.append(f"{html.escape(notice)}\n")
-    lines.extend([
-        "🎙 <b>VoxCPM2 Provider Health</b>",
-        "",
-        f"Service: <b>{status_icon} {html.escape(str(snap.get('status') or 'UNKNOWN'))}</b>",
-        f"Enabled: <b>{'YES' if snap.get('enabled') else 'NO'}</b>",
-        f"Space: <code>{html.escape(str(VOXCPM2_SPACE))}{html.escape(str(VOXCPM2_API_NAME))}</code>",
-        f"Client cached: <b>{'YES' if snap.get('client_cached') else 'NO'}</b>",
-        f"Upload helper: <b>{'READY' if GradioHandleFile is not None else 'MISSING'}</b>",
-        "",
-        f"Cooldown remaining: <b>{int(snap.get('cooldown_s') or 0)}s</b>",
-        f"Failure count: <b>{int(snap.get('failures') or 0)}</b>",
-        f"Queue-full hits: <b>{int(snap.get('queue_full_hits') or 0)}</b>",
-        f"Last success: <b>{html.escape(str(snap.get('last_success_age')))}</b>",
-        f"Last error: <b>{html.escape(str(snap.get('last_error_age')))}</b>",
-        "",
-        f"Auto fallback on queue-full: <b>{'ON' if snap.get('auto_fallback') else 'OFF'}</b>",
-        f"Fallback route: <code>Khmer → Kiri/HF, other languages → Edge</code>",
-        f"Retry: <b>{VOXCPM2_RETRIES}</b> · queue delay: <b>{VOXCPM2_QUEUE_RETRY_DELAY_S:g}s</b> · queue cooldown: <b>{VOXCPM2_QUEUE_COOLDOWN_S:g}s</b>",
-    ])
-    if last_error:
-        lines.extend([
-            "",
-            "<b>Last error preview</b>",
-            f"<code>{html.escape(last_error)}</code>",
-        ])
-    lines.extend([
-        "",
-        "<b>Khmer user behavior</b>",
-        "• Queue full: បង្ហាញសារ Khmer ជាមុន",
-        "• បន្ទាប់មកបង្កើតសំឡេងបម្រុងដោយស្វ័យប្រវត្តិ",
-        "• អ្នកប្រើអាចសាក VoxCPM2 ម្តងទៀតក្រោយ cooldown",
-    ])
-    return "\n".join(lines)
-
-
-async def _admin_open_voxcpm2_health_panel(query, notice: str = "") -> None:
-    await safe_send(lambda: query.message.edit_text(
-        _admin_voxcpm2_health_text(notice),
-        parse_mode="HTML",
-        reply_markup=_voxcpm2_health_kb(),
         disable_web_page_preview=True,
     ))
 
@@ -23900,6 +23980,48 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         ))
         return
 
+    if data == "admin_welcome":
+        await _clear_admin_transient_state(context, user_id)
+        await _admin_open_welcome_panel(query)
+        return
+
+    if data == "admin_welcome_edit_text":
+        await _clear_admin_transient_state(context, user_id)
+        context.user_data["admin_welcome_state"] = "awaiting_text"
+        await safe_send(lambda: query.message.edit_text(
+            "✏️ <b>Edit Welcome Text</b>\n\nSend the new message now (maximum 4096 characters). Use /cancel to stop.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancel", callback_data="admin_welcome")
+            ]]),
+        ))
+        return
+
+    if data == "admin_welcome_set_photo":
+        await _clear_admin_transient_state(context, user_id)
+        context.user_data["admin_welcome_state"] = "awaiting_photo"
+        await safe_send(lambda: query.message.edit_text(
+            "🖼 <b>Set Welcome Image</b>\n\nSend a Telegram photo now. The reusable Telegram file ID will be saved; no image bytes are stored by the bot. Use /cancel to stop.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancel", callback_data="admin_welcome")
+            ]]),
+        ))
+        return
+
+    if data == "admin_welcome_remove_photo":
+        ok, info = await asyncio.get_running_loop().run_in_executor(
+            _DB_EXECUTOR,
+            lambda: db_bot_setting_value_set("welcome_photo_file_id", "", user_id),
+        )
+        notice = "Welcome image removed ✅" if ok else f"Could not remove image: {info}"
+        await _admin_open_welcome_panel(query, notice=notice)
+        return
+
+    if data == "admin_welcome_preview":
+        await _send_welcome_message(query.message)
+        return
+
     if data in ("admin_settings", "admin_settings_refresh"):
         await _admin_open_settings_panel(query, force=True)
         return
@@ -23986,25 +24108,6 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
             _HF_TTS_CLIENT = None
             _HF_TTS_CLIENT_KEY = None
         await _admin_open_tts_provider_panel(query, notice="🧹 HF cached client cleared.")
-        return
-
-    if data == "admin_voxcpm2_health":
-        await _admin_open_voxcpm2_health_panel(query)
-        return
-
-    if data == "admin_voxcpm2_enable":
-        _reset_voxcpm2_cooldown()
-        await _admin_open_voxcpm2_health_panel(query, notice="✅ VoxCPM2 cooldown cleared.")
-        return
-
-    if data == "admin_voxcpm2_5m":
-        _voxcpm2_force_cooldown(300)
-        await _admin_open_voxcpm2_health_panel(query, notice="⏸ VoxCPM2 disabled for 5 minutes.")
-        return
-
-    if data == "admin_voxcpm2_clear":
-        _voxcpm2_reset_client_sync()
-        await _admin_open_voxcpm2_health_panel(query, notice="🧹 VoxCPM2 cached client cleared.")
         return
 
     if data == "admin_calendar" or data.startswith("admin_calendar:"):
@@ -25043,6 +25146,7 @@ async def _clear_admin_transient_state(context: Any, admin_id: int) -> list[str]
 
     _pop_state("admin_report_state", "report")
     _pop_state("admin_input_mode", "admin-input")
+    _pop_state("admin_welcome_state", "welcome-message")
     _pop_state(FEATURE_REQUEST_WAIT_TEXT, "feature-request")
     _pop_state("awaiting_broadcast", "broadcast")
     _pop_state("awaiting_schedule", "schedule")
@@ -25107,7 +25211,6 @@ async def _delete_user_personal_data(user_id: int) -> None:
     user_id = int(user_id)
     db_history_clear(user_id)
     _invalidate_prefs(user_id)
-    await _voxcpm2_profile_delete(user_id)
 
     def _run():
         with suppress(Exception):
@@ -25346,12 +25449,6 @@ async def _ensure_voxcpm2_allowed(update: Update, context: ContextTypes.DEFAULT_
     if not allowed:
         context.user_data.pop("voxcpm2_state", None)
     return allowed
-
-
-async def cmd_voxcpm2(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Compatibility wrapper; live implementation moved in V4.1."""
-    from app.services.telegram.commands import cmd_voxcpm2 as _impl
-    return await _impl(update, context)
 
 
 async def _voxcpm2_accept_reference(
@@ -26192,7 +26289,9 @@ async def _run_bot():
     global _BOT_START_TIME, _AI_SEMAPHORE, _BROADCAST_SEMAPHORE
     global _prefs_cache_lock, _prefs_cache_lock_loop, _TTS_CHUNK_SEMAPHORE, _TELEGRAM_APP, _TELEGRAM_APP_READY, telegram_application
 
+    _set_telegram_runtime_status("loading", "validating_configuration")
     if not TELEGRAM_BOT_TOKEN:
+        _set_telegram_runtime_status("error", "missing_bot_token")
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
 
     # This application lifecycle supports both webhook and polling.  The
@@ -26217,7 +26316,7 @@ async def _run_bot():
         _prefs_cache, _user_last_tts, _sched_payload,
         _hist_cache, _user_locks,
         # FIX: These two were missing from the original reset list:
-        _last_tts_text, _text_cache_memory, _VOXCPM2_PROFILE_MEMORY,
+        _last_tts_text, _text_cache_memory,
     ):
         store.clear()
     with _tts_request_reservations_guard:
@@ -26249,6 +26348,7 @@ async def _run_bot():
     _TELEGRAM_APP_READY = False
     _TELEGRAM_APP = app
     telegram_application = app
+    _set_telegram_runtime_status("loading", "registering_handlers")
 
     # V4.1: live Telegram routing and handler implementations are native modules.
     from app.services.telegram.routing import register_telegram_handlers
@@ -26271,19 +26371,23 @@ async def _run_bot():
         # Application.__aenter__() already calls initialize(). Calling
         # initialize() again can raise "Application is already initialized"
         # on python-telegram-bot v20/v21 and break deploy restarts.
+        _set_telegram_runtime_status("loading", "initializing_telegram")
         await app.start()
         _TELEGRAM_APP_READY = True
         polling_started = False
         leader_refresh_due = 0.0
+        _set_telegram_runtime_status("loading", "acquiring_ownership")
         active_owner = await _telegram_leader_refresh_once(app)
         leader_refresh_due = time.monotonic() + _telegram_leader_renew_interval_s()
 
         if not active_owner:
+            _set_telegram_runtime_status("standby", "waiting_for_ownership")
             webhook_logger.warning(
                 "Telegram application is running in STANDBY mode. Web/Admin routes are online, but this Render service will not process Telegram updates until it owns the active lock."
             )
         elif _run_state_bot_mode() == "WEBHOOK":
             await _cancel_active_polling_task("startup_webhook_mode")
+            _set_telegram_runtime_status("online", "webhook")
             webhook_logger.info("Telegram polling updater is disabled because BOT_MODE=WEBHOOK and this instance owns the active lock.")
         else:
             # Startup may follow a previous webhook deployment; delete it before
@@ -26293,8 +26397,14 @@ async def _run_bot():
                 await _delete_telegram_webhook_via_http(
                     drop_pending=_telegram_polling_drop_pending_updates()
                 )
+            _set_telegram_runtime_status("loading", "starting_polling")
             polling_started = await _telegram_start_polling_runtime(app)
-            logger.info("Telegram polling started by active owner.")
+            if polling_started:
+                _set_telegram_runtime_status("online", "polling")
+                logger.info("Telegram polling started by active owner.")
+            else:
+                _set_telegram_runtime_status("error", "polling_start_failed")
+                logger.error("Telegram polling did not start for the active owner.")
 
         # Start background jobs only after the Telegram application is fully ready.
         # Scheduler itself has its own distributed lock, so both Render services
@@ -26311,6 +26421,7 @@ async def _run_bot():
                     active_owner = _telegram_should_run_telegram_workers()
 
                 if not active_owner:
+                    _set_telegram_runtime_status("standby", "waiting_for_ownership")
                     if polling_started:
                         webhook_logger.info("Stopping Telegram polling because this Render service is standby.")
                         await _telegram_stop_polling_runtime(app)
@@ -26324,18 +26435,30 @@ async def _run_bot():
                 # only the updater polling worker is stopped.
                 mode = _run_state_bot_mode()
                 if polling_started and mode != "POLLING":
+                    _set_telegram_runtime_status("loading", "switching_to_webhook")
                     webhook_logger.info("_run_bot observed BOT_MODE=%s while polling_started; stopping polling worker.", mode)
                     await _telegram_stop_polling_runtime(app)
                     polling_started = False
+                    _set_telegram_runtime_status("online", "webhook")
                 elif not polling_started and mode == "POLLING":
+                    _set_telegram_runtime_status("loading", "starting_polling")
                     with suppress(Exception):
                         await _delete_telegram_webhook_via_http(
                             drop_pending=_telegram_polling_drop_pending_updates()
                         )
                     polling_started = await _telegram_start_polling_runtime(app)
+                    _set_telegram_runtime_status(
+                        "online" if polling_started else "error",
+                        "polling" if polling_started else "polling_start_failed",
+                    )
+                elif mode == "WEBHOOK":
+                    _set_telegram_runtime_status("online", "webhook")
+                elif polling_started:
+                    _set_telegram_runtime_status("online", "polling")
 
                 await asyncio.sleep(1.0)
         finally:
+            _set_telegram_runtime_status("stopping", "shutting_down")
             sched_stop.set()
             sweep_stop.set()
             if polling_started and app.updater is not None:
@@ -26354,6 +26477,9 @@ async def _run_bot():
             # stop it explicitly before __aexit__ performs shutdown().
             with suppress(Exception):
                 await app.stop()
+            _TELEGRAM_APP = None
+            telegram_application = None
+            _set_telegram_runtime_status("offline", "stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -26420,7 +26546,6 @@ async def _async_main_once():
     )
 
     _start_web_broadcast_queue_workers()
-    keepalive_stop = asyncio.Event()
     telegram_app_task = asyncio.create_task(_run_bot(), name="telegram-bot")
     startup_checks_task = asyncio.create_task(_run_startup_background_checks(), name="startup-background-checks")
     tasks = [
@@ -26428,9 +26553,6 @@ async def _async_main_once():
         telegram_app_task,
         startup_checks_task,
     ]
-    if (os.environ.get("RENDER_EXTERNAL_URL") or getattr(SETTINGS, "RENDER_EXTERNAL_URL", "") or "").strip():
-        tasks.append(asyncio.create_task(keep_alive_async(keepalive_stop), name="async-keep-alive"))
-
     try:
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
         for task in done:
@@ -26438,7 +26560,6 @@ async def _async_main_once():
             if exc:
                 raise exc
     finally:
-        keepalive_stop.set()
         await _stop_web_broadcast_queue_workers()
         for task in tasks:
             if not task.done():

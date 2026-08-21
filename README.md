@@ -12,10 +12,11 @@ the dedicated worker service are no longer part of the runtime.
 - Telegram commands, callbacks, photos, voice, audio, and text handlers
 - Gemini-first AI chat with health-aware provider fallback
 - Gemini and Hugging Face OCR routing
-- Edge TTS 7.2.8+ with optional Hugging Face Khmer TTS and VoxCPM2 support
+- Edge TTS 7.2.8+ with optional Hugging Face Khmer TTS
 - Broadcast and recurring schedule management
 - Supabase-backed preferences, history, administrators, CORS, and runtime settings
 - Signed Telegram Mini App administrator authentication
+- Admin-editable `/start` welcome text and image with Support, Channel, and User Profile actions
 - Process-local webhook replay protection with ownership-aware leases
 - Bounded OCR, transcription, and audio workload admission
 - English and Khmer administration interface
@@ -110,8 +111,7 @@ eligible provider fails, the internal provider manager can route to another
 healthy provider.
 
 Edge TTS is the default general speech path. Optional provider credentials and
-models can be configured with `HF_TOKEN`, `HF_TTS_SPACE`, `GRADIO_TOKEN`,
-`VOXCPM2_ENABLED`, and `VOXCPM2_SPACE`.
+models can be configured with `HF_TOKEN`, `HF_TTS_SPACE`, and `GRADIO_TOKEN`.
 
 ## Telegram runtime modes
 
@@ -173,6 +173,9 @@ during every automatic restart. Enable it only when the host does not install
 ```bash
 python -m app.main
 ```
+
+The application does not self-ping. Configure the hosting platform to check
+`/readyz` when an external uptime or readiness probe is required.
 
 Compatibility launchers are also supported:
 
@@ -244,7 +247,7 @@ node --check static/admin/app.js
 Current verified result:
 
 ```text
-83 passed
+85 passed
 Ruff passed
 Python compilation passed
 Admin JavaScript syntax passed

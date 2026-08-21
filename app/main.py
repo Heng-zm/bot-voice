@@ -14,7 +14,6 @@ if __package__ in {None, ""}:
         sys.path.insert(0, _repo_root)
 
 import asyncio
-import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
@@ -80,6 +79,7 @@ async def _runtime_ready_middleware(request: Request, call_next):
             "role": snapshot.get("role"),
             "supabase": snapshot.get("supabase"),
             "settings_store": snapshot.get("settings_store"),
+            "telegram": snapshot.get("telegram"),
             "architecture": snapshot.get("architecture"),
             "redis_removed": True,
             "worker_removed": True,
@@ -146,7 +146,6 @@ async def _combined_main_once() -> None:
     )
 
     _legacy._start_web_broadcast_queue_workers()
-    keepalive_stop = asyncio.Event()
     critical_tasks: list[asyncio.Task] = [
         asyncio.create_task(_legacy.run_fastapi(), name="fastapi-web"),
         asyncio.create_task(_legacy._run_bot(), name="telegram-bot"),
@@ -157,17 +156,6 @@ async def _combined_main_once() -> None:
             name="startup-background-checks",
         )
     ]
-    if str(
-        os.environ.get("RENDER_EXTERNAL_URL")
-        or getattr(_legacy.SETTINGS, "RENDER_EXTERNAL_URL", "")
-        or ""
-    ).strip():
-        auxiliary_tasks.append(
-            asyncio.create_task(
-                _legacy.keep_alive_async(keepalive_stop),
-                name="async-keep-alive",
-            )
-        )
     tasks = [*critical_tasks, *auxiliary_tasks]
 
     try:
@@ -188,7 +176,6 @@ async def _combined_main_once() -> None:
         names = ", ".join(sorted(task.get_name() for task in done)) or "unknown"
         raise RuntimeError(f"Critical runtime service stopped unexpectedly: {names}")
     finally:
-        keepalive_stop.set()
         await _legacy._stop_web_broadcast_queue_workers()
         for task in tasks:
             if not task.done():

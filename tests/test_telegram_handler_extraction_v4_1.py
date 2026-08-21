@@ -14,7 +14,7 @@ TELEGRAM_DIR = ROOT / "app" / "services" / "telegram"
 
 EXTRACTED = {
     "commands.py": {
-        "on_start", "on_help", "cmd_myprefs", "cmd_ttsmodel", "cmd_voxcpm2",
+        "on_start", "on_help", "cmd_myprefs", "cmd_ttsmodel",
         "cmd_clear", "cmd_security", "cmd_privacy", "cmd_delete_my_data",
         "broadcast_start", "cmd_schedule", "cmd_schedules", "cmd_cancelschedule",
         "cmd_cancel", "admin_stats", "cmd_health", "cmd_admin", "cmd_feature_request",

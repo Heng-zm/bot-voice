@@ -94,6 +94,22 @@ class SingleProcessArchitectureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("return_when=asyncio.FIRST_COMPLETED", source)
         self.assertIn("Critical runtime service stopped unexpectedly", source)
         self.assertNotIn("return_when=asyncio.FIRST_EXCEPTION", source)
+        self.assertNotIn("keep_alive_async", source)
+        self.assertNotIn("async-keep-alive", source)
+
+    def test_welcome_message_is_editable_and_voxcpm2_is_not_live(self) -> None:
+        legacy_source = (ROOT / "app" / "legacy.py").read_text(encoding="utf-8")
+        command_source = (ROOT / "app" / "services" / "telegram" / "commands.py").read_text(encoding="utf-8")
+        routing_source = (ROOT / "app" / "services" / "telegram" / "routing.py").read_text(encoding="utf-8")
+        provider_source = (ROOT / "app" / "services" / "ai" / "providers.py").read_text(encoding="utf-8")
+
+        self.assertIn('"welcome_message": WELCOME_TEXT', legacy_source)
+        self.assertIn('"welcome_photo_file_id": ""', legacy_source)
+        self.assertIn("admin_welcome_set_photo", legacy_source)
+        self.assertIn("pay-coffee-topaz.vercel.app", legacy_source)
+        self.assertIn("send_user_profile", command_source)
+        self.assertNotIn('(\"voxcpm2\", cmd_voxcpm2)', routing_source)
+        self.assertNotIn('(\"voxcpm2\", {\"tts\", \"voice_clone\"}', provider_source)
 
     def test_telegram_runtime_panel_exposes_workload_pressure(self) -> None:
         source = (ROOT / "app" / "legacy.py").read_text(encoding="utf-8")

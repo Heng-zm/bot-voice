@@ -772,7 +772,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ):
             return
 
-        if action == "show_speed":
+        if action == "welcome_profile":
+            from app.services.telegram.commands import send_user_profile
+
+            await send_user_profile(query.message, user_id)
+        elif action == "show_speed":
             await _cb_show_speed(query, user_id, context)
         elif action == "hide_speed":
             await _cb_hide_speed(query, user_id, context)
@@ -780,8 +784,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cb_show_tts_model(query, user_id, context)
         elif action == "hide_tts_model":
             await _cb_hide_tts_model(query, user_id, context)
-        elif action == "voxcpm2":
-            await _cb_voxcpm2(query, user_id, context, data)
         elif action == "tts_model":
             await _cb_tts_model(query, user_id, context, data)
         elif action == "speed":

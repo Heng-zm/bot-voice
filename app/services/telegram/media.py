@@ -20,6 +20,8 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if _is_admin(user_id):
+        if await _handle_admin_welcome_photo(update, context):
+            return
         sched_state = context.user_data.get("sched_state")
         if sched_state == SCHED_EDIT_WAIT_PHOTO:
             await _handle_sched_edit_photo(update, context)
@@ -176,21 +178,6 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: msg.reply_text("✅ បានផ្ញើសារសំឡេងទៅអ្នកគ្រប់គ្រង។"))
         return
 
-    if context.user_data.get("voxcpm2_state") == VOXCPM2_WAIT_REFERENCE:
-        if not await _ensure_voxcpm2_allowed(update, context):
-            return
-        await _voxcpm2_accept_reference(
-            update,
-            context,
-            file_id=msg.voice.file_id,
-            file_unique_id=msg.voice.file_unique_id,
-            filename="telegram_voice.ogg",
-            mime_type=msg.voice.mime_type or "audio/ogg",
-            file_size=int(msg.voice.file_size or 0),
-            duration=float(msg.voice.duration or 0.0),
-        )
-        return
-
     if not await _ensure_user_allowed(update, context, "voice_transcribe_enabled", "បម្លែងសំឡេងទៅជាអត្ថបទ"):
         return
     if not _gemini:
@@ -305,9 +292,7 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filename = doc.file_name or ""
         mime_type = doc.mime_type or ""
         file_id = doc.file_id
-        file_unique_id = doc.file_unique_id
         file_size = int(doc.file_size or 0)
-        duration = 0.0
         if _is_subtitle_file(filename) or not _is_audio_file(filename, mime_type):
             await on_document(update, context)
             return
@@ -315,25 +300,8 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filename = audio.file_name or ""
         mime_type = audio.mime_type or ""
         file_id = audio.file_id
-        file_unique_id = audio.file_unique_id
         file_size = int(audio.file_size or 0)
-        duration = float(audio.duration or 0.0)
     else:
-        return
-
-    if context.user_data.get("voxcpm2_state") == VOXCPM2_WAIT_REFERENCE:
-        if not await _ensure_voxcpm2_allowed(update, context):
-            return
-        await _voxcpm2_accept_reference(
-            update,
-            context,
-            file_id=file_id,
-            file_unique_id=file_unique_id,
-            filename=filename or "reference_audio",
-            mime_type=mime_type or "audio/ogg",
-            file_size=file_size,
-            duration=duration,
-        )
         return
 
     if not await _ensure_user_allowed(update, context):
@@ -558,6 +526,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = int(user.id)
 
     if _is_admin(user_id):
+        if await _handle_admin_welcome_text(update, context):
+            return
         if await _handle_feature_request_admin_reply_text(update, context):
             return
         if await _handle_runtime_admin_text(update, context):
@@ -603,27 +573,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     context.user_data.pop("chat_state", None)
             return
 
-    if context.user_data.get("voxcpm2_state") == VOXCPM2_WAIT_REFERENCE:
-        if not await _ensure_voxcpm2_allowed(update, context):
-            return
-        await _voxcpm2_send_panel(
-            msg,
-            user_id,
-            "សូមផ្ញើសារជាសំឡេង Telegram ឬឯកសារអូឌីយ៉ូ។ អត្ថបទមិនអាចប្រើជាសំឡេងគំរូបានទេ។",
-            context=context,
-            prefer_saved=True,
-        )
-        return
-    if context.user_data.get("voxcpm2_state") == VOXCPM2_WAIT_CONTROL:
-        if not await _ensure_voxcpm2_allowed(update, context):
-            return
-        await _voxcpm2_save_control_text(update, context, text)
-        return
-    if context.user_data.get("voxcpm2_state") == VOXCPM2_WAIT_PROMPT_TEXT:
-        if not await _ensure_voxcpm2_allowed(update, context):
-            return
-        await _voxcpm2_save_prompt_text(update, context, text)
-        return
     if await _handle_feature_request_user_text(update, context):
         return
 

@@ -12,6 +12,7 @@ const state = {
   runtime: {},
   lastOk: 0,
   timer: null,
+  botStatusTimer: null,
 };
 
 const I18N = {
@@ -32,6 +33,7 @@ const I18N = {
     settingsApply: "Changes apply immediately and persist across restarts.", saveSettings: "Save settings",
     operational: "Operational", degraded: "Degraded", healthy: "Healthy", unavailable: "Unavailable",
     connected: "Connected", memory: "Memory fallback", active: "Active", paused: "Paused",
+    loading: "Starting…", standby: "Standby", stopping: "Stopping…", error: "Error",
     single: "Single process", saved: "Saved", removed: "Removed", added: "Added", reset: "Reset", remove: "Remove",
     noAdmins: "No administrators found.", noAudit: "No audit entries yet.", confirmRemove: "Remove this administrator?",
     refreshFailed: "Some dashboard sections could not refresh.", requestTimeout: "Request timed out. Please retry.",
@@ -182,7 +184,13 @@ function renderStats(payload) {
   $("messageCount").textContent = compact(usage.message_count);
   $("uptime").textContent = bot.uptime || "—";
   $("storageBackend").textContent = storage.persistent ? "Supabase" : "Memory";
-  setHealth($("botHealth"), bot.active ? t("active") : t("unavailable"), bot.active ? "" : "down");
+  const botStatus = bot.status || (bot.active ? "online" : "offline");
+  const botStatusLabels = {
+    online: t("active"), loading: t("loading"), standby: t("standby"),
+    stopping: t("stopping"), offline: t("unavailable"), error: t("error"),
+  };
+  const botHealthKind = botStatus === "online" ? "" : (["loading", "standby", "stopping"].includes(botStatus) ? "warn" : "down");
+  setHealth($("botHealth"), botStatusLabels[botStatus] || botStatus, botHealthKind);
   setHealth($("databaseHealth"), db.ok ? t("connected") : t("memory"), db.ok ? "" : "warn");
   setHealth($("architectureHealth"), t("single"));
   $("botMode").textContent = bot.mode || "—";
@@ -196,6 +204,11 @@ function renderStats(payload) {
   $("lastUpdated").textContent = new Date(payload.generated_at || Date.now()).toLocaleTimeString(
     state.language === "km" ? "km-KH" : undefined,
   );
+  clearTimeout(state.botStatusTimer);
+  state.botStatusTimer = null;
+  if (["loading", "stopping"].includes(botStatus)) {
+    state.botStatusTimer = setTimeout(() => refreshAll({ silent: true }), 2500);
+  }
 }
 
 function renderRuntime(payload) {

@@ -41,7 +41,6 @@ from app.services.telegram.commands import (
     cmd_security,
     cmd_ttsmodel,
     cmd_users,
-    cmd_voxcpm2,
     on_help,
     on_start,
 )
@@ -73,7 +72,6 @@ def register_telegram_handlers(application: Application, *, bot_mode: str) -> No
         ("help", on_help),
         ("myprefs", cmd_myprefs),
         ("ttsmodel", cmd_ttsmodel),
-        ("voxcpm2", cmd_voxcpm2),
         ("clear", cmd_clear),
         ("security", cmd_security),
         ("privacy", cmd_privacy),

@@ -16,11 +16,7 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sync_user_data(update.effective_user)
         if not await _ensure_user_allowed(update, context):
             return
-        await safe_send(lambda: update.message.reply_text(
-            WELCOME_TEXT,
-            reply_markup=ReplyKeyboardRemove(),
-            disable_web_page_preview=True,
-        ))
+        await _send_welcome_message(update.message)
     except Exception as e:
         logger.error(f"on_start error: {e}")
 
@@ -31,8 +27,7 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @legacy_bound_handler
-async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+async def send_user_profile(message, user_id: int):
     prefs   = await get_user_prefs_async(user_id)
     gender_label = "👩 សំឡេងស្រី" if prefs["gender"] == "female" else "👨 សំឡេងប្រុស"
     speed_label  = next(
@@ -40,17 +35,22 @@ async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{prefs['speed']}x",
     )
     model_label = _tts_model_label(prefs.get("tts_model", "auto"))
-    await safe_send(lambda: update.message.reply_text(
+    await safe_send(lambda: message.reply_text(
         f"⚙️ <b>ការកំណត់របស់អ្នក</b>\n\n"
         f"🗣️ សំឡេង: <b>{gender_label}</b>\n"
         f"🎚️ ល្បឿន: <b>{speed_label}</b>\n"
         f"🤖 ម៉ូដែល TTS: <b>{html.escape(model_label)}</b>\n"
-        f"🎙️ ការកំណត់ VoxCPM2៖ <b>{'ប្រើ /voxcpm2 ដើម្បីកែប្រែ' if _normalize_tts_model(prefs.get('tts_model', 'auto')) == 'voxcpm2' else 'មិនចាំបាច់'}</b>\n\n"
+        "\n"
         "ផ្ញើអត្ថបទណាមួយ។ បូតស្គាល់ភាសា និងជ្រើសសំឡេងដោយស្វ័យប្រវត្តិ; "
         "ប៊ូតុងក្រោមសារសំឡេងប្រើសម្រាប់ប្តូរម៉ូដែល ល្បឿន ឬប្រភេទសំឡេង។",
         parse_mode="HTML",
         reply_markup=get_main_kb(prefs["gender"], prefs.get("tts_model", "auto")),
     ))
+
+
+@legacy_bound_handler
+async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_user_profile(update.message, update.effective_user.id)
 
 
 @legacy_bound_handler
@@ -60,24 +60,10 @@ async def cmd_ttsmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     prefs = await get_user_prefs_async(user_id)
     await safe_send(lambda: update.message.reply_text(
-        '🤖 <b>ជ្រើសរើសម៉ូដែល TTS</b>\n\nស្វ័យប្រវត្តិ៖ ប្រើ Khmer HF Space សម្រាប់ភាសាខ្មែរ និងប្ដូរទៅ Edge ប្រសិនបើចាំបាច់\nKhmer HF៖ ប្រើ mrrtmob/khmer-tts សម្រាប់អត្ថបទខ្មែរ\nEdge៖ ប្រើ Microsoft Edge TTS សម្រាប់គ្រប់ភាសា\nVoxCPM2 Clone៖ បញ្ចូលសំឡេងគំរូ និងការណែនាំរចនាប័ទ្មសំឡេង (មិនចាំបាច់) តាម /voxcpm2',
+        '🤖 <b>ជ្រើសរើសម៉ូដែល TTS</b>\n\nស្វ័យប្រវត្តិ៖ ប្រើ Khmer HF Space សម្រាប់ភាសាខ្មែរ និងប្ដូរទៅ Edge ប្រសិនបើចាំបាច់\nKhmer HF៖ ប្រើ mrrtmob/khmer-tts សម្រាប់អត្ថបទខ្មែរ\nEdge៖ ប្រើ Microsoft Edge TTS សម្រាប់គ្រប់ភាសា',
         parse_mode="HTML",
         reply_markup=get_tts_model_kb(prefs.get("tts_model", "auto")),
     ))
-
-
-@legacy_bound_handler
-async def cmd_voxcpm2(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not update.effective_message:
-        return
-    if not await _ensure_voxcpm2_allowed(update, context):
-        return
-    context.user_data.pop("voxcpm2_state", None)
-    await _voxcpm2_send_panel(
-        update.effective_message,
-        int(update.effective_user.id),
-        context=context,
-    )
 
 
 @legacy_bound_handler
@@ -109,7 +95,7 @@ async def cmd_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_message:
         return
     await safe_send(lambda: update.effective_message.reply_text(
-        '🔒 <b>ឯកជនភាព</b>\n\nបូតនេះរក្សាទុកតែទិន្នន័យដែលចាំបាច់សម្រាប់ចំណូលចិត្ត ដំណើរការ Cache អត្ថបទ/សំឡេង បរិបទការសន្ទនា សុវត្ថិភាពអ្នកគ្រប់គ្រង កំណត់ហេតុការផ្ញើ និង—នៅពេលបានកំណត់ VoxCPM2—លេខសម្គាល់ឯកសារសំឡេងគំរូ Telegram ដែលអាចប្រើឡើងវិញ រួមជាមួយការណែនាំរចនាប័ទ្មសំឡេងដែលអ្នកអាចបញ្ចូល។ ទិន្នន័យសំឡេងគំរូដើមត្រូវបានទាញយកទៅកន្លែងបណ្ដោះអាសន្ន និងផ្ញើទៅសេវា VoxCPM2 ដែលបានកំណត់ តែក្នុងពេលបង្កើតសំឡេងប៉ុណ្ណោះ។\n\nអ្នកអាចប្រើ /clear ដើម្បីលុបបរិបទការសន្ទនាបច្ចុប្បន្ន ឬ /deleteme ដើម្បីលុបប្រវត្តិបូត និងចំណូលចិត្តដែលបានរក្សាទុកពី Cache/មូលដ្ឋានទិន្នន័យ តាមការកំណត់របស់ប្រព័ន្ធ។',
+        '🔒 <b>ឯកជនភាព</b>\n\nបូតនេះរក្សាទុកតែទិន្នន័យដែលចាំបាច់សម្រាប់ចំណូលចិត្ត ដំណើរការ Cache អត្ថបទ/សំឡេង បរិបទការសន្ទនា សុវត្ថិភាពអ្នកគ្រប់គ្រង និងកំណត់ហេតុការផ្ញើ។\n\nអ្នកអាចប្រើ /clear ដើម្បីលុបបរិបទការសន្ទនាបច្ចុប្បន្ន ឬ /deleteme ដើម្បីលុបប្រវត្តិបូត និងចំណូលចិត្តដែលបានរក្សាទុកពី Cache/មូលដ្ឋានទិន្នន័យ តាមការកំណត់របស់ប្រព័ន្ធ។',
         parse_mode="HTML",
     ))
 
@@ -127,7 +113,7 @@ async def cmd_delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     await _delete_user_personal_data(int(user.id))
     await safe_send(lambda: update.effective_message.reply_text(
-        '✅ បានសម្អាតប្រវត្តិបូត Cache អត្ថបទ ចំណូលចិត្ត និងទម្រង់សំឡេងគំរូ VoxCPM2 របស់អ្នក។\nសម្គាល់៖ កំណត់ត្រាបិទសិទ្ធិសុវត្ថិភាព និងកំណត់ហេតុការផ្ញើ/សវនកម្មចាំបាច់ អាចត្រូវរក្សាទុកដោយអ្នកគ្រប់គ្រង ដើម្បីការពារការប្រើប្រាស់ខុសគោលបំណង។'
+        '✅ បានសម្អាតប្រវត្តិបូត Cache អត្ថបទ និងចំណូលចិត្តរបស់អ្នក។\nសម្គាល់៖ កំណត់ត្រាបិទសិទ្ធិសុវត្ថិភាព និងកំណត់ហេតុការផ្ញើ/សវនកម្មចាំបាច់ អាចត្រូវរក្សាទុកដោយអ្នកគ្រប់គ្រង ដើម្បីការពារការប្រើប្រាស់ខុសគោលបំណង។'
     ))
 
 
@@ -203,18 +189,8 @@ async def cmd_cancelschedule(update: Update, context: ContextTypes.DEFAULT_TYPE)
 @legacy_bound_handler
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    vox_state = context.user_data.pop("voxcpm2_state", None)
     if not _is_admin(uid):
-        if vox_state:
-            await _voxcpm2_send_panel(
-                update.message,
-                int(uid),
-                "បានបោះបង់ការបញ្ចូលព័ត៌មាន VoxCPM2។",
-                context=context,
-                prefer_saved=True,
-            )
-        else:
-            await safe_send(lambda: update.message.reply_text('ℹ️ មិនមានប្រតិបត្តិការដែលត្រូវបោះបង់ទេ។'))
+        await safe_send(lambda: update.message.reply_text('ℹ️ មិនមានប្រតិបត្តិការដែលត្រូវបោះបង់ទេ។'))
         return
 
     # Preserve the old admin-chat notification behavior while still using the
@@ -225,9 +201,6 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             target_id = _admin_chat_target.get(uid)
 
     cleared = await _clear_admin_transient_state(context, uid)
-    if vox_state:
-        cleared.insert(0, "voxcpm2-setup")
-        cleared = list(dict.fromkeys(cleared))
 
     if target_id:
         with suppress(Exception):
@@ -629,7 +602,6 @@ __all__ = [
     'on_help',
     'cmd_myprefs',
     'cmd_ttsmodel',
-    'cmd_voxcpm2',
     'cmd_clear',
     'cmd_security',
     'cmd_privacy',

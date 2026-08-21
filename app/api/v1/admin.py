@@ -107,16 +107,14 @@ async def get_admin_stats(
         legacy._setting_bool_from(settings, "maintenance_mode", False)
     )
     bot_mode = str(legacy._run_state_bot_mode())
-    polling_active = bool(getattr(legacy, "_TELEGRAM_POLLING_ACTIVE", False))
-    telegram_app_ready = bool(getattr(legacy, "_TELEGRAM_APP", None))
+    telegram_status = dict(legacy._telegram_runtime_status_snapshot())
 
     return {
         "ok": True,
         "generated_at": datetime.now(UTC).isoformat(),
         "bot": {
-            "active": telegram_app_ready or polling_active,
+            **telegram_status,
             "mode": bot_mode,
-            "polling_active": polling_active,
             "maintenance_mode": maintenance_mode,
             "uptime": str(legacy._format_uptime()),
         },

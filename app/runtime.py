@@ -187,6 +187,13 @@ class RuntimeContext:
             if self.settings_store is not None
             else {"backend": "unconfigured", "persistent": False, "configured": False}
         )
+        telegram_snapshot = getattr(self.legacy, "_telegram_runtime_status_snapshot", None)
+        telegram = telegram_snapshot() if callable(telegram_snapshot) else {
+            "status": "offline",
+            "phase": "unavailable",
+            "active": False,
+            "ready": False,
+        }
         return {
             "started": self.started,
             "started_at": self.started_at or None,
@@ -199,6 +206,7 @@ class RuntimeContext:
             "worker_removed": True,
             "redis_removed": True,
             "providers": get_provider_manager().metadata(),
+            "telegram": telegram,
             "telegram_workloads": get_telegram_workload_limiter().snapshot(),
             "webhook_replay": get_webhook_replay_snapshot(),
         }
