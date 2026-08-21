@@ -26,6 +26,7 @@ def classify_callback(
         "tg_female": "gender",
         "tg_male": "gender",
         "welcome_profile": "welcome_profile",
+        "welcome_back": "welcome_back",
     }
     if value in exact_actions:
         return exact_actions[value]

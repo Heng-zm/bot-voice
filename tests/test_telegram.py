@@ -141,6 +141,10 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
             "welcome_profile",
             classify_callback("welcome_profile", speed_callbacks=speeds),
         )
+        self.assertEqual(
+            "welcome_back",
+            classify_callback("welcome_back", speed_callbacks=speeds),
+        )
         self.assertFalse(callback_requires_tts_access("welcome_profile", "welcome_profile"))
         self.assertIsNone(classify_callback("voxcpm2:refresh", speed_callbacks=speeds))
 
@@ -279,6 +283,20 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
             show_alert=False,
         )
 
+    async def test_welcome_back_button_removes_profile_card(self) -> None:
+        query = SimpleNamespace(
+            data="welcome_back",
+            from_user=SimpleNamespace(id=42),
+            message=SimpleNamespace(delete=AsyncMock()),
+            answer=AsyncMock(),
+        )
+        update = SimpleNamespace(callback_query=query)
+
+        await legacy.on_callback(update, SimpleNamespace())
+
+        query.answer.assert_awaited_once_with()
+        query.message.delete.assert_awaited_once_with()
+
     async def test_tts_callback_honors_runtime_access_policy(self) -> None:
         query = SimpleNamespace(
             data="spd_1.0",
@@ -379,6 +397,18 @@ class TelegramFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(button.url == "https://t.me/m11mmm112" for button in buttons))
         self.assertTrue(any(button.callback_data == "welcome_profile" for button in buttons))
         message.reply_text.assert_not_awaited()
+
+    async def test_user_profile_has_back_button(self) -> None:
+        message = SimpleNamespace(reply_text=AsyncMock())
+        prefs = {"gender": "female", "speed": 1.0, "tts_model": "auto"}
+        with patch.object(legacy, "get_user_prefs_async", AsyncMock(return_value=prefs)):
+            from app.services.telegram.commands import send_user_profile
+
+            await send_user_profile(message, 42)
+
+        markup = message.reply_text.await_args.kwargs["reply_markup"]
+        buttons = [button for row in markup.inline_keyboard for button in row]
+        self.assertTrue(any(button.callback_data == "welcome_back" for button in buttons))
 
     async def test_setting_toggle_updates_runtime_cache_immediately(self) -> None:
         old_memory = dict(legacy._bot_settings_memory)

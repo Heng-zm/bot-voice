@@ -19306,17 +19306,25 @@ async def _deliver_paged_tts(
 # ---------------------------------------------------------------------------
 # Keyboard builders
 # ---------------------------------------------------------------------------
-def get_main_kb(gender: str, tts_model: str = "auto") -> InlineKeyboardMarkup:
+def get_main_kb(
+    gender: str,
+    tts_model: str = "auto",
+    *,
+    include_back: bool = False,
+) -> InlineKeyboardMarkup:
     f_btn = "👩 សំឡេងស្រី" + (" ✅" if gender == "female" else "")
     m_btn = "👨 សំឡេងប្រុស" + (" ✅" if gender == "male" else "")
     model_key = _normalize_tts_model(tts_model)
     model_btn = f"🤖 ម៉ូដែល TTS: {TTS_MODEL_OPTIONS.get(model_key, TTS_MODEL_OPTIONS['auto'])[0]}"
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton(f_btn, callback_data="tg_female"),
          InlineKeyboardButton(m_btn, callback_data="tg_male")],
         [InlineKeyboardButton("🎚️ ល្បឿនសំឡេង", callback_data="show_speed")],
         [InlineKeyboardButton(model_btn, callback_data="show_tts_model")],
-    ])
+    ]
+    if include_back:
+        rows.append([InlineKeyboardButton("🔙 Back", callback_data="welcome_back")])
+    return InlineKeyboardMarkup(rows)
 
 
 def get_tts_model_kb(current_model: str = "auto") -> InlineKeyboardMarkup:

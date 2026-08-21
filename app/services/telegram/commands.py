@@ -45,7 +45,11 @@ async def send_user_profile(message, user_id: int):
         "ផ្ញើអត្ថបទណាមួយ។ បូតស្គាល់ភាសា និងជ្រើសសំឡេងដោយស្វ័យប្រវត្តិ; "
         "ប៊ូតុងក្រោមសារសំឡេងប្រើសម្រាប់ប្តូរម៉ូដែល ល្បឿន ឬប្រភេទសំឡេង។",
         parse_mode="HTML",
-        reply_markup=get_main_kb(prefs["gender"], prefs.get("tts_model", "auto")),
+        reply_markup=get_main_kb(
+            prefs["gender"],
+            prefs.get("tts_model", "auto"),
+            include_back=True,
+        ),
     ))
 
 
