@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
 import logging
+import re
 from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any, Literal
@@ -49,6 +51,17 @@ class BroadcastTestPayload(BaseModel):
     link_preview: bool = True
 
 
+class DailyBroadcastPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    time: str = Field(min_length=4, max_length=8)
+    text: str = Field(default="", max_length=4096)
+    photo_file_id: str | None = Field(default=None, max_length=512)
+    caption: str = Field(default="", max_length=1024)
+    parse_mode: str = Field(default="auto", max_length=32)
+    link_preview: bool = True
+
+
 def _audit(legacy: Any, action: str, detail: str) -> None:
     try:
         legacy._web_admin_audit(action, detail)
@@ -67,6 +80,147 @@ def _safe_settings(settings: dict[str, Any]) -> dict[str, Any]:
         for key, value in settings.items()
         if not _is_sensitive(str(key))
     }
+
+
+def _daily_schedule_create_sync(
+    legacy: Any,
+    *,
+    admin_id: int,
+    schedule_time: str,
+    text: str,
+    photo_file_id: str | None,
+    caption: str,
+    parse_mode: str,
+    link_preview: bool,
+) -> dict[str, Any]:
+    """Create one confirmed daily row using the existing scheduler schema."""
+    raw_time = re.sub(r"\s+", "", str(schedule_time or ""))
+    if not re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d", raw_time):
+        raise ValueError("time must use 24-hour HH:MM format.")
+    broadcast_at = legacy._parse_daily_schedule_time(f"daily {raw_time}")
+    if broadcast_at is None:
+        raise ValueError("Could not calculate the next daily run time.")
+    supabase = getattr(legacy, "supabase", None)
+    if not supabase:
+        raise RuntimeError("Supabase is not configured.")
+
+    existing = legacy.db_call_sync(
+        "admin_v2_daily_schedule_duplicates",
+        lambda: (
+            supabase.table("scheduled_broadcasts")
+            .select("id,admin_id,broadcast_at,status,error_msg,plain_text,caption,photo_file_id")
+            .eq("admin_id", int(admin_id))
+            .limit(500)
+            .execute()
+        ),
+        default=None,
+        attempts=1,
+        critical=False,
+    )
+    for row in list(getattr(existing, "data", None) or []):
+        if str(row.get("status") or "").lower() == "cancelled":
+            continue
+        if legacy._sched_row_recurrence(row) != legacy.SCHED_RECURRENCE_DAILY:
+            continue
+        raise ValueError(
+            "A daily broadcast already exists "
+            f"(schedule #{int(row.get('id') or 0)}). Cancel it before creating another."
+        )
+
+    normalized_mode = legacy._broadcast_normalize_parse_mode(parse_mode)
+    normalized_preview = legacy._broadcast_normalize_link_preview(link_preview, True)
+    if photo_file_id:
+        content = str(caption or text or "").strip()
+        clean_content, normalized_mode, normalized_preview = legacy._broadcast_prepare_text(
+            content,
+            normalized_mode,
+            max_chars=1024,
+            default_link_preview=normalized_preview,
+        )
+        if not clean_content:
+            raise ValueError("A photo daily broadcast needs a caption.")
+        stored_caption = legacy._broadcast_apply_option_directives(
+            clean_content,
+            normalized_mode,
+            normalized_preview,
+        )
+        row = {
+            "admin_id": int(admin_id),
+            "photo_file_id": str(photo_file_id).strip(),
+            "caption": legacy._sched_apply_recurrence_directive(stored_caption, legacy.SCHED_RECURRENCE_DAILY),
+            "plain_text": None,
+            "broadcast_at": legacy._sched_iso(broadcast_at),
+            "status": legacy.SCHED_STATUS_PENDING,
+            "error_msg": None,
+        }
+    else:
+        clean_content, normalized_mode, normalized_preview = legacy._broadcast_prepare_text(
+            str(text or "").strip(),
+            normalized_mode,
+            max_chars=int(getattr(legacy, "TELE_MSG_LIMIT", 4096)),
+            default_link_preview=normalized_preview,
+        )
+        if not clean_content:
+            raise ValueError("A daily broadcast needs message text.")
+        stored_text = legacy._broadcast_apply_option_directives(
+            clean_content,
+            normalized_mode,
+            normalized_preview,
+        )
+        row = {
+            "admin_id": int(admin_id),
+            "photo_file_id": None,
+            "caption": None,
+            "plain_text": legacy._sched_apply_recurrence_directive(stored_text, legacy.SCHED_RECURRENCE_DAILY),
+            "broadcast_at": legacy._sched_iso(broadcast_at),
+            "status": legacy.SCHED_STATUS_PENDING,
+            "error_msg": None,
+        }
+    result = legacy.db_call_sync(
+        "admin_v2_daily_schedule_create",
+        lambda: supabase.table("scheduled_broadcasts").insert(row).execute(),
+        default=None,
+        attempts=2,
+        critical=True,
+    )
+    saved = (getattr(result, "data", None) or [None])[0]
+    if not saved:
+        raise RuntimeError("Daily broadcast schedule could not be saved.")
+    legacy._sched_admin_pending_cache_clear(admin_id)
+    return dict(saved)
+
+
+def _daily_schedule_rows_sync(legacy: Any, admin_id: int) -> list[dict[str, Any]]:
+    supabase = getattr(legacy, "supabase", None)
+    if not supabase:
+        return []
+    result = legacy.db_call_sync(
+        "admin_v2_daily_schedule_list",
+        lambda: (
+            supabase.table("scheduled_broadcasts")
+            .select("id,admin_id,broadcast_at,status,error_msg,plain_text,caption,photo_file_id,failed_count")
+            .eq("admin_id", int(admin_id))
+            .order("broadcast_at", desc=False)
+            .limit(100)
+            .execute()
+        ),
+        default=None,
+        attempts=1,
+        critical=False,
+    )
+    rows = []
+    for row in list(getattr(result, "data", None) or []):
+        if legacy._sched_row_recurrence(row) != legacy.SCHED_RECURRENCE_DAILY:
+            continue
+        item = dict(row)
+        item["content"] = legacy._sched_row_content(row)[:180]
+        item["time"] = (
+            legacy._to_local_time(legacy._sched_parse_iso(row.get("broadcast_at"))).strftime("%H:%M")
+            if legacy._sched_parse_iso(row.get("broadcast_at"))
+            else ""
+        )
+        rows.append(item)
+    return rows
 
 
 def _parse_event_day(value: Any) -> date | None:
@@ -458,6 +612,79 @@ async def admin_broadcast_test(
         raise HTTPException(status_code=502, detail="Telegram test delivery failed.") from exc
     _audit(legacy, "admin_v2_broadcast_test", f"admin_id={principal.admin_id} photo={bool(payload.photo_file_id)}")
     return {"ok": True, "message_id": getattr(message, "message_id", None), "parse_mode": mode}
+
+
+@router.get("/schedules/daily")
+async def admin_daily_schedules(
+    principal: Annotated[AdminPrincipal, Depends(require_admin)],
+) -> dict[str, Any]:
+    legacy = legacy_module()
+    rows = await asyncio.to_thread(_daily_schedule_rows_sync, legacy, principal.admin_id)
+    return {
+        "ok": True,
+        "schedules": rows,
+        "count": len(rows),
+        "timezone": "Asia/Phnom_Penh",
+        "persistent": bool(getattr(legacy, "supabase", None)),
+    }
+
+
+@router.post("/schedules/daily")
+async def admin_daily_schedule_create(
+    payload: DailyBroadcastPayload,
+    principal: Annotated[AdminPrincipal, Depends(require_admin_write)],
+) -> dict[str, Any]:
+    legacy = legacy_module()
+    try:
+        row = await asyncio.to_thread(
+            _daily_schedule_create_sync,
+            legacy,
+            admin_id=principal.admin_id,
+            schedule_time=payload.time,
+            text=payload.text,
+            photo_file_id=payload.photo_file_id,
+            caption=payload.caption,
+            parse_mode=payload.parse_mode,
+            link_preview=payload.link_preview,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    _audit(
+        legacy,
+        "admin_v2_daily_schedule_create",
+        f"admin_id={principal.admin_id} schedule_id={row.get('id')} time={payload.time}",
+    )
+    return {"ok": True, "schedule": row, "timezone": "Asia/Phnom_Penh"}
+
+
+@router.delete("/schedules/daily/{schedule_id}")
+async def admin_daily_schedule_cancel(
+    schedule_id: int,
+    principal: Annotated[AdminPrincipal, Depends(require_admin_write)],
+) -> dict[str, Any]:
+    legacy = legacy_module()
+    row = await asyncio.to_thread(legacy.db_sched_fetch_one, schedule_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Schedule not found.")
+    if int(row.get("admin_id") or 0) != int(principal.admin_id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Schedule belongs to another administrator.")
+    if legacy._sched_row_recurrence(row) != legacy.SCHED_RECURRENCE_DAILY:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Schedule is not a daily broadcast.")
+    if str(row.get("status") or "").lower() in {"done", "cancelled"}:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Schedule is already finished.")
+    saved = await asyncio.to_thread(
+        legacy.db_sched_set_status,
+        schedule_id,
+        legacy.SCHED_STATUS_CANCELLED,
+        critical=True,
+        error_msg="Cancelled from Daily Broadcast Scheduler",
+    )
+    if not saved:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Could not cancel daily schedule.")
+    _audit(legacy, "admin_v2_daily_schedule_cancel", f"admin_id={principal.admin_id} schedule_id={schedule_id}")
+    return {"ok": True, "schedule_id": schedule_id, "status": legacy.SCHED_STATUS_CANCELLED}
 
 
 @router.get("/schedules/failures")

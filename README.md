@@ -234,7 +234,16 @@ POST /backup/restore            restore a validated backup
 POST /broadcast/test            send a preview to the requesting admin
 GET  /schedules/failures        failed scheduled broadcasts
 POST /schedules/{id}/retry      queue one failed broadcast again
+GET  /schedules/daily           inspect the active daily broadcast
+POST /schedules/daily           schedule one automatic message per day
+DELETE /schedules/daily/{id}    cancel the active daily broadcast
 ```
+
+Daily broadcasts use the `Asia/Phnom_Penh` timezone. The scheduler keeps one
+active daily message per administrator, advances it to the next day after
+delivery, and reuses the existing retry path when a delivery fails. The Mini
+App can create, inspect, and cancel the schedule; send a test broadcast first
+when changing the message or formatting.
 
 Maintenance mode now supports a custom message. Backups and exports omit
 credential-like settings; provider health is process-local and should be read

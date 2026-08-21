@@ -286,6 +286,30 @@ function renderScheduleFailures(payload = {}) {
   });
 }
 
+function renderDailySchedules(payload = {}) {
+  const root = $("dailyScheduleList");
+  if (!root) return;
+  root.replaceChildren();
+  const schedules = payload.schedules || [];
+  if (!schedules.length) {
+    root.append(simpleRow("No daily broadcast configured."));
+    return;
+  }
+  schedules.forEach((row) => {
+    const time = row.time || "--:--";
+    const status = row.status || "pending";
+    const content = row.content || "Daily message";
+    root.append(simpleRow(`${time} · ${content} · ${status}`, "Cancel", async () => {
+      if (!window.confirm("Cancel this daily broadcast?")) return;
+      try {
+        await api(`/api/admin/schedules/daily/${Number(row.id)}`, { method: "DELETE" });
+        showToast("Daily broadcast cancelled");
+        await refreshV2();
+      } catch (error) { showToast(error.message, true); }
+    }));
+  });
+}
+
 function renderRuntime(payload) {
   const store = payload.settings_store || {};
   const backend = store.backend === "supabase" ? "Supabase" : "Memory";
@@ -477,6 +501,7 @@ async function refreshAll({ silent = false } = {}) {
       api("/api/admin/runtime/status"), api("/api/admin/providers/health"), api("/api/admin/administrators"),
       api("/api/admin/administrators/audit?limit=50"), api("/api/admin/analytics?days=30"),
       api("/api/admin/usage/users?limit=50"), api("/api/admin/schedules/failures?limit=50"),
+      api("/api/admin/schedules/daily"),
     ];
     const results = await Promise.allSettled(calls);
     const good = results.filter((item) => item.status === "fulfilled").length;
@@ -493,6 +518,7 @@ async function refreshAll({ silent = false } = {}) {
       renderAnalytics(results[8].status === "fulfilled" ? results[8].value : {}, results[9].status === "fulfilled" ? results[9].value : {});
     }
     if (results[10].status === "fulfilled") renderScheduleFailures(results[10].value);
+    if (results[11].status === "fulfilled") renderDailySchedules(results[11].value);
     if (good === 0) throw (results[0].reason || new Error("Dashboard unavailable"));
     state.lastOk = Date.now();
     setConnection(good === results.length);
@@ -554,13 +580,15 @@ async function removeCors(origin) {
 
 async function refreshV2() {
   const days = Number($("analyticsRange")?.value || 30);
-  const [analytics, users, failures] = await Promise.all([
+  const [analytics, users, failures, daily] = await Promise.all([
     api(`/api/admin/analytics?days=${days}`),
     api("/api/admin/usage/users?limit=50"),
     api("/api/admin/schedules/failures?limit=50"),
+    api("/api/admin/schedules/daily"),
   ]);
   renderAnalytics(analytics, users);
   renderScheduleFailures(failures);
+  renderDailySchedules(daily);
 }
 
 async function downloadAdminFile(path, filename) {
@@ -659,6 +687,29 @@ $("broadcastTestButton").onclick = async () => {
       parse_mode: $("broadcastParseMode").value,
     }) });
     showToast("Test sent to your Telegram account");
+  } catch (error) { showToast(error.message, true); }
+  finally { button.disabled = false; }
+};
+$("dailyBroadcastForm").onsubmit = async (event) => {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector("button[type=submit]");
+  button.disabled = true;
+  try {
+    const payload = await api("/api/admin/schedules/daily", {
+      method: "POST",
+      body: JSON.stringify({
+        time: $("dailyBroadcastTime").value,
+        text: $("dailyBroadcastText").value,
+        photo_file_id: $("dailyBroadcastPhotoId").value || null,
+        caption: $("dailyBroadcastCaption").value,
+        parse_mode: $("dailyBroadcastParseMode").value,
+      }),
+    });
+    showToast(`Daily broadcast scheduled for ${payload.schedule?.broadcast_at || "the next run"}`);
+    $("dailyBroadcastText").value = "";
+    $("dailyBroadcastPhotoId").value = "";
+    $("dailyBroadcastCaption").value = "";
+    await refreshV2();
   } catch (error) { showToast(error.message, true); }
   finally { button.disabled = false; }
 };
