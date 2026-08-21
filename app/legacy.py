@@ -13528,6 +13528,7 @@ BOT_PERFORMANCE_SETTING_SPECS: OrderedDict[str, dict[str, Any]] = OrderedDict([
 
 BOT_SETTING_DEFAULTS: dict[str, str] = {
     "maintenance_mode": "0",
+    "maintenance_message": "Bot is temporarily under maintenance. Please try again shortly.",
     "welcome_message": WELCOME_TEXT,
     "welcome_photo_file_id": "",
     "tts_enabled": "1",
@@ -13558,6 +13559,9 @@ BOT_SETTING_DESCRIPTIONS: dict[str, str] = {
     "ai_resolver_enabled": "Allow AI to rewrite/resolve text before TTS when enabled by env.",
     **{key: str(spec.get("help", "")) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
+BOT_SETTING_LABELS["maintenance_message"] = "Maintenance Message"
+BOT_SETTING_DESCRIPTIONS["maintenance_message"] = "Message shown to normal users while maintenance mode is enabled."
+
 _SETTINGS_CACHE_TTL_S = _env_float("BOT_SETTINGS_CACHE_TTL_S", 30.0, minimum=0.0, maximum=3600.0)
 _bot_settings_memory: dict[str, str] = dict(BOT_SETTING_DEFAULTS)
 _bot_settings_cache: dict = {
@@ -13589,8 +13593,56 @@ _RUNTIME_METRICS: OrderedDict[str, int] = OrderedDict([
 ])
 
 
-def _metric_inc(name: str, amount: int = 1) -> None:
+_ADMIN_USAGE_EVENTS_MAX = _env_int("ADMIN_USAGE_EVENTS_MAX", 20_000, minimum=1_000, maximum=100_000)
+_ADMIN_USAGE_EVENTS: deque[dict[str, Any]] = deque(maxlen=_ADMIN_USAGE_EVENTS_MAX)
+_ADMIN_USAGE_EVENTS_LOCK = threading.RLock()
+
+
+def _record_admin_usage(
+    user_id: int | None,
+    feature: str,
+    *,
+    duration_ms: float = 0.0,
+    amount: int = 1,
+) -> None:
+    """Record bounded process-local usage for the Mini App analytics view.
+
+    Supabase ``text_cache`` remains the durable request source.  These events
+    add latency and feature detail without introducing a new required table.
+    """
+    try:
+        uid = int(user_id or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    if uid <= 0:
+        return
+    item = {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "ts": time.time(),
+        "user_id": uid,
+        "feature": str(feature or "request")[:40],
+        "amount": max(1, int(amount or 1)),
+        "duration_ms": round(max(0.0, float(duration_ms or 0.0)), 3),
+    }
+    with _ADMIN_USAGE_EVENTS_LOCK:
+        _ADMIN_USAGE_EVENTS.append(item)
+
+
+def _admin_usage_events_snapshot() -> list[dict[str, Any]]:
+    with _ADMIN_USAGE_EVENTS_LOCK:
+        return [dict(item) for item in _ADMIN_USAGE_EVENTS]
+
+
+def _metric_inc(
+    name: str,
+    amount: int = 1,
+    *,
+    user_id: int | None = None,
+    duration_ms: float = 0.0,
+) -> None:
     _RUNTIME_METRICS[name] = int(_RUNTIME_METRICS.get(name, 0)) + int(amount)
+    if user_id is not None:
+        _record_admin_usage(user_id, name, duration_ms=duration_ms, amount=amount)
 
 
 def _format_uptime() -> str:
@@ -14031,7 +14083,12 @@ async def _ensure_user_allowed(update: Update, context: ContextTypes.DEFAULT_TYP
     settings, _status = await get_bot_settings_async()
     if not is_admin and _setting_bool_from(settings, "maintenance_mode", False):
         _metric_inc("disabled_hits")
-        await safe_send(lambda: msg.reply_text("🛠️ Bot កំពុង Maintenance។ សូមព្យាយាមម្តងទៀតពេលក្រោយ។"))
+        maintenance_message = _setting_raw_from(
+            settings,
+            "maintenance_message",
+            BOT_SETTING_DEFAULTS.get("maintenance_message", "Bot is temporarily under maintenance."),
+        ).strip()
+        await safe_send(lambda: msg.reply_text(maintenance_message or "Bot is temporarily under maintenance."))
         return False
 
     if feature_key and not _setting_bool_from(settings, feature_key, True):

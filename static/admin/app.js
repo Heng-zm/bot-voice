@@ -13,6 +13,8 @@ const state = {
   lastOk: 0,
   timer: null,
   botStatusTimer: null,
+  analytics: null,
+  userUsage: {},
 };
 
 const I18N = {
@@ -211,6 +213,79 @@ function renderStats(payload) {
   }
 }
 
+function renderAnalytics(payload, usersPayload = {}) {
+  state.analytics = payload || {};
+  state.userUsage = usersPayload || {};
+  const period = $("analyticsPeriod")?.value || "daily";
+  const rows = payload?.[period] || [];
+  const canvas = $("usageChart");
+  if (canvas) {
+    const context = canvas.getContext("2d");
+    const width = canvas.clientWidth || 520;
+    const height = 170;
+    const ratio = window.devicePixelRatio || 1;
+    canvas.width = width * ratio;
+    canvas.height = height * ratio;
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    context.clearRect(0, 0, width, height);
+    const values = rows.map((row) => Number(row.requests || 0));
+    const max = Math.max(1, ...values);
+    const gap = 3;
+    const barWidth = Math.max(2, (width - gap * Math.max(0, values.length - 1)) / Math.max(1, values.length));
+    context.fillStyle = "#5b7cfa";
+    values.forEach((value, index) => {
+      const barHeight = Math.max(2, (value / max) * (height - 28));
+      const x = index * (barWidth + gap);
+      context.fillRect(x, height - barHeight - 18, barWidth, barHeight);
+    });
+    context.fillStyle = "#8290a8";
+    context.font = "11px system-ui";
+    context.fillText(`0`, 2, height - 3);
+    context.fillText(`${max}`, 2, 12);
+  }
+  const total = rows.reduce((sum, row) => sum + Number(row.requests || 0), 0);
+  const audioMs = rows.reduce((sum, row) => sum + Number(row.audio_generation_ms || 0), 0);
+  $("usageSummary").textContent = `${compact(total)} requests · ${(audioMs / 1000).toFixed(1)}s audio generation · source: ${payload?.source || "process"}`;
+  renderUserUsage(usersPayload);
+}
+
+function renderUserUsage(payload = {}) {
+  const root = $("userUsageList");
+  if (!root) return;
+  root.replaceChildren();
+  const users = payload.users || [];
+  if (!users.length) {
+    root.append(simpleRow("No usage recorded yet."));
+    return;
+  }
+  users.slice(0, 12).forEach((user) => {
+    const label = `${user.username ? `@${user.username} · ` : ""}${user.user_id}`;
+    const detail = `${compact(user.request_count)} requests · ${(Number(user.audio_generation_ms || 0) / 1000).toFixed(1)}s audio`;
+    root.append(simpleRow(`${label} — ${detail}`));
+  });
+}
+
+function renderScheduleFailures(payload = {}) {
+  const root = $("scheduleFailures");
+  if (!root) return;
+  root.replaceChildren();
+  const failures = payload.failures || [];
+  if (!failures.length) {
+    root.append(simpleRow("No failed schedules."));
+    return;
+  }
+  failures.forEach((row) => {
+    const detail = `${row.id} · ${row.error_msg || "delivery failed"}`;
+    root.append(simpleRow(detail, "Retry", async () => {
+      try {
+        await api(`/api/admin/schedules/${Number(row.id)}/retry`, { method: "POST" });
+        showToast("Retry queued");
+        await refreshV2();
+      } catch (error) { showToast(error.message, true); }
+    }));
+  });
+}
+
 function renderRuntime(payload) {
   const store = payload.settings_store || {};
   const backend = store.backend === "supabase" ? "Supabase" : "Memory";
@@ -245,6 +320,7 @@ function renderRuntime(payload) {
 
 function renderSettings(payload) {
   state.runtime = payload.runtime || {};
+  if ($("maintenanceMessage")) $("maintenanceMessage").value = payload.maintenance_message || "";
   const root = $("runtimeFields");
   root.replaceChildren();
   Object.entries(state.runtime).forEach(([key, spec]) => {
@@ -381,7 +457,7 @@ function renderAdmins(payload, audit) {
 }
 
 async function refreshProviders() {
-  renderProviders(await api("/api/admin/runtime/providers"));
+  renderProviders(await api("/api/admin/providers/health"));
 }
 async function refreshAdmins() {
   const [admins, audit] = await Promise.all([
@@ -398,8 +474,9 @@ async function refreshAll({ silent = false } = {}) {
   try {
     const calls = [
       api("/api/admin/me"), api("/api/admin/stats"), api("/api/admin/settings"), api("/api/admin/cors"),
-      api("/api/admin/runtime/status"), api("/api/admin/runtime/providers"), api("/api/admin/administrators"),
-      api("/api/admin/administrators/audit?limit=50"),
+      api("/api/admin/runtime/status"), api("/api/admin/providers/health"), api("/api/admin/administrators"),
+      api("/api/admin/administrators/audit?limit=50"), api("/api/admin/analytics?days=30"),
+      api("/api/admin/usage/users?limit=50"), api("/api/admin/schedules/failures?limit=50"),
     ];
     const results = await Promise.allSettled(calls);
     const good = results.filter((item) => item.status === "fulfilled").length;
@@ -412,6 +489,10 @@ async function refreshAll({ silent = false } = {}) {
     if (results[6].status === "fulfilled" && results[7].status === "fulfilled") {
       renderAdmins(results[6].value, results[7].value);
     }
+    if (results[8].status === "fulfilled" || results[9].status === "fulfilled") {
+      renderAnalytics(results[8].status === "fulfilled" ? results[8].value : {}, results[9].status === "fulfilled" ? results[9].value : {});
+    }
+    if (results[10].status === "fulfilled") renderScheduleFailures(results[10].value);
     if (good === 0) throw (results[0].reason || new Error("Dashboard unavailable"));
     state.lastOk = Date.now();
     setConnection(good === results.length);
@@ -471,6 +552,41 @@ async function removeCors(origin) {
   }
 }
 
+async function refreshV2() {
+  const days = Number($("analyticsRange")?.value || 30);
+  const [analytics, users, failures] = await Promise.all([
+    api(`/api/admin/analytics?days=${days}`),
+    api("/api/admin/usage/users?limit=50"),
+    api("/api/admin/schedules/failures?limit=50"),
+  ]);
+  renderAnalytics(analytics, users);
+  renderScheduleFailures(failures);
+}
+
+async function downloadAdminFile(path, filename) {
+  const response = await fetch(path, { credentials: "same-origin", cache: "no-store", headers: headers() });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.detail || `Request failed (${response.status})`);
+  }
+  const blob = await response.blob();
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = filename;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}
+
+async function downloadBackup() {
+  const payload = await api("/api/admin/backup");
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = "bot-settings-backup.json";
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}
+
 $("refreshButton").onclick = () => refreshAll();
 $("languageButton").onclick = () => {
   state.language = state.language === "en" ? "km" : "en";
@@ -491,6 +607,60 @@ $("maintenanceToggle").onchange = async (event) => {
   } finally {
     event.target.disabled = false;
   }
+};
+$("saveMaintenanceMessage").onclick = async () => {
+  const button = $("saveMaintenanceMessage");
+  button.disabled = true;
+  try {
+    await api("/api/admin/settings", { method: "POST", body: JSON.stringify({ maintenance_message: $("maintenanceMessage").value }) });
+    showToast(t("saved"));
+  } catch (error) { showToast(error.message, true); }
+  finally { button.disabled = false; }
+};
+$("analyticsRange").onchange = async () => {
+  try { await refreshV2(); } catch (error) { showToast(error.message, true); }
+};
+$("analyticsPeriod").onchange = () => renderAnalytics(state.analytics || {}, state.userUsage || {});
+$("clearCacheButton").onclick = async () => {
+  const button = $("clearCacheButton");
+  button.disabled = true;
+  try {
+    const payload = await api("/api/admin/cache/clear", { method: "POST", body: JSON.stringify({}) });
+    showToast(payload.message || t("saved"));
+  } catch (error) { showToast(error.message, true); }
+  finally { button.disabled = false; }
+};
+$("downloadBackupButton").onclick = async () => {
+  try { await downloadBackup(); showToast("Backup downloaded"); } catch (error) { showToast(error.message, true); }
+};
+$("restoreBackupButton").onclick = async () => {
+  try {
+    const value = JSON.parse($("backupPayload").value || "{}");
+    await api("/api/admin/backup/restore", { method: "POST", body: JSON.stringify({ settings: value.settings || {}, runtime: value.runtime || {} }) });
+    showToast("Backup restored");
+    await refreshAll({ silent: true });
+  } catch (error) { showToast(error.message, true); }
+};
+document.querySelectorAll("[data-export]").forEach((button) => button.addEventListener("click", async () => {
+  try {
+    const dataset = button.dataset.export;
+    const format = button.dataset.format;
+    await downloadAdminFile(`/api/admin/export/${dataset}?format=${format}`, `bot-${dataset}.${format}`);
+    showToast("Export downloaded");
+  } catch (error) { showToast(error.message, true); }
+}));
+$("broadcastTestButton").onclick = async () => {
+  const button = $("broadcastTestButton");
+  button.disabled = true;
+  try {
+    await api("/api/admin/broadcast/test", { method: "POST", body: JSON.stringify({
+      text: $("broadcastTestText").value,
+      photo_file_id: $("broadcastPhotoId").value || null,
+      parse_mode: $("broadcastParseMode").value,
+    }) });
+    showToast("Test sent to your Telegram account");
+  } catch (error) { showToast(error.message, true); }
+  finally { button.disabled = false; }
 };
 $("runtimeForm").onsubmit = async (event) => {
   event.preventDefault();

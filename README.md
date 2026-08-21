@@ -17,6 +17,10 @@ the dedicated worker service are no longer part of the runtime.
 - Supabase-backed preferences, history, administrators, CORS, and runtime settings
 - Signed Telegram Mini App administrator authentication
 - Admin-editable `/start` welcome text and image with Support, Channel, and User Profile actions
+- Admin Panel V2 analytics (daily/weekly/monthly), per-user request and audio timing,
+  Gemini/Hugging Face/Edge TTS health cards, audit history, cache cleanup, exports,
+  settings backup/restore, maintenance messaging, broadcast test delivery, and
+  scheduled-broadcast retry reports
 - Process-local webhook replay protection with ownership-aware leases
 - Bounded OCR, transcription, and audio workload admission
 - Batched runtime-setting startup reads and cache-first blocked-user checks
@@ -213,6 +217,29 @@ trusted administrator and accept Telegram init data through either:
 The existing opaque administrator API bearer token remains supported. Cookie
 writes require the CSRF header generated for the administrator session.
 
+### Admin Panel V2 operations
+
+The Mini App adds these authenticated JSON routes under `/api/admin`:
+
+```text
+GET  /analytics                 usage chart data
+GET  /usage/users               per-user request and audio timing
+GET  /providers/health          stable provider health cards
+GET  /activity                  admin activity/audit timeline
+GET  /cache                     cache-size snapshot
+POST /cache/clear               one-click runtime cache cleanup
+GET  /export/{users|settings|usage}?format=json|csv
+GET  /backup                    settings/runtime backup
+POST /backup/restore            restore a validated backup
+POST /broadcast/test            send a preview to the requesting admin
+GET  /schedules/failures        failed scheduled broadcasts
+POST /schedules/{id}/retry      queue one failed broadcast again
+```
+
+Maintenance mode now supports a custom message. Backups and exports omit
+credential-like settings; provider health is process-local and should be read
+as an instance signal rather than a cluster-wide SLA.
+
 Dynamic CORS accepts only exact HTTP or HTTPS origins. Wildcards, URL paths,
 credentials, queries, fragments, malformed ports, and invalid host syntax are
 rejected.
@@ -245,18 +272,6 @@ python -m pytest -q
 python -m ruff check app tests
 python -m compileall -q app tests
 node --check static/admin/app.js
-```
-
-Current verified result:
-
-```text
-85 passed
-Ruff passed
-Python compilation passed
-Admin JavaScript syntax passed
-Edge TTS 7.2.8 live synthesis passed
-Gemini chat and OCR live checks passed
-Telegram identity and Supabase schema checks passed
 ```
 
 Live broadcasts, destructive user-data actions, and scheduler mutations should

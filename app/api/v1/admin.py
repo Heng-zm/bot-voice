@@ -35,6 +35,7 @@ class AdminSettingsPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     maintenance_mode: bool | None = None
+    maintenance_message: str | None = None
     runtime: dict[str, Any] | None = None
 
 
@@ -147,6 +148,7 @@ async def get_admin_settings(
         "maintenance_mode": bool(
             legacy._setting_bool_from(settings, "maintenance_mode", False)
         ),
+        "maintenance_message": str(settings.get("maintenance_message") or ""),
         "runtime": _runtime_settings_payload(legacy),
         "settings_store": {
             "database_ok": bool(settings_status.get("db_ok")),
@@ -160,10 +162,10 @@ async def update_admin_settings(
     payload: AdminSettingsPayload,
     principal: Annotated[AdminPrincipal, Depends(require_admin_write)],
 ) -> dict[str, Any]:
-    if payload.maintenance_mode is None and not payload.runtime:
+    if payload.maintenance_mode is None and payload.maintenance_message is None and not payload.runtime:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Provide maintenance_mode or at least one runtime setting.",
+            detail="Provide maintenance_mode, maintenance_message, or at least one runtime setting.",
         )
 
     legacy = legacy_module()
@@ -201,6 +203,26 @@ async def update_admin_settings(
         await legacy.get_bot_settings_async(force=True)
         changed.append("maintenance_mode")
 
+    if payload.maintenance_message is not None:
+        message = str(payload.maintenance_message).strip()
+        if len(message) > 4096:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="maintenance_message must be at most 4096 characters.",
+            )
+        ok, save_message = await asyncio.to_thread(
+            legacy.db_bot_setting_value_set,
+            "maintenance_message",
+            message,
+            principal.admin_id,
+        )
+        if not ok:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Could not update maintenance message: {save_message}",
+            )
+        changed.append("maintenance_message")
+
     for key, value in coerced_runtime.items():
         current = getattr(legacy, "RUN_STATE", {}).get(
             key,
@@ -237,6 +259,7 @@ async def update_admin_settings(
         "maintenance_mode": bool(
             legacy._setting_bool_from(settings, "maintenance_mode", False)
         ),
+        "maintenance_message": str(settings.get("maintenance_message") or ""),
         "runtime": _runtime_settings_payload(legacy),
     }
 

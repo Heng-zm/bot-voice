@@ -236,6 +236,7 @@ for each row execute function public.bot_set_updated_at();
 
 insert into public.bot_settings (key, value) values
   ('maintenance_mode', '0'),
+  ('maintenance_message', 'Bot is temporarily under maintenance. Please try again shortly.'),
   ('tts_enabled', '1'),
   ('ocr_enabled', '1'),
   ('voice_transcribe_enabled', '1'),

@@ -5,6 +5,8 @@ These are live runtime handlers; app.legacy now contains compatibility wrappers 
 
 from __future__ import annotations
 
+import time
+
 # Transitional V4.1 modules bind remaining legacy helpers at runtime.
 # ruff: noqa: F821
 from app.services.telegram._legacy_runtime import legacy_bound_handler
@@ -604,7 +606,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        _metric_inc("tts")
+        _metric_inc("tts", user_id=user_id)
         sync_user_data(user)
         progress = await TelegramProgress.start(
             bot=context.bot,
@@ -672,6 +674,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             file_path = _make_temp_ogg()
             await progress.update(35, "កំពុងបង្កើតសំឡេង", f"កំពុងប្រើ {model_label}។", force=True)
+            generation_started = time.perf_counter()
             audio_bytes = await generate_user_voice_limited(
                 tts_text,
                 gender,
@@ -682,6 +685,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 bot=context.bot,
                 chat_id=msg.chat_id,
                 progress=progress,
+            )
+            _record_admin_usage(
+                user_id,
+                "tts_generation",
+                duration_ms=(time.perf_counter() - generation_started) * 1_000,
             )
             await progress.update(88, "បានបង្កើតសំឡេង", "កំពុងផ្ញើសារសំឡេងទៅអ្នក។", force=True)
             sent_msg = await safe_send(lambda ab=audio_bytes: msg.reply_voice(

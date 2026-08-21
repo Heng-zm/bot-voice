@@ -28,6 +28,7 @@ from app.api.v1.admin import router as admin_router
 from app.api.v1.admin_cors import router as admin_cors_router
 from app.api.v1.admin_runtime import router as admin_runtime_router
 from app.api.v1.admin_users import router as admin_users_router
+from app.api.v1.admin_v2 import router as admin_v2_router
 from app.core.cors import DynamicCORSMiddleware
 from app.runtime import get_runtime_context
 
@@ -94,6 +95,7 @@ if not getattr(app.state, "_runtime_bootstrap_installed", False):
     app.include_router(admin_cors_router)
     app.include_router(admin_runtime_router)
     app.include_router(admin_users_router)
+    app.include_router(admin_v2_router)
     app.mount(
         "/miniapp/admin/assets",
         StaticFiles(directory=str(_ADMIN_STATIC_DIR), check_dir=False),
