@@ -9507,7 +9507,34 @@ async def _telegram_start_polling_runtime(app_obj: Any) -> bool:
         return True
 
 
-async def _telegram_stop_polling_runtime(app_obj: Any, *, cancel_task: bool = True) -> bool:
+async def _telegram_noop_polling_cleanup() -> None:
+    """Skip PTB's final getUpdates request during forced ownership handoff."""
+
+
+def _telegram_skip_polling_cleanup(updater: Any) -> bool:
+    """Replace PTB's private cleanup callback with a no-op when going standby.
+
+    Updater.stop() normally sends one final getUpdates request so Telegram can
+    mark the last offset. That request is counterproductive after distributed
+    ownership is lost and produces a long error traceback during a network
+    outage. The polling loop already uses update replay protection, so allowing
+    the last update to be fetched again is safer than delaying the handoff.
+    """
+    callback_name = "_Updater__polling_cleanup_cb"
+    if updater is None or not hasattr(updater, callback_name):
+        return False
+    if getattr(updater, callback_name, None) is None:
+        return False
+    setattr(updater, callback_name, _telegram_noop_polling_cleanup)
+    return True
+
+
+async def _telegram_stop_polling_runtime(
+    app_obj: Any,
+    *,
+    cancel_task: bool = True,
+    skip_cleanup: bool = False,
+) -> bool:
     global _TELEGRAM_POLLING_ACTIVE
     updater = _telegram_app_updater(app_obj)
     if cancel_task:
@@ -9518,8 +9545,13 @@ async def _telegram_stop_polling_runtime(app_obj: Any, *, cancel_task: bool = Tr
     async with _telegram_polling_lock():
         if not _TELEGRAM_POLLING_ACTIVE:
             return True
-        with suppress(Exception):
+        cleanup_skipped = skip_cleanup and _telegram_skip_polling_cleanup(updater)
+        if cleanup_skipped:
+            webhook_logger.info("Skipping final getUpdates cleanup during Telegram ownership handoff.")
+        try:
             await updater.stop()
+        except Exception as exc:
+            webhook_logger.warning("Telegram polling stop completed with a suppressed error: %s", exc)
         _TELEGRAM_POLLING_ACTIVE = False
         webhook_logger.info("Telegram long polling stopped dynamically.")
         return True
@@ -15179,7 +15211,7 @@ async def _telegram_leader_refresh_once(app_obj: Any | None = None) -> bool:
             webhook_logger.warning("This Render instance lost Telegram active ownership; switching to standby.")
             if app_obj is not None:
                 with suppress(Exception):
-                    await _telegram_stop_polling_runtime(app_obj)
+                    await _telegram_stop_polling_runtime(app_obj, skip_cleanup=True)
         _TELEGRAM_LEADER_OWNED = False
         _TELEGRAM_LEADER_LAST_CHANGE_AT = now
         _TELEGRAM_LEADER_LAST_WEBHOOK_SIGNATURE = None
@@ -20322,7 +20354,7 @@ def _is_admin(user_id: int) -> bool:
 
         return get_telegram_admin_authorizer().is_admin_sync(user_id)
     except Exception as exc:
-        logger.warning("Redis admin authorization check failed user_id=%s: %s", user_id, exc)
+        logger.warning("Cached admin authorization check failed user_id=%s: %s", user_id, exc)
         return False
 
 

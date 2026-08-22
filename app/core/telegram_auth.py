@@ -177,6 +177,24 @@ class TelegramAdminAuthorizer:
         self._cache = None
         self._cache_at = 0.0
 
+    def is_admin_sync(self, user_id: int) -> bool:
+        """Check the already-loaded admin snapshot without blocking the event loop.
+
+        Telegram command guards are synchronous callbacks. Runtime startup and
+        Mini App mutations keep this snapshot current, so these guards must not
+        start a second event loop or perform synchronous Supabase I/O.
+        """
+        try:
+            candidate = int(user_id)
+        except (TypeError, ValueError):
+            return False
+        if candidate <= 0:
+            return False
+        snapshot = self._cache
+        if snapshot is not None:
+            return candidate in snapshot
+        return candidate in self.fallback_admin_ids
+
     async def load_ids(self, *, force: bool = False) -> frozenset[int]:
         now = time.monotonic()
         if not force and self._cache is not None and now - self._cache_at < self.cache_ttl_seconds:
