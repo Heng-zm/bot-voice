@@ -31,7 +31,7 @@ case "${INSTALL_REQUIREMENTS_ON_START:-false}" in
         ;;
 esac
 
-# Fail with a clear syntax error before starting the web server. This check can
+# Fail with a clear syntax error before starting the Telegram bot. This check can
 # be disabled for read-only deployments with STARTUP_COMPILE_CHECK=false.
 case "${STARTUP_COMPILE_CHECK:-true}" in
     0|false|FALSE|no|NO)

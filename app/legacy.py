@@ -118,7 +118,6 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    WebAppInfo,
 )
 from telegram.error import (
     NetworkError,
@@ -1291,11 +1290,6 @@ class FastAPICompatApp:
             return func
         return decorator
 
-    def run(self, host: str = "0.0.0.0", port: int = 8080, **kwargs: Any):
-        import uvicorn
-        uvicorn.run(self.fastapi, host=host, port=port, **kwargs)
-
-
 app_flask = FastAPICompatApp()
 app = app_flask.fastapi
 
@@ -2097,26 +2091,6 @@ def _webhook_rotate_finish(success: bool) -> None:
             _WEBHOOK_LAST_ROTATE_AT = time.monotonic()
         _WEBHOOK_ROTATE_IN_PROGRESS = False
 
-
-async def run_fastapi():
-    """Run the FastAPI dashboard inside the main asyncio runtime."""
-    import uvicorn
-    port = _env_int("PORT", 8080, minimum=1, maximum=65535)
-    config = uvicorn.Config(
-        app,
-        host="0.0.0.0",
-        port=port,
-        log_level=os.environ.get("UVICORN_LOG_LEVEL", "info").lower(),
-        proxy_headers=_env_bool("WEB_TRUST_PROXY", _env_bool("RENDER", False)),
-        forwarded_allow_ips="*" if _env_bool("WEB_TRUST_PROXY", _env_bool("RENDER", False)) else None,
-    )
-    server = uvicorn.Server(config)
-    await server.serve()
-
-
-def run_flask():
-    """Backward-compatible alias. Prefer run_fastapi()."""
-    asyncio.run(run_fastapi())
 
 # ── AI Assistant REST API ──────────────────────────────────────────────────
 
@@ -9082,8 +9056,9 @@ def _run_state_get(key: str, default: Any = None) -> Any:
 
 
 def _run_state_bot_mode() -> str:
-    mode = str(RUN_STATE.get("BOT_MODE") or BOT_MODE or _perf_default("BOT_MODE", "WEBHOOK")).strip().upper()
-    return mode if mode in {"POLLING", "WEBHOOK"} else str(_perf_default("BOT_MODE", "WEBHOOK")).upper()
+    # The HTTP backend has been removed. Long polling is now the only supported
+    # Telegram transport and cannot be changed by stale persisted settings.
+    return "POLLING"
 
 
 def _run_state_user_rate_limit() -> int:
@@ -9348,16 +9323,13 @@ async def _update_run_state(key: str, value: Any, *, persist: bool = True) -> No
         await _persist_run_state_key(key, persisted_value)
 
 def _runtime_admin_text() -> str:
-    from app.services.telegram.deduplication import get_webhook_replay_snapshot
     from app.services.telegram.workloads import get_telegram_workload_limiter
 
     mode = _run_state_bot_mode()
     rate_limit = _run_state_user_rate_limit()
     http_conn = _run_state_http_max_connections()
     polling_status = "ON" if globals().get("_TELEGRAM_POLLING_ACTIVE") else "OFF"
-    webhook_ready = "YES" if TELEGRAM_WEBHOOK_URL and _runtime_webhook_secret_token() else "NO"
     workloads = get_telegram_workload_limiter().snapshot()
-    replay = get_webhook_replay_snapshot()
 
     pressure_lines: list[str] = []
     for label, kind in (("OCR", "ocr"), ("Transcribe", "transcribe"), ("Audio", "audio")):
@@ -9375,11 +9347,8 @@ def _runtime_admin_text() -> str:
         "តម្លៃសំខាន់ៗបច្ចុប្បន្ន៖\n"
         f"• Bot Mode: <b>{html.escape(mode)}</b>\n"
         f"• Polling Active: <b>{html.escape(polling_status)}</b>\n"
-        f"• Webhook Config Ready: <b>{html.escape(webhook_ready)}</b>\n"
         f"• User Rate Limit: <b>{rate_limit} req/{_run_state_user_rate_window():g}s</b>\n"
-        f"• HTTP Max Connections: <b>{http_conn}</b>\n"
-        f"• Webhook Replay: <b>{int(replay.get('entries', 0))}</b> entries"
-        f" · duplicates {int(replay.get('duplicates', 0))}\n\n"
+        f"• Telegram Connections: <b>{http_conn}</b>\n\n"
         "⚙️ <b>Workload pressure</b>\n"
         f"{pressure_text}\n\n"
         "ជ្រើសរើសសកម្មភាពខាងក្រោម ដើម្បីកែប្រែ Runtime ដោយមិនបាច់ Restart។"
@@ -9387,12 +9356,8 @@ def _runtime_admin_text() -> str:
 
 
 def get_runtime_admin_kb() -> Any:
-    mode = _run_state_bot_mode()
-    target = "WEBHOOK" if mode != "WEBHOOK" else "POLLING"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🔄 Switch to {target}", callback_data=f"rtadmin_switch:{target}")],
         [InlineKeyboardButton("⚡ Modify Rate Limit", callback_data="rtadmin_rate")],
-        [InlineKeyboardButton("🔄 Rotate Webhook Secret", callback_data="rtadmin_rotate_secret")],
         [InlineKeyboardButton("⬅️ Admin V9", callback_data="admin_home")],
         [InlineKeyboardButton("❌ Close Menu", callback_data="rtadmin_close")],
     ])
@@ -9577,6 +9542,8 @@ async def _switch_telegram_runtime_mode(target_mode: str, admin_id: int = 0) -> 
     target = str(target_mode or "POLLING").strip().upper()
     if target not in {"POLLING", "WEBHOOK"}:
         raise ValueError("Invalid target Telegram mode.")
+    if target == "WEBHOOK":
+        raise RuntimeError("Webhook mode is unavailable because the FastAPI backend was removed.")
     app_obj = globals().get("_TELEGRAM_APP")
     if app_obj is None:
         raise RuntimeError("Telegram application is not ready yet.")
@@ -13672,7 +13639,7 @@ def _record_admin_usage(
     duration_ms: float = 0.0,
     amount: int = 1,
 ) -> None:
-    """Record bounded process-local usage for the Mini App analytics view.
+    """Record bounded process-local usage for Telegram admin diagnostics.
 
     Supabase ``text_cache`` remains the durable request source.  These events
     add latency and feature detail without introducing a new required table.
@@ -16143,8 +16110,7 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings"),
          InlineKeyboardButton("🛠 Runtime", callback_data="admin_runtime")],
         [InlineKeyboardButton("👋 Welcome Message", callback_data="admin_welcome")],
-        [InlineKeyboardButton("📄 Report", callback_data="admin_report"),
-         InlineKeyboardButton("🔐 WEB_KEY", callback_data="admin_web_key")],
+        [InlineKeyboardButton("📄 Report", callback_data="admin_report")],
         [InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
          InlineKeyboardButton("📅 Calendar", callback_data="admin_calendar")],
         [InlineKeyboardButton("🔑 API Keys", callback_data="admin_api"),
@@ -16153,14 +16119,6 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🔄 Refresh", callback_data="admin_home")],
         [InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ]
-    mini_app_url = f"{_runtime_webhook_base_url()}/miniapp/admin"
-    if mini_app_url.startswith("https://"):
-        rows.insert(0, [
-            InlineKeyboardButton(
-                "📊 Open Admin Mini App",
-                web_app=WebAppInfo(url=mini_app_url),
-            )
-        ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -26592,9 +26550,8 @@ async def _run_bot():
         _set_telegram_runtime_status("error", "missing_bot_token")
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
 
-    # This application lifecycle supports both webhook and polling.  The
-    # getUpdates worker itself is guarded separately by ACTIVE_POLLING_TASK;
-    # if mode is WEBHOOK, no polling updater is started.
+    # Telegram-only deployments use getUpdates polling. The worker itself is
+    # guarded separately by ACTIVE_POLLING_TASK for multi-instance ownership.
 
     with suppress(Exception):
         applied = await _apply_all_bot_performance_settings(admin_id=0, force=True)
@@ -26681,7 +26638,7 @@ async def _run_bot():
         if not active_owner:
             _set_telegram_runtime_status("standby", "waiting_for_ownership")
             webhook_logger.warning(
-                "Telegram application is running in STANDBY mode. Web/Admin routes are online, but this Render service will not process Telegram updates until it owns the active lock."
+                "Telegram bot is in STANDBY mode and will resume polling when it owns the active lock."
             )
         elif _run_state_bot_mode() == "WEBHOOK":
             await _cancel_active_polling_task("startup_webhook_mode")
@@ -26811,15 +26768,20 @@ async def _run_startup_background_checks() -> None:
 # Main
 # ---------------------------------------------------------------------------
 async def _async_main_once():
+    global BOT_MODE
     load_dotenv()
     _refresh_arch_runtime_settings()
     _init_clients()
+    from app.services.settings.store import configure_settings_store
+
+    configure_settings_store(supabase)
     await _init_async_clients()
     try:
         await _restore_run_state()
     except Exception as rexc:
         webhook_logger.warning("Runtime state restore failed during boot: %s", rexc)
-    await _bootstrap_runtime_security()
+    BOT_MODE = "POLLING"
+    RUN_STATE["BOT_MODE"] = "POLLING"
     from app.core.telegram_auth import configure_telegram_admin_authorizer
 
     admin_authorizer = configure_telegram_admin_authorizer(
@@ -26831,11 +26793,11 @@ async def _async_main_once():
     if not ADMIN_IDS:
         logger.warning(
             "No Telegram administrators are authorized. Configure ADMIN_IDS once; "
-            "the Mini App will persist subsequent changes in Supabase."
+            "restart the bot after changing the administrator list."
         )
 
     print(
-        f"Bot + FastAPI are starting... (AI: {AI_PROVIDER} | HF: {HF_MODEL} | "
+        f"Telegram bot is starting... (AI: {AI_PROVIDER} | HF: {HF_MODEL} | "
         f"OCR: {OCR_PROVIDER} | HF OCR: {HF_OCR_MODEL} | "
         f"TTS: {TTS_PROVIDER}/{KHMER_TTS_PROVIDER} | user_model_default: {_normalize_tts_model(DEFAULT_TTS_MODEL)} | "
         "Storage: Supabase + memory fallback | "
@@ -26843,22 +26805,12 @@ async def _async_main_once():
         f"HTTP pool: {HTTP_MAX_CONNECTIONS}/{HTTP_MAX_KEEPALIVE_CONNECTIONS})"
     )
 
-    _start_web_broadcast_queue_workers()
     telegram_app_task = asyncio.create_task(_run_bot(), name="telegram-bot")
     startup_checks_task = asyncio.create_task(_run_startup_background_checks(), name="startup-background-checks")
-    tasks = [
-        asyncio.create_task(run_fastapi(), name="fastapi-web"),
-        telegram_app_task,
-        startup_checks_task,
-    ]
+    tasks = [telegram_app_task, startup_checks_task]
     try:
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-        for task in done:
-            exc = task.exception()
-            if exc:
-                raise exc
+        await telegram_app_task
     finally:
-        await _stop_web_broadcast_queue_workers()
         for task in tasks:
             if not task.done():
                 task.cancel()

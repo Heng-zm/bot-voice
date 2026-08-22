@@ -19,10 +19,6 @@ COPY --chown=appuser:appuser . .
 
 USER appuser
 
-EXPOSE 8080
 STOPSIGNAL SIGTERM
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD python -m app.healthcheck
 
 CMD ["python", "-m", "app.main"]
