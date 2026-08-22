@@ -11676,6 +11676,35 @@ def ai_text_reply(prompt: str, history: list[dict] | None = None) -> tuple[str, 
     return result
 
 
+def _supabase_postgrest_timeout() -> httpx.Timeout:
+    """Bound Supabase calls so an outage cannot occupy DB workers for minutes."""
+    request_timeout = _env_float("SUPABASE_HTTP_TIMEOUT_S", 12.0, minimum=2.0, maximum=60.0)
+    connect_timeout = _env_float(
+        "SUPABASE_CONNECT_TIMEOUT_S",
+        min(5.0, request_timeout),
+        minimum=1.0,
+        maximum=request_timeout,
+    )
+    return httpx.Timeout(
+        connect=connect_timeout,
+        read=request_timeout,
+        write=request_timeout,
+        pool=connect_timeout,
+    )
+
+
+def _supabase_client_options(*, asynchronous: bool = False) -> Any | None:
+    """Build version-compatible Supabase options with bounded PostgREST I/O."""
+    try:
+        if asynchronous:
+            from supabase.lib.client_options import AsyncClientOptions as options_type
+        else:
+            from supabase.lib.client_options import SyncClientOptions as options_type
+        return options_type(postgrest_client_timeout=_supabase_postgrest_timeout())
+    except (ImportError, TypeError):
+        return None
+
+
 def _init_clients() -> None:
     global supabase, redis_client, _gemini, TELEGRAM_BOT_TOKEN, SB_URL, SB_KEY, REDIS_URL
     global GEMINI_API_KEY, GEMINI_MODEL
@@ -11731,7 +11760,13 @@ def _init_clients() -> None:
         try:
             if SB_KEY.startswith("sb_publishable_") or "publishable" in SB_KEY.lower():
                 logger.warning("SUPABASE_KEY looks like a publishable key. Admin tables such as ai_api_keys should use SUPABASE_SERVICE_ROLE_KEY on the server.")
-            supabase = _supabase_v2_compat_client(create_client(SB_URL, SB_KEY))
+            options = _supabase_client_options()
+            client = (
+                create_client(SB_URL, SB_KEY, options=options)
+                if options is not None
+                else create_client(SB_URL, SB_KEY)
+            )
+            supabase = _supabase_v2_compat_client(client)
             if SUPABASE_DB_POOLER_URL:
                 logger.info("Supabase DB pooler URL configured for direct PostgreSQL workloads (transaction pooler / Supavisor recommended on port 6543).")
             else:
@@ -14597,7 +14632,12 @@ async def _init_async_clients() -> None:
         supabase_async = None
         return
     try:
-        maybe_client = acreate_client(SB_URL, SB_KEY)
+        options = _supabase_client_options(asynchronous=True)
+        maybe_client = (
+            acreate_client(SB_URL, SB_KEY, options=options)
+            if options is not None
+            else acreate_client(SB_URL, SB_KEY)
+        )
         supabase_async = await maybe_client if inspect.isawaitable(maybe_client) else maybe_client
         logger.info("Async Supabase client initialised.")
     except Exception as e:
@@ -14763,7 +14803,11 @@ def _lock_until_iso(ttl_s: int | float) -> str:
     return _sched_iso(datetime.now(timezone.utc) + timedelta(seconds=max(1, int(ttl_s))))
 
 
-def db_lock_acquire(lock_key: str = _SCHED_LOCK_KEY, owner: str = _BOT_LOCK_OWNER, ttl_s: int = _SCHED_LOCK_TTL_S) -> bool:
+def db_lock_acquire(
+    lock_key: str = _SCHED_LOCK_KEY,
+    owner: str = _BOT_LOCK_OWNER,
+    ttl_s: int = _SCHED_LOCK_TTL_S,
+) -> bool | None:
     """Acquire or renew a lightweight Supabase lock.
 
     This intentionally does NOT use db_call_sync, because a missing bot_locks
@@ -14795,6 +14839,7 @@ def db_lock_acquire(lock_key: str = _SCHED_LOCK_KEY, owner: str = _BOT_LOCK_OWNE
             .execute()
         )
         if getattr(res, "data", None):
+            supabase_breaker.record_success()
             return True
 
         # Safe takeover: only expired rows are updateable. Postgres re-checks
@@ -14807,13 +14852,17 @@ def db_lock_acquire(lock_key: str = _SCHED_LOCK_KEY, owner: str = _BOT_LOCK_OWNE
             .execute()
         )
         if getattr(res, "data", None):
+            supabase_breaker.record_success()
             return True
 
         # First boot path: create the lock row. If another instance inserts
         # first, the unique constraint fails and we simply do not own it.
         try:
             res = supabase.table("bot_locks").insert({"lock_key": lock_key, **update}).execute()
-            return bool(getattr(res, "data", None))
+            acquired = bool(getattr(res, "data", None))
+            if acquired:
+                supabase_breaker.record_success()
+            return acquired
         except Exception as insert_exc:
             # Unique violation means another instance already owns/created it.
             low = str(insert_exc).lower()
@@ -14821,6 +14870,15 @@ def db_lock_acquire(lock_key: str = _SCHED_LOCK_KEY, owner: str = _BOT_LOCK_OWNE
                 return False
             raise
     except Exception as exc:
+        if _is_retryable_store_error(exc):
+            _log_once(
+                logging.WARNING,
+                f"sched_lock_store_outage:{type(exc).__name__}:{str(exc)[:120]}",
+                "Scheduler lock store is temporarily unavailable; this tick will be deferred. Error: %s",
+                exc,
+            )
+            supabase_breaker.record_failure(exc)
+            return None
         _log_once(
             logging.WARNING,
             f"sched_lock_unavailable:{type(exc).__name__}:{str(exc)[:120]}",
@@ -14864,10 +14922,10 @@ def db_lock_read(lock_key: str = _SCHED_LOCK_KEY) -> dict | None:
         return None
 
 
-def db_named_lock_acquire(lock_key: str, owner: str, ttl_s: int | float) -> bool:
+def db_named_lock_acquire(lock_key: str, owner: str, ttl_s: int | float) -> bool | None:
     """Acquire/renew a named lock in Supabase without depending on scheduler flags."""
     if not supabase:
-        return False
+        return None
     lock_key = str(lock_key or "lock")[:240]
     owner = str(owner or "unknown")[:240]
     now_iso = _sched_iso()
@@ -14882,6 +14940,7 @@ def db_named_lock_acquire(lock_key: str, owner: str, ttl_s: int | float) -> bool
             .execute()
         )
         if getattr(res, "data", None):
+            supabase_breaker.record_success()
             return True
 
         res = (
@@ -14892,11 +14951,15 @@ def db_named_lock_acquire(lock_key: str, owner: str, ttl_s: int | float) -> bool
             .execute()
         )
         if getattr(res, "data", None):
+            supabase_breaker.record_success()
             return True
 
         try:
             res = supabase.table("bot_locks").insert({"lock_key": lock_key, **update}).execute()
-            return bool(getattr(res, "data", None))
+            acquired = bool(getattr(res, "data", None))
+            if acquired:
+                supabase_breaker.record_success()
+            return acquired
         except Exception as insert_exc:
             low = str(insert_exc).lower()
             if "duplicate" in low or "23505" in low or "unique" in low:
@@ -14910,6 +14973,9 @@ def db_named_lock_acquire(lock_key: str, owner: str, ttl_s: int | float) -> bool
             lock_key,
             exc,
         )
+        if _is_retryable_store_error(exc):
+            supabase_breaker.record_failure(exc)
+            return None
         return False
 
 
@@ -14998,7 +15064,7 @@ def _telegram_leader_store_available() -> bool:
     return bool(globals().get("redis_client") is not None or globals().get("supabase") is not None)
 
 
-def _telegram_leader_acquire_sync() -> bool:
+def _telegram_leader_acquire_sync() -> bool | None:
     """Acquire/renew active Telegram ownership. Redis is preferred; Supabase is fallback."""
     global _TELEGRAM_LEADER_LAST_ERROR
     if not _telegram_leader_lock_enabled():
@@ -15058,6 +15124,9 @@ def _telegram_leader_acquire_sync() -> bool:
 
     if supabase is not None:
         ok = db_named_lock_acquire(_telegram_leader_lock_key(), owner, ttl)
+        if ok is None:
+            _TELEGRAM_LEADER_LAST_ERROR = "supabase:unavailable"
+            return None
         _TELEGRAM_LEADER_LAST_ERROR = "" if ok else "supabase:not_owner"
         return bool(ok)
 
@@ -15206,6 +15275,20 @@ async def _telegram_leader_refresh_once(app_obj: Any | None = None) -> bool:
     loop = asyncio.get_running_loop()
     acquired = await loop.run_in_executor(None, _telegram_leader_acquire_sync)
     now = time.monotonic()
+    if acquired is None and _TELEGRAM_LEADER_OWNED:
+        last_renew = float(_TELEGRAM_LEADER_LAST_RENEW_AT or 0.0)
+        ttl = float(_telegram_leader_ttl_s())
+        safety_margin = max(3.0, min(10.0, ttl * 0.1))
+        lease_age = now - last_renew if last_renew > 0 else ttl
+        if lease_age < ttl - safety_margin:
+            remaining = max(0.0, ttl - safety_margin - lease_age)
+            _log_once(
+                logging.WARNING,
+                "telegram_leader_store_grace",
+                "Telegram ownership store is unavailable; retaining the existing lease for up to %.0fs.",
+                remaining,
+            )
+            return True
     if not acquired:
         if _TELEGRAM_LEADER_OWNED:
             webhook_logger.warning("This Render instance lost Telegram active ownership; switching to standby.")
@@ -15475,6 +15558,7 @@ def db_sched_fetch_due(limit: int = _SCHED_DUE_LIMIT) -> list[dict]:
             .execute()
         ),
         default=None,
+        attempts=1,
     )
     rows = list(getattr(res, "data", None) or [])
     return [r for r in rows if _sched_is_confirmed_pending(r)][: max(1, int(limit or _SCHED_DUE_LIMIT))]
@@ -15625,6 +15709,7 @@ def db_sched_mark_stale_sending_failed() -> int:
             .execute()
         ),
         default=None,
+        attempts=1,
     )
     for row in list(getattr(sending_res, "data", None) or []):
         started_at = _sched_claim_time(row)
@@ -15672,6 +15757,7 @@ def db_sched_mark_stale_sending_failed() -> int:
             .execute()
         ),
         default=None,
+        attempts=1,
     )
     changed += len(getattr(draft_res, "data", None) or [])
     return changed
@@ -24779,11 +24865,19 @@ async def _scheduler_loop(bot, stop_event: asyncio.Event) -> None:
         lock_acquired = False
         try:
             loop = asyncio.get_running_loop()
-            lock_acquired = await loop.run_in_executor(
+            lock_result = await loop.run_in_executor(
                 None, db_lock_acquire, _SCHED_LOCK_KEY, _BOT_LOCK_OWNER, _SCHED_LOCK_TTL_S
             )
-            _scheduler_lock_last_status = "owned" if lock_acquired else "not_owner"
-            if not lock_acquired:
+            lock_acquired = bool(lock_result)
+            if lock_result is None:
+                _scheduler_lock_last_status = "store_unavailable"
+                _log_once(
+                    logging.WARNING,
+                    "sched_lock_store_unavailable",
+                    "Scheduler tick deferred because the distributed lock store is temporarily unavailable.",
+                )
+            elif not lock_acquired:
+                _scheduler_lock_last_status = "not_owner"
                 lock_row = await loop.run_in_executor(None, db_lock_read, _SCHED_LOCK_KEY)
                 owner_hint = ""
                 if lock_row:
@@ -24796,6 +24890,7 @@ async def _scheduler_loop(bot, stop_event: asyncio.Event) -> None:
                     owner_hint,
                 )
             else:
+                _scheduler_lock_last_status = "owned"
                 stale_count = await loop.run_in_executor(None, db_sched_mark_stale_sending_failed)
                 if stale_count:
                     logger.warning(f"Recovered/expired {stale_count} scheduled broadcast row(s).")

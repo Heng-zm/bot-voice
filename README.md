@@ -184,6 +184,20 @@ python -m app.main
 The application does not self-ping. Configure the hosting platform to check
 `/readyz` when an external uptime or readiness probe is required.
 
+Supabase PostgREST requests use bounded connect/read timeouts so a database or
+DNS outage does not consume all response workers. Override them only when the
+deployment has unusually slow database connectivity:
+
+```env
+SUPABASE_CONNECT_TIMEOUT_S=5
+SUPABASE_HTTP_TIMEOUT_S=12
+```
+
+Telegram ownership renewal distinguishes “another instance owns the lease”
+from “the lock store is temporarily unavailable.” An active instance keeps its
+existing lease only until a safety margin before expiry, avoiding needless
+polling restarts without allowing two instances to become active.
+
 Compatibility launchers are also supported:
 
 ```bash
