@@ -17087,8 +17087,10 @@ def _hf_tts_is_quota_error(exc: BaseException | str) -> bool:
     msg = _hf_tts_error_text(exc).lower()
     return (
         "zerogpu quota" in msg
+        or "zerogpu runs limit" in msg
         or "exceeded your free" in msg
         or "quota" in msg and "exceeded" in msg
+        or "zerogpu" in msg and ("limit" in msg or "exceeded" in msg)
         or "0s left" in msg
     )
 
@@ -17108,40 +17110,20 @@ def _hf_tts_record_failure(exc: BaseException | str) -> None:
     during cold starts or overloaded periods.
     """
     global _HF_TTS_FAILURES, _HF_TTS_DISABLED_UNTIL
-    exc_text = _hf_tts_error_text(exc)[:500]
     now = time.monotonic()
     cooldown = 0.0
-    reason = "failure-threshold"
 
     with _HF_TTS_STATE_LOCK:
         _HF_TTS_FAILURES += 1
         previous_until = _HF_TTS_DISABLED_UNTIL
-        already_disabled = now < previous_until
 
         if _hf_tts_is_quota_error(exc):
             cooldown = HF_TTS_QUOTA_COOLDOWN_S
-            reason = "quota"
         elif _HF_TTS_FAILURES >= HF_TTS_FAILURE_LIMIT:
             cooldown = HF_TTS_NO_AUDIO_COOLDOWN_S if _hf_tts_is_no_audio_error(exc) else HF_TTS_COOLDOWN_S
-            reason = "no-audio" if _hf_tts_is_no_audio_error(exc) else "failure-threshold"
 
         if cooldown > 0:
             _HF_TTS_DISABLED_UNTIL = max(previous_until, now + cooldown)
-            should_log = (not already_disabled) or (_HF_TTS_DISABLED_UNTIL > previous_until + 1.0)
-        else:
-            should_log = False
-
-        failures = _HF_TTS_FAILURES
-        remaining = max(0, int(_HF_TTS_DISABLED_UNTIL - now))
-
-    if should_log:
-        logger.warning(
-            "HF Khmer TTS temporarily disabled for %ss after %s failure(s), reason=%s: %s",
-            remaining,
-            failures,
-            reason,
-            exc_text,
-        )
 
 
 def _should_try_hf_khmer_tts(text: str, tts_model: str = "auto") -> bool:
@@ -17616,6 +17598,8 @@ def _hf_tts_get_client_sync():
 def _hf_tts_predict_should_retry(exc: Exception) -> bool:
     """Return True for transient Gradio/ZeroGPU cold-start style failures."""
     msg = str(exc).lower()
+    if _hf_tts_is_quota_error(exc):
+        return False
     non_retryable = (
         "invalid api",
         "api_name",
@@ -19048,9 +19032,8 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
             if not cooldown_only:
                 _hf_tts_record_failure(exc)
                 logger.warning(
-                    "HF Khmer TTS failed; user_model=%s edge fallback=%s cooldown_remaining=%ss: %s",
+                    "HF Khmer TTS unavailable; using Edge fallback user_model=%s cooldown_remaining=%ss: %s",
                     user_model,
-                    HF_TTS_EDGE_FALLBACK,
                     _hf_tts_disabled_remaining_s(),
                     exc,
                 )
