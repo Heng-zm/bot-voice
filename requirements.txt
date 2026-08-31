@@ -1,0 +1,18 @@
+python-telegram-bot
+# The legacy command module still imports FastAPI compatibility types, but no
+# ASGI backend/server is started by the Telegram-only entry point.
+fastapi==0.128.2
+httpx
+pydantic-settings
+jinja2
+itsdangerous
+python-dotenv
+supabase
+imageio-ffmpeg
+edge-tts>=7.2.8,<8
+google-genai
+huggingface_hub
+gradio_client>=2,<3
+orjson
+ujson
+reportlab

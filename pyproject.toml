@@ -1,0 +1,15 @@
+[tool.ruff]
+target-version = "py311"
+extend-exclude = ["app/legacy.py"]
+
+[tool.ruff.lint]
+# Keep the legacy monolith excluded while new/extracted modules use stricter
+# correctness, modernization, async, simplification, and security checks.
+select = ["E4", "E7", "E9", "F", "I", "B", "UP", "SIM", "ASYNC", "S"]
+# Lazy PEP 562 compatibility modules expose names through module __getattr__.
+ignore = ["F822"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test fixtures intentionally use fake credentials and dynamic ``exec`` to
+# exercise bytecode dependency discovery; neither pattern reaches production.
+"tests/*" = ["S101", "S102", "S105"]
