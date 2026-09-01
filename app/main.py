@@ -455,13 +455,17 @@ async def translate_endpoint(
         raise HTTPException(status_code=400, detail="Missing required field: 'text'")
 
     target_lang = body.get("target_language", "Khmer")
-    gemini_client = getattr(legacy, "gemini_client", None)
+    gemini_client = getattr(legacy, "_gemini", None)
     if gemini_client is not None:
+        import asyncio
+        loop = asyncio.get_running_loop()
         prompt = f"Translate the following text accurately and naturally into {target_lang}. Return only the translated text without extra explanation:\n\n{text}"
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-        )
+        def _call_ai():
+            return gemini_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+            )
+        response = await loop.run_in_executor(None, _call_ai)
         translated = (getattr(response, "text", "") or "").strip()
     else:
         translated = text
@@ -494,13 +498,17 @@ async def summarize_endpoint(
     if not text:
         raise HTTPException(status_code=400, detail="Missing required field: 'text'")
 
-    gemini_client = getattr(legacy, "gemini_client", None)
+    gemini_client = getattr(legacy, "_gemini", None)
     if gemini_client is not None:
+        import asyncio
+        loop = asyncio.get_running_loop()
         prompt = f"Summarize the following text into clear, actionable bullet points preserving key details:\n\n{text}"
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-        )
+        def _call_ai():
+            return gemini_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+            )
+        response = await loop.run_in_executor(None, _call_ai)
         summary = (getattr(response, "text", "") or "").strip()
     else:
         summary = text[:300] + "..."
