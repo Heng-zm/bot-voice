@@ -1,8 +1,9 @@
-"""Telegram Voice Bot entry point with Automated Registration and AI Assistant API."""
+"""Telegram Voice Bot entry point with Automated Registration, AI Assistant, and TTS APIs."""
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import sys
@@ -21,6 +22,7 @@ from fastapi.responses import JSONResponse
 from telegram import BotCommand, Update
 
 from app import legacy
+from app.utils.file_io import cleanup_files, make_temp_ogg
 
 logger = logging.getLogger("app.webhook")
 
@@ -165,7 +167,12 @@ async def lifespan(app_instance: FastAPI) -> AsyncGenerator[None, None]:
             await bot_task
 
 
-app = FastAPI(title="Telegram Bot Voice API", lifespan=lifespan)
+app = FastAPI(
+    title="Telegram Bot Voice & AI Assistant Suite",
+    description="Multilingual Voice Synthesis, AI Vision OCR, and Gemini Assistant API.",
+    version="4.2.0",
+    lifespan=lifespan,
+)
 
 
 @app.get("/")
@@ -186,6 +193,7 @@ async def health_check(request: Request) -> JSONResponse:
         "service": "telegram-bot-voice",
         "webhook_url": f"{captured_url}/webhook" if captured_url else "polling_mode",
         "api_url": f"{captured_url}/ai-assistant" if captured_url else "https://your-domain.onrender.com/ai-assistant",
+        "tts_url": f"{captured_url}/tts" if captured_url else "https://your-domain.onrender.com/tts",
     })
 
 
@@ -235,7 +243,6 @@ async def telegram_webhook(
     path_token: str | None = None,
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
 ) -> JSONResponse:
-
     """Handle incoming Telegram webhook updates with secret token verification."""
     expected_secret = (os.environ.get("TELEGRAM_WEBHOOK_SECRET_TOKEN") or "").strip()
     if expected_secret and x_telegram_bot_api_secret_token != expected_secret:
@@ -280,6 +287,17 @@ async def ai_assistant_info(request: Request) -> JSONResponse:
     })
 
 
+def _validate_api_key(x_api_key: str | None, authorization: str | None) -> bool:
+    api_key = x_api_key or (authorization.replace("Bearer ", "").strip() if authorization else "")
+    configured_key = os.environ.get("BOT_API_KEY", "").strip()
+
+    return bool(api_key) and (
+        api_key in _KNOWN_API_KEYS
+        or (bool(configured_key) and api_key == configured_key)
+        or api_key.startswith("sk-ai-")
+    )
+
+
 @app.post("/ai-assistant")
 @app.post("/api/ai-assistant")
 async def ai_assistant_endpoint(
@@ -288,24 +306,13 @@ async def ai_assistant_endpoint(
     authorization: str | None = Header(default=None),
 ) -> JSONResponse:
     """Generate AI response with auto-captured URL."""
-    api_key = x_api_key or (authorization.replace("Bearer ", "").strip() if authorization else "")
-    configured_key = os.environ.get("BOT_API_KEY", "").strip()
-
-    valid = (
-        bool(api_key) and (
-            api_key in _KNOWN_API_KEYS
-            or (bool(configured_key) and api_key == configured_key)
-            or api_key.startswith("sk-ai-")
-        )
-    )
-    if not valid:
+    if not _validate_api_key(x_api_key, authorization):
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid X-Api-Key")
 
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON payload") from None
-
 
     message = (body.get("message") or body.get("prompt") or "").strip()
     if not message:
@@ -343,6 +350,135 @@ async def ai_assistant_endpoint(
         "response": ai_text,
         "model": model,
         "api_url": f"{base_url}/ai-assistant",
+    })
+
+
+@app.post("/tts")
+@app.post("/api/tts")
+async def tts_endpoint(
+    request: Request,
+    x_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """High-quality Text-to-Speech synthesis API endpoint."""
+    if not _validate_api_key(x_api_key, authorization):
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid X-Api-Key")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") from None
+
+    text = (body.get("text") or body.get("message") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Missing required field: 'text'")
+
+    gender = str(body.get("gender", "female")).lower()
+    speed = float(body.get("speed", 1.0))
+    model = str(body.get("model", "auto")).lower()
+
+    temp_path = make_temp_ogg()
+    try:
+        audio_bytes = await legacy.generate_voice_limited(
+            text=text,
+            gender=gender,
+            speed=speed,
+            output_path=temp_path,
+            tts_model=model,
+        )
+        audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+        return JSONResponse({
+            "ok": True,
+            "text": text,
+            "gender": gender,
+            "speed": speed,
+            "model": model,
+            "mime_type": "audio/ogg",
+            "bytes_length": len(audio_bytes),
+            "audio_base64": audio_b64,
+        })
+    except Exception as exc:
+        logger.warning("TTS API synthesis failed: %s", exc)
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    finally:
+        cleanup_files(temp_path)
+
+
+@app.post("/translate")
+@app.post("/api/translate")
+async def translate_endpoint(
+    request: Request,
+    x_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """Multilingual AI translation endpoint."""
+    if not _validate_api_key(x_api_key, authorization):
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid X-Api-Key")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") from None
+
+    text = (body.get("text") or body.get("message") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Missing required field: 'text'")
+
+    target_lang = body.get("target_language", "Khmer")
+    gemini_client = getattr(legacy, "gemini_client", None)
+    if gemini_client is not None:
+        prompt = f"Translate the following text accurately and naturally into {target_lang}. Return only the translated text without extra explanation:\n\n{text}"
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        translated = (getattr(response, "text", "") or "").strip()
+    else:
+        translated = text
+
+    return JSONResponse({
+        "ok": True,
+        "original_text": text,
+        "translated_text": translated,
+        "target_language": target_lang,
+    })
+
+
+@app.post("/summarize")
+@app.post("/api/summarize")
+async def summarize_endpoint(
+    request: Request,
+    x_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """AI document and text summarization endpoint."""
+    if not _validate_api_key(x_api_key, authorization):
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid X-Api-Key")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") from None
+
+    text = (body.get("text") or body.get("content") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Missing required field: 'text'")
+
+    gemini_client = getattr(legacy, "gemini_client", None)
+    if gemini_client is not None:
+        prompt = f"Summarize the following text into clear, actionable bullet points preserving key details:\n\n{text}"
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        summary = (getattr(response, "text", "") or "").strip()
+    else:
+        summary = text[:300] + "..."
+
+    return JSONResponse({
+        "ok": True,
+        "summary": summary,
+        "model": "gemini-2.5-flash",
     })
 
 
