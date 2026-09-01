@@ -445,8 +445,10 @@ except Exception as exc:
         return False
 
 # Redis support was removed in the single-process runtime.  Keep the sentinel
-# for old optional-cache branches while those branches are gradually extracted.
-redis_lib = None
+try:
+    import redis as redis_lib
+except ImportError:
+    redis_lib = None
 
 
 # ── Built-in smooth performance defaults ───────────────────────────────────
@@ -7828,6 +7830,10 @@ def _optimization_score(snap: dict[str, Any] | None = None) -> tuple[int, list[s
         score -= 8
         warnings.append("Large rate-limit notice cache")
         tips.append("Trim notices after a flood event to reduce memory pressure.")
+    if not bool(stores.get("redis")):
+        score -= 8
+        warnings.append("Redis is OFF")
+        tips.append("Redis improves cache-aside, runtime config, and rate limiting stability.")
     if not bool(stores.get("supabase")):
         score -= 12
         warnings.append("Supabase is OFF")
@@ -11809,11 +11815,25 @@ def _init_clients() -> None:
     else:
         supabase = None
 
-    # Redis has been removed. Old REDIS_URL values are ignored so existing
-    # deployments can roll forward without an immediate environment cleanup.
+    # Re-enable Redis for users who explicitly request it
     redis_client = None
     if REDIS_URL:
-        logger.warning("REDIS_URL is configured but ignored; runtime state now uses Supabase bot_settings.")
+        if redis_lib is None:
+            logger.warning("REDIS_URL is set but 'redis' Python package is missing. Cache will not be used.")
+        else:
+            try:
+                redis_client = redis_lib.from_url(
+                    REDIS_URL,
+                    decode_responses=True,
+                    socket_connect_timeout=3.0,
+                    socket_timeout=3.0,
+                )
+                # Verify connection
+                redis_client.ping()
+                logger.info("Redis cache re-enabled and connected successfully!")
+            except Exception as e:
+                logger.error(f"Redis connection failed: {e}")
+                redis_client = None
 
 
     gemini_sdk_available = bool(GEMINI_API_KEY and GEMINI_MODEL and _load_google_genai_sdk())
@@ -22221,6 +22241,12 @@ async def _admin_smart_alert_lines(counts: dict | None = None) -> list[str]:
         db_queue = int(_db_executor_queue_size())
         if db_queue >= 10:
             alerts.append(f"🧵 DB queue high: {db_queue}")
+    except Exception:
+        pass
+
+    try:
+        if not bool(globals().get("redis_client")):
+            alerts.append("🧰 Redis not connected")
     except Exception:
         pass
 
