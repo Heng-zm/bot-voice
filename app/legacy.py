@@ -7828,10 +7828,6 @@ def _optimization_score(snap: dict[str, Any] | None = None) -> tuple[int, list[s
         score -= 8
         warnings.append("Large rate-limit notice cache")
         tips.append("Trim notices after a flood event to reduce memory pressure.")
-    if not bool(stores.get("redis")):
-        score -= 8
-        warnings.append("Redis is OFF")
-        tips.append("Redis improves cache-aside, runtime config, and rate limiting stability.")
     if not bool(stores.get("supabase")):
         score -= 12
         warnings.append("Supabase is OFF")
@@ -22225,12 +22221,6 @@ async def _admin_smart_alert_lines(counts: dict | None = None) -> list[str]:
         db_queue = int(_db_executor_queue_size())
         if db_queue >= 10:
             alerts.append(f"🧵 DB queue high: {db_queue}")
-    except Exception:
-        pass
-
-    try:
-        if not bool(globals().get("redis_client")):
-            alerts.append("🧰 Redis not connected")
     except Exception:
         pass
 
