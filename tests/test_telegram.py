@@ -29,12 +29,12 @@ class TelegramOnlyRuntimeTests(unittest.TestCase):
         self.assertFalse(hasattr(legacy, "run_fastapi"))
         self.assertFalse(hasattr(legacy, "run_flask"))
 
-    def test_bot_builder_creates_application(self) -> None:
-        from app.bot import build_telegram_application
+    def test_webhook_routes_registered(self) -> None:
+        route_paths = [route.path for route in bot_entrypoint.app.routes]
+        self.assertIn("/webhook", route_paths)
+        self.assertIn("/telegram/webhook", route_paths)
+        self.assertIn("/healthz", route_paths)
 
-        app = build_telegram_application("123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ")
-        self.assertIsNotNone(app)
-        self.assertEqual(app.bot.token, "123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ")
 
 
 
