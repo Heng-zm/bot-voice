@@ -228,10 +228,14 @@ async def get_webhook_info() -> JSONResponse:
 
 @app.post("/webhook")
 @app.post("/telegram/webhook")
+@app.post("/tg-webhook-{path_token:path}")
+@app.post("/tg-webhook/{path_token:path}")
 async def telegram_webhook(
     request: Request,
+    path_token: str | None = None,
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
 ) -> JSONResponse:
+
     """Handle incoming Telegram webhook updates with secret token verification."""
     expected_secret = (os.environ.get("TELEGRAM_WEBHOOK_SECRET_TOKEN") or "").strip()
     if expected_secret and x_telegram_bot_api_secret_token != expected_secret:
