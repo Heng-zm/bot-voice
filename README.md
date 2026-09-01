@@ -1,184 +1,196 @@
-# Bot Voice
+<div align="center">
 
-Telegram-only AI, OCR, transcription, and text-to-speech bot. The FastAPI
-backend and Telegram Mini App have been removed; the process now runs through
-Telegram long polling with its internal broadcast scheduler.
+# 🎙️ Bot Voice
+### Next-Generation Multilingual Text-to-Speech, OCR & AI Assistant for Telegram
 
-## Features
+[![Python Version](https://img.shields.io/badge/Python-3.11%20%7C%203.12-blue?logo=python&logoColor=white)](https://python.org)
+[![Telegram Bot API](https://img.shields.io/badge/Telegram-Bot%20API-2CA5E0?logo=telegram&logoColor=white)](https://core.telegram.org/bots/api)
+[![Google Gemini](https://img.shields.io/badge/Google%20Gemini-2.5%20Flash-4285F4?logo=google&logoColor=white)](https://deepmind.google/technologies/gemini/)
+[![Supabase Database](https://img.shields.io/badge/Database-Supabase-3ECF8E?logo=supabase&logoColor=white)](https://supabase.com)
+[![Docker Ready](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](https://www.docker.com)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-- AI chat with Gemini and optional Hugging Face fallback
-- Khmer and multilingual text-to-speech
-- OCR and audio transcription
-- User profiles, preferences, history, and welcome messages
-- Telegram `/admin` controls
-- Immediate, scheduled, and recurring daily broadcasts
-- Supabase persistence with bounded outage retries
-- Provider health, workload limits, caches, and maintenance mode
+*High-performance, low-latency voice synthesis in Khmer & 10+ languages, image OCR transcription, intelligent multimodal chat, and full-featured broadcast scheduling.*
 
-## Requirements
+[Features](#-key-features) • [Quickstart](#-quickstart-in-3-steps) • [Deployment](#-easy-server-deployment) • [Admin Panel](#-telegram-admin-panel-admin) • [Architecture](#-architecture)
 
-- Python 3.11 or newer
-- FFmpeg
-- Telegram bot token
-- Supabase project and service-role key
+---
+</div>
 
-## Install
+## ✨ Key Features
 
-```bash
-python -m pip install -r requirements.txt
-```
-
-Copy `.env.example` to `.env`, replace the placeholder credentials, and run
-`supabase_bot_setup.sql` in the Supabase SQL Editor.
-
-Minimum configuration:
-
-```env
-TELEGRAM_BOT_TOKEN=123456789:REPLACE_ME
-ADMIN_IDS=123456789
-SUPABASE_URL=https://YOUR_PROJECT.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=YOUR_SERVICE_ROLE_KEY
-GEMINI_API_KEY=REPLACE_ME
-AI_PROVIDER=gemini
-GEMINI_MODEL=gemini-2.5-flash
-BOT_MODE=POLLING
-```
-
-`SUPABASE_KEY` remains accepted as a compatibility alias. Keep the service-role
-key private and never send it through Telegram.
-
-## 🚀 Easy Server Deployment
-
-### Method 1: Docker Compose (Recommended)
-
-1. Copy `.env.example` to `.env` and fill in your credentials:
-   ```bash
-   cp .env.example .env
-   ```
-2. Start the bot in the background:
-   ```bash
-   docker compose up -d --build
-   ```
-3. View live logs:
-   ```bash
-   docker compose logs -f
-   ```
+| Domain | Capabilities |
+| :--- | :--- |
+| 🗣️ **Text-to-Speech (TTS)** | High-speed Edge TTS & Hugging Face Kiri Space integration. Supports **Khmer**, English, Chinese, Korean, Japanese, Hindi, Malay, Indonesian, Filipino, and Arabic. |
+| 🔍 **Image OCR** | Instant text extraction from photos, documents, and screenshots using Google Gemini multimodal vision. |
+| 🎙️ **Voice & Audio Transcription** | Transcribes Telegram voice notes and uploaded audio files (`.mp3`, `.wav`, `.m4a`, `.ogg`) into text. |
+| 🎵 **Audio to Voice Note** | Converts standard MP3/audio files into native Telegram Opus voice message bubbles. |
+| 🎛️ **Live Admin Controls (`/admin`)** | Full in-app control panel for maintenance mode, feature toggles, performance tuning, and CRM user lookups. |
+| 📢 **Broadcast Engine** | Instant broadcasts, scheduled announcements (Phnom Penh UTC+7), daily recurrence, and template libraries. |
+| ⚡ **Zero-Disk Streaming** | In-memory FFmpeg Opus encoding (`pipe:1`) with VoIP low-latency compression and SHA-256 LRU audio caching. |
+| 🛡️ **Security & Privacy** | Rate limiting, brute-force protection, admin fallback lockout prevention, and complete `/deleteme` GDPR purge. |
 
 ---
 
-### Method 2: Automated 1-Click Script (`deploy.sh`)
+## ⚡ Quickstart in 3 Steps
 
-On any Linux VPS (Ubuntu / Debian / CentOS / RHEL):
+### 1. Clone & Install Dependencies
+```bash
+git clone https://github.com/Heng-zm/bot-voice.git
+cd bot-voice
+python -m pip install -r requirements.txt
+```
+
+### 2. Configure Minimal Environment (Only 5 Lines!)
+Copy `.env.example` to `.env` and fill in your keys:
+```bash
+cp .env.example .env
+```
+```env
+TELEGRAM_BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ
+ADMIN_IDS=1272791365
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your-supabase-service-role-key
+GEMINI_API_KEY=your-gemini-api-key
+```
+
+### 3. Launch the Bot
+```bash
+python -m app.main
+# or
+./start.sh
+```
+
+---
+
+## 🚀 Easy Server Deployment
+
+### 🐳 Option 1: Docker Compose (Recommended)
+Deploy 24/7 in a background container with automated health management and log rotation:
+```bash
+# 1. Edit your .env file
+cp .env.example .env
+
+# 2. Build and run
+docker compose up -d --build
+
+# 3. View live output
+docker compose logs -f
+```
+
+---
+
+### ⚡ Option 2: Automated 1-Click VPS Script (`deploy.sh`)
+Works on any Linux VPS (**Ubuntu 22.04 / 24.04, Debian 12, CentOS, AlmaLinux**):
 ```bash
 chmod +x deploy.sh
 ./deploy.sh
 ```
-*The script automatically detects Docker (or configures a Python virtual environment with dependencies) and launches the bot.*
+*The script automatically checks dependencies, creates virtual environments, verifies FFmpeg, and starts the service.*
 
 ---
 
-### Method 3: Linux Systemd Daemon (24/7 Background Service)
+### ☁️ Option 3: Anajak Cloud (https://anajak.cloud/)
 
-1. Copy the service file template:
-   ```bash
-   sudo cp bot-voice.service.example /etc/systemd/system/bot-voice.service
-   ```
-2. Edit `/etc/systemd/system/bot-voice.service` with your user and working directory.
-3. Enable and start the service:
-   ```bash
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now bot-voice
-   ```
-4. Check status & logs:
-   ```bash
-   sudo systemctl status bot-voice
-   journalctl -u bot-voice -f
-   ```
-
-### Method 4: Anajak Cloud (https://anajak.cloud/)
-
-**For Anajak Cloud VPS (Ubuntu/Debian):**
+#### A. On Anajak Cloud Linux VPS:
 ```bash
 git clone https://github.com/Heng-zm/bot-voice.git
 cd bot-voice
 cp .env.example .env
-# Edit .env with your tokens
 docker compose up -d --build
 ```
 
-**For Anajak Cloud Bot / Pterodactyl Panel:**
-1. Upload files and `.env` via Web File Manager / SFTP.
-2. In Panel **Startup**: select **Python 3.11+** and set Startup Command to `./start.sh` (or `python main.py`).
-3. Set panel environment variable `INSTALL_REQUIREMENTS_ON_START=true`.
-4. Click **Start**.
+#### B. On Anajak Cloud Bot Hosting Panel (Pterodactyl):
+1. **Upload Files**: Upload the project directory and `.env` via Web File Manager or SFTP.
+2. **Startup Tab**: Select **Python 3.11+** and set Startup Command to:
+   ```bash
+   ./start.sh
+   ```
+3. **Environment Tab**: Add the variable:
+   ```env
+   INSTALL_REQUIREMENTS_ON_START=true
+   ```
+4. Click **Start / Restart**.
 
 ---
 
-## 💻 Manual Run & Development
+### ⚙️ Option 4: Linux Systemd Daemon (Native VPS Service)
+```bash
+# 1. Copy service template
+sudo cp bot-voice.service.example /etc/systemd/system/bot-voice.service
 
-Direct launchers:
+# 2. Edit paths & user
+sudo nano /etc/systemd/system/bot-voice.service
+
+# 3. Enable & Start
+sudo systemctl daemon-reload
+sudo systemctl enable --now bot-voice
+
+# 4. View status & logs
+sudo systemctl status bot-voice
+journalctl -u bot-voice -f
+```
+
+---
+
+## 🎛️ Telegram Admin Panel (`/admin`)
+
+Manage every aspect of your bot dynamically from Telegram without editing `.env` or restarting servers:
+
+```
+/admin
+├── ⚙️ Settings          — Toggle TTS, OCR, Voice Transcribe, AI Resolver, Maintenance Mode
+├── ⚡ Performance       — Hot-reload DB Workers, Audio Cache MB, TTL, Edge Parallel Streams
+├── 📢 Broadcasts        — Compose, preview, schedule (Phnom Penh UTC+7), and template manager
+├── 👥 User CRM          — Search user by ID/@username, inspect preferences, block/unblock
+├── 📊 Live Metrics      — Real-time memory usage, cache hit ratios, and latency graphs
+└── 🚨 Error Center      — Inspect recent runtime exceptions and stack traces
+```
+
+---
+
+## 🏗️ Architecture
+
+```mermaid
+flowchart TD
+    User([👤 Telegram User]) <-->|Long Polling| TG[🤖 Telegram Bot Engine]
+    
+    subgraph "Core Domain Services"
+        TG --> Router[🚦 Security Guard & Router]
+        Router --> TTS[🗣️ TTS & Voice Pipeline]
+        Router --> OCR[🔍 Vision & OCR Service]
+        Router --> STT[🎙️ Transcribe Engine]
+        Router --> Admin[🎛️ Admin & Broadcast Scheduler]
+    end
+    
+    subgraph "High-Performance Layer"
+        TTS --> Cache[(💾 In-Memory Audio Cache)]
+        TTS --> FFmpeg[⚡ In-Memory FFmpeg pipe:1]
+        Admin --> DB[(🗄️ Supabase Cloud DB)]
+        OCR --> Gemini[✨ Gemini 2.5 Flash]
+        STT --> Gemini
+    end
+```
+
+---
+
+## 🧪 Testing & Verification
+
+Run the full automated test suite (41+ tests across language detection, security, replay stores, TTS caching, and user preferences):
 
 ```bash
-python -m app.main
-python main.py
-python app/main.py
-```
+# Run all unit tests
+python -m unittest discover -s tests -v
 
-`start.sh` checks Python 3.11+, optionally installs requirements, compiles the
-application, and starts the polling bot:
+# Run Ruff code linter
+python -m ruff check .
 
-```bash
-chmod +x start.sh
-./start.sh
-```
-
-
-Only one process may poll a Telegram token unless distributed ownership is
-enabled. For a normal single-process deployment:
-
-```env
-TELEGRAM_MULTI_SERVER_ENABLED=false
-TELEGRAM_ACTIVE_LOCK_ENABLED=false
-TELEGRAM_ACTIVE_LOCK_REQUIRED=false
-SCHED_LOCK_ENABLED=false
-```
-
-For multiple services using the same bot token, run the `bot_locks` section of
-`supabase_bot_setup.sql` and enable both ownership locks:
-
-```env
-TELEGRAM_MULTI_SERVER_ENABLED=true
-TELEGRAM_ACTIVE_LOCK_ENABLED=true
-TELEGRAM_ACTIVE_LOCK_REQUIRED=true
-SCHED_LOCK_ENABLED=true
-SCHED_LOCK_REQUIRED=true
-```
-
-Supabase timeouts are bounded so a DNS/database outage cannot occupy all bot
-workers:
-
-```env
-SUPABASE_CONNECT_TIMEOUT_S=5
-SUPABASE_HTTP_TIMEOUT_S=12
-```
-
-## Administration and broadcasts
-
-Open `/admin` inside Telegram for settings, users, provider status, cache
-controls, welcome messages, broadcast previews, scheduling, and reports.
-
-Daily broadcasts use Phnom Penh time and automatically move to the next day
-after completion. Test messages with an administrator account before sending to
-all users. Failed scheduled broadcasts remain available through the Telegram
-admin controls for inspection and retry.
-
-## Verification
-
-```bash
+# Syntax byte-compile check
 python -m compileall -q app
-ruff check app --output-format concise
-python -m pip check
 ```
 
-The Docker image starts `python -m app.main` as a Telegram-only process and no
-longer exposes a port or HTTP health check.
+---
+
+## 📄 License
+
+This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
