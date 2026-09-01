@@ -10893,11 +10893,14 @@ _user_to_admin:      dict[int, int]  = {}
 _sched_payload:      dict[int, dict] = {}
 
 from app.services.tts import (
+    clear_user_tts_history as _clear_user_tts_history,
     get_last_tts as _get_last_tts,
     get_last_tts_text as get_last_tts_text,
     set_last_tts as _set_last_tts,
     set_last_tts_text as set_last_tts_text,
 )
+from app.services.users.prefs import get_global_user_prefs_cache as _get_global_user_prefs_cache
+
 
 
 
@@ -26249,12 +26252,12 @@ async def _run_bot():
     # accumulation across crash-restart cycles.
     for store in (
         _admin_chat_target, _user_to_admin, _pending_broadcast,
-        _prefs_cache, _user_last_tts, _sched_payload,
-        _hist_cache, _user_locks,
-        # FIX: These two were missing from the original reset list:
-        _last_tts_text, _text_cache_memory,
+        _sched_payload, _hist_cache, _user_locks,
+        _text_cache_memory,
     ):
         store.clear()
+    _clear_user_tts_history()
+    _get_global_user_prefs_cache().clear()
     with _tts_request_reservations_guard:
         _tts_request_reservations.clear()
     _api_key_cache_clear()
