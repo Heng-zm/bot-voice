@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Sequence
+from contextlib import suppress
 from typing import Any
 
 from app.services.ai.language import _detect_lang
@@ -103,14 +104,12 @@ def normalize_tts_model(value: Any) -> str:
 
 def get_default_tts_model() -> str:
     """Return runtime default TTS model with dynamic database override."""
-    try:
+    with suppress(Exception):
         from app.services.settings.store import get_settings_store
 
         val = get_settings_store().get_text_sync("DEFAULT_TTS_MODEL", "")
         if val:
             return normalize_tts_model(val)
-    except Exception:
-        pass
     return normalize_tts_model(DEFAULT_TTS_MODEL)
 
 

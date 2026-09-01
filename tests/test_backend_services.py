@@ -231,7 +231,11 @@ class GeminiServicesTests(unittest.TestCase):
 class SecurityServicesTests(unittest.IsolatedAsyncioTestCase):
     def test_telegram_command_name_extraction(self) -> None:
         from unittest.mock import MagicMock
-        from app.services.telegram.security import telegram_command_name, ADMIN_ONLY_COMMANDS
+
+        from app.services.telegram.security import (
+            ADMIN_ONLY_COMMANDS,
+            telegram_command_name,
+        )
 
         mock_update = MagicMock()
         mock_update.effective_message.text = "/admin@MyVoiceBot status"
@@ -247,6 +251,7 @@ class SecurityServicesTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_security_notice_once_rate_limits(self) -> None:
         from unittest.mock import AsyncMock, MagicMock
+
         from app.services.telegram.security import security_notice_once
 
         mock_update = MagicMock()
@@ -266,10 +271,10 @@ class SecurityServicesTests(unittest.IsolatedAsyncioTestCase):
 class BroadcastServicesTests(unittest.TestCase):
     def test_template_safe_id_and_int(self) -> None:
         from app.services.broadcast.templates import (
-            broadcast_template_safe_id,
-            broadcast_template_safe_int,
             broadcast_template_clean_preview,
             broadcast_template_fingerprint,
+            broadcast_template_safe_id,
+            broadcast_template_safe_int,
         )
 
         self.assertEqual("1234abcd", broadcast_template_safe_id("1234abcd"))
@@ -287,7 +292,7 @@ class BroadcastServicesTests(unittest.TestCase):
 
 class UserPrefsServicesTests(unittest.TestCase):
     def test_normalize_user_prefs(self) -> None:
-        from app.services.users.prefs import normalize_user_prefs, DEFAULT_USER_PREFS
+        from app.services.users.prefs import DEFAULT_USER_PREFS, normalize_user_prefs
 
         # Empty / None
         self.assertEqual(DEFAULT_USER_PREFS, normalize_user_prefs(None))
@@ -350,7 +355,8 @@ class TextUtilityServicesTests(unittest.TestCase):
 class FileIOServicesTests(unittest.TestCase):
     def test_temp_file_lifecycle(self) -> None:
         import os
-        from app.utils.file_io import make_temp_ogg, make_temp_img, cleanup_files
+
+        from app.utils.file_io import cleanup_files, make_temp_img, make_temp_ogg
 
         ogg_path = make_temp_ogg()
         img_path = make_temp_img()

@@ -6,7 +6,6 @@ import asyncio
 import threading
 import time
 from contextlib import suppress
-from typing import Any
 
 from telegram import Update
 

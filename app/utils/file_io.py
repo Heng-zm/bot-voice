@@ -83,7 +83,7 @@ def get_temp_dir() -> str:
     if cached == temp_dir:
         return cached
     with _TEMP_DIR_CACHE_LOCK:
-        if _TEMP_DIR_CACHE != temp_dir:
+        if temp_dir != _TEMP_DIR_CACHE:
             os.makedirs(temp_dir, exist_ok=True)
             _TEMP_DIR_CACHE = temp_dir
         return _TEMP_DIR_CACHE

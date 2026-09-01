@@ -9,10 +9,10 @@ from __future__ import annotations
 # ruff: noqa: F821
 from app.services.telegram._legacy_runtime import legacy_bound_handler
 from app.services.telegram.security import (
-    ADMIN_ONLY_COMMANDS,
+    _ADMIN_ONLY_COMMANDS,
+    _security_notice_once,
+    _telegram_command_name,
     is_user_blocked,
-    security_notice_once,
-    telegram_command_name,
 )
 
 
