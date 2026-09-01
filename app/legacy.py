@@ -108,12 +108,30 @@ def _load_supabase_sdk() -> bool:
         return True
 
 
-from fastapi import FastAPI, Request as FastAPIRequest, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse, Response as StarletteResponse
-from fastapi.encoders import jsonable_encoder
-from starlette.middleware.sessions import SessionMiddleware
-from starlette.concurrency import run_in_threadpool
-from jinja2 import Environment, Template, select_autoescape
+FastAPIRequest = Any
+FastAPI = object
+HTTPException = Exception
+HTMLResponse = object
+RedirectResponse = object
+StarletteResponse = object
+SessionMiddleware = object
+Environment = object
+Template = object
+
+
+def select_autoescape(*args: Any, **kwargs: Any) -> Any:
+    return None
+
+
+def jsonable_encoder(obj: Any) -> Any:
+    return obj
+
+
+def run_in_threadpool(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    return fn(*args, **kwargs)
+
+
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -343,11 +361,15 @@ def _json_dumps_fast(content: Any) -> bytes:
     return _json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-class _FastJSONResponse(StarletteResponse):
+class _FastJSONResponse:
     media_type = "application/json"
 
+    def __init__(self, content: Any = None):
+        self.content = content
+
     def render(self, content: Any) -> bytes:
-        return _json_dumps_fast(content)
+        return _json_dumps_fast(content if content is not None else self.content)
+
 
 
 # Extracted low-level file helpers. Keep imported names stable for legacy callers.

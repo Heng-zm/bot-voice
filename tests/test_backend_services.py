@@ -244,6 +244,23 @@ class GeminiServicesTests(unittest.TestCase):
         self.assertFalse(is_retryable_gemini_error("Invalid API Key"))
 
 
+class VectorStoreServicesTests(unittest.TestCase):
+    def test_vector_store_initialization(self) -> None:
+        from app.services.ai.vector_store import UpstashVectorStore
+
+        store = UpstashVectorStore(
+            url="https://test-endpoint.upstash.io",
+            token="test-token-123",
+        )
+        self.assertTrue(store.is_configured)
+        self.assertEqual("https://test-endpoint.upstash.io", store.url)
+        self.assertEqual("Bearer test-token-123", store._headers()["Authorization"])
+
+        unconfigured = UpstashVectorStore(url="", token="")
+        self.assertFalse(unconfigured.is_configured)
+
+
+
 class SecurityServicesTests(unittest.IsolatedAsyncioTestCase):
     def test_telegram_command_name_extraction(self) -> None:
         from unittest.mock import MagicMock

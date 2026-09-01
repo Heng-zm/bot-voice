@@ -24,6 +24,11 @@ from app.services.ai.providers import (
     configure_default_providers,
     get_provider_manager,
 )
+from app.services.ai.vector_store import (
+    UpstashVectorStore,
+    get_global_vector_store,
+)
+
 
 __all__ = [
     "GEMINI_MODEL_DEFAULT",
@@ -33,6 +38,7 @@ __all__ = [
     "ProviderPolicy",
     "ProviderState",
     "ProviderTimeout",
+    "UpstashVectorStore",
     "_detect_lang",
     "_detect_latin_tts_language",
     "_language_display",
@@ -40,6 +46,7 @@ __all__ = [
     "configure_default_providers",
     "detect_image_mime",
     "detect_image_mime_from_bytes",
+    "get_global_vector_store",
     "get_provider_manager",
     "is_retryable_gemini_error",
 ]
