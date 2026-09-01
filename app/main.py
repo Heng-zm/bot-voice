@@ -188,13 +188,16 @@ async def health_check(request: Request) -> JSONResponse:
             asyncio.create_task(auto_setup_webhook(detected))
 
     captured_url = get_detected_webhook_url()
+    instance_id = os.environ.get("RENDER_INSTANCE_ID") or os.environ.get("HOSTNAME") or f"node-{os.getpid()}"
     return JSONResponse({
         "status": "ok",
         "service": "telegram-bot-voice",
+        "instance_id": instance_id,
         "webhook_url": f"{captured_url}/webhook" if captured_url else "polling_mode",
         "api_url": f"{captured_url}/ai-assistant" if captured_url else "https://your-domain.onrender.com/ai-assistant",
         "tts_url": f"{captured_url}/tts" if captured_url else "https://your-domain.onrender.com/tts",
     })
+
 
 
 @app.get("/setup-webhook")
