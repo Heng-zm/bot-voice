@@ -1,24 +1,24 @@
-FROM python:3.12.9-slim
+FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    PORT=8080
 
 WORKDIR /app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg libopus-dev \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --disable-pip-version-check --no-cache-dir -r requirements.txt \
-    && python -m pip check
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -r requirements.txt
 
-RUN useradd --create-home --uid 10001 appuser
+COPY . .
 
-COPY --chown=appuser:appuser . .
+EXPOSE 8080
 
-USER appuser
-
-STOPSIGNAL SIGTERM
-
-CMD ["python", "-m", "app.main"]
+CMD ["python", "main.py"]
