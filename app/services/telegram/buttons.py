@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 from contextlib import suppress
 
-
 logger = logging.getLogger(__name__)
 
 # Default button texts across all user flows

@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from app.core.config import AppSettings, SETTINGS
+from app.core.config import SETTINGS, AppSettings
 
 __all__ = [
     "AppSettings",
     "SETTINGS",
 ]
-

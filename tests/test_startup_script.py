@@ -16,7 +16,7 @@ def test_start_script_launches_telegram_only_entrypoint() -> None:
     assert "uvicorn" not in script.lower()
 
 
-def test_root_launcher_exports_main_without_asgi_app() -> None:
+def test_root_launcher_exports_main_and_app() -> None:
     launcher = ROOT / "main.py"
     spec = importlib.util.spec_from_file_location("bot_launcher", launcher)
     assert spec is not None and spec.loader is not None
@@ -24,4 +24,5 @@ def test_root_launcher_exports_main_without_asgi_app() -> None:
     spec.loader.exec_module(module)
 
     assert callable(module.main)
-    assert not hasattr(module, "app")
+    assert hasattr(module, "app")
+

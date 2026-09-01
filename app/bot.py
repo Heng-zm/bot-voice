@@ -10,13 +10,12 @@ import logging
 import os
 import time
 from contextlib import suppress
-from typing import Any
 
-from telegram import Update
 from telegram.ext import Application
 
 from app.core.config import SETTINGS
 from app.services.ai.gemini import GEMINI_MODEL_DEFAULT
+from app.services.health import start_health_server
 from app.services.settings.store import get_settings_store
 from app.services.telegram.routing import register_telegram_handlers
 from app.services.tts.voices import get_default_tts_model, tts_model_label
@@ -80,8 +79,7 @@ async def run_bot_async() -> None:
         f"TTS: {model_name} | Mode: {bot_mode} | Storage: Supabase]"
     )
 
-    from app.services.health import start_health_server
-    health_task = asyncio.create_task(start_health_server(), name="health-server")
+    asyncio.create_task(start_health_server(), name="health-server")
 
     app = build_telegram_application(token, bot_mode=bot_mode)
 
@@ -110,9 +108,9 @@ async def run_bot_async() -> None:
                 logger.info("Telegram polling started successfully.")
 
         # Keep running until cancelled
+        stop_event = asyncio.Event()
         try:
-            while True:
-                await asyncio.sleep(3600)
+            await stop_event.wait()
         except (asyncio.CancelledError, KeyboardInterrupt):
             logger.info("Bot shutdown requested.")
         finally:

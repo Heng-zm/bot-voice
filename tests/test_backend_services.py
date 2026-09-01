@@ -259,8 +259,9 @@ class VectorStoreServicesTests(unittest.TestCase):
 
         store = UpstashVectorStore(
             url="https://test-endpoint.upstash.io",
-            token="test-token-123",
+            token="test-token-123",  # noqa: S106
         )
+
         self.assertTrue(store.is_configured)
         self.assertEqual("https://test-endpoint.upstash.io", store.url)
         self.assertEqual("Bearer test-token-123", store._headers()["Authorization"])
@@ -440,9 +441,10 @@ class TTSEngineServicesTests(unittest.TestCase):
 
 class CoreConfigTests(unittest.TestCase):
     def test_settings_initialization(self) -> None:
-        from app.core.config import AppSettings, SETTINGS
+        from app.core.config import SETTINGS, AppSettings
 
         self.assertIsInstance(SETTINGS, AppSettings)
+
         self.assertEqual(SETTINGS.GEMINI_MODEL, "gemini-2.5-flash")
 
 

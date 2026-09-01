@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import AsyncGenerator
 
 if __package__ in {None, ""}:
     project_root = str(Path(__file__).resolve().parent.parent)

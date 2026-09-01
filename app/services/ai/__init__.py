@@ -14,6 +14,10 @@ from app.services.ai.language import (
     _language_display,
     _looks_like_japanese_han_phrase,
 )
+from app.services.ai.ocr import (
+    OCRService,
+    ask_gemini_ocr_bytes,
+)
 from app.services.ai.providers import (
     NoProviderAvailable,
     ProviderBusy,
@@ -24,16 +28,10 @@ from app.services.ai.providers import (
     configure_default_providers,
     get_provider_manager,
 )
-from app.services.ai.ocr import (
-    OCRService,
-    ask_gemini_ocr_bytes,
-)
 from app.services.ai.vector_store import (
     UpstashVectorStore,
     get_global_vector_store,
 )
-
-
 
 __all__ = [
     "GEMINI_MODEL_DEFAULT",

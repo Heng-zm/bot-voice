@@ -15,8 +15,7 @@ logger = logging.getLogger("app.health")
 
 async def _handle_http_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
-        data = await asyncio.wait_for(reader.read(1024), timeout=5.0)
-        request_line = data.decode("utf-8", errors="ignore").split("\r\n")[0] if data else ""
+        await asyncio.wait_for(reader.read(1024), timeout=5.0)
 
         body = b'{"status":"ok","service":"telegram-bot-voice"}\n'
         response = (
@@ -27,8 +26,8 @@ async def _handle_http_client(reader: asyncio.StreamReader, writer: asyncio.Stre
         )
         writer.write(response)
         await writer.drain()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Health check client error: %s", exc)
     finally:
         with suppress(Exception):
             writer.close()
@@ -39,7 +38,7 @@ async def start_health_server(port: int | None = None) -> asyncio.Server | None:
     """Start listening on the configured cloud platform port."""
     target_port = int(port or os.environ.get("PORT", "8080"))
     try:
-        server = await asyncio.start_server(_handle_http_client, "0.0.0.0", target_port)
+        server = await asyncio.start_server(_handle_http_client, "0.0.0.0", target_port)  # noqa: S104
         logger.info("Health check server listening on port %s", target_port)
         return server
     except Exception as exc:

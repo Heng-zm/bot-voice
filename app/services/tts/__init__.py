@@ -35,7 +35,6 @@ from app.services.tts.voices import (
     tts_model_label,
 )
 
-
 __all__ = [
     "DEFAULT_SPEED",
     "DEFAULT_TTS_MODEL",
