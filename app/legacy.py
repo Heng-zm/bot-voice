@@ -18808,7 +18808,10 @@ async def generate_voice_limited(text: str, gender: str, speed: float, output_pa
 # ---------------------------------------------------------------------------
 # Gemini transcription helpers
 # ---------------------------------------------------------------------------
+from app.services.ai.gemini import detect_image_mime, is_retryable_gemini_error
+
 _is_retryable_gemini_error = is_retryable_gemini_error
+_detect_image_mime = detect_image_mime
 
 
 
@@ -18965,10 +18968,7 @@ def _split_text_chunks(text: str, max_chars: int = TTS_CHUNK_CHARS) -> list[str]
     return [c for c in chunks if c.strip()]
 
 
-# ---------------------------------------------------------------------------
-from app.services.ai.gemini import detect_image_mime, is_retryable_gemini_error
 
-_detect_image_mime = detect_image_mime
 
 
 
