@@ -155,12 +155,18 @@ class _WebStub:
         return lambda f: f
 
 
-FastAPIRequest = Any
+try:
+    from fastapi import Request as FastAPIRequest, HTTPException
+    from fastapi.responses import HTMLResponse, RedirectResponse
+    from starlette.responses import Response as StarletteResponse
+except ImportError:
+    FastAPIRequest = Any
+    HTTPException = Exception
+    HTMLResponse = _WebStub
+    RedirectResponse = _WebStub
+    StarletteResponse = _WebStub
+
 FastAPI = _WebStub
-HTTPException = Exception
-HTMLResponse = _WebStub
-RedirectResponse = _WebStub
-StarletteResponse = _WebStub
 SessionMiddleware = _WebStub
 Environment = _WebStub
 Template = _WebStub

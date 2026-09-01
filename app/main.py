@@ -69,7 +69,9 @@ async def auto_setup_webhook(app_url: str) -> bool:
     app_instance = None
     for _ in range(30):
         app_instance = getattr(legacy, "telegram_application", None) or getattr(legacy, "_TELEGRAM_APP", None)
-        if app_instance is not None and getattr(app_instance, "bot", None) is not None:
+        is_ready = getattr(legacy, "_TELEGRAM_APP_READY", False)
+        secret_ready = bool(getattr(legacy, "_runtime_webhook_secret_token", lambda: "")())
+        if app_instance is not None and getattr(app_instance, "bot", None) is not None and is_ready and secret_ready:
             break
         await asyncio.sleep(0.5)
 
@@ -77,12 +79,16 @@ async def auto_setup_webhook(app_url: str) -> bool:
         logger.warning("Could not auto-register webhook: Telegram application not ready.")
         return False
 
-    secret = (os.environ.get("TELEGRAM_WEBHOOK_SECRET_TOKEN") or "").strip()
+
+    secret_func = getattr(legacy, "_runtime_webhook_secret_token", None)
+    secret = secret_func() if secret_func else (os.environ.get("TELEGRAM_WEBHOOK_SECRET_TOKEN") or "").strip()
+
     for attempt in range(5):
         try:
             await app_instance.bot.set_webhook(
                 url=webhook_endpoint,
                 secret_token=secret or None,
+
                 allowed_updates=["message", "edited_message", "callback_query"],
                 drop_pending_updates=False,
             )
