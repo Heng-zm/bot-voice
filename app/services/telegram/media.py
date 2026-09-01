@@ -530,7 +530,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _is_admin(user_id):
         if await _handle_admin_welcome_text(update, context):
             return
+        if await _handle_admin_button_text(update, context):
+            return
         if await _handle_feature_request_admin_reply_text(update, context):
+
             return
         if await _handle_runtime_admin_text(update, context):
             return

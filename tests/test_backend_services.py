@@ -270,7 +270,32 @@ class VectorStoreServicesTests(unittest.TestCase):
 
 
 
+class ButtonCustomizationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_button_label_fallback_and_mutation(self) -> None:
+        from app.services.telegram.buttons import (
+            DEFAULT_BUTTON_LABELS,
+            get_all_button_labels,
+            get_button_label,
+            reset_button_label,
+            set_button_label,
+        )
+
+        self.assertEqual(DEFAULT_BUTTON_LABELS["btn_female"], get_button_label("btn_female"))
+        all_labels = get_all_button_labels()
+        self.assertIn("btn_female", all_labels)
+        self.assertIn("btn_male", all_labels)
+
+        # Custom override
+        await set_button_label("btn_female", "👩 Custom Female Voice")
+        self.assertEqual("👩 Custom Female Voice", get_button_label("btn_female"))
+
+        # Reset
+        await reset_button_label("btn_female")
+        self.assertEqual(DEFAULT_BUTTON_LABELS["btn_female"], get_button_label("btn_female"))
+
+
 class SecurityServicesTests(unittest.IsolatedAsyncioTestCase):
+
     def test_telegram_command_name_extraction(self) -> None:
         from unittest.mock import MagicMock
 

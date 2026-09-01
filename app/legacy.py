@@ -9698,6 +9698,53 @@ async def _handle_admin_welcome_text(update: Any, context: Any) -> bool:
     return True
 
 
+async def _handle_admin_button_text(update: Any, context: Any) -> bool:
+    message = update.message
+    user = update.effective_user
+    if (
+        message is None
+        or user is None
+        or not _is_admin(user.id)
+        or context.user_data.get("admin_btn_state") != "awaiting_text"
+    ):
+        return False
+
+    btn_key = context.user_data.get("admin_btn_edit_key", "")
+    text = str(message.text or "").strip()
+    if text.lower() in {"/cancel", "cancel"}:
+        context.user_data.pop("admin_btn_state", None)
+        context.user_data.pop("admin_btn_edit_key", None)
+        await safe_send(lambda: message.reply_text(
+            "❌ បានបោះបង់ការកែប្រែប៊ូតុង។\n\n" + _admin_btn_editor_text(),
+            parse_mode="HTML",
+            reply_markup=get_admin_btn_editor_kb(),
+        ))
+        return True
+
+    if not text:
+        await safe_send(lambda: message.reply_text("Button text cannot be empty."))
+        return True
+
+    from app.services.telegram.buttons import set_button_label
+    ok = await set_button_label(btn_key, text)
+    context.user_data.pop("admin_btn_state", None)
+    context.user_data.pop("admin_btn_edit_key", None)
+
+    if ok:
+        await safe_send(lambda: message.reply_text(
+            f"✅ <b>បានរក្សាទុកអក្សរប៊ូតុងថ្មីជោគជ័យ!</b>\n\nប៊ូតុង: <code>{html.escape(btn_key)}</code>\nតម្លៃថ្មី: «<b>{html.escape(text)}</b>»\n\n" + _admin_btn_editor_text(),
+            parse_mode="HTML",
+            reply_markup=get_admin_btn_editor_kb(),
+        ))
+    else:
+        await safe_send(lambda: message.reply_text(
+            f"❌ មិនអាចរក្សាទុកប៊ូតុង <code>{html.escape(btn_key)}</code> បានទេ។",
+            parse_mode="HTML",
+            reply_markup=get_admin_btn_editor_kb(),
+        ))
+    return True
+
+
 async def _handle_admin_welcome_photo(update: Any, context: Any) -> bool:
     message = update.message
     user = update.effective_user
@@ -15885,7 +15932,10 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("⚡ Optimize", callback_data="admin_optimize")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings"),
          InlineKeyboardButton("🛠 Runtime", callback_data="admin_runtime")],
+        [InlineKeyboardButton("🎛️ Button Editor", callback_data="admin_btn_editor"),
+         InlineKeyboardButton("🎙️ TTS Engine", callback_data="admin_tts_models")],
         [InlineKeyboardButton("👋 Welcome Message", callback_data="admin_welcome")],
+
         [InlineKeyboardButton("📄 Report", callback_data="admin_report")],
         [InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
          InlineKeyboardButton("📅 Calendar", callback_data="admin_calendar")],
@@ -15933,6 +15983,71 @@ def get_admin_report_day_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
          InlineKeyboardButton("❌ Cancel", callback_data="admin_cancel_state")],
     ])
+
+
+def get_admin_btn_editor_kb() -> InlineKeyboardMarkup:
+    from app.services.telegram.buttons import DEFAULT_BUTTON_LABELS, get_button_label
+
+    rows: list[list[InlineKeyboardButton]] = []
+    btn_descriptions = {
+        "btn_female": "👩 Female Voice",
+        "btn_male": "👨 Male Voice",
+        "btn_speed": "🎚️ Speed Menu",
+        "btn_tts_model": "🤖 TTS Model",
+        "btn_back": "🔙 Back Button",
+        "btn_ai_read": "📢 AI Read (Audio)",
+        "btn_delete": "🗑️ Delete Button",
+        "btn_ocr_read": "▶️ OCR Read",
+        "btn_audio_tts": "📢 Voice to TTS",
+    }
+    for key, desc in btn_descriptions.items():
+        curr_text = get_button_label(key, DEFAULT_BUTTON_LABELS.get(key, key))
+        rows.append([InlineKeyboardButton(f"{desc}: «{curr_text}»", callback_data=f"admin_btn_edit:{key}")])
+
+    rows.extend([
+        [InlineKeyboardButton("🔄 Reset All to Defaults", callback_data="admin_btn_reset_all")],
+        [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _admin_btn_editor_text() -> str:
+    return (
+        "🎛️ <b>ផ្ទាំងកែប្រែអក្សរលើប៊ូតុង (Button Text Editor)</b>\n\n"
+        "អ្នកគ្រប់គ្រងអាចកែប្រែអត្ថបទលើប៊ូតុងទាំងអស់ក្នុង Bot បានដោយផ្ទាល់។\n\n"
+        "👇 <b>សូមចុចលើប៊ូតុងណាមួយខាងក្រោមដែលចង់កែប្រែ៖</b>"
+    )
+
+
+def get_admin_tts_models_kb() -> InlineKeyboardMarkup:
+    from app.services.tts.voices import TTS_MODEL_OPTIONS, get_default_tts_model
+
+    curr_default = get_default_tts_model()
+    rows: list[list[InlineKeyboardButton]] = []
+    for key, (label, hint) in TTS_MODEL_OPTIONS.items():
+        active = " ✅ (Active)" if key == curr_default else ""
+        hint_str = f" — {hint}" if hint else ""
+        rows.append([InlineKeyboardButton(f"{label}{active}{hint_str}", callback_data=f"admin_tts_set:{key}")])
+
+    rows.extend([
+        [InlineKeyboardButton("🔄 Refresh", callback_data="admin_tts_models")],
+        [InlineKeyboardButton("⬅️ Admin", callback_data="admin_home"),
+         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _admin_tts_models_text() -> str:
+    from app.services.tts.voices import get_default_tts_model, tts_model_label
+
+    curr_default = get_default_tts_model()
+    return (
+        "🎙️ <b>ផ្ទាំងកំណត់ម៉ូដែលសំឡេងលំនាំដើម (Default TTS Engine)</b>\n\n"
+        f"ម៉ូដែលសកម្មបច្ចុប្បន្នសម្រាប់ User ថ្មី៖ <b>{html.escape(tts_model_label(curr_default))}</b>\n\n"
+        "ជ្រើសរើសម៉ូដែលលំនាំដើមខាងក្រោម ដើម្បីអនុវត្តលើអ្នកប្រើប្រាស់ទាំងអស់៖"
+    )
+
 
 
 def generate_web_secret_key() -> str:
@@ -19240,32 +19355,46 @@ def get_main_kb(
     *,
     include_back: bool = False,
 ) -> InlineKeyboardMarkup:
-    f_btn = "👩 សំឡេងស្រី" + (" ✅" if gender == "female" else "")
-    m_btn = "👨 សំឡេងប្រុស" + (" ✅" if gender == "male" else "")
+    from app.services.telegram.buttons import get_button_label
+
+    f_label = get_button_label("btn_female", "👩 សំឡេងស្រី")
+    m_label = get_button_label("btn_male", "👨 សំឡេងប្រុស")
+    spd_label = get_button_label("btn_speed", "🎚️ ល្បឿនសំឡេង")
+    tts_label = get_button_label("btn_tts_model", "🤖 ម៉ូដែល TTS")
+    back_label = get_button_label("btn_back", "🔙 Back")
+
+    f_btn = f_label + (" ✅" if gender == "female" else "")
+    m_btn = m_label + (" ✅" if gender == "male" else "")
     model_key = _normalize_tts_model(tts_model)
-    model_btn = f"🤖 ម៉ូដែល TTS: {TTS_MODEL_OPTIONS.get(model_key, TTS_MODEL_OPTIONS['auto'])[0]}"
+    model_btn = f"{tts_label}: {TTS_MODEL_OPTIONS.get(model_key, TTS_MODEL_OPTIONS['auto'])[0]}"
     rows = [
         [InlineKeyboardButton(f_btn, callback_data="tg_female"),
          InlineKeyboardButton(m_btn, callback_data="tg_male")],
-        [InlineKeyboardButton("🎚️ ល្បឿនសំឡេង", callback_data="show_speed")],
+        [InlineKeyboardButton(spd_label, callback_data="show_speed")],
         [InlineKeyboardButton(model_btn, callback_data="show_tts_model")],
     ]
     if include_back:
-        rows.append([InlineKeyboardButton("🔙 Back", callback_data="welcome_back")])
+        rows.append([InlineKeyboardButton(back_label, callback_data="welcome_back")])
     return InlineKeyboardMarkup(rows)
 
 
 def get_tts_model_kb(current_model: str = "auto") -> InlineKeyboardMarkup:
+    from app.services.telegram.buttons import get_button_label
+
     current = _normalize_tts_model(current_model)
     rows: list[list[InlineKeyboardButton]] = []
     for key, (label, hint) in TTS_MODEL_OPTIONS.items():
         suffix = " ✅" if key == current else ""
-        rows.append([InlineKeyboardButton(f"{label}{suffix} — {hint}", callback_data=f"ttsmodel_{key}")])
-    rows.append([InlineKeyboardButton("🔙 ត្រឡប់", callback_data="hide_tts_model")])
+        hint_str = f" — {hint}" if hint else ""
+        rows.append([InlineKeyboardButton(f"{label}{suffix}{hint_str}", callback_data=f"ttsmodel_{key}")])
+    back_label = get_button_label("btn_back", "🔙 ត្រឡប់")
+    rows.append([InlineKeyboardButton(back_label, callback_data="hide_tts_model")])
     return InlineKeyboardMarkup(rows)
 
 
 def get_speed_kb(current_speed: float) -> InlineKeyboardMarkup:
+    from app.services.telegram.buttons import get_button_label
+
     speed_row = [
         InlineKeyboardButton(
             lbl + (" ✅" if abs(val - current_speed) < 0.01 else ""),
@@ -19273,31 +19402,45 @@ def get_speed_kb(current_speed: float) -> InlineKeyboardMarkup:
         )
         for cb, (lbl, val) in SPEED_OPTIONS.items()
     ]
+    back_label = get_button_label("btn_back", "🔙 ត្រឡប់")
     return InlineKeyboardMarkup([
         speed_row,
-        [InlineKeyboardButton("🔙 ត្រឡប់", callback_data="hide_speed")],
+        [InlineKeyboardButton(back_label, callback_data="hide_speed")],
     ])
 
 
 def get_transcription_kb(transcript_msg_id: int) -> InlineKeyboardMarkup:
+    from app.services.telegram.buttons import get_button_label
+
+    read_label = get_button_label("btn_ai_read", "📢 AI អាន")
+    del_label = get_button_label("btn_delete", "🗑️ លុប")
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📢 AI អាន",  callback_data=f"tts_transcript:{transcript_msg_id}"),
-        InlineKeyboardButton("🗑️ លុប",    callback_data=f"del_transcript:{transcript_msg_id}"),
+        InlineKeyboardButton(read_label, callback_data=f"tts_transcript:{transcript_msg_id}"),
+        InlineKeyboardButton(del_label,  callback_data=f"del_transcript:{transcript_msg_id}"),
     ]])
 
 
 def get_audio_file_kb(msg_id: int) -> InlineKeyboardMarkup:
+    from app.services.telegram.buttons import get_button_label
+
+    audio_label = get_button_label("btn_audio_tts", "📢 បំលែងទៅសំឡេង TTS")
+    del_label = get_button_label("btn_delete", "🗑️ លុប")
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📢 បំលែងទៅសំឡេង TTS", callback_data=f"audio_tts:{msg_id}"),
-        InlineKeyboardButton("🗑️ លុប",               callback_data=f"audio_del:{msg_id}"),
+        InlineKeyboardButton(audio_label, callback_data=f"audio_tts:{msg_id}"),
+        InlineKeyboardButton(del_label,   callback_data=f"audio_del:{msg_id}"),
     ]])
 
 
 def get_ocr_confirm_kb(msg_id: int) -> InlineKeyboardMarkup:
+    from app.services.telegram.buttons import get_button_label
+
+    read_label = get_button_label("btn_ocr_read", "▶️ អាន")
+    del_label = get_button_label("btn_delete", "🗑️ លុប")
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("▶️ អាន", callback_data=f"doc_read:{msg_id}"),
-        InlineKeyboardButton("🗑️ លុប", callback_data=f"doc_del:{msg_id}"),
+        InlineKeyboardButton(read_label, callback_data=f"doc_read:{msg_id}"),
+        InlineKeyboardButton(del_label,  callback_data=f"doc_del:{msg_id}"),
     ]])
+
 
 
 def get_broadcast_confirm_kb() -> InlineKeyboardMarkup:
@@ -23958,6 +24101,70 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
             _runtime_admin_text(),
             parse_mode="HTML",
             reply_markup=get_runtime_admin_kb(),
+            disable_web_page_preview=True,
+        ))
+        return
+
+    if data in ("admin_btn_editor", "admin_btn_refresh"):
+        await _clear_admin_transient_state(context, user_id)
+        await safe_send(lambda: query.message.edit_text(
+            _admin_btn_editor_text(),
+            parse_mode="HTML",
+            reply_markup=get_admin_btn_editor_kb(),
+            disable_web_page_preview=True,
+        ))
+        return
+
+    if data.startswith("admin_btn_edit:"):
+        btn_key = data.split(":", 1)[1]
+        await _clear_admin_transient_state(context, user_id)
+        context.user_data["admin_btn_edit_key"] = btn_key
+        context.user_data["admin_btn_state"] = "awaiting_text"
+        from app.services.telegram.buttons import get_button_label
+        curr = get_button_label(btn_key)
+        await safe_send(lambda: query.message.edit_text(
+            f"✏️ <b>កែប្រែអក្សរលើប៊ូតុង:</b> <code>{html.escape(btn_key)}</code>\n\n"
+            f"តម្លៃបច្ចុប្បន្ន៖ «<b>{html.escape(curr)}</b>»\n\n"
+            "សូមផ្ញើអត្ថបទថ្មីសម្រាប់ប៊ូតុងនេះឥឡូវនេះ (ឬវាយ /cancel ដើម្បីបោះបង់)៖",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancel", callback_data="admin_btn_editor")
+            ]]),
+        ))
+        return
+
+    if data == "admin_btn_reset_all":
+        from app.services.telegram.buttons import DEFAULT_BUTTON_LABELS, reset_button_label
+        for k in DEFAULT_BUTTON_LABELS:
+            await reset_button_label(k)
+        await safe_send(lambda: query.message.edit_text(
+            "✅ <b>បានកំណត់ប៊ូតុងទាំងអស់ត្រឡប់ទៅតម្លៃដើម (Reset to Default) រួចរាល់!</b>\n\n" + _admin_btn_editor_text(),
+            parse_mode="HTML",
+            reply_markup=get_admin_btn_editor_kb(),
+            disable_web_page_preview=True,
+        ))
+        return
+
+    if data in ("admin_tts_models", "admin_tts_refresh"):
+        await _clear_admin_transient_state(context, user_id)
+        await safe_send(lambda: query.message.edit_text(
+            _admin_tts_models_text(),
+            parse_mode="HTML",
+            reply_markup=get_admin_tts_models_kb(),
+            disable_web_page_preview=True,
+        ))
+        return
+
+    if data.startswith("admin_tts_set:"):
+        model_name = data.split(":", 1)[1]
+        from app.services.settings.store import get_settings_store
+        await get_settings_store().set_text("DEFAULT_TTS_MODEL", model_name)
+        from app.services.tts.voices import tts_model_label
+        notice = f"✅ បានកំណត់ម៉ូដែលលំនាំដើមទៅ៖ <b>{html.escape(tts_model_label(model_name))}</b>"
+        await safe_send(lambda: query.message.edit_text(
+            f"{notice}\n\n" + _admin_tts_models_text(),
+            parse_mode="HTML",
+            reply_markup=get_admin_tts_models_kb(),
             disable_web_page_preview=True,
         ))
         return
