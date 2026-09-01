@@ -9617,11 +9617,10 @@ async def _switch_telegram_runtime_mode(target_mode: str, admin_id: int = 0) -> 
     target = str(target_mode or "POLLING").strip().upper()
     if target not in {"POLLING", "WEBHOOK"}:
         raise ValueError("Invalid target Telegram mode.")
-    if target == "WEBHOOK":
-        raise RuntimeError("Webhook mode is unavailable because the FastAPI backend was removed.")
     app_obj = globals().get("_TELEGRAM_APP")
     if app_obj is None:
         raise RuntimeError("Telegram application is not ready yet.")
+
 
     if target == "WEBHOOK":
         if not _runtime_webhook_base_url() or not _runtime_webhook_secret_token():
@@ -26868,11 +26867,10 @@ async def _async_main_once():
         f"HTTP pool: {HTTP_MAX_CONNECTIONS}/{HTTP_MAX_KEEPALIVE_CONNECTIONS})"
     )
 
-    from app.services.health import start_health_server
-    health_server_task = asyncio.create_task(start_health_server(), name="health-check-server")
     telegram_app_task = asyncio.create_task(_run_bot(), name="telegram-bot")
     startup_checks_task = asyncio.create_task(_run_startup_background_checks(), name="startup-background-checks")
-    tasks = [health_server_task, telegram_app_task, startup_checks_task]
+    tasks = [telegram_app_task, startup_checks_task]
+
     try:
         await telegram_app_task
     finally:

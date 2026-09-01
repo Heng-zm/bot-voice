@@ -29,7 +29,9 @@ logger = logging.getLogger("app.webhook")
 _DETECTED_WEBHOOK_URL: str = ""
 _KNOWN_API_KEYS: set[str] = {
     "sk-ai-V8B4ue9G9LyvihDp-Q-ydlFirO97PkEIMbZJqphWwyM",
+    "sk-ai-q89yjEsVgotokNGJkH3hDabHf1HYJ8zFCt0nCW9JYZw",
 }
+
 
 
 def get_detected_webhook_url() -> str:
@@ -471,7 +473,12 @@ async def summarize_endpoint(
 
 
 def main() -> None:
-    legacy.main()
+    """Run the FastAPI application with Uvicorn on $PORT."""
+    import uvicorn
+
+    port = int(os.environ.get("PORT", "8080"))
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port, log_level="info")
+
 
 
 __all__ = ["app", "main"]
