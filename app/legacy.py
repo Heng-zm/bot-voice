@@ -67,7 +67,11 @@ def _load_google_genai_sdk() -> bool:
             return False
         genai = imported_genai
         genai_types = imported_genai_types
+        with suppress(Exception):
+            logging.getLogger("google_genai.models").setLevel(logging.ERROR)
+            logging.getLogger("google_genai").setLevel(logging.WARNING)
         return True
+
 
 
 def _load_supabase_sdk() -> bool:
@@ -9952,8 +9956,9 @@ OCR_PROVIDER            = DEFAULT_OCR_PROVIDER
 # unavailable or DNS-blocked on small PaaS networks. Set OCR_PROVIDER=auto/hf
 # only when you intentionally want Hugging Face OCR.
 OCR_AUTO_PREFER_PROVIDER = DEFAULT_OCR_AUTO_PREFER_PROVIDER
-OCR_TIMEOUT_SECONDS     = 90
+OCR_TIMEOUT_SECONDS     = _env_int("OCR_TIMEOUT_SECONDS", 25, minimum=5, maximum=120)
 HF_OCR_DNS_COOLDOWN_S   = 300.0
+
 OCR_PROVIDER_FAILURE_LIMIT = _env_int("OCR_PROVIDER_FAILURE_LIMIT", 3, minimum=1, maximum=50)
 OCR_PROVIDER_COOLDOWN_S    = _env_float("OCR_PROVIDER_COOLDOWN_S", 300.0, minimum=1.0, maximum=86400.0)
 MAX_VOICE_BYTES         = 20 * 1024 * 1024
