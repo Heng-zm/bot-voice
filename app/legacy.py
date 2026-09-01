@@ -409,14 +409,13 @@ def _json_dumps_fast(content: Any) -> bytes:
     return _json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-class _FastJSONResponse:
+from fastapi.responses import JSONResponse
+
+class _FastJSONResponse(JSONResponse):
     media_type = "application/json"
 
-    def __init__(self, content: Any = None):
-        self.content = content
-
     def render(self, content: Any) -> bytes:
-        return _json_dumps_fast(content if content is not None else self.content)
+        return _json_dumps_fast(content)
 
 
 
