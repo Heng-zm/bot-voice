@@ -14,8 +14,8 @@ dependencies = [
     "itsdangerous>=2.1.0",
     "python-dotenv>=1.0.0",
     "supabase>=2.0.0",
-    "imageio-ffmpeg>=0.4.9",
     "edge-tts>=7.2.8,<8",
+
     "google-genai>=0.1.1",
     "huggingface_hub>=0.20.0",
     "gradio_client>=2,<3",

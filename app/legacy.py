@@ -19,9 +19,11 @@ import socket
 import subprocess
 import atexit
 import base64
-import httpx
-import imageio_ffmpeg as _iio_ffmpeg
-from typing import Any, Callable
+try:
+    import imageio_ffmpeg as _iio_ffmpeg
+except Exception:
+    _iio_ffmpeg = None
+
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from contextlib import suppress
@@ -8497,7 +8499,9 @@ def web_admin_dashboard_alias():
 
 
 # ── FFmpeg ─────────────────────────────────────────────────────────────────
-_FFMPEG_EXE = _iio_ffmpeg.get_ffmpeg_exe()
+import shutil
+_FFMPEG_EXE = (_iio_ffmpeg.get_ffmpeg_exe() if _iio_ffmpeg is not None else None) or shutil.which("ffmpeg") or "ffmpeg"
+
 
 try:
     import edge_tts
