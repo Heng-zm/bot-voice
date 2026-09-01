@@ -204,8 +204,13 @@ def get_last_tts_text(user_id: int) -> str | None:
     return _GLOBAL_TTS_HISTORY.get_last_tts_text(user_id)
 
 
-def clear_user_tts_history(user_id: int) -> None:
-    _GLOBAL_TTS_HISTORY.clear_user(user_id)
+def clear_user_tts_history(user_id: int | None = None) -> None:
+    """Clear TTS history for a specific user or all users if user_id is None."""
+    if user_id is None:
+        _GLOBAL_TTS_HISTORY.clear_all()
+    else:
+        _GLOBAL_TTS_HISTORY.clear_user(int(user_id))
+
 
 
 __all__ = [

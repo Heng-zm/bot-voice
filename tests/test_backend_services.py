@@ -190,7 +190,12 @@ class TTSServicesTests(unittest.TestCase):
         self.assertIsNone(cache.get(key))
 
     def test_user_history_tracker(self) -> None:
-        from app.services.tts.cache import TTSUserHistoryTracker
+        from app.services.tts.cache import (
+            TTSUserHistoryTracker,
+            clear_user_tts_history,
+            get_last_tts_text,
+            set_last_tts_text,
+        )
 
         tracker = TTSUserHistoryTracker(max_users=10)
         tracker.set_last_tts(1001)
@@ -202,6 +207,17 @@ class TTSServicesTests(unittest.TestCase):
         tracker.clear_user(1001)
         self.assertEqual(0.0, tracker.get_last_tts(1001))
         self.assertIsNone(tracker.get_last_tts_text(1001))
+
+        # Module-level convenience functions with and without user_id
+        set_last_tts_text(2002, "Sample global text")
+        self.assertEqual("Sample global text", get_last_tts_text(2002))
+        clear_user_tts_history(2002)
+        self.assertIsNone(get_last_tts_text(2002))
+
+        set_last_tts_text(3003, "Sample text 2")
+        clear_user_tts_history()  # Clear all
+        self.assertIsNone(get_last_tts_text(3003))
+
 
 
 class GeminiServicesTests(unittest.TestCase):
