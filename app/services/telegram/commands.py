@@ -28,6 +28,116 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @legacy_bound_handler
+async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Directly ask Gemini AI a question and hear the answer in voice."""
+    msg = update.message
+    if not msg: return
+    text = msg.text.replace("/ask", "").strip()
+    if not text:
+        from app.services.telegram._legacy_runtime import safe_send
+        await safe_send(lambda: msg.reply_text("💡 សូមសរសេរសំណួររបស់អ្នកតាមក្រោយ /ask (ឧ. /ask តើ AI គឺជាអ្វី?)"))
+        return
+    from app import legacy
+    if getattr(legacy, "_gemini", None) is None:
+        from app.services.telegram._legacy_runtime import safe_send
+        await safe_send(lambda: msg.reply_text("❌ Gemini API មិនទាន់បានបើកទេ។"))
+        return
+    from app.services.telegram._legacy_runtime import safe_send
+    await safe_send(lambda: msg.reply_chat_action("typing"))
+    try:
+        import asyncio
+        loop = asyncio.get_running_loop()
+        def _call_ai():
+            return legacy._gemini.models.generate_content(
+                model=getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash"),
+                contents=text,
+            )
+        resp = await loop.run_in_executor(None, _call_ai)
+        ai_text = getattr(resp, "text", "") or ""
+        if not ai_text:
+            await safe_send(lambda: msg.reply_text("❌ គ្មានចម្លើយតបពី AI ទេ។"))
+            return
+        
+        msg.text = ai_text
+        from app.services.telegram.media import on_text
+        await on_text(update, context)
+    except Exception as exc:
+        from app.services.telegram._legacy_runtime import safe_send
+        await safe_send(lambda: msg.reply_text(f"❌ បរាជ័យ: {exc}"))
+
+
+@legacy_bound_handler
+async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Translate text to Khmer and hear it out loud."""
+    msg = update.message
+    if not msg: return
+    text = msg.text.replace("/translate", "").strip()
+    if not text:
+        from app.services.telegram._legacy_runtime import safe_send
+        await safe_send(lambda: msg.reply_text("💡 សូមបញ្ចូលអត្ថបទដើម្បីបកប្រែ (ឧ. /translate Hello world)"))
+        return
+    from app import legacy
+    if getattr(legacy, "_gemini", None) is None:
+        from app.services.telegram._legacy_runtime import safe_send
+        await safe_send(lambda: msg.reply_text("❌ Gemini API មិនទាន់បានបើកទេ។"))
+        return
+    from app.services.telegram._legacy_runtime import safe_send
+    await safe_send(lambda: msg.reply_chat_action("typing"))
+    try:
+        import asyncio
+        loop = asyncio.get_running_loop()
+        def _call_ai():
+            return legacy._gemini.models.generate_content(
+                model=getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash"),
+                contents=f"Translate the following text accurately and naturally into Khmer. Return only the translated text without extra explanation:\n\n{text}",
+            )
+        resp = await loop.run_in_executor(None, _call_ai)
+        khmer_text = getattr(resp, "text", "") or ""
+        msg.text = khmer_text
+        from app.services.telegram.media import on_text
+        await on_text(update, context)
+    except Exception as exc:
+        from app.services.telegram._legacy_runtime import safe_send
+        await safe_send(lambda: msg.reply_text(f"❌ បរាជ័យ: {exc}"))
+
+
+@legacy_bound_handler
+async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Summarize long text into bullet points and hear them out loud."""
+    msg = update.message
+    if not msg: return
+    text = msg.text.replace("/summary", "").strip()
+    if not text:
+        from app.services.telegram._legacy_runtime import safe_send
+        await safe_send(lambda: msg.reply_text("💡 សូមបញ្ចូលអត្ថបទវែងៗដើម្បីសង្ខេប (ឧ. /summary ...អត្ថបទ...)"))
+        return
+    from app import legacy
+    if getattr(legacy, "_gemini", None) is None:
+        from app.services.telegram._legacy_runtime import safe_send
+        await safe_send(lambda: msg.reply_text("❌ Gemini API មិនទាន់បានបើកទេ។"))
+        return
+    from app.services.telegram._legacy_runtime import safe_send
+    await safe_send(lambda: msg.reply_chat_action("typing"))
+    try:
+        import asyncio
+        loop = asyncio.get_running_loop()
+        def _call_ai():
+            return legacy._gemini.models.generate_content(
+                model=getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash"),
+                contents=f"Summarize the following text into clear, concise bullet points in Khmer:\n\n{text}",
+            )
+        resp = await loop.run_in_executor(None, _call_ai)
+        summary_text = getattr(resp, "text", "") or ""
+        msg.text = summary_text
+        from app.services.telegram.media import on_text
+        await on_text(update, context)
+    except Exception as exc:
+        from app.services.telegram._legacy_runtime import safe_send
+        await safe_send(lambda: msg.reply_text(f"❌ បរាជ័យ: {exc}"))
+
+
+
+@legacy_bound_handler
 async def send_user_profile(message, user_id: int):
     prefs   = await get_user_prefs_async(user_id)
     gender_label = "👩 សំឡេងស្រី" if prefs["gender"] == "female" else "👨 សំឡេងប្រុស"
