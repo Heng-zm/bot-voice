@@ -16889,15 +16889,16 @@ async def _edge_tts_stream_once(chunk_text: str, voice: str) -> bytes:
 
     async def _collect() -> bytes:
         audio_chunks: list[bytes] = []
-        # Do not pass rate here; speed is applied by FFmpeg atempo. This avoids
-        # invalid edge-tts parameter combinations that can produce NoAudioReceived.
         communicate = edge_tts.Communicate(chunk_text, voice)
         async for message in communicate.stream():
-            if message.get("type") == "audio" and message.get("data"):
-                audio_chunks.append(message["data"])
+            msg_type = message.get("type") if isinstance(message, dict) else getattr(message, "type", None)
+            msg_data = message.get("data") if isinstance(message, dict) else getattr(message, "data", None)
+            if msg_type == "audio" and msg_data:
+                audio_chunks.append(msg_data)
         return b"".join(audio_chunks)
 
     return await asyncio.wait_for(_collect(), timeout=EDGE_TTS_STREAM_TIMEOUT_S)
+
 
 
 async def _edge_tts_stream_with_retry(chunk_text: str, voices: list[str]) -> tuple[bytes, str]:
@@ -18878,7 +18879,9 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
     try:
         proc = await asyncio.wait_for(
             asyncio.create_subprocess_exec(
-                *cmd,
+
+                _FFMPEG_EXE,
+                *cmd[1:],
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -18890,23 +18893,21 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
             proc.communicate(input=mp3_data),
             timeout=timeout_s,
         )
-    except FileNotFoundError as exc:
-        _cleanup(output_path)
-        raise RuntimeError(f"FFmpeg executable not found: {_FFMPEG_EXE}") from exc
-    except asyncio.TimeoutError:
-        _cleanup(output_path)
-        await _terminate_subprocess(proc, "Edge TTS FFmpeg")
-        raise RuntimeError(f"FFmpeg timed out after {timeout_s:.0f}s")
-
-    if proc.returncode != 0 or not stdout_data:
-        _cleanup(output_path)
-        snippet = (stderr_data or b"").decode(errors="replace")[-400:]
-        raise RuntimeError(f"FFmpeg failed (code {proc.returncode}): {snippet}")
+        if proc.returncode == 0 and stdout_data:
+            if output_path:
+                with suppress(Exception):
+                    await asyncio.to_thread(_write_cached_audio_to_path, output_path, stdout_data)
+            return stdout_data
+        else:
+            logger.warning("FFmpeg conversion returned code %s; delivering direct audio.", proc.returncode)
+    except Exception as exc:
+        logger.warning("FFmpeg subprocess execution exception (%s); delivering direct audio.", exc)
 
     if output_path:
         with suppress(Exception):
-            await asyncio.to_thread(_write_cached_audio_to_path, output_path, stdout_data)
-    return stdout_data
+            await asyncio.to_thread(_write_cached_audio_to_path, output_path, mp3_data)
+    return mp3_data
+
 
 
 async def _generate_voice_gemini(text: str, gender: str, speed: float, output_path: str) -> bytes:
