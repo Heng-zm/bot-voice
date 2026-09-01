@@ -24,7 +24,9 @@ try:
 except Exception:
     _iio_ffmpeg = None
 
+from typing import Any, Callable
 from collections import OrderedDict, deque
+
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from contextlib import suppress
 from datetime import datetime, timezone, timedelta

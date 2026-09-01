@@ -154,6 +154,25 @@ class SettingsStore:
             updated_by=updated_by,
         )
 
+    async def delete_setting(self, key: str) -> bool:
+        clean = self._clean_key(key)
+        async with self._lock:
+            self._memory.pop(clean, None)
+            if self.supabase is not None:
+                try:
+                    await asyncio.to_thread(
+                        lambda: self.supabase.table("bot_settings").delete().eq("key", clean).execute()
+                    )
+                    return True
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Settings delete error key=%s: %s", clean, exc)
+            return True
+
+    def get_text_sync(self, key: str, default: str = "") -> str:
+        clean = self._clean_key(key)
+        return self._memory.get(clean, default)
+
+
     def _read_sync(self, key: str) -> str | None:
         result = (
             self.supabase.table("bot_settings")
