@@ -244,25 +244,10 @@ async def get_webhook_info() -> JSONResponse:
 async def telegram_webhook(
     request: Request,
     path_token: str | None = None,
-    x_telegram_bot_api_secret_token: str | None = Header(default=None),
-) -> JSONResponse:
-    """Handle incoming Telegram webhook updates with secret token verification."""
-    expected_secret = (os.environ.get("TELEGRAM_WEBHOOK_SECRET_TOKEN") or "").strip()
-    if expected_secret and x_telegram_bot_api_secret_token != expected_secret:
-        raise HTTPException(status_code=403, detail="Invalid secret token")
+) -> Any:
+    """Handle incoming Telegram webhook updates with deduplication and state tracking."""
+    return await legacy._process_telegram_webhook_request(request, path_token)
 
-    telegram_app = getattr(legacy, "telegram_application", None) or getattr(legacy, "_TELEGRAM_APP", None)
-    if telegram_app is None:
-        raise HTTPException(status_code=503, detail="Telegram application is initializing")
-
-    try:
-        data = await request.json()
-        update = Update.de_json(data, telegram_app.bot)
-        if update is not None:
-            await telegram_app.process_update(update)
-        return JSONResponse({"ok": True})
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
 
 @app.get("/ai-assistant")
