@@ -108,15 +108,52 @@ def _load_supabase_sdk() -> bool:
         return True
 
 
+class _WebStub:
+    """Safe no-op dummy class for decommissioned web framework objects."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self
+
+    def __getattr__(self, name: str) -> Any:
+        return _WebStub()
+
+    def from_string(self, *args: Any, **kwargs: Any) -> Any:
+        return self
+
+    def render(self, *args: Any, **kwargs: Any) -> str:
+        return ""
+
+    def add_middleware(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def middleware(self, *args: Any, **kwargs: Any) -> Any:
+        return lambda f: f
+
+    def get(self, *args: Any, **kwargs: Any) -> Any:
+        return lambda f: f
+
+    def post(self, *args: Any, **kwargs: Any) -> Any:
+        return lambda f: f
+
+    def route(self, *args: Any, **kwargs: Any) -> Any:
+        return lambda f: f
+
+    def after_request(self, *args: Any, **kwargs: Any) -> Any:
+        return lambda f: f
+
+
 FastAPIRequest = Any
-FastAPI = object
+FastAPI = _WebStub
 HTTPException = Exception
-HTMLResponse = object
-RedirectResponse = object
-StarletteResponse = object
-SessionMiddleware = object
-Environment = object
-Template = object
+HTMLResponse = _WebStub
+RedirectResponse = _WebStub
+StarletteResponse = _WebStub
+SessionMiddleware = _WebStub
+Environment = _WebStub
+Template = _WebStub
 
 
 def select_autoescape(*args: Any, **kwargs: Any) -> Any:
@@ -129,6 +166,7 @@ def jsonable_encoder(obj: Any) -> Any:
 
 def run_in_threadpool(fn: Any, *args: Any, **kwargs: Any) -> Any:
     return fn(*args, **kwargs)
+
 
 
 
