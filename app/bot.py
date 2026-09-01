@@ -85,41 +85,49 @@ async def run_bot_async() -> None:
 
     async with app:
         await app.start()
-
-        if bot_mode == "WEBHOOK" and webhook_url:
-            webhook_endpoint = f"{webhook_url}/webhook"
-            logger.info("Configuring Telegram Webhook at %s", webhook_endpoint)
-            await app.bot.set_webhook(
-                url=webhook_endpoint,
-                secret_token=secret_token or None,
-                allowed_updates=["message", "edited_message", "callback_query"],
-                drop_pending_updates=False,
-            )
-            logger.info("Telegram Webhook set successfully.")
-        else:
-            with suppress(Exception):
-                await app.bot.delete_webhook(drop_pending_updates=False)
-            updater = getattr(app, "updater", None)
-            if updater is not None:
-                await updater.start_polling(
-                    allowed_updates=["message", "edited_message", "callback_query"],
-                    drop_pending_updates=False,
-                )
-                logger.info("Telegram polling started successfully.")
-
-        # Keep running until cancelled
-        stop_event = asyncio.Event()
         try:
+            if bot_mode == "WEBHOOK" and webhook_url:
+                webhook_endpoint = f"{webhook_url}/webhook"
+                logger.info("Configuring Telegram Webhook at %s", webhook_endpoint)
+                for attempt in range(5):
+                    try:
+                        await app.bot.set_webhook(
+                            url=webhook_endpoint,
+                            secret_token=secret_token or None,
+                            allowed_updates=["message", "edited_message", "callback_query"],
+                            drop_pending_updates=False,
+                        )
+                        logger.info("Telegram Webhook set successfully.")
+                        break
+                    except Exception as exc:
+                        retry_after = getattr(exc, "retry_after", None)
+                        delay = (float(retry_after) + 0.5) if retry_after is not None else (attempt + 1.0)
+                        logger.warning("set_webhook flood control / retry (%ss): %s", delay, exc)
+                        await asyncio.sleep(delay)
+            else:
+                with suppress(Exception):
+                    await app.bot.delete_webhook(drop_pending_updates=False)
+                updater = getattr(app, "updater", None)
+                if updater is not None:
+                    await updater.start_polling(
+                        allowed_updates=["message", "edited_message", "callback_query"],
+                        drop_pending_updates=False,
+                    )
+                    logger.info("Telegram polling started successfully.")
+
+            # Keep running until cancelled
+            stop_event = asyncio.Event()
             await stop_event.wait()
         except (asyncio.CancelledError, KeyboardInterrupt):
             logger.info("Bot shutdown requested.")
         finally:
             updater = getattr(app, "updater", None)
-            if updater is not None and updater.running:
+            if updater is not None and getattr(updater, "running", False):
                 with suppress(Exception):
                     await updater.stop()
-            with suppress(Exception):
-                await app.stop()
+            if getattr(app, "running", False):
+                with suppress(Exception):
+                    await app.stop()
 
 
 def main() -> None:
