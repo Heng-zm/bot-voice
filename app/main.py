@@ -117,6 +117,9 @@ async def auto_register_bot_commands() -> bool:
     commands = [
         BotCommand("start", "🚀 ចាប់ផ្ដើម / Start Bot"),
         BotCommand("help", "📖 របៀបប្រើប្រាស់ / Help"),
+        BotCommand("ask", "🤖 សួរ AI / Ask AI"),
+        BotCommand("translate", "🌐 បកប្រែជាភាសាខ្មែរ / Translate"),
+        BotCommand("summary", "📝 សង្ខេបអត្ថបទវែង / Summarize"),
         BotCommand("myprefs", "⚙️ កំណត់សំឡេង & ល្បឿន / Settings"),
         BotCommand("ttsmodel", "🎙️ ជ្រើសរើសម៉ូដែល TTS / TTS Engine"),
         BotCommand("clear", "🗑️ សម្អាតប្រវត្តិ / Clear Chat"),
@@ -160,15 +163,39 @@ async def auto_register_all() -> dict[str, Any]:
     return results
 
 
+async def keep_awake() -> None:
+    """Ping the public URL every 5 minutes to prevent Render Free Tier hibernation."""
+    import httpx
+    
+    # Wait for server to fully start
+    await asyncio.sleep(60)
+    
+    async with httpx.AsyncClient() as client:
+        while True:
+            url = get_detected_webhook_url()
+            if url:
+                health_url = f"{url.rstrip('/')}/healthz"
+                try:
+                    await client.get(health_url, timeout=10.0)
+                    logger.debug("Keep-awake ping sent to %s", health_url)
+                except Exception as e:
+                    logger.warning("Keep-awake ping failed: %s", e)
+            
+            # Sleep for 10 minutes (Render sleeps after 15m)
+            await asyncio.sleep(600)
+
+
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI) -> AsyncGenerator[None, None]:
     """Start the Telegram Bot runner and auto-register all services."""
     bot_task = asyncio.create_task(legacy._async_main_once(), name="telegram-bot-runner")
     auto_reg_task = asyncio.create_task(auto_register_all(), name="auto-register-all")
+    keep_awake_task = asyncio.create_task(keep_awake(), name="keep-awake")
 
     try:
         yield
     finally:
+        keep_awake_task.cancel()
         auto_reg_task.cancel()
         bot_task.cancel()
         with suppress(asyncio.CancelledError, Exception):
@@ -184,8 +211,11 @@ app = FastAPI(
 
 
 @app.get("/")
+@app.head("/")
 @app.get("/healthz")
+@app.head("/healthz")
 @app.get("/ping")
+@app.head("/ping")
 async def health_check(request: Request) -> JSONResponse:
     """Health check endpoint that auto-captures host header for Webhook and API URL."""
     host_header = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
@@ -327,13 +357,17 @@ async def ai_assistant_endpoint(
 
     # Call Gemini AI
     try:
-        gemini_client = getattr(legacy, "gemini_client", None)
+        gemini_client = getattr(legacy, "_gemini", None)
         if gemini_client is not None:
-            response = gemini_client.models.generate_content(
-                model=model,
-                contents=message,
-                config={"system_instruction": system_prompt},
-            )
+            import asyncio
+            loop = asyncio.get_running_loop()
+            def _call_ai():
+                return gemini_client.models.generate_content(
+                    model=model,
+                    contents=message,
+                    config={"system_instruction": system_prompt},
+                )
+            response = await loop.run_in_executor(None, _call_ai)
             ai_text = (getattr(response, "text", "") or "").strip()
         else:
             ai_text = f"Received: {message}"
