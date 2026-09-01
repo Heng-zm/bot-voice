@@ -609,6 +609,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
+        await process_tts_for_text(update, context, stripped, user_id)
+    except BaseException:
+        pass
+
+
+async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYPE, stripped: str, user_id: int):
+    """Core TTS processing extracted from on_text so it can be called programmatically."""
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user: return
+    try:
         _metric_inc("tts", user_id=user_id)
         sync_user_data(user)
         progress = await TelegramProgress.start(
@@ -729,5 +740,6 @@ __all__ = [
     'on_voice',
     'on_audio_file',
     'on_any_media',
-    'on_text'
+    'on_text',
+    'process_tts_for_text'
 ]

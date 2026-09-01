@@ -58,9 +58,8 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_send(lambda: msg.reply_text("❌ គ្មានចម្លើយតបពី AI ទេ។"))
             return
         
-        msg.text = ai_text
-        from app.services.telegram.media import on_text
-        await on_text(update, context)
+        from app.services.telegram.media import process_tts_for_text
+        await process_tts_for_text(update, context, ai_text, update.effective_user.id)
     except Exception as exc:
         from app.services.telegram._legacy_runtime import safe_send
         await safe_send(lambda: msg.reply_text(f"❌ បរាជ័យ: {exc}"))
@@ -93,9 +92,8 @@ async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         resp = await loop.run_in_executor(None, _call_ai)
         khmer_text = getattr(resp, "text", "") or ""
-        msg.text = khmer_text
-        from app.services.telegram.media import on_text
-        await on_text(update, context)
+        from app.services.telegram.media import process_tts_for_text
+        await process_tts_for_text(update, context, khmer_text, update.effective_user.id)
     except Exception as exc:
         from app.services.telegram._legacy_runtime import safe_send
         await safe_send(lambda: msg.reply_text(f"❌ បរាជ័យ: {exc}"))
@@ -128,9 +126,8 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         resp = await loop.run_in_executor(None, _call_ai)
         summary_text = getattr(resp, "text", "") or ""
-        msg.text = summary_text
-        from app.services.telegram.media import on_text
-        await on_text(update, context)
+        from app.services.telegram.media import process_tts_for_text
+        await process_tts_for_text(update, context, summary_text, update.effective_user.id)
     except Exception as exc:
         from app.services.telegram._legacy_runtime import safe_send
         await safe_send(lambda: msg.reply_text(f"❌ បរាជ័យ: {exc}"))
