@@ -22052,6 +22052,12 @@ async def _admin_home_text(admin_id: int, title: str = ADMIN_UI_TITLE) -> str:
     alerts = await _admin_smart_alert_lines(counts)
     alert_text = "\n".join(f"• {line}" for line in alerts) if alerts else "✅ No critical alerts"
 
+    redis_active = bool(os.environ.get("REDIS_URL") or getattr(SETTINGS, "REDIS_URL", ""))
+    vector_active = bool(os.environ.get("UPSTASH_VECTOR_REST_URL"))
+    gemini_active = bool(os.environ.get("GEMINI_API_KEY"))
+    from app.services.tts.voices import get_default_tts_model, tts_model_label
+    default_tts = tts_model_label(get_default_tts_model())
+
     return (
         f"{title}\n"
         f"<code>/admin › overview</code>\n\n"
@@ -22059,6 +22065,11 @@ async def _admin_home_text(admin_id: int, title: str = ADMIN_UI_TITLE) -> str:
         f"Telegram phase: <code>{telegram_phase}</code>\n"
         f"Uptime: <b>{html.escape(_format_uptime())}</b>\n"
         f"Optimize: <b>{html.escape(optimize_score)}/100</b> · Errors: <b>{error_count}</b>\n\n"
+        "<b>Cloud & AI Stack</b>\n"
+        f"⚡ Redis: <b>{_ok_bad(redis_active, 'ONLINE (Upstash TLS)', 'LOCAL')}</b>\n"
+        f"🧠 Vector: <b>{_ok_bad(vector_active, 'ACTIVE (Upstash)', 'OFF')}</b>\n"
+        f"🤖 Gemini: <b>{_ok_bad(gemini_active, 'READY (2.5-flash)', 'OFF')}</b> · "
+        f"🎙 Default TTS: <b>{html.escape(default_tts)}</b>\n\n"
         "<b>Smart Alerts</b>\n"
         f"{alert_text}\n\n"
         "<b>Quick Stats</b>\n"
@@ -22077,6 +22088,7 @@ async def _admin_home_text(admin_id: int, title: str = ADMIN_UI_TITLE) -> str:
         f"📡 Telegram: <b>{_ok_bad(bool(telegram_runtime.get('ready')), 'READY', 'STARTING')}</b>\n\n"
         "ចុចប៊ូតុងខាងក្រោម ដើម្បីគ្រប់គ្រង Bot។"
     )
+
 
 
 # ── User Needs Center V10.1: open answers + request inbox ───────────────────
