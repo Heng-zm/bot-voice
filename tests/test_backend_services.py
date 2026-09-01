@@ -175,6 +175,15 @@ class TTSServicesTests(unittest.TestCase):
         en_candidates = resolve_tts_voice_candidates("Hello there", "male")
         self.assertTrue(en_candidates[0].startswith("en-US-Guy"))
 
+    def test_normalize_gemini_tts_model(self) -> None:
+        from app.services.tts.voices import normalize_tts_model, tts_model_label
+
+        self.assertEqual("gemini", normalize_tts_model("gemini"))
+        self.assertEqual("gemini", normalize_tts_model("gemini_tts"))
+        self.assertEqual("gemini", normalize_tts_model("google_tts"))
+        self.assertIn("Gemini", tts_model_label("gemini"))
+
+
     def test_audio_cache_lifecycle(self) -> None:
         from app.services.tts.cache import TTSAudioCache, make_tts_audio_cache_key
 

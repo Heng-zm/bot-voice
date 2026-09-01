@@ -70,14 +70,20 @@ SPEED_OPTIONS: dict[str, tuple[str, float]] = {
 
 TTS_MODEL_OPTIONS: dict[str, tuple[str, str]] = {
     "auto": ("ស្វ័យប្រវត្តិ", "Kiri → Edge TTS"),
-    "hf_space": ("សំឡេងខ្មែរ Kiri", ""),
+    "gemini": ("សំឡេង Gemini AI", "Google Gemini TTS"),
     "edge": ("Edge TTS ពហុភាសា", ""),
+    "hf_space": ("សំឡេងខ្មែរ Kiri", ""),
 }
 
 TTS_MODEL_ALIASES: dict[str, str] = {
     "auto": "auto",
     "default": "auto",
     "server": "auto",
+    "gemini": "gemini",
+    "gemini_tts": "gemini",
+    "google": "gemini",
+    "google_tts": "gemini",
+    "genai": "gemini",
     "hf": "hf_space",
     "hf_space": "hf_space",
     "khmer_hf": "hf_space",
@@ -88,6 +94,7 @@ TTS_MODEL_ALIASES: dict[str, str] = {
     "edge_tts": "edge",
     "msedge": "edge",
 }
+
 
 DEFAULT_TTS_MODEL: str = (
     os.environ.get("DEFAULT_TTS_MODEL")
