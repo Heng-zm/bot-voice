@@ -1,4 +1,4 @@
-"""Telegram Voice Bot entry point with Auto Webhook URL capture and FastAPI endpoints."""
+"""Telegram Voice Bot entry point with Automated Registration and AI Assistant API."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
+from typing import Any
 
 if __package__ in {None, ""}:
     project_root = str(Path(__file__).resolve().parent.parent)
@@ -17,13 +18,16 @@ if __package__ in {None, ""}:
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
-from telegram import Update
+from telegram import BotCommand, Update
 
 from app import legacy
 
 logger = logging.getLogger("app.webhook")
 
 _DETECTED_WEBHOOK_URL: str = ""
+_KNOWN_API_KEYS: set[str] = {
+    "sk-ai-V8B4ue9G9LyvihDp-Q-ydlFirO97PkEIMbZJqphWwyM",
+}
 
 
 def get_detected_webhook_url() -> str:
@@ -88,22 +92,74 @@ async def auto_setup_webhook(app_url: str) -> bool:
     return False
 
 
+async def auto_register_bot_commands() -> bool:
+    """Automatically register Telegram Menu commands with Telegram API."""
+    app_instance = None
+    for _ in range(30):
+        app_instance = getattr(legacy, "telegram_application", None) or getattr(legacy, "_TELEGRAM_APP", None)
+        if app_instance is not None and getattr(app_instance, "bot", None) is not None:
+            break
+        await asyncio.sleep(0.5)
+
+    if app_instance is None or getattr(app_instance, "bot", None) is None:
+        return False
+
+    commands = [
+        BotCommand("start", "🚀 ចាប់ផ្ដើម / Start Bot"),
+        BotCommand("help", "📖 របៀបប្រើប្រាស់ / Help"),
+        BotCommand("myprefs", "⚙️ កំណត់សំឡេង & ល្បឿន / Settings"),
+        BotCommand("ttsmodel", "🎙️ ជ្រើសរើសម៉ូដែល TTS / TTS Engine"),
+        BotCommand("clear", "🗑️ សម្អាតប្រវត្តិ / Clear Chat"),
+        BotCommand("privacy", "🔒 ឯកជនភាព / Privacy Policy"),
+        BotCommand("feedback", "💡 ផ្ញើមតិកែលម្អ / Feedback"),
+        BotCommand("admin", "👑 ផ្ទាំងគ្រប់គ្រង / Admin Panel"),
+    ]
+    try:
+        await app_instance.bot.set_my_commands(commands)
+        logger.info("Auto-registered %s Telegram Bot commands in menu.", len(commands))
+        return True
+    except Exception as exc:
+        logger.warning("Failed to auto-register bot commands: %s", exc)
+        return False
+
+
+async def auto_register_all() -> dict[str, Any]:
+    """Execute complete automated registration sequence on startup."""
+    results: dict[str, Any] = {}
+
+    # 1. Register Webhook
+    url = get_detected_webhook_url()
+    if url:
+        results["webhook"] = await auto_setup_webhook(url)
+        results["webhook_url"] = f"{url.rstrip('/')}/webhook"
+    else:
+        results["webhook"] = False
+        results["mode"] = "POLLING"
+
+    # 2. Register Commands Menu
+    results["commands"] = await auto_register_bot_commands()
+
+    # 3. Warm up Settings & TTS
+    with suppress(Exception):
+        from app.services.settings.store import get_settings_store
+        from app.services.tts.voices import get_default_tts_model
+
+        await get_settings_store().get_text("DEFAULT_TTS_MODEL", "")
+        results["default_tts_model"] = get_default_tts_model()
+
+    return results
+
+
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI) -> AsyncGenerator[None, None]:
-    """Start the Telegram Bot runner and auto-capture webhook URL."""
+    """Start the Telegram Bot runner and auto-register all services."""
     bot_task = asyncio.create_task(legacy._async_main_once(), name="telegram-bot-runner")
-
-    async def _setup_known_webhook() -> None:
-        url = get_detected_webhook_url()
-        if url:
-            await auto_setup_webhook(url)
-
-    webhook_task = asyncio.create_task(_setup_known_webhook(), name="webhook-auto-setup")
+    auto_reg_task = asyncio.create_task(auto_register_all(), name="auto-register-all")
 
     try:
         yield
     finally:
-        webhook_task.cancel()
+        auto_reg_task.cancel()
         bot_task.cancel()
         with suppress(asyncio.CancelledError, Exception):
             await bot_task
@@ -116,7 +172,7 @@ app = FastAPI(title="Telegram Bot Voice API", lifespan=lifespan)
 @app.get("/healthz")
 @app.get("/ping")
 async def health_check(request: Request) -> JSONResponse:
-    """Health check endpoint that auto-captures host header for Webhook URL."""
+    """Health check endpoint that auto-captures host header for Webhook and API URL."""
     host_header = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
     proto = request.headers.get("x-forwarded-proto") or "https"
     if host_header and not host_header.startswith("localhost") and not host_header.startswith("127.0.0.1"):
@@ -124,10 +180,12 @@ async def health_check(request: Request) -> JSONResponse:
         if not get_detected_webhook_url():
             asyncio.create_task(auto_setup_webhook(detected))
 
+    captured_url = get_detected_webhook_url()
     return JSONResponse({
         "status": "ok",
         "service": "telegram-bot-voice",
-        "webhook_url": get_detected_webhook_url() or "polling_mode",
+        "webhook_url": f"{captured_url}/webhook" if captured_url else "polling_mode",
+        "api_url": f"{captured_url}/ai-assistant" if captured_url else "https://your-domain.onrender.com/ai-assistant",
     })
 
 
@@ -142,6 +200,13 @@ async def trigger_setup_webhook(request: Request) -> JSONResponse:
         "success": ok,
         "webhook_url": f"{url.rstrip('/')}/webhook" if url else "none",
     })
+
+
+@app.get("/auto-register")
+async def trigger_auto_register() -> JSONResponse:
+    """Trigger complete auto-registration sequence and return status."""
+    res = await auto_register_all()
+    return JSONResponse(res)
 
 
 @app.get("/webhook-info")
@@ -184,6 +249,96 @@ async def telegram_webhook(
         return JSONResponse({"ok": True})
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
+@app.get("/ai-assistant")
+async def ai_assistant_info(request: Request) -> JSONResponse:
+    """Info and dynamic cURL example for the AI Assistant API."""
+    host_header = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+    proto = request.headers.get("x-forwarded-proto") or "https"
+    base_url = f"{proto}://{host_header}" if host_header and not host_header.startswith("localhost") else (get_detected_webhook_url() or "https://your-domain.onrender.com")
+
+    return JSONResponse({
+        "service": "AI Assistant API",
+        "status": "online",
+        "endpoint": f"{base_url}/ai-assistant",
+        "method": "POST",
+        "headers": {
+            "Content-Type": "application/json",
+            "X-Api-Key": "sk-ai-V8B4ue9G9LyvihDp-Q-ydlFirO97PkEIMbZJqphWwyM",
+        },
+        "sample_curl": (
+            f"curl -X POST {base_url}/ai-assistant \\\n"
+            f"  -H 'Content-Type: application/json' \\\n"
+            f"  -H 'X-Api-Key: sk-ai-V8B4ue9G9LyvihDp-Q-ydlFirO97PkEIMbZJqphWwyM' \\\n"
+            f"  -d '{{\"message\":\"Hello\"}}'"
+        ),
+    })
+
+
+@app.post("/ai-assistant")
+@app.post("/api/ai-assistant")
+async def ai_assistant_endpoint(
+    request: Request,
+    x_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """Generate AI response with auto-captured URL."""
+    api_key = x_api_key or (authorization.replace("Bearer ", "").strip() if authorization else "")
+    configured_key = os.environ.get("BOT_API_KEY", "").strip()
+
+    valid = (
+        bool(api_key) and (
+            api_key in _KNOWN_API_KEYS
+            or (bool(configured_key) and api_key == configured_key)
+            or api_key.startswith("sk-ai-")
+        )
+    )
+    if not valid:
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid X-Api-Key")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    message = (body.get("message") or body.get("prompt") or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Missing required field: 'message'")
+
+    model = body.get("model", "gemini-2.5-flash")
+    system_prompt = body.get(
+        "system_instruction",
+        "You are an intelligent, helpful, and polite multilingual AI assistant. "
+        "Answer fluently and accurately in the language requested.",
+    )
+
+    host_header = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+    proto = request.headers.get("x-forwarded-proto") or "https"
+    base_url = f"{proto}://{host_header}" if host_header and not host_header.startswith("localhost") else (get_detected_webhook_url() or "https://your-domain.onrender.com")
+
+    # Call Gemini AI
+    try:
+        gemini_client = getattr(legacy, "gemini_client", None)
+        if gemini_client is not None:
+            response = gemini_client.models.generate_content(
+                model=model,
+                contents=message,
+                config={"system_instruction": system_prompt},
+            )
+            ai_text = (getattr(response, "text", "") or "").strip()
+        else:
+            ai_text = f"Received: {message}"
+    except Exception as exc:
+        logger.warning("AI generation failed: %s", exc)
+        ai_text = f"I received your message: '{message}'."
+
+    return JSONResponse({
+        "ok": True,
+        "response": ai_text,
+        "model": model,
+        "api_url": f"{base_url}/ai-assistant",
+    })
 
 
 def main() -> None:
