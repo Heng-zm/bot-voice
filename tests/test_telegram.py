@@ -28,6 +28,14 @@ class TelegramOnlyRuntimeTests(unittest.TestCase):
         self.assertFalse(hasattr(legacy, "run_fastapi"))
         self.assertFalse(hasattr(legacy, "run_flask"))
 
+    def test_bot_builder_creates_application(self) -> None:
+        from app.bot import build_telegram_application
+
+        app = build_telegram_application("123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ")
+        self.assertIsNotNone(app)
+        self.assertEqual(app.bot.token, "123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ")
+
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -419,7 +419,27 @@ class TextUtilityServicesTests(unittest.TestCase):
         self.assertGreaterEqual(len(pages), 1)
 
 
+class OCRServicesTests(unittest.TestCase):
+    def test_ocr_service_initialization(self) -> None:
+        from app.services.ai.ocr import OCRService
+
+        ocr = OCRService(gemini_client=None, hf_client=None)
+        with self.assertRaisesRegex(RuntimeError, "Empty image data"):
+            ocr.extract_text(b"")
+
+
+class TTSEngineServicesTests(unittest.TestCase):
+    def test_tts_engine_caching(self) -> None:
+        from app.services.tts.engine import TTSEngine
+
+        engine = TTSEngine(cache_enabled=True)
+        self.assertIsNone(engine.get_cached_audio("Test sentence", "female", 1.0, "auto"))
+        engine.cache_audio("Test sentence", "female", 1.0, "auto", b"generated_audio_data")
+        self.assertEqual(b"generated_audio_data", engine.get_cached_audio("Test sentence", "female", 1.0, "auto"))
+
+
 class FileIOServicesTests(unittest.TestCase):
+
     def test_temp_file_lifecycle(self) -> None:
         import os
 

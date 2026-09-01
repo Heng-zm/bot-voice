@@ -8960,9 +8960,10 @@ _IS_RENDER_ENV = (
     or bool(os.environ.get("RENDER_SERVICE_ID"))
     or bool(os.environ.get("RENDER_EXTERNAL_URL"))
 )
-TELEGRAM_MULTI_SERVER_ENABLED = _env_bool("TELEGRAM_MULTI_SERVER_ENABLED", _IS_RENDER_ENV)
-TELEGRAM_ACTIVE_LOCK_ENABLED = _env_bool("TELEGRAM_ACTIVE_LOCK_ENABLED", TELEGRAM_MULTI_SERVER_ENABLED)
-TELEGRAM_ACTIVE_LOCK_REQUIRED = _env_bool("TELEGRAM_ACTIVE_LOCK_REQUIRED", TELEGRAM_MULTI_SERVER_ENABLED)
+TELEGRAM_MULTI_SERVER_ENABLED = _env_bool("TELEGRAM_MULTI_SERVER_ENABLED", False)
+TELEGRAM_ACTIVE_LOCK_ENABLED = _env_bool("TELEGRAM_ACTIVE_LOCK_ENABLED", False)
+TELEGRAM_ACTIVE_LOCK_REQUIRED = _env_bool("TELEGRAM_ACTIVE_LOCK_REQUIRED", False)
+
 TELEGRAM_ACTIVE_LOCK_KEY = (os.environ.get("TELEGRAM_ACTIVE_LOCK_KEY") or "telegram_webhook_owner").strip() or "telegram_webhook_owner"
 TELEGRAM_ACTIVE_LOCK_TTL_S = _env_int("TELEGRAM_ACTIVE_LOCK_TTL_S", 90, minimum=30, maximum=3600)
 TELEGRAM_ACTIVE_LOCK_RENEW_S = _env_float(
@@ -18899,11 +18900,81 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
     return stdout_data
 
 
+async def _generate_voice_gemini(text: str, gender: str, speed: float, output_path: str) -> bytes:
+    """Generate speech using Google Gemini Audio Output / Multimodal TTS with Edge fallback."""
+    if _gemini is None:
+        logger.info("Gemini client not configured; routing to Edge TTS.")
+        return await _generate_voice_edge(text, gender, speed, output_path)
+
+    voice_name = "Aoede" if gender == "female" else "Puck"
+    prompt = (
+        f"Read the following text out loud clearly and naturally. "
+        f"Do not add any preamble, conversational commentary, or introduction. "
+        f"Only read the exact text provided below:\n\n{text}"
+    )
+
+    loop = asyncio.get_running_loop()
+
+    def _call_gemini_audio_sync() -> bytes | None:
+        try:
+            from google.genai import types as _gtypes
+            speech_cfg = None
+            with suppress(Exception):
+                speech_cfg = _gtypes.SpeechConfig(
+                    voice_config=_gtypes.VoiceConfig(
+                        prebuilt_voice_config=_gtypes.PrebuiltVoiceConfig(
+                            voice_name=voice_name
+                        )
+                    )
+                )
+
+            gen_config = None
+            with suppress(Exception):
+                if speech_cfg is not None:
+                    gen_config = _gtypes.GenerateContentConfig(
+                        response_modalities=["AUDIO"],
+                        speech_config=speech_cfg,
+                        temperature=0.3,
+                    )
+                else:
+                    gen_config = _gtypes.GenerateContentConfig(
+                        response_modalities=["AUDIO"],
+                        temperature=0.3,
+                    )
+
+            resp = _gemini.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=gen_config,
+            )
+            for cand in getattr(resp, "candidates", []) or []:
+                content = getattr(cand, "content", None)
+                for part in getattr(content, "parts", []) or []:
+                    inline = getattr(part, "inline_data", None)
+                    if inline is not None and getattr(inline, "data", None):
+                        return bytes(inline.data)
+        except Exception as exc:
+            logger.warning("Gemini multimodal audio generation exception: %s", exc)
+        return None
+
+    audio_bytes = await loop.run_in_executor(_AI_EXECUTOR, _call_gemini_audio_sync)
+    if audio_bytes:
+        with tempfile.TemporaryDirectory(prefix="gemini_tts_") as tmpdir:
+            raw_path = os.path.join(tmpdir, "gemini_raw.wav")
+            await asyncio.to_thread(_write_file_bytes_sync, raw_path, audio_bytes)
+            return await _convert_audio_files_to_telegram_voice([raw_path], speed, output_path)
+
+    # Fallback to Edge TTS if Gemini model or API account does not support audio modalities
+    logger.info("Gemini did not return inline audio; falling back to Edge TTS for seamless delivery.")
+    return await _generate_voice_edge(text, gender, speed, output_path)
+
+
 async def generate_voice(text: str, gender: str, speed: float, output_path: str, tts_model: str = "auto") -> bytes:
     """Generate Telegram voice audio using the user's selected TTS model.
 
     User model routing:
       - auto: server default; Khmer usually uses HF Space, English uses Edge.
+      - gemini: Google Gemini audio output with automatic Edge TTS fallback.
       - hf_space: force mrrtmob/khmer-tts for Khmer text; English still uses Edge.
       - edge: force Edge TTS for all supported languages.
     """
@@ -18915,7 +18986,19 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
 
     provider_manager = get_provider_manager()
     user_model = _normalize_tts_model(tts_model)
+
+    if user_model == "gemini":
+        started = time.perf_counter()
+        try:
+            audio = await _generate_voice_gemini(text, gender, speed, output_path)
+            provider_manager.record_success("gemini", (time.perf_counter() - started) * 1_000)
+            return audio
+        except Exception as exc:
+            logger.warning("Gemini TTS failed, falling back to Edge TTS: %s", exc)
+            provider_manager.record_failure("gemini", exc)
+
     if _should_try_hf_khmer_tts(text, user_model):
+
         started = time.perf_counter()
         try:
             audio = await _generate_voice_hf_space(text, speed, output_path)
@@ -26773,9 +26856,11 @@ async def _async_main_once():
         f"HTTP pool: {HTTP_MAX_CONNECTIONS}/{HTTP_MAX_KEEPALIVE_CONNECTIONS})"
     )
 
+    from app.services.health import start_health_server
+    health_server_task = asyncio.create_task(start_health_server(), name="health-check-server")
     telegram_app_task = asyncio.create_task(_run_bot(), name="telegram-bot")
     startup_checks_task = asyncio.create_task(_run_startup_background_checks(), name="startup-background-checks")
-    tasks = [telegram_app_task, startup_checks_task]
+    tasks = [health_server_task, telegram_app_task, startup_checks_task]
     try:
         await telegram_app_task
     finally:
@@ -26785,6 +26870,7 @@ async def _async_main_once():
         for task in tasks:
             with suppress(asyncio.CancelledError, Exception):
                 await task
+
 
 
 def main():

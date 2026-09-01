@@ -11,14 +11,9 @@ if __package__ in {None, ""}:
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-from app import legacy
-
-
-def main() -> None:
-    """Run the Telegram polling bot and its internal schedulers."""
-
-    legacy.main()
+from app.bot import main
 
 
 if __name__ == "__main__":
     main()
+

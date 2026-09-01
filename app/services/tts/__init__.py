@@ -14,6 +14,10 @@ from app.services.tts.cache import (
     set_last_tts,
     set_last_tts_text,
 )
+from app.services.tts.engine import (
+    TTSEngine,
+    get_global_tts_engine,
+)
 from app.services.tts.voices import (
     DEFAULT_SPEED,
     DEFAULT_TTS_MODEL,
@@ -31,11 +35,13 @@ from app.services.tts.voices import (
     tts_model_label,
 )
 
+
 __all__ = [
     "DEFAULT_SPEED",
     "DEFAULT_TTS_MODEL",
     "SPEED_OPTIONS",
     "TTSAudioCache",
+    "TTSEngine",
     "TTSUserHistoryTracker",
     "TTS_LANGUAGE_LABELS",
     "TTS_MODEL_ALIASES",
@@ -46,6 +52,7 @@ __all__ = [
     "clear_user_tts_history",
     "get_default_tts_model",
     "get_global_tts_cache",
+    "get_global_tts_engine",
     "get_global_tts_history",
     "get_last_tts",
     "get_last_tts_text",
