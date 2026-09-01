@@ -9,9 +9,10 @@ from app import main as bot_entrypoint
 
 
 class TelegramOnlyRuntimeTests(unittest.TestCase):
-    def test_entrypoint_exports_main_without_asgi_app(self) -> None:
+    def test_entrypoint_exports_main_and_app(self) -> None:
         self.assertTrue(callable(bot_entrypoint.main))
-        self.assertFalse(hasattr(bot_entrypoint, "app"))
+        self.assertTrue(hasattr(bot_entrypoint, "app"))
+
 
     def test_runtime_is_polling_only(self) -> None:
         self.assertEqual("POLLING", legacy._run_state_bot_mode())

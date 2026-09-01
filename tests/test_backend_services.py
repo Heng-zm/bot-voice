@@ -438,7 +438,16 @@ class TTSEngineServicesTests(unittest.TestCase):
         self.assertEqual(b"generated_audio_data", engine.get_cached_audio("Test sentence", "female", 1.0, "auto"))
 
 
+class CoreConfigTests(unittest.TestCase):
+    def test_settings_initialization(self) -> None:
+        from app.core.config import AppSettings, SETTINGS
+
+        self.assertIsInstance(SETTINGS, AppSettings)
+        self.assertEqual(SETTINGS.GEMINI_MODEL, "gemini-2.5-flash")
+
+
 class FileIOServicesTests(unittest.TestCase):
+
 
     def test_temp_file_lifecycle(self) -> None:
         import os
