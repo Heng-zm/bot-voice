@@ -9129,9 +9129,11 @@ def _run_state_get(key: str, default: Any = None) -> Any:
 
 
 def _run_state_bot_mode() -> str:
-    # The HTTP backend has been removed. Long polling is now the only supported
-    # Telegram transport and cannot be changed by stale persisted settings.
+    webhook_url = (os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").strip()
+    if os.environ.get("BOT_MODE", "").strip().upper() == "WEBHOOK" or bool(webhook_url):
+        return "WEBHOOK"
     return "POLLING"
+
 
 
 def _run_state_user_rate_limit() -> int:
@@ -26839,8 +26841,10 @@ async def _async_main_once():
         await _restore_run_state()
     except Exception as rexc:
         webhook_logger.warning("Runtime state restore failed during boot: %s", rexc)
-    BOT_MODE = "POLLING"
-    RUN_STATE["BOT_MODE"] = "POLLING"
+    active_mode = _run_state_bot_mode()
+    BOT_MODE = active_mode
+    RUN_STATE["BOT_MODE"] = active_mode
+
     from app.core.telegram_auth import configure_telegram_admin_authorizer
 
     admin_authorizer = configure_telegram_admin_authorizer(

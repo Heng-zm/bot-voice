@@ -300,7 +300,8 @@ async def ai_assistant_endpoint(
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") from None
+
 
     message = (body.get("message") or body.get("prompt") or "").strip()
     if not message:
