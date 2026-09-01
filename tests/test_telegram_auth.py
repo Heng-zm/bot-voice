@@ -28,6 +28,18 @@ class TelegramAdminAuthorizerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(authorizer.is_admin_sync(7))
         self.assertFalse(authorizer.is_admin_sync(42))
 
+    async def test_empty_save_preserves_fallback_admin_ids(self) -> None:
+        authorizer = TelegramAdminAuthorizer().configure(
+            settings_store=SettingsStore(),
+            fallback_admin_ids={42},
+        )
+
+        # Attempting to save empty set
+        await authorizer.save_ids(set())
+
+        self.assertTrue(authorizer.is_admin_sync(42))
+        self.assertEqual(frozenset({42}), await authorizer.load_ids())
+
     async def test_concurrent_cache_misses_share_one_store_read(self) -> None:
         class CountingStore(SettingsStore):
             def __init__(self) -> None:

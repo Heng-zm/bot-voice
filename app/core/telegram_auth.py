@@ -84,7 +84,10 @@ class TelegramAdminAuthorizer:
         *,
         updated_by: int | None = None,
     ) -> bool:
-        clean = sorted({int(value) for value in ids if int(value) > 0})
+        clean_set = {int(value) for value in ids if int(value) > 0}
+        if not clean_set and self.fallback_admin_ids:
+            clean_set.update(self.fallback_admin_ids)
+        clean = sorted(clean_set)
         persistent = await self.store.set_json(_ADMIN_KEY, clean, updated_by=updated_by)
         self._cache = frozenset(clean)
         self._cache_at = time.monotonic()

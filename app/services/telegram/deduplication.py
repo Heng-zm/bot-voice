@@ -91,11 +91,16 @@ class WebhookReplayStore:
             self._reclaimed += 1
 
     def _trim_locked(self, now: float) -> None:
-        for uid, lease in list(self._items.items())[:10_000]:
+        expired_uids: list[int] = []
+        for uid, lease in self._items.items():
             if self._expired(lease, now):
-                self._items.pop(uid, None)
-                if lease.state == "processing":
-                    self._reclaimed += 1
+                expired_uids.append(uid)
+            if len(expired_uids) >= 1000:
+                break
+        for uid in expired_uids:
+            lease = self._items.pop(uid, None)
+            if lease is not None and lease.state == "processing":
+                self._reclaimed += 1
         max_entries = _webhook_replay_max_entries()
         while len(self._items) > max_entries:
             self._items.popitem(last=False)

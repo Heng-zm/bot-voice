@@ -8,7 +8,12 @@ from __future__ import annotations
 # Transitional V4.1 modules bind remaining legacy helpers at runtime.
 # ruff: noqa: F821
 from app.services.telegram._legacy_runtime import legacy_bound_handler
-from app.services.telegram.security import is_user_blocked
+from app.services.telegram.security import (
+    ADMIN_ONLY_COMMANDS,
+    is_user_blocked,
+    security_notice_once,
+    telegram_command_name,
+)
 
 
 @legacy_bound_handler
@@ -27,11 +32,13 @@ async def _telegram_rate_limit_guard(update: Any, context: Any) -> None:
         if now - last >= USER_RATE_LIMIT_NOTICE_COOLDOWN_S:
             _RATE_LIMIT_NOTICE_MEMORY[key] = now
             should_send_notice = True
-            if len(_RATE_LIMIT_NOTICE_MEMORY) > 50_000:
+            if len(_RATE_LIMIT_NOTICE_MEMORY) > 10_000:
                 stale_before = now - max(USER_RATE_LIMIT_NOTICE_COOLDOWN_S * 4, 300.0)
-                for old_key, old_ts in list(_RATE_LIMIT_NOTICE_MEMORY.items())[:5000]:
+                for old_key, old_ts in list(_RATE_LIMIT_NOTICE_MEMORY.items()):
                     if old_ts < stale_before:
                         _RATE_LIMIT_NOTICE_MEMORY.pop(old_key, None)
+                while len(_RATE_LIMIT_NOTICE_MEMORY) > 10_000:
+                    _RATE_LIMIT_NOTICE_MEMORY.pop(next(iter(_RATE_LIMIT_NOTICE_MEMORY)), None)
     if should_send_notice:
         msg = getattr(update, "effective_message", None)
         if msg is not None:

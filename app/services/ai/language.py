@@ -118,34 +118,48 @@ def _detect_lang(text: str) -> str:
     """Detect the dominant writing system without manual prefix overrides."""
 
     value = str(text or "")
-    khmer = sum(1 for char in value if "\u1780" <= char <= "\u17FF")
-    korean = sum(
-        1
-        for char in value
-        if "\u1100" <= char <= "\u11FF"
-        or "\u3130" <= char <= "\u318F"
-        or "\uAC00" <= char <= "\uD7AF"
-    )
-    japanese = sum(
-        1
-        for char in value
-        if "\u3040" <= char <= "\u30FF"
-        or "\u31F0" <= char <= "\u31FF"
-    )
-    chinese = sum(
-        1
-        for char in value
-        if "\u3400" <= char <= "\u4DBF"
-        or "\u4E00" <= char <= "\u9FFF"
-        or "\uF900" <= char <= "\uFAFF"
-    )
-    devanagari = len(_DEVANAGARI_RE.findall(value))
-    arabic = len(_ARABIC_SCRIPT_RE.findall(value))
-    latin = sum(
-        1
-        for char in value
-        if "A" <= char <= "Z" or "a" <= char <= "z"
-    )
+    if not value:
+        return "en"
+
+    khmer = 0
+    korean = 0
+    japanese = 0
+    chinese = 0
+    devanagari = 0
+    arabic = 0
+    latin = 0
+
+    for char in value:
+        cp = ord(char)
+        if 0x1780 <= cp <= 0x17FF:
+            khmer += 1
+        elif (
+            (0x1100 <= cp <= 0x11FF)
+            or (0x3130 <= cp <= 0x318F)
+            or (0xAC00 <= cp <= 0xD7AF)
+        ):
+            korean += 1
+        elif (0x3040 <= cp <= 0x30FF) or (0x31F0 <= cp <= 0x31FF):
+            japanese += 1
+        elif (
+            (0x3400 <= cp <= 0x4DBF)
+            or (0x4E00 <= cp <= 0x9FFF)
+            or (0xF900 <= cp <= 0xFAFF)
+        ):
+            chinese += 1
+        elif 0x0900 <= cp <= 0x097F:
+            devanagari += 1
+        elif (
+            (0x0600 <= cp <= 0x06FF)
+            or (0x0750 <= cp <= 0x077F)
+            or (0x08A0 <= cp <= 0x08FF)
+            or (0xFB50 <= cp <= 0xFDFF)
+            or (0xFE70 <= cp <= 0xFEFF)
+        ):
+            arabic += 1
+        elif (65 <= cp <= 90) or (97 <= cp <= 122):
+            latin += 1
+
     signal_total = (
         khmer + korean + japanese + chinese + devanagari + arabic + latin
     )

@@ -47,14 +47,74 @@ BOT_MODE=POLLING
 `SUPABASE_KEY` remains accepted as a compatibility alias. Keep the service-role
 key private and never send it through Telegram.
 
-## Run
+## 🚀 Easy Server Deployment
 
-Linux or hosting panel:
+### Method 1: Docker Compose (Recommended)
 
+1. Copy `.env.example` to `.env` and fill in your credentials:
+   ```bash
+   cp .env.example .env
+   ```
+2. Start the bot in the background:
+   ```bash
+   docker compose up -d --build
+   ```
+3. View live logs:
+   ```bash
+   docker compose logs -f
+   ```
+
+---
+
+### Method 2: Automated 1-Click Script (`deploy.sh`)
+
+On any Linux VPS (Ubuntu / Debian / CentOS / RHEL):
 ```bash
-chmod +x start.sh
-./start.sh
+chmod +x deploy.sh
+./deploy.sh
 ```
+*The script automatically detects Docker (or configures a Python virtual environment with dependencies) and launches the bot.*
+
+---
+
+### Method 3: Linux Systemd Daemon (24/7 Background Service)
+
+1. Copy the service file template:
+   ```bash
+   sudo cp bot-voice.service.example /etc/systemd/system/bot-voice.service
+   ```
+2. Edit `/etc/systemd/system/bot-voice.service` with your user and working directory.
+3. Enable and start the service:
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now bot-voice
+   ```
+4. Check status & logs:
+   ```bash
+   sudo systemctl status bot-voice
+   journalctl -u bot-voice -f
+   ```
+
+### Method 4: Anajak Cloud (https://anajak.cloud/)
+
+**For Anajak Cloud VPS (Ubuntu/Debian):**
+```bash
+git clone https://github.com/Heng-zm/bot-voice.git
+cd bot-voice
+cp .env.example .env
+# Edit .env with your tokens
+docker compose up -d --build
+```
+
+**For Anajak Cloud Bot / Pterodactyl Panel:**
+1. Upload files and `.env` via Web File Manager / SFTP.
+2. In Panel **Startup**: select **Python 3.11+** and set Startup Command to `./start.sh` (or `python main.py`).
+3. Set panel environment variable `INSTALL_REQUIREMENTS_ON_START=true`.
+4. Click **Start**.
+
+---
+
+## 💻 Manual Run & Development
 
 Direct launchers:
 
@@ -65,19 +125,13 @@ python app/main.py
 ```
 
 `start.sh` checks Python 3.11+, optionally installs requirements, compiles the
-application, and starts the polling bot. Dependency installation on every
-restart is disabled by default; enable it only when required:
+application, and starts the polling bot:
 
-```env
-INSTALL_REQUIREMENTS_ON_START=true
-STARTUP_COMPILE_CHECK=true
+```bash
+chmod +x start.sh
+./start.sh
 ```
 
-## Deployment
-
-Deploy this project as a background worker or persistent process. It does not
-open an HTTP port and does not provide `/readyz`, webhook, REST API, dashboard,
-or Mini App routes.
 
 Only one process may poll a Telegram token unless distributed ownership is
 enabled. For a normal single-process deployment:

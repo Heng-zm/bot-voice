@@ -175,9 +175,10 @@ class SettingsStore:
             .execute()
         )
         values: dict[str, str] = {}
+        target_keys = set(keys)
         for row in list(getattr(result, "data", None) or []):
             key = str(row.get("key") or "").strip()
-            if key in keys:
+            if key in target_keys:
                 values[key] = str(row.get("value") or "")
         return values
 

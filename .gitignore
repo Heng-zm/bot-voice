@@ -10,6 +10,9 @@ htmlcov/
 .env.*
 !.env.example
 /env
+env
+*.key
+*.pem
 
 .venv/
 venv/

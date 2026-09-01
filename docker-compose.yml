@@ -1,0 +1,18 @@
+services:
+  bot-voice:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bot-voice
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Polling bot does not expose external ports; communication is outbound to Telegram & Supabase.

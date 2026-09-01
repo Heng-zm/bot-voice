@@ -10792,43 +10792,12 @@ async def _telegram_rate_limit_guard(update: Any, context: Any) -> None:
     return await _impl(update, context)
 
 
-_ADMIN_ONLY_COMMANDS = {
-    "admin", "stats", "broadcast", "schedule", "schedules", "cancelschedule",
-    "runtime", "api", "botsettings", "users", "chat", "endchat",
-}
-_ADMIN_SECURITY_NOTICE_MEMORY: dict[str, float] = {}
-_ADMIN_SECURITY_NOTICE_MEMORY_LOCK = threading.RLock()
+from app.services.telegram.security import (
+    ADMIN_ONLY_COMMANDS as _ADMIN_ONLY_COMMANDS,
+    security_notice_once as _security_notice_once,
+    telegram_command_name as _telegram_command_name,
+)
 
-
-def _telegram_command_name(update: Update) -> str:
-    msg = update.effective_message
-    text = str(getattr(msg, "text", None) or getattr(msg, "caption", None) or "").strip()
-    if not text.startswith("/"):
-        return ""
-    return text[1:].split(maxsplit=1)[0].split("@", 1)[0].lower()
-
-
-async def _security_notice_once(update: Update, key: str, text: str, *, alert: bool = False) -> None:
-    now = time.monotonic()
-    with _ADMIN_SECURITY_NOTICE_MEMORY_LOCK:
-        last = _ADMIN_SECURITY_NOTICE_MEMORY.get(key, 0.0)
-        if now - last < USER_RATE_LIMIT_NOTICE_COOLDOWN_S:
-            return
-        _ADMIN_SECURITY_NOTICE_MEMORY[key] = now
-        if len(_ADMIN_SECURITY_NOTICE_MEMORY) > 50_000:
-            stale_before = now - max(USER_RATE_LIMIT_NOTICE_COOLDOWN_S * 4, 300.0)
-            for old_key, old_ts in list(_ADMIN_SECURITY_NOTICE_MEMORY.items())[:5000]:
-                if old_ts < stale_before:
-                    _ADMIN_SECURITY_NOTICE_MEMORY.pop(old_key, None)
-    query = update.callback_query
-    if query is not None:
-        with suppress(Exception):
-            await query.answer(text, show_alert=alert)
-        return
-    msg = update.effective_message
-    if msg is not None:
-        with suppress(Exception):
-            await msg.reply_text(text)
 
 
 async def _telegram_user_security_guard(update: Any, context: Any) -> None:
@@ -10923,45 +10892,13 @@ _admin_chat_target:  dict[int, int]  = {}
 _user_to_admin:      dict[int, int]  = {}
 _sched_payload:      dict[int, dict] = {}
 
-_USER_LAST_TTS_MAX = 10_000
-_user_last_tts: OrderedDict[int, float] = OrderedDict()
+from app.services.tts import (
+    get_last_tts as _get_last_tts,
+    get_last_tts_text as get_last_tts_text,
+    set_last_tts as _set_last_tts,
+    set_last_tts_text as set_last_tts_text,
+)
 
-
-def _set_last_tts(user_id: int) -> None:
-    _user_last_tts.pop(user_id, None)
-    _user_last_tts[user_id] = time.monotonic()
-    while len(_user_last_tts) > _USER_LAST_TTS_MAX:
-        _user_last_tts.popitem(last=False)
-
-
-def _get_last_tts(user_id: int) -> float:
-    return _user_last_tts.get(user_id, 0.0)
-
-
-# ---------------------------------------------------------------------------
-# Last TTS text fallback cache
-# ---------------------------------------------------------------------------
-_LAST_TTS_TEXT_MAX = 10_000
-_last_tts_text: OrderedDict[int, tuple[str, float]] = OrderedDict()
-
-
-def set_last_tts_text(user_id: int, text: str) -> None:
-    text = (text or "").strip()
-    if not text:
-        return
-    _last_tts_text.pop(user_id, None)
-    _last_tts_text[user_id] = (text, time.monotonic())
-    while len(_last_tts_text) > _LAST_TTS_TEXT_MAX:
-        _last_tts_text.popitem(last=False)
-
-
-def get_last_tts_text(user_id: int) -> str | None:
-    item = _last_tts_text.get(user_id)
-    if not item:
-        return None
-    _last_tts_text.move_to_end(user_id)
-    text, _ = item
-    return text
 
 
 # ---------------------------------------------------------------------------
@@ -11778,47 +11715,21 @@ def _init_clients() -> None:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-VOICE_MAP = {
-    # Khmer
-    "km": {"female": "km-KH-SreymomNeural", "male": "km-KH-PisethNeural"},
-    # English (United States)
-    "en": {"female": "en-US-AriaNeural", "male": "en-US-GuyNeural"},
-    # Chinese / Mandarin (Simplified + Traditional text detection routes here)
-    "zh": {"female": "zh-CN-XiaoxiaoNeural", "male": "zh-CN-YunxiNeural"},
-    # Korean
-    "ko": {"female": "ko-KR-SunHiNeural", "male": "ko-KR-InJoonNeural"},
-    # Japanese
-    "ja": {"female": "ja-JP-NanamiNeural", "male": "ja-JP-KeitaNeural"},
-    # Hindi (India)
-    "hi": {"female": "hi-IN-SwaraNeural", "male": "hi-IN-MadhurNeural"},
-    # Malay (Malaysia)
-    "ms": {"female": "ms-MY-YasminNeural", "male": "ms-MY-OsmanNeural"},
-    # Indonesian (Indonesia)
-    "id": {"female": "id-ID-GadisNeural", "male": "id-ID-ArdiNeural"},
-    # Filipino / Tagalog (Philippines)
-    "fil": {"female": "fil-PH-BlessicaNeural", "male": "fil-PH-AngeloNeural"},
-    # Arabic (Saudi Arabia)
-    "ar": {"female": "ar-SA-ZariyahNeural", "male": "ar-SA-HamedNeural"},
-}
-TTS_LANGUAGE_LABELS = {
-    "km": "Khmer",
-    "en": "English",
-    "zh": "Chinese",
-    "ko": "Korean",
-    "ja": "Japanese",
-    "hi": "Hindi (India)",
-    "ms": "Malay (Malaysia)",
-    "id": "Indonesian",
-    "fil": "Filipino (Philippines)",
-    "ar": "Arabic",
-}
-TTS_SUPPORTED_LANG_ORDER = ("en", "km", "zh", "ja", "ko", "hi", "ms", "id", "fil", "ar")
-SPEED_OPTIONS = {
-    "spd_0.5": ("x0.5", 0.5),
-    "spd_1.0": ("Normal", 1.0),
-    "spd_1.5": ("x1.5", 1.5),
-    "spd_2.0": ("x2.0", 2.0),
-}
+from app.services.tts import (
+    DEFAULT_SPEED,
+    SPEED_OPTIONS,
+    TTS_LANGUAGE_LABELS,
+    TTS_MODEL_ALIASES,
+    TTS_MODEL_OPTIONS,
+    TTS_SUPPORTED_LANG_ORDER,
+    VOICE_MAP,
+    clean_tts_text,
+    normalize_tts_model,
+    resolve_tts_voice_candidates,
+    split_text_chunks,
+    tts_model_label,
+)
+
 WELCOME_TEXT = (
     "🎵 សួស្តី! ខ្ញុំជាបូតបម្លែងអត្ថបទទៅជាសំឡេងដោយ AI។\n\n"
     "📌 វាយអត្ថបទជាភាសាណាមួយ ហើយផ្ញើមកបូត។ បូតនឹងបង្កើតសំឡេងដោយស្វ័យប្រវត្តិ។\n"
@@ -11895,15 +11806,9 @@ TTS_MODEL_ALIASES = {
 DEFAULT_TTS_MODEL = (os.environ.get("DEFAULT_TTS_MODEL") or os.environ.get("USER_DEFAULT_TTS_MODEL") or "auto").strip().lower()
 
 
-def _normalize_tts_model(value: Any) -> str:
-    raw = str(value or DEFAULT_TTS_MODEL or "auto").strip().lower().replace("-", "_")
-    return TTS_MODEL_ALIASES.get(raw, "auto")
+_normalize_tts_model = normalize_tts_model
+_tts_model_label = tts_model_label
 
-
-def _tts_model_label(value: Any) -> str:
-    key = _normalize_tts_model(value)
-    label, hint = TTS_MODEL_OPTIONS.get(key, TTS_MODEL_OPTIONS["auto"])
-    return f"{label} — {hint}"
 
 
 DEFAULT_USER_PREFS: dict = {"gender": "female", "speed": DEFAULT_SPEED, "tts_model": _normalize_tts_model(DEFAULT_TTS_MODEL)}
@@ -12193,24 +12098,8 @@ def _prefs_redis_key(user_id: int) -> str:
     return _redis_key("prefs", int(user_id))
 
 
-def _normalize_user_prefs(row: dict | None) -> dict:
-    prefs = dict(DEFAULT_USER_PREFS)
-    row = row or {}
+from app.services.users import normalize_user_prefs as _normalize_user_prefs
 
-    gender = row.get("gender") or prefs["gender"]
-    if gender not in ("female", "male"):
-        gender = "female"
-    prefs["gender"] = gender
-
-    raw_speed = row.get("speed", prefs["speed"])
-    try:
-        prefs["speed"] = max(_SPEED_MIN, min(_SPEED_MAX, float(raw_speed)))
-    except Exception:
-        prefs["speed"] = DEFAULT_SPEED
-
-    prefs["tts_model"] = _normalize_tts_model(row.get("tts_model", prefs.get("tts_model")))
-
-    return prefs
 
 
 def _cache_prefs_sync(user_id: int, prefs: dict) -> None:
@@ -12618,122 +12507,14 @@ def _paginate_plain(text: str, limit: int = TELE_MSG_LIMIT, header: str = "") ->
     return [p for p in pages if p]
 
 
-def _take_escaped_prefix(text: str, escaped_limit: int) -> tuple[str, str]:
-    """Return the largest raw prefix whose html.escape() fits escaped_limit."""
-    if escaped_limit <= 0:
-        return "", text
-    if len(html.escape(text)) <= escaped_limit:
-        return text, ""
+from app.utils.text import (
+    html_safe_cut as _html_safe_cut,
+    paginate_html as _paginate_html,
+    paginate_pre_html as _paginate_pre_html,
+    take_escaped_prefix as _take_escaped_prefix,
+    truncate_text as _truncate_text,
+)
 
-    lo, hi = 0, len(text)
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if len(html.escape(text[:mid])) <= escaped_limit:
-            lo = mid
-        else:
-            hi = mid - 1
-    if lo <= 0:
-        lo = 1
-    return text[:lo], text[lo:]
-
-
-def _paginate_pre_html(text: str, limit: int = TELE_MSG_LIMIT, header: str = "") -> list[str]:
-    """Paginate plain text as HTML <pre> blocks without splitting entities/tags."""
-    text = str(text or "").strip()
-    header = str(header or "")
-    wrapper_len = len("<pre></pre>")
-    body_limit = max(1, int(limit or TELE_MSG_LIMIT) - len(header) - wrapper_len)
-    pages: list[str] = []
-
-    while text:
-        raw, rest = _take_escaped_prefix(text, body_limit)
-        if rest:
-            # Prefer a clean boundary if it still leaves useful content.
-            for sep in ("\n", " "):
-                cut = raw.rfind(sep)
-                if cut > 0 and len(html.escape(raw[:cut].rstrip())) <= body_limit:
-                    rest = raw[cut:] + rest
-                    raw = raw[:cut].rstrip()
-                    break
-        raw = raw.rstrip()
-        if raw:
-            pages.append(f"{header}<pre>{html.escape(raw)}</pre>")
-        text = rest.lstrip()
-
-    if not pages and header:
-        pages.append(header.rstrip())
-    return pages
-
-
-def _html_safe_cut(text: str, limit: int) -> int:
-    """Pick a cut position that does not land inside an HTML tag or entity."""
-    if len(text) <= limit:
-        return len(text)
-    cut = max(1, min(limit, len(text)))
-
-    # Avoid splitting a tag token such as <code> or </b>.
-    last_lt = text.rfind("<", 0, cut)
-    last_gt = text.rfind(">", 0, cut)
-    if last_lt > last_gt:
-        cut = max(1, last_lt)
-
-    # Avoid splitting an HTML entity such as &amp; or &#123;.
-    last_amp = text.rfind("&", 0, cut)
-    last_semi = text.rfind(";", 0, cut)
-    if last_amp > last_semi and cut - last_amp <= 12:
-        cut = max(1, last_amp)
-
-    # Prefer human-readable boundaries before falling back to a hard safe cut.
-    for sep in ("\n\n", "\n", " "):
-        boundary = text.rfind(sep, 0, cut)
-        if boundary > 0:
-            return boundary
-    return cut
-
-
-def _paginate_html(text: str, limit: int = TELE_MSG_LIMIT, header: str = "") -> list[str]:
-    """Split already-escaped Telegram HTML without cutting through tags.
-
-    This function is intentionally conservative: it first paginates on paragraph
-    and line boundaries, then uses _html_safe_cut only for unusually long blocks.
-    `header` is prepended to every page and included in the limit calculation.
-    """
-    text = str(text or "").strip()
-    header = str(header or "")
-    if not text and not header:
-        return []
-
-    limit = max(1, int(limit or TELE_MSG_LIMIT))
-    body_limit = max(1, limit - len(header))
-    pages: list[str] = []
-    current = ""
-
-    blocks = re.split(r"(\n{2,})", text)
-    for block in blocks:
-        if not block:
-            continue
-        candidate = current + block
-        if len(candidate) <= body_limit:
-            current = candidate
-            continue
-        if current.strip():
-            pages.append(header + current.strip())
-            current = ""
-
-        block = block.lstrip()
-        while len(block) > body_limit:
-            cut = _html_safe_cut(block, body_limit)
-            piece = block[:cut].strip()
-            if piece:
-                pages.append(header + piece)
-            block = block[cut:].lstrip()
-        current = block
-
-    if current.strip():
-        pages.append(header + current.strip())
-    if not pages and header:
-        pages.append(header.rstrip())
-    return [p for p in pages if p]
 
 
 # ---------------------------------------------------------------------------
@@ -12744,84 +12525,16 @@ _TEMP_DIR_CACHE: str | None = None
 _TEMP_DIR_CACHE_LOCK = threading.Lock()
 
 
-def _get_temp_dir() -> str:
-    """Return the bot temp directory, creating it once per process.
+from app.utils.file_io import (
+    cleanup_files as _cleanup,
+    get_temp_dir as _get_temp_dir,
+    make_temp_audio as _make_temp_audio,
+    make_temp_file as _make_temp_file,
+    make_temp_img as _make_temp_img,
+    make_temp_ogg as _make_temp_ogg,
+    sweep_stale_temp_files as _sweep_stale_temps,
+)
 
-    The old implementation called os.makedirs on every temp-file creation.
-    That is safe, but it becomes noisy on high-volume TTS/media workloads.
-    """
-    global _TEMP_DIR_CACHE
-    configured = os.environ.get("BOT_TMP_DIR") or tempfile.gettempdir()
-    temp_dir = os.path.abspath(configured)
-    cached = _TEMP_DIR_CACHE
-    if cached == temp_dir:
-        return cached
-    with _TEMP_DIR_CACHE_LOCK:
-        if _TEMP_DIR_CACHE != temp_dir:
-            os.makedirs(temp_dir, exist_ok=True)
-            _TEMP_DIR_CACHE = temp_dir
-        return _TEMP_DIR_CACHE
-
-
-def _make_temp_file(suffix: str) -> str:
-    temp_dir = _get_temp_dir()
-    fd, path = tempfile.mkstemp(suffix=suffix, prefix=_TMP_PREFIX, dir=temp_dir)
-    os.close(fd)
-    return path
-
-
-def _make_temp_ogg()                          -> str: return _make_temp_file(".ogg")
-def _make_temp_audio(suffix: str = ".mp3")    -> str: return _make_temp_file(suffix if suffix.startswith(".") else f".{suffix}")
-def _make_temp_img(suffix: str = ".jpg")      -> str: return _make_temp_file(suffix if suffix.startswith(".") else f".{suffix}")
-
-
-def _cleanup(*paths) -> None:
-    """Remove one or more temp files, silencing errors."""
-    for p in paths:
-        if not p:
-            continue
-        try:
-            if os.path.exists(p):
-                os.remove(p)
-        except OSError as e:
-            logger.warning(f"Temp cleanup failed for {p}: {e}")
-
-
-_STALE_TEMP_AGE_S = 7200
-_STALE_TEMP_EXTENSIONS = frozenset({
-    ".ogg", ".jpg", ".jpeg", ".png", ".webp",
-    ".mp3", ".wav", ".mp4", ".m4a", ".flac", ".aac", ".opus", ".webm",
-})
-
-
-def _sweep_stale_temps() -> None:
-    """Delete old bot temp files using one directory scan.
-
-    This replaces one glob pass per extension with os.scandir(), reducing
-    filesystem work when the temp directory contains many files.
-    """
-    temp_dir = _get_temp_dir()
-    now = time.time()
-    try:
-        entries = list(os.scandir(temp_dir))
-    except OSError as exc:
-        logger.warning("Temp sweep could not scan %s: %s", temp_dir, exc)
-        return
-
-    for entry in entries:
-        try:
-            if not entry.is_file():
-                continue
-            name = entry.name
-            if not name.startswith(_TMP_PREFIX):
-                continue
-            if os.path.splitext(name.lower())[1] not in _STALE_TEMP_EXTENSIONS:
-                continue
-            if now - entry.stat().st_mtime > _STALE_TEMP_AGE_S:
-                os.remove(entry.path)
-                logger.info("Swept stale temp file: %s", entry.path)
-        except OSError:
-            pass
 
 
 async def _periodic_temp_sweep(stop_event: asyncio.Event) -> None:
@@ -16948,16 +16661,8 @@ def _detect_voice(text: str, gender: str) -> str:
     voices = VOICE_MAP.get(_detect_tts_lang_key(text)) or VOICE_MAP["en"]
     return voices.get(gender) or voices.get("female") or VOICE_MAP["en"]["female"]
 
+_clean_tts_text_for_edge = clean_tts_text
 
-def _clean_tts_text_for_edge(text: str) -> str:
-    """Remove hidden and control characters without rewriting user content."""
-    text = (text or "")
-    for ch in ("\ufeff", "\u200b", "\u200c", "\u200d"):
-        text = text.replace(ch, "")
-    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text)
-    text = re.sub(r"[ \t\r\f\v]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
 
 
 def _tts_voice_candidates(text: str, gender: str) -> list[str]:
@@ -17787,7 +17492,7 @@ async def _convert_audio_files_to_telegram_voice(
         "-application", "voip",
         "-b:a", "32k",
         "-vbr", "on",
-        "-compression_level", "10",
+        "-compression_level", "7",
         "-f", "ogg",
         output_path,
     ]
@@ -17896,7 +17601,7 @@ async def _convert_uploaded_audio_to_telegram_voice(input_path: str, output_path
         "-application", "voip",
         "-b:a", "32k",
         "-vbr", "on",
-        "-compression_level", "10",
+        "-compression_level", "7",
         "-f", "ogg",
         output_path,
     ]
@@ -18954,10 +18659,26 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
 
     speed_key = _rounded_speed(speed)
     af        = _build_atempo_chain(speed_key) if abs(speed_key - DEFAULT_SPEED) > 1e-4 else None
-    cmd       = [_FFMPEG_EXE, "-y", "-f", "mp3", "-i", "pipe:0"]
+    cmd       = [
+        _FFMPEG_EXE,
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+        "-f", "mp3",
+        "-i", "pipe:0",
+    ]
     if af:
         cmd += ["-filter:a", af]
-    cmd += ["-c:a", "libopus", "-b:a", "32k", output_path]
+    cmd += [
+        "-c:a", "libopus",
+        "-b:a", "32k",
+        "-vbr", "on",
+        "-application", "voip",
+        "-compression_level", "7",
+        "-frame_duration", "20",
+        "-f", "ogg",
+        "pipe:1",
+    ]
 
     proc: asyncio.subprocess.Process | None = None
     timeout_s = float(FFMPEG_CONVERT_TIMEOUT_S)
@@ -18966,13 +18687,16 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
             asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             ),
             timeout=FFMPEG_START_TIMEOUT_S,
         )
         timeout_s = _ffmpeg_tts_timeout_s(chunk_count=len(text_chunks), input_bytes=len(mp3_data))
-        _, stderr_data = await asyncio.wait_for(proc.communicate(input=mp3_data), timeout=timeout_s)
+        stdout_data, stderr_data = await asyncio.wait_for(
+            proc.communicate(input=mp3_data),
+            timeout=timeout_s,
+        )
     except FileNotFoundError as exc:
         _cleanup(output_path)
         raise RuntimeError(f"FFmpeg executable not found: {_FFMPEG_EXE}") from exc
@@ -18981,23 +18705,15 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
         await _terminate_subprocess(proc, "Edge TTS FFmpeg")
         raise RuntimeError(f"FFmpeg timed out after {timeout_s:.0f}s")
 
-    if proc.returncode != 0:
+    if proc.returncode != 0 or not stdout_data:
         _cleanup(output_path)
         snippet = (stderr_data or b"").decode(errors="replace")[-400:]
         raise RuntimeError(f"FFmpeg failed (code {proc.returncode}): {snippet}")
 
-    try:
-        audio_bytes = await asyncio.wait_for(
-            _read_file_bytes_async(output_path),
-            timeout=10,
-        )
-    except asyncio.TimeoutError:
-        _cleanup(output_path)
-        raise RuntimeError("Timed out reading output audio file")
-    except OSError as e:
-        _cleanup(output_path)
-        raise RuntimeError(f"Failed to read output audio file: {e}") from e
-    return audio_bytes
+    if output_path:
+        with suppress(Exception):
+            await asyncio.to_thread(_write_cached_audio_to_path, output_path, stdout_data)
+    return stdout_data
 
 
 async def generate_voice(text: str, gender: str, speed: float, output_path: str, tts_model: str = "auto") -> bytes:
@@ -19092,20 +18808,8 @@ async def generate_voice_limited(text: str, gender: str, speed: float, output_pa
 # ---------------------------------------------------------------------------
 # Gemini transcription helpers
 # ---------------------------------------------------------------------------
-def _is_retryable_gemini_error(exc: BaseException | str) -> bool:
-    msg = str(exc).lower()
-    return any(token in msg for token in (
-        "429",
-        "500",
-        "502",
-        "503",
-        "504",
-        "unavailable",
-        "high demand",
-        "resource exhausted",
-        "temporarily overloaded",
-        "service unavailable",
-    ))
+_is_retryable_gemini_error = is_retryable_gemini_error
+
 
 
 async def _gemini_generate_with_retry(
@@ -19262,23 +18966,10 @@ def _split_text_chunks(text: str, max_chars: int = TTS_CHUNK_CHARS) -> list[str]
 
 
 # ---------------------------------------------------------------------------
-# Detect image MIME type from magic bytes
-# ---------------------------------------------------------------------------
-def _detect_image_mime(path: str) -> str:
-    try:
-        with open(path, "rb") as f:
-            header = f.read(12)
-        if header[:8] == b"\x89PNG\r\n\x1a\n":
-            return "image/png"
-        if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
-            return "image/webp"
-        if header[:2] == b"\xff\xd8":
-            return "image/jpeg"
-        if header[:6] in (b"GIF87a", b"GIF89a"):
-            return "image/gif"
-    except Exception:
-        pass
-    return "image/jpeg"
+from app.services.ai.gemini import detect_image_mime, is_retryable_gemini_error
+
+_detect_image_mime = detect_image_mime
+
 
 
 # ---------------------------------------------------------------------------
@@ -19606,16 +19297,12 @@ def get_broadcast_sent_delete_confirm_kb(delete_job_id: str) -> InlineKeyboardMa
     ])
 
 
-def _broadcast_template_safe_id(value: Any) -> str:
-    text = str(value or "").strip().lower()
-    return text if re.fullmatch(r"[a-f0-9]{8,16}", text) else ""
+from app.services.broadcast import (
+    broadcast_template_fingerprint as _broadcast_template_fingerprint,
+    broadcast_template_safe_id as _broadcast_template_safe_id,
+    broadcast_template_safe_int as _broadcast_template_safe_int,
+)
 
-
-def _broadcast_template_safe_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return int(default)
 
 
 def _broadcast_template_content(payload: dict) -> str:
@@ -19664,16 +19351,6 @@ def _broadcast_template_payload_from_template(tpl: dict) -> dict:
     }
 
 
-def _broadcast_template_fingerprint(payload: dict) -> str:
-    clean = {
-        "photo_file_id": str(payload.get("photo_file_id") or ""),
-        "caption": str(payload.get("caption") or ""),
-        "text": str(payload.get("text") or ""),
-        "parse_mode": _broadcast_normalize_parse_mode(payload.get("parse_mode") or _BROADCAST_PARSE_MODE_AUTO),
-        "link_preview": _broadcast_normalize_link_preview(payload.get("link_preview"), True),
-    }
-    raw = _json.dumps(clean, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def _broadcast_template_normalize(tpl: dict, *, fallback_id: str | None = None) -> dict | None:
@@ -25451,6 +25128,25 @@ async def _delete_user_personal_data(user_id: int) -> None:
     db_history_clear(user_id)
     _invalidate_prefs(user_id)
 
+    with suppress(Exception):
+        from app.services.tts import clear_user_tts_history
+        clear_user_tts_history(user_id)
+    with suppress(Exception):
+        with _user_locks_guard:
+            _user_locks.pop(user_id, None)
+    with suppress(Exception):
+        _user_cooldowns.pop(user_id, None)
+    with suppress(Exception):
+        _pending_broadcast.pop(user_id, None)
+    with suppress(Exception):
+        _sched_payload.pop(user_id, None)
+    with suppress(Exception):
+        _admin_chat_target.pop(user_id, None)
+        _user_admin_target.pop(user_id, None)
+    with suppress(Exception):
+        with _VOXCPM2_PROFILE_MEMORY_LOCK:
+            _VOXCPM2_PROFILE_MEMORY.pop(user_id, None)
+
     def _run():
         with suppress(Exception):
             _hist_cache_clear(user_id)
@@ -25459,6 +25155,7 @@ async def _delete_user_personal_data(user_id: int) -> None:
                 _redis_delete_sync(_prefs_redis_key(user_id))
                 _redis_delete_sync(_hist_redis_key(user_id))
                 _redis_delete_sync(_text_cache_user_history_redis_key(user_id))
+                _redis_delete_sync(_voxcpm2_profile_redis_key(user_id))
         if supabase:
             db_call_sync(
                 f"user_prefs_delete:{user_id}",
@@ -25483,6 +25180,7 @@ async def _delete_user_personal_data(user_id: int) -> None:
             )
 
     await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, _run)
+
 
 
 async def cmd_delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):

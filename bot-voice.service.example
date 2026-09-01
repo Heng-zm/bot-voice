@@ -1,0 +1,21 @@
+[Unit]
+Description=Bot Voice Telegram Daemon
+After=network.target
+
+[Service]
+Type=simple
+# Replace 'appuser' with your Linux username
+User=appuser
+Group=appuser
+# Replace '/opt/bot-voice' with your deployment directory
+WorkingDirectory=/opt/bot-voice
+EnvironmentFile=/opt/bot-voice/.env
+ExecStart=/opt/bot-voice/.venv/bin/python -m app.main
+Restart=always
+RestartSec=5
+# Output logs to journalctl
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

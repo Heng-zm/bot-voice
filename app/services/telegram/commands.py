@@ -116,6 +116,8 @@ async def cmd_delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode="HTML",
         ))
         return
+    if getattr(context, "user_data", None) is not None:
+        context.user_data.clear()
     await _delete_user_personal_data(int(user.id))
     await safe_send(lambda: update.effective_message.reply_text(
         '✅ បានសម្អាតប្រវត្តិបូត Cache អត្ថបទ និងចំណូលចិត្តរបស់អ្នក។\nសម្គាល់៖ កំណត់ត្រាបិទសិទ្ធិសុវត្ថិភាព និងកំណត់ហេតុការផ្ញើ/សវនកម្មចាំបាច់ អាចត្រូវរក្សាទុកដោយអ្នកគ្រប់គ្រង ដើម្បីការពារការប្រើប្រាស់ខុសគោលបំណង។'
