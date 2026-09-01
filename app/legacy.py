@@ -19,6 +19,8 @@ import socket
 import subprocess
 import atexit
 import base64
+import httpx
+
 try:
     import imageio_ffmpeg as _iio_ffmpeg
 except Exception:
