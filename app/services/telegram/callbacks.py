@@ -774,8 +774,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action == "welcome_profile":
             from app.services.telegram.commands import send_user_profile
-
-            await send_user_profile(query.message, user_id)
+            user = update.effective_user or getattr(query, "from_user", None)
+            await send_user_profile(query.message, user_id, user=user)
         elif action == "welcome_back":
             with suppress(Exception):
                 await query.message.delete()
@@ -817,9 +817,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as exc:
         _metric_inc("errors")
         logger.error("on_callback failed action=%s data=%r: %s", action, data, exc, exc_info=True)
-        await safe_send(lambda: query.message.reply_text(
-            "⚠️ Something went wrong while processing this button. Please try again."
-        ))
+        if query.message:
+            await safe_send(lambda: query.message.reply_text(
+                "⚠️ Something went wrong while processing this button. Please try again."
+            ))
 
 
 __all__ = [

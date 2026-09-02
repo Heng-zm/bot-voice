@@ -78,3 +78,15 @@ def legacy_bound_handler(func: _F) -> _F:
     wrapped.__telegram_extracted_handler__ = True
     wrapped.__legacy_dependencies__ = dependency_names
     return wrapped  # type: ignore[return-value]
+
+
+async def safe_send(coro_factory: Any, retries: int = 3, delay: float = 2.0) -> Any:
+    """Safe sender wrapper bridging to legacy safe_send with retries."""
+    legacy = legacy_module()
+    func = getattr(legacy, "safe_send", None)
+    if func is not None:
+        return await func(coro_factory, retries=retries, delay=delay)
+    return await coro_factory()
+
+
+__all__ = ["legacy_bound_handler", "safe_send"]

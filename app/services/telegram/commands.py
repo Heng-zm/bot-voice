@@ -7,7 +7,7 @@ from __future__ import annotations
 
 # Transitional V4.1 modules bind remaining legacy helpers at runtime.
 # ruff: noqa: F821
-from app.services.telegram._legacy_runtime import legacy_bound_handler
+from app.services.telegram._legacy_runtime import legacy_bound_handler, safe_send
 from app.services.telegram.security import is_user_blocked
 
 
@@ -51,7 +51,6 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "💬 <i>ផ្ញើសារ ឬសំណួររបស់អ្នកមកឥឡូវនេះបាន!</i>"
     )
-    from app.services.telegram._legacy_runtime import safe_send
     from telegram import InlineKeyboardMarkup, InlineKeyboardButton
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⚙️ ការកំណត់ / Settings", callback_data="welcome_profile"),
@@ -65,19 +64,16 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @legacy_bound_handler
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Directly ask Gemini AI a question and hear the answer in voice."""
-    msg = update.message
+    msg = update.effective_message
     if not msg: return
-    text = msg.text.replace("/ask", "").strip()
+    text = (msg.text or "").replace("/ask", "").strip()
     if not text:
-        from app.services.telegram._legacy_runtime import safe_send
         await safe_send(lambda: msg.reply_text("💡 សូមសរសេរសំណួររបស់អ្នកតាមក្រោយ /ask (ឧ. /ask តើ AI គឺជាអ្វី?)"))
         return
     from app import legacy
     if getattr(legacy, "_gemini", None) is None:
-        from app.services.telegram._legacy_runtime import safe_send
         await safe_send(lambda: msg.reply_text("❌ Gemini API មិនទាន់បានបើកទេ។"))
         return
-    from app.services.telegram._legacy_runtime import safe_send
     await safe_send(lambda: msg.reply_chat_action("typing"))
     try:
         import asyncio
@@ -96,26 +92,22 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from app.services.telegram.media import process_tts_for_text
         await process_tts_for_text(update, context, ai_text, update.effective_user.id)
     except Exception as exc:
-        from app.services.telegram._legacy_runtime import safe_send
         await safe_send(lambda: msg.reply_text(f"❌ បរាជ័យ: {exc}"))
 
 
 @legacy_bound_handler
 async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Translate text to Khmer and hear it out loud."""
-    msg = update.message
+    msg = update.effective_message
     if not msg: return
-    text = msg.text.replace("/translate", "").strip()
+    text = (msg.text or "").replace("/translate", "").strip()
     if not text:
-        from app.services.telegram._legacy_runtime import safe_send
         await safe_send(lambda: msg.reply_text("💡 សូមបញ្ចូលអត្ថបទដើម្បីបកប្រែ (ឧ. /translate Hello world)"))
         return
     from app import legacy
     if getattr(legacy, "_gemini", None) is None:
-        from app.services.telegram._legacy_runtime import safe_send
         await safe_send(lambda: msg.reply_text("❌ Gemini API មិនទាន់បានបើកទេ។"))
         return
-    from app.services.telegram._legacy_runtime import safe_send
     await safe_send(lambda: msg.reply_chat_action("typing"))
     try:
         import asyncio
@@ -130,26 +122,22 @@ async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from app.services.telegram.media import process_tts_for_text
         await process_tts_for_text(update, context, khmer_text, update.effective_user.id)
     except Exception as exc:
-        from app.services.telegram._legacy_runtime import safe_send
         await safe_send(lambda: msg.reply_text(f"❌ បរាជ័យ: {exc}"))
 
 
 @legacy_bound_handler
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Summarize long text into bullet points and hear them out loud."""
-    msg = update.message
+    msg = update.effective_message
     if not msg: return
-    text = msg.text.replace("/summary", "").strip()
+    text = (msg.text or "").replace("/summary", "").strip()
     if not text:
-        from app.services.telegram._legacy_runtime import safe_send
         await safe_send(lambda: msg.reply_text("💡 សូមបញ្ចូលអត្ថបទវែងៗដើម្បីសង្ខេប (ឧ. /summary ...អត្ថបទ...)"))
         return
     from app import legacy
     if getattr(legacy, "_gemini", None) is None:
-        from app.services.telegram._legacy_runtime import safe_send
         await safe_send(lambda: msg.reply_text("❌ Gemini API មិនទាន់បានបើកទេ។"))
         return
-    from app.services.telegram._legacy_runtime import safe_send
     await safe_send(lambda: msg.reply_chat_action("typing"))
     try:
         import asyncio
@@ -164,30 +152,46 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from app.services.telegram.media import process_tts_for_text
         await process_tts_for_text(update, context, summary_text, update.effective_user.id)
     except Exception as exc:
-        from app.services.telegram._legacy_runtime import safe_send
         await safe_send(lambda: msg.reply_text(f"❌ បរាជ័យ: {exc}"))
 
 
 @legacy_bound_handler
-async def send_user_profile(message, user_id: int):
+async def send_user_profile(message, user_id: int, user: Any = None):
     prefs = await get_user_prefs_async(user_id)
-    gender_label = "👩 សំឡេងស្រី (Female)" if prefs["gender"] == "female" else "👨 សំឡេងប្រុស (Male)"
+    
+    # Extract user display name & username
+    first_name = getattr(user, "first_name", None) or prefs.get("first_name") or ""
+    last_name = getattr(user, "last_name", None) or ""
+    full_name = f"{first_name} {last_name}".strip() or first_name or "អ្នកប្រើប្រាស់ (User)"
+    username = getattr(user, "username", None) or prefs.get("username") or ""
+    username_line = f"\n🔗 <b>Username:</b> @{html.escape(username)}" if username else ""
+
+    gender_label = "👩 សំឡេងស្រី (Female)" if prefs.get("gender") == "female" else "👨 សំឡេងប្រុស (Male)"
     speed_label = next(
-        (lbl for _, (lbl, val) in SPEED_OPTIONS.items() if abs(val - prefs["speed"]) < 0.01),
-        f"{prefs['speed']}x",
+        (lbl for _, (lbl, val) in SPEED_OPTIONS.items() if abs(val - prefs.get("speed", 1.0)) < 0.01),
+        f"{prefs.get('speed', 1.0)}x",
     )
     model_label = _tts_model_label(prefs.get("tts_model", "auto"))
-    await safe_send(lambda: message.reply_text(
+    
+    text = (
         f"⚙️ <b>កម្រងព័ត៌មាន & ការកំណត់សំឡេងរបស់អ្នក</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>ឈ្មោះ:</b> <b>{html.escape(full_name)}</b>\n"
+        f"🆔 <b>User ID:</b> <code>{user_id}</code>"
+        f"{username_line}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🗣️ <b>ប្រភេទសំឡេង:</b> <b>{gender_label}</b>\n"
         f"🎚️ <b>ល្បឿនអាន:</b> <code>{speed_label}</code>\n"
         f"🤖 <b>ម៉ូដែល TTS:</b> <b>{html.escape(model_label)}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💡 <i>ចុចប៊ូតុងខាងក្រោមដើម្បីកែប្រែការកំណត់បានភ្លាមៗ៖</i>",
+        f"💡 <i>ចុចប៊ូតុងខាងក្រោមដើម្បីកែប្រែការកំណត់បានភ្លាមៗ៖</i>"
+    )
+
+    await safe_send(lambda: message.reply_text(
+        text,
         parse_mode="HTML",
         reply_markup=get_main_kb(
-            prefs["gender"],
+            prefs.get("gender", "female"),
             prefs.get("tts_model", "auto"),
             include_back=True,
         ),
@@ -196,7 +200,11 @@ async def send_user_profile(message, user_id: int):
 
 @legacy_bound_handler
 async def cmd_myprefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_user_profile(update.message, update.effective_user.id)
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    await send_user_profile(msg, user.id, user=user)
 
 
 @legacy_bound_handler
@@ -275,7 +283,8 @@ async def cmd_delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = update.effective_user
     if not user or not update.effective_message:
         return
-    if _is_admin(int(user.id)) and "--confirm-admin" not in context.args:
+    args = context.args or []
+    if _is_admin(int(user.id)) and "--confirm-admin" not in args:
         await safe_send(lambda: update.effective_message.reply_text(
             '⚠️ បានរកឃើញគណនីអ្នកគ្រប់គ្រង។ ដើម្បីលុបទិន្នន័យអ្នកប្រើប្រាស់របស់ខ្លួន សូមប្រើ៖\n<code>/deleteme --confirm-admin</code>',
             parse_mode="HTML",
@@ -291,9 +300,13 @@ async def cmd_delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 @legacy_bound_handler
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _pending_broadcast.pop(update.effective_user.id, None)
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    _pending_broadcast.pop(user.id, None)
     context.user_data["bc_state"] = BROADCAST_WAIT_MESSAGE
-    await safe_send(lambda: update.message.reply_text(
+    await safe_send(lambda: msg.reply_text(
         '🛡️ <b>សុវត្ថិភាពការផ្សាយសារ V2</b>\n\n📨 <b>របៀបប្រើ</b>\n• ផ្ញើ <b>អត្ថបទ</b> ឬ <b>រូបភាព + ចំណងជើង</b> ដែលចង់ផ្សាយ\n• បូតនឹងបង្ហាញសារមើលជាមុនចុងក្រោយ មុនពេលផ្ញើពិត\n• គាំទ្រទម្រង់សារ Telegram, HTML, MarkdownV2, Markdown និងអត្ថបទធម្មតា\n• ដើម្បីបង្ខំទម្រង់ សូមដាក់ <code>::html</code>, <code>::mdv2</code>, <code>::md</code> ឬ <code>::plain</code> នៅជួរទី១\n\n🔐 <b>ការការពារ</b>\n✅ បញ្ជាក់សារមើលជាមុន មុនពេលផ្ញើ\n✅ រំលងអ្នកប្រើប្រាស់ដែលបានបិទបូត ឬមិនអាចទាក់ទងបាន\n✅ គ្រប់គ្រងល្បឿនផ្ញើ និង RetryAfter\n\nវាយ /cancel ដើម្បីបោះបង់។',
         parse_mode="HTML",
         reply_markup=get_broadcast_entry_kb(),
@@ -302,10 +315,14 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @legacy_bound_handler
 async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_id = update.effective_user.id
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    admin_id = user.id
     _sched_payload.pop(admin_id, None)
     context.user_data["sched_state"] = SCHED_WAIT_MSG
-    await safe_send(lambda: update.message.reply_text(
+    await safe_send(lambda: msg.reply_text(
         '📅 <b>ការផ្សាយតាមកាលវិភាគ</b>\n\nសូមផ្ញើ <b>សារ</b> ឬ <b>រូបភាព + ចំណងជើង</b> ដែលចង់កំណត់ពេលផ្ញើ។\n✅ គាំទ្រទម្រង់ដើមរបស់ Telegram, HTML, MarkdownV2, Markdown និងអត្ថបទធម្មតា។\nដើម្បីបង្ខំទម្រង់ សូមដាក់ <code>::html</code>, <code>::mdv2</code>, <code>::md</code> ឬ <code>::plain</code> នៅជួរទី១។\n\nវាយ /cancel ដើម្បីបោះបង់។',
         parse_mode="HTML",
     ))
@@ -313,13 +330,17 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @legacy_bound_handler
 async def cmd_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_id = update.effective_user.id
-    loop     = asyncio.get_running_loop()
-    rows     = await loop.run_in_executor(_DB_EXECUTOR, db_sched_fetch_admin_pending, admin_id)
-    if not rows:
-        await safe_send(lambda: update.message.reply_text('📭 មិនមានការផ្សាយតាមកាលវិភាគទេ។'))
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
         return
-    await safe_send(lambda: update.message.reply_text(
+    admin_id = user.id
+    loop = asyncio.get_running_loop()
+    rows = await loop.run_in_executor(_DB_EXECUTOR, db_sched_fetch_admin_pending, admin_id)
+    if not rows:
+        await safe_send(lambda: msg.reply_text('📭 មិនមានការផ្សាយតាមកាលវិភាគទេ។'))
+        return
+    await safe_send(lambda: msg.reply_text(
         f'📋 <b>ការផ្សាយតាមកាលវិភាគ ({len(rows)} កំពុងរង់ចាំ)</b>\nចុចលើកាលវិភាគ ដើម្បីមើលព័ត៌មានលម្អិត ឬបោះបង់។',
         parse_mode="HTML",
         reply_markup=get_schedules_list_kb(rows, page=0),
@@ -328,41 +349,49 @@ async def cmd_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @legacy_bound_handler
 async def cmd_cancelschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_id = update.effective_user.id
-    args     = context.args or []
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    admin_id = user.id
+    args = context.args or []
     if not args or not args[0].isdigit():
-        await safe_send(lambda: update.message.reply_text(
+        await safe_send(lambda: msg.reply_text(
             '❌ របៀបប្រើ៖ /cancelschedule &lt;id&gt;\nឬប្រើ /schedules ដើម្បីជ្រើស។',
             parse_mode="HTML",
         ))
         return
     row_id = int(args[0])
-    loop   = asyncio.get_running_loop()
-    row    = await loop.run_in_executor(_DB_EXECUTOR, db_sched_fetch_one, row_id)
+    loop = asyncio.get_running_loop()
+    row = await loop.run_in_executor(_DB_EXECUTOR, db_sched_fetch_one, row_id)
     if not row:
-        await safe_send(lambda: update.message.reply_text(f"❌ រកមិនឃើញ Schedule #{row_id}។"))
+        await safe_send(lambda: msg.reply_text(f"❌ រកមិនឃើញ Schedule #{row_id}។"))
         return
     if row["admin_id"] != admin_id:
-        await safe_send(lambda: update.message.reply_text("⛔ Schedule នេះមិនមែនជារបស់អ្នកទេ។"))
+        await safe_send(lambda: msg.reply_text("⛔ Schedule នេះមិនមែនជារបស់អ្នកទេ។"))
         return
     if row["status"] != "pending":
         st = row["status"]
-        await safe_send(lambda: update.message.reply_text(
+        await safe_send(lambda: msg.reply_text(
             f"⚠️ Schedule #{row_id} មានស្ថានភាព <b>{st}</b> — មិនអាច cancel ។",
             parse_mode="HTML",
         ))
         return
     await loop.run_in_executor(_DB_EXECUTOR, db_sched_set_status, row_id, "cancelled")
-    await safe_send(lambda: update.message.reply_text(
+    await safe_send(lambda: msg.reply_text(
         f'✅ កាលវិភាគ <b>#{row_id}</b> បានបោះបង់។', parse_mode="HTML"
     ))
 
 
 @legacy_bound_handler
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    uid = user.id
     if not _is_admin(uid):
-        await safe_send(lambda: update.message.reply_text('ℹ️ មិនមានប្រតិបត្តិការដែលត្រូវបោះបង់ទេ។'))
+        await safe_send(lambda: msg.reply_text('ℹ️ មិនមានប្រតិបត្តិការដែលត្រូវបោះបង់ទេ។'))
         return
 
     # Preserve the old admin-chat notification behavior while still using the
@@ -380,14 +409,14 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if cleared:
         labels = ", ".join(cleared[:8])
-        await safe_send(lambda: update.message.reply_text(
+        await safe_send(lambda: msg.reply_text(
             f"✅ បានបោះបង់/សម្អាត state រួច: <code>{html.escape(labels)}</code>",
             parse_mode="HTML",
             reply_markup=get_admin_dashboard_kb(),
         ))
         return
 
-    await safe_send(lambda: update.message.reply_text('ℹ️ មិនមានប្រតិបត្តិការដែលត្រូវបោះបង់ទេ។'))
+    await safe_send(lambda: msg.reply_text('ℹ️ មិនមានប្រតិបត្តិការដែលត្រូវបោះបង់ទេ។'))
 
 
 @legacy_bound_handler
@@ -555,6 +584,31 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if arg in {"runtime", "run"}:
         await safe_send(lambda: msg.reply_text(_runtime_admin_text(), parse_mode="HTML", reply_markup=get_runtime_admin_kb(), disable_web_page_preview=True))
+        return
+    if arg in {"geminiaudio", "gemini_audio", "gemini_audio_model", "geminimodel"}:
+        args = context.args or []
+        if len(args) > 1:
+            new_model = args[1].strip()
+            from app import legacy
+            await legacy._update_run_state("GEMINI_AUDIO_MODEL", new_model, persist=True)
+            await safe_send(lambda: msg.reply_text(
+                f"✅ <b>បានប្តូរ Gemini Audio TTS Model ជោគជ័យ!</b>\n\n"
+                f"🤖 <b>Active Model:</b> <code>{html.escape(new_model)}</code>\n"
+                f"💾 <i>បានរក្សាទុកក្នុង Supabase & Redis រួចរាល់។</i>",
+                parse_mode="HTML"
+            ))
+            return
+        from app import legacy
+        current = legacy._run_state_gemini_audio_model()
+        await safe_send(lambda: msg.reply_text(
+            f"🎙️ <b>ការកំណត់ម៉ូដែល Gemini Audio TTS</b>\n\n"
+            f"🤖 <b>ម៉ូដែលបច្ចុប្បន្ន:</b> <code>{html.escape(current)}</code>\n\n"
+            f"💡 <b>របៀបប្តូរម៉ូដែលថ្មី:</b>\n"
+            f"• <code>/admin geminiaudio gemini-2.5-flash-preview-tts</code>\n"
+            f"• <code>/admin geminiaudio gemini-2.5-pro-preview-tts</code>\n"
+            f"• <code>/admin geminiaudio gemini-3.1-flash-tts-preview</code>",
+            parse_mode="HTML"
+        ))
         return
 
     text = await _admin_home_text(user_id)

@@ -59,6 +59,11 @@ def get_detected_webhook_url() -> str:
 async def auto_setup_webhook(app_url: str) -> bool:
     """Automatically register the captured webhook URL with Telegram."""
     global _DETECTED_WEBHOOK_URL
+    bot_mode = os.environ.get("BOT_MODE", "").strip().upper()
+    if bot_mode == "POLLING":
+        logger.info("auto_setup_webhook aborted because BOT_MODE=POLLING.")
+        return False
+
     clean_url = app_url.rstrip("/")
     if not clean_url.startswith("https://"):
         return False

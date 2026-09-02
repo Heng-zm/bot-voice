@@ -9064,6 +9064,7 @@ ACTIVE_POLLING_TASK: asyncio.Task | None = None
 _RUNTIME_STATE_RESTORED_FROM_STORE = False
 _RUN_STATE_PERSISTED_KEYS = (
     "BOT_MODE",
+    "GEMINI_AUDIO_MODEL",
     "TELEGRAM_WEBHOOK_URL",
     "TELEGRAM_WEBHOOK_SECRET_TOKEN",
     "HTTP_MAX_CONNECTIONS",
@@ -9098,6 +9099,7 @@ _RUN_STATE_PERSISTED_KEYS = (
 
 _RUNTIME_CONFIG_SPECS: OrderedDict[str, dict[str, Any]] = OrderedDict([
     ("BOT_MODE", {"kind": "mode", "label": "Bot mode", "help": "POLLING for one node; WEBHOOK for scalable deployment."}),
+    ("GEMINI_AUDIO_MODEL", {"kind": "str", "label": "Gemini Audio Model", "help": "Active Gemini Audio TTS model (e.g. gemini-2.5-flash-preview-tts, gemini-2.5-pro-preview-tts, gemini-3.1-flash-tts-preview)."}),
     ("TELEGRAM_WEBHOOK_URL", {"kind": "url", "label": "Webhook base URL", "help": "Public HTTPS base URL only. Do not include /tg-webhook-..."}),
     ("TELEGRAM_WEBHOOK_SECRET_TOKEN", {"kind": "secret", "label": "Webhook secret", "help": "Rotatable secret used in the webhook path and Telegram secret header."}),
     ("USER_RATE_LIMIT_PER_SECOND", {"kind": "int", "min": 1, "max": 100, "label": "User rate limit / second", "help": "Anti-flood limit per chat/user."}),
@@ -9143,6 +9145,11 @@ def _run_state_bot_mode() -> str:
     if bool(webhook_url):
         return "WEBHOOK"
     return "POLLING"
+
+
+def _run_state_gemini_audio_model() -> str:
+    val = str(RUN_STATE.get("GEMINI_AUDIO_MODEL", globals().get("GEMINI_AUDIO_MODEL", "gemini-2.5-flash-preview-tts")) or "gemini-2.5-flash-preview-tts").strip()
+    return val or "gemini-2.5-flash-preview-tts"
 
 
 
@@ -9493,14 +9500,31 @@ async def _telegram_polling_task_guard(app_obj: Any) -> None:
 
     python-telegram-bot owns the actual getUpdates worker internally after
     updater.start_polling(); this task gives the runtime controller a single
-    cancellable handle and exits if BOT_MODE changes away from POLLING.
+    cancellable handle, exits if BOT_MODE changes away from POLLING, and
+    continuously auto-heals any 409 Conflict caused by remote setWebhook requests.
     """
+    check_interval = 0
     try:
         while True:
             if _run_state_bot_mode() != "POLLING":
                 webhook_logger.info("Polling guard detected BOT_MODE=%s; stopping updater to prevent 409 conflicts.", _run_state_bot_mode())
                 await _telegram_stop_polling_runtime(app_obj, cancel_task=False)
                 break
+
+            # Self-healing: every 5 seconds, ensure no rogue webhook is active on Telegram servers
+            check_interval += 1
+            if check_interval >= 5:
+                check_interval = 0
+                try:
+                    wb = await app_obj.bot.get_webhook_info()
+                    if wb and getattr(wb, "url", None):
+                        webhook_logger.warning("Polling guard detected active webhook '%s'; auto-deleting to heal 409 polling conflict!", wb.url)
+                        await app_obj.bot.delete_webhook(drop_pending_updates=False)
+                        # Grace sleep after deleting webhook to let Telegram reset update loop
+                        await asyncio.sleep(1.0)
+                except Exception as chk_exc:
+                    webhook_logger.debug("Polling guard webhook check suppressed: %s", chk_exc)
+
             await asyncio.sleep(1.0)
     except asyncio.CancelledError:
         webhook_logger.info("Polling guard task cancelled.")
@@ -9964,11 +9988,13 @@ ADMIN_IDS:  set[int]    = set()
 # still override them with env variables, but a missing OCR_PROVIDER,
 # OCR_AUTO_PREFER_PROVIDER, or GEMINI_MODEL now boots with Gemini OCR selected.
 DEFAULT_GEMINI_MODEL             = "gemini-2.5-flash"  # change this one line if you want another default Gemini model
+DEFAULT_GEMINI_AUDIO_MODEL       = "gemini-2.5-flash-preview-tts"  # default Gemini TTS audio model
 DEFAULT_AI_PROVIDER              = "gemini"            # gemini | hf
 DEFAULT_OCR_PROVIDER             = "gemini"            # gemini | auto | hf
 DEFAULT_OCR_AUTO_PREFER_PROVIDER = "gemini"            # gemini | hf
 
 GEMINI_MODEL            = DEFAULT_GEMINI_MODEL
+GEMINI_AUDIO_MODEL      = (os.environ.get("GEMINI_AUDIO_MODEL") or DEFAULT_GEMINI_AUDIO_MODEL).strip() or DEFAULT_GEMINI_AUDIO_MODEL
 HF_TOKEN                = ""
 HF_MODEL                = "Qwen/Qwen2.5-7B-Instruct"
 HF_OCR_MODEL            = "microsoft/trocr-base-printed"
@@ -13035,6 +13061,22 @@ def update_user_tts_model(user_id: int, tts_model: str) -> str:
             supabase.table("user_prefs").upsert(payload, on_conflict="user_id").execute()
             _set_tts_model_column_status(True)
         except Exception as exc:
+            err_str = str(exc)
+            if "user_prefs_tts_model_check" in err_str:
+                try:
+                    fallback_payload = dict(payload)
+                    fallback_payload["tts_model"] = "auto"
+                    supabase.table("user_prefs").upsert(fallback_payload, on_conflict="user_id").execute()
+                    _log_once(
+                        logging.INFO,
+                        "tts_model_constraint_fallback",
+                        "Saved 'auto' to Supabase for user=%s due to user_prefs_tts_model_check; '%s' remains active in memory/Redis.",
+                        user_id,
+                        model,
+                    )
+                    return
+                except Exception:
+                    pass
             if _is_missing_tts_model_column_error(exc):
                 _set_tts_model_column_status(False)
                 _log_once(
@@ -19055,10 +19097,21 @@ async def _generate_voice_gemini(text: str, gender: str, speed: float, output_pa
                     )
 
             audio_models = [
-                os.environ.get("GEMINI_AUDIO_MODEL", "gemini-2.0-flash"),
+                _run_state_gemini_audio_model(),
+                "gemini-2.5-flash-preview-tts",
+                "gemini-2.5-pro-preview-tts",
+                "gemini-3.1-flash-tts-preview",
+                "gemini-2.5-flash",
+                "gemini-2.0-flash",
                 "gemini-2.0-flash-exp",
             ]
-            for mdl in audio_models:
+            # De-duplicate while preserving prioritization order
+            unique_models: list[str] = []
+            for m in audio_models:
+                if m and m not in unique_models:
+                    unique_models.append(m)
+
+            for mdl in unique_models:
                 try:
                     resp = _gemini.models.generate_content(
                         model=mdl,
@@ -19145,29 +19198,35 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
 
     # Secondary Provider: Microsoft Edge TTS
     started = time.perf_counter()
+    edge_err: Exception | None = None
     try:
         audio = await asyncio.wait_for(_generate_voice_edge(text, gender, speed, output_path), timeout=30.0)
-        provider_manager.record_success(
-            "edge_tts",
-            (time.perf_counter() - started) * 1_000,
-        )
+        with suppress(Exception):
+            provider_manager.record_success(
+                "edge_tts",
+                (time.perf_counter() - started) * 1_000,
+            )
         return audio
-    except Exception as edge_exc:
-        provider_manager.record_failure("edge_tts", edge_exc)
-        logger.warning("Edge TTS failed (%s). Attempting Tier 3 Gemini emergency audio fallback...", edge_exc)
+    except Exception as exc:
+        edge_err = exc
+        with suppress(Exception):
+            provider_manager.record_failure("edge_tts", exc)
+        logger.warning("Edge TTS failed (%s). Attempting Tier 3 Gemini emergency audio fallback...", exc)
 
     # Tier 3 Emergency Provider: Google Gemini Multimodal Audio
     if _gemini is not None:
         try:
             started = time.perf_counter()
             audio = await asyncio.wait_for(_generate_voice_gemini(text, gender, speed, output_path), timeout=25.0)
-            provider_manager.record_success("gemini_emergency", (time.perf_counter() - started) * 1_000)
-            logger.info("Tier 3 Gemini Audio emergency fallback succeeded!")
-            return audio
+            if audio:
+                with suppress(Exception):
+                    provider_manager.record_success("gemini", (time.perf_counter() - started) * 1_000)
+                logger.info("Tier 3 Gemini Audio emergency fallback succeeded!")
+                return audio
         except Exception as gemini_exc:
-            logger.error("All 3 TTS engines failed: HF, Edge (%s), and Gemini (%s)", edge_exc, gemini_exc)
+            logger.error("All 3 TTS engines failed: HF, Edge (%s), and Gemini (%s)", edge_err, gemini_exc)
 
-    raise RuntimeError(f"TTS synthesis failed across all providers: {edge_exc}")
+    raise RuntimeError(f"TTS synthesis failed across all providers: {edge_err}")
 
 
 async def generate_voice_limited(text: str, gender: str, speed: float, output_path: str, tts_model: str = "auto") -> bytes:
@@ -19311,8 +19370,33 @@ async def transcribe_audio_file(file_path: str, mime_type: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Text chunking for TTS
+# Text chunking for TTS: Grapheme-Safe Khmer & Multilingual Segmentation Algorithm
 # ---------------------------------------------------------------------------
+def _find_safe_khmer_split_boundary(text: str, target_idx: int, window: int = 30) -> int:
+    """Find a linguistically safe split index in Khmer/multilingual text (O(1) window).
+
+    Scans backward from target_idx within a window to find punctuation, space,
+    or zero-width space. Avoids cutting immediately after Coeng sign (\u17D2) or
+    before combining vowels/diacritics (\u17B4-\u17D3).
+    """
+    if target_idx >= len(text):
+        return len(text)
+    start_search = max(1, target_idx - window)
+    for i in range(target_idx, start_search, -1):
+        ch = text[i - 1]
+        if ch in ("\n", " ", "\t", "\u200B", "។", "៕", "៖", "ៗ", "!", "?", "…", ".", ",", ";"):
+            return i
+    for i in range(target_idx, start_search, -1):
+        prev_ch = text[i - 1]
+        curr_ch = text[i] if i < len(text) else ""
+        if prev_ch == "\u17D2":
+            continue
+        if curr_ch and (0x17B4 <= ord(curr_ch) <= 0x17D3 or ord(curr_ch) == 0x17DD):
+            continue
+        return i
+    return target_idx
+
+
 def _split_text_chunks(text: str, max_chars: int = TTS_CHUNK_CHARS) -> list[str]:
     text = text.strip()
     if not text:
@@ -19320,8 +19404,9 @@ def _split_text_chunks(text: str, max_chars: int = TTS_CHUNK_CHARS) -> list[str]
     if len(text) <= max_chars:
         return [text]
 
-    sentences     = [s for s in _SENTENCE_RE.split(text) if s.strip()]
-    chunks, current = [], ""
+    sentences = [s for s in _SENTENCE_RE.split(text) if s.strip()]
+    chunks: list[str] = []
+    current = ""
 
     for sent in sentences:
         sent = sent.strip()
@@ -19331,25 +19416,17 @@ def _split_text_chunks(text: str, max_chars: int = TTS_CHUNK_CHARS) -> list[str]
             if current:
                 chunks.append(current.strip())
                 current = ""
-            if " " in sent:
-                for word in sent.split():
-                    if not word:
-                        continue
-                    if len(current) + len(word) + (1 if current else 0) > max_chars:
-                        if current:
-                            chunks.append(current.strip())
-                        current = word
-                    else:
-                        current = (current + " " + word).strip() if current else word
-            else:
-                pos = 0
-                while pos < len(sent):
-                    space    = max_chars - len(current)
-                    current += sent[pos: pos + space]
-                    pos     += space
-                    if len(current) >= max_chars:
-                        chunks.append(current)
-                        current = ""
+            pos = 0
+            while pos < len(sent):
+                remaining = len(sent) - pos
+                if remaining <= max_chars:
+                    chunks.append(sent[pos:].strip())
+                    break
+                split_at = _find_safe_khmer_split_boundary(sent[pos:], max_chars)
+                if split_at <= 0:
+                    split_at = max_chars
+                chunks.append(sent[pos: pos + split_at].strip())
+                pos += split_at
         elif len(current) + len(sent) + (1 if current else 0) > max_chars:
             if current:
                 chunks.append(current.strip())
