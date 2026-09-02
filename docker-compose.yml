@@ -5,14 +5,44 @@ services:
       dockerfile: Dockerfile
     container_name: bot-voice
     restart: unless-stopped
+    ports:
+      - "8080:8080"
     env_file:
       - .env
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONDONTWRITEBYTECODE=1
+      - PORT=8080
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
-    # Polling bot does not expose external ports; communication is outbound to Telegram & Supabase.
+
+  redis:
+    image: redis:7-alpine
+    container_name: bot-voice-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  redis-data:
+

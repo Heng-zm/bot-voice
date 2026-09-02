@@ -123,6 +123,8 @@ async def auto_register_bot_commands() -> bool:
         BotCommand("myprefs", "⚙️ កំណត់សំឡេង & ល្បឿន / Settings"),
         BotCommand("ttsmodel", "🎙️ ជ្រើសរើសម៉ូដែល TTS / TTS Engine"),
         BotCommand("clear", "🗑️ សម្អាតប្រវត្តិ / Clear Chat"),
+        BotCommand("unlock", "🔓 ដោះសោររង់ចាំ / Force Unlock"),
+        BotCommand("system", "📊 ព័ត៌មានប្រព័ន្ធ / System Status"),
         BotCommand("privacy", "🔒 ឯកជនភាព / Privacy Policy"),
         BotCommand("feedback", "💡 ផ្ញើមតិកែលម្អ / Feedback"),
         BotCommand("admin", "👑 ផ្ទាំងគ្រប់គ្រង / Admin Panel"),
@@ -140,14 +142,34 @@ async def auto_register_all() -> dict[str, Any]:
     """Execute complete automated registration sequence on startup."""
     results: dict[str, Any] = {}
 
-    # 1. Register Webhook
-    url = get_detected_webhook_url()
-    if url:
-        results["webhook"] = await auto_setup_webhook(url)
-        results["webhook_url"] = f"{url.rstrip('/')}/webhook"
-    else:
+    # 1. Register Webhook or Fallback to Polling
+    bot_mode = os.environ.get("BOT_MODE", "").strip().upper()
+    if bot_mode == "POLLING":
         results["webhook"] = False
         results["mode"] = "POLLING"
+        logger.info("BOT_MODE=POLLING explicitly configured; webhook registration skipped.")
+    else:
+        url = get_detected_webhook_url()
+        if url:
+            webhook_ok = await auto_setup_webhook(url)
+            results["webhook"] = webhook_ok
+            results["webhook_url"] = f"{url.rstrip('/')}/webhook"
+            if not webhook_ok:
+                logger.warning("Webhook registration failed (unresolvable host); falling back to POLLING mode.")
+                try:
+                    if hasattr(legacy, "_switch_telegram_runtime_mode"):
+                        await legacy._switch_telegram_runtime_mode("POLLING")
+                        results["fallback_mode"] = "POLLING"
+                except Exception as e:
+                    logger.error("Failed to switch to POLLING mode: %s", e)
+        else:
+            results["webhook"] = False
+            results["mode"] = "POLLING"
+            try:
+                if hasattr(legacy, "_run_state_bot_mode") and legacy._run_state_bot_mode() == "WEBHOOK":
+                    await legacy._switch_telegram_runtime_mode("POLLING")
+            except Exception as e:
+                logger.debug("Ensure polling mode error: %s", e)
 
     # 2. Register Commands Menu
     results["commands"] = await auto_register_bot_commands()
@@ -172,14 +194,15 @@ async def keep_awake() -> None:
     
     async with httpx.AsyncClient() as client:
         while True:
+            bot_mode = os.environ.get("BOT_MODE", "").strip().upper()
             url = get_detected_webhook_url()
-            if url:
+            if url and bot_mode != "POLLING":
                 health_url = f"{url.rstrip('/')}/healthz"
                 try:
                     await client.get(health_url, timeout=10.0)
                     logger.debug("Keep-awake ping sent to %s", health_url)
                 except Exception as e:
-                    logger.warning("Keep-awake ping failed: %s", e)
+                    logger.debug("Keep-awake ping suppressed: %s", e)
             
             # Sleep for 10 minutes (Render sleeps after 15m)
             await asyncio.sleep(600)
@@ -247,7 +270,8 @@ async def health_check(request: Request) -> JSONResponse:
     """Health check endpoint that auto-captures host header for Webhook and API URL."""
     host_header = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
     proto = request.headers.get("x-forwarded-proto") or "https"
-    if host_header and not host_header.startswith("localhost") and not host_header.startswith("127.0.0.1"):
+    bot_mode = os.environ.get("BOT_MODE", "").strip().upper()
+    if bot_mode != "POLLING" and host_header and not host_header.startswith("localhost") and not host_header.startswith("127.0.0.1"):
         detected = f"{proto}://{host_header}"
         if not get_detected_webhook_url():
             asyncio.create_task(auto_setup_webhook(detected))

@@ -5,6 +5,7 @@ These are live runtime handlers; app.legacy now contains compatibility wrappers 
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 # Transitional V4.1 modules bind remaining legacy helpers at runtime.
@@ -661,7 +662,6 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
         async with lock:
             if len(tts_text) > TTS_SINGLE_VOICE_MAX_CHARS:
                 uname = user.username or user.first_name or str(user_id)
-                import asyncio
                 try:
                     sent_count, failed_count = await asyncio.wait_for(
                         _deliver_paged_tts(
@@ -698,7 +698,6 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
             file_path = _make_temp_ogg()
             await progress.update(35, "កំពុងបង្កើតសំឡេង", f"កំពុងប្រើ {model_label}។", force=True)
             generation_started = time.perf_counter()
-            import asyncio
             try:
                 audio_bytes = await asyncio.wait_for(
                     generate_user_voice_limited(

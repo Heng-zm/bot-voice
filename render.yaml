@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: bot-voice
+    runtime: python
+    plan: free
+    buildCommand: pip install --upgrade pip setuptools wheel && pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      - key: PORT
+        value: 8080
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: REDIS_URL
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET_TOKEN
+        generateValue: true

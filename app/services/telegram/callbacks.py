@@ -777,11 +777,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await send_user_profile(query.message, user_id)
         elif action == "welcome_back":
-            # The profile is sent as a separate message from the welcome card;
-            # deleting it reveals the original welcome menu without creating
-            # another duplicate message.
             with suppress(Exception):
                 await query.message.delete()
+        elif action == "help":
+            from app.services.telegram.commands import on_help
+            await on_help(update, context)
+        elif action == "system_status":
+            from app.services.telegram.commands import cmd_system
+            await cmd_system(update, context)
         elif action == "show_speed":
             await _cb_show_speed(query, user_id, context)
         elif action == "hide_speed":

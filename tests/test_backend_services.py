@@ -81,6 +81,8 @@ class TelegramFlowTests(unittest.TestCase):
         self.assertEqual("show_speed", classify_callback("show_speed"))
         self.assertEqual("gender", classify_callback("tg_female"))
         self.assertEqual("welcome_profile", classify_callback("welcome_profile"))
+        self.assertEqual("help", classify_callback("btn_help"))
+        self.assertEqual("system_status", classify_callback("btn_system_status"))
 
     def test_classify_prefix_actions(self) -> None:
         self.assertEqual("tts_model", classify_callback("ttsmodel_edge"))

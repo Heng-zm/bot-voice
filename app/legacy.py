@@ -9136,8 +9136,11 @@ def _run_state_get(key: str, default: Any = None) -> Any:
 
 
 def _run_state_bot_mode() -> str:
+    explicit = (os.environ.get("BOT_MODE") or RUN_STATE.get("BOT_MODE") or "").strip().upper()
+    if explicit in {"POLLING", "WEBHOOK"}:
+        return explicit
     webhook_url = (os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").strip()
-    if os.environ.get("BOT_MODE", "").strip().upper() == "WEBHOOK" or bool(webhook_url):
+    if bool(webhook_url):
         return "WEBHOOK"
     return "POLLING"
 
@@ -9544,6 +9547,17 @@ async def _telegram_start_polling_runtime(app_obj: Any) -> bool:
             if ACTIVE_POLLING_TASK is None or ACTIVE_POLLING_TASK.done():
                 ACTIVE_POLLING_TASK = asyncio.create_task(_telegram_polling_task_guard(app_obj), name="telegram-polling-guard")
             return True
+
+        # Pre-polling cleanup: automatically delete any existing active webhook from previous deployments
+        for attempt in range(1, 4):
+            try:
+                await app_obj.bot.delete_webhook(drop_pending_updates=bool(_telegram_polling_drop_pending_updates()))
+                webhook_logger.info("Deleted existing Telegram webhook before starting long polling.")
+                break
+            except Exception as del_exc:
+                webhook_logger.warning("delete_webhook pre-polling attempt %d/3: %s", attempt, del_exc)
+                await asyncio.sleep(1.0)
+
         await updater.start_polling(
             allowed_updates=_telegram_allowed_updates(),
             drop_pending_updates=_telegram_polling_drop_pending_updates(),
@@ -9973,7 +9987,7 @@ OCR_PROVIDER            = DEFAULT_OCR_PROVIDER
 # unavailable or DNS-blocked on small PaaS networks. Set OCR_PROVIDER=auto/hf
 # only when you intentionally want Hugging Face OCR.
 OCR_AUTO_PREFER_PROVIDER = DEFAULT_OCR_AUTO_PREFER_PROVIDER
-OCR_TIMEOUT_SECONDS     = _env_int("OCR_TIMEOUT_SECONDS", 25, minimum=5, maximum=120)
+OCR_TIMEOUT_SECONDS     = _env_int("OCR_TIMEOUT_SECONDS", 75, minimum=5, maximum=180)
 HF_OCR_DNS_COOLDOWN_S   = 300.0
 
 OCR_PROVIDER_FAILURE_LIMIT = _env_int("OCR_PROVIDER_FAILURE_LIMIT", 3, minimum=1, maximum=50)
@@ -11877,16 +11891,19 @@ from app.services.tts import (
 )
 
 WELCOME_TEXT = (
-    "🎵 សួស្តី! ខ្ញុំជាបូតបម្លែងអត្ថបទទៅជាសំឡេងដោយ AI។\n\n"
-    "📌 វាយអត្ថបទជាភាសាណាមួយ ហើយផ្ញើមកបូត។ បូតនឹងបង្កើតសំឡេងដោយស្វ័យប្រវត្តិ។\n"
-    "🎙️ អ្នកក៏អាចផ្ញើឯកសារ MP3 ឬឯកសារសំឡេង ដើម្បីបម្លែងទៅជាសារសំឡេង Telegram បានផងដែរ។\n\n"
-    "🌍 ភាសាដែលគាំទ្រ៖\n"
-    "🇰🇭 ខ្មែរ | 🇺🇸 អង់គ្លេស | 🇨🇳 ចិន | 🇰🇷 កូរ៉េ | 🇯🇵 ជប៉ុន\n"
-    "🇮🇳 ហិណ្ឌី | 🇲🇾 ម៉ាឡេ | 🇮🇩 ឥណ្ឌូណេស៊ី | 🇵🇭 ហ្វីលីពីន | 🇸🇦 អារ៉ាប់\n"
-    "💡 បូតស្គាល់ភាសា និងជ្រើសសំឡេងដែលសមស្របដោយស្វ័យប្រវត្តិ ១០០%។\n\n"
-    "⚙️ ប្រើ /myprefs ដើម្បីមើលការកំណត់របស់អ្នក។\n"
-    "☕ Support: https://pay-coffee-topaz.vercel.app/\n"
-    "📢 ចូលរួមឆានែល៖ https://t.me/m11mmm112"
+    "✨ <b>ស្វាគមន៍មកកាន់ Khmer Voice AI Bot!</b> 🎙️🇰🇭\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "បូតឆ្លាតវៃជំនួយការបម្លែងអត្ថបទទៅជាសំឡេង (TTS) និង AI Audio ទំនើបចុងក្រោយបំផុត។\n\n"
+    "🚀 <b>មុខងារពិសេសៗ (Features):</b>\n"
+    "• 🎙️ <b>បម្លែងអត្ថបទជាសំឡេង:</b> ផ្ញើអត្ថបទខ្មែរ ឬអន្តរជាតិ បូតនឹងបង្កើត Voice Note ជូនភ្លាមៗ\n"
+    "• 🤖 <b>សួរ AI Assistant:</b> វាយ <code>/ask សំណួររបស់អ្នក</code>\n"
+    "• 🌐 <b>បកប្រែភាសាខ្មែរ:</b> វាយ <code>/translate អត្ថបទ</code>\n"
+    "• 📝 <b>សង្ខេបអត្ថបទវែង:</b> វាយ <code>/summary អត្ថបទ</code>\n"
+    "• 📸 <b>អានអក្សរពីរូបភាព (OCR):</b> ផ្ញើរូបភាពសៀវភៅ ឬឯកសារ\n"
+    "• 🎧 <b>បម្លែង File សំឡេង:</b> ផ្ញើ File MP3 ឬ Voice\n\n"
+    "⚡ <b>ម៉ាស៊ីនសំឡេងគាំទ្រ:</b> 🇰🇭 <b>Khmer Kiri</b> • 🤖 <b>Gemini AI</b> • 🌐 <b>Edge TTS</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "👉 <i>ចុចប៊ូតុងខាងក្រោមដើម្បីកំណត់សំឡេង ឬមើលព័ត៌មាន៖</i>"
 )
 BOT_TAG = "@voicekhaibot"
 
@@ -11932,6 +11949,7 @@ def _get_prefs_load_lock(user_id: int) -> asyncio.Lock:
 
 TTS_MODEL_OPTIONS = {
     "auto": ("ស្វ័យប្រវត្តិ", "Kiri → Edge TTS"),
+    "gemini": ("សំឡេង Gemini AI", "Google Gemini TTS"),
     "hf_space": ("សំឡេងខ្មែរ Kiri", ""),
     "edge": ("Edge TTS ពហុភាសា", ""),
 }
@@ -11939,6 +11957,11 @@ TTS_MODEL_ALIASES = {
     "auto": "auto",
     "default": "auto",
     "server": "auto",
+    "gemini": "gemini",
+    "gemini_tts": "gemini",
+    "google": "gemini",
+    "google_tts": "gemini",
+    "genai": "gemini",
     "hf": "hf_space",
     "hf_space": "hf_space",
     "khmer_hf": "hf_space",
@@ -13599,9 +13622,11 @@ async def _send_welcome_message(message: Any) -> Any:
     text = _setting_raw_from(settings, "welcome_message", WELCOME_TEXT) or WELCOME_TEXT
     photo_file_id = _setting_raw_from(settings, "welcome_photo_file_id", "")
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("☕ Support", url="https://pay-coffee-topaz.vercel.app/"),
+        [InlineKeyboardButton("⚙️ ការកំណត់ / Settings", callback_data="welcome_profile"),
+         InlineKeyboardButton("🤖 ម៉ូដែល TTS", callback_data="show_tts_model")],
+        [InlineKeyboardButton("🎚️ ល្បឿនសំឡេង", callback_data="show_speed"),
          InlineKeyboardButton("📢 Channel", url="https://t.me/m11mmm112")],
-        [InlineKeyboardButton("👤 User Profile", callback_data="welcome_profile")],
+        [InlineKeyboardButton("☕ Support Creator", url="https://pay-coffee-topaz.vercel.app/")],
     ])
 
     if photo_file_id:
@@ -13610,6 +13635,7 @@ async def _send_welcome_message(message: Any) -> Any:
                 return await safe_send(lambda: message.reply_photo(
                     photo=photo_file_id,
                     caption=text,
+                    parse_mode="HTML",
                     reply_markup=keyboard,
                 ))
             await safe_send(lambda: message.reply_photo(photo=photo_file_id))
@@ -13618,6 +13644,7 @@ async def _send_welcome_message(message: Any) -> Any:
 
     return await safe_send(lambda: message.reply_text(
         text,
+        parse_mode="HTML",
         reply_markup=keyboard,
         disable_web_page_preview=True,
     ))
@@ -15986,7 +16013,8 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🎙️ TTS Engine", callback_data="admin_tts_models")],
         [InlineKeyboardButton("👋 Welcome Message", callback_data="admin_welcome")],
 
-        [InlineKeyboardButton("📄 Report", callback_data="admin_report")],
+        [InlineKeyboardButton("📄 Report", callback_data="admin_report"),
+         InlineKeyboardButton("📈 Telemetry", callback_data="btn_system_status")],
         [InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
          InlineKeyboardButton("📅 Calendar", callback_data="admin_calendar")],
         [InlineKeyboardButton("🔑 API Keys", callback_data="admin_api"),
@@ -17705,7 +17733,7 @@ async def _convert_audio_files_to_telegram_voice(
             output_label = "paced"
         cmd += ["-filter_complex", ";".join(filters), "-map", f"[{output_label}]"]
     else:
-        audio_filters = ["aresample=48000", "aformat=sample_fmts=fltp:channel_layouts=mono"]
+        audio_filters = ["aresample=48000", "aformat=sample_fmts=fltp:channel_layouts=mono", "volume=1.2"]
         if speed_filter:
             audio_filters.append(speed_filter)
         cmd += ["-map", "0:a:0", "-filter:a", ",".join(audio_filters)]
@@ -19026,17 +19054,26 @@ async def _generate_voice_gemini(text: str, gender: str, speed: float, output_pa
                         temperature=0.3,
                     )
 
-            resp = _gemini.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=gen_config,
-            )
-            for cand in getattr(resp, "candidates", []) or []:
-                content = getattr(cand, "content", None)
-                for part in getattr(content, "parts", []) or []:
-                    inline = getattr(part, "inline_data", None)
-                    if inline is not None and getattr(inline, "data", None):
-                        return bytes(inline.data)
+            audio_models = [
+                os.environ.get("GEMINI_AUDIO_MODEL", "gemini-2.0-flash"),
+                "gemini-2.0-flash-exp",
+            ]
+            for mdl in audio_models:
+                try:
+                    resp = _gemini.models.generate_content(
+                        model=mdl,
+                        contents=prompt,
+                        config=gen_config,
+                    )
+                    for cand in getattr(resp, "candidates", []) or []:
+                        content = getattr(cand, "content", None)
+                        for part in getattr(content, "parts", []) or []:
+                            inline = getattr(part, "inline_data", None)
+                            if inline is not None and getattr(inline, "data", None):
+                                return bytes(inline.data)
+                except Exception as model_err:
+                    logger.debug("Gemini audio attempt with %s failed: %s", mdl, model_err)
+                    continue
         except Exception as exc:
             logger.warning("Gemini multimodal audio generation exception: %s", exc)
         return None
@@ -24554,6 +24591,38 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
 
     if data == "admin_schedule_new":
         await _admin_start_schedule_from_button(query, context, user_id)
+        return
+
+    if data in ("admin_system", "btn_system_status"):
+        snapshot = _system_metrics_snapshot()
+        storage = snapshot.get("storage", {})
+        cache = snapshot.get("tts_audio_cache", {})
+        anti_spam = snapshot.get("anti_spam", {})
+        status_icon = "🟢" if snapshot.get("status") == "healthy" else "🟡"
+        redis_status = f"✅ Connected ({storage.get('redis_ping_ms')}ms)" if storage.get("redis_connected") else "❌ Offline"
+        supabase_status = "✅ Connected" if storage.get("supabase_connected") else "⚠️ Degraded"
+        uptime_m = round(float(snapshot.get("uptime_seconds", 0.0)) / 60.0, 1)
+        sys_text = (
+            f"{status_icon} <b>ប្រព័ន្ធ Telemetry & Metrics (v{snapshot.get('version', '4.2.0')})</b>\n\n"
+            f"⏱️ Uptime: <b>{uptime_m} នាទី</b>\n"
+            f"🤖 Bot Mode: <b>{snapshot.get('bot_mode', 'POLLING')}</b>\n\n"
+            f"🗄️ <b>Storage Layer:</b>\n"
+            f"• Redis L2 Cache: <b>{redis_status}</b>\n"
+            f"• Supabase Database: <b>{supabase_status}</b>\n\n"
+            f"🎵 <b>Audio Cache (L1/L2):</b>\n"
+            f"• Memory Items: <b>{cache.get('l1_memory_items', 0)}</b> ({round(cache.get('l1_memory_bytes', 0)/1024, 1)} KB)\n"
+            f"• Binary TTL: <b>{cache.get('ttl_seconds', 0)}s</b>\n\n"
+            f"🛡️ <b>Anti-Spam & Rate Limiter:</b>\n"
+            f"• Tracked Users: <b>{anti_spam.get('tracked_users', 0)}</b>\n"
+            f"• Active Cooldowns: <b>{anti_spam.get('active_cooldowns', 0)}</b>\n\n"
+            f"🌐 <i>REST API: <code>/system</code>, <code>/metrics</code></i>"
+        )
+        await safe_send(lambda: query.message.edit_text(
+            sys_text,
+            parse_mode="HTML",
+            reply_markup=get_admin_dashboard_kb(),
+            disable_web_page_preview=True,
+        ))
         return
 
     # Fallback: reopen dashboard instead of sending a separate command message.

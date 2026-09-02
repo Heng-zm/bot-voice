@@ -24,7 +24,42 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @legacy_bound_handler
 async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await on_start(update, context)
+    msg = update.message
+    if not msg:
+        return
+    help_text = (
+        "📖 <b>សៀវភៅណែនាំរបៀបប្រើប្រាស់ Bot Voice</b> 🎙️\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "1️⃣ <b>បម្លែងអត្ថបទទៅជាសំឡេង (TTS):</b>\n"
+        "• គ្រាន់តែវាយអត្ថបទខ្មែរ ឬអន្តរជាតិ រួចផ្ញើមកកាន់ Bot\n"
+        "• បូតនឹងបង្កើត Voice Note ជូនភ្លាមៗ\n\n"
+        "2️⃣ <b>សួរ AI Assistant:</b>\n"
+        "• វាយ <code>/ask សំណួររបស់អ្នក</code>\n"
+        "• ឧទាហរណ៍៖ <code>/ask តើភ្នំពេញជារាជធានីនៃប្រទេសណា?</code>\n\n"
+        "3️⃣ <b>បកប្រែជាភាសាខ្មែរ:</b>\n"
+        "• វាយ <code>/translate អត្ថបទ</code>\n"
+        "• ឧទាហរណ៍៖ <code>/translate Good morning, how are you?</code>\n\n"
+        "4️⃣ <b>សង្ខេបអត្ថបទវែងៗ:</b>\n"
+        "• វាយ <code>/summary អត្ថបទរបស់អ្នក</code>\n\n"
+        "5️⃣ <b>អានអក្សរពីរូបភាព (OCR):</b>\n"
+        "• ផ្ញើរូបភាពសៀវភៅ ឬឯកសារ មកកាន់ Bot\n\n"
+        "6️⃣ <b>ការកំណត់សំឡេង & ម៉ូដែល:</b>\n"
+        "• <code>/myprefs</code> — មើល និងកែប្រែការកំណត់សំឡេង\n"
+        "• <code>/ttsmodel</code> — ជ្រើសរើសម៉ូដែលសំឡេង (Kiri, Gemini AI, Edge)\n"
+        "• <code>/unlock</code> — ដោះសោររង់ចាំ\n"
+        "• <code>/clear</code> — សម្អាតប្រវត្តិសន្ទនា\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💬 <i>ផ្ញើសារ ឬសំណួររបស់អ្នកមកឥឡូវនេះបាន!</i>"
+    )
+    from app.services.telegram._legacy_runtime import safe_send
+    from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚙️ ការកំណត់ / Settings", callback_data="welcome_profile"),
+         InlineKeyboardButton("🤖 ម៉ូដែល TTS", callback_data="show_tts_model")],
+        [InlineKeyboardButton("📢 Channel", url="https://t.me/m11mmm112"),
+         InlineKeyboardButton("☕ Support Creator", url="https://pay-coffee-topaz.vercel.app/")],
+    ])
+    await safe_send(lambda: msg.reply_text(help_text, parse_mode="HTML", reply_markup=kb))
 
 
 @legacy_bound_handler
@@ -133,24 +168,23 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(lambda: msg.reply_text(f"❌ បរាជ័យ: {exc}"))
 
 
-
 @legacy_bound_handler
 async def send_user_profile(message, user_id: int):
-    prefs   = await get_user_prefs_async(user_id)
-    gender_label = "👩 សំឡេងស្រី" if prefs["gender"] == "female" else "👨 សំឡេងប្រុស"
-    speed_label  = next(
+    prefs = await get_user_prefs_async(user_id)
+    gender_label = "👩 សំឡេងស្រី (Female)" if prefs["gender"] == "female" else "👨 សំឡេងប្រុស (Male)"
+    speed_label = next(
         (lbl for _, (lbl, val) in SPEED_OPTIONS.items() if abs(val - prefs["speed"]) < 0.01),
         f"{prefs['speed']}x",
     )
     model_label = _tts_model_label(prefs.get("tts_model", "auto"))
     await safe_send(lambda: message.reply_text(
-        f"⚙️ <b>ការកំណត់របស់អ្នក</b>\n\n"
-        f"🗣️ សំឡេង: <b>{gender_label}</b>\n"
-        f"🎚️ ល្បឿន: <b>{speed_label}</b>\n"
-        f"🤖 ម៉ូដែល TTS: <b>{html.escape(model_label)}</b>\n"
-        "\n"
-        "ផ្ញើអត្ថបទណាមួយ។ បូតស្គាល់ភាសា និងជ្រើសសំឡេងដោយស្វ័យប្រវត្តិ; "
-        "ប៊ូតុងក្រោមសារសំឡេងប្រើសម្រាប់ប្តូរម៉ូដែល ល្បឿន ឬប្រភេទសំឡេង។",
+        f"⚙️ <b>កម្រងព័ត៌មាន & ការកំណត់សំឡេងរបស់អ្នក</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🗣️ <b>ប្រភេទសំឡេង:</b> <b>{gender_label}</b>\n"
+        f"🎚️ <b>ល្បឿនអាន:</b> <code>{speed_label}</code>\n"
+        f"🤖 <b>ម៉ូដែល TTS:</b> <b>{html.escape(model_label)}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 <i>ចុចប៊ូតុងខាងក្រោមដើម្បីកែប្រែការកំណត់បានភ្លាមៗ៖</i>",
         parse_mode="HTML",
         reply_markup=get_main_kb(
             prefs["gender"],
@@ -172,7 +206,11 @@ async def cmd_ttsmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     prefs = await get_user_prefs_async(user_id)
     await safe_send(lambda: update.message.reply_text(
-        '🤖 <b>ជ្រើសរើសម៉ូដែល TTS</b>\n\nស្វ័យប្រវត្តិ៖ ប្រើ Khmer HF Space សម្រាប់ភាសាខ្មែរ និងប្ដូរទៅ Edge ប្រសិនបើចាំបាច់\nKhmer HF៖ ប្រើ mrrtmob/khmer-tts សម្រាប់អត្ថបទខ្មែរ\nEdge៖ ប្រើ Microsoft Edge TTS សម្រាប់គ្រប់ភាសា',
+        '🤖 <b>ជ្រើសរើសម៉ូដែល TTS</b>\n\n'
+        '• <b>ស្វ័យប្រវត្តិ៖</b> ប្រើ Khmer HF សម្រាប់ភាសាខ្មែរ និង Edge សម្រាប់ភាសាផ្សេងៗ\n'
+        '• <b>Gemini AI៖</b> ប្រើសំឡេង Google Gemini AI សំឡេងបែបធម្មជាតិ\n'
+        '• <b>Khmer Kiri៖</b> ប្រើ mrrtmob/khmer-tts សម្រាប់អត្ថបទខ្មែរ\n'
+        '• <b>Edge TTS៖</b> ប្រើ Microsoft Edge TTS សម្រាប់គ្រប់ភាសា',
         parse_mode="HTML",
         reply_markup=get_tts_model_kb(prefs.get("tts_model", "auto")),
     ))
@@ -354,12 +392,15 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @legacy_bound_handler
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    loop   = asyncio.get_running_loop()
+    msg = update.effective_message
+    if not msg:
+        return
+    loop = asyncio.get_running_loop()
     user_ids, pending_scheds = await asyncio.gather(
         loop.run_in_executor(_DB_EXECUTOR, get_all_user_ids),
         loop.run_in_executor(_DB_EXECUTOR, db_sched_fetch_admin_pending, update.effective_user.id),
     )
-    await safe_send(lambda: update.message.reply_text(
+    await safe_send(lambda: msg.reply_text(
         f"📊 <b>ស្ថិតិបូត</b>\n\n👥 អ្នកប្រើប្រាស់សរុប៖ <b>{len(user_ids)}</b>\n💬 ការជជែកសកម្មរបស់អ្នកគ្រប់គ្រង៖ <b>{len(_admin_chat_target)}</b>\n📅 កាលវិភាគកំពុងរង់ចាំ៖ <b>{len(pending_scheds)}</b>\n🔒 សោអ្នកប្រើប្រាស់សកម្ម៖ <b>{len(_user_locks)}</b>\n💭 ចំនួនធាតុប្រវត្តិក្នុង Cache៖ <b>{len(_hist_cache)}</b>\n🔑 ការផ្ទៀងផ្ទាត់ API បែប Dynamic៖ <b>{('ON' if _dynamic_ai_auth_configured() else 'OFF')}</b>\n🤗 ម៉ូដែល HF៖ <b>{HF_MODEL}</b>\nOCR៖ <b>{HF_OCR_MODEL}</b>",
         parse_mode="HTML",
     ))
@@ -368,8 +409,11 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @legacy_bound_handler
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Telegram admin shortcut for the full bot health panel."""
+    msg = update.effective_message
+    if not msg:
+        return
     text = await _admin_health_text()
-    await safe_send(lambda: update.message.reply_text(
+    await safe_send(lambda: msg.reply_text(
         text,
         parse_mode="HTML",
         reply_markup=get_admin_dashboard_kb(),
@@ -379,13 +423,28 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @legacy_bound_handler
 async def cmd_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Live System Metrics & Telemetry report for Admins."""
+    """Live System Metrics & Telemetry report for Admins, and friendly status for users."""
     user = update.effective_user
-    if not user or not _is_admin(int(user.id)):
+    msg = update.effective_message
+    if not user or not msg:
         return
 
     from app import legacy
     snapshot = legacy._system_metrics_snapshot() if hasattr(legacy, "_system_metrics_snapshot") else {}
+
+    if not _is_admin(int(user.id)):
+        status_text = (
+            "🟢 <b>ស្ថានភាពប្រព័ន្ធ Bot Voice (System Status)</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚡ <b>ស្ថានភាពទូទៅ:</b> កំពុងដំណើរការយ៉ាងរលូន (Online 24/7)\n"
+            "🎙️ <b>ម៉ាស៊ីន TTS:</b> ដំណើរការធម្មតា (Kiri, Gemini AI, Edge)\n"
+            "📸 <b>ម៉ាស៊ីន OCR:</b> ដំណើរការធម្មតា (Google Gemini Vision)\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "💡 <i>ប្រសិនបើជួបបញ្ហា សូមប្រើ /unlock ឬទាក់ទងមកកាន់ @m11mmm112</i>"
+        )
+        await safe_send(lambda: msg.reply_text(status_text, parse_mode="HTML"))
+        return
+
     storage = snapshot.get("storage", {})
     cache = snapshot.get("tts_audio_cache", {})
     anti_spam = snapshot.get("anti_spam", {})
@@ -399,7 +458,7 @@ async def cmd_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"{status_icon} <b>ប្រព័ន្ធ Telemetry & Metrics (v{snapshot.get('version', '4.2.0')})</b>\n\n"
         f"⏱️ Uptime: <b>{uptime_m} នាទី</b>\n"
-        f"🤖 Bot Mode: <b>{snapshot.get('bot_mode', 'WEBHOOK')}</b>\n\n"
+        f"🤖 Bot Mode: <b>{snapshot.get('bot_mode', 'POLLING')}</b>\n\n"
         f"🗄️ <b>Storage Layer:</b>\n"
         f"• Redis L2 Cache: <b>{redis_status}</b>\n"
         f"• Supabase Database: <b>{supabase_status}</b>\n\n"
@@ -412,7 +471,7 @@ async def cmd_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🌐 <i>REST API: <code>/system</code>, <code>/metrics</code></i>"
     )
 
-    await safe_send(lambda: update.message.reply_text(
+    await safe_send(lambda: msg.reply_text(
         text,
         parse_mode="HTML",
         reply_markup=get_admin_dashboard_kb(),
@@ -429,13 +488,17 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
       /admin report, /admin optimize, /admin users, /admin settings, /admin runtime, /admin needs
     """
     user_id = update.effective_user.id if update.effective_user else 0
+    msg = update.effective_message
+    if not msg:
+        return
+
     arg = ""
     with suppress(Exception):
         arg = str((context.args or [""])[0]).strip().lower()
 
     if arg in {"needs", "userneeds", "user_needs", "feedback"}:
         text = await _user_needs_home_text(user_id)
-        await safe_send(lambda: update.message.reply_text(
+        await safe_send(lambda: msg.reply_text(
             text,
             parse_mode="HTML",
             reply_markup=get_user_needs_home_kb(),
@@ -445,7 +508,7 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if arg in {"compact", "mobile", "mini"}:
         text = await _admin_compact_text(user_id)
-        await safe_send(lambda: update.message.reply_text(
+        await safe_send(lambda: msg.reply_text(
             text,
             parse_mode="HTML",
             reply_markup=get_admin_compact_kb(),
@@ -454,23 +517,33 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if arg in {"health", "status"}:
         text = await _admin_health_text()
-        await safe_send(lambda: update.message.reply_text(text, parse_mode="HTML", reply_markup=get_admin_dashboard_kb(), disable_web_page_preview=True))
+        await safe_send(lambda: msg.reply_text(text, parse_mode="HTML", reply_markup=get_admin_dashboard_kb(), disable_web_page_preview=True))
         return
     if arg in {"errors", "error"}:
-        await safe_send(lambda: update.message.reply_text(_error_center_text(), parse_mode="HTML", reply_markup=_error_center_kb(), disable_web_page_preview=True))
+        await safe_send(lambda: msg.reply_text(_error_center_text(), parse_mode="HTML", reply_markup=_error_center_kb(), disable_web_page_preview=True))
         return
     if arg in {"optimize", "perf", "performance"}:
-        await safe_send(lambda: update.message.reply_text(_admin_optimize_text(), parse_mode="HTML", reply_markup=get_admin_optimize_kb(), disable_web_page_preview=True))
+        await safe_send(lambda: msg.reply_text(_admin_optimize_text(), parse_mode="HTML", reply_markup=get_admin_optimize_kb(), disable_web_page_preview=True))
         return
     if arg in {"report", "pdf"}:
-        await safe_send(lambda: update.message.reply_text('📄 <b>របាយការណ៍ PDF</b>\n\nសូមជ្រើសរើសចន្លោះពេលរបាយការណ៍៖', parse_mode="HTML", reply_markup=get_admin_report_day_kb(), disable_web_page_preview=True))
+        await safe_send(lambda: msg.reply_text('📄 <b>របាយការណ៍ PDF</b>\n\nសូមជ្រើសរើសចន្លោះពេលរបាយការណ៍៖', parse_mode="HTML", reply_markup=get_admin_report_day_kb(), disable_web_page_preview=True))
         return
     if arg in {"users", "user"}:
-        await safe_send(lambda: update.message.reply_text('👥 កំពុងបើកផ្ទាំងអ្នកប្រើប្រាស់...', reply_markup=get_admin_dashboard_kb()))
+        await cmd_users(update, context)
+        return
+    if arg in {"crm"}:
+        text = await _admin_crm_text("all")
+        await safe_send(lambda: msg.reply_text(text, parse_mode="HTML", reply_markup=get_admin_crm_kb("all"), disable_web_page_preview=True))
+        return
+    if arg in {"system", "metrics"}:
+        await cmd_system(update, context)
+        return
+    if arg in {"api", "apikeys"}:
+        await cmd_api(update, context)
         return
     if arg in {"broadcast", "bc"}:
         context.user_data["bc_state"] = BROADCAST_WAIT_MESSAGE
-        await safe_send(lambda: update.message.reply_text(
+        await safe_send(lambda: msg.reply_text(
             '📢 <b>ដំណើរការផ្សាយសារដោយសុវត្ថិភាព</b>\n\nសូមផ្ញើអត្ថបទ ឬរូបភាព + ចំណងជើងឥឡូវនេះ។ បូតនឹងបង្ហាញសារមើលជាមុន មុនពេលផ្ញើពិត។\n\nប្រើ /cancel ដើម្បីបោះបង់។',
             parse_mode="HTML",
             reply_markup=get_admin_action_kb(),
@@ -478,14 +551,14 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if arg in {"settings", "setting"}:
         settings, _status = await get_bot_settings_async(force=True)
-        await safe_send(lambda: update.message.reply_text('⚙️ <b>ការកំណត់បូត</b>', parse_mode="HTML", reply_markup=get_bot_settings_kb(settings)))
+        await safe_send(lambda: msg.reply_text('⚙️ <b>ការកំណត់បូត</b>', parse_mode="HTML", reply_markup=get_bot_settings_kb(settings)))
         return
     if arg in {"runtime", "run"}:
-        await safe_send(lambda: update.message.reply_text(_runtime_admin_text(), parse_mode="HTML", reply_markup=get_runtime_admin_kb(), disable_web_page_preview=True))
+        await safe_send(lambda: msg.reply_text(_runtime_admin_text(), parse_mode="HTML", reply_markup=get_runtime_admin_kb(), disable_web_page_preview=True))
         return
 
     text = await _admin_home_text(user_id)
-    await safe_send(lambda: update.message.reply_text(
+    await safe_send(lambda: msg.reply_text(
         text,
         parse_mode="HTML",
         reply_markup=get_admin_dashboard_kb(),
@@ -523,7 +596,10 @@ async def cmd_feature_request(update: Update, context: ContextTypes.DEFAULT_TYPE
 @legacy_bound_handler
 async def cmd_runtime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Direct shortcut for runtime operations without replacing /admin.
-    await safe_send(lambda: update.message.reply_text(
+    msg = update.effective_message
+    if not msg:
+        return
+    await safe_send(lambda: msg.reply_text(
         _runtime_admin_text(),
         parse_mode="HTML",
         reply_markup=get_runtime_admin_kb(),
@@ -534,7 +610,9 @@ async def cmd_runtime(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @legacy_bound_handler
 async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin command to create/list/revoke API keys for /ai-assistant."""
-    msg = update.message
+    msg = update.effective_message
+    if not msg:
+        return
     admin_id = update.effective_user.id
     args = list(context.args or [])
 
