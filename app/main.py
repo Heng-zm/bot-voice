@@ -185,16 +185,31 @@ async def keep_awake() -> None:
             await asyncio.sleep(600)
 
 
+async def periodic_database_pruner() -> None:
+    """Run database cleanup every 24 hours."""
+    await asyncio.sleep(120)  # wait 2 minutes after startup
+    while True:
+        try:
+            if hasattr(legacy, "db_run_periodic_pruning"):
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, legacy.db_run_periodic_pruning)
+        except Exception as exc:
+            logger.warning("Periodic DB pruning error: %s", exc)
+        await asyncio.sleep(86400)
+
+
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI) -> AsyncGenerator[None, None]:
     """Start the Telegram Bot runner and auto-register all services."""
     bot_task = asyncio.create_task(legacy._async_main_once(), name="telegram-bot-runner")
     auto_reg_task = asyncio.create_task(auto_register_all(), name="auto-register-all")
     keep_awake_task = asyncio.create_task(keep_awake(), name="keep-awake")
+    db_prune_task = asyncio.create_task(periodic_database_pruner(), name="db-pruner")
 
     try:
         yield
     finally:
+        db_prune_task.cancel()
         keep_awake_task.cancel()
         auto_reg_task.cancel()
         bot_task.cancel()
@@ -208,6 +223,18 @@ app = FastAPI(
     version="4.2.0",
     lifespan=lifespan,
 )
+
+
+@app.get("/system")
+@app.get("/metrics")
+@app.get("/api/system")
+@app.get("/api/metrics")
+async def system_metrics_endpoint() -> JSONResponse:
+    """Live system telemetry, resource health, and multi-provider stats."""
+    snapshot_func = getattr(legacy, "_system_metrics_snapshot", None)
+    if snapshot_func:
+        return JSONResponse(snapshot_func())
+    return JSONResponse({"status": "running", "version": "4.2.0"})
 
 
 @app.get("/")

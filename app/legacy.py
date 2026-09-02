@@ -12400,30 +12400,44 @@ async def get_user_prefs_async(user_id: int) -> dict:
 _USER_LOCK_MAX = 5_000
 _user_locks: OrderedDict[int, asyncio.Lock] = OrderedDict()
 _user_locks_guard = threading.RLock()
-_tts_request_reservations: set[int] = set()
+_tts_request_reservations: dict[int, float] = {}
 _tts_request_reservations_guard = threading.RLock()
+_TTS_RESERVATION_TTL_S = 120.0
 
 
 def _reserve_tts_request(user_id: int) -> bool:
     """Reserve the preparation window before the per-user async lock is held."""
-
     user_id = int(user_id)
+    now = time.time()
     lock = _get_user_lock(user_id)
     with _tts_request_reservations_guard:
-        if lock.locked() or user_id in _tts_request_reservations:
+        # Cleanup expired reservations
+        expired = [uid for uid, t in _tts_request_reservations.items() if now - t > _TTS_RESERVATION_TTL_S]
+        for uid in expired:
+            _tts_request_reservations.pop(uid, None)
+
+        if user_id in _tts_request_reservations:
             return False
-        _tts_request_reservations.add(user_id)
+        if lock.locked():
+            return False
+        _tts_request_reservations[user_id] = now
         return True
 
 
 def _release_tts_request(user_id: int) -> None:
     with _tts_request_reservations_guard:
-        _tts_request_reservations.discard(int(user_id))
+        _tts_request_reservations.pop(int(user_id), None)
 
 
 def _tts_request_reserved(user_id: int) -> bool:
+    user_id = int(user_id)
+    now = time.time()
     with _tts_request_reservations_guard:
-        return int(user_id) in _tts_request_reservations
+        t = _tts_request_reservations.get(user_id)
+        if t is not None and now - t <= _TTS_RESERVATION_TTL_S:
+            return True
+        _tts_request_reservations.pop(user_id, None)
+        return False
 
 
 def _evict_idle_user_locks() -> int:
@@ -18747,27 +18761,48 @@ def _tts_audio_cache_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _tts_audio_redis_key(key: str) -> str:
+    return _redis_key("audio", "tts", str(key))
+
+
 def _tts_audio_cache_get(key: str) -> bytes | None:
     if not TTS_AUDIO_CACHE_ENABLED:
         return None
     now = time.monotonic()
+    # 1. Check L1 Memory Cache
     with _TTS_AUDIO_CACHE_LOCK:
         item = _TTS_AUDIO_CACHE.get(key)
-        if not item:
-            return None
-        data, created, size = item
-        if now - created > TTS_AUDIO_CACHE_TTL_S:
-            global _TTS_AUDIO_CACHE_BYTES
-            _TTS_AUDIO_CACHE.pop(key, None)
-            _TTS_AUDIO_CACHE_BYTES = max(0, _TTS_AUDIO_CACHE_BYTES - size)
-            return None
-        _TTS_AUDIO_CACHE.move_to_end(key)
-        return bytes(data)
+        if item:
+            data, created, size = item
+            if now - created <= TTS_AUDIO_CACHE_TTL_S:
+                _TTS_AUDIO_CACHE.move_to_end(key)
+                return bytes(data)
+            else:
+                global _TTS_AUDIO_CACHE_BYTES
+                _TTS_AUDIO_CACHE.pop(key, None)
+                _TTS_AUDIO_CACHE_BYTES = max(0, _TTS_AUDIO_CACHE_BYTES - size)
+
+    # 2. Check L2 Redis Cache
+    if redis_client is not None:
+        try:
+            rkey = _tts_audio_redis_key(key)
+            raw = redis_client.get(rkey)
+            if raw:
+                if isinstance(raw, str):
+                    audio_data = base64.b64decode(raw.encode("ascii"))
+                else:
+                    audio_data = bytes(raw)
+                if audio_data:
+                    # Populate L1 cache for subsequent fast reads
+                    _tts_audio_cache_set_memory_only(key, audio_data)
+                    return audio_data
+        except Exception as exc:
+            logger.debug("Redis audio cache get error: %s", exc)
+
+    return None
 
 
-def _tts_audio_cache_set(key: str, data: bytes) -> None:
-    if not TTS_AUDIO_CACHE_ENABLED or not data:
-        return
+def _tts_audio_cache_set_memory_only(key: str, data: bytes) -> None:
     size = len(data)
     if size > TTS_AUDIO_CACHE_ITEM_MAX_BYTES:
         return
@@ -18782,6 +18817,24 @@ def _tts_audio_cache_set(key: str, data: bytes) -> None:
         while _TTS_AUDIO_CACHE_BYTES > TTS_AUDIO_CACHE_MAX_BYTES and _TTS_AUDIO_CACHE:
             _old_key, (_old_data, _old_created, old_size) = _TTS_AUDIO_CACHE.popitem(last=False)
             _TTS_AUDIO_CACHE_BYTES = max(0, _TTS_AUDIO_CACHE_BYTES - old_size)
+
+
+def _tts_audio_cache_set(key: str, data: bytes) -> None:
+    if not TTS_AUDIO_CACHE_ENABLED or not data:
+        return
+    # Write to L1 Memory Cache
+    _tts_audio_cache_set_memory_only(key, data)
+
+    # Write to L2 Redis Cache asynchronously / in background
+    if redis_client is not None:
+        def _write_redis():
+            try:
+                rkey = _tts_audio_redis_key(key)
+                b64_str = base64.b64encode(data).decode("ascii")
+                redis_client.set(rkey, b64_str, ex=int(TTS_AUDIO_CACHE_TTL_S))
+            except Exception as exc:
+                logger.debug("Redis audio cache set error: %s", exc)
+        _submit_db(_write_redis)
 
 
 def _tts_audio_cache_trim_expired() -> int:
@@ -19028,11 +19081,11 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
             logger.warning("Gemini TTS failed, falling back to Edge TTS: %s", exc)
             provider_manager.record_failure("gemini", exc)
 
+    # Primary Provider: Hugging Face Khmer Space
     if _should_try_hf_khmer_tts(text, user_model):
-
         started = time.perf_counter()
         try:
-            audio = await _generate_voice_hf_space(text, speed, output_path)
+            audio = await asyncio.wait_for(_generate_voice_hf_space(text, speed, output_path), timeout=15.0)
             provider_manager.record_success(
                 "huggingface",
                 (time.perf_counter() - started) * 1_000,
@@ -19045,32 +19098,39 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
             if not cooldown_only:
                 _hf_tts_record_failure(exc)
                 logger.warning(
-                    "HF Khmer TTS unavailable; using Edge fallback user_model=%s cooldown_remaining=%ss: %s",
-                    user_model,
-                    _hf_tts_disabled_remaining_s(),
+                    "HF Khmer TTS unavailable (attempting Tier 2 Edge fallback): %s",
                     exc,
                 )
             else:
                 logger.info(
-                    "HF Khmer TTS skipped due to cooldown; user_model=%s edge fallback=%s cooldown_remaining=%ss",
-                    user_model,
-                    HF_TTS_EDGE_FALLBACK,
-                    _hf_tts_disabled_remaining_s(),
+                    "HF Khmer TTS cooling down; routing to Tier 2 Edge fallback."
                 )
-            if not HF_TTS_EDGE_FALLBACK:
-                raise RuntimeError(f"HF Khmer TTS failed and Edge fallback is disabled: {exc}") from exc
 
+    # Secondary Provider: Microsoft Edge TTS
     started = time.perf_counter()
     try:
-        audio = await _generate_voice_edge(text, gender, speed, output_path)
-    except Exception as exc:
-        provider_manager.record_failure("edge_tts", exc)
-        raise
-    provider_manager.record_success(
-        "edge_tts",
-        (time.perf_counter() - started) * 1_000,
-    )
-    return audio
+        audio = await asyncio.wait_for(_generate_voice_edge(text, gender, speed, output_path), timeout=30.0)
+        provider_manager.record_success(
+            "edge_tts",
+            (time.perf_counter() - started) * 1_000,
+        )
+        return audio
+    except Exception as edge_exc:
+        provider_manager.record_failure("edge_tts", edge_exc)
+        logger.warning("Edge TTS failed (%s). Attempting Tier 3 Gemini emergency audio fallback...", edge_exc)
+
+    # Tier 3 Emergency Provider: Google Gemini Multimodal Audio
+    if _gemini is not None:
+        try:
+            started = time.perf_counter()
+            audio = await asyncio.wait_for(_generate_voice_gemini(text, gender, speed, output_path), timeout=25.0)
+            provider_manager.record_success("gemini_emergency", (time.perf_counter() - started) * 1_000)
+            logger.info("Tier 3 Gemini Audio emergency fallback succeeded!")
+            return audio
+        except Exception as gemini_exc:
+            logger.error("All 3 TTS engines failed: HF, Edge (%s), and Gemini (%s)", edge_exc, gemini_exc)
+
+    raise RuntimeError(f"TTS synthesis failed across all providers: {edge_exc}")
 
 
 async def generate_voice_limited(text: str, gender: str, speed: float, output_path: str, tts_model: str = "auto") -> bytes:
@@ -26849,6 +26909,87 @@ async def _run_startup_background_checks() -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def db_run_periodic_pruning() -> dict[str, Any]:
+    """Prune conversation history older than 30 days and text_cache older than 14 days."""
+    if not supabase:
+        return {"ok": False, "reason": "no_supabase"}
+    
+    cutoff_history = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    cutoff_cache = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+    pruned_history = 0
+    pruned_cache = 0
+
+    try:
+        res = supabase.table("conversation_history").delete().lt("created_at", cutoff_history).execute()
+        pruned_history = len(getattr(res, "data", []) or [])
+    except Exception as exc:
+        logger.debug("Prune conversation_history failed: %s", exc)
+
+    try:
+        res = supabase.table("text_cache").delete().lt("created_at", cutoff_cache).execute()
+        pruned_cache = len(getattr(res, "data", []) or [])
+    except Exception as exc:
+        logger.debug("Prune text_cache failed: %s", exc)
+
+    logger.info("Database periodic pruning finished: %d history rows, %d text cache rows pruned.", pruned_history, pruned_cache)
+    return {
+        "ok": True,
+        "pruned_history": pruned_history,
+        "pruned_text_cache": pruned_cache,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _system_metrics_snapshot() -> dict[str, Any]:
+    """Capture live telemetry and system metrics."""
+    import sys
+    import platform
+    
+    process_uptime_s = time.time() - float(globals().get("_BOT_START_TIME", 0.0) or time.time())
+    
+    from app.services.ai.providers import get_provider_manager
+    pm = get_provider_manager()
+    provider_stats = pm.get_stats() if hasattr(pm, "get_stats") else {}
+
+    redis_connected = bool(redis_client is not None)
+    redis_ping_ms = None
+    if redis_connected:
+        try:
+            t0 = time.perf_counter()
+            redis_client.ping()
+            redis_ping_ms = round((time.perf_counter() - t0) * 1000, 2)
+        except Exception:
+            redis_connected = False
+
+    supabase_connected = bool(supabase is not None and not supabase_breaker.is_open())
+
+    return {
+        "ok": True,
+        "status": "healthy" if (supabase_connected or redis_connected) else "degraded",
+        "bot_mode": globals().get("BOT_MODE", "WEBHOOK"),
+        "version": "4.2.0-resilient",
+        "uptime_seconds": round(process_uptime_s, 1),
+        "python_version": sys.version.split()[0],
+        "platform": platform.platform(),
+        "storage": {
+            "redis_connected": redis_connected,
+            "redis_ping_ms": redis_ping_ms,
+            "supabase_connected": supabase_connected,
+            "supabase_circuit_open": supabase_breaker.is_open(),
+        },
+        "tts_audio_cache": {
+            "l1_memory_items": len(_TTS_AUDIO_CACHE),
+            "l1_memory_bytes": _TTS_AUDIO_CACHE_BYTES,
+            "ttl_seconds": TTS_AUDIO_CACHE_TTL_S,
+        },
+        "anti_spam": {
+            "active_cooldowns": len(getattr(_RATE_LIMIT_NOTICE_MEMORY, "_flood_cooldowns", {})),
+            "tracked_users": len(_RATE_LIMIT_NOTICE_MEMORY),
+        },
+        "providers": provider_stats,
+    }
+
+
 async def _async_main_once():
     global BOT_MODE
     load_dotenv()

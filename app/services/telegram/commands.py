@@ -190,6 +190,26 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @legacy_bound_handler
+async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Force release any stuck TTS locks or waiting queues for the user."""
+    user_id = update.effective_user.id
+    from app import legacy
+    if hasattr(legacy, "_release_tts_request"):
+        legacy._release_tts_request(user_id)
+    
+    # Also release user lock if needed
+    with getattr(legacy, "_user_locks_guard", threading.RLock()):
+        user_locks = getattr(legacy, "_user_locks", {})
+        if user_id in user_locks:
+            user_locks.pop(user_id, None)
+
+    await safe_send(lambda: update.message.reply_text(
+        "🔓 <b>ដោះសោរជោគជ័យ!</b>\n\nរាល់ការរង់ចាំ និងសោរដំណើរការចាស់របស់អ្នកត្រូវបានសម្អាតរួចរាល់។ អ្នកអាចផ្ញើសារថ្មីបានឥឡូវនេះ។",
+        parse_mode="HTML"
+    ))
+
+
+@legacy_bound_handler
 async def cmd_security(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not update.effective_message:
@@ -349,6 +369,49 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Telegram admin shortcut for the full bot health panel."""
     text = await _admin_health_text()
+    await safe_send(lambda: update.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=get_admin_dashboard_kb(),
+        disable_web_page_preview=True,
+    ))
+
+
+@legacy_bound_handler
+async def cmd_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Live System Metrics & Telemetry report for Admins."""
+    user = update.effective_user
+    if not user or not _is_admin(int(user.id)):
+        return
+
+    from app import legacy
+    snapshot = legacy._system_metrics_snapshot() if hasattr(legacy, "_system_metrics_snapshot") else {}
+    storage = snapshot.get("storage", {})
+    cache = snapshot.get("tts_audio_cache", {})
+    anti_spam = snapshot.get("anti_spam", {})
+
+    status_icon = "🟢" if snapshot.get("status") == "healthy" else "🟡"
+    redis_status = f"✅ Connected ({storage.get('redis_ping_ms')}ms)" if storage.get("redis_connected") else "❌ Offline"
+    supabase_status = "✅ Connected" if storage.get("supabase_connected") else "⚠️ Degraded"
+
+    uptime_m = round(float(snapshot.get("uptime_seconds", 0.0)) / 60.0, 1)
+
+    text = (
+        f"{status_icon} <b>ប្រព័ន្ធ Telemetry & Metrics (v{snapshot.get('version', '4.2.0')})</b>\n\n"
+        f"⏱️ Uptime: <b>{uptime_m} នាទី</b>\n"
+        f"🤖 Bot Mode: <b>{snapshot.get('bot_mode', 'WEBHOOK')}</b>\n\n"
+        f"🗄️ <b>Storage Layer:</b>\n"
+        f"• Redis L2 Cache: <b>{redis_status}</b>\n"
+        f"• Supabase Database: <b>{supabase_status}</b>\n\n"
+        f"🎵 <b>Audio Cache (L1/L2):</b>\n"
+        f"• Memory Items: <b>{cache.get('l1_memory_items', 0)}</b> ({round(cache.get('l1_memory_bytes', 0)/1024, 1)} KB)\n"
+        f"• Binary TTL: <b>{cache.get('ttl_seconds', 0)}s</b>\n\n"
+        f"🛡️ <b>Anti-Spam & Rate Limiter:</b>\n"
+        f"• Tracked Users: <b>{anti_spam.get('tracked_users', 0)}</b>\n"
+        f"• Active Cooldowns: <b>{anti_spam.get('active_cooldowns', 0)}</b>\n\n"
+        f"🌐 <i>REST API: <code>/system</code>, <code>/metrics</code></i>"
+    )
+
     await safe_send(lambda: update.message.reply_text(
         text,
         parse_mode="HTML",
@@ -734,5 +797,10 @@ __all__ = [
     'cmd_botsettings',
     'cmd_users',
     'cmd_chat',
-    'cmd_endchat'
+    'cmd_endchat',
+    'cmd_ask',
+    'cmd_translate',
+    'cmd_summary',
+    'cmd_unlock',
+    'cmd_system'
 ]

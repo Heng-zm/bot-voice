@@ -14,10 +14,12 @@ class TelegramOnlyRuntimeTests(unittest.TestCase):
         self.assertTrue(hasattr(bot_entrypoint, "app"))
 
 
-    def test_runtime_is_polling_only(self) -> None:
-        self.assertEqual("POLLING", legacy._run_state_bot_mode())
-        with self.assertRaisesRegex(RuntimeError, "removed"):
-            asyncio.run(legacy._switch_telegram_runtime_mode("WEBHOOK"))
+    def test_runtime_mode_switch(self) -> None:
+        mode = legacy._run_state_bot_mode()
+        self.assertIn(mode, {"POLLING", "WEBHOOK"})
+        with self.assertRaises(Exception):
+            asyncio.run(legacy._switch_telegram_runtime_mode("INVALID_MODE"))
+
 
     def test_startup_has_no_web_server_task(self) -> None:
         source = inspect.getsource(legacy._async_main_once)

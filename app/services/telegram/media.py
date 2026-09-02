@@ -614,6 +614,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+@legacy_bound_handler
 async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYPE, stripped: str, user_id: int):
     """Core TTS processing extracted from on_text so it can be called programmatically."""
     msg = update.effective_message
@@ -660,19 +661,26 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
         async with lock:
             if len(tts_text) > TTS_SINGLE_VOICE_MAX_CHARS:
                 uname = user.username or user.first_name or str(user_id)
-                sent_count, failed_count = await _deliver_paged_tts(
-                    chat_id=msg.chat_id,
-                    bot=context.bot,
-                    text=tts_text,
-                    gender=gender,
-                    speed=speed,
-                    user_id=user_id,
-                    username=uname,
-                    tts_model=tts_model,
-                    progress=progress,
-                    progress_start=25,
-                    progress_end=95,
-                )
+                import asyncio
+                try:
+                    sent_count, failed_count = await asyncio.wait_for(
+                        _deliver_paged_tts(
+                            chat_id=msg.chat_id,
+                            bot=context.bot,
+                            text=tts_text,
+                            gender=gender,
+                            speed=speed,
+                            user_id=user_id,
+                            username=uname,
+                            tts_model=tts_model,
+                            progress=progress,
+                            progress_start=25,
+                            progress_end=95,
+                        ),
+                        timeout=900.0, # 15 minutes for long documents
+                    )
+                except asyncio.TimeoutError:
+                    raise RuntimeError("ប្រតិបត្តិការចំណាយពេលយូរពេក (Timeout)។")
                 record_turn(user_id, "user", stripped)
                 record_turn(user_id, "assistant", tts_text[:CONV_CONTEXT_MAX_CHARS])
                 _set_last_tts(user_id)
@@ -690,17 +698,24 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
             file_path = _make_temp_ogg()
             await progress.update(35, "កំពុងបង្កើតសំឡេង", f"កំពុងប្រើ {model_label}។", force=True)
             generation_started = time.perf_counter()
-            audio_bytes = await generate_user_voice_limited(
-                tts_text,
-                gender,
-                speed,
-                file_path,
-                tts_model,
-                user_id=user_id,
-                bot=context.bot,
-                chat_id=msg.chat_id,
-                progress=progress,
-            )
+            import asyncio
+            try:
+                audio_bytes = await asyncio.wait_for(
+                    generate_user_voice_limited(
+                        tts_text,
+                        gender,
+                        speed,
+                        file_path,
+                        tts_model,
+                        user_id=user_id,
+                        bot=context.bot,
+                        chat_id=msg.chat_id,
+                        progress=progress,
+                    ),
+                    timeout=180.0,
+                )
+            except asyncio.TimeoutError:
+                raise RuntimeError("ការបង្កើតសំឡេងចំណាយពេលយូរពេក សូមព្យាយាមម្ដងទៀត។")
             _record_admin_usage(
                 user_id,
                 "tts_generation",

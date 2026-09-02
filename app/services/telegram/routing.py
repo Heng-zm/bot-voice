@@ -43,6 +43,11 @@ from app.services.telegram.commands import (
     cmd_users,
     on_help,
     on_start,
+    cmd_ask,
+    cmd_translate,
+    cmd_summary,
+    cmd_unlock,
+    cmd_system,
 )
 from app.services.telegram.guards import (
     _drop_stale_updates,
@@ -93,6 +98,13 @@ def register_telegram_handlers(application: Application, *, bot_mode: str) -> No
         ("users", cmd_users),
         ("chat", cmd_chat),
         ("endchat", cmd_endchat),
+        ("ask", cmd_ask),
+        ("translate", cmd_translate),
+        ("summary", cmd_summary),
+        ("unlock", cmd_unlock),
+        ("reset", cmd_unlock),
+        ("system", cmd_system),
+        ("metrics", cmd_system),
     )
     for command, callback in command_handlers:
         application.add_handler(CommandHandler(command, callback))

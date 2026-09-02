@@ -70,8 +70,8 @@ async def run_bot_async() -> None:
     default_model = get_default_tts_model()
     model_name = tts_model_label(default_model)
 
-    webhook_url = (os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
-    bot_mode = "WEBHOOK" if (os.environ.get("BOT_MODE", "").upper() == "WEBHOOK" or bool(webhook_url)) else "POLLING"
+    webhook_url = (os.environ.get("WEBHOOK_URL") or "").strip().rstrip("/")
+    bot_mode = "WEBHOOK" if os.environ.get("BOT_MODE", "").strip().upper() == "WEBHOOK" and webhook_url else "POLLING"
     secret_token = (os.environ.get("TELEGRAM_WEBHOOK_SECRET_TOKEN") or "").strip()
 
     print(
@@ -105,8 +105,16 @@ async def run_bot_async() -> None:
                         logger.warning("set_webhook flood control / retry (%ss): %s", delay, exc)
                         await asyncio.sleep(delay)
             else:
-                with suppress(Exception):
-                    await app.bot.delete_webhook(drop_pending_updates=False)
+                for attempt in range(5):
+                    try:
+                        await app.bot.delete_webhook(drop_pending_updates=False)
+                        break
+                    except Exception as exc:
+                        retry_after = getattr(exc, "retry_after", None)
+                        delay = (float(retry_after) + 0.5) if retry_after is not None else (attempt + 1.0)
+                        logger.warning("delete_webhook flood control / retry (%ss): %s", delay, exc)
+                        await asyncio.sleep(delay)
+
                 updater = getattr(app, "updater", None)
                 if updater is not None:
                     await updater.start_polling(

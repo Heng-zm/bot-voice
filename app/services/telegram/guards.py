@@ -20,14 +20,44 @@ from app.services.telegram.security import (
 async def _telegram_rate_limit_guard(update: Any, context: Any) -> None:
     if not isinstance(update, Update):
         return
+    user = getattr(update, "effective_user", None)
+    if user and _is_admin(int(user.id)):
+        # Admins are exempt from rate limiting to maintain uninterrupted emergency control
+        return
+
     key = _update_rate_limit_key(update)
-    allowed, _remaining = await _rate_limit_check(key, _run_state_user_rate_limit(), _run_state_user_rate_window())
+    now = time.monotonic()
+    
+    # 1. Check Anti-Flood Cooldown
+    with _RATE_LIMIT_MEMORY_THREAD_LOCK:
+        cooldown_until = getattr(_RATE_LIMIT_NOTICE_MEMORY, "_flood_cooldowns", {}).get(key, 0.0)
+        if now < cooldown_until:
+            _metric_inc("flood_blocked")
+            raise ApplicationHandlerStop
+
+    allowed, remaining = await _rate_limit_check(key, _run_state_user_rate_limit(), _run_state_user_rate_window())
     if allowed:
         return
+
     _metric_inc("rate_limited")
-    now = time.monotonic()
     should_send_notice = False
+    flood_detected = False
+
     with _RATE_LIMIT_MEMORY_THREAD_LOCK:
+        if not hasattr(_RATE_LIMIT_NOTICE_MEMORY, "_flood_cooldowns"):
+            _RATE_LIMIT_NOTICE_MEMORY._flood_cooldowns = {}
+        if not hasattr(_RATE_LIMIT_NOTICE_MEMORY, "_violation_counts"):
+            _RATE_LIMIT_NOTICE_MEMORY._violation_counts = {}
+
+        violations = _RATE_LIMIT_NOTICE_MEMORY._violation_counts.get(key, 0) + 1
+        _RATE_LIMIT_NOTICE_MEMORY._violation_counts[key] = violations
+
+        if violations >= 6:
+            # Excessive spam: trigger 45-second progressive cooldown
+            cooldown_s = min(300.0, 45.0 * (violations - 5))
+            _RATE_LIMIT_NOTICE_MEMORY._flood_cooldowns[key] = now + cooldown_s
+            flood_detected = True
+
         last = _RATE_LIMIT_NOTICE_MEMORY.get(key, 0.0)
         if now - last >= USER_RATE_LIMIT_NOTICE_COOLDOWN_S:
             _RATE_LIMIT_NOTICE_MEMORY[key] = now
@@ -39,11 +69,19 @@ async def _telegram_rate_limit_guard(update: Any, context: Any) -> None:
                         _RATE_LIMIT_NOTICE_MEMORY.pop(old_key, None)
                 while len(_RATE_LIMIT_NOTICE_MEMORY) > 10_000:
                     _RATE_LIMIT_NOTICE_MEMORY.pop(next(iter(_RATE_LIMIT_NOTICE_MEMORY)), None)
+
     if should_send_notice:
         msg = getattr(update, "effective_message", None)
         if msg is not None:
             with suppress(Exception):
-                await msg.reply_text(_runtime_admin_notice_text())
+                if flood_detected:
+                    await safe_send(lambda: msg.reply_text(
+                        "🛑 <b>ការផ្ញើសារលឿនពេក (Anti-Spam)</b>\n\n"
+                        "ប្រព័ន្ធបានដាក់ Cooldown បណ្តោះអាសន្ន ៤៥ វិនាទី។ សូមរង់ចាំបន្តិចមុនពេលផ្ញើសារបន្ទាប់។",
+                        parse_mode="HTML"
+                    ))
+                else:
+                    await safe_send(lambda: msg.reply_text(_runtime_admin_notice_text()))
     raise ApplicationHandlerStop
 
 
