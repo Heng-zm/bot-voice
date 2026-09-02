@@ -92,32 +92,49 @@ chmod +x deploy.sh
 
 ### ☁️ Option 3: Anajak Cloud (https://anajak.cloud/)
 
-#### A. On Anajak Cloud Linux VPS:
+#### 🚀 Method 1: 1-Click Automated VPS Script (Recommended)
+Log in to your Anajak Cloud VPS and run:
+```bash
+git clone https://github.com/Heng-zm/bot-voice.git
+cd bot-voice
+chmod +x anajak-deploy.sh
+./anajak-deploy.sh
+```
+*The script automatically provisions Docker, FFmpeg, creates `.env`, and launches both Bot Voice and Redis 7 in background containers.*
+
+#### 🐳 Method 2: Manual Docker Compose
 ```bash
 git clone https://github.com/Heng-zm/bot-voice.git
 cd bot-voice
 cp .env.example .env
+# Edit .env with your credentials: nano .env
 docker compose up -d --build
+docker compose logs -f
 ```
-
-#### B. On Anajak Cloud Bot Hosting Panel (Pterodactyl):
-1. **Upload Files**: Upload the project directory and `.env` via Web File Manager or SFTP.
-2. **Startup Tab**: Select **Python 3.11+** and set Startup Command to:
-   ```bash
-   ./start.sh
-   ```
-3. **Environment Tab**: Add the variable:
-   ```env
-   INSTALL_REQUIREMENTS_ON_START=true
-   ```
-4. Click **Start / Restart**.
 
 ---
 
-### ⚙️ Option 4: Linux Systemd Daemon (Native VPS Service)
+### 🌐 Option 4: Wasmer Edge (https://wasmer.io)
+
+Deploy globally to Wasmer Edge with zero server maintenance:
+```bash
+# 1. Install Wasmer CLI (if not already installed)
+curl https://get.wasmer.io -sSfL | sh
+
+# 2. Login to your Wasmer account
+wasmer login
+
+# 3. Deploy using the configured wasmer.toml
+wasmer deploy
+```
+*Wasmer will automatically package the container, deploy to the edge network, and expose your `/healthz`, `/system`, `/tts`, and Telegram Webhook endpoints globally.*
+
+---
+
+### ⚙️ Option 5: Linux Systemd Daemon (Native VPS Service)
 ```bash
 # 1. Copy service template
-sudo cp bot-voice.service.example /etc/systemd/system/bot-voice.service
+sudo cp bot-voice.service /etc/systemd/system/bot-voice.service
 
 # 2. Edit paths & user
 sudo nano /etc/systemd/system/bot-voice.service

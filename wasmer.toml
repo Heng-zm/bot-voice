@@ -1,0 +1,22 @@
+[package]
+name = "bot-voice"
+version = "4.2.0"
+description = "Next-Generation Multilingual Text-to-Speech, OCR & AI Assistant for Telegram"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Heng-zm/bot-voice"
+
+[[command]]
+name = "server"
+module = "Dockerfile"
+
+[package.metadata.app]
+domains = ["bot-voice.wasmer.app"]
+
+[package.metadata.app.scaling]
+min_replicas = 1
+max_replicas = 3
+
+[package.metadata.app.routing]
+port = 8080
+health_check_path = "/healthz"

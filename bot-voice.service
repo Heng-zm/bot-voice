@@ -1,0 +1,17 @@
+[Unit]
+Description=Bot Voice — Multilingual Telegram Voice & AI Assistant Suite
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/bot-voice
+EnvironmentFile=/opt/bot-voice/.env
+ExecStart=/opt/bot-voice/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 1
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
