@@ -611,8 +611,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await process_tts_for_text(update, context, stripped, user_id)
-    except BaseException:
-        pass
+    except Exception as err:
+        logger.warning("process_tts_for_text failed for user %s: %s", user_id, err)
 
 
 @legacy_bound_handler
@@ -620,7 +620,8 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
     """Core TTS processing extracted from on_text so it can be called programmatically."""
     msg = update.effective_message
     user = update.effective_user
-    if not msg or not user: return
+    if not msg or not user:
+        return
     try:
         _metric_inc("tts", user_id=user_id)
         sync_user_data(user)
@@ -679,8 +680,8 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
                         ),
                         timeout=900.0, # 15 minutes for long documents
                     )
-                except asyncio.TimeoutError:
-                    raise RuntimeError("ប្រតិបត្តិការចំណាយពេលយូរពេក (Timeout)។")
+                except TimeoutError as exc:
+                    raise RuntimeError("ប្រតិបត្តិការចំណាយពេលយូរពេក (Timeout)។") from exc
                 record_turn(user_id, "user", stripped)
                 record_turn(user_id, "assistant", tts_text[:CONV_CONTEXT_MAX_CHARS])
                 _set_last_tts(user_id)
@@ -713,8 +714,8 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
                     ),
                     timeout=180.0,
                 )
-            except asyncio.TimeoutError:
-                raise RuntimeError("ការបង្កើតសំឡេងចំណាយពេលយូរពេក សូមព្យាយាមម្ដងទៀត។")
+            except TimeoutError as exc:
+                raise RuntimeError("ការបង្កើតសំឡេងចំណាយពេលយូរពេក សូមព្យាយាមម្ដងទៀត។") from exc
             _record_admin_usage(
                 user_id,
                 "tts_generation",

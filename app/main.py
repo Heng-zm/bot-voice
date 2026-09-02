@@ -19,7 +19,7 @@ if __package__ in {None, ""}:
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
-from telegram import BotCommand, Update
+from telegram import BotCommand
 
 from app import legacy
 from app.utils.file_io import cleanup_files, make_temp_ogg
@@ -581,7 +581,7 @@ def main() -> None:
     import uvicorn
 
     port = int(os.environ.get("PORT", "8080"))
-    uvicorn.run("app.main:app", host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port, log_level="info")  # noqa: S104
 
 
 

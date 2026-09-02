@@ -51,7 +51,7 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "💬 <i>ផ្ញើសារ ឬសំណួររបស់អ្នកមកឥឡូវនេះបាន!</i>"
     )
-    from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⚙️ ការកំណត់ / Settings", callback_data="welcome_profile"),
          InlineKeyboardButton("🤖 ម៉ូដែល TTS", callback_data="show_tts_model")],
@@ -65,7 +65,8 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Directly ask Gemini AI a question and hear the answer in voice."""
     msg = update.effective_message
-    if not msg: return
+    if not msg:
+        return
     text = (msg.text or "").replace("/ask", "").strip()
     if not text:
         await safe_send(lambda: msg.reply_text("💡 សូមសរសេរសំណួររបស់អ្នកតាមក្រោយ /ask (ឧ. /ask តើ AI គឺជាអ្វី?)"))
@@ -92,14 +93,16 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from app.services.telegram.media import process_tts_for_text
         await process_tts_for_text(update, context, ai_text, update.effective_user.id)
     except Exception as exc:
-        await safe_send(lambda: msg.reply_text(f"❌ បរាជ័យ: {exc}"))
+        err_msg = f"❌ បរាជ័យ: {exc}"
+        await safe_send(lambda: msg.reply_text(err_msg))
 
 
 @legacy_bound_handler
 async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Translate text to Khmer and hear it out loud."""
     msg = update.effective_message
-    if not msg: return
+    if not msg:
+        return
     text = (msg.text or "").replace("/translate", "").strip()
     if not text:
         await safe_send(lambda: msg.reply_text("💡 សូមបញ្ចូលអត្ថបទដើម្បីបកប្រែ (ឧ. /translate Hello world)"))
@@ -122,14 +125,16 @@ async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from app.services.telegram.media import process_tts_for_text
         await process_tts_for_text(update, context, khmer_text, update.effective_user.id)
     except Exception as exc:
-        await safe_send(lambda: msg.reply_text(f"❌ បរាជ័យ: {exc}"))
+        err_msg = f"❌ បរាជ័យ: {exc}"
+        await safe_send(lambda: msg.reply_text(err_msg))
 
 
 @legacy_bound_handler
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Summarize long text into bullet points and hear them out loud."""
     msg = update.effective_message
-    if not msg: return
+    if not msg:
+        return
     text = (msg.text or "").replace("/summary", "").strip()
     if not text:
         await safe_send(lambda: msg.reply_text("💡 សូមបញ្ចូលអត្ថបទវែងៗដើម្បីសង្ខេប (ឧ. /summary ...អត្ថបទ...)"))
@@ -152,7 +157,8 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from app.services.telegram.media import process_tts_for_text
         await process_tts_for_text(update, context, summary_text, update.effective_user.id)
     except Exception as exc:
-        await safe_send(lambda: msg.reply_text(f"❌ បរាជ័យ: {exc}"))
+        err_msg = f"❌ បរាជ័យ: {exc}"
+        await safe_send(lambda: msg.reply_text(err_msg))
 
 
 @legacy_bound_handler

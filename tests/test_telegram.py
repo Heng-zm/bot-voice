@@ -17,7 +17,7 @@ class TelegramOnlyRuntimeTests(unittest.TestCase):
     def test_runtime_mode_switch(self) -> None:
         mode = legacy._run_state_bot_mode()
         self.assertIn(mode, {"POLLING", "WEBHOOK"})
-        with self.assertRaises(Exception):
+        with self.assertRaises(ValueError):
             asyncio.run(legacy._switch_telegram_runtime_mode("INVALID_MODE"))
 
 

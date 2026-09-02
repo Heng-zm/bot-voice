@@ -5,11 +5,10 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
-from app import legacy
-from app.services.telegram.guards import _telegram_rate_limit_guard
-from app.services.telegram.commands import cmd_system, cmd_unlock
-from app.main import app
 from fastapi.testclient import TestClient
+
+from app import legacy
+from app.main import app
 
 
 class TestRedisAudioCache(unittest.TestCase):
