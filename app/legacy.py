@@ -1858,15 +1858,15 @@ def _telegram_allowed_updates() -> list[str]:
     """
     raw = str(
         os.environ.get("TELEGRAM_ALLOWED_UPDATES")
-        or getattr(SETTINGS, "TELEGRAM_ALLOWED_UPDATES", "message,callback_query")
-        or "message,callback_query"
+        or getattr(SETTINGS, "TELEGRAM_ALLOWED_UPDATES", "message,edited_message,callback_query,channel_post")
+        or "message,edited_message,callback_query,channel_post"
     )
     allowed = []
     for item in raw.split(","):
         item = item.strip()
         if item and re.fullmatch(r"[a-z_]+", item) and item not in allowed:
             allowed.append(item)
-    return allowed or ["message", "callback_query"]
+    return allowed or ["message", "edited_message", "callback_query", "channel_post"]
 
 
 from app.services.telegram.deduplication import (
@@ -7607,7 +7607,7 @@ def _runtime_performance_snapshot(light: bool = False) -> dict:
             "user_rate_window_s": _run_state_user_rate_window(),
             "api_rate_limit": _run_state_api_rate_limit(),
             "api_rate_window_s": _run_state_api_rate_window(),
-            "allowed_updates": ["message", "callback_query"],
+            "allowed_updates": _telegram_allowed_updates(),
         },
         "semaphores": {
             "tts": _semaphore_snapshot(_TTS_CHUNK_SEMAPHORE, MAX_CONCURRENT_TTS_USERS),
@@ -10353,7 +10353,7 @@ def _is_retryable_store_error(exc: BaseException | str) -> bool:
     if any(word in msg for word in retryable_words):
         return True
     name = exc.__class__.__name__.lower() if not isinstance(exc, str) else ""
-    return any(word in name for word in ("timeout", "connection", "network"))
+    return any(word in name for word in ("timeout", "connection", "network", "protocol", "disconnect", "remote"))
 
 
 def retry_call_sync(
@@ -13924,8 +13924,11 @@ def db_user_is_blocked(user_id: int) -> bool:
         _blocked_cache_set(user_id, False)
         return False
     try:
-        res = supabase.table("blocked_users").select("user_id").eq("user_id", user_id).limit(1).execute()
-        blocked = bool(res.data)
+        def _fetch():
+            return supabase.table("blocked_users").select("user_id").eq("user_id", user_id).limit(1).execute()
+
+        res = db_call_sync(f"is_user_blocked:{user_id}", _fetch, default=None, attempts=2)
+        blocked = bool(getattr(res, "data", None))
         _blocked_cache_set(user_id, blocked)
         return blocked
     except Exception as e:
@@ -13977,6 +13980,29 @@ def db_user_set_blocked(user_id: int, admin_id: int, blocked: bool, reason: str 
             supabase.table("blocked_users").delete().eq("user_id", user_id).execute()
         return True, "saved"
     except Exception as e:
+        return False, str(e)
+
+
+def db_users_set_blocked_batch(records: list[dict[str, Any]]) -> tuple[bool, str]:
+    """Persist multiple blocked user records to Supabase in a single batch operation."""
+    if not records:
+        return True, "empty"
+    with _BLOCKED_USER_CACHE_LOCK:
+        for rec in records:
+            uid = int(rec.get("user_id", 0) or 0)
+            if uid:
+                _blocked_users_memory.add(uid)
+                _blocked_cache_set(uid, True)
+    if not supabase:
+        return True, "memory-only"
+    try:
+        chunk_size = 100
+        for i in range(0, len(records), chunk_size):
+            chunk = records[i:i + chunk_size]
+            supabase.table("blocked_users").upsert(chunk, on_conflict="user_id").execute()
+        return True, "saved"
+    except Exception as e:
+        logger.warning("db_users_set_blocked_batch error: %s", e)
         return False, str(e)
 
 
@@ -15057,7 +15083,7 @@ def _telegram_leader_acquire_sync() -> bool | None:
                     "telegram_leader_meta",
                     lambda: redis_client.set(meta_key, _json_dumps_fast(_telegram_leader_meta()).decode("utf-8"), ex=ttl),
                     default=False,
-                    attempts=1,
+                    attempts=2,
                     critical=False,
                 )
                 _TELEGRAM_LEADER_LAST_ERROR = ""
@@ -15180,7 +15206,7 @@ def _telegram_webhook_signature() -> tuple[Any, ...]:
         _run_state_bot_mode() if "_run_state_bot_mode" in globals() else str(globals().get("BOT_MODE", "WEBHOOK")),
         _runtime_webhook_base_url() if "_runtime_webhook_base_url" in globals() else str(globals().get("TELEGRAM_WEBHOOK_URL", "")),
         _runtime_webhook_secret_token() if "_runtime_webhook_secret_token" in globals() else str(globals().get("TELEGRAM_WEBHOOK_SECRET_TOKEN", "")),
-        tuple(_telegram_allowed_updates() if "_telegram_allowed_updates" in globals() else ["message", "callback_query"]),
+        tuple(_telegram_allowed_updates() if "_telegram_allowed_updates" in globals() else ["message", "edited_message", "callback_query", "channel_post"]),
     )
 
 
@@ -15504,7 +15530,7 @@ def db_sched_fetch_due(limit: int = _SCHED_DUE_LIMIT) -> list[dict]:
             .execute()
         ),
         default=None,
-        attempts=1,
+        attempts=2,
     )
     rows = list(getattr(res, "data", None) or [])
     return [r for r in rows if _sched_is_confirmed_pending(r)][: max(1, int(limit or _SCHED_DUE_LIMIT))]
@@ -15655,7 +15681,7 @@ def db_sched_mark_stale_sending_failed() -> int:
             .execute()
         ),
         default=None,
-        attempts=1,
+        attempts=2,
     )
     for row in list(getattr(sending_res, "data", None) or []):
         started_at = _sched_claim_time(row)
@@ -15703,7 +15729,7 @@ def db_sched_mark_stale_sending_failed() -> int:
             .execute()
         ),
         default=None,
-        attempts=1,
+        attempts=2,
     )
     changed += len(getattr(draft_res, "data", None) or [])
     return changed
@@ -15739,7 +15765,7 @@ def db_sched_fetch_admin_pending(admin_id: int) -> list[dict]:
                 .execute()
             ),
             default=None,
-            attempts=1,
+            attempts=2,
         )
         rows = list(getattr(res, "data", None) or [])
         rows = [r for r in rows if _sched_is_draft(r) or _sched_is_confirmed_pending(r)]
@@ -19135,20 +19161,14 @@ async def _generate_voice_gemini(text: str, gender: str, speed: float, output_pa
 
             audio_models = [
                 _run_state_gemini_audio_model(),
-                "gemini-2.5-flash-preview-tts",
-                "gemini-2.5-pro-preview-tts",
-                "gemini-3.1-flash-tts-preview",
-                "gemini-2.5-flash",
-                "gemini-2.0-flash",
                 "gemini-2.0-flash-exp",
             ]
-            # De-duplicate while preserving prioritization order
             unique_models: list[str] = []
             for m in audio_models:
                 if m and m not in unique_models:
                     unique_models.append(m)
 
-            for mdl in unique_models:
+            for mdl in unique_models[:2]:
                 try:
                     resp = _gemini.models.generate_content(
                         model=mdl,
@@ -19168,7 +19188,15 @@ async def _generate_voice_gemini(text: str, gender: str, speed: float, output_pa
             logger.warning("Gemini multimodal audio generation exception: %s", exc)
         return None
 
-    audio_bytes = await loop.run_in_executor(_AI_EXECUTOR, _call_gemini_audio_sync)
+    try:
+        audio_bytes = await asyncio.wait_for(
+            loop.run_in_executor(_AI_EXECUTOR, _call_gemini_audio_sync),
+            timeout=15.0,
+        )
+    except (TimeoutError, asyncio.TimeoutError):
+        logger.warning("Gemini audio generation timed out (>15s); falling back to Edge TTS.")
+        audio_bytes = None
+
     if audio_bytes:
         # Wrap raw PCM with standard 24kHz 16-bit mono WAV header if missing RIFF header
         if not audio_bytes.startswith(b"RIFF"):
@@ -19215,12 +19243,17 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
     if user_model == "gemini":
         started = time.perf_counter()
         try:
-            audio = await _generate_voice_gemini(text, gender, speed, output_path)
-            provider_manager.record_success("gemini", (time.perf_counter() - started) * 1_000)
-            return audio
+            audio = await asyncio.wait_for(
+                _generate_voice_gemini(text, gender, speed, output_path),
+                timeout=25.0,
+            )
+            if audio:
+                provider_manager.record_success("gemini", (time.perf_counter() - started) * 1_000)
+                return audio
         except Exception as exc:
             logger.warning("Gemini TTS failed, falling back to Edge TTS: %s", exc)
             provider_manager.record_failure("gemini", exc)
+        return await _generate_voice_edge(text, gender, speed, output_path)
 
     # Primary Provider: Hugging Face Khmer Space
     if _should_try_hf_khmer_tts(text, user_model):
@@ -21083,6 +21116,7 @@ async def _run_broadcast_to_all(
 
         sent = failed = 0
         sent_records: list[dict] = []
+        newly_blocked_records: list[dict[str, Any]] = []
 
         async def _send_one(uid: int) -> tuple[str, dict | None]:
             async with broadcast_semaphore:
@@ -21100,17 +21134,16 @@ async def _run_broadcast_to_all(
                         record = {"chat_id": int(uid), "message_id": message_id} if message_id else None
                         return "sent", record
                     except Forbidden as exc:
-                        await loop.run_in_executor(
-                            None,
-                            functools.partial(
-                                db_user_set_blocked,
-                                int(uid),
-                                int(admin_id),
-                                True,
-                                f"Telegram Forbidden during broadcast: {str(exc)[:180]}",
-                            ),
-                        )
-                        return "blocked", None
+                        with _BLOCKED_USER_CACHE_LOCK:
+                            _blocked_users_memory.add(int(uid))
+                        _blocked_cache_set(int(uid), True)
+                        blocked_record = {
+                            "user_id": int(uid),
+                            "admin_id": int(admin_id),
+                            "reason": f"Telegram Forbidden during broadcast: {str(exc)[:180]}",
+                            "blocked_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                        return "blocked", blocked_record
                     except RetryAfter as exc:
                         await asyncio.sleep(_retry_after_seconds(exc))
                         if attempt == 1:
@@ -21123,17 +21156,16 @@ async def _run_broadcast_to_all(
                             "bot can't initiate conversation",
                             "bot can’t initiate conversation",
                         )):
-                            await loop.run_in_executor(
-                                None,
-                                functools.partial(
-                                    db_user_set_blocked,
-                                    int(uid),
-                                    int(admin_id),
-                                    True,
-                                    f"Telegram unreachable during broadcast: {str(exc)[:180]}",
-                                ),
-                            )
-                            return "blocked", None
+                            with _BLOCKED_USER_CACHE_LOCK:
+                                _blocked_users_memory.add(int(uid))
+                            _blocked_cache_set(int(uid), True)
+                            blocked_record = {
+                                "user_id": int(uid),
+                                "admin_id": int(admin_id),
+                                "reason": f"Telegram unreachable during broadcast: {str(exc)[:180]}",
+                                "blocked_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                            return "blocked", blocked_record
                         logger.error("%s Telegram BadRequest uid=%s: %s", label, uid, exc)
                         return "failed", None
                     except Exception as exc:
@@ -21166,6 +21198,8 @@ async def _run_broadcast_to_all(
                         sent_records.append(record)
                 elif status == "blocked":
                     blocked += 1
+                    if isinstance(record, dict):
+                        newly_blocked_records.append(record)
                 else:
                     failed += 1
 
@@ -21179,6 +21213,12 @@ async def _run_broadcast_to_all(
             )
             if completed < total:
                 await asyncio.sleep(max(0.0, _run_state_broadcast_delay()))
+
+        if newly_blocked_records:
+            await loop.run_in_executor(
+                None,
+                functools.partial(db_users_set_blocked_batch, list(newly_blocked_records)),
+            )
 
         delete_job_id = _broadcast_sent_delete_register(admin_id, label, sent_records)
         delete_note = (

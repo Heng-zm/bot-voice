@@ -94,14 +94,19 @@ async def auto_setup_webhook(app_url: str) -> bool:
 
     secret_func = getattr(legacy, "_runtime_webhook_secret_token", None)
     secret = secret_func() if secret_func else (os.environ.get("TELEGRAM_WEBHOOK_SECRET_TOKEN") or "").strip()
+    allowed_updates_func = getattr(legacy, "_telegram_allowed_updates", None)
+    allowed_updates = (
+        allowed_updates_func()
+        if allowed_updates_func
+        else ["message", "edited_message", "callback_query", "channel_post"]
+    )
 
     for attempt in range(5):
         try:
             await app_instance.bot.set_webhook(
                 url=webhook_endpoint,
                 secret_token=secret or None,
-
-                allowed_updates=["message", "edited_message", "callback_query"],
+                allowed_updates=allowed_updates,
                 drop_pending_updates=False,
             )
             logger.info("Auto-captured and registered Telegram Webhook at %s", webhook_endpoint)
@@ -200,37 +205,43 @@ async def auto_register_all() -> dict[str, Any]:
 async def keep_awake() -> None:
     """Ping the public URL every 5 minutes to prevent Render Free Tier hibernation."""
     import httpx
-    
-    # Wait for server to fully start
-    await asyncio.sleep(60)
-    
-    async with httpx.AsyncClient() as client:
-        while True:
-            bot_mode = os.environ.get("BOT_MODE", "").strip().upper()
-            url = get_detected_webhook_url()
-            if url and bot_mode != "POLLING":
-                health_url = f"{url.rstrip('/')}/healthz"
-                try:
-                    await client.get(health_url, timeout=10.0)
-                    logger.debug("Keep-awake ping sent to %s", health_url)
-                except Exception as e:
-                    logger.debug("Keep-awake ping suppressed: %s", e)
-            
-            # Sleep for 10 minutes (Render sleeps after 15m)
-            await asyncio.sleep(600)
+
+    try:
+        # Wait for server to fully start
+        await asyncio.sleep(60)
+
+        async with httpx.AsyncClient() as client:
+            while True:
+                bot_mode = os.environ.get("BOT_MODE", "").strip().upper()
+                url = get_detected_webhook_url()
+                if url and bot_mode != "POLLING":
+                    health_url = f"{url.rstrip('/')}/healthz"
+                    try:
+                        await client.get(health_url, timeout=10.0)
+                        logger.debug("Keep-awake ping sent to %s", health_url)
+                    except Exception as e:
+                        logger.debug("Keep-awake ping suppressed: %s", e)
+
+                # Sleep for 10 minutes (Render sleeps after 15m)
+                await asyncio.sleep(600)
+    except asyncio.CancelledError:
+        logger.debug("keep_awake background task stopped cleanly.")
 
 
 async def periodic_database_pruner() -> None:
     """Run database cleanup every 24 hours."""
-    await asyncio.sleep(120)  # wait 2 minutes after startup
-    while True:
-        try:
-            if hasattr(legacy, "db_run_periodic_pruning"):
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, legacy.db_run_periodic_pruning)
-        except Exception as exc:
-            logger.warning("Periodic DB pruning error: %s", exc)
-        await asyncio.sleep(86400)
+    try:
+        await asyncio.sleep(120)  # wait 2 minutes after startup
+        while True:
+            try:
+                if hasattr(legacy, "db_run_periodic_pruning"):
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, legacy.db_run_periodic_pruning)
+            except Exception as exc:
+                logger.warning("Periodic DB pruning error: %s", exc)
+            await asyncio.sleep(86400)
+    except asyncio.CancelledError:
+        logger.debug("periodic_database_pruner background task stopped cleanly.")
 
 
 @asynccontextmanager
@@ -241,15 +252,15 @@ async def lifespan(app_instance: FastAPI) -> AsyncGenerator[None, None]:
     keep_awake_task = asyncio.create_task(keep_awake(), name="keep-awake")
     db_prune_task = asyncio.create_task(periodic_database_pruner(), name="db-pruner")
 
+    tasks = (db_prune_task, keep_awake_task, auto_reg_task, bot_task)
     try:
         yield
     finally:
-        db_prune_task.cancel()
-        keep_awake_task.cancel()
-        auto_reg_task.cancel()
-        bot_task.cancel()
-        with suppress(asyncio.CancelledError, Exception):
-            await bot_task
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            with suppress(asyncio.CancelledError, Exception):
+                await t
 
 
 app = FastAPI(

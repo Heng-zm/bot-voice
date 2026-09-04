@@ -94,7 +94,7 @@ async def run_bot_async() -> None:
                         await app.bot.set_webhook(
                             url=webhook_endpoint,
                             secret_token=secret_token or None,
-                            allowed_updates=["message", "edited_message", "callback_query"],
+                            allowed_updates=["message", "edited_message", "callback_query", "channel_post"],
                             drop_pending_updates=False,
                         )
                         logger.info("Telegram Webhook set successfully.")
@@ -118,7 +118,7 @@ async def run_bot_async() -> None:
                 updater = getattr(app, "updater", None)
                 if updater is not None:
                     await updater.start_polling(
-                        allowed_updates=["message", "edited_message", "callback_query"],
+                        allowed_updates=["message", "edited_message", "callback_query", "channel_post"],
                         drop_pending_updates=False,
                         bootstrap_retries=-1,
                         timeout=20,

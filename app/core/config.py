@@ -26,6 +26,7 @@ class AppSettings(BaseSettings):
     UPSTASH_VECTOR_REST_URL: str = ""
     UPSTASH_VECTOR_REST_TOKEN: str = ""
     PORT: int = 8080
+    TELEGRAM_ALLOWED_UPDATES: str = "message,edited_message,callback_query,channel_post"
 
     CHANNEL_NARRATOR_ENABLED: bool = True
     CHANNEL_NARRATOR_GENDER: str = "female"

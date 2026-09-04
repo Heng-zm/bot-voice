@@ -20,6 +20,10 @@ from app.services.telegram.security import (
 async def _telegram_rate_limit_guard(update: Any, context: Any) -> None:
     if not isinstance(update, Update):
         return
+    # Channel posts are managed broadcasts by channel administrators/editors;
+    # do not throttle them under standard user DM rate-limits.
+    if getattr(update, "channel_post", None) is not None:
+        return
     user = getattr(update, "effective_user", None)
     if user and _is_admin(int(user.id)):
         # Admins are exempt from rate limiting to maintain uninterrupted emergency control

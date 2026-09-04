@@ -712,10 +712,28 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
                         chat_id=msg.chat_id,
                         progress=progress,
                     ),
-                    timeout=180.0,
+                    timeout=45.0,
                 )
-            except TimeoutError as exc:
-                raise RuntimeError("ការបង្កើតសំឡេងចំណាយពេលយូរពេក សូមព្យាយាមម្ដងទៀត។") from exc
+            except Exception as exc:
+                logger.warning(
+                    "Primary voice generation failed/timed out (%s); activating fast emergency Edge-TTS fallback...",
+                    exc,
+                )
+                with suppress(Exception):
+                    await progress.update(
+                        60,
+                        "កំពុងដំណើរការសំឡេងបម្រុង",
+                        "កំពុងប្រើប្រាស់ Edge-TTS ល្បឿនលឿន...",
+                        force=True,
+                    )
+                try:
+                    audio_bytes = await asyncio.wait_for(
+                        _generate_voice_edge(tts_text, gender, speed, file_path),
+                        timeout=20.0,
+                    )
+                except Exception as fallback_exc:
+                    logger.error("Emergency Edge-TTS fallback failed: %s", fallback_exc)
+                    raise RuntimeError("ការបង្កើតសំឡេងចំណាយពេលយូរពេក សូមព្យាយាមម្ដងទៀត។") from fallback_exc
             _record_admin_usage(
                 user_id,
                 "tts_generation",

@@ -85,6 +85,14 @@ class TestChannelNarrator(unittest.TestCase):
             else:
                 os.environ.pop("ALLOWED_CHANNEL_IDS", None)
 
+    def test_clean_channel_text_truncates_at_latin_sentence(self):
+        base_sentence = "This is a breaking news report from the capital city. "
+        long_text = base_sentence * 50
+        cleaned = clean_channel_text(long_text, max_chars=400)
+        self.assertLessEqual(len(cleaned), 405)
+        self.assertTrue(cleaned.endswith("…"))
+        self.assertTrue("." in cleaned)
+
 
 if __name__ == "__main__":
     unittest.main()

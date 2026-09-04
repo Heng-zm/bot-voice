@@ -22,13 +22,15 @@
 | Domain | Capabilities |
 | :--- | :--- |
 | 🗣️ **Text-to-Speech (TTS)** | High-speed Edge TTS & Hugging Face Kiri Space integration. Supports **Khmer**, English, Chinese, Korean, Japanese, Hindi, Malay, Indonesian, Filipino, and Arabic. |
-| 🔍 **Image OCR** | Instant text extraction from photos, documents, and screenshots using Google Gemini multimodal vision. |
+| 📢 **Channel Auto-Voice Narrator** | Automatically synthesizes studio-grade voice note narration for Telegram channel posts (text & captions) with smart URL/delimiter cleaning, sentence-level cuts, `#notts` opt-out tags, and whitelist control. |
+| 📄 **PDF & Document Voice Synthesis** | Reads `.pdf` documents uploaded by users, transcribes text using Gemini Multimodal Vision, and outputs interactive voice playback. |
+| 🔍 **Image OCR** | Instant text extraction from photos, documents, and screenshots using Google Gemini multimodal vision with automatic model fallback (`gemini-2.0-flash`). |
 | 🎙️ **Voice & Audio Transcription** | Transcribes Telegram voice notes and uploaded audio files (`.mp3`, `.wav`, `.m4a`, `.ogg`) into text. |
 | 🎵 **Audio to Voice Note** | Converts standard MP3/audio files into native Telegram Opus voice message bubbles. |
 | 🎛️ **Live Admin Controls (`/admin`)** | Full in-app control panel for maintenance mode, feature toggles, performance tuning, and CRM user lookups. |
-| 📢 **Broadcast Engine** | Instant broadcasts, scheduled announcements (Phnom Penh UTC+7), daily recurrence, and template libraries. |
-| ⚡ **Zero-Disk Streaming** | In-memory FFmpeg Opus encoding (`pipe:1`) with VoIP low-latency compression and SHA-256 LRU audio caching. |
-| 🛡️ **Security & Privacy** | Rate limiting, brute-force protection, admin fallback lockout prevention, and complete `/deleteme` GDPR purge. |
+| 📢 **Broadcast Engine** | Instant broadcasts, scheduled announcements (Phnom Penh UTC+7), daily recurrence, and bulk blocked-user persistence (99% Supabase API savings). |
+| ⚡ **Zero-Disk Streaming & Caching** | In-memory FFmpeg Opus encoding (`pipe:1`) with VoIP low-latency compression and SHA-256 LRU audio caching. |
+| 🛡️ **Self-Healing Infrastructure** | 4-tier resilient speech fallback (HF $\to$ Edge $\to$ Gemini $\to$ Emergency Edge), idle database reconnection recovery (`RemoteProtocolError` resilience), and rate limits. |
 
 ---
 
@@ -170,22 +172,34 @@ Manage every aspect of your bot dynamically from Telegram without editing `.env`
 
 ```mermaid
 flowchart TD
-    User([👤 Telegram User]) <-->|Long Polling| TG[🤖 Telegram Bot Engine]
+    User([👤 Telegram User / DM]) <-->|Webhook / Polling| TG[🤖 Telegram Gateway]
+    Channel([📢 Public Channel Post]) -->|channel_post| TG
     
     subgraph "Core Domain Services"
-        TG --> Router[🚦 Security Guard & Router]
-        Router --> TTS[🗣️ TTS & Voice Pipeline]
-        Router --> OCR[🔍 Vision & OCR Service]
-        Router --> STT[🎙️ Transcribe Engine]
-        Router --> Admin[🎛️ Admin & Broadcast Scheduler]
+        TG --> Guard[🚦 Security Guard & Anti-Spam Shield]
+        Guard --> Router{Dispatcher}
+        Router --> TTS[🗣️ Resilient 4-Tier TTS Pipeline]
+        Router --> ChanNarrator[📢 Channel Auto-Voice Narrator]
+        Router --> OCR[🔍 Vision & PDF Document OCR]
+        Router --> STT[🎙️ Transcribe & Speech Engine]
+        Router --> Admin[🎛️ Admin CRM & Broadcast Scheduler]
+        
+        ChanNarrator -->|Sanitized Text| TTS
     end
     
-    subgraph "High-Performance Layer"
-        TTS --> Cache[(💾 In-Memory Audio Cache)]
-        TTS --> FFmpeg[⚡ In-Memory FFmpeg pipe:1]
-        Admin --> DB[(🗄️ Supabase Cloud DB)]
-        OCR --> Gemini[✨ Gemini 2.0 Flash]
-        STT --> Gemini
+    subgraph "Multi-Tier Resilient TTS Engine"
+        TTS --> T1[Tier 1: Hugging Face Khmer Space]
+        T1 -.->|Timeout / Cooldown| T2[Tier 2: Microsoft Edge TTS]
+        T2 -.->|Language / Retry| T3[Tier 3: Google Gemini Multimodal]
+        T3 -.->|Timeout >15s / Error| T4[Tier 4: Emergency Fast Edge Fallback]
+    end
+    
+    subgraph "High-Performance Persistence & Cache"
+        T1 & T2 & T3 & T4 --> Cache[(💾 In-Memory Audio Cache SHA-256)]
+        T1 & T2 & T3 & T4 --> FFmpeg[⚡ In-Memory FFmpeg Opus pipe:1]
+        Admin & Guard --> DB[(🗄️ Supabase PostgreSQL - Auto Reconnect)]
+        Admin & Guard --> Redis[(⚡ Redis 7 - Distributed Locks & Telemetry)]
+        OCR & STT --> Gemini[✨ Google Gemini 2.0 Flash API]
     end
 ```
 
@@ -202,7 +216,7 @@ bot-voice/
 │   ├── services/                     # Domain Services Architecture
 │   │   ├── ai/                       # AI, Multimodal Vision & Embeddings
 │   │   │   ├── gemini.py             # Google Gemini client & auto-fallback (2.0/1.5)
-│   │   │   ├── ocr.py                # Multi-provider Vision OCR pipeline
+│   │   │   ├── ocr.py                # Multi-provider Vision OCR & PDF pipeline
 │   │   │   ├── language.py           # Fast regex + langdetect language detection
 │   │   │   ├── providers.py          # Provider interfaces & routing
 │   │   │   └── vector_store.py       # Upstash / Supabase Vector similarity search
@@ -213,11 +227,12 @@ bot-voice/
 │   │   ├── telegram/                 # Modular Telegram Bot System
 │   │   │   ├── buttons.py            # Inline keyboard layouts & UI builders
 │   │   │   ├── callbacks.py          # Inline button callback queries & state machine
+│   │   │   ├── channel.py            # Channel Auto-Voice Narrator & text cleaning
 │   │   │   ├── commands.py           # Command handlers (/ask, /tts, /admin, /help)
 │   │   │   ├── deduplication.py      # Update deduplication & idempotency
 │   │   │   ├── flow.py               # Conversational flow helpers
-│   │   │   ├── guards.py             # Rate limits, flood control & cooldowns
-│   │   │   ├── media.py              # Voice, photo, audio & document handlers
+│   │   │   ├── guards.py             # Rate limits, flood control & channel protection
+│   │   │   ├── media.py              # Voice, photo, audio, document & PDF handlers
 │   │   │   ├── routing.py            # Central Telegram handler registration
 │   │   │   ├── security.py           # Admin authentication & privilege enforcement
 │   │   │   └── workloads.py          # Background worker tasks & audio rendering
@@ -237,6 +252,7 @@ bot-voice/
 │   └── main.py                       # FastAPI application & REST API endpoints
 ├── tests/                            # Comprehensive Automated Test Suite
 │   ├── test_backend_services.py      # Core service unit tests
+│   ├── test_channel_narrator.py      # Channel narrator & audio text cleaning tests
 │   ├── test_startup_script.py        # Startup script validation
 │   ├── test_system_upgrades.py       # API & webhook regression tests
 │   ├── test_telegram.py              # Telegram command & message tests
