@@ -254,6 +254,45 @@ class GeminiServicesTests(unittest.TestCase):
         self.assertTrue(is_retryable_gemini_error("temporarily overloaded"))
         self.assertFalse(is_retryable_gemini_error("Invalid API Key"))
 
+    def test_generate_content_with_fallback_on_503_or_404(self) -> None:
+        from unittest.mock import MagicMock
+
+        from app.services.ai.gemini import generate_content_with_fallback
+
+        mock_client = MagicMock()
+        attempts = []
+
+        def mock_generate_content(model, contents, **kwargs):
+            attempts.append(model)
+            if model == "preferred-model":
+                raise RuntimeError("503 The model is overloaded. Please try again later.")
+            return MagicMock(text="Success from fallback model")
+
+        mock_client.models.generate_content.side_effect = mock_generate_content
+
+        resp = generate_content_with_fallback(
+            client=mock_client,
+            contents="test prompt",
+            preferred_model="preferred-model",
+        )
+        self.assertEqual("Success from fallback model", resp.text)
+        self.assertEqual(["preferred-model", "gemini-2.0-flash"], attempts[:2])
+
+    def test_generate_content_with_fallback_raises_on_unrecoverable(self) -> None:
+        from unittest.mock import MagicMock
+
+        from app.services.ai.gemini import generate_content_with_fallback
+
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = PermissionError("Permission denied: invalid token")
+
+        with self.assertRaises(PermissionError):
+            generate_content_with_fallback(
+                client=mock_client,
+                contents="test prompt",
+                preferred_model="gemini-2.0-flash",
+            )
+
 
 class VectorStoreServicesTests(unittest.TestCase):
     def test_vector_store_initialization(self) -> None:

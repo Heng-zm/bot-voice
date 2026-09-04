@@ -6,7 +6,10 @@ import logging
 import os
 from typing import Any
 
-import httpx
+try:
+    import httpx
+except (ImportError, ModuleNotFoundError):
+    httpx = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +47,7 @@ class UpstashVectorStore:
         metadata: dict[str, Any] | None = None,
     ) -> bool:
         """Upsert a single vector or raw text data (with Upstash auto-embedding)."""
-        if not self.is_configured:
+        if not self.is_configured or httpx is None:
             return False
 
         payload: dict[str, Any] = {"id": str(id)}
@@ -68,7 +71,7 @@ class UpstashVectorStore:
 
     async def upsert_many(self, documents: list[dict[str, Any]]) -> bool:
         """Upsert multiple documents/vectors in a batch."""
-        if not self.is_configured or not documents:
+        if not self.is_configured or not documents or httpx is None:
             return False
 
         endpoint = f"{self.url}/upsert-data" if any("data" in doc for doc in documents) else f"{self.url}/upsert"
@@ -92,7 +95,7 @@ class UpstashVectorStore:
         include_vectors: bool = False,
     ) -> list[dict[str, Any]]:
         """Query similar vectors using raw text query (auto-embedded) or dense vector."""
-        if not self.is_configured:
+        if not self.is_configured or httpx is None:
             return []
 
         payload: dict[str, Any] = {
@@ -122,7 +125,7 @@ class UpstashVectorStore:
 
     async def delete(self, ids: list[str]) -> bool:
         """Delete vectors by ID."""
-        if not self.is_configured or not ids:
+        if not self.is_configured or not ids or httpx is None:
             return False
 
         endpoint = f"{self.url}/delete"
@@ -136,7 +139,7 @@ class UpstashVectorStore:
 
     async def info(self) -> dict[str, Any] | None:
         """Retrieve index statistics (vector count, dimension, capacity)."""
-        if not self.is_configured:
+        if not self.is_configured or httpx is None:
             return None
 
         endpoint = f"{self.url}/info"

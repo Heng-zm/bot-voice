@@ -28,10 +28,17 @@ from app.services.ai.providers import (
     configure_default_providers,
     get_provider_manager,
 )
-from app.services.ai.vector_store import (
-    UpstashVectorStore,
-    get_global_vector_store,
-)
+
+try:
+    from app.services.ai.vector_store import (
+        UpstashVectorStore,
+        get_global_vector_store,
+    )
+except (ImportError, ModuleNotFoundError):
+    UpstashVectorStore = None  # type: ignore[assignment,misc]
+
+    def get_global_vector_store():  # type: ignore[misc]
+        return None
 
 __all__ = [
     "GEMINI_MODEL_DEFAULT",

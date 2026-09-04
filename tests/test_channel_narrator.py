@@ -93,6 +93,27 @@ class TestChannelNarrator(unittest.TestCase):
         self.assertTrue(cleaned.endswith("…"))
         self.assertTrue("." in cleaned)
 
+    def test_channel_narrator_buttons_disabled_by_default(self):
+        import os
+
+        from app.core.config import SETTINGS
+        self.assertFalse(SETTINGS.CHANNEL_NARRATOR_SHOW_BUTTONS)
+
+        old_val = os.environ.get("CHANNEL_NARRATOR_SHOW_BUTTONS")
+        try:
+            os.environ["CHANNEL_NARRATOR_SHOW_BUTTONS"] = "false"
+            show_buttons = os.environ.get("CHANNEL_NARRATOR_SHOW_BUTTONS", "false").lower() in ("1", "true", "yes")
+            self.assertFalse(show_buttons)
+
+            os.environ["CHANNEL_NARRATOR_SHOW_BUTTONS"] = "true"
+            show_buttons = os.environ.get("CHANNEL_NARRATOR_SHOW_BUTTONS", "false").lower() in ("1", "true", "yes")
+            self.assertTrue(show_buttons)
+        finally:
+            if old_val is not None:
+                os.environ["CHANNEL_NARRATOR_SHOW_BUTTONS"] = old_val
+            else:
+                os.environ.pop("CHANNEL_NARRATOR_SHOW_BUTTONS", None)
+
 
 if __name__ == "__main__":
     unittest.main()

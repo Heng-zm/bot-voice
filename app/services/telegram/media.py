@@ -740,10 +740,18 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
                 duration_ms=(time.perf_counter() - generation_started) * 1_000,
             )
             await progress.update(88, "បានបង្កើតសំឡេង", "កំពុងផ្ញើសារសំឡេងទៅអ្នក។", force=True)
+            chat_type = str(getattr(msg.chat, "type", "private") or "private").lower()
+            is_channel_or_group = chat_type in ("channel", "group", "supergroup") or int(msg.chat_id) < 0
+            allow_channel_buttons = (
+                os.environ.get("CHANNEL_NARRATOR_SHOW_BUTTONS", "false").lower() in ("1", "true", "yes")
+                or (bot_setting_bool_cached("channel_narrator_show_buttons", False) if "bot_setting_bool_cached" in globals() else False)
+            )
+            voice_markup = get_main_kb(gender, tts_model) if (not is_channel_or_group or allow_channel_buttons) else None
+
             sent_msg = await safe_send(lambda ab=audio_bytes: msg.reply_voice(
                 voice=io.BytesIO(ab),
                 caption=f"🗣️ {BOT_TAG}",
-                reply_markup=get_main_kb(gender, tts_model),
+                reply_markup=voice_markup,
             ))
             if sent_msg is None:
                 raise RuntimeError("Telegram មិនអាចផ្ញើសារសំឡេងបាន។")

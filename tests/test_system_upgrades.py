@@ -5,12 +5,20 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
-from fastapi.testclient import TestClient
+try:
+    from fastapi.testclient import TestClient
 
-from app import legacy
-from app.main import app
+    from app import legacy
+    from app.main import app
+    HAS_SERVER_DEPS = True
+except (ImportError, ModuleNotFoundError):
+    TestClient = None  # type: ignore[assignment,misc]
+    legacy = None  # type: ignore[assignment]
+    app = None  # type: ignore[assignment]
+    HAS_SERVER_DEPS = False
 
 
+@unittest.skipUnless(HAS_SERVER_DEPS, "Requires full server dependencies")
 class TestRedisAudioCache(unittest.TestCase):
     def setUp(self):
         legacy._TTS_AUDIO_CACHE.clear()
@@ -53,6 +61,7 @@ class TestRedisAudioCache(unittest.TestCase):
             self.assertIn(cache_key, legacy._TTS_AUDIO_CACHE)
 
 
+@unittest.skipUnless(HAS_SERVER_DEPS, "Requires full server dependencies")
 class TestSystemMetricsSnapshot(unittest.TestCase):
     def test_metrics_snapshot_structure(self):
         snapshot = legacy._system_metrics_snapshot()
@@ -72,6 +81,7 @@ class TestSystemMetricsSnapshot(unittest.TestCase):
         self.assertIn("supabase_connected", storage)
 
 
+@unittest.skipUnless(HAS_SERVER_DEPS, "Requires full server dependencies")
 class TestDatabasePruning(unittest.TestCase):
     def test_pruning_without_supabase_returns_gracefully(self):
         with patch.object(legacy, "supabase", None):
@@ -97,6 +107,7 @@ class TestDatabasePruning(unittest.TestCase):
             self.assertIn("pruned_text_cache", res)
 
 
+@unittest.skipUnless(HAS_SERVER_DEPS, "Requires full server dependencies")
 class TestFastAPISystemEndpoints(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
@@ -121,6 +132,7 @@ class TestFastAPISystemEndpoints(unittest.TestCase):
         self.assertTrue(data.get("ok"))
 
 
+@unittest.skipUnless(HAS_SERVER_DEPS, "Requires full server dependencies")
 class TestAntiSpamAndUnlock(unittest.TestCase):
     def setUp(self):
         legacy._tts_request_reservations.clear()

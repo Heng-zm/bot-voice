@@ -186,10 +186,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if isinstance(update, Update) and update.effective_message:
-        with suppress(Exception):
-            await safe_send(lambda: update.effective_message.reply_text(
-                "⚠️ មានបញ្ហាបច្ចេកទេស។ Bot នៅដំណើរការ — សូមព្យាយាមម្តងទៀត។"
-            ))
+        chat = getattr(update, "effective_chat", None)
+        if getattr(chat, "type", None) != "channel":
+            with suppress(Exception):
+                await safe_send(lambda: update.effective_message.reply_text(
+                    "⚠️ មានបញ្ហាបច្ចេកទេស។ Bot នៅដំណើរការ — សូមព្យាយាមម្តងទៀត។"
+                ))
 
 
 __all__ = [

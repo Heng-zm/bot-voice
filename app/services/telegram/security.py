@@ -6,8 +6,12 @@ import asyncio
 import threading
 import time
 from contextlib import suppress
+from typing import Any
 
-from telegram import Update
+try:
+    from telegram import Update
+except (ImportError, ModuleNotFoundError):
+    Update = Any  # type: ignore[assignment,misc]
 
 from app._legacy_bridge import legacy_module
 

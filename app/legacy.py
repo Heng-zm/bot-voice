@@ -19658,12 +19658,18 @@ async def _deliver_paged_tts(
                     chat_id=chat_id,
                     progress=progress,
                 )
+                is_group_or_channel = int(chat_id) < 0
+                allow_channel_buttons = (
+                    os.environ.get("CHANNEL_NARRATOR_SHOW_BUTTONS", "false").lower() in ("1", "true", "yes")
+                    or (bot_setting_bool_cached("channel_narrator_show_buttons", False) if "bot_setting_bool_cached" in globals() else False)
+                )
+                voice_markup = get_main_kb(gender, model) if (not is_group_or_channel or allow_channel_buttons) else None
                 sent = await safe_send(
-                    lambda ab=audio_bytes, ci=i, ct=total: bot.send_voice(
+                    lambda ab=audio_bytes, ci=i, ct=total, vm=voice_markup: bot.send_voice(
                         chat_id=chat_id,
                         voice=io.BytesIO(ab),
                         caption=f"🗣️ {BOT_TAG}  [{ci}/{ct}]",
-                        reply_markup=get_main_kb(gender, model),
+                        reply_markup=vm,
                     )
                 )
                 if sent is None:
@@ -26650,11 +26656,17 @@ async def _regenerate_tts_voice_with_progress(
                 progress=progress,
             )
             await progress.update(88, "បានបង្កើតសំឡេង", "កំពុងផ្ញើសារសំឡេងថ្មី។", force=True)
+            is_group_or_channel = int(chat_id) < 0
+            allow_channel_buttons = (
+                os.environ.get("CHANNEL_NARRATOR_SHOW_BUTTONS", "false").lower() in ("1", "true", "yes")
+                or (bot_setting_bool_cached("channel_narrator_show_buttons", False) if "bot_setting_bool_cached" in globals() else False)
+            )
+            voice_markup = get_main_kb(gender, tts_model) if (not is_group_or_channel or allow_channel_buttons) else None
             new_msg = await safe_send(lambda ab=audio_bytes: context.bot.send_voice(
                 chat_id=chat_id,
                 voice=io.BytesIO(ab),
                 caption=f"🗣️ {BOT_TAG}",
-                reply_markup=get_main_kb(gender, tts_model),
+                reply_markup=voice_markup,
             ))
             if new_msg is None:
                 raise RuntimeError("Telegram មិនអាចផ្ញើសារសំឡេងបាន។")

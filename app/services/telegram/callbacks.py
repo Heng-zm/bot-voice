@@ -760,6 +760,30 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    chat = getattr(query.message, "chat", None) if query.message else None
+    chat_type = str(getattr(chat, "type", "private") or "private").lower()
+    if (
+        chat
+        and (chat_type in ("channel", "group", "supergroup") or int(chat.id) < 0)
+        and action in ("gender", "speed", "tts_model", "show_speed", "hide_speed", "show_tts_model", "hide_tts_model")
+    ):
+        is_authorized = False
+        if "_is_admin" in globals() and _is_admin(user_id):
+            is_authorized = True
+        else:
+            try:
+                member = await context.bot.get_chat_member(chat_id=chat.id, user_id=user_id)
+                is_authorized = getattr(member, "status", "") in ("creator", "administrator")
+            except Exception:
+                is_authorized = False
+        if not is_authorized:
+            with suppress(Exception):
+                await query.answer(
+                    "⛔ មានតែអ្នកគ្រប់គ្រង Channel/Group ប៉ុណ្ណោះដែលអាចកែប្រែការកំណត់សំឡេងបាន។",
+                    show_alert=True,
+                )
+            return
+
     with suppress(Exception):
         await query.answer()
 

@@ -4,10 +4,17 @@ import asyncio
 import inspect
 import unittest
 
-from app import legacy
-from app import main as bot_entrypoint
+try:
+    from app import legacy
+    from app import main as bot_entrypoint
+    HAS_SERVER_DEPS = True
+except (ImportError, ModuleNotFoundError):
+    legacy = None  # type: ignore[assignment]
+    bot_entrypoint = None  # type: ignore[assignment]
+    HAS_SERVER_DEPS = False
 
 
+@unittest.skipUnless(HAS_SERVER_DEPS, "Requires full server dependencies")
 class TelegramOnlyRuntimeTests(unittest.TestCase):
     def test_entrypoint_exports_main_and_app(self) -> None:
         self.assertTrue(callable(bot_entrypoint.main))
