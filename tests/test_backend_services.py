@@ -447,7 +447,7 @@ class CoreConfigTests(unittest.TestCase):
 
         self.assertIsInstance(SETTINGS, AppSettings)
 
-        self.assertEqual(SETTINGS.GEMINI_MODEL, "gemini-2.5-flash")
+        self.assertEqual(SETTINGS.GEMINI_MODEL, "gemini-2.0-flash")
 
 
 class FileIOServicesTests(unittest.TestCase):

@@ -3019,9 +3019,11 @@ async def ai_assistant():
             contents = _build_gemini_contents(message, history, image_data, audio_data, image_mime, audio_mime)
 
             def _generate_audio_reply():
-                return _gemini.models.generate_content(
-                    model=GEMINI_MODEL,
+                from app.services.ai.gemini import generate_content_with_fallback
+                return generate_content_with_fallback(
+                    client=_gemini,
                     contents=contents,
+                    preferred_model=GEMINI_MODEL,
                     config=_ai_gen_config(),
                 )
 
@@ -3080,10 +3082,11 @@ async def ai_transcribe():
         return _ai_cors(_ai_error("Audio too large (max 50 MB)."))
 
     from google.genai import types as _gtypes
+    from app.services.ai.gemini import generate_content_with_fallback
 
     def _transcribe_audio():
-        return _gemini.models.generate_content(
-            model=GEMINI_MODEL,
+        return generate_content_with_fallback(
+            client=_gemini,
             contents=[
                 _gtypes.Part.from_bytes(data=audio_data, mime_type=audio_mime),
                 (
@@ -3093,6 +3096,7 @@ async def ai_transcribe():
                     "preserve its original script."
                 ),
             ],
+            preferred_model=GEMINI_MODEL,
         )
 
     try:
@@ -9585,6 +9589,8 @@ async def _telegram_start_polling_runtime(app_obj: Any) -> bool:
         await updater.start_polling(
             allowed_updates=_telegram_allowed_updates(),
             drop_pending_updates=_telegram_polling_drop_pending_updates(),
+            bootstrap_retries=-1,
+            timeout=20,
         )
         _TELEGRAM_POLLING_ACTIVE = True
         ACTIVE_POLLING_TASK = asyncio.create_task(_telegram_polling_task_guard(app_obj), name="telegram-polling-guard")
@@ -9987,7 +9993,7 @@ ADMIN_IDS:  set[int]    = set()
 # These are real code defaults, not required Render/env values.  Operators can
 # still override them with env variables, but a missing OCR_PROVIDER,
 # OCR_AUTO_PREFER_PROVIDER, or GEMINI_MODEL now boots with Gemini OCR selected.
-DEFAULT_GEMINI_MODEL             = "gemini-2.5-flash"  # change this one line if you want another default Gemini model
+DEFAULT_GEMINI_MODEL             = "gemini-2.0-flash"  # change this one line if you want another default Gemini model
 DEFAULT_GEMINI_AUDIO_MODEL       = "gemini-2.5-flash-preview-tts"  # default Gemini TTS audio model
 DEFAULT_AI_PROVIDER              = "gemini"            # gemini | hf
 DEFAULT_OCR_PROVIDER             = "gemini"            # gemini | auto | hf
@@ -11597,15 +11603,35 @@ def ask_gemini_ocr(image_data: bytes, mime_type: str = "image/jpeg") -> str:
         "and Japanese exactly. Keep useful line breaks. If there is no readable text, "
         "output only NOTEXT. Do not describe the image and do not add explanations."
     )
-    response = _gemini.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[
-            _gtypes.Part.from_bytes(data=image_data, mime_type=mime_type or "image/jpeg"),
-            prompt,
-        ],
-    )
-    text = (response.text or "").strip()
-    return text or "NOTEXT"
+    models_to_try = [GEMINI_MODEL, "gemini-2.0-flash", "gemini-1.5-flash"]
+    unique_models: list[str] = []
+    for m in models_to_try:
+        if m and m not in unique_models:
+            unique_models.append(m)
+
+    last_err: Exception | None = None
+    for mdl in unique_models:
+        try:
+            response = _gemini.models.generate_content(
+                model=mdl,
+                contents=[
+                    _gtypes.Part.from_bytes(data=image_data, mime_type=mime_type or "image/jpeg"),
+                    prompt,
+                ],
+            )
+            text = (response.text or "").strip()
+            return text or "NOTEXT"
+        except Exception as exc:
+            last_err = exc
+            err_msg = str(exc)
+            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower():
+                logger.warning("Gemini OCR model %s quota exhausted (429); falling back to next model...", mdl)
+                continue
+            raise exc
+
+    if last_err:
+        raise last_err
+    return "NOTEXT"
 
 
 def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tuple[str, str, str]:
@@ -11731,9 +11757,11 @@ def ai_text_reply(prompt: str, history: list[dict] | None = None) -> tuple[str, 
             image_mime="",
             audio_mime="",
         )
-        response = _gemini.models.generate_content(
-            model=GEMINI_MODEL,
+        from app.services.ai.gemini import generate_content_with_fallback
+        response = generate_content_with_fallback(
+            client=_gemini,
             contents=contents,
+            preferred_model=GEMINI_MODEL,
             config=_ai_gen_config(),
         )
         tokens_used = None
@@ -13477,6 +13505,7 @@ BOT_FEATURE_SETTING_KEYS: tuple[str, ...] = (
     "audio_transcribe_enabled",
     "audio_to_voice_enabled",
     "ai_resolver_enabled",
+    "channel_narrator_enabled",
 )
 
 BOT_PERFORMANCE_SETTING_SPECS: OrderedDict[str, dict[str, Any]] = OrderedDict([
@@ -13509,6 +13538,7 @@ BOT_SETTING_DEFAULTS: dict[str, str] = {
     "audio_transcribe_enabled": "1",
     "audio_to_voice_enabled": "1",
     "ai_resolver_enabled": "1",
+    "channel_narrator_enabled": "1",
     **{key: str(_perf_default(key, spec.get("default", ""))) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 BOT_SETTING_LABELS: dict[str, str] = {
@@ -13519,6 +13549,7 @@ BOT_SETTING_LABELS: dict[str, str] = {
     "audio_transcribe_enabled": "🎵 Audio File Transcribe",
     "audio_to_voice_enabled": "🎙️ MP3/Audio → Voice Record",
     "ai_resolver_enabled": "🧠 AI Text Resolver",
+    "channel_narrator_enabled": "📢 Channel Voice Narrator",
     **{key: str(spec.get("label", key)) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 BOT_SETTING_DESCRIPTIONS: dict[str, str] = {
@@ -13529,6 +13560,7 @@ BOT_SETTING_DESCRIPTIONS: dict[str, str] = {
     "audio_transcribe_enabled": "Allow uploaded audio-file transcription.",
     "audio_to_voice_enabled": "Convert uploaded MP3/audio files to Telegram OGG/Opus voice records.",
     "ai_resolver_enabled": "Allow AI to rewrite/resolve text before TTS when enabled by env.",
+    "channel_narrator_enabled": "Automatically narrates channel text and captions to voice notes.",
     **{key: str(spec.get("help", "")) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 BOT_SETTING_LABELS["maintenance_message"] = "Maintenance Message"
@@ -14680,8 +14712,13 @@ async def resolve_tts_text(
 
     async def _guarded_call():
         async with semaphore:
+            from app.services.ai.gemini import generate_content_with_fallback
             def _call():
-                return _gemini.models.generate_content(model=GEMINI_MODEL, contents=combined)
+                return generate_content_with_fallback(
+                    client=_gemini,
+                    contents=combined,
+                    preferred_model=GEMINI_MODEL,
+                )
             return await loop.run_in_executor(_AI_EXECUTOR, _call)
 
     try:
@@ -19133,6 +19170,20 @@ async def _generate_voice_gemini(text: str, gender: str, speed: float, output_pa
 
     audio_bytes = await loop.run_in_executor(_AI_EXECUTOR, _call_gemini_audio_sync)
     if audio_bytes:
+        # Wrap raw PCM with standard 24kHz 16-bit mono WAV header if missing RIFF header
+        if not audio_bytes.startswith(b"RIFF"):
+            try:
+                import io, wave
+                wav_io = io.BytesIO()
+                with wave.open(wav_io, "wb") as wav_file:
+                    wav_file.setnchannels(1)
+                    wav_file.setsampwidth(2)
+                    wav_file.setframerate(24000)
+                    wav_file.writeframes(audio_bytes)
+                audio_bytes = wav_io.getvalue()
+            except Exception as w_exc:
+                logger.debug("WAV header wrapping exception for Gemini PCM: %s", w_exc)
+
         with tempfile.TemporaryDirectory(prefix="gemini_tts_") as tmpdir:
             raw_path = os.path.join(tmpdir, "gemini_raw.wav")
             await asyncio.to_thread(_write_file_bytes_sync, raw_path, audio_bytes)
@@ -19288,10 +19339,12 @@ async def _gemini_generate_with_retry(
     for attempt in range(1, attempts + 1):
         try:
             async with semaphore:
+                from app.services.ai.gemini import generate_content_with_fallback
                 def _call():
-                    return _gemini.models.generate_content(
-                        model=GEMINI_MODEL,
+                    return generate_content_with_fallback(
+                        client=_gemini,
                         contents=contents,
+                        preferred_model=GEMINI_MODEL,
                     )
 
                 return await asyncio.wait_for(
@@ -21233,7 +21286,9 @@ def _ok_bad(ok: bool, ok_text: str = "OK", bad_text: str = "OFF") -> str:
 
 
 def _strip_html_tags(value: Any) -> str:
-    text = re.sub(r"<[^>]+>", "", str(value or ""))
+    if value is None:
+        return ""
+    text = re.sub(r"<[^>]+>", "", str(value))
     return html.unescape(text)
 
 
@@ -21609,11 +21664,9 @@ def _admin_report_lines(data: dict[str, Any]) -> list[str]:
         f"Supabase: {'ON' if data.get('supabase_on') else 'OFF'}",
         f"Redis: {'ON' if data.get('redis_on') else 'OFF'}",
         f"FFmpeg: {'OK' if data.get('ffmpeg_ok') else 'ERROR'}",
-        f"Temp: {'OK' if data.get('temp_ok') else 'ERROR'} ({data.get('temp_count')} files) {data.get('temp_dir')}",
-        f"Bot mode: {data.get('bot_mode')}",
-        f"Webhook ready: {'YES' if data.get('webhook_ready') else 'NO'}",
+        f"Temp: {'OK' if data.get('temp_ok') else 'ERROR'} ({data.get('temp_count', 0)} files) {data.get('temp_dir')}",
+        f"Telegram service: {'Ready' if data.get('webhook_ready') else 'Not ready'} (mode={data.get('bot_mode')}, leader={leader.get('owner') or 'unknown'})",
         f"Uptime: {data.get('uptime')}",
-        f"Telegram leader owner: {leader.get('owner') or 'unknown'}",
         "",
         "Counts",
         f"Users: {counts.get('users', 0)}",
@@ -21629,10 +21682,12 @@ def _admin_report_lines(data: dict[str, Any]) -> list[str]:
         "Runtime Metrics Since Restart",
     ]
     for key in sorted(metrics):
-        lines.append(f"{key}: {metrics.get(key)}")
+        lines.append(f"{key}: {metrics.get(key, 0)}")
     lines.extend(["", "Feature Settings"])
     for key in BOT_FEATURE_SETTING_KEYS:
-        lines.append(f"{key}: {settings.get(key, BOT_SETTING_DEFAULTS.get(key, ''))}")
+        enabled = _setting_bool_from(settings, key, default=False if key == "maintenance_mode" else True)
+        val_text = ("Active (ON)" if enabled else "Disabled (OFF)") if key == "maintenance_mode" else ("Enabled" if enabled else "Disabled")
+        lines.append(f"{key}: {val_text}")
     lines.extend(["", "Performance Runtime Settings"])
     for key in BOT_PERFORMANCE_SETTING_SPECS:
         value = run_state.get(key, BOT_SETTING_DEFAULTS.get(key, _perf_default(key, "")))
@@ -21835,6 +21890,7 @@ def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
             textColor=primary_dark,
             spaceBefore=12,
             spaceAfter=7,
+            keepWithNext=True,
         ))
         styles.add(ParagraphStyle(
             name="SmallMuted",
@@ -21853,12 +21909,22 @@ def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
             textColor=ink,
         ))
         styles.add(ParagraphStyle(
+            name="TableTextCenter",
+            parent=styles["TableText"],
+            alignment=TA_CENTER,
+        ))
+        styles.add(ParagraphStyle(
             name="TableHead",
             parent=styles["BodyText"],
             fontName=bold_font,
             fontSize=8.5,
             leading=11,
             textColor=colors.white,
+        ))
+        styles.add(ParagraphStyle(
+            name="TableHeadCenter",
+            parent=styles["TableHead"],
+            alignment=TA_CENTER,
         ))
         styles.add(ParagraphStyle(
             name="CardLabel",
@@ -21887,12 +21953,22 @@ def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
             textColor=good,
         ))
         styles.add(ParagraphStyle(
+            name="StatusGoodCenter",
+            parent=styles["StatusGood"],
+            alignment=TA_CENTER,
+        ))
+        styles.add(ParagraphStyle(
             name="StatusBad",
             parent=styles["BodyText"],
             fontName=bold_font,
             fontSize=8.5,
             leading=11,
             textColor=warn,
+        ))
+        styles.add(ParagraphStyle(
+            name="StatusBadCenter",
+            parent=styles["StatusBad"],
+            alignment=TA_CENTER,
         ))
         styles.add(ParagraphStyle(
             name="RightMuted",
@@ -22177,75 +22253,90 @@ def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
             story.append(KeepTogether([section("Activity Graph"), graph]))
 
         analytics_rows = [
-            [P("Report Window", "TableHead"), P("Schedules", "TableHead"), P("Sent", "TableHead"), P("Failed", "TableHead"), P("Blocked", "TableHead"), P("Delivery Rate", "TableHead")],
+            [
+                P("Report Window", "TableHead"),
+                P("Schedules", "TableHeadCenter"),
+                P("Sent", "TableHeadCenter"),
+                P("Failed", "TableHeadCenter"),
+                P("Blocked", "TableHeadCenter"),
+                P("Delivery Rate", "TableHeadCenter"),
+            ],
             [
                 P(report_range_label, limit=95),
-                P(analytics.get("total_schedules", 0)),
-                P(analytics.get("sent", 0)),
-                P(analytics.get("failed", 0)),
-                P(analytics.get("blocked", 0)),
-                P(f"{analytics.get('delivery_rate', 0)}%"),
+                P(analytics.get("total_schedules", 0), "TableTextCenter"),
+                P(analytics.get("sent", 0), "TableTextCenter"),
+                P(analytics.get("failed", 0), "TableTextCenter"),
+                P(analytics.get("blocked", 0), "TableTextCenter"),
+                P(f"{analytics.get('delivery_rate', 0)}%", "TableTextCenter"),
             ],
         ]
         if analytics.get("error"):
-            analytics_rows.append([P("Data warning", "StatusBad"), P("-"), P("-"), P("-"), P("-"), P(analytics.get("error"), "StatusBad", limit=80)])
+            analytics_rows.append([P("Data warning", "StatusBad"), P("-", "TableTextCenter"), P("-", "TableTextCenter"), P("-", "TableTextCenter"), P("-", "TableTextCenter"), P(analytics.get("error"), "StatusBad", limit=80)])
         story.append(table(analytics_rows, [doc.width * 0.34, doc.width * 0.13, doc.width * 0.13, doc.width * 0.12, doc.width * 0.12, doc.width * 0.16]))
 
+        bot_mode = str(data.get("bot_mode") or "").strip().upper()
+        bot_service_name = "Telegram Polling" if bot_mode == "POLLING" else ("Telegram Webhook" if bot_mode == "WEBHOOK" else "Telegram Service")
         status_rows = [
             [P("Service", "TableHead"), P("Status", "TableHead"), P("Details", "TableHead")],
             [P("Supabase"), P(_report_bool_label(data.get("supabase_on"), "Connected", "Offline"), "StatusGood" if data.get("supabase_on") else "StatusBad"), P("Database-backed features and settings storage")],
             [P("Redis"), P(_report_bool_label(data.get("redis_on"), "Connected", "Offline"), "StatusGood" if data.get("redis_on") else "StatusBad"), P("Runtime state, locks, cache, and queue helpers")],
             [P("FFmpeg"), P(_report_bool_label(data.get("ffmpeg_ok"), "Available", "Missing"), "StatusGood" if data.get("ffmpeg_ok") else "StatusBad"), P("Video/audio processing dependency")],
-            [P("Temp folder"), P(_report_bool_label(data.get("temp_ok"), "Writable", "Problem"), "StatusGood" if data.get("temp_ok") else "StatusBad"), P(f"{data.get('temp_count')} temp files | {_report_pdf_text(data.get('temp_dir'), 85)}")],
-            [P("Webhook"), P(_report_bool_label(data.get("webhook_ready"), "Ready", "Not ready"), "StatusGood" if data.get("webhook_ready") else "StatusBad"), P(f"Bot mode: {_report_pdf_text(data.get('bot_mode'))} | Leader: {_report_pdf_text(leader.get('owner') or 'unknown', 70)}")],
+            [P("Temp folder"), P(_report_bool_label(data.get("temp_ok"), "Writable", "Problem"), "StatusGood" if data.get("temp_ok") else "StatusBad"), P(f"{data.get('temp_count', 0)} temp files | {_report_pdf_text(data.get('temp_dir'), 85)}")],
+            [P(bot_service_name), P(_report_bool_label(data.get("webhook_ready"), "Ready", "Not ready"), "StatusGood" if data.get("webhook_ready") else "StatusBad"), P(f"Bot mode: {_report_pdf_text(data.get('bot_mode'))} | Leader: {_report_pdf_text(leader.get('owner') or 'unknown', 70)}")],
         ]
         story.append(KeepTogether([section("System Health"), table(status_rows, [33 * mm, 31 * mm, doc.width - 64 * mm])]))
 
         schedule_rows = [
-            [P("Metric", "TableHead"), P("Value", "TableHead"), P("Note", "TableHead")],
-            [P("Blocked users"), P(counts.get("blocked", 0)), P("Users currently blocked by admin tools")],
-            [P("Sending jobs"), P(counts.get("sending", 0)), P("Broadcasts or scheduled jobs currently marked sending")],
-            [P("Failed jobs"), P(counts.get("failed", 0)), P("Jobs that need admin review or retry")],
-            [P("Settings DB"), P("OK" if data.get("settings_db_ok") else "Fallback", "StatusGood" if data.get("settings_db_ok") else "StatusBad"), P("Whether bot settings loaded from Supabase")],
+            [P("Metric", "TableHead"), P("Value", "TableHeadCenter"), P("Note", "TableHead")],
+            [P("Blocked users"), P(counts.get("blocked", 0), "TableTextCenter"), P("Users currently blocked by admin tools")],
+            [P("Sending jobs"), P(counts.get("sending", 0), "TableTextCenter"), P("Broadcasts or scheduled jobs currently marked sending")],
+            [P("Failed jobs"), P(counts.get("failed", 0), "TableTextCenter"), P("Jobs that need admin review or retry")],
+            [P("Settings DB"), P("OK" if data.get("settings_db_ok") else "Fallback", "StatusGoodCenter" if data.get("settings_db_ok") else "StatusBadCenter"), P("Whether bot settings loaded from Supabase")],
         ]
         story.append(KeepTogether([section("Operations Summary"), table(schedule_rows, [40 * mm, 28 * mm, doc.width - 68 * mm])]))
 
-        metric_rows = [[P("Metric", "TableHead"), P("Value", "TableHead")]]
+        metric_rows = [[P("Metric", "TableHead"), P("Value", "TableHeadCenter")]]
         for key in sorted(metrics):
-            metric_rows.append([P(key, limit=70), P(metrics.get(key), limit=90)])
+            val = metrics.get(key)
+            if val is None:
+                val = 0
+            metric_rows.append([P(key, limit=70), P(val, "TableTextCenter", limit=90)])
         if len(metric_rows) == 1:
-            metric_rows.append([P("No metrics captured"), P("-")])
-        story.append(section("Runtime Metrics Since Restart"))
-        story.append(table(metric_rows, [doc.width * 0.58, doc.width * 0.42]))
+            metric_rows.append([P("No metrics captured"), P("-", "TableTextCenter")])
+        story.append(KeepTogether([section("Runtime Metrics Since Restart"), table(metric_rows, [doc.width * 0.58, doc.width * 0.42])]))
 
-        feature_rows = [[P("Feature", "TableHead"), P("Current Value", "TableHead")]]
+        feature_rows = [[P("Feature", "TableHead"), P("Current Value", "TableHeadCenter")]]
         for key in BOT_FEATURE_SETTING_KEYS:
-            feature_rows.append([P(key, limit=75), P(settings.get(key, BOT_SETTING_DEFAULTS.get(key, "")), limit=95)])
-        story.append(section("Feature Settings"))
-        story.append(table(feature_rows, [doc.width * 0.55, doc.width * 0.45]))
+            enabled = _setting_bool_from(settings, key, default=False if key == "maintenance_mode" else True)
+            if key == "maintenance_mode":
+                val_text = "Active (ON)" if enabled else "Disabled (OFF)"
+                val_style = "StatusBadCenter" if enabled else "StatusGoodCenter"
+            else:
+                val_text = "Enabled" if enabled else "Disabled"
+                val_style = "StatusGoodCenter" if enabled else "StatusBadCenter"
+            feature_rows.append([P(key, limit=75), P(val_text, val_style)])
+        story.append(KeepTogether([section("Feature Settings"), table(feature_rows, [doc.width * 0.55, doc.width * 0.45])]))
 
-        perf_rows = [[P("Setting", "TableHead"), P("Current Value", "TableHead")]]
+        perf_rows = [[P("Setting", "TableHead"), P("Current Value", "TableHeadCenter")]]
         for key in BOT_PERFORMANCE_SETTING_SPECS:
             value = run_state.get(key, BOT_SETTING_DEFAULTS.get(key, _perf_default(key, "")))
-            perf_rows.append([P(key, limit=75), P(value, limit=95)])
-        story.append(section("Performance Runtime Settings"))
-        story.append(table(perf_rows, [doc.width * 0.62, doc.width * 0.38]))
+            perf_rows.append([P(key, limit=75), P(value, "TableTextCenter", limit=95)])
+        story.append(KeepTogether([section("Performance Runtime Settings"), table(perf_rows, [doc.width * 0.62, doc.width * 0.38])]))
 
-        error_rows = [[P("Time", "TableHead"), P("Level", "TableHead"), P("Source", "TableHead"), P("Message", "TableHead")]]
+        error_rows = [[P("Time", "TableHead"), P("Level", "TableHeadCenter"), P("Source", "TableHead"), P("Message", "TableHead")]]
         if not recent_errors:
-            error_rows.append([P("-"), P("OK", "StatusGood"), P("System"), P("No recent errors captured.")])
+            error_rows.append([P("-"), P("OK", "StatusGoodCenter"), P("System"), P("No recent errors captured.")])
         else:
             for item in recent_errors[:12]:
                 level = _report_pdf_text(item.get("level", ""), 20)
-                style = "StatusBad" if level.upper() in {"ERROR", "CRITICAL"} else "TableText"
+                style = "StatusBadCenter" if level.upper() in {"ERROR", "CRITICAL"} else "TableTextCenter"
                 error_rows.append([
                     P(item.get("ts", ""), limit=42),
                     P(level, style),
                     P(item.get("source", ""), limit=45),
                     P(item.get("message", ""), limit=160),
                 ])
-        story.append(section("Recent Errors"))
-        story.append(table(error_rows, [32 * mm, 21 * mm, 31 * mm, doc.width - 84 * mm]))
+        story.append(KeepTogether([section("Recent Errors"), table(error_rows, [32 * mm, 21 * mm, 31 * mm, doc.width - 84 * mm])]))
 
         story.append(Spacer(1, 10))
         story.append(Paragraph(
@@ -24837,11 +24928,12 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = int(msg.chat_id)
     document = msg.document
     filename = document.file_name or ""
+    is_pdf = bool(filename and filename.lower().endswith(".pdf")) or (document.mime_type == "application/pdf")
 
-    if not _is_subtitle_file(filename):
+    if not _is_subtitle_file(filename) and not is_pdf:
         await safe_send(lambda: msg.reply_text(
             "❌ ឯកសារប្រភេទនេះមិនទាន់ត្រូវបានគាំទ្រទេ។\n\n"
-            "ប្រភេទឯកសារដែលគាំទ្រ៖\n• .srt\n• .vtt\n• .txt"
+            "ប្រភេទឯកសារដែលគាំទ្រ៖\n• .pdf (ឯកសារ PDF)\n• .srt\n• .vtt\n• .txt"
         ))
         return
 
@@ -24849,10 +24941,10 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot=context.bot,
         chat_id=chat_id,
         reply_target=msg,
-        title="កំពុងអានឯកសារចំណងជើងរង/អត្ថបទ",
+        title="កំពុងអានឯកសារ PDF" if is_pdf else "កំពុងអានឯកសារចំណងជើងរង/អត្ថបទ",
         percent=5,
         stage="កំពុងពិនិត្យឯកសារ",
-        detail=filename or "ឯកសារអត្ថបទ",
+        detail=filename or ("ឯកសារ PDF" if is_pdf else "ឯកសារអត្ថបទ"),
     )
     try:
         if document.file_size and document.file_size > MAX_SUBTITLE_BYTES:
@@ -24865,11 +24957,35 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tg_file = await context.bot.get_file(document.file_id)
         file_bytes = await _download_telegram_file_to_bytes(tg_file, MAX_SUBTITLE_BYTES)
 
-        await progress.update(45, "បានទាញយកឯកសារ", "កំពុងស្គាល់ការអ៊ិនកូដ និងបម្លែងទៅអត្ថបទ។", force=True)
-        raw_text = _decode_text_bytes(file_bytes)
+        if is_pdf:
+            await progress.update(45, "កំពុងស្រង់អត្ថបទពី PDF", "កំពុងអានអត្ថបទដោយប្រើ Google Gemini AI...", force=True)
+            if _gemini is None:
+                raise RuntimeError("Gemini API មិនទាន់បានបើកដំណើរការទេ។")
+            from google.genai import types as _gtypes
+            from app.services.ai.gemini import generate_content_with_fallback
+            loop = asyncio.get_running_loop()
+            preferred_m = getattr(globals().get("legacy", None), "GEMINI_MODEL", None) or GEMINI_MODEL or "gemini-2.0-flash"
+            def _extract_pdf():
+                prompt = (
+                    "Extract all readable text from this PDF document. Preserve Khmer, English, and other languages accurately. "
+                    "Keep useful line breaks. Return only the extracted text without extra explanations or summaries."
+                )
+                return generate_content_with_fallback(
+                    client=_gemini,
+                    contents=[
+                        _gtypes.Part.from_bytes(data=file_bytes, mime_type="application/pdf"),
+                        prompt,
+                    ],
+                    preferred_model=preferred_m,
+                )
+            pdf_resp = await loop.run_in_executor(None, _extract_pdf)
+            cleaned = (getattr(pdf_resp, "text", "") or "").strip()
+        else:
+            await progress.update(45, "បានទាញយកឯកសារ", "កំពុងស្គាល់ការអ៊ិនកូដ និងបម្លែងទៅអត្ថបទ។", force=True)
+            raw_text = _decode_text_bytes(file_bytes)
+            await progress.update(70, "កំពុងសម្អាតអត្ថបទ", "កំពុងដកលេខពេលវេលា និងស្លាកចំណងជើងរង។", force=True)
+            cleaned = _clean_subtitle_text(raw_text)
 
-        await progress.update(70, "កំពុងសម្អាតអត្ថបទ", "កំពុងដកលេខពេលវេលា និងស្លាកចំណងជើងរង។", force=True)
-        cleaned = _clean_subtitle_text(raw_text)
         if not cleaned:
             await progress.fail("❌ មិនមានអត្ថបទដែលអាចអានបានក្នុងឯកសារនេះទេ។")
             return
@@ -24885,11 +25001,12 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             username=user.username or user.first_name,
         )
         set_last_tts_text(user_id, cleaned)
-        record_turn(user_id, "user", f"[subtitle file] {filename}")
+        record_turn(user_id, "user", f"[{'pdf file' if is_pdf else 'subtitle file'}] {filename}")
         record_turn(user_id, "assistant", cleaned[:CONV_CONTEXT_MAX_CHARS])
 
+        doc_type = "ឯកសារ PDF" if is_pdf else "ឯកសារ"
         result = (
-            "🎬 <b>បានអានឯកសាររួចរាល់</b>\n\n"
+            f"🎬 <b>បានអាន{doc_type}រួចរាល់</b>\n\n"
             f"📄 ឯកសារ៖ <code>{html.escape(filename)}</code>\n"
             f"🔤 ចំនួនតួអក្សរ៖ <b>{len(cleaned)}</b>\n\n"
             f"<blockquote>{html.escape(preview)}</blockquote>\n\n"

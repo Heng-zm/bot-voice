@@ -17,7 +17,7 @@ class AppSettings(BaseSettings):
     TELEGRAM_BOT_TOKEN: str = ""
     ADMIN_IDS: str = ""
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_MODEL: str = "gemini-2.0-flash"
     HF_TOKEN: str = ""
     SUPABASE_URL: str = ""
     SUPABASE_KEY: str = ""
@@ -26,6 +26,13 @@ class AppSettings(BaseSettings):
     UPSTASH_VECTOR_REST_URL: str = ""
     UPSTASH_VECTOR_REST_TOKEN: str = ""
     PORT: int = 8080
+
+    CHANNEL_NARRATOR_ENABLED: bool = True
+    CHANNEL_NARRATOR_GENDER: str = "female"
+    CHANNEL_NARRATOR_SPEED: float = 1.0
+    CHANNEL_NARRATOR_MODEL: str = "auto"
+    CHANNEL_NARRATOR_MAX_CHARS: int = 2000
+    ALLOWED_CHANNEL_IDS: str = ""
 
 
 SETTINGS = AppSettings()

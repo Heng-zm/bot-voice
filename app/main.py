@@ -413,7 +413,7 @@ async def ai_assistant_endpoint(
     if not message:
         raise HTTPException(status_code=400, detail="Missing required field: 'message'")
 
-    model = body.get("model", "gemini-2.5-flash")
+    model = body.get("model", getattr(legacy, "GEMINI_MODEL", "gemini-2.0-flash"))
     system_prompt = body.get(
         "system_instruction",
         "You are an intelligent, helpful, and polite multilingual AI assistant. "
@@ -429,11 +429,14 @@ async def ai_assistant_endpoint(
         gemini_client = getattr(legacy, "_gemini", None)
         if gemini_client is not None:
             import asyncio
+
+            from app.services.ai.gemini import generate_content_with_fallback
             loop = asyncio.get_running_loop()
             def _call_ai():
-                return gemini_client.models.generate_content(
-                    model=model,
+                return generate_content_with_fallback(
+                    client=gemini_client,
                     contents=message,
+                    preferred_model=model,
                     config={"system_instruction": system_prompt},
                 )
             response = await loop.run_in_executor(None, _call_ai)
@@ -525,14 +528,18 @@ async def translate_endpoint(
 
     target_lang = body.get("target_language", "Khmer")
     gemini_client = getattr(legacy, "_gemini", None)
+    preferred_model = getattr(legacy, "GEMINI_MODEL", "gemini-2.0-flash")
     if gemini_client is not None:
         import asyncio
+
+        from app.services.ai.gemini import generate_content_with_fallback
         loop = asyncio.get_running_loop()
         prompt = f"Translate the following text accurately and naturally into {target_lang}. Return only the translated text without extra explanation:\n\n{text}"
         def _call_ai():
-            return gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
+            return generate_content_with_fallback(
+                client=gemini_client,
                 contents=prompt,
+                preferred_model=preferred_model,
             )
         response = await loop.run_in_executor(None, _call_ai)
         translated = (getattr(response, "text", "") or "").strip()
@@ -568,14 +575,18 @@ async def summarize_endpoint(
         raise HTTPException(status_code=400, detail="Missing required field: 'text'")
 
     gemini_client = getattr(legacy, "_gemini", None)
+    preferred_model = getattr(legacy, "GEMINI_MODEL", "gemini-2.0-flash")
     if gemini_client is not None:
         import asyncio
+
+        from app.services.ai.gemini import generate_content_with_fallback
         loop = asyncio.get_running_loop()
         prompt = f"Summarize the following text into clear, actionable bullet points preserving key details:\n\n{text}"
         def _call_ai():
-            return gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
+            return generate_content_with_fallback(
+                client=gemini_client,
                 contents=prompt,
+                preferred_model=preferred_model,
             )
         response = await loop.run_in_executor(None, _call_ai)
         summary = (getattr(response, "text", "") or "").strip()
@@ -585,7 +596,7 @@ async def summarize_endpoint(
     return JSONResponse({
         "ok": True,
         "summary": summary,
-        "model": "gemini-2.5-flash",
+        "model": preferred_model,
     })
 
 

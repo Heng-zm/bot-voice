@@ -755,7 +755,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info("Ignored unknown or expired callback data=%r user=%s", data, user_id)
         with suppress(Exception):
             await query.answer(
-                "This button is no longer available. Please reopen the menu.",
+                "ប៊ូតុងនេះផុតសុពលភាពហើយ។ សូមបើកម៉ឺនុយឡើងវិញ។",
                 show_alert=False,
             )
         return
@@ -819,7 +819,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error("on_callback failed action=%s data=%r: %s", action, data, exc, exc_info=True)
         if query.message:
             await safe_send(lambda: query.message.reply_text(
-                "⚠️ Something went wrong while processing this button. Please try again."
+                "⚠️ មានបញ្ហាក្នុងការដំណើរការប៊ូតុងនេះ។ សូមព្យាយាមម្ដងទៀត។"
             ))
 
 

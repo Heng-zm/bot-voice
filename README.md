@@ -5,14 +5,14 @@
 
 [![Python Version](https://img.shields.io/badge/Python-3.11%20%7C%203.12-blue?logo=python&logoColor=white)](https://python.org)
 [![Telegram Bot API](https://img.shields.io/badge/Telegram-Bot%20API-2CA5E0?logo=telegram&logoColor=white)](https://core.telegram.org/bots/api)
-[![Google Gemini](https://img.shields.io/badge/Google%20Gemini-2.5%20Flash-4285F4?logo=google&logoColor=white)](https://deepmind.google/technologies/gemini/)
+[![Google Gemini](https://img.shields.io/badge/Google%20Gemini-2.0%20Flash-4285F4?logo=google&logoColor=white)](https://deepmind.google/technologies/gemini/)
 [![Supabase Database](https://img.shields.io/badge/Database-Supabase-3ECF8E?logo=supabase&logoColor=white)](https://supabase.com)
 [![Docker Ready](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](https://www.docker.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 *High-performance, low-latency voice synthesis in Khmer & 10+ languages, image OCR transcription, intelligent multimodal chat, and full-featured broadcast scheduling.*
 
-[Features](#-key-features) • [Quickstart](#-quickstart-in-3-steps) • [Deployment](#-easy-server-deployment) • [Admin Panel](#-telegram-admin-panel-admin) • [Architecture](#-architecture)
+[Features](#-key-features) • [Quickstart](#-quickstart-in-3-steps) • [Deployment](#-easy-server-deployment) • [Admin Panel](#-telegram-admin-panel-admin) • [Architecture](#-architecture) • [Project Structure](#-project-structure)
 
 ---
 </div>
@@ -184,10 +184,84 @@ flowchart TD
         TTS --> Cache[(💾 In-Memory Audio Cache)]
         TTS --> FFmpeg[⚡ In-Memory FFmpeg pipe:1]
         Admin --> DB[(🗄️ Supabase Cloud DB)]
-        OCR --> Gemini[✨ Gemini 2.5 Flash]
+        OCR --> Gemini[✨ Gemini 2.0 Flash]
         STT --> Gemini
     end
 ```
+
+---
+
+## 📁 Project Structure
+
+```
+bot-voice/
+├── app/                              # Core Application Codebase
+│   ├── core/                         # Core Configurations & Security
+│   │   ├── config.py                 # Pydantic Settings & environment variables
+│   │   └── telegram_auth.py          # Admin dynamic authorization & fallback
+│   ├── services/                     # Domain Services Architecture
+│   │   ├── ai/                       # AI, Multimodal Vision & Embeddings
+│   │   │   ├── gemini.py             # Google Gemini client & auto-fallback (2.0/1.5)
+│   │   │   ├── ocr.py                # Multi-provider Vision OCR pipeline
+│   │   │   ├── language.py           # Fast regex + langdetect language detection
+│   │   │   ├── providers.py          # Provider interfaces & routing
+│   │   │   └── vector_store.py       # Upstash / Supabase Vector similarity search
+│   │   ├── broadcast/                # Mass Messaging & Scheduled Announcements
+│   │   │   └── templates.py          # Broadcast layout templates & presets
+│   │   ├── settings/                 # Dynamic Runtime Configuration Store
+│   │   │   └── store.py              # Supabase/PostgreSQL settings key-value store
+│   │   ├── telegram/                 # Modular Telegram Bot System
+│   │   │   ├── buttons.py            # Inline keyboard layouts & UI builders
+│   │   │   ├── callbacks.py          # Inline button callback queries & state machine
+│   │   │   ├── commands.py           # Command handlers (/ask, /tts, /admin, /help)
+│   │   │   ├── deduplication.py      # Update deduplication & idempotency
+│   │   │   ├── flow.py               # Conversational flow helpers
+│   │   │   ├── guards.py             # Rate limits, flood control & cooldowns
+│   │   │   ├── media.py              # Voice, photo, audio & document handlers
+│   │   │   ├── routing.py            # Central Telegram handler registration
+│   │   │   ├── security.py           # Admin authentication & privilege enforcement
+│   │   │   └── workloads.py          # Background worker tasks & audio rendering
+│   │   ├── tts/                      # Text-to-Speech Engines & Pipelines
+│   │   │   ├── engine.py             # Edge TTS & Hugging Face Kiri integration
+│   │   │   ├── cache.py              # In-memory SHA-256 LRU audio cache
+│   │   │   └── voices.py             # Supported voice catalogs & mappings
+│   │   ├── users/                    # User CRM & Preferences
+│   │   │   └── prefs.py              # User language, voice, and speed persistence
+│   │   └── health.py                 # Internal health probe server
+│   ├── utils/                        # Shared Utilities
+│   │   ├── file_io.py                # Safe temp file lifecycle & cleanup
+│   │   ├── text.py                   # Khmer & multilingual text sanitization
+│   │   └── time.py                   # Phnom Penh (UTC+7) timezone formatting
+│   ├── bot.py                        # Telegram Bot builder & polling runner
+│   ├── legacy.py                     # Legacy engine compatibility & state
+│   └── main.py                       # FastAPI application & REST API endpoints
+├── tests/                            # Comprehensive Automated Test Suite
+│   ├── test_backend_services.py      # Core service unit tests
+│   ├── test_startup_script.py        # Startup script validation
+│   ├── test_system_upgrades.py       # API & webhook regression tests
+│   ├── test_telegram.py              # Telegram command & message tests
+│   └── test_telegram_auth.py         # Admin authorization tests
+├── ev/                               # Environment template archives
+│   └── .env.example                  # Reference environment template
+├── static/                           # Static assets, logos & templates
+├── .dockerignore                     # Docker build exclusions
+├── .env.example                      # Root configuration template
+├── .gitignore                        # Git exclusion rules
+├── Dockerfile                        # Multi-stage production container image
+├── Procfile                          # Cloud platform process file
+├── anajak-deploy.sh                  # 1-click Anajak Cloud deployment script
+├── bot-voice.service                 # Linux systemd daemon definition
+├── deploy.sh                         # 1-click Linux VPS automated installer
+├── docker-compose.yml                # Docker Compose orchestration (Bot + Redis)
+├── main.py                           # Root launcher entrypoint
+├── pyproject.toml                    # Modern PEP 621 / Poetry packaging metadata
+├── render.yaml                       # Render.com Blueprint configuration
+├── requirements.txt                  # Production dependencies
+├── requirements-dev.txt              # Development & testing dependencies
+├── run_local.ps1                     # Windows local development launcher
+├── start.sh                          # Production container startup script
+├── supabase_bot_setup.sql            # PostgreSQL schema, migrations & RLS
+└── upload.sftp                       # SFTP direct file deployment batch script
 
 ---
 

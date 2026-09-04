@@ -19,6 +19,7 @@ from app.services.telegram.callbacks import (
     sched_callback,
     users_page_callback,
 )
+from app.services.telegram.channel import on_channel_post
 from app.services.telegram.commands import (
     admin_stats,
     broadcast_start,
@@ -127,6 +128,12 @@ def register_telegram_handlers(application: Application, *, bot_mode: str) -> No
     )
     application.add_handler(CallbackQueryHandler(on_callback))
 
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.CHANNEL & (filters.TEXT | filters.CAPTION),
+            on_channel_post,
+        )
+    )
     application.add_handler(MessageHandler(filters.PHOTO, on_photo))
     application.add_handler(MessageHandler(filters.VOICE, on_voice))
     application.add_handler(

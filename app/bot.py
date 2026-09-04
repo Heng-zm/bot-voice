@@ -120,6 +120,8 @@ async def run_bot_async() -> None:
                     await updater.start_polling(
                         allowed_updates=["message", "edited_message", "callback_query"],
                         drop_pending_updates=False,
+                        bootstrap_retries=-1,
+                        timeout=20,
                     )
                     logger.info("Telegram polling started successfully.")
 

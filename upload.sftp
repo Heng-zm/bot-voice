@@ -1,0 +1,17 @@
+lcd "g:\bot-voice"
+put -r app
+put -r static
+put -r tests
+put main.py
+put requirements.txt
+put requirements-dev.txt
+put pyproject.toml
+put start.sh
+put anajak-deploy.sh
+put deploy.sh
+put Dockerfile
+put docker-compose.yml
+put supabase_bot_setup.sql
+put .env.example
+put README.md
+put .env

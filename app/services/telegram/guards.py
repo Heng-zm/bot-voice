@@ -71,8 +71,10 @@ async def _telegram_rate_limit_guard(update: Any, context: Any) -> None:
                     _RATE_LIMIT_NOTICE_MEMORY.pop(next(iter(_RATE_LIMIT_NOTICE_MEMORY)), None)
 
     if should_send_notice:
+        chat = getattr(update, "effective_chat", None)
         msg = getattr(update, "effective_message", None)
-        if msg is not None:
+        # Never send rate-limit warning messages into public broadcast channels
+        if msg is not None and getattr(chat, "type", None) != "channel":
             with suppress(Exception):
                 if flood_detected:
                     await safe_send(lambda: msg.reply_text(
@@ -153,11 +155,11 @@ async def _drop_stale_updates(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # Only filter plain messages (not callbacks)
-    msg = update.message or update.edited_message
+    msg = update.message or update.edited_message or update.channel_post
     if msg and getattr(msg, "date", None) and msg.date.timestamp() < (
         _BOT_START_TIME - _STALE_GRACE_S
     ):
-        logger.debug(f"Dropping stale message update (id={update.update_id})")
+        logger.debug(f"Dropping stale message/channel update (id={update.update_id})")
         raise ApplicationHandlerStop
 
 

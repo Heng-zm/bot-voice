@@ -90,10 +90,13 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         import asyncio
         loop = asyncio.get_running_loop()
+        from app.services.ai.gemini import generate_content_with_fallback
+        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.0-flash")
         def _call_ai():
-            return legacy._gemini.models.generate_content(
-                model=getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash"),
+            return generate_content_with_fallback(
+                legacy._gemini,
                 contents=text,
+                preferred_model=preferred,
             )
         resp = await loop.run_in_executor(None, _call_ai)
         ai_text = getattr(resp, "text", "") or ""
@@ -136,10 +139,13 @@ async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         import asyncio
         loop = asyncio.get_running_loop()
+        from app.services.ai.gemini import generate_content_with_fallback
+        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.0-flash")
         def _call_ai():
-            return legacy._gemini.models.generate_content(
-                model=getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash"),
+            return generate_content_with_fallback(
+                legacy._gemini,
                 contents=f"Translate the following text accurately and naturally into Khmer. Return only the translated text without extra explanation:\n\n{text}",
+                preferred_model=preferred,
             )
         resp = await loop.run_in_executor(None, _call_ai)
         khmer_text = getattr(resp, "text", "") or ""
@@ -181,10 +187,13 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         import asyncio
         loop = asyncio.get_running_loop()
+        from app.services.ai.gemini import generate_content_with_fallback
+        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.0-flash")
         def _call_ai():
-            return legacy._gemini.models.generate_content(
-                model=getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash"),
+            return generate_content_with_fallback(
+                legacy._gemini,
                 contents=f"Summarize the following text into clear, concise bullet points in Khmer:\n\n{text}",
+                preferred_model=preferred,
             )
         resp = await loop.run_in_executor(None, _call_ai)
         summary_text = getattr(resp, "text", "") or ""
@@ -292,11 +301,14 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if hasattr(legacy, "_release_tts_request"):
         legacy._release_tts_request(user_id)
     
-    # Also release user lock if needed
+    # Also release user lock and clear user state if needed
     with getattr(legacy, "_user_locks_guard", threading.RLock()):
         user_locks = getattr(legacy, "_user_locks", {})
         if user_id in user_locks:
             user_locks.pop(user_id, None)
+
+    if getattr(context, "user_data", None) is not None:
+        context.user_data.clear()
 
     await safe_send(lambda: msg.reply_text(
         "🔓 <b>ដោះសោរជោគជ័យ!</b>\n\nរាល់ការរង់ចាំ និងសោរដំណើរការចាស់របស់អ្នកត្រូវបានសម្អាតរួចរាល់។ អ្នកអាចផ្ញើសារថ្មីបានឥឡូវនេះ។",

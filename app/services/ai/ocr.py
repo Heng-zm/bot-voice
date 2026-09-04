@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from app.services.ai.gemini import GEMINI_MODEL_DEFAULT
+from app.services.ai.gemini import GEMINI_MODEL_DEFAULT, generate_content_with_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +16,7 @@ def ask_gemini_ocr_bytes(
     mime_type: str = "image/jpeg",
     model: str = GEMINI_MODEL_DEFAULT,
 ) -> str:
-    """Extract text from image bytes using Google Gemini Vision."""
+    """Extract text from image bytes using Google Gemini Vision with model fallback."""
     if client is None:
         raise RuntimeError("Gemini client is not configured.")
     if not image_bytes:
@@ -29,12 +29,14 @@ def ask_gemini_ocr_bytes(
         "and Japanese exactly. Keep useful line breaks. If there is no readable text, "
         "output only NOTEXT. Do not describe the image and do not add explanations."
     )
-    response = client.models.generate_content(
-        model=model,
-        contents=[
-            _gtypes.Part.from_bytes(data=image_bytes, mime_type=mime_type or "image/jpeg"),
-            prompt,
-        ],
+    contents = [
+        _gtypes.Part.from_bytes(data=image_bytes, mime_type=mime_type or "image/jpeg"),
+        prompt,
+    ]
+    response = generate_content_with_fallback(
+        client=client,
+        contents=contents,
+        preferred_model=model,
     )
     text = (getattr(response, "text", "") or "").strip()
     return text or "NOTEXT"
