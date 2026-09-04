@@ -6,6 +6,7 @@ import asyncio
 import base64
 import logging
 import os
+import secrets
 import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
@@ -27,10 +28,16 @@ from app.utils.file_io import cleanup_files, make_temp_ogg
 logger = logging.getLogger("app.webhook")
 
 _DETECTED_WEBHOOK_URL: str = ""
-_KNOWN_API_KEYS: set[str] = {
-    "sk-ai-V8B4ue9G9LyvihDp-Q-ydlFirO97PkEIMbZJqphWwyM",
-    "sk-ai-q89yjEsVgotokNGJkH3hDabHf1HYJ8zFCt0nCW9JYZw",
-}
+
+
+def _get_allowed_api_keys() -> set[str]:
+    """Retrieve authorized API keys from environment variables."""
+    keys: set[str] = set()
+    for var in ("BOT_API_KEY", "API_KEY", "BOT_API_KEYS"):
+        val = (os.environ.get(var) or "").strip()
+        if val:
+            keys.update(k.strip() for k in val.split(",") if k.strip())
+    return keys
 
 
 
@@ -272,15 +279,7 @@ async def system_metrics_endpoint() -> JSONResponse:
 @app.get("/ping")
 @app.head("/ping")
 async def health_check(request: Request) -> JSONResponse:
-    """Health check endpoint that auto-captures host header for Webhook and API URL."""
-    host_header = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
-    proto = request.headers.get("x-forwarded-proto") or "https"
-    bot_mode = os.environ.get("BOT_MODE", "").strip().upper()
-    if bot_mode != "POLLING" and host_header and not host_header.startswith("localhost") and not host_header.startswith("127.0.0.1"):
-        detected = f"{proto}://{host_header}"
-        if not get_detected_webhook_url():
-            asyncio.create_task(auto_setup_webhook(detected))
-
+    """Health check endpoint reporting live service and webhook status."""
     captured_url = get_detected_webhook_url()
     instance_id = os.environ.get("RENDER_INSTANCE_ID") or os.environ.get("HOSTNAME") or f"node-{os.getpid()}"
     return JSONResponse({
@@ -288,18 +287,25 @@ async def health_check(request: Request) -> JSONResponse:
         "service": "telegram-bot-voice",
         "instance_id": instance_id,
         "webhook_url": f"{captured_url}/webhook" if captured_url else "polling_mode",
-        "api_url": f"{captured_url}/ai-assistant" if captured_url else "https://your-domain.onrender.com/ai-assistant",
-        "tts_url": f"{captured_url}/tts" if captured_url else "https://your-domain.onrender.com/tts",
+        "api_url": f"{captured_url}/ai-assistant" if captured_url else "/ai-assistant",
+        "tts_url": f"{captured_url}/tts" if captured_url else "/tts",
     })
 
 
 
 @app.get("/setup-webhook")
-async def trigger_setup_webhook(request: Request) -> JSONResponse:
-    """Manually force-register the current URL as the Telegram Webhook."""
-    host_header = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
-    proto = request.headers.get("x-forwarded-proto") or "https"
-    url = f"{proto}://{host_header}" if host_header and not host_header.startswith("localhost") else get_detected_webhook_url()
+@app.post("/setup-webhook")
+async def trigger_setup_webhook(
+    request: Request,
+    x_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """Manually force-register the detected URL as the Telegram Webhook (Protected)."""
+    if not _validate_api_key(x_api_key, authorization):
+        raise HTTPException(status_code=401, detail="Unauthorized: Valid API key required")
+    url = get_detected_webhook_url()
+    if not url:
+        raise HTTPException(status_code=400, detail="No valid WEBHOOK_URL found in environment")
     ok = await auto_setup_webhook(url)
     return JSONResponse({
         "success": ok,
@@ -358,26 +364,33 @@ async def ai_assistant_info(request: Request) -> JSONResponse:
         "method": "POST",
         "headers": {
             "Content-Type": "application/json",
-            "X-Api-Key": "sk-ai-V8B4ue9G9LyvihDp-Q-ydlFirO97PkEIMbZJqphWwyM",
+            "X-Api-Key": "YOUR_API_KEY",
         },
         "sample_curl": (
             f"curl -X POST {base_url}/ai-assistant \\\n"
             f"  -H 'Content-Type: application/json' \\\n"
-            f"  -H 'X-Api-Key: sk-ai-V8B4ue9G9LyvihDp-Q-ydlFirO97PkEIMbZJqphWwyM' \\\n"
+            f"  -H 'X-Api-Key: YOUR_API_KEY' \\\n"
             f"  -d '{{\"message\":\"Hello\"}}'"
         ),
     })
 
 
 def _validate_api_key(x_api_key: str | None, authorization: str | None) -> bool:
-    api_key = x_api_key or (authorization.replace("Bearer ", "").strip() if authorization else "")
-    configured_key = os.environ.get("BOT_API_KEY", "").strip()
+    api_key = (x_api_key or "").strip()
+    if not api_key and authorization:
+        parts = authorization.strip().split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            api_key = parts[1].strip()
+        else:
+            api_key = authorization.strip()
 
-    return bool(api_key) and (
-        api_key in _KNOWN_API_KEYS
-        or (bool(configured_key) and api_key == configured_key)
-        or api_key.startswith("sk-ai-")
-    )
+    if not api_key:
+        return False
+
+    allowed = _get_allowed_api_keys()
+    if not allowed:
+        return False
+    return any(secrets.compare_digest(api_key, valid_key) for valid_key in allowed)
 
 
 @app.post("/ai-assistant")

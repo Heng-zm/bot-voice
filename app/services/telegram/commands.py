@@ -5,6 +5,9 @@ These are live runtime handlers; app.legacy now contains compatibility wrappers 
 
 from __future__ import annotations
 
+import re
+import threading
+
 # Transitional V4.1 modules bind remaining legacy helpers at runtime.
 # ruff: noqa: F821
 from app.services.telegram._legacy_runtime import legacy_bound_handler, safe_send
@@ -65,14 +68,22 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Directly ask Gemini AI a question and hear the answer in voice."""
     msg = update.effective_message
-    if not msg:
+    user = update.effective_user
+    if not msg or not user:
         return
-    text = (msg.text or "").replace("/ask", "").strip()
+    user_id = int(user.id)
+    text = re.sub(r"^/ask(?:@\w+)?\s*", "", msg.text or "", flags=re.IGNORECASE).strip()
     if not text:
         await safe_send(lambda: msg.reply_text("💡 សូមសរសេរសំណួររបស់អ្នកតាមក្រោយ /ask (ឧ. /ask តើ AI គឺជាអ្វី?)"))
         return
+    if await _check_cooldown(msg, user_id):
+        return
+    if not _reserve_tts_request(user_id):
+        await safe_send(lambda: msg.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
+        return
     from app import legacy
     if getattr(legacy, "_gemini", None) is None:
+        _release_tts_request(user_id)
         await safe_send(lambda: msg.reply_text("❌ Gemini API មិនទាន់បានបើកទេ។"))
         return
     await safe_send(lambda: msg.reply_chat_action("typing"))
@@ -87,12 +98,14 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resp = await loop.run_in_executor(None, _call_ai)
         ai_text = getattr(resp, "text", "") or ""
         if not ai_text:
+            _release_tts_request(user_id)
             await safe_send(lambda: msg.reply_text("❌ គ្មានចម្លើយតបពី AI ទេ។"))
             return
         
         from app.services.telegram.media import process_tts_for_text
-        await process_tts_for_text(update, context, ai_text, update.effective_user.id)
+        await process_tts_for_text(update, context, ai_text, user_id)
     except Exception as exc:
+        _release_tts_request(user_id)
         err_msg = f"❌ បរាជ័យ: {exc}"
         await safe_send(lambda: msg.reply_text(err_msg))
 
@@ -101,14 +114,22 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Translate text to Khmer and hear it out loud."""
     msg = update.effective_message
-    if not msg:
+    user = update.effective_user
+    if not msg or not user:
         return
-    text = (msg.text or "").replace("/translate", "").strip()
+    user_id = int(user.id)
+    text = re.sub(r"^/translate(?:@\w+)?\s*", "", msg.text or "", flags=re.IGNORECASE).strip()
     if not text:
         await safe_send(lambda: msg.reply_text("💡 សូមបញ្ចូលអត្ថបទដើម្បីបកប្រែ (ឧ. /translate Hello world)"))
         return
+    if await _check_cooldown(msg, user_id):
+        return
+    if not _reserve_tts_request(user_id):
+        await safe_send(lambda: msg.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
+        return
     from app import legacy
     if getattr(legacy, "_gemini", None) is None:
+        _release_tts_request(user_id)
         await safe_send(lambda: msg.reply_text("❌ Gemini API មិនទាន់បានបើកទេ។"))
         return
     await safe_send(lambda: msg.reply_chat_action("typing"))
@@ -122,9 +143,14 @@ async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         resp = await loop.run_in_executor(None, _call_ai)
         khmer_text = getattr(resp, "text", "") or ""
+        if not khmer_text:
+            _release_tts_request(user_id)
+            await safe_send(lambda: msg.reply_text("❌ គ្មានចម្លើយតបពី AI ទេ។"))
+            return
         from app.services.telegram.media import process_tts_for_text
-        await process_tts_for_text(update, context, khmer_text, update.effective_user.id)
+        await process_tts_for_text(update, context, khmer_text, user_id)
     except Exception as exc:
+        _release_tts_request(user_id)
         err_msg = f"❌ បរាជ័យ: {exc}"
         await safe_send(lambda: msg.reply_text(err_msg))
 
@@ -133,14 +159,22 @@ async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Summarize long text into bullet points and hear them out loud."""
     msg = update.effective_message
-    if not msg:
+    user = update.effective_user
+    if not msg or not user:
         return
-    text = (msg.text or "").replace("/summary", "").strip()
+    user_id = int(user.id)
+    text = re.sub(r"^/summary(?:@\w+)?\s*", "", msg.text or "", flags=re.IGNORECASE).strip()
     if not text:
         await safe_send(lambda: msg.reply_text("💡 សូមបញ្ចូលអត្ថបទវែងៗដើម្បីសង្ខេប (ឧ. /summary ...អត្ថបទ...)"))
         return
+    if await _check_cooldown(msg, user_id):
+        return
+    if not _reserve_tts_request(user_id):
+        await safe_send(lambda: msg.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
+        return
     from app import legacy
     if getattr(legacy, "_gemini", None) is None:
+        _release_tts_request(user_id)
         await safe_send(lambda: msg.reply_text("❌ Gemini API មិនទាន់បានបើកទេ។"))
         return
     await safe_send(lambda: msg.reply_chat_action("typing"))
@@ -154,9 +188,14 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         resp = await loop.run_in_executor(None, _call_ai)
         summary_text = getattr(resp, "text", "") or ""
+        if not summary_text:
+            _release_tts_request(user_id)
+            await safe_send(lambda: msg.reply_text("❌ គ្មានចម្លើយតបពី AI ទេ។"))
+            return
         from app.services.telegram.media import process_tts_for_text
-        await process_tts_for_text(update, context, summary_text, update.effective_user.id)
+        await process_tts_for_text(update, context, summary_text, user_id)
     except Exception as exc:
+        _release_tts_request(user_id)
         err_msg = f"❌ បរាជ័យ: {exc}"
         await safe_send(lambda: msg.reply_text(err_msg))
 
@@ -244,7 +283,11 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @legacy_bound_handler
 async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Force release any stuck TTS locks or waiting queues for the user."""
-    user_id = update.effective_user.id
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    user_id = int(user.id)
     from app import legacy
     if hasattr(legacy, "_release_tts_request"):
         legacy._release_tts_request(user_id)
@@ -255,7 +298,7 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id in user_locks:
             user_locks.pop(user_id, None)
 
-    await safe_send(lambda: update.message.reply_text(
+    await safe_send(lambda: msg.reply_text(
         "🔓 <b>ដោះសោរជោគជ័យ!</b>\n\nរាល់ការរង់ចាំ និងសោរដំណើរការចាស់របស់អ្នកត្រូវបានសម្អាតរួចរាល់។ អ្នកអាចផ្ញើសារថ្មីបានឥឡូវនេះ។",
         parse_mode="HTML"
     ))
@@ -445,7 +488,11 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Telegram admin shortcut for the full bot health panel."""
     msg = update.effective_message
-    if not msg:
+    user = update.effective_user
+    if not msg or not user:
+        return
+    if not _is_admin(int(user.id)):
+        await safe_send(lambda: msg.reply_text("⛔ ពាក្យបញ្ជានេះសម្រាប់ Admin ប៉ុណ្ណោះ។"))
         return
     text = await _admin_health_text()
     await safe_send(lambda: msg.reply_text(

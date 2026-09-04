@@ -9,11 +9,10 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_start_script_launches_telegram_only_entrypoint() -> None:
     script = (ROOT / "start.sh").read_text(encoding="utf-8")
 
-    assert script.startswith("#!/usr/bin/env sh\nset -eu\n")
-    assert 'cd "$SCRIPT_DIR"' in script
-    assert '"$PYTHON_CMD" -m compileall -q app' in script
-    assert script.rstrip().endswith('exec "$PYTHON_CMD" -m app.main')
-    assert "uvicorn" not in script.lower()
+    assert script.startswith("#!/usr/bin/env bash")
+    assert "set -e" in script
+    assert "exec uvicorn app.main:app" in script
+    assert "--workers 1" in script
 
 
 def test_root_launcher_exports_main_and_app() -> None:

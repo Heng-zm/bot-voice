@@ -19,6 +19,7 @@ ADMIN_ONLY_COMMANDS: frozenset[str] = frozenset({
     "schedules",
     "cancelschedule",
     "runtime",
+    "health",
     "api",
     "botsettings",
     "users",

@@ -57,6 +57,7 @@ alter table public.user_prefs add column if not exists speed double precision de
 alter table public.user_prefs add column if not exists tts_model text default 'auto';
 alter table public.user_prefs add column if not exists last_active timestamptz;
 alter table public.user_prefs add column if not exists created_at timestamptz default now();
+alter table public.user_prefs add column if not exists updated_at timestamptz default now();
 alter table public.user_prefs drop constraint if exists user_prefs_tts_model_check;
 
 update public.user_prefs set gender = 'female' where gender is null;
