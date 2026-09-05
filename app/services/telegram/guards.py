@@ -177,6 +177,23 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         logger.debug("Ignored non-fatal Telegram handler condition: %s", err)
         return
 
+    err_str = str(err).lower()
+    if any(term in err_str for term in (
+        "bad gateway",
+        "gateway timeout",
+        "timed out",
+        "timedout",
+        "readtimeout",
+        "connect timeout",
+        "server disconnected",
+        "connection reset",
+        "network is unreachable",
+        "502",
+        "504",
+    )):
+        logger.warning("Telegram transient upstream network issue in handler: %s", err)
+        return
+
     _metric_inc("errors")
     _record_admin_error("telegram_error_handler", str(err), level="ERROR", context=type(update).__name__)
     logger.error(
@@ -187,7 +204,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
     if isinstance(update, Update) and update.effective_message:
         chat = getattr(update, "effective_chat", None)
-        if getattr(chat, "type", None) != "channel":
+        if getattr(chat, "type", None) == "private":
             with suppress(Exception):
                 await safe_send(lambda: update.effective_message.reply_text(
                     "⚠️ មានបញ្ហាបច្ចេកទេស។ Bot នៅដំណើរការ — សូមព្យាយាមម្តងទៀត។"

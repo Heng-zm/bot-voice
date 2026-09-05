@@ -160,5 +160,135 @@ class TestAntiSpamAndUnlock(unittest.TestCase):
         self.assertTrue(legacy._reserve_tts_request(user_id))
 
 
+@unittest.skipUnless(HAS_SERVER_DEPS, "Requires full server dependencies")
+class TestBotConfigPanel(unittest.TestCase):
+    def test_mask_secret(self):
+        self.assertEqual("Not configured", legacy._mask_secret(""))
+        self.assertEqual("Not configured", legacy._mask_secret(None))
+        self.assertEqual("******", legacy._mask_secret("123"))
+        self.assertEqual("123******cba", legacy._mask_secret("1234567890cba"))
+
+    def test_bot_setting_defaults_contains_all_domains(self):
+        # AI & Speech
+        self.assertIn("DEFAULT_TTS_MODEL", legacy.BOT_SETTING_DEFAULTS)
+        self.assertIn("DEFAULT_GENDER", legacy.BOT_SETTING_DEFAULTS)
+        self.assertIn("DEFAULT_SPEED", legacy.BOT_SETTING_DEFAULTS)
+        self.assertIn("GEMINI_MODEL", legacy.BOT_SETTING_DEFAULTS)
+        self.assertIn("OCR_PROVIDER", legacy.BOT_SETTING_DEFAULTS)
+        # Channel Narrator
+        self.assertIn("channel_narrator_enabled", legacy.BOT_SETTING_DEFAULTS)
+        self.assertIn("channel_narrator_gender", legacy.BOT_SETTING_DEFAULTS)
+        self.assertIn("channel_narrator_speed", legacy.BOT_SETTING_DEFAULTS)
+        self.assertIn("channel_narrator_model", legacy.BOT_SETTING_DEFAULTS)
+        self.assertIn("channel_narrator_max_chars", legacy.BOT_SETTING_DEFAULTS)
+        self.assertIn("channel_narrator_show_buttons", legacy.BOT_SETTING_DEFAULTS)
+        self.assertIn("allowed_channel_ids", legacy.BOT_SETTING_DEFAULTS)
+        # Feature toggles & system
+        self.assertIn("voice_reply_mode", legacy.BOT_SETTING_DEFAULTS)
+        self.assertIn("anti_spam_window", legacy.BOT_SETTING_DEFAULTS)
+        self.assertIn("maintenance_mode", legacy.BOT_SETTING_DEFAULTS)
+
+    def test_cached_setting_lookup(self):
+        legacy._bot_settings_cache["test_key_xyz"] = "hello_world"
+        self.assertEqual("hello_world", legacy.bot_setting_raw_cached("test_key_xyz"))
+        self.assertEqual("default_fallback", legacy.bot_setting_raw_cached("non_existent_key_abc", "default_fallback"))
+
+    def test_keyboards_generation(self):
+        # Home keyboard
+        home_kb = legacy.get_bot_config_home_kb()
+        self.assertIsNotNone(home_kb)
+        flattened_home = [btn.callback_data for row in home_kb.inline_keyboard for btn in row]
+        self.assertIn("cfg_cat:ai", flattened_home)
+        self.assertIn("cfg_cat:channel", flattened_home)
+        self.assertIn("cfg_cat:features", flattened_home)
+        self.assertIn("cfg_cat:performance", flattened_home)
+        self.assertIn("cfg_cat:all", flattened_home)
+
+        # AI keyboard
+        ai_kb = legacy.get_bot_config_ai_kb({"DEFAULT_TTS_MODEL": "auto", "DEFAULT_GENDER": "female", "DEFAULT_SPEED": 1.0})
+        self.assertIsNotNone(ai_kb)
+        flattened_ai = [btn.callback_data for row in ai_kb.inline_keyboard for btn in row]
+        self.assertIn("cfg_set:DEFAULT_TTS_MODEL:auto", flattened_ai)
+        self.assertIn("cfg_set:DEFAULT_GENDER:female", flattened_ai)
+
+        # Channel keyboard
+        ch_kb = legacy.get_bot_config_channel_kb({"channel_narrator_enabled": True, "channel_narrator_gender": "female"})
+        self.assertIsNotNone(ch_kb)
+        flattened_ch = [btn.callback_data for row in ch_kb.inline_keyboard for btn in row]
+        self.assertIn("cfg_set:channel_narrator_enabled:toggle", flattened_ch)
+        self.assertIn("cfg_set:channel_narrator_gender:female", flattened_ch)
+
+        # All config keyboard
+        all_kb = legacy.get_bot_config_all_kb()
+        self.assertIsNotNone(all_kb)
+        flattened_all = [btn.callback_data for row in all_kb.inline_keyboard for btn in row]
+        self.assertIn("cfg_cat:home", flattened_all)
+
+    def test_admin_config_text_renderers(self):
+        settings = dict(legacy.BOT_SETTING_DEFAULTS)
+        status = {"status": "ok", "uptime_seconds": 120, "version": "4.2.0"}
+
+        home_text = legacy._admin_bot_config_home_text(settings, status)
+        self.assertIn("Bot Configuration Hub", home_text)
+        self.assertIn("Speech & AI Models", home_text)
+        self.assertIn("Channel Narrator", home_text)
+
+        ai_text = legacy._admin_bot_config_ai_text(settings)
+        self.assertIn("Speech & AI Models", ai_text)
+
+        channel_text = legacy._admin_bot_config_channel_text(settings)
+        self.assertIn("Channel Auto-Voice Narrator", channel_text)
+
+        all_text = legacy._admin_bot_config_all_text(settings, status)
+        self.assertIn("Complete Configuration Dump", all_text)
+        self.assertIn("Environment & Secrets", all_text)
+
+    def test_admin_dashboard_cleaned_layout(self):
+        kb = legacy.get_admin_dashboard_kb()
+        self.assertIsNotNone(kb)
+        # Verify exactly 6 clean rows
+        self.assertEqual(6, len(kb.inline_keyboard))
+        # Total buttons is 12 (2 per row)
+        flattened = [btn.callback_data for row in kb.inline_keyboard for btn in row]
+        self.assertEqual(12, len(flattened))
+        self.assertEqual(
+            [
+                "admin_bot_config", "admin_broadcast",
+                "admin_users", "admin_schedules",
+                "admin_user_needs", "admin_report",
+                "admin_health", "admin_errors",
+                "admin_optimize", "admin_stats",
+                "admin_home", "admin_close",
+            ],
+            flattened,
+        )
+
+    def test_admin_health_and_stats_kbs(self):
+        health_kb = legacy.get_admin_health_kb()
+        stats_kb = legacy.get_admin_stats_kb()
+
+        flat_health = [btn.callback_data for row in health_kb.inline_keyboard for btn in row]
+        self.assertIn("admin_health", flat_health)
+        self.assertIn("admin_home", flat_health)
+
+        flat_stats = [btn.callback_data for row in stats_kb.inline_keyboard for btn in row]
+        self.assertIn("admin_report", flat_stats)
+        self.assertIn("admin_home", flat_stats)
+
+    def test_admin_home_text_clean_format(self):
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            text = loop.run_until_complete(legacy._admin_home_text(0))
+            self.assertIn("Admin Control Center", text)
+            self.assertIn("AI & Speech Stack", text)
+            self.assertIn("Audience & Activity", text)
+            self.assertNotIn("2.5-flash", text)
+        finally:
+            loop.close()
+
+
 if __name__ == "__main__":
     unittest.main()
+
+

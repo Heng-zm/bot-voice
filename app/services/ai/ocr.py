@@ -5,7 +5,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from app.services.ai.gemini import GEMINI_MODEL_DEFAULT, generate_content_with_fallback
+from app.services.ai.gemini import (
+    GEMINI_MODEL_DEFAULT,
+    extract_gemini_text,
+    generate_content_with_fallback,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +42,7 @@ def ask_gemini_ocr_bytes(
         contents=contents,
         preferred_model=model,
     )
-    text = (getattr(response, "text", "") or "").strip()
+    text = extract_gemini_text(response)
     return text or "NOTEXT"
 
 

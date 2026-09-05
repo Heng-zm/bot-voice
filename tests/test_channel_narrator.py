@@ -85,6 +85,25 @@ class TestChannelNarrator(unittest.TestCase):
             else:
                 os.environ.pop("ALLOWED_CHANNEL_IDS", None)
 
+    def test_is_channel_allowed_with_bot_settings(self):
+        import sys
+        from types import ModuleType
+
+        fake_legacy = ModuleType("app.legacy")
+        fake_legacy.bot_setting_raw_cached = lambda key, default="": "-100555666, @khmer_news" if key == "allowed_channel_ids" else default
+
+        old_legacy = sys.modules.get("app.legacy")
+        try:
+            sys.modules["app.legacy"] = fake_legacy
+            self.assertTrue(_is_channel_allowed(-100555666, None))
+            self.assertTrue(_is_channel_allowed(-100999999, "khmer_news"))
+            self.assertFalse(_is_channel_allowed(-100999999, "other_channel"))
+        finally:
+            if old_legacy is not None:
+                sys.modules["app.legacy"] = old_legacy
+            else:
+                sys.modules.pop("app.legacy", None)
+
     def test_clean_channel_text_truncates_at_latin_sentence(self):
         base_sentence = "This is a breaking news report from the capital city. "
         long_text = base_sentence * 50

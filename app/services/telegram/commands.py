@@ -90,7 +90,10 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         import asyncio
         loop = asyncio.get_running_loop()
-        from app.services.ai.gemini import generate_content_with_fallback
+        from app.services.ai.gemini import (
+            extract_gemini_text,
+            generate_content_with_fallback,
+        )
         preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.0-flash")
         def _call_ai():
             return generate_content_with_fallback(
@@ -99,10 +102,10 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 preferred_model=preferred,
             )
         resp = await loop.run_in_executor(None, _call_ai)
-        ai_text = getattr(resp, "text", "") or ""
+        ai_text = extract_gemini_text(resp)
         if not ai_text:
             _release_tts_request(user_id)
-            await safe_send(lambda: msg.reply_text("❌ គ្មានចម្លើយតបពី AI ទេ។"))
+            await safe_send(lambda: msg.reply_text("⚠️ មិនអាចឆ្លើយបានទេ (អាចដោយសារគោលការណ៍សុវត្ថិភាព AI ឬគ្មានចម្លើយ)។"))
             return
         
         from app.services.telegram.media import process_tts_for_text
@@ -139,7 +142,10 @@ async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         import asyncio
         loop = asyncio.get_running_loop()
-        from app.services.ai.gemini import generate_content_with_fallback
+        from app.services.ai.gemini import (
+            extract_gemini_text,
+            generate_content_with_fallback,
+        )
         preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.0-flash")
         def _call_ai():
             return generate_content_with_fallback(
@@ -148,10 +154,10 @@ async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 preferred_model=preferred,
             )
         resp = await loop.run_in_executor(None, _call_ai)
-        khmer_text = getattr(resp, "text", "") or ""
+        khmer_text = extract_gemini_text(resp)
         if not khmer_text:
             _release_tts_request(user_id)
-            await safe_send(lambda: msg.reply_text("❌ គ្មានចម្លើយតបពី AI ទេ។"))
+            await safe_send(lambda: msg.reply_text("⚠️ មិនអាចបកប្រែបានទេ (អាចដោយសារគោលការណ៍សុវត្ថិភាព AI ឬគ្មានចម្លើយ)។"))
             return
         from app.services.telegram.media import process_tts_for_text
         await process_tts_for_text(update, context, khmer_text, user_id)
@@ -187,7 +193,10 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         import asyncio
         loop = asyncio.get_running_loop()
-        from app.services.ai.gemini import generate_content_with_fallback
+        from app.services.ai.gemini import (
+            extract_gemini_text,
+            generate_content_with_fallback,
+        )
         preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.0-flash")
         def _call_ai():
             return generate_content_with_fallback(
@@ -196,10 +205,10 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 preferred_model=preferred,
             )
         resp = await loop.run_in_executor(None, _call_ai)
-        summary_text = getattr(resp, "text", "") or ""
+        summary_text = extract_gemini_text(resp)
         if not summary_text:
             _release_tts_request(user_id)
-            await safe_send(lambda: msg.reply_text("❌ គ្មានចម្លើយតបពី AI ទេ។"))
+            await safe_send(lambda: msg.reply_text("⚠️ មិនអាចសង្ខេបបានទេ (អាចដោយសារគោលការណ៍សុវត្ថិភាព AI ឬគ្មានចម្លើយ)។"))
             return
         from app.services.telegram.media import process_tts_for_text
         await process_tts_for_text(update, context, summary_text, user_id)
@@ -611,7 +620,13 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if arg in {"health", "status"}:
         text = await _admin_health_text()
-        await safe_send(lambda: msg.reply_text(text, parse_mode="HTML", reply_markup=get_admin_dashboard_kb(), disable_web_page_preview=True))
+        from app import legacy
+        await safe_send(lambda: msg.reply_text(text, parse_mode="HTML", reply_markup=legacy.get_admin_health_kb(), disable_web_page_preview=True))
+        return
+    if arg in {"stats", "stat", "telemetry"}:
+        from app import legacy
+        text = await legacy._admin_stats_text(user_id)
+        await safe_send(lambda: msg.reply_text(text, parse_mode="HTML", reply_markup=legacy.get_admin_stats_kb(), disable_web_page_preview=True))
         return
     if arg in {"errors", "error"}:
         await safe_send(lambda: msg.reply_text(_error_center_text(), parse_mode="HTML", reply_markup=_error_center_kb(), disable_web_page_preview=True))
@@ -642,6 +657,10 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
             reply_markup=get_admin_action_kb(),
         ))
+        return
+    if arg in {"config", "botconfig", "bot_config", "configuration"}:
+        from app import legacy
+        await legacy._admin_open_bot_config_panel(msg, user_id, force=True)
         return
     if arg in {"settings", "setting"}:
         settings, _status = await get_bot_settings_async(force=True)

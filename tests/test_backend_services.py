@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import unittest
 from types import SimpleNamespace
 
@@ -97,6 +98,20 @@ class TelegramFlowTests(unittest.TestCase):
         self.assertTrue(callback_requires_tts_access("speed", "spd_1.0"))
         self.assertTrue(callback_requires_tts_access("gender", "tg_female"))
         self.assertFalse(callback_requires_tts_access("admin", "admin_home"))
+
+    def test_nonfatal_edit_error_detection(self) -> None:
+        from app.services.telegram.flow import (
+            is_message_not_modified_error,
+            is_nonfatal_telegram_edit_error,
+            is_stale_telegram_message_error,
+        )
+
+        self.assertTrue(is_stale_telegram_message_error("BadRequest: Message_id_invalid"))
+        self.assertTrue(is_stale_telegram_message_error("message to edit not found"))
+        self.assertTrue(is_stale_telegram_message_error("message to be replied not found"))
+        self.assertTrue(is_message_not_modified_error("message is not modified: specified new message content is the same"))
+        self.assertTrue(is_nonfatal_telegram_edit_error("Message_id_invalid"))
+        self.assertFalse(is_nonfatal_telegram_edit_error("Invalid token"))
 
 
 class SettingsStoreTests(unittest.IsolatedAsyncioTestCase):
@@ -487,6 +502,8 @@ class CoreConfigTests(unittest.TestCase):
         self.assertIsInstance(SETTINGS, AppSettings)
 
         self.assertEqual(SETTINGS.GEMINI_MODEL, "gemini-2.0-flash")
+        self.assertTrue(hasattr(SETTINGS, "CHANNEL_NARRATOR_ENABLED"))
+        self.assertTrue(hasattr(SETTINGS, "CHANNEL_NARRATOR_MAX_CHARS"))
 
 
 class FileIOServicesTests(unittest.TestCase):
@@ -510,5 +527,150 @@ class FileIOServicesTests(unittest.TestCase):
         self.assertFalse(os.path.exists(img_path))
 
 
+class TelegramPollingNetworkFilterTests(unittest.TestCase):
+    def test_filter_demotes_bad_gateway_to_warning_and_clears_traceback(self) -> None:
+        import logging
+
+        from app.utils.logging import TelegramPollingNetworkFilter
+
+        filt = TelegramPollingNetworkFilter()
+        try:
+            raise Exception("Bad Gateway")
+        except Exception as exc:
+            record = logging.LogRecord(
+                name="telegram.ext.Updater",
+                level=logging.ERROR,
+                pathname="test.py",
+                lineno=1,
+                msg="Exception happened while polling for updates.",
+                args=(),
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            result = filt.filter(record)
+            self.assertTrue(result)
+            self.assertEqual(logging.WARNING, record.levelno)
+            self.assertEqual("WARNING", record.levelname)
+            self.assertIsNone(record.exc_info)
+            self.assertIn("Bad Gateway", record.msg)
+            self.assertIn("retrying automatically", record.msg)
+
+    def test_filter_ignores_non_polling_or_unrelated_errors(self) -> None:
+        import logging
+
+        from app.utils.logging import TelegramPollingNetworkFilter
+
+        filt = TelegramPollingNetworkFilter()
+        try:
+            raise ValueError("Some other bug")
+        except Exception as exc:
+            record = logging.LogRecord(
+                name="app.bot",
+                level=logging.ERROR,
+                pathname="test.py",
+                lineno=1,
+                msg="Some other unhandled error",
+                args=(),
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            result = filt.filter(record)
+            self.assertTrue(result)
+            self.assertEqual(logging.ERROR, record.levelno)
+            self.assertIsNotNone(record.exc_info)
+
+
+class GeminiTextExtractionAndRetryTests(unittest.TestCase):
+    def test_extract_gemini_text_from_normal_text_property(self) -> None:
+        from app.services.ai.gemini import extract_gemini_text
+
+        resp = SimpleNamespace(text="Hello world!")
+        self.assertEqual("Hello world!", extract_gemini_text(resp))
+
+    def test_extract_gemini_text_fallback_on_value_error(self) -> None:
+        from app.services.ai.gemini import extract_gemini_text
+
+        class MockBlockedResponse:
+            @property
+            def text(self):
+                raise ValueError("The candidate's response has no text due to safety.")
+
+            candidates = [
+                SimpleNamespace(
+                    content=SimpleNamespace(
+                        parts=[
+                            SimpleNamespace(text="Partial safe text"),
+                        ]
+                    )
+                )
+            ]
+
+        self.assertEqual("Partial safe text", extract_gemini_text(MockBlockedResponse()))
+
+    def test_extract_gemini_text_fallback_empty_candidates(self) -> None:
+        from app.services.ai.gemini import extract_gemini_text
+
+        class MockNoCandidateResponse:
+            @property
+            def text(self):
+                raise ValueError("No candidates.")
+
+            candidates = []
+
+        self.assertEqual("", extract_gemini_text(MockNoCandidateResponse()))
+
+    def test_extract_gemini_text_none(self) -> None:
+        from app.services.ai.gemini import extract_gemini_text
+
+        self.assertEqual("", extract_gemini_text(None))
+
+    def test_is_retryable_gemini_error(self) -> None:
+        from app.services.ai.gemini import is_retryable_gemini_error
+
+        self.assertTrue(is_retryable_gemini_error(Exception("429 Too Many Requests")))
+        self.assertTrue(is_retryable_gemini_error(Exception("rate limit exceeded")))
+        self.assertTrue(is_retryable_gemini_error(Exception("Connection reset by peer: socket error")))
+        self.assertTrue(is_retryable_gemini_error(Exception("Read timed out (read timeout)")))
+        self.assertTrue(is_retryable_gemini_error(Exception("503 Service Unavailable: overloaded")))
+        self.assertFalse(is_retryable_gemini_error(Exception("401 Unauthorized API key")))
+
+
+class StaleTelegramErrorExtendedTests(unittest.TestCase):
+    def test_flow_is_stale_telegram_message_error(self) -> None:
+        from app.services.telegram.flow import is_stale_telegram_message_error
+
+        self.assertTrue(is_stale_telegram_message_error("BadRequest: There is no text in the message to edit"))
+        self.assertTrue(is_stale_telegram_message_error("BadRequest: Message to be edited not found"))
+        self.assertTrue(is_stale_telegram_message_error("BadRequest: Message is too old"))
+        self.assertTrue(is_stale_telegram_message_error("BadRequest: Query is too old"))
+        self.assertFalse(is_stale_telegram_message_error("Chat not found"))
+
+
+HAS_SERVER_DEPS = (
+    importlib.util.find_spec("fastapi") is not None
+    and importlib.util.find_spec("httpx") is not None
+)
+
+
+@unittest.skipUnless(HAS_SERVER_DEPS, "Requires server dependencies (fastapi)")
+class LifespanSupervisorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bot_runner_supervisor_cancels_cleanly(self) -> None:
+        from unittest.mock import patch
+
+        from app.main import bot_runner_supervisor
+
+        started = asyncio.Event()
+
+        async def mock_runner():
+            started.set()
+            await asyncio.Event().wait()
+
+        with patch("app.legacy._async_main_once", side_effect=mock_runner):
+            task = asyncio.create_task(bot_runner_supervisor())
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+
 if __name__ == "__main__":
     unittest.main()
+

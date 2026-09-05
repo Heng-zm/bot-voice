@@ -1,4 +1,4 @@
-lcd "g:\bot-voice"
+lcd "G:/bot-voice"
 put -r app
 put -r static
 put -r tests

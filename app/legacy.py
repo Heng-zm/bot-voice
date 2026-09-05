@@ -8547,10 +8547,17 @@ logging.basicConfig(
 for _noisy in ("httpx", "httpcore", "urllib3", "telegram",
                "google_genai.models", "google.genai", "google"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+
+from app.utils.logging import install_telegram_polling_filter
+
+install_telegram_polling_filter()
+
 logger = logging.getLogger(__name__)
 webhook_logger = logging.getLogger("telegram_webhook")
 rate_limit_logger = logging.getLogger("rate_limit")
 broadcast_queue_logger = logging.getLogger("broadcast_queue")
+
 
 
 # ---------------------------------------------------------------------------
@@ -9068,7 +9075,10 @@ ACTIVE_POLLING_TASK: asyncio.Task | None = None
 _RUNTIME_STATE_RESTORED_FROM_STORE = False
 _RUN_STATE_PERSISTED_KEYS = (
     "BOT_MODE",
+    "GEMINI_MODEL",
     "GEMINI_AUDIO_MODEL",
+    "DEFAULT_TTS_MODEL",
+    "OCR_PROVIDER",
     "TELEGRAM_WEBHOOK_URL",
     "TELEGRAM_WEBHOOK_SECRET_TOKEN",
     "HTTP_MAX_CONNECTIONS",
@@ -9103,7 +9113,10 @@ _RUN_STATE_PERSISTED_KEYS = (
 
 _RUNTIME_CONFIG_SPECS: OrderedDict[str, dict[str, Any]] = OrderedDict([
     ("BOT_MODE", {"kind": "mode", "label": "Bot mode", "help": "POLLING for one node; WEBHOOK for scalable deployment."}),
+    ("GEMINI_MODEL", {"kind": "str", "label": "Gemini Model", "help": "Default Gemini text/chat model (e.g. gemini-2.0-flash, gemini-1.5-flash)."}),
     ("GEMINI_AUDIO_MODEL", {"kind": "str", "label": "Gemini Audio Model", "help": "Active Gemini Audio TTS model (e.g. gemini-2.5-flash-preview-tts, gemini-2.5-pro-preview-tts, gemini-3.1-flash-tts-preview)."}),
+    ("DEFAULT_TTS_MODEL", {"kind": "str", "label": "Default TTS Model", "help": "Default engine for speech synthesis (auto, edge, hf, gemini)."}),
+    ("OCR_PROVIDER", {"kind": "str", "label": "OCR Provider", "help": "Default OCR service for images/docs (gemini, hf, tesseract)."}),
     ("TELEGRAM_WEBHOOK_URL", {"kind": "url", "label": "Webhook base URL", "help": "Public HTTPS base URL only. Do not include /tg-webhook-..."}),
     ("TELEGRAM_WEBHOOK_SECRET_TOKEN", {"kind": "secret", "label": "Webhook secret", "help": "Rotatable secret used in the webhook path and Telegram secret header."}),
     ("USER_RATE_LIMIT_PER_SECOND", {"kind": "int", "min": 1, "max": 100, "label": "User rate limit / second", "help": "Anti-flood limit per chat/user."}),
@@ -11619,7 +11632,8 @@ def ask_gemini_ocr(image_data: bytes, mime_type: str = "image/jpeg") -> str:
                     prompt,
                 ],
             )
-            text = (response.text or "").strip()
+            from app.services.ai.gemini import extract_gemini_text
+            text = extract_gemini_text(response).strip()
             return text or "NOTEXT"
         except Exception as exc:
             last_err = exc
@@ -12625,6 +12639,14 @@ def _is_stale_telegram_message_error(exc: Exception | str) -> bool:
         "message can't be deleted",
         "message can't be edited",
         "message is not found",
+        "message_id_invalid",
+        "message not found",
+        "message to be replied not found",
+        "reply message not found",
+        "there is no text in the message to edit",
+        "message is too old",
+        "message to be edited not found",
+        "query is too old",
     ))
 
 
@@ -13539,6 +13561,21 @@ BOT_SETTING_DEFAULTS: dict[str, str] = {
     "audio_to_voice_enabled": "1",
     "ai_resolver_enabled": "1",
     "channel_narrator_enabled": "1",
+    # Channel Auto-Voice Narrator Extended Config
+    "channel_narrator_gender": os.environ.get("CHANNEL_NARRATOR_GENDER", "female"),
+    "channel_narrator_speed": os.environ.get("CHANNEL_NARRATOR_SPEED", "1.0"),
+    "channel_narrator_model": os.environ.get("CHANNEL_NARRATOR_MODEL", "auto"),
+    "channel_narrator_max_chars": os.environ.get("CHANNEL_NARRATOR_MAX_CHARS", "2000"),
+    "channel_narrator_show_buttons": os.environ.get("CHANNEL_NARRATOR_SHOW_BUTTONS", "0"),
+    "allowed_channel_ids": os.environ.get("ALLOWED_CHANNEL_IDS", ""),
+    # AI & Speech Engine Config
+    "DEFAULT_TTS_MODEL": os.environ.get("DEFAULT_TTS_MODEL", "auto"),
+    "DEFAULT_GENDER": os.environ.get("DEFAULT_GENDER", "female"),
+    "DEFAULT_SPEED": os.environ.get("DEFAULT_SPEED", "1.0"),
+    "GEMINI_MODEL": os.environ.get("GEMINI_MODEL", "gemini-2.0-flash"),
+    "GEMINI_AUDIO_MODEL": os.environ.get("GEMINI_AUDIO_MODEL", "gemini-2.0-flash-exp"),
+    "OCR_PROVIDER": os.environ.get("OCR_PROVIDER", "gemini"),
+    "HF_MODEL": os.environ.get("HF_MODEL", "mrrtmob/khmer-tts"),
     **{key: str(_perf_default(key, spec.get("default", ""))) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 BOT_SETTING_LABELS: dict[str, str] = {
@@ -13550,6 +13587,19 @@ BOT_SETTING_LABELS: dict[str, str] = {
     "audio_to_voice_enabled": "🎙️ MP3/Audio → Voice Record",
     "ai_resolver_enabled": "🧠 AI Text Resolver",
     "channel_narrator_enabled": "📢 Channel Voice Narrator",
+    "channel_narrator_gender": "📢 Channel Voice Gender",
+    "channel_narrator_speed": "📢 Channel Speech Speed",
+    "channel_narrator_model": "📢 Channel TTS Engine",
+    "channel_narrator_max_chars": "📢 Channel Max Chars",
+    "channel_narrator_show_buttons": "📢 Channel Buttons Display",
+    "allowed_channel_ids": "📢 Allowed Channel IDs",
+    "DEFAULT_TTS_MODEL": "🎙️ Default TTS Engine",
+    "DEFAULT_GENDER": "👩/👨 Default Voice Gender",
+    "DEFAULT_SPEED": "🎚️ Default Speech Speed",
+    "GEMINI_MODEL": "🧠 Gemini AI Model",
+    "GEMINI_AUDIO_MODEL": "🎙️ Gemini Audio TTS Model",
+    "OCR_PROVIDER": "🔍 OCR Provider",
+    "HF_MODEL": "🎙️ Hugging Face Model",
     **{key: str(spec.get("label", key)) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 BOT_SETTING_DESCRIPTIONS: dict[str, str] = {
@@ -13561,6 +13611,19 @@ BOT_SETTING_DESCRIPTIONS: dict[str, str] = {
     "audio_to_voice_enabled": "Convert uploaded MP3/audio files to Telegram OGG/Opus voice records.",
     "ai_resolver_enabled": "Allow AI to rewrite/resolve text before TTS when enabled by env.",
     "channel_narrator_enabled": "Automatically narrates channel text and captions to voice notes.",
+    "channel_narrator_gender": "Voice gender for channel narration (female or male).",
+    "channel_narrator_speed": "Speech pacing speed for channel narration (e.g. 1.0).",
+    "channel_narrator_model": "TTS engine used for channel narration (auto, edge, gemini, hf_space).",
+    "channel_narrator_max_chars": "Maximum character limit per channel post to narrate.",
+    "channel_narrator_show_buttons": "Whether to display audio action buttons under channel voice posts.",
+    "allowed_channel_ids": "Comma-separated list of allowed channel chat IDs (blank = all).",
+    "DEFAULT_TTS_MODEL": "Default TTS synthesis engine (auto, edge, gemini, hf_space).",
+    "DEFAULT_GENDER": "Default voice gender for user speech (female or male).",
+    "DEFAULT_SPEED": "Default playback speed multiplier (e.g. 1.0).",
+    "GEMINI_MODEL": "Active Google Gemini multimodal model for chat, translations, and summaries.",
+    "GEMINI_AUDIO_MODEL": "Active model for direct Gemini Audio speech generation.",
+    "OCR_PROVIDER": "Active OCR vision engine provider (gemini or hf).",
+    "HF_MODEL": "Hugging Face Space repository name for external Khmer TTS.",
     **{key: str(spec.get("help", "")) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 BOT_SETTING_LABELS["maintenance_message"] = "Maintenance Message"
@@ -13683,6 +13746,12 @@ def _setting_raw_from(settings: dict | None, key: str, default: Any = None) -> s
     if default is None:
         default = BOT_SETTING_DEFAULTS.get(key, "")
     return str(source.get(key, default)).strip()
+
+
+def bot_setting_raw_cached(key: str, default: Any = "") -> str:
+    """Retrieve raw setting string from memory cache with code defaults fallback."""
+    return _setting_raw_from(_bot_settings_cache.get("data") or BOT_SETTING_DEFAULTS, key, default)
+
 
 
 async def _send_welcome_message(message: Any) -> Any:
@@ -16055,8 +16124,8 @@ def _fmt_dt(dt: datetime) -> str:
 # ---------------------------------------------------------------------------
 # Keyboard helpers
 # ---------------------------------------------------------------------------
-ADMIN_UI_VERSION = "V9"
-ADMIN_UI_TITLE = f"🛡️ Admin System Center {ADMIN_UI_VERSION}"
+ADMIN_UI_VERSION = "V10"
+ADMIN_UI_TITLE = "🛡️ <b>Admin Control Center</b>"
 
 def get_sched_confirm_kb(row_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -16096,50 +16165,62 @@ def get_sched_detail_kb(row: dict) -> InlineKeyboardMarkup:
 
 
 def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
-    """Mobile-first Telegram admin home keyboard for Admin V9.
+    """Clean, mobile-first Telegram admin home keyboard.
 
-    Keep the first screen small enough for phones while preserving every
-    existing admin feature through grouped shortcuts.
+    Organized into 6 balanced rows with clear operational categories:
+    1. Primary Controls: Bot Config & Instant Broadcast
+    2. Audience & Automation: Users/CRM & Scheduled Broadcasts
+    3. Intelligence & Reporting: User Feedback/Needs & PDF Reports
+    4. Diagnostics & Monitoring: Health Deep-Check & Error Inbox
+    5. Maintenance & Telemetry: One-Tap Optimizer & Live Stats
+    6. Navigation: Refresh & Dismiss
     """
     rows = [
-        [InlineKeyboardButton("🏠 Overview", callback_data="admin_home"),
-         InlineKeyboardButton("🩺 Health", callback_data="admin_health")],
-        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
+        [InlineKeyboardButton("🤖 Bot Config", callback_data="admin_bot_config"),
+         InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("👥 Users & CRM", callback_data="admin_users"),
          InlineKeyboardButton("🗓 Schedules", callback_data="admin_schedules")],
-        [InlineKeyboardButton("👥 Users", callback_data="admin_users"),
-         InlineKeyboardButton("⭐ CRM", callback_data="admin_crm")],
         [InlineKeyboardButton("🧠 User Needs", callback_data="admin_user_needs"),
-         InlineKeyboardButton("💬 Open Answers", callback_data="needs_open_answers")],
-        [InlineKeyboardButton("🚨 Errors", callback_data="admin_errors"),
-         InlineKeyboardButton("⚡ Optimize", callback_data="admin_optimize")],
-        [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings"),
-         InlineKeyboardButton("🛠 Runtime", callback_data="admin_runtime")],
-        [InlineKeyboardButton("🎛️ Button Editor", callback_data="admin_btn_editor"),
-         InlineKeyboardButton("🎙️ TTS Engine", callback_data="admin_tts_models")],
-        [InlineKeyboardButton("👋 Welcome Message", callback_data="admin_welcome")],
-
-        [InlineKeyboardButton("📄 Report", callback_data="admin_report"),
-         InlineKeyboardButton("📈 Telemetry", callback_data="btn_system_status")],
-        [InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
-         InlineKeyboardButton("📅 Calendar", callback_data="admin_calendar")],
-        [InlineKeyboardButton("🔑 API Keys", callback_data="admin_api"),
-         InlineKeyboardButton("🕘 History", callback_data="admin_history")],
-        [InlineKeyboardButton("📱 Compact", callback_data="admin_compact"),
-         InlineKeyboardButton("🔄 Refresh", callback_data="admin_home")],
-        [InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
+         InlineKeyboardButton("📄 PDF Report", callback_data="admin_report")],
+        [InlineKeyboardButton("🩺 Health", callback_data="admin_health"),
+         InlineKeyboardButton("🚨 Error Inbox", callback_data="admin_errors")],
+        [InlineKeyboardButton("⚡ Optimize", callback_data="admin_optimize"),
+         InlineKeyboardButton("📈 Stats", callback_data="admin_stats")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="admin_home"),
+         InlineKeyboardButton("❌ បិទ (Close)", callback_data="admin_close")],
     ]
     return InlineKeyboardMarkup(rows)
 
 
-def get_admin_compact_kb() -> InlineKeyboardMarkup:
-    """Very small /admin menu for Telegram mobile."""
+def get_admin_health_kb() -> InlineKeyboardMarkup:
+    """Sub-panel navigation keyboard for Admin Health Diagnostics."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
-         InlineKeyboardButton("🚨 Errors", callback_data="admin_errors")],
+        [InlineKeyboardButton("🔄 Refresh Health", callback_data="admin_health"),
+         InlineKeyboardButton("⚡ Optimize System", callback_data="admin_optimize")],
+        [InlineKeyboardButton("⬅️ Admin Home", callback_data="admin_home"),
+         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
+    ])
+
+
+def get_admin_stats_kb() -> InlineKeyboardMarkup:
+    """Sub-panel navigation keyboard for Admin Statistics & Telemetry."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📄 PDF Report", callback_data="admin_report"),
+         InlineKeyboardButton("🔄 Refresh Stats", callback_data="admin_stats")],
+        [InlineKeyboardButton("⬅️ Admin Home", callback_data="admin_home"),
+         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
+    ])
+
+
+def get_admin_compact_kb() -> InlineKeyboardMarkup:
+    """Clean mini /admin menu for Telegram mobile."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🤖 Bot Config", callback_data="admin_bot_config"),
+         InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
         [InlineKeyboardButton("👥 Users", callback_data="admin_users"),
-         InlineKeyboardButton("⚡ Optimize", callback_data="admin_optimize")],
-        [InlineKeyboardButton("📄 Report", callback_data="admin_report"),
-         InlineKeyboardButton("🩺 Health", callback_data="admin_health")],
+         InlineKeyboardButton("🚨 Errors", callback_data="admin_errors")],
+        [InlineKeyboardButton("⚡ Optimize", callback_data="admin_optimize"),
+         InlineKeyboardButton("📄 Report", callback_data="admin_report")],
         [InlineKeyboardButton("🏠 Full Admin", callback_data="admin_home"),
          InlineKeyboardButton("❌ Close", callback_data="admin_close")],
     ])
@@ -16832,9 +16913,12 @@ class TelegramProgress:
                 return
             if rendered == self.last_text:
                 return
-            await self._edit_or_send(rendered, reply_markup=reply_markup)
-            self.last_text = rendered
-            self.last_edit_at = now
+            try:
+                await self._edit_or_send(rendered, reply_markup=reply_markup)
+                self.last_text = rendered
+                self.last_edit_at = now
+            except Exception as exc:
+                logger.debug("Progress update skipped non-fatal edit error: %s", exc)
 
     async def finish(
         self,
@@ -16850,12 +16934,15 @@ class TelegramProgress:
             if self.closed:
                 return self.message
             self.percent = 100
-            await self._edit_or_send(
-                str(text or "✅ បានបញ្ចប់ដោយជោគជ័យ។"),
-                parse_mode=parse_mode,
-                reply_markup=reply_markup,
-                disable_web_page_preview=disable_web_page_preview,
-            )
+            try:
+                await self._edit_or_send(
+                    str(text or "✅ បានបញ្ចប់ដោយជោគជ័យ។"),
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=disable_web_page_preview,
+                )
+            except Exception as exc:
+                logger.debug("Progress finish skipped non-fatal edit error: %s", exc)
             self.closed = True
             if delete_after_s is not None and self.message is not None:
                 asyncio.create_task(_delete_message_later(self.message, delete_after_s))
@@ -19428,7 +19515,8 @@ async def transcribe_voice(ogg_path: str) -> str:
         timeout_s=60,
         operation="Gemini voice transcription",
     )
-    return (response.text or "").strip()
+    from app.services.ai.gemini import extract_gemini_text
+    return extract_gemini_text(response).strip()
 
 
 async def transcribe_audio_file(file_path: str, mime_type: str) -> str:
@@ -19452,7 +19540,8 @@ async def transcribe_audio_file(file_path: str, mime_type: str) -> str:
         timeout_s=90,
         operation="Gemini audio transcription",
     )
-    return (response.text or "").strip()
+    from app.services.ai.gemini import extract_gemini_text
+    return extract_gemini_text(response).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -20597,7 +20686,10 @@ def get_bot_settings_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
             state = "ON ✅" if enabled else "OFF ⚠️"
         rows.append([InlineKeyboardButton(f"{label}: {state}", callback_data=f"admin_set:{key}")])
 
-    rows.append([InlineKeyboardButton("⚡ Performance Settings", callback_data="admin_perf")])
+    rows.append([
+        InlineKeyboardButton("🤖 Bot Config Hub", callback_data="admin_bot_config"),
+        InlineKeyboardButton("⚡ Performance Settings", callback_data="admin_perf"),
+    ])
     rows.extend([
         [InlineKeyboardButton("🔄 Refresh", callback_data="admin_settings_refresh"),
          InlineKeyboardButton("🧩 Setup SQL", callback_data="admin_settings_sql")],
@@ -22574,22 +22666,20 @@ async def _admin_compact_text(admin_id: int) -> str:
     with suppress(Exception):
         optimize_score = str(_optimization_score(_runtime_performance_snapshot(light=True))[0])
     alerts = await _admin_smart_alert_lines(counts)
-    alert_text = "\n".join(f"• {line}" for line in alerts) if alerts else "✅ No critical alerts"
+    alert_text = "\n".join(f"• {line}" for line in alerts) if alerts else "• ✅ All systems normal"
     return (
-        f"📱 <b>Admin Compact {ADMIN_UI_VERSION}</b>\n\n"
-        f"✅ Online · <code>{html.escape(str(mode))}</code>\n"
-        f"👥 Users: <b>{int(counts.get('total_users') or 0)}</b>\n"
-        f"🗓 Pending: <b>{int(counts.get('pending_sched') or 0)}</b>\n"
-        f"🚨 Errors: <b>{error_count}</b>\n"
-        f"⚡ Score: <b>{html.escape(optimize_score)}/100</b>\n"
-        f"⏱ Uptime: <b>{html.escape(_format_uptime())}</b>\n\n"
-        f"<b>Smart Alerts</b>\n{alert_text}\n\n"
-        "Choose an action below."
+        f"📱 <b>Admin Quick View</b>\n\n"
+        f"⚡ <b>Status:</b> ✅ Online · <code>{html.escape(str(mode))}</code>\n"
+        f"⏱ <b>Uptime:</b> {html.escape(_format_uptime())} · <b>Score:</b> {html.escape(optimize_score)}/100\n"
+        f"👥 <b>Users:</b> {int(counts.get('total_users') or 0):,} · <b>Errors:</b> {error_count}\n"
+        f"🗓 <b>Schedules:</b> {int(counts.get('pending_sched') or 0):,} pending\n\n"
+        f"<b>System Alerts</b>\n{alert_text}\n\n"
+        "💡 <i>ជ្រើសរើសផ្នែកខាងក្រោម ដើម្បីគ្រប់គ្រង Bot៖</i>"
     )
 
 
 async def _admin_home_text(admin_id: int, title: str = ADMIN_UI_TITLE) -> str:
-    """Fast, mobile-readable Admin V9 home screen."""
+    """Clean, mobile-readable Admin Control Center overview."""
     counts = await _admin_summary_counts(admin_id)
     settings, settings_status = await get_bot_settings_async()
     ffmpeg_ok = bool(_FFMPEG_EXE and os.path.exists(_FFMPEG_EXE))
@@ -22608,12 +22698,10 @@ async def _admin_home_text(admin_id: int, title: str = ADMIN_UI_TITLE) -> str:
         telegram_status,
         f"⚠️ {telegram_status.title()}",
     )
-    telegram_phase = html.escape(str(telegram_runtime.get("phase") or telegram_status))
     maintenance = _setting_bool_from(settings, "maintenance_mode", False)
     tts_on = _setting_bool_from(settings, "tts_enabled", True)
     ocr_on = _setting_bool_from(settings, "ocr_enabled", True)
-    voice_on = _setting_bool_from(settings, "voice_transcribe_enabled", True)
-    api_ready = bool(os.environ.get("AI_API_KEY", "").strip()) or bool(counts.get("active_api_keys"))
+    channel_on = _setting_bool_from(settings, "channel_narrator_enabled", True)
 
     error_count = 0
     with suppress(Exception):
@@ -22623,43 +22711,31 @@ async def _admin_home_text(admin_id: int, title: str = ADMIN_UI_TITLE) -> str:
         optimize_score = str(_optimization_score(_runtime_performance_snapshot(light=True))[0])
 
     alerts = await _admin_smart_alert_lines(counts)
-    alert_text = "\n".join(f"• {line}" for line in alerts) if alerts else "✅ No critical alerts"
+    alert_text = "\n".join(f"• {line}" for line in alerts) if alerts else "• ✅ All core systems operational"
 
     redis_active = bool(os.environ.get("REDIS_URL") or getattr(SETTINGS, "REDIS_URL", ""))
-    vector_active = bool(os.environ.get("UPSTASH_VECTOR_REST_URL"))
-    gemini_active = bool(os.environ.get("GEMINI_API_KEY"))
     from app.services.tts.voices import get_default_tts_model, tts_model_label
     default_tts = tts_model_label(get_default_tts_model())
+    active_gemini = _setting_raw_from(settings, "GEMINI_MODEL", getattr(SETTINGS, "GEMINI_MODEL", "gemini-2.0-flash"))
+    db_ok = bool(supabase and settings_status.get("db_ok"))
 
     return (
         f"{title}\n"
         f"<code>/admin › overview</code>\n\n"
-        f"Status: <b>{telegram_status_label}</b> · Mode: <code>{html.escape(str(mode))}</code>\n"
-        f"Telegram phase: <code>{telegram_phase}</code>\n"
-        f"Uptime: <b>{html.escape(_format_uptime())}</b>\n"
-        f"Optimize: <b>{html.escape(optimize_score)}/100</b> · Errors: <b>{error_count}</b>\n\n"
-        "<b>Cloud & AI Stack</b>\n"
-        f"⚡ Redis: <b>{_ok_bad(redis_active, 'ONLINE (Upstash TLS)', 'LOCAL')}</b>\n"
-        f"🧠 Vector: <b>{_ok_bad(vector_active, 'ACTIVE (Upstash)', 'OFF')}</b>\n"
-        f"🤖 Gemini: <b>{_ok_bad(gemini_active, 'READY (2.5-flash)', 'OFF')}</b> · "
-        f"🎙 Default TTS: <b>{html.escape(default_tts)}</b>\n\n"
-        "<b>Smart Alerts</b>\n"
+        f"⚡ <b>System:</b> {telegram_status_label} · <b>Mode:</b> <code>{html.escape(str(mode))}</code>\n"
+        f"⏱ <b>Uptime:</b> <code>{html.escape(_format_uptime())}</code> · <b>Health:</b> <code>{html.escape(optimize_score)}/100</code> · <b>Errors:</b> <code>{error_count}</code>\n\n"
+        f"🤖 <b>AI & Speech Stack</b>\n"
+        f"• Gemini Model: <code>{html.escape(active_gemini)}</code>\n"
+        f"• Default TTS: <b>{html.escape(default_tts)}</b> · Voice: <b>{'ON ✅' if tts_on else 'OFF ⚠️'}</b>\n"
+        f"• Channel Narrator: <b>{'ON ✅' if channel_on else 'OFF ⚠️'}</b> · OCR: <b>{'ON ✅' if ocr_on else 'OFF ⚠️'}</b>\n"
+        f"• Storage: Supabase <b>{_ok_bad(db_ok, 'OK', 'WARN')}</b> · Redis <b>{_ok_bad(redis_active, 'OK', 'LOCAL')}</b>\n\n"
+        f"📊 <b>Audience & Activity</b>\n"
+        f"• Users: <b>{int(counts.get('total_users') or 0):,}</b> · Blocked: <b>{int(counts.get('blocked_users') or 0):,}</b>\n"
+        f"• Broadcasts Sent: <b>{int(counts.get('total_broadcasts') or 0):,}</b> · Schedules: <b>{int(counts.get('pending_sched') or 0):,}</b>\n"
+        f"• Maintenance: <b>{'ACTIVE ⚠️' if maintenance else 'NORMAL ✅'}</b>\n\n"
+        f"🔔 <b>System Alerts:</b>\n"
         f"{alert_text}\n\n"
-        "<b>Quick Stats</b>\n"
-        f"👥 Users: <b>{int(counts.get('total_users') or 0)}</b> · "
-        f"🚫 Blocked: <b>{int(counts.get('blocked_users') or 0)}</b>\n"
-        f"🗓 Pending schedules: <b>{int(counts.get('pending_sched') or 0)}</b> · "
-        f"🔑 API: <b>{_ok_bad(api_ready, 'READY', 'SETUP')}</b>\n"
-        f"🗣 TTS: <b>{'ON ✅' if tts_on else 'OFF ⚠️'}</b> · "
-        f"🔍 OCR: <b>{'ON ✅' if ocr_on else 'OFF ⚠️'}</b> · "
-        f"🎙 Voice: <b>{'ON ✅' if voice_on else 'OFF ⚠️'}</b>\n"
-        f"🛠 Maintenance: <b>{'ON ⚠️' if maintenance else 'OFF ✅'}</b>\n\n"
-        "<b>Core</b>\n"
-        f"🗄 Supabase: <b>{_ok_bad(bool(supabase))}</b> · "
-        f"⚙️ Settings: <b>{_ok_bad(bool(settings_status.get('db_ok')), 'READY', 'MEMORY')}</b>\n"
-        f"🎧 FFmpeg: <b>{_ok_bad(ffmpeg_ok, 'OK', 'ERROR')}</b> · "
-        f"📡 Telegram: <b>{_ok_bad(bool(telegram_runtime.get('ready')), 'READY', 'STARTING')}</b>\n\n"
-        "ចុចប៊ូតុងខាងក្រោម ដើម្បីគ្រប់គ្រង Bot។"
+        "💡 <i>ចុចប៊ូតុងខាងក្រោម ដើម្បីគ្រប់គ្រង Bot៖</i>"
     )
 
 
@@ -23555,26 +23631,24 @@ async def _admin_stats_text(admin_id: int) -> str:
     counts = await _admin_summary_counts(admin_id)
     settings, status = await get_bot_settings_async()
     return (
-        "📊 <b>Admin System Center V9 Stats</b>\n\n"
-        f"👥 Total users: <b>{int(counts.get('total_users') or 0)}</b>\n"
-        f"🚫 Blocked users: <b>{int(counts.get('blocked_users') or 0)}</b>\n"
-        f"⏰ Pending schedules: <b>{int(counts.get('pending_sched') or 0)}</b>\n"
-        f"🔑 Active API keys: <b>{int(counts.get('active_api_keys') or 0)}</b>\n"
+        "📊 <b>Admin Analytics & Telemetry</b>\n\n"
+        f"👥 Total users: <b>{int(counts.get('total_users') or 0):,}</b>\n"
+        f"🚫 Blocked users: <b>{int(counts.get('blocked_users') or 0):,}</b>\n"
+        f"⏰ Pending schedules: <b>{int(counts.get('pending_sched') or 0):,}</b>\n"
+        f"🔑 Active API keys: <b>{int(counts.get('active_api_keys') or 0):,}</b>\n"
         f"💬 Active admin chats: <b>{len(_admin_chat_target)}</b>\n"
         f"🔒 Active user locks: <b>{len(_user_locks)}</b>\n"
         f"💭 History cache: <b>{len(_hist_cache)}</b> users\n"
         f"⚙️ Settings DB: <b>{_ok_bad(bool(status.get('db_ok')), 'READY', 'MEMORY/SETUP')}</b>\n"
-        f"🛠️ Maintenance: <b>{'ON' if _setting_bool_from(settings, 'maintenance_mode', False) else 'OFF'}</b>\n\n"
+        f"🛠️ Maintenance: <b>{'ON ⚠️' if _setting_bool_from(settings, 'maintenance_mode', False) else 'OFF ✅'}</b>\n\n"
         "<b>Runtime metrics since restart</b>\n"
-        f"🗣️ TTS requests: <b>{_RUNTIME_METRICS.get('tts', 0)}</b>\n"
-        f"🔍 OCR requests: <b>{_RUNTIME_METRICS.get('ocr', 0)}</b>\n"
-        f"🎙️ Voice transcripts: <b>{_RUNTIME_METRICS.get('voice', 0)}</b>\n"
-        f"🎵 Audio transcripts: <b>{_RUNTIME_METRICS.get('audio', 0)}</b>\n"
-        f"⛔ Blocked hits: <b>{_RUNTIME_METRICS.get('blocked_hits', 0)}</b>\n"
-        f"⚠️ Disabled hits: <b>{_RUNTIME_METRICS.get('disabled_hits', 0)}</b>\n"
-        f"❌ Errors: <b>{_RUNTIME_METRICS.get('errors', 0)}</b>\n\n"
-        f"🧠 HF model: <code>{html.escape(str(HF_MODEL or 'OFF'))}</code>\n"
-        f"🔍 OCR provider: <code>{html.escape(str(OCR_PROVIDER or 'auto'))}</code>\n"
+        f"🗣️ TTS requests: <b>{_RUNTIME_METRICS.get('tts', 0):,}</b>\n"
+        f"🔍 OCR requests: <b>{_RUNTIME_METRICS.get('ocr', 0):,}</b>\n"
+        f"🎙️ Voice transcripts: <b>{_RUNTIME_METRICS.get('voice', 0):,}</b>\n"
+        f"🎵 Audio transcripts: <b>{_RUNTIME_METRICS.get('audio', 0):,}</b>\n"
+        f"⛔ Blocked hits: <b>{_RUNTIME_METRICS.get('blocked_hits', 0):,}</b>\n"
+        f"⚠️ Disabled hits: <b>{_RUNTIME_METRICS.get('disabled_hits', 0):,}</b>\n"
+        f"❌ Errors: <b>{_RUNTIME_METRICS.get('errors', 0):,}</b>\n\n"
         f"⏱️ Uptime: <b>{html.escape(_format_uptime())}</b>"
     )
 
@@ -23997,6 +24071,298 @@ async def _admin_open_settings_panel(query, force: bool = False, notice: str = "
         reply_markup=get_bot_settings_kb(settings),
         disable_web_page_preview=True,
     ))
+
+
+def _mask_secret(val: str, prefix_len: int = 4, suffix_len: int = 4) -> str:
+    s = str(val or "").strip()
+    if not s:
+        return "⚪ Not Set"
+    if len(s) <= prefix_len + suffix_len:
+        return "✅ Set (***)"
+    return f"{s[:prefix_len]}...{s[-suffix_len:]}"
+
+
+def _admin_bot_config_home_text(settings: dict[str, str], status: dict) -> str:
+    db_status = "Supabase ✅" if status.get("db_ok") else ("Memory ⚠️" if not supabase else "Supabase Error ⚠️")
+    bot_mode = _run_state_bot_mode()
+    polling_active = "Active ✅" if globals().get("_TELEGRAM_POLLING_ACTIVE") else ("Webhook Mode" if bot_mode == "WEBHOOK" else "Standby ⚠️")
+
+    # AI & Speech
+    tts_model = _setting_raw_from(settings, "DEFAULT_TTS_MODEL", "auto")
+    gemini_model = _setting_raw_from(settings, "GEMINI_MODEL", "gemini-2.0-flash")
+    gemini_audio = _setting_raw_from(settings, "GEMINI_AUDIO_MODEL", "gemini-2.0-flash-exp")
+    gender = _setting_raw_from(settings, "DEFAULT_GENDER", "female").title()
+    speed = _setting_raw_from(settings, "DEFAULT_SPEED", "1.0")
+    ocr = _setting_raw_from(settings, "OCR_PROVIDER", "gemini").upper()
+    ai_ok = "ON ✅" if _setting_bool_from(settings, "ai_resolver_enabled", True) else "OFF ⚠️"
+
+    # Channel Narrator
+    ch_on = _setting_bool_from(settings, "channel_narrator_enabled", True)
+    ch_gender = _setting_raw_from(settings, "channel_narrator_gender", "female").title()
+    ch_speed = _setting_raw_from(settings, "channel_narrator_speed", "1.0")
+    ch_model = _setting_raw_from(settings, "channel_narrator_model", "auto")
+    ch_max = _setting_raw_from(settings, "channel_narrator_max_chars", "2000")
+    ch_btn = "Shown 🔘" if _setting_bool_from(settings, "channel_narrator_show_buttons", False) else "Hidden 🙈 (Clean)"
+    ch_wl = _setting_raw_from(settings, "allowed_channel_ids", "") or "All Channels (Admin)"
+
+    # Features
+    maint = "ON 🛠️ (Blocked)" if _setting_bool_from(settings, "maintenance_mode", False) else "OFF ✅ (Normal)"
+    tts_ok = "ON ✅" if _setting_bool_from(settings, "tts_enabled", True) else "OFF ⚠️"
+    ocr_ok = "ON ✅" if _setting_bool_from(settings, "ocr_enabled", True) else "OFF ⚠️"
+
+    # Performance
+    conc_updates = _setting_raw_from(settings, "TELEGRAM_CONCURRENT_UPDATES", "4")
+    rate_limit = f"{_run_state_user_rate_limit()} req/{_run_state_user_rate_window():g}s"
+    cache_on = "ON ✅" if _setting_bool_from(settings, "TTS_AUDIO_CACHE_ENABLED", True) else "OFF ⚠️"
+
+    # Integrations
+    bot_token_masked = _mask_secret(TELEGRAM_BOT_TOKEN)
+    gemini_key_masked = "Configured ✅" if GEMINI_API_KEY else "Not Set ❌"
+    supabase_masked = "Connected ✅" if supabase else "Not Connected ⚠️"
+    redis_masked = "Connected ✅" if redis_client else "None (Memory)"
+
+    return (
+        "🤖 <b>ផ្ទាំងគ្រប់គ្រងការកំណត់បូត (Bot Configuration Hub)</b>\n\n"
+        f"📊 <b>ស្ថានភាពផ្ទុក:</b> <code>{html.escape(db_status)}</code> | <b>Mode:</b> <code>{html.escape(bot_mode)}</code> ({polling_active})\n\n"
+        "🎙️ <b>AI & TTS Engine:</b>\n"
+        f"• Default TTS: <b>{html.escape(tts_model)}</b> · Voice: <b>{html.escape(gender)}</b> ({html.escape(speed)}x)\n"
+        f"• Gemini AI: <code>{html.escape(gemini_model)}</code>\n"
+        f"• Gemini Audio: <code>{html.escape(gemini_audio)}</code>\n"
+        f"• OCR Provider: <b>{html.escape(ocr)}</b> · AI Resolver: <b>{ai_ok}</b>\n\n"
+        "📢 <b>Channel Auto-Voice Narrator:</b>\n"
+        f"• Narrator: <b>{'ON ✅' if ch_on else 'OFF ⚠️'}</b> · Buttons: <b>{ch_btn}</b>\n"
+        f"• Voice: <b>{html.escape(ch_gender)}</b> ({html.escape(ch_speed)}x) · Engine: <b>{html.escape(ch_model)}</b>\n"
+        f"• Max Length: <b>{html.escape(ch_max)}</b> chars · Whitelist: <code>{html.escape(ch_wl[:35])}</code>\n\n"
+        "🛠️ <b>Core Features:</b>\n"
+        f"• Maintenance: <b>{maint}</b>\n"
+        f"• Text → Voice: <b>{tts_ok}</b> · OCR Vision: <b>{ocr_ok}</b>\n\n"
+        "⚡ <b>Performance & Security:</b>\n"
+        f"• Updates Concurrency: <b>{html.escape(conc_updates)}</b> · Rate Limit: <b>{rate_limit}</b>\n"
+        f"• Audio Cache: <b>{cache_on}</b>\n\n"
+        "🔐 <b>System Credentials:</b>\n"
+        f"• Telegram Token: <code>{html.escape(bot_token_masked)}</code>\n"
+        f"• Gemini AI Key: <b>{gemini_key_masked}</b> | Supabase: <b>{supabase_masked}</b>\n"
+        f"• Redis Cache: <b>{redis_masked}</b> | Port: <code>{PORT}</code>\n\n"
+        "💡 <i>ចុចប៊ូតុងខាងក្រោមដើម្បីកែប្រែការកំណត់នីមួយៗភ្លាមៗ៖</i>"
+    )
+
+
+def get_bot_config_home_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎙️ AI & TTS Models", callback_data="cfg_cat:ai"),
+         InlineKeyboardButton("📢 Channel Narrator", callback_data="cfg_cat:channel")],
+        [InlineKeyboardButton("🛠️ Feature Toggles", callback_data="admin_settings"),
+         InlineKeyboardButton("⚡ Performance Settings", callback_data="admin_perf")],
+        [InlineKeyboardButton("👋 Welcome Message", callback_data="admin_welcome"),
+         InlineKeyboardButton("🎛️ Button Editor", callback_data="admin_btn_editor")],
+        [InlineKeyboardButton("📋 All Raw Config", callback_data="cfg_cat:all"),
+         InlineKeyboardButton("🔄 Refresh", callback_data="admin_bot_config")],
+        [InlineKeyboardButton("⬅️ Admin Home", callback_data="admin_home"),
+         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
+    ])
+
+
+def _admin_bot_config_ai_text(settings: dict[str, str]) -> str:
+    tts = _setting_raw_from(settings, "DEFAULT_TTS_MODEL", "auto")
+    gemini = _setting_raw_from(settings, "GEMINI_MODEL", "gemini-2.0-flash")
+    gemini_audio = _setting_raw_from(settings, "GEMINI_AUDIO_MODEL", "gemini-2.0-flash-exp")
+    gender = _setting_raw_from(settings, "DEFAULT_GENDER", "female").title()
+    speed = _setting_raw_from(settings, "DEFAULT_SPEED", "1.0")
+    ocr = _setting_raw_from(settings, "OCR_PROVIDER", "gemini").upper()
+    resolver = "ON ✅" if _setting_bool_from(settings, "ai_resolver_enabled", True) else "OFF ⚠️"
+
+    return (
+        "🎙️ <b>ការកំណត់ AI & TTS Models</b>\n\n"
+        f"• ម៉ូដែល TTS លំនាំដើម: <b>{html.escape(tts)}</b>\n"
+        f"• ម៉ូដែល Gemini AI: <code>{html.escape(gemini)}</code>\n"
+        f"• ម៉ូដែល Gemini Audio: <code>{html.escape(gemini_audio)}</code>\n"
+        f"• សំឡេងលំនាំដើម: <b>{html.escape(gender)}</b> · ល្បឿន: <b>{html.escape(speed)}x</b>\n"
+        f"• OCR Provider: <b>{html.escape(ocr)}</b>\n"
+        f"• AI Text Resolver: <b>{resolver}</b>\n\n"
+        "ចុចប៊ូតុងខាងក្រោមដើម្បីជ្រើសរើស ឬប្តូរភ្លាមៗ៖"
+    )
+
+
+def get_bot_config_ai_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
+    active_tts = _setting_raw_from(settings, "DEFAULT_TTS_MODEL", "auto").lower()
+    active_gemini = _setting_raw_from(settings, "GEMINI_MODEL", "gemini-2.0-flash").lower()
+    active_gender = _setting_raw_from(settings, "DEFAULT_GENDER", "female").lower()
+    active_speed = _setting_raw_from(settings, "DEFAULT_SPEED", "1.0")
+    active_ocr = _setting_raw_from(settings, "OCR_PROVIDER", "gemini").lower()
+    resolver_on = _setting_bool_from(settings, "ai_resolver_enabled", True)
+
+    def _mark(current: str, val: str) -> str:
+        return f"✓ {val}" if current == val else val
+
+    rows = [
+        # TTS Engine
+        [InlineKeyboardButton("TTS:", callback_data="noop"),
+         InlineKeyboardButton(_mark(active_tts, "auto"), callback_data="cfg_set:DEFAULT_TTS_MODEL:auto"),
+         InlineKeyboardButton(_mark(active_tts, "edge"), callback_data="cfg_set:DEFAULT_TTS_MODEL:edge"),
+         InlineKeyboardButton(_mark(active_tts, "gemini"), callback_data="cfg_set:DEFAULT_TTS_MODEL:gemini"),
+         InlineKeyboardButton(_mark(active_tts, "hf_space"), callback_data="cfg_set:DEFAULT_TTS_MODEL:hf_space")],
+        # Gemini Model
+        [InlineKeyboardButton("Gemini:", callback_data="noop"),
+         InlineKeyboardButton(_mark(active_gemini, "gemini-2.0-flash"), callback_data="cfg_set:GEMINI_MODEL:gemini-2.0-flash"),
+         InlineKeyboardButton(_mark(active_gemini, "gemini-1.5-flash"), callback_data="cfg_set:GEMINI_MODEL:gemini-1.5-flash"),
+         InlineKeyboardButton(_mark(active_gemini, "gemini-2.5-flash"), callback_data="cfg_set:GEMINI_MODEL:gemini-2.5-flash")],
+        # Voice Gender
+        [InlineKeyboardButton("Voice:", callback_data="noop"),
+         InlineKeyboardButton(_mark(active_gender, "female") + " 👩", callback_data="cfg_set:DEFAULT_GENDER:female"),
+         InlineKeyboardButton(_mark(active_gender, "male") + " 👨", callback_data="cfg_set:DEFAULT_GENDER:male")],
+        # Speech Speed
+        [InlineKeyboardButton("Speed:", callback_data="noop"),
+         InlineKeyboardButton(_mark(active_speed, "0.75") + "x", callback_data="cfg_set:DEFAULT_SPEED:0.75"),
+         InlineKeyboardButton(_mark(active_speed, "1.0") + "x", callback_data="cfg_set:DEFAULT_SPEED:1.0"),
+         InlineKeyboardButton(_mark(active_speed, "1.25") + "x", callback_data="cfg_set:DEFAULT_SPEED:1.25"),
+         InlineKeyboardButton(_mark(active_speed, "1.5") + "x", callback_data="cfg_set:DEFAULT_SPEED:1.5")],
+        # OCR & AI Resolver
+        [InlineKeyboardButton(f"OCR: {_mark(active_ocr, 'gemini')}", callback_data="cfg_set:OCR_PROVIDER:gemini"),
+         InlineKeyboardButton(f"OCR: {_mark(active_ocr, 'hf')}", callback_data="cfg_set:OCR_PROVIDER:hf")],
+        [InlineKeyboardButton(f"🧠 AI Resolver: {'ON ✅' if resolver_on else 'OFF ⚠️'}", callback_data="cfg_set:ai_resolver_enabled:toggle")],
+        # Navigation
+        [InlineKeyboardButton("⬅️ Bot Config", callback_data="admin_bot_config"),
+         InlineKeyboardButton("🏠 Admin Home", callback_data="admin_home")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _admin_bot_config_channel_text(settings: dict[str, str]) -> str:
+    ch_on = _setting_bool_from(settings, "channel_narrator_enabled", True)
+    ch_gender = _setting_raw_from(settings, "channel_narrator_gender", "female").title()
+    ch_speed = _setting_raw_from(settings, "channel_narrator_speed", "1.0")
+    ch_model = _setting_raw_from(settings, "channel_narrator_model", "auto")
+    ch_max = _setting_raw_from(settings, "channel_narrator_max_chars", "2000")
+    ch_btn = "Shown 🔘" if _setting_bool_from(settings, "channel_narrator_show_buttons", False) else "Hidden 🙈 (Clean)"
+    ch_wl = _setting_raw_from(settings, "allowed_channel_ids", "") or "All Channels (Admin)"
+
+    return (
+        "📢 <b>ការកំណត់ Channel Auto-Voice Narrator</b>\n\n"
+        f"• Status: <b>{'ON ✅ (Active)' if ch_on else 'OFF ⚠️ (Disabled)'}</b>\n"
+        f"• Voice Gender: <b>{html.escape(ch_gender)}</b> · Speed: <b>{html.escape(ch_speed)}x</b>\n"
+        f"• TTS Engine: <b>{html.escape(ch_model)}</b> · Max Length: <b>{html.escape(ch_max)}</b> chars\n"
+        f"• Action Buttons in Channel: <b>{ch_btn}</b>\n"
+        f"• Whitelist Channels: <code>{html.escape(ch_wl[:50])}</code>\n\n"
+        "ចុចប៊ូតុងខាងក្រោមដើម្បីផ្លាស់ប្តូរការកំណត់ភ្លាមៗ៖"
+    )
+
+
+def get_bot_config_channel_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
+    ch_on = _setting_bool_from(settings, "channel_narrator_enabled", True)
+    ch_gender = _setting_raw_from(settings, "channel_narrator_gender", "female").lower()
+    ch_speed = _setting_raw_from(settings, "channel_narrator_speed", "1.0")
+    ch_model = _setting_raw_from(settings, "channel_narrator_model", "auto").lower()
+    ch_max = _setting_raw_from(settings, "channel_narrator_max_chars", "2000")
+    ch_btn_on = _setting_bool_from(settings, "channel_narrator_show_buttons", False)
+
+    def _mark(current: str, val: str) -> str:
+        return f"✓ {val}" if current == val else val
+
+    rows = [
+        # Master Toggle
+        [InlineKeyboardButton(f"📢 Narrator: {'ON ✅ (Active)' if ch_on else 'OFF ⚠️ (Disabled)'}", callback_data="cfg_set:channel_narrator_enabled:toggle")],
+        # Gender
+        [InlineKeyboardButton("Voice:", callback_data="noop"),
+         InlineKeyboardButton(_mark(ch_gender, "female") + " 👩", callback_data="cfg_set:channel_narrator_gender:female"),
+         InlineKeyboardButton(_mark(ch_gender, "male") + " 👨", callback_data="cfg_set:channel_narrator_gender:male")],
+        # Speed
+        [InlineKeyboardButton("Speed:", callback_data="noop"),
+         InlineKeyboardButton(_mark(ch_speed, "0.75") + "x", callback_data="cfg_set:channel_narrator_speed:0.75"),
+         InlineKeyboardButton(_mark(ch_speed, "1.0") + "x", callback_data="cfg_set:channel_narrator_speed:1.0"),
+         InlineKeyboardButton(_mark(ch_speed, "1.25") + "x", callback_data="cfg_set:channel_narrator_speed:1.25"),
+         InlineKeyboardButton(_mark(ch_speed, "1.5") + "x", callback_data="cfg_set:channel_narrator_speed:1.5")],
+        # Engine
+        [InlineKeyboardButton("Engine:", callback_data="noop"),
+         InlineKeyboardButton(_mark(ch_model, "auto"), callback_data="cfg_set:channel_narrator_model:auto"),
+         InlineKeyboardButton(_mark(ch_model, "edge"), callback_data="cfg_set:channel_narrator_model:edge"),
+         InlineKeyboardButton(_mark(ch_model, "gemini"), callback_data="cfg_set:channel_narrator_model:gemini"),
+         InlineKeyboardButton(_mark(ch_model, "hf_space"), callback_data="cfg_set:channel_narrator_model:hf_space")],
+        # Buttons in Channel
+        [InlineKeyboardButton(f"Buttons in Post: {'Shown 🔘' if ch_btn_on else 'Hidden 🙈 (Clean)'}", callback_data="cfg_set:channel_narrator_show_buttons:toggle")],
+        # Max Characters
+        [InlineKeyboardButton("Max Chars:", callback_data="noop"),
+         InlineKeyboardButton(_mark(ch_max, "1000"), callback_data="cfg_set:channel_narrator_max_chars:1000"),
+         InlineKeyboardButton(_mark(ch_max, "2000"), callback_data="cfg_set:channel_narrator_max_chars:2000"),
+         InlineKeyboardButton(_mark(ch_max, "3000"), callback_data="cfg_set:channel_narrator_max_chars:3000"),
+         InlineKeyboardButton(_mark(ch_max, "4000"), callback_data="cfg_set:channel_narrator_max_chars:4000")],
+        # Navigation
+        [InlineKeyboardButton("⬅️ Bot Config", callback_data="admin_bot_config"),
+         InlineKeyboardButton("🏠 Admin Home", callback_data="admin_home")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _admin_bot_config_all_text(settings: dict[str, str], status: dict) -> str:
+    db_ok = status.get("db_ok", False)
+    storage_label = "Supabase PostgreSQL" if db_ok else "In-Memory Fallback"
+    lines = [
+        "📋 <b>All Bot Configurations (ការកំណត់សរុប)</b>",
+        f"💾 <b>Storage:</b> <code>{storage_label}</code>",
+        "",
+        "<pre>",
+    ]
+    for k in sorted(BOT_SETTING_DEFAULTS.keys()):
+        val = _setting_raw_from(settings, k, BOT_SETTING_DEFAULTS[k])
+        if any(sec in k.lower() for sec in ("token", "secret", "password", "key")):
+            val = _mask_secret(val)
+        lines.append(f"{k} = {val}")
+    lines.append("</pre>")
+    lines.append("\n💡 <i>ដើម្បីកែប្រែ សូមជ្រើសរើស Menu តាមផ្នែកក្នុង Bot Config</i>")
+    return "\n".join(lines)
+
+
+def get_bot_config_all_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh", callback_data="cfg_cat:all"),
+         InlineKeyboardButton("⬅️ Bot Config", callback_data="admin_bot_config")],
+        [InlineKeyboardButton("🏠 Admin Home", callback_data="admin_home"),
+         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
+    ])
+
+
+async def _admin_open_bot_config_panel(query_or_msg: Any, user_id: int, force: bool = False, notice: str = "") -> None:
+    settings, status = await get_bot_settings_async(force=force)
+    text = _admin_bot_config_home_text(settings, status)
+    if notice:
+        text = f"{html.escape(notice)}\n\n{text}"
+    kb = get_bot_config_home_kb()
+
+    if hasattr(query_or_msg, "message") and query_or_msg.message:
+        await safe_send(lambda: query_or_msg.message.edit_text(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True))
+    elif hasattr(query_or_msg, "edit_text"):
+        await safe_send(lambda: query_or_msg.edit_text(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True))
+    elif hasattr(query_or_msg, "reply_text"):
+        await safe_send(lambda: query_or_msg.reply_text(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True))
+
+
+async def _admin_open_bot_config_ai(query: Any, user_id: int, force: bool = False, notice: str = "") -> None:
+    settings, _status = await get_bot_settings_async(force=force)
+    text = _admin_bot_config_ai_text(settings)
+    if notice:
+        text = f"{html.escape(notice)}\n\n{text}"
+    kb = get_bot_config_ai_kb(settings)
+    msg = query.message if hasattr(query, "message") and query.message else query
+    await safe_send(lambda: msg.edit_text(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True))
+
+
+async def _admin_open_bot_config_channel(query: Any, user_id: int, force: bool = False, notice: str = "") -> None:
+    settings, _status = await get_bot_settings_async(force=force)
+    text = _admin_bot_config_channel_text(settings)
+    if notice:
+        text = f"{html.escape(notice)}\n\n{text}"
+    kb = get_bot_config_channel_kb(settings)
+    msg = query.message if hasattr(query, "message") and query.message else query
+    await safe_send(lambda: msg.edit_text(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True))
+
+
+async def _admin_open_bot_config_all(query: Any, user_id: int, force: bool = False, notice: str = "") -> None:
+    settings, status = await get_bot_settings_async(force=force)
+    text = _admin_bot_config_all_text(settings, status)
+    if notice:
+        text = f"{html.escape(notice)}\n\n{text}"
+    kb = get_bot_config_all_kb()
+    msg = query.message if hasattr(query, "message") and query.message else query
+    await safe_send(lambda: msg.edit_text(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True))
 
 
 async def _admin_send_settings_sql(message) -> None:
@@ -24478,7 +24844,7 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         await safe_send(lambda: query.message.edit_text(
             text,
             parse_mode="HTML",
-            reply_markup=get_admin_dashboard_kb(),
+            reply_markup=get_admin_stats_kb(),
             disable_web_page_preview=True,
         ))
         return
@@ -24498,7 +24864,7 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         await safe_send(lambda: query.message.edit_text(
             text,
             parse_mode="HTML",
-            reply_markup=get_admin_dashboard_kb(),
+            reply_markup=get_admin_health_kb(),
         ))
         return
 
@@ -24639,6 +25005,55 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
 
     if data == "admin_welcome_preview":
         await _send_welcome_message(query.message)
+        return
+
+    if data in ("admin_bot_config", "admin_bot_config_refresh"):
+        await _admin_open_bot_config_panel(query, user_id, force=True)
+        return
+
+    if data == "cfg_cat:ai":
+        await _admin_open_bot_config_ai(query, user_id, force=True)
+        return
+
+    if data == "cfg_cat:channel":
+        await _admin_open_bot_config_channel(query, user_id, force=True)
+        return
+
+    if data == "cfg_cat:features":
+        await _admin_open_settings_panel(query, force=True)
+        return
+
+    if data == "cfg_cat:all":
+        await _admin_open_bot_config_all(query, user_id, force=True)
+        return
+
+    if data.startswith("cfg_set:"):
+        parts = data.split(":", 2)
+        if len(parts) == 3:
+            key, val = parts[1], parts[2]
+            settings, _status = await get_bot_settings_async(force=True)
+            if val == "toggle":
+                curr = _setting_bool_from(settings, key, True)
+                val = "0" if curr else "1"
+            ok, info = await asyncio.get_running_loop().run_in_executor(
+                _DB_EXECUTOR,
+                lambda: db_bot_setting_value_set(key, val, user_id),
+            )
+            if key in globals().get("_RUN_STATE_PERSISTED_KEYS", ()):
+                with suppress(Exception):
+                    await _update_run_state(key, val, persist=True)
+            notice = f"✅ បានរក្សាទុក {key} = {val}" if ok else f"⚠️ កំហុស: {info}"
+            if key.startswith("channel_narrator_"):
+                await _admin_open_bot_config_channel(query, user_id, force=True, notice=notice)
+            elif key in ("DEFAULT_TTS_MODEL", "DEFAULT_GENDER", "DEFAULT_SPEED", "GEMINI_MODEL", "GEMINI_AUDIO_MODEL", "OCR_PROVIDER", "ai_resolver_enabled"):
+                await _admin_open_bot_config_ai(query, user_id, force=True, notice=notice)
+            else:
+                await _admin_open_bot_config_panel(query, user_id, force=True, notice=notice)
+            return
+
+    if data == "noop":
+        with suppress(Exception):
+            await query.answer()
         return
 
     if data in ("admin_settings", "admin_settings_refresh"):
@@ -24834,7 +25249,7 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         await safe_send(lambda: query.message.edit_text(
             sys_text,
             parse_mode="HTML",
-            reply_markup=get_admin_dashboard_kb(),
+            reply_markup=get_admin_stats_kb(),
             disable_web_page_preview=True,
         ))
         return
@@ -27050,6 +27465,18 @@ async def _run_bot():
         .write_timeout(30)
         .pool_timeout(30)
     )
+    # Configure dedicated polling timeouts and connection pool if supported by PTB version
+    if hasattr(builder, "get_updates_connect_timeout"):
+        builder = builder.get_updates_connect_timeout(15.0)
+    if hasattr(builder, "get_updates_read_timeout"):
+        builder = builder.get_updates_read_timeout(35.0)
+    if hasattr(builder, "get_updates_write_timeout"):
+        builder = builder.get_updates_write_timeout(15.0)
+    if hasattr(builder, "get_updates_pool_timeout"):
+        builder = builder.get_updates_pool_timeout(15.0)
+    if hasattr(builder, "get_updates_connection_pool_size"):
+        builder = builder.get_updates_connection_pool_size(8)
+
     # Admin Performance V5: tune update processing and HTTP connection pool.
     # hasattr keeps compatibility with older python-telegram-bot versions.
     if hasattr(builder, "concurrent_updates"):

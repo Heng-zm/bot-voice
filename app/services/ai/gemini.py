@@ -28,8 +28,40 @@ def is_retryable_gemini_error(exc: BaseException | str) -> bool:
             "temporarily overloaded",
             "service unavailable",
             "quota exceeded",
+            "rate limit",
+            "ratelimit",
+            "deadline exceeded",
+            "overloaded",
+            "connection error",
+            "connect error",
+            "read timeout",
+            "socket error",
         )
     )
+
+
+def extract_gemini_text(response: Any) -> str:
+    """Safely extract text from Gemini response without ValueError on safety blocks or empty candidates."""
+    if response is None:
+        return ""
+    try:
+        val = getattr(response, "text", "")
+        if val:
+            return str(val).strip()
+    except (ValueError, AttributeError) as exc:
+        logger.debug("Gemini response.text unavailable: %s", exc)
+
+    try:
+        candidates = getattr(response, "candidates", None) or []
+        for cand in candidates:
+            content = getattr(cand, "content", None)
+            parts = getattr(content, "parts", None) or []
+            cand_text = "".join(getattr(p, "text", "") or "" for p in parts if getattr(p, "text", None))
+            if cand_text.strip():
+                return cand_text.strip()
+    except Exception as exc:
+        logger.debug("Gemini candidates text extraction error: %s", exc)
+    return ""
 
 
 def generate_content_with_fallback(
@@ -102,6 +134,7 @@ __all__ = [
     "GEMINI_MODEL_DEFAULT",
     "detect_image_mime",
     "detect_image_mime_from_bytes",
+    "extract_gemini_text",
     "generate_content_with_fallback",
     "is_retryable_gemini_error",
 ]

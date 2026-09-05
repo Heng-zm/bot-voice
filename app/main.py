@@ -244,10 +244,26 @@ async def periodic_database_pruner() -> None:
         logger.debug("periodic_database_pruner background task stopped cleanly.")
 
 
+async def bot_runner_supervisor() -> None:
+    """Supervise the Telegram bot runner and restart it automatically if it ever exits."""
+    backoff = 5
+    while True:
+        try:
+            logger.info("Starting Telegram bot runner under supervisor...")
+            await legacy._async_main_once()
+            logger.warning("Telegram bot runner exited. Restarting in %ss...", backoff)
+        except asyncio.CancelledError:
+            logger.info("Telegram bot runner supervisor received cancellation.")
+            raise
+        except Exception as exc:
+            logger.error("Telegram bot runner crashed: %s. Restarting in %ss...", exc, backoff, exc_info=True)
+        await asyncio.sleep(backoff)
+
+
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI) -> AsyncGenerator[None, None]:
     """Start the Telegram Bot runner and auto-register all services."""
-    bot_task = asyncio.create_task(legacy._async_main_once(), name="telegram-bot-runner")
+    bot_task = asyncio.create_task(bot_runner_supervisor(), name="telegram-bot-runner")
     auto_reg_task = asyncio.create_task(auto_register_all(), name="auto-register-all")
     keep_awake_task = asyncio.create_task(keep_awake(), name="keep-awake")
     db_prune_task = asyncio.create_task(periodic_database_pruner(), name="db-pruner")

@@ -66,4 +66,40 @@ def callback_requires_tts_access(action: str, data: str | None) -> bool:
     }
 
 
-__all__ = ["callback_requires_tts_access", "classify_callback"]
+def is_message_not_modified_error(exc: Exception | str) -> bool:
+    """Return True if Telegram error indicates message was already identical."""
+    return "message is not modified" in str(exc).lower()
+
+
+def is_stale_telegram_message_error(exc: Exception | str) -> bool:
+    """Return True for harmless Telegram edit/delete races on stale messages."""
+    msg = str(exc).lower()
+    return any(token in msg for token in (
+        "message to edit not found",
+        "message to delete not found",
+        "message can't be deleted",
+        "message can't be edited",
+        "message is not found",
+        "message_id_invalid",
+        "message not found",
+        "message to be replied not found",
+        "reply message not found",
+        "there is no text in the message to edit",
+        "message is too old",
+        "message to be edited not found",
+        "query is too old",
+    ))
+
+
+def is_nonfatal_telegram_edit_error(exc: Exception | str) -> bool:
+    """Return True if Telegram edit error is harmless and non-fatal."""
+    return is_message_not_modified_error(exc) or is_stale_telegram_message_error(exc)
+
+
+__all__ = [
+    "callback_requires_tts_access",
+    "classify_callback",
+    "is_message_not_modified_error",
+    "is_nonfatal_telegram_edit_error",
+    "is_stale_telegram_message_error",
+]

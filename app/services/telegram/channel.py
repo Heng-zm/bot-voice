@@ -115,7 +115,17 @@ async def _get_channel_lock(chat_id: int) -> asyncio.Lock:
 
 def _is_channel_allowed(chat_id: int, username: str | None) -> bool:
     """Check if the channel is allowed based on ALLOWED_CHANNEL_IDS configuration."""
-    raw_allowed = os.environ.get("ALLOWED_CHANNEL_IDS", "").strip()
+    raw_allowed = ""
+    try:
+        from app import legacy
+        get_setting = getattr(legacy, "bot_setting_raw_cached", None)
+        if callable(get_setting):
+            raw_allowed = str(get_setting("allowed_channel_ids", "") or "").strip()
+    except Exception:
+        raw_allowed = ""
+
+    if not raw_allowed:
+        raw_allowed = os.environ.get("ALLOWED_CHANNEL_IDS", "").strip()
     if not raw_allowed:
         return True  # If not explicitly restricted, allow any channel where bot is admin
 
@@ -163,7 +173,15 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     # 5. Clean text for natural speech
-    max_chars = int(os.environ.get("CHANNEL_NARRATOR_MAX_CHARS", "2000"))
+    max_chars_str = (
+        bot_setting_raw_cached("channel_narrator_max_chars", os.environ.get("CHANNEL_NARRATOR_MAX_CHARS", "2000"))
+        if "bot_setting_raw_cached" in globals()
+        else os.environ.get("CHANNEL_NARRATOR_MAX_CHARS", "2000")
+    )
+    try:
+        max_chars = int(max_chars_str)
+    except Exception:
+        max_chars = 2000
     tts_text = clean_channel_text(raw_text, max_chars=max_chars)
     if not tts_text:
         return
@@ -176,9 +194,25 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     async with lock:
         file_path: str | None = None
         try:
-            gender = os.environ.get("CHANNEL_NARRATOR_GENDER", "female").strip().lower()
-            speed = float(os.environ.get("CHANNEL_NARRATOR_SPEED", "1.0"))
-            tts_model = os.environ.get("CHANNEL_NARRATOR_MODEL", "auto").strip().lower()
+            gender = (
+                bot_setting_raw_cached("channel_narrator_gender", os.environ.get("CHANNEL_NARRATOR_GENDER", "female"))
+                if "bot_setting_raw_cached" in globals()
+                else os.environ.get("CHANNEL_NARRATOR_GENDER", "female")
+            ).strip().lower()
+            speed_str = (
+                bot_setting_raw_cached("channel_narrator_speed", os.environ.get("CHANNEL_NARRATOR_SPEED", "1.0"))
+                if "bot_setting_raw_cached" in globals()
+                else os.environ.get("CHANNEL_NARRATOR_SPEED", "1.0")
+            )
+            try:
+                speed = float(speed_str)
+            except Exception:
+                speed = 1.0
+            tts_model = (
+                bot_setting_raw_cached("channel_narrator_model", os.environ.get("CHANNEL_NARRATOR_MODEL", "auto"))
+                if "bot_setting_raw_cached" in globals()
+                else os.environ.get("CHANNEL_NARRATOR_MODEL", "auto")
+            ).strip().lower()
             file_path = _make_temp_ogg()
 
             logger.info(
@@ -210,13 +244,24 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 else "🗣️ សំឡេងអានអត្ថបទ (Audio Narration)"
             )
 
+            show_buttons = (
+                bot_setting_bool_cached("channel_narrator_show_buttons", False)
+                if "bot_setting_bool_cached" in globals()
+                else os.environ.get("CHANNEL_NARRATOR_SHOW_BUTTONS", "0").lower() in ("1", "true", "yes")
+            )
+            reply_markup = None
+            if show_buttons and "get_audio_action_kb" in globals() and "_tts_text_cache_set" in globals():
+                text_cache_id = _tts_text_cache_set(tts_text)
+                reply_markup = get_audio_action_kb(text_cache_id, tts_text, gender=gender, speed=speed, model=tts_model)
+
             # Try replying to the post first so it anchors directly in discussion threads
             sent = False
             try:
-                await safe_send(lambda ab=audio_bytes: context.bot.send_voice(
+                await safe_send(lambda ab=audio_bytes, rm=reply_markup: context.bot.send_voice(
                     chat_id=chat.id,
                     voice=io.BytesIO(ab),
                     caption=caption,
+                    reply_markup=rm,
                     reply_to_message_id=post.message_id,
                 ))
                 sent = True
@@ -230,10 +275,11 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
             if not sent:
                 # Direct post without reply_to_message_id if replying is disabled in channel
-                await safe_send(lambda ab=audio_bytes: context.bot.send_voice(
+                await safe_send(lambda ab=audio_bytes, rm=reply_markup: context.bot.send_voice(
                     chat_id=chat.id,
                     voice=io.BytesIO(ab),
                     caption=caption,
+                    reply_markup=rm,
                 ))
 
             _metric_inc("channel_narrations")

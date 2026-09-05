@@ -19,6 +19,9 @@ from app.services.health import start_health_server
 from app.services.settings.store import get_settings_store
 from app.services.telegram.routing import register_telegram_handlers
 from app.services.tts.voices import get_default_tts_model, tts_model_label
+from app.utils.logging import install_telegram_polling_filter
+
+install_telegram_polling_filter()
 
 logger = logging.getLogger("app.bot")
 
@@ -44,6 +47,17 @@ def build_telegram_application(token: str, bot_mode: str = "POLLING") -> Applica
         .write_timeout(30)
         .pool_timeout(30)
     )
+    if hasattr(builder, "get_updates_connect_timeout"):
+        builder = builder.get_updates_connect_timeout(15.0)
+    if hasattr(builder, "get_updates_read_timeout"):
+        builder = builder.get_updates_read_timeout(35.0)
+    if hasattr(builder, "get_updates_write_timeout"):
+        builder = builder.get_updates_write_timeout(15.0)
+    if hasattr(builder, "get_updates_pool_timeout"):
+        builder = builder.get_updates_pool_timeout(15.0)
+    if hasattr(builder, "get_updates_connection_pool_size"):
+        builder = builder.get_updates_connection_pool_size(8)
+
     if hasattr(builder, "concurrent_updates"):
         builder = builder.concurrent_updates(4)
     if hasattr(builder, "connection_pool_size"):
