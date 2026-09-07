@@ -10252,11 +10252,13 @@ _TTS_CHUNK_SEMAPHORE: asyncio.Semaphore | None = None
 # ---------------------------------------------------------------------------
 class CircuitBreaker:
     """Small circuit breaker to avoid hammering Redis/Supabase during outages."""
-    def __init__(self, name: str, max_failures: int = 5, reset_after: float = 30.0):
+    def __init__(self, name: str, max_failures: int = 5, reset_after: float = 30.0, window_s: float = 60.0):
         self.name = name
         self.max_failures = max(1, int(max_failures))
         self.reset_after = max(1.0, float(reset_after))
+        self.window_s = max(5.0, float(window_s))
         self.failures = 0
+        self.last_failure_time = 0.0
         self.open_until = 0.0
         self._lock = threading.Lock()
 
@@ -10271,14 +10273,19 @@ class CircuitBreaker:
 
     def record_failure(self, exc: BaseException | str) -> None:
         with self._lock:
+            now = time.monotonic()
+            if now - self.last_failure_time > self.window_s:
+                self.failures = 0
+            self.last_failure_time = now
             self.failures += 1
             if self.failures >= self.max_failures:
-                self.open_until = time.monotonic() + self.reset_after
+                self.open_until = now + self.reset_after
                 logger.warning(
-                    "%s circuit breaker opened for %.0fs after %d failure(s): %s",
+                    "%s circuit breaker opened for %.0fs after %d failure(s) in %gs: %s",
                     self.name,
                     self.reset_after,
                     self.failures,
+                    self.window_s,
                     str(exc)[:240],
                 )
 
@@ -10398,8 +10405,6 @@ def retry_call_sync(
             last_exc = exc
             retryable = _is_retryable_store_error(exc)
             if not retryable:
-                if breaker:
-                    breaker.record_failure(exc)
                 _log_once(
                     logging.ERROR,
                     f"{name}:non_retryable:{type(exc).__name__}:{str(exc)[:120]}",
@@ -10481,8 +10486,6 @@ async def retry_call(
             last_exc = exc
             retryable = _is_retryable_store_error(exc)
             if not retryable:
-                if breaker:
-                    breaker.record_failure(exc)
                 _log_once(
                     logging.ERROR,
                     f"{name}:non_retryable:{type(exc).__name__}:{str(exc)[:120]}",
@@ -10660,8 +10663,9 @@ def _supabase_select_schema_safe_sync(
                     _supabase_mark_missing_column(table, missing_col, name)
                     continue
 
-                with suppress(Exception):
-                    supabase_breaker.record_failure(exc)
+                if _is_retryable_store_error(exc):
+                    with suppress(Exception):
+                        supabase_breaker.record_failure(exc)
                 level = logging.WARNING if _is_retryable_store_error(exc) else logging.ERROR
                 _log_once(
                     level,
@@ -10726,8 +10730,9 @@ def _supabase_upsert_schema_safe_sync(
                 _supabase_mark_missing_column(table, missing_col, name)
                 continue
 
-            with suppress(Exception):
-                supabase_breaker.record_failure(exc)
+            if _is_retryable_store_error(exc):
+                with suppress(Exception):
+                    supabase_breaker.record_failure(exc)
             level = logging.WARNING if _is_retryable_store_error(exc) else logging.ERROR
             _log_once(
                 level,
@@ -17269,8 +17274,15 @@ def _hf_tts_record_failure(exc: BaseException | str) -> None:
         _HF_TTS_FAILURES += 1
         previous_until = _HF_TTS_DISABLED_UNTIL
 
+        is_timeout = (
+            isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+            or "timeout" in str(exc).lower()
+            or "timed out" in str(exc).lower()
+        )
         if _hf_tts_is_quota_error(exc):
             cooldown = HF_TTS_QUOTA_COOLDOWN_S
+        elif is_timeout:
+            cooldown = HF_TTS_COOLDOWN_S
         elif _HF_TTS_FAILURES >= HF_TTS_FAILURE_LIMIT:
             cooldown = HF_TTS_NO_AUDIO_COOLDOWN_S if _hf_tts_is_no_audio_error(exc) else HF_TTS_COOLDOWN_S
 
@@ -19276,10 +19288,10 @@ async def _generate_voice_gemini(text: str, gender: str, speed: float, output_pa
     try:
         audio_bytes = await asyncio.wait_for(
             loop.run_in_executor(_AI_EXECUTOR, _call_gemini_audio_sync),
-            timeout=15.0,
+            timeout=10.0,
         )
     except (TimeoutError, asyncio.TimeoutError):
-        logger.warning("Gemini audio generation timed out (>15s); falling back to Edge TTS.")
+        logger.warning("Gemini audio generation timed out (>10s); falling back to Edge TTS.")
         audio_bytes = None
 
     if audio_bytes:
@@ -19356,9 +19368,10 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
             cooldown_only = "cooldown active" in low
             if not cooldown_only:
                 _hf_tts_record_failure(exc)
+                err_text = str(exc).strip() or (type(exc).__name__ if exc else "timeout")
                 logger.warning(
                     "HF Khmer TTS unavailable (attempting Tier 2 Edge fallback): %s",
-                    exc,
+                    err_text,
                 )
             else:
                 logger.info(
