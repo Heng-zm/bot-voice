@@ -22052,17 +22052,20 @@ def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
 
         regular_font, bold_font = _register_report_pdf_fonts()
         page_width, page_height = A4
-        margin_x = 17 * mm
-        margin_top = 22 * mm
-        margin_bottom = 17 * mm
-        primary = colors.HexColor("#2563EB")
-        primary_dark = colors.HexColor("#1E3A8A")
-        ink = colors.HexColor("#0F172A")
-        muted = colors.HexColor("#64748B")
-        line = colors.HexColor("#E2E8F0")
-        soft = colors.HexColor("#F8FAFC")
-        good = colors.HexColor("#16A34A")
-        warn = colors.HexColor("#DC2626")
+        margin_x = 15 * mm
+        margin_top = 18 * mm
+        margin_bottom = 16 * mm
+
+        c_primary = colors.HexColor("#4F46E5")      # Indigo 600
+        c_ink = colors.HexColor("#0F172A")          # Slate 900
+        c_muted = colors.HexColor("#64748B")        # Slate 500
+        c_line = colors.HexColor("#E2E8F0")         # Slate 200
+        c_border = colors.HexColor("#CBD5E1")       # Slate 300
+        c_bg_soft = colors.HexColor("#F8FAFC")      # Slate 50
+        c_bg_subtle = colors.HexColor("#F1F5F9")    # Slate 100
+        c_good = colors.HexColor("#059669")         # Emerald 600
+        c_warn = colors.HexColor("#DC2626")         # Rose 600
+        c_amber = colors.HexColor("#D97706")        # Amber 600
 
         doc = BaseDocTemplate(
             path,
@@ -22072,7 +22075,7 @@ def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
             topMargin=margin_top,
             bottomMargin=margin_bottom,
             title="Telegram Bot Admin Report",
-            author="Telegram Bot Admin",
+            author="Telegram Bot Voice & AI Assistant",
         )
         frame = Frame(
             doc.leftMargin,
@@ -22088,369 +22091,385 @@ def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
 
         def _draw_page(canvas_obj, doc_obj):
             canvas_obj.saveState()
-            canvas_obj.setFillColor(primary)
-            canvas_obj.rect(0, page_height - 13 * mm, page_width, 13 * mm, fill=1, stroke=0)
-            canvas_obj.setFillColor(colors.white)
-            canvas_obj.setFont(bold_font, 9)
-            canvas_obj.drawString(margin_x, page_height - 8.6 * mm, "Telegram Bot Admin Report")
-            canvas_obj.setFont(regular_font, 8)
-            canvas_obj.drawRightString(page_width - margin_x, page_height - 8.6 * mm, _report_pdf_text(data.get("generated_at"), 80))
-            canvas_obj.setStrokeColor(line)
-            canvas_obj.line(margin_x, 12 * mm, page_width - margin_x, 12 * mm)
-            canvas_obj.setFillColor(muted)
-            canvas_obj.setFont(regular_font, 8)
-            footer_left = f"Admin ID: {_report_pdf_text(data.get('admin_id'), 32)} | Uptime: {_report_pdf_text(data.get('uptime'), 60)}"
-            canvas_obj.drawString(margin_x, 7.5 * mm, footer_left)
-            canvas_obj.drawRightString(page_width - margin_x, 7.5 * mm, f"Page {doc_obj.page}")
+            # Top subtle accent stripe on all pages
+            canvas_obj.setFillColor(c_primary)
+            canvas_obj.rect(0, page_height - 3.5 * mm, page_width, 3.5 * mm, fill=1, stroke=0)
+
+            # Running header on page 2+
+            if doc_obj.page > 1:
+                canvas_obj.setFont(bold_font, 7.5)
+                canvas_obj.setFillColor(c_primary)
+                canvas_obj.drawString(margin_x, page_height - 11 * mm, "VOICE BOT")
+                canvas_obj.setFont(regular_font, 7.5)
+                canvas_obj.setFillColor(c_muted)
+                canvas_obj.drawString(margin_x + 16 * mm, page_height - 11 * mm, "•   Executive Operations & System Report")
+                canvas_obj.drawRightString(page_width - margin_x, page_height - 11 * mm, f"Page {doc_obj.page}")
+                canvas_obj.setStrokeColor(c_line)
+                canvas_obj.setLineWidth(0.6)
+                canvas_obj.line(margin_x, page_height - 13.5 * mm, page_width - margin_x, page_height - 13.5 * mm)
+
+            # Running footer on all pages
+            canvas_obj.setStrokeColor(c_line)
+            canvas_obj.setLineWidth(0.6)
+            canvas_obj.line(margin_x, 11 * mm, page_width - margin_x, 11 * mm)
+            canvas_obj.setFillColor(c_muted)
+            canvas_obj.setFont(regular_font, 7.5)
+            admin_str = f"Admin ID: {_report_pdf_text(data.get('admin_id'), 24)}  |  Uptime: {_report_pdf_text(data.get('uptime'), 30)}  |  Generated: {_report_pdf_text(data.get('generated_at'), 50)}"
+            canvas_obj.drawString(margin_x, 6.8 * mm, admin_str)
+            canvas_obj.drawRightString(page_width - margin_x, 6.8 * mm, f"Page {doc_obj.page}")
             canvas_obj.restoreState()
 
-        doc.addPageTemplates([PageTemplate(id="report", frames=[frame], onPage=_draw_page)])
+        doc.addPageTemplates([PageTemplate(id="modern_report", frames=[frame], onPage=_draw_page)])
 
         styles = getSampleStyleSheet()
         styles.add(ParagraphStyle(
-            name="ReportTitle",
-            parent=styles["Title"],
+            name="HeaderTag",
             fontName=bold_font,
-            fontSize=24,
-            leading=29,
-            textColor=ink,
-            spaceAfter=5,
+            fontSize=7.5,
+            leading=9,
+            textColor=c_primary,
+            spaceAfter=3,
         ))
         styles.add(ParagraphStyle(
-            name="ReportSubtitle",
-            parent=styles["BodyText"],
+            name="HeaderTitle",
+            fontName=bold_font,
+            fontSize=20,
+            leading=23,
+            textColor=c_ink,
+            spaceAfter=4,
+        ))
+        styles.add(ParagraphStyle(
+            name="HeaderSubtitle",
             fontName=regular_font,
-            fontSize=9.5,
-            leading=13,
-            textColor=muted,
-            spaceAfter=12,
+            fontSize=8.5,
+            leading=11.5,
+            textColor=c_muted,
         ))
         styles.add(ParagraphStyle(
-            name="SectionTitle",
-            parent=styles["Heading2"],
+            name="MetaLabel",
+            fontName=regular_font,
+            fontSize=7.2,
+            leading=9,
+            textColor=c_muted,
+            alignment=TA_RIGHT,
+        ))
+        styles.add(ParagraphStyle(
+            name="MetaValue",
             fontName=bold_font,
-            fontSize=13,
-            leading=16,
-            textColor=primary_dark,
-            spaceBefore=12,
-            spaceAfter=7,
+            fontSize=8,
+            leading=10,
+            textColor=c_ink,
+            alignment=TA_RIGHT,
+        ))
+        styles.add(ParagraphStyle(
+            name="SectionHeader",
+            fontName=bold_font,
+            fontSize=10.5,
+            leading=13,
+            textColor=c_ink,
+            spaceBefore=8,
+            spaceAfter=5,
             keepWithNext=True,
         ))
         styles.add(ParagraphStyle(
-            name="SmallMuted",
-            parent=styles["BodyText"],
-            fontName=regular_font,
-            fontSize=8.2,
-            leading=11,
-            textColor=muted,
-        ))
-        styles.add(ParagraphStyle(
-            name="TableText",
-            parent=styles["BodyText"],
-            fontName=regular_font,
-            fontSize=8.5,
-            leading=11,
-            textColor=ink,
-        ))
-        styles.add(ParagraphStyle(
-            name="TableTextCenter",
-            parent=styles["TableText"],
-            alignment=TA_CENTER,
-        ))
-        styles.add(ParagraphStyle(
             name="TableHead",
-            parent=styles["BodyText"],
             fontName=bold_font,
-            fontSize=8.5,
-            leading=11,
-            textColor=colors.white,
+            fontSize=7.8,
+            leading=10,
+            textColor=c_ink,
         ))
         styles.add(ParagraphStyle(
             name="TableHeadCenter",
-            parent=styles["TableHead"],
-            alignment=TA_CENTER,
-        ))
-        styles.add(ParagraphStyle(
-            name="CardLabel",
-            parent=styles["BodyText"],
-            fontName=regular_font,
-            fontSize=7.6,
-            leading=9.5,
-            textColor=muted,
-            alignment=TA_CENTER,
-        ))
-        styles.add(ParagraphStyle(
-            name="CardValue",
-            parent=styles["BodyText"],
             fontName=bold_font,
-            fontSize=15,
-            leading=18,
-            textColor=ink,
+            fontSize=7.8,
+            leading=10,
+            textColor=c_ink,
             alignment=TA_CENTER,
+        ))
+        styles.add(ParagraphStyle(
+            name="TableText",
+            fontName=regular_font,
+            fontSize=8,
+            leading=10.5,
+            textColor=c_ink,
+        ))
+        styles.add(ParagraphStyle(
+            name="TableTextCenter",
+            fontName=regular_font,
+            fontSize=8,
+            leading=10.5,
+            textColor=c_ink,
+            alignment=TA_CENTER,
+        ))
+        styles.add(ParagraphStyle(
+            name="TableTextBold",
+            fontName=bold_font,
+            fontSize=8,
+            leading=10.5,
+            textColor=c_ink,
+        ))
+        styles.add(ParagraphStyle(
+            name="TableMuted",
+            fontName=regular_font,
+            fontSize=7.5,
+            leading=9.5,
+            textColor=c_muted,
         ))
         styles.add(ParagraphStyle(
             name="StatusGood",
-            parent=styles["BodyText"],
             fontName=bold_font,
-            fontSize=8.5,
-            leading=11,
-            textColor=good,
+            fontSize=8,
+            leading=10,
+            textColor=c_good,
         ))
         styles.add(ParagraphStyle(
             name="StatusGoodCenter",
-            parent=styles["StatusGood"],
+            fontName=bold_font,
+            fontSize=8,
+            leading=10,
+            textColor=c_good,
             alignment=TA_CENTER,
         ))
         styles.add(ParagraphStyle(
             name="StatusBad",
-            parent=styles["BodyText"],
             fontName=bold_font,
-            fontSize=8.5,
-            leading=11,
-            textColor=warn,
+            fontSize=8,
+            leading=10,
+            textColor=c_warn,
         ))
         styles.add(ParagraphStyle(
             name="StatusBadCenter",
-            parent=styles["StatusBad"],
+            fontName=bold_font,
+            fontSize=8,
+            leading=10,
+            textColor=c_warn,
             alignment=TA_CENTER,
         ))
         styles.add(ParagraphStyle(
-            name="RightMuted",
-            parent=styles["SmallMuted"],
-            alignment=TA_RIGHT,
+            name="StatusAmberCenter",
+            fontName=bold_font,
+            fontSize=8,
+            leading=10,
+            textColor=c_amber,
+            alignment=TA_CENTER,
+        ))
+        styles.add(ParagraphStyle(
+            name="Disclaimer",
+            fontName=regular_font,
+            fontSize=7.5,
+            leading=10,
+            textColor=c_muted,
+            alignment=TA_CENTER,
         ))
 
         def P(value: Any, style_name: str = "TableText", limit: int | None = None) -> Paragraph:
             return Paragraph(html.escape(_report_pdf_text(value, limit)), styles[style_name])
 
-        def section(title: str):
-            return Paragraph(html.escape(title), styles["SectionTitle"])
+        def section_bar(title: str, subtitle: str = "") -> Table:
+            left_p = [Paragraph(f"<b>{html.escape(title)}</b>", styles["SectionHeader"])]
+            if subtitle:
+                left_p.append(Paragraph(html.escape(subtitle), styles["TableMuted"]))
+            t = Table([[left_p]], colWidths=[doc.width], hAlign="LEFT")
+            t.setStyle(TableStyle([
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("LINEBELOW", (0, 0), (-1, -1), 1.0, c_line),
+            ]))
+            return t
 
-        def table(rows, col_widths=None, header=True, extra_style=None):
+        def modern_table(rows, col_widths=None, header=True, extra_style=None):
             tbl = Table(rows, colWidths=col_widths, hAlign="LEFT", repeatRows=1 if header else 0)
             base = [
-                ("BOX", (0, 0), (-1, -1), 0.55, line),
-                ("INNERGRID", (0, 0), (-1, -1), 0.35, line),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 7),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 7),
-                ("TOPPADDING", (0, 0), (-1, -1), 6),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-                ("ROWBACKGROUNDS", (0, 1 if header else 0), (-1, -1), [colors.white, soft]),
+                ("BOX", (0, 0), (-1, -1), 0.75, c_line),
+                ("INNERGRID", (0, 0), (-1, -1), 0.45, colors.HexColor("#EEF2F6")),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 4.5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4.5),
+                ("ROWBACKGROUNDS", (0, 1 if header else 0), (-1, -1), [colors.white, c_bg_soft]),
             ]
             if header:
                 base.extend([
-                    ("BACKGROUND", (0, 0), (-1, 0), primary),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("BACKGROUND", (0, 0), (-1, 0), c_bg_subtle),
+                    ("LINEBELOW", (0, 0), (-1, 0), 1.0, c_border),
+                    ("TOPPADDING", (0, 0), (-1, 0), 5.5),
+                    ("BOTTOMPADDING", (0, 0), (-1, 0), 5.5),
                 ])
             if extra_style:
                 base.extend(extra_style)
             tbl.setStyle(TableStyle(base))
             return tbl
 
-        def activity_graph(analytics: dict[str, Any], report_label: str = ""):
-            """Draw a modern line-chart activity card directly in the PDF.
+        def draw_kpi_cards(counts_data: dict, total_w: float) -> Drawing:
+            """Render 5 sleek modern floating cards with top colored accent bars."""
+            h = 56
+            dw = Drawing(total_w, h)
+            card_count = 5
+            gap = 6
+            card_w = (total_w - (gap * (card_count - 1))) / card_count
 
-            Style goal: similar to a clean analytics dashboard card with KPI
-            values, legend dots, subtle grid lines, smooth blue/cyan lines, and
-            compact range pills. This avoids image/network dependencies and is
-            safe on Render because it uses only ReportLab vector shapes.
-            """
-            if not isinstance(analytics, dict):
-                return None
+            cards_spec = [
+                ("USERS", counts_data.get("users", 0), "Audience", colors.HexColor("#3B82F6")),
+                ("SCHEDULES", counts_data.get("schedules", 0), "Automated", colors.HexColor("#6366F1")),
+                ("PENDING", counts_data.get("pending", 0), "In queue", colors.HexColor("#F59E0B")),
+                ("FAILED", counts_data.get("failed", 0), "Review", colors.HexColor("#EF4444") if counts_data.get("failed", 0) else colors.HexColor("#10B981")),
+                ("API KEYS", counts_data.get("api_keys", 0), "Integrations", colors.HexColor("#10B981")),
+            ]
 
-            timeline = analytics.get("activity_timeline") or []
+            for i, (label, val, sub, accent) in enumerate(cards_spec):
+                x = i * (card_w + gap)
+                dw.add(Rect(x + 1, 0, card_w, h - 2, rx=5, ry=5, fillColor=colors.HexColor("#F1F5F9"), strokeColor=None))
+                dw.add(Rect(x, 2, card_w, h - 3, rx=5, ry=5, fillColor=colors.white, strokeColor=c_line, strokeWidth=0.75))
+                dw.add(Rect(x, h - 4, card_w, 3, rx=1.5, ry=1.5, fillColor=accent, strokeColor=None))
+                dw.add(String(x + 8, h - 14, label, fontName=bold_font, fontSize=6.5, fillColor=c_muted))
+                val_str = str(val if val is not None else 0)
+                dw.add(String(x + 8, h - 32, val_str, fontName=bold_font, fontSize=16, fillColor=c_ink))
+                dw.add(String(x + 8, h - 45, sub, fontName=regular_font, fontSize=6.8, fillColor=c_muted))
+
+            return dw
+
+        def modern_activity_graph(analytics_data: dict, report_label: str, width: float) -> Drawing:
+            """Compact 148pt activity card with smooth curves and metrics badge."""
+            height = 148
+            dw = Drawing(width, height)
+
+            timeline = analytics_data.get("activity_timeline") or []
             if not timeline:
-                day_counts = analytics.get("day_counts") or {}
+                day_counts = analytics_data.get("day_counts") or {}
                 for day_key, bucket in list(day_counts.items())[:31]:
                     try:
-                        label = datetime.strptime(str(day_key), "%Y-%m-%d").strftime("%b %d")
+                        lbl = datetime.strptime(str(day_key), "%Y-%m-%d").strftime("%b %d")
                     except Exception:
-                        label = str(day_key)[5:] or str(day_key)
+                        lbl = str(day_key)[5:] or str(day_key)
                     bucket = bucket or {}
                     timeline.append({
-                        "label": label,
-                        "schedules": max(0, _web_safe_int(bucket.get("schedules"))),
-                        "sent": max(0, _web_safe_int(bucket.get("sent"))),
-                        "failed": max(0, _web_safe_int(bucket.get("failed"))),
-                        "blocked": max(0, _web_safe_int(bucket.get("blocked"))),
-                        "issues": max(0, _web_safe_int(bucket.get("failed")) + _web_safe_int(bucket.get("blocked"))),
+                        "label": lbl,
+                        "schedules": max(0, int(bucket.get("schedules") or 0)),
+                        "sent": max(0, int(bucket.get("sent") or 0)),
+                        "failed": max(0, int(bucket.get("failed") or 0)),
+                        "blocked": max(0, int(bucket.get("blocked") or 0)),
+                        "issues": max(0, int(bucket.get("failed") or 0) + int(bucket.get("blocked") or 0)),
                     })
-            if not timeline:
-                return None
 
             timeline = list(timeline)[:60]
-            series_a = [max(0, _web_safe_int(item.get("sent"))) for item in timeline]
-            series_b = [max(0, _web_safe_int(item.get("schedules"))) for item in timeline]
+            series_a = [max(0, int(item.get("sent") or 0)) for item in timeline]
+            series_b = [max(0, int(item.get("schedules") or 0)) for item in timeline]
             labels = [str(item.get("label") or "") for item in timeline]
-            total_sent = max(0, _web_safe_int(analytics.get("sent")))
-            total_schedules = max(0, _web_safe_int(analytics.get("total_schedules")))
-            total_issues = max(0, _web_safe_int(analytics.get("failed")) + _web_safe_int(analytics.get("blocked")))
-            if max(series_a + series_b + [total_sent, total_schedules, 1]) <= 0:
-                # Keep the card visible even on quiet days, but draw flat zero lines.
-                series_a = [0 for _ in timeline]
-                series_b = [0 for _ in timeline]
+            total_sent = max(0, int(analytics_data.get("sent") or 0))
+            total_schedules = max(0, int(analytics_data.get("total_schedules") or 0))
+            total_issues = max(0, int(analytics_data.get("failed") or 0) + int(analytics_data.get("blocked") or 0))
 
-            def compact_number(value: Any) -> str:
-                n = max(0, _web_safe_int(value))
-                if n >= 1_000_000:
-                    return f"{n / 1_000_000:.2f}m".rstrip("0").rstrip(".")
-                if n >= 1_000:
-                    return f"{n / 1_000:.2f}k".rstrip("0").rstrip(".")
-                return str(n)
+            if not series_a or max(series_a + series_b + [total_sent, total_schedules, 1]) <= 0:
+                series_a = [0, 0, 0, 0, 0]
+                series_b = [0, 0, 0, 0, 0]
+                labels = ["00:00", "06:00", "12:00", "18:00", "23:00"]
+            elif not labels:
+                labels = ["00:00", "06:00", "12:00", "18:00", "23:00"]
 
-            def nice_max(value: int) -> int:
-                value = max(1, int(value or 1))
-                if value <= 5:
-                    return 5
-                magnitude = 10 ** max(0, len(str(value)) - 1)
-                for mult in (1, 2, 5, 10):
-                    candidate = mult * magnitude
-                    if candidate >= value:
-                        return candidate
-                return value
+            dw.add(Rect(2, 0, width - 4, height - 2, rx=6, ry=6, fillColor=colors.HexColor("#F8FAFC"), strokeColor=None))
+            dw.add(Rect(0, 2, width - 4, height - 4, rx=6, ry=6, fillColor=colors.white, strokeColor=c_line, strokeWidth=0.8))
 
-            def smooth_path(points: list[tuple[float, float]]) -> Path:
-                path = Path()
-                if not points:
-                    return path
-                path.moveTo(points[0][0], points[0][1])
-                if len(points) == 1:
-                    return path
-                if len(points) == 2:
-                    path.lineTo(points[1][0], points[1][1])
-                    return path
-                for i in range(len(points) - 1):
-                    p0 = points[max(i - 1, 0)]
-                    p1 = points[i]
-                    p2 = points[i + 1]
-                    p3 = points[min(i + 2, len(points) - 1)]
+            dw.add(String(14, height - 19, "DISPATCH & ACTIVITY VOLUME", fontName=bold_font, fontSize=7.5, fillColor=c_muted))
+
+            blue = colors.HexColor("#3B82F6")
+            cyan = colors.HexColor("#06B6D4")
+            amber = colors.HexColor("#F59E0B")
+
+            dw.add(Circle(142, height - 16, 3, fillColor=blue, strokeColor=blue))
+            dw.add(String(149, height - 19, f"Sent: {total_sent}", fontName=bold_font, fontSize=8, fillColor=c_ink))
+
+            dw.add(Circle(210, height - 16, 3, fillColor=cyan, strokeColor=cyan))
+            dw.add(String(217, height - 19, f"Schedules: {total_schedules}", fontName=bold_font, fontSize=8, fillColor=c_ink))
+
+            if total_issues:
+                dw.add(Circle(300, height - 16, 3, fillColor=amber, strokeColor=amber))
+                dw.add(String(307, height - 19, f"Issues: {total_issues}", fontName=bold_font, fontSize=8, fillColor=c_warn))
+
+            pill_w = max(55, len(pill_text) * 6.2 + 14)
+            dw.add(Rect(width - pill_w - 14, height - 24, pill_w, 15, rx=3.5, ry=3.5, fillColor=colors.HexColor("#EFF6FF"), strokeColor=colors.HexColor("#BFDBFE"), strokeWidth=0.6))
+            dw.add(String(width - pill_w - 7, height - 19, pill_text, fontName=bold_font, fontSize=6.8, fillColor=colors.HexColor("#1D4ED8")))
+
+            chart_x0 = 36
+            chart_y0 = 26
+            chart_w = width - 58
+            chart_h = height - 58
+
+            all_vals = series_a + series_b + [1]
+            max_v = max(all_vals)
+            if max_v <= 5:
+                max_v = 5
+            else:
+                mag = 10 ** max(0, len(str(max_v)) - 1)
+                for m in (1, 2, 5, 10):
+                    if m * mag >= max_v:
+                        max_v = m * mag
+                        break
+
+            steps = 3
+            for i in range(steps + 1):
+                y = chart_y0 + (chart_h / steps) * i
+                dw.add(Line(chart_x0, y, chart_x0 + chart_w, y, strokeColor=colors.HexColor("#F1F5F9"), strokeWidth=0.6))
+                val_lbl = str(int(round((max_v / steps) * i)))
+                dw.add(String(12, y - 2.5, val_lbl, fontName=regular_font, fontSize=6.8, fillColor=c_muted))
+
+            dw.add(Line(chart_x0, chart_y0, chart_x0 + chart_w, chart_y0, strokeColor=colors.HexColor("#CBD5E1"), strokeWidth=0.7))
+
+            def scale_points(vals: list) -> list:
+                n = max(1, len(vals) - 1)
+                return [
+                    (chart_x0 + (chart_w * idx / n if len(vals) > 1 else chart_w / 2),
+                     chart_y0 + (chart_h * (max(0, float(v)) / max_v if max_v else 0)))
+                    for idx, v in enumerate(vals)
+                ]
+
+            def make_path(pts):
+                p = Path()
+                if not pts:
+                    return p
+                p.moveTo(pts[0][0], pts[0][1])
+                for i in range(len(pts) - 1):
+                    p0 = pts[max(i - 1, 0)]
+                    p1 = pts[i]
+                    p2 = pts[i + 1]
+                    p3 = pts[min(i + 2, len(pts) - 1)]
                     c1x = p1[0] + (p2[0] - p0[0]) / 6.0
                     c1y = p1[1] + (p2[1] - p0[1]) / 6.0
                     c2x = p2[0] - (p3[0] - p1[0]) / 6.0
                     c2y = p2[1] - (p3[1] - p1[1]) / 6.0
-                    path.curveTo(c1x, c1y, c2x, c2y, p2[0], p2[1])
-                return path
+                    p.curveTo(c1x, c1y, c2x, c2y, p2[0], p2[1])
+                return p
 
-            width = max(440, min(540, int(doc.width)))
-            height = 238
-            drawing = Drawing(width, height)
-            blue = colors.HexColor("#2563EB")
-            cyan = colors.HexColor("#7DD3E0")
-            card_bg = colors.HexColor("#FFFFFF")
-            shadow = colors.HexColor("#E5EAF3")
-            grid = colors.HexColor("#E5E7EB")
-            axis = colors.HexColor("#D1D5DB")
-            text_dark = colors.HexColor("#111827")
-            text_muted = colors.HexColor("#6B7280")
-            pill_border = colors.HexColor("#D7DBE2")
-            pill_active_bg = colors.HexColor("#EFF6FF")
-            issue_color = colors.HexColor("#F59E0B")
+            pa = make_path(scale_points(series_a))
+            pa.strokeColor = blue
+            pa.strokeWidth = 2.0
+            pa.fillColor = None
 
-            # Soft dashboard card shell.
-            drawing.add(Rect(3, 0, width - 6, height - 3, rx=13, ry=13, fillColor=shadow, strokeColor=None))
-            drawing.add(Rect(0, 4, width - 6, height - 7, rx=13, ry=13, fillColor=card_bg, strokeColor=colors.HexColor("#EEF2F7"), strokeWidth=0.7))
+            pb = make_path(scale_points(series_b))
+            pb.strokeColor = cyan
+            pb.strokeWidth = 1.75
+            pb.fillColor = None
 
-            # KPI legend and numbers.
-            top_y = height - 27
-            drawing.add(Circle(26, top_y + 1, 3.6, fillColor=blue, strokeColor=blue))
-            drawing.add(String(36, top_y - 2, "Sent", fontName=regular_font, fontSize=8.5, fillColor=text_muted))
-            drawing.add(String(22, top_y - 31, compact_number(total_sent), fontName=bold_font, fontSize=25, fillColor=text_dark))
+            dw.add(pb)
+            dw.add(pa)
 
-            drawing.add(Circle(144, top_y + 1, 3.6, fillColor=cyan, strokeColor=cyan))
-            drawing.add(String(154, top_y - 2, "Schedules", fontName=regular_font, fontSize=8.5, fillColor=text_muted))
-            drawing.add(String(140, top_y - 31, compact_number(total_schedules), fontName=bold_font, fontSize=25, fillColor=text_dark))
-
-            # Compact range pills at top right, with selected range highlighted.
-            pill_labels = ["Today", "7D", "30D"]
-            label_lower = str(report_label or "").lower()
-            active_idx = 0
-            if "30" in label_lower:
-                active_idx = 2
-            elif "7" in label_lower:
-                active_idx = 1
-            pill_w = 35
-            pill_h = 17
-            start_x = width - 22 - (pill_w * len(pill_labels))
-            for idx, label in enumerate(pill_labels):
-                x = start_x + idx * pill_w
-                active = idx == active_idx
-                drawing.add(Rect(
-                    x, height - 31, pill_w, pill_h,
-                    rx=3.5, ry=3.5,
-                    fillColor=pill_active_bg if active else colors.white,
-                    strokeColor=blue if active else pill_border,
-                    strokeWidth=0.8,
-                ))
-                drawing.add(String(x + 9, height - 25.2, label, fontName=regular_font, fontSize=7.3, fillColor=blue if active else text_muted))
-
-            if total_issues:
-                issue_text = f"Issues {compact_number(total_issues)}"
-                drawing.add(Circle(width - 91, height - 49, 2.8, fillColor=issue_color, strokeColor=issue_color))
-                drawing.add(String(width - 83, height - 52, issue_text, fontName=regular_font, fontSize=7.3, fillColor=text_muted))
-
-            # Chart area.
-            chart_x0 = 40
-            chart_y0 = 42
-            chart_w = width - 70
-            chart_h = 122
-            max_value = nice_max(max(series_a + series_b + [1]))
-            steps = 4
-            for i in range(steps + 1):
-                y = chart_y0 + (chart_h / steps) * i
-                drawing.add(Line(chart_x0, y, chart_x0 + chart_w, y, strokeColor=grid, strokeWidth=0.55))
-                value = int(round((max_value / steps) * i))
-                label = compact_number(value)
-                drawing.add(String(12, y - 3, label, fontName=regular_font, fontSize=7.2, fillColor=text_muted))
-            drawing.add(Line(chart_x0, chart_y0, chart_x0 + chart_w, chart_y0, strokeColor=axis, strokeWidth=0.75))
-
-            def scale_points(values: list[int]) -> list[tuple[float, float]]:
-                n = max(1, len(values) - 1)
-                return [
-                    (
-                        chart_x0 + (chart_w * idx / n if len(values) > 1 else chart_w / 2),
-                        chart_y0 + (chart_h * (max(0, float(value)) / max_value if max_value else 0)),
-                    )
-                    for idx, value in enumerate(values)
-                ]
-
-            blue_points = scale_points(series_a)
-            cyan_points = scale_points(series_b)
-            blue_path = smooth_path(blue_points)
-            cyan_path = smooth_path(cyan_points)
-            cyan_path.strokeColor = cyan
-            cyan_path.strokeWidth = 2.15
-            cyan_path.fillColor = None
-            blue_path.strokeColor = blue
-            blue_path.strokeWidth = 2.25
-            blue_path.fillColor = None
-            drawing.add(cyan_path)
-            drawing.add(blue_path)
-
-            # Minimal x-axis labels, kept readable for hourly/day timelines.
             count = len(labels)
             if count <= 1:
-                tick_indexes = [0]
-            elif count <= 8:
-                tick_indexes = list(range(count))
+                ticks = [0]
+            elif count <= 7:
+                ticks = list(range(count))
             else:
-                tick_indexes = sorted(set([0, count // 4, count // 2, (count * 3) // 4, count - 1]))
+                ticks = sorted(set([0, count // 4, count // 2, (count * 3) // 4, count - 1]))
+
             n = max(1, count - 1)
-            for idx in tick_indexes:
+            for idx in ticks:
                 x = chart_x0 + (chart_w * idx / n if count > 1 else chart_w / 2)
-                label = labels[idx]
-                if len(label) > 7:
-                    label = label[:7]
-                drawing.add(String(x - 10, chart_y0 - 16, label, fontName=regular_font, fontSize=7.2, fillColor=text_muted))
+                lbl = labels[idx][:7]
+                dw.add(String(x - 8, chart_y0 - 12, lbl, fontName=regular_font, fontSize=6.8, fillColor=c_muted))
 
-            # Small visual baseline ticks, like analytics dashboard activity cards.
-            mini_y = 18
-            tick_count = min(12, max(4, count))
-            for idx in range(tick_count):
-                x = chart_x0 + (chart_w * idx / max(1, tick_count - 1))
-                drawing.add(Line(x - 3, mini_y, x + 3, mini_y, strokeColor=colors.HexColor("#D6D8DC"), strokeWidth=3, strokeLineCap=1))
-
-            return drawing
+            return dw
 
         counts = data.get("counts") or {}
         metrics = data.get("metrics") or {}
@@ -22460,42 +22479,69 @@ def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
         recent_errors = data.get("recent_errors") or []
         analytics = data.get("analytics") or {}
         report_range_label = data.get("report_range_label") or "Today"
+        bot_mode = str(data.get("bot_mode") or "POLLING").strip().upper()
+
+        if "today" in report_range_label.lower():
+            pill_text = "Today"
+        elif "yesterday" in report_range_label.lower():
+            pill_text = "Yesterday"
+        elif "7" in report_range_label:
+            pill_text = "Last 7 Days"
+        elif "30" in report_range_label:
+            pill_text = "Last 30 Days"
+        elif len(report_range_label) > 14:
+            pill_text = report_range_label[:14]
+        else:
+            pill_text = report_range_label
 
         story = []
-        story.append(Paragraph("Telegram Bot Admin Report", styles["ReportTitle"]))
-        story.append(Paragraph(
-            html.escape(
-                f"Generated {_report_pdf_text(data.get('generated_at'))} | "
-                f"Mode: {_report_pdf_text(data.get('bot_mode'))} | "
-                f"Admin ID: {_report_pdf_text(data.get('admin_id'))} | "
-                f"Range: {_report_pdf_text(report_range_label, 120)}"
-            ),
-            styles["ReportSubtitle"],
-        ))
 
-        card_data = [[
-            [P("Users", "CardLabel"), P(counts.get("users", 0), "CardValue")],
-            [P("Schedules", "CardLabel"), P(counts.get("schedules", 0), "CardValue")],
-            [P("Pending", "CardLabel"), P(counts.get("pending", 0), "CardValue")],
-            [P("Failed", "CardLabel"), P(counts.get("failed", 0), "CardValue")],
-            [P("API Keys", "CardLabel"), P(counts.get("api_keys", 0), "CardValue")],
-        ]]
-        card_table = Table(card_data, colWidths=[doc.width / 5.0] * 5, hAlign="LEFT")
-        card_table.setStyle(TableStyle([
-            ("BOX", (0, 0), (-1, -1), 0.6, line),
-            ("INNERGRID", (0, 0), (-1, -1), 0.6, line),
-            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F8FBFF")),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("TOPPADDING", (0, 0), (-1, -1), 9),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
+        # 1. Executive Top Header (2-column header block)
+        header_left = [
+            Paragraph("TELEGRAM BOT VOICE & AI SUITE", styles["HeaderTag"]),
+            Paragraph("Executive Operations & Audit Report", styles["HeaderTitle"]),
+            Paragraph("Operational telemetry, voice synthesis workloads, database latency & runtime configs.", styles["HeaderSubtitle"]),
+        ]
+
+        status_text = "● ONLINE" if data.get("webhook_ready", True) else "▲ RESTARTING"
+        status_style = "StatusGood" if data.get("webhook_ready", True) else "StatusAmberCenter"
+        header_meta = [
+            [P("SYSTEM STATUS", "MetaLabel"), Paragraph(f"<b>{status_text}</b>", styles[status_style])],
+            [P("BOT MODE", "MetaLabel"), P(bot_mode, "MetaValue")],
+            [P("REPORT WINDOW", "MetaLabel"), P(pill_text, "MetaValue")],
+            [P("CLUSTER LEADER", "MetaLabel"), P(leader.get("owner") or "node-1", "MetaValue")],
+        ]
+        meta_card = Table(header_meta, colWidths=[doc.width * 0.16, doc.width * 0.18], hAlign="RIGHT")
+        meta_card.setStyle(TableStyle([
+            ("BOX", (0, 0), (-1, -1), 0.75, c_line),
+            ("BACKGROUND", (0, 0), (-1, -1), c_bg_soft),
+            ("TOPPADDING", (0, 0), (-1, -1), 3.5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
         ]))
-        story.append(card_table)
+
+        header_table = Table([[header_left, meta_card]], colWidths=[doc.width * 0.64, doc.width * 0.36], hAlign="LEFT")
+        header_table.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(header_table)
         story.append(Spacer(1, 8))
 
-        graph = activity_graph(analytics, report_range_label)
-        if graph is not None:
-            story.append(KeepTogether([section("Activity Graph"), graph]))
+        # 2. KPI Cards
+        story.append(draw_kpi_cards(counts, doc.width))
+        story.append(Spacer(1, 8))
 
+        # 3. Activity Graph
+        story.append(modern_activity_graph(analytics, report_range_label, doc.width))
+        story.append(Spacer(1, 8))
+
+        # 4. Analytics Summary Table
+        story.append(section_bar("Delivery Performance & Window Analytics"))
         analytics_rows = [
             [
                 P("Report Window", "TableHead"),
@@ -22506,86 +22552,136 @@ def _write_admin_report_pdf_sync(path: str, data: dict[str, Any]) -> None:
                 P("Delivery Rate", "TableHeadCenter"),
             ],
             [
-                P(report_range_label, limit=95),
+                P(report_range_label, "TableTextBold", limit=95),
                 P(analytics.get("total_schedules", 0), "TableTextCenter"),
                 P(analytics.get("sent", 0), "TableTextCenter"),
                 P(analytics.get("failed", 0), "TableTextCenter"),
                 P(analytics.get("blocked", 0), "TableTextCenter"),
-                P(f"{analytics.get('delivery_rate', 0)}%", "TableTextCenter"),
+                P(f"{analytics.get('delivery_rate', 0)}%", "StatusGoodCenter" if analytics.get("delivery_rate", 0) >= 90 else "StatusBadCenter"),
             ],
         ]
-        if analytics.get("error"):
-            analytics_rows.append([P("Data warning", "StatusBad"), P("-", "TableTextCenter"), P("-", "TableTextCenter"), P("-", "TableTextCenter"), P("-", "TableTextCenter"), P(analytics.get("error"), "StatusBad", limit=80)])
-        story.append(table(analytics_rows, [doc.width * 0.34, doc.width * 0.13, doc.width * 0.13, doc.width * 0.12, doc.width * 0.12, doc.width * 0.16]))
+        story.append(modern_table(analytics_rows, [doc.width * 0.34, doc.width * 0.13, doc.width * 0.13, doc.width * 0.13, doc.width * 0.13, doc.width * 0.14]))
+        story.append(Spacer(1, 8))
 
-        bot_mode = str(data.get("bot_mode") or "").strip().upper()
-        bot_service_name = "Telegram Polling" if bot_mode == "POLLING" else ("Telegram Webhook" if bot_mode == "WEBHOOK" else "Telegram Service")
+        # 5. Side-by-Side: System Health (Left) & Operations (Right)
+        bot_service_name = "Telegram Polling" if bot_mode == "POLLING" else "Telegram Webhook"
         status_rows = [
-            [P("Service", "TableHead"), P("Status", "TableHead"), P("Details", "TableHead")],
-            [P("Supabase"), P(_report_bool_label(data.get("supabase_on"), "Connected", "Offline"), "StatusGood" if data.get("supabase_on") else "StatusBad"), P("Database-backed features and settings storage")],
-            [P("Redis"), P(_report_bool_label(data.get("redis_on"), "Connected", "Offline"), "StatusGood" if data.get("redis_on") else "StatusBad"), P("Runtime state, locks, cache, and queue helpers")],
-            [P("FFmpeg"), P(_report_bool_label(data.get("ffmpeg_ok"), "Available", "Missing"), "StatusGood" if data.get("ffmpeg_ok") else "StatusBad"), P("Video/audio processing dependency")],
-            [P("Temp folder"), P(_report_bool_label(data.get("temp_ok"), "Writable", "Problem"), "StatusGood" if data.get("temp_ok") else "StatusBad"), P(f"{data.get('temp_count', 0)} temp files | {_report_pdf_text(data.get('temp_dir'), 85)}")],
-            [P(bot_service_name), P(_report_bool_label(data.get("webhook_ready"), "Ready", "Not ready"), "StatusGood" if data.get("webhook_ready") else "StatusBad"), P(f"Bot mode: {_report_pdf_text(data.get('bot_mode'))} | Leader: {_report_pdf_text(leader.get('owner') or 'unknown', 70)}")],
+            [P("Component", "TableHead"), P("Status", "TableHeadCenter"), P("Health Notes", "TableHead")],
+            [P("Supabase DB"), P("● Connected" if data.get("supabase_on") else "▲ Offline", "StatusGoodCenter" if data.get("supabase_on") else "StatusBadCenter"), P("Settings & persistent storage", "TableMuted")],
+            [P("Redis Cache"), P("● Connected" if data.get("redis_on") else "▲ Offline", "StatusGoodCenter" if data.get("redis_on") else "StatusBadCenter"), P("State, locks & deduplication", "TableMuted")],
+            [P("FFmpeg Audio"), P("● Available" if data.get("ffmpeg_ok") else "▲ Missing", "StatusGoodCenter" if data.get("ffmpeg_ok") else "StatusBadCenter"), P("Transcoding & voice pipelines", "TableMuted")],
+            [P("Temp Storage"), P("● Writable" if data.get("temp_ok") else "▲ Problem", "StatusGoodCenter" if data.get("temp_ok") else "StatusBadCenter"), P(f"{data.get('temp_count', 0)} files in /tmp", "TableMuted")],
+            [P(bot_service_name), P("● Ready" if data.get("webhook_ready") else "▲ Problem", "StatusGoodCenter" if data.get("webhook_ready") else "StatusBadCenter"), P(f"Leader: {leader.get('owner') or 'node-1'}", "TableMuted")],
         ]
-        story.append(KeepTogether([section("System Health"), table(status_rows, [33 * mm, 31 * mm, doc.width - 64 * mm])]))
+        health_tbl = modern_table(status_rows, [doc.width * 0.22, doc.width * 0.14, doc.width * 0.22])
 
-        schedule_rows = [
-            [P("Metric", "TableHead"), P("Value", "TableHeadCenter"), P("Note", "TableHead")],
-            [P("Blocked users"), P(counts.get("blocked", 0), "TableTextCenter"), P("Users currently blocked by admin tools")],
-            [P("Sending jobs"), P(counts.get("sending", 0), "TableTextCenter"), P("Broadcasts or scheduled jobs currently marked sending")],
-            [P("Failed jobs"), P(counts.get("failed", 0), "TableTextCenter"), P("Jobs that need admin review or retry")],
-            [P("Settings DB"), P("OK" if data.get("settings_db_ok") else "Fallback", "StatusGoodCenter" if data.get("settings_db_ok") else "StatusBadCenter"), P("Whether bot settings loaded from Supabase")],
+        ops_rows = [
+            [P("Operational Metric", "TableHead"), P("Value", "TableHeadCenter"), P("Context", "TableHead")],
+            [P("Blocked Users"), P(counts.get("blocked", 0), "TableTextCenter"), P("Restricted by admin gate", "TableMuted")],
+            [P("Active Senders"), P(counts.get("sending", 0), "TableTextCenter"), P("Currently broadcasting", "TableMuted")],
+            [P("Review Jobs"), P(counts.get("failed", 0), "StatusAmberCenter" if counts.get("failed", 0) else "TableTextCenter"), P("Failed delivery tasks", "TableMuted")],
+            [P("Settings DB"), P("● Supabase" if data.get("settings_db_ok") else "▲ Memory", "StatusGoodCenter" if data.get("settings_db_ok") else "StatusBadCenter"), P("Database config backing", "TableMuted")],
+            [P("Cluster Node"), P(leader.get("owner") or "node-1", "TableTextCenter"), P("Active election leader", "TableMuted")],
         ]
-        story.append(KeepTogether([section("Operations Summary"), table(schedule_rows, [40 * mm, 28 * mm, doc.width - 68 * mm])]))
+        ops_tbl = modern_table(ops_rows, [doc.width * 0.16, doc.width * 0.14, doc.width * 0.12])
 
-        metric_rows = [[P("Metric", "TableHead"), P("Value", "TableHeadCenter")]]
-        for key in sorted(metrics):
-            val = metrics.get(key)
-            if val is None:
-                val = 0
-            metric_rows.append([P(key, limit=70), P(val, "TableTextCenter", limit=90)])
-        if len(metric_rows) == 1:
-            metric_rows.append([P("No metrics captured"), P("-", "TableTextCenter")])
-        story.append(KeepTogether([section("Runtime Metrics Since Restart"), table(metric_rows, [doc.width * 0.58, doc.width * 0.42])]))
+        combined_infra = Table([[health_tbl, ops_tbl]], colWidths=[doc.width * 0.58, doc.width * 0.42], hAlign="LEFT")
+        combined_infra.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (0, 0), 6),
+            ("LEFTPADDING", (1, 0), (1, 0), 6),
+        ]))
+        story.append(KeepTogether([section_bar("Infrastructure Health & Operations"), combined_infra]))
 
-        feature_rows = [[P("Feature", "TableHead"), P("Current Value", "TableHeadCenter")]]
-        for key in BOT_FEATURE_SETTING_KEYS:
-            enabled = _setting_bool_from(settings, key, default=False if key == "maintenance_mode" else True)
-            if key == "maintenance_mode":
-                val_text = "Active (ON)" if enabled else "Disabled (OFF)"
-                val_style = "StatusBadCenter" if enabled else "StatusGoodCenter"
+        # PAGE 2: Fine-grained Telemetry & Configuration Matrix
+        # 6. Side-by-Side: Feature Settings & Runtime Metrics
+        feat_rows = [[P("Feature Toggle", "TableHead"), P("State", "TableHeadCenter")]]
+        for k in BOT_FEATURE_SETTING_KEYS:
+            en = _setting_bool_from(settings, k, default=False if k == "maintenance_mode" else True)
+            if k == "maintenance_mode":
+                st_text = "▲ Active (ON)" if en else "Disabled (OFF)"
+                st_style = "StatusBadCenter" if en else "StatusGoodCenter"
             else:
-                val_text = "Enabled" if enabled else "Disabled"
-                val_style = "StatusGoodCenter" if enabled else "StatusBadCenter"
-            feature_rows.append([P(key, limit=75), P(val_text, val_style)])
-        story.append(KeepTogether([section("Feature Settings"), table(feature_rows, [doc.width * 0.55, doc.width * 0.45])]))
+                st_text = "● Enabled" if en else "Disabled"
+                st_style = "StatusGoodCenter" if en else "TableMuted"
+            feat_rows.append([P(k, limit=40), P(st_text, st_style)])
+        feat_tbl = modern_table(feat_rows, [doc.width * 0.32, doc.width * 0.16])
 
-        perf_rows = [[P("Setting", "TableHead"), P("Current Value", "TableHeadCenter")]]
-        for key in BOT_PERFORMANCE_SETTING_SPECS:
-            value = run_state.get(key, BOT_SETTING_DEFAULTS.get(key, _perf_default(key, "")))
-            perf_rows.append([P(key, limit=75), P(value, "TableTextCenter", limit=95)])
-        story.append(KeepTogether([section("Performance Runtime Settings"), table(perf_rows, [doc.width * 0.62, doc.width * 0.38])]))
+        met_rows = [[P("Telemetry Metric", "TableHead"), P("Count", "TableHeadCenter")]]
+        for k in sorted(metrics):
+            val = metrics.get(k) or 0
+            met_rows.append([P(k, limit=40), P(val, "TableTextCenter")])
+        if len(met_rows) == 1:
+            met_rows.append([P("No metrics captured"), P("-", "TableTextCenter")])
+        met_tbl = modern_table(met_rows, [doc.width * 0.34, doc.width * 0.18])
 
-        error_rows = [[P("Time", "TableHead"), P("Level", "TableHeadCenter"), P("Source", "TableHead"), P("Message", "TableHead")]]
+        combined_telemetry = Table([[feat_tbl, met_tbl]], colWidths=[doc.width * 0.48, doc.width * 0.52], hAlign="LEFT")
+        combined_telemetry.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (0, 0), 6),
+            ("LEFTPADDING", (1, 0), (1, 0), 6),
+        ]))
+        story.append(KeepTogether([section_bar("Runtime Feature Flags & Traffic Counters"), combined_telemetry]))
+        story.append(Spacer(1, 8))
+
+        # 7. Performance Settings (Compact 2-column paired layout)
+        perf_items = list(BOT_PERFORMANCE_SETTING_SPECS.items())
+        perf_rows = [
+            [
+                P("Setting Name", "TableHead"),
+                P("Value", "TableHeadCenter"),
+                P("Setting Name", "TableHead"),
+                P("Value", "TableHeadCenter"),
+            ]
+        ]
+        half = (len(perf_items) + 1) // 2
+        for idx in range(half):
+            k1, _ = perf_items[idx]
+            v1 = run_state.get(k1, 0)
+            if idx + half < len(perf_items):
+                k2, _ = perf_items[idx + half]
+                v2 = run_state.get(k2, 0)
+            else:
+                k2, v2 = "", ""
+            perf_rows.append([
+                P(k1, limit=36),
+                P(v1, "TableTextCenter"),
+                P(k2, limit=36) if k2 else P("-"),
+                P(v2, "TableTextCenter") if k2 else P("-"),
+            ])
+
+        perf_tbl = modern_table(perf_rows, [doc.width * 0.35, doc.width * 0.15, doc.width * 0.35, doc.width * 0.15])
+        story.append(KeepTogether([section_bar("High-Throughput Concurrency & Engine Tuning"), perf_tbl]))
+        story.append(Spacer(1, 8))
+
+        # 8. Recent Errors
+        err_rows = [[P("Timestamp", "TableHead"), P("Severity", "TableHeadCenter"), P("Subsystem", "TableHead"), P("Message", "TableHead")]]
         if not recent_errors:
-            error_rows.append([P("-"), P("OK", "StatusGoodCenter"), P("System"), P("No recent errors captured.")])
+            err_rows.append([P("-"), P("● Clean", "StatusGoodCenter"), P("Kernel"), P("Zero critical runtime errors captured in current window.")])
         else:
-            for item in recent_errors[:12]:
-                level = _report_pdf_text(item.get("level", ""), 20)
-                style = "StatusBadCenter" if level.upper() in {"ERROR", "CRITICAL"} else "TableTextCenter"
-                error_rows.append([
-                    P(item.get("ts", ""), limit=42),
-                    P(level, style),
-                    P(item.get("source", ""), limit=45),
-                    P(item.get("message", ""), limit=160),
+            for item in recent_errors[:10]:
+                lvl = _report_pdf_text(item.get("level", ""), 15).upper()
+                err_rows.append([
+                    P(item.get("ts", ""), limit=30),
+                    P(f"▲ {lvl}", "StatusBadCenter" if lvl in {"ERROR", "CRITICAL"} else "TableTextCenter"),
+                    P(item.get("source", ""), limit=35),
+                    P(item.get("message", ""), limit=130),
                 ])
-        story.append(KeepTogether([section("Recent Errors"), table(error_rows, [32 * mm, 21 * mm, 31 * mm, doc.width - 84 * mm])]))
+        err_tbl = modern_table(err_rows, [doc.width * 0.20, doc.width * 0.14, doc.width * 0.20, doc.width * 0.46])
+        story.append(KeepTogether([section_bar("System Event Log & Exception Tracking"), err_tbl]))
 
         story.append(Spacer(1, 10))
         story.append(Paragraph(
-            html.escape("Generated automatically from the Telegram bot admin system. Keep this report private because it may include operational details."),
-            styles["SmallMuted"],
+            "Automated operational report generated by Telegram Voice Bot Engine. Contains sensitive internal diagnostic telemetry; keep confidential.",
+            styles["Disclaimer"],
         ))
 
         doc.build(story)

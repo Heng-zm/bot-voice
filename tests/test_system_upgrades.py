@@ -224,6 +224,22 @@ class TestFastAPISystemEndpoints(unittest.TestCase):
             self.assertFalse(data.get("ok"))
             self.assertIn("Model overloaded", data.get("error", ""))
 
+    def test_build_admin_report_pdf_sync(self):
+        import os
+
+        from app import legacy
+
+        pdf_path = legacy.build_admin_report_pdf_sync(123456789, {"key": "today", "label": "Today"})
+        try:
+            self.assertTrue(os.path.isfile(pdf_path))
+            self.assertGreater(os.path.getsize(pdf_path), 1000)
+            with open(pdf_path, "rb") as f:
+                header = f.read(5)
+            self.assertEqual(b"%PDF-", header)
+        finally:
+            if os.path.isfile(pdf_path):
+                os.remove(pdf_path)
+
 
 @unittest.skipUnless(HAS_SERVER_DEPS, "Requires full server dependencies")
 class TestAntiSpamAndUnlock(unittest.TestCase):
