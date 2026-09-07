@@ -21,3 +21,4 @@ venv/
 *.log
 tmp/
 temp/
+backups/
