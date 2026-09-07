@@ -8,7 +8,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-GEMINI_MODEL_DEFAULT = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"
+GEMINI_MODEL_DEFAULT = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
 
 
 def is_retryable_gemini_error(exc: BaseException | str) -> bool:
@@ -74,7 +74,7 @@ def generate_content_with_fallback(
     if client is None:
         raise RuntimeError("Gemini client is not configured.")
 
-    candidates = [preferred_model, "gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash"]
+    candidates = [preferred_model, "gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash", "gemini-3.6-flash"]
     unique_models: list[str] = []
     for m in candidates:
         if m and m not in unique_models:
@@ -92,7 +92,18 @@ def generate_content_with_fallback(
             err_text = str(exc)
             err_lower = err_text.lower()
             if is_retryable_gemini_error(exc) or any(
-                k in err_lower for k in ("404", "not found", "not supported", "unsupported")
+                k in err_lower
+                for k in (
+                    "404",
+                    "not found",
+                    "not supported",
+                    "unsupported",
+                    "no longer available",
+                    "not available",
+                    "is not found",
+                    "quota",
+                    "resource_exhausted",
+                )
             ):
                 logger.warning(
                     "Gemini model %s failed (%s); falling back to next available model...",

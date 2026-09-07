@@ -84,12 +84,15 @@ class TelegramFlowTests(unittest.TestCase):
         self.assertEqual("welcome_profile", classify_callback("welcome_profile"))
         self.assertEqual("help", classify_callback("btn_help"))
         self.assertEqual("system_status", classify_callback("btn_system_status"))
+        self.assertEqual("admin", classify_callback("noop"))
 
     def test_classify_prefix_actions(self) -> None:
         self.assertEqual("tts_model", classify_callback("ttsmodel_edge"))
         self.assertEqual("delete", classify_callback("doc_del:123"))
         self.assertEqual("doc_read", classify_callback("doc_read:456"))
         self.assertEqual("admin", classify_callback("admin_home"))
+        self.assertEqual("admin", classify_callback("cfg_cat:all"))
+        self.assertEqual("admin", classify_callback("cfg_set:DEFAULT_SPEED:1.0"))
 
     def test_unknown_callback(self) -> None:
         self.assertIsNone(classify_callback("unrecognized_action_123"))
@@ -291,7 +294,33 @@ class GeminiServicesTests(unittest.TestCase):
             preferred_model="preferred-model",
         )
         self.assertEqual("Success from fallback model", resp.text)
-        self.assertEqual(["preferred-model", "gemini-2.0-flash"], attempts[:2])
+        self.assertEqual(["preferred-model", "gemini-2.5-flash"], attempts[:2])
+
+    def test_generate_content_with_fallback_on_404_deprecation(self) -> None:
+        from unittest.mock import MagicMock
+
+        from app.services.ai.gemini import generate_content_with_fallback
+
+        mock_client = MagicMock()
+        attempts = []
+
+        def mock_generate_content(model, contents, **kwargs):
+            attempts.append(model)
+            if model == "gemini-2.0-flash":
+                raise RuntimeError(
+                    "404 NOT_FOUND. This model models/gemini-2.0-flash is no longer available. Please update your code to use models/gemini-3.6-flash"
+                )
+            return MagicMock(text="Success from modern model")
+
+        mock_client.models.generate_content.side_effect = mock_generate_content
+
+        resp = generate_content_with_fallback(
+            client=mock_client,
+            contents="test prompt",
+            preferred_model="gemini-2.0-flash",
+        )
+        self.assertEqual("Success from modern model", resp.text)
+        self.assertIn("gemini-2.5-flash", attempts)
 
     def test_generate_content_with_fallback_raises_on_unrecoverable(self) -> None:
         from unittest.mock import MagicMock
@@ -543,7 +572,7 @@ class CoreConfigTests(unittest.TestCase):
 
         self.assertIsInstance(SETTINGS, AppSettings)
 
-        self.assertEqual(SETTINGS.GEMINI_MODEL, "gemini-2.0-flash")
+        self.assertEqual(SETTINGS.GEMINI_MODEL, "gemini-2.5-flash")
         self.assertTrue(hasattr(SETTINGS, "CHANNEL_NARRATOR_ENABLED"))
         self.assertTrue(hasattr(SETTINGS, "CHANNEL_NARRATOR_MAX_CHARS"))
 

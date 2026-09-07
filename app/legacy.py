@@ -467,7 +467,7 @@ PERFORMANCE_CODE_DEFAULTS: dict[str, Any] = {
     "USER_SYNC_TTL_S": 1800.0,
     "PREFS_CACHE_TTL_S": 600.0,
     "TTS_AUDIO_CACHE_ENABLED": True,
-    "TTS_AUDIO_CACHE_MAX_MB": 64,
+    "TTS_AUDIO_CACHE_MAX_MB": 32,
     "TTS_AUDIO_CACHE_ITEM_MAX_MB": 8,
     "TTS_AUDIO_CACHE_TTL_S": 1200.0,
     "EDGE_TTS_PARALLEL_CHUNKS": 1,
@@ -565,7 +565,7 @@ class AppSettings(BaseSettings):
     USER_SYNC_TTL_S: float = float(_perf_default("USER_SYNC_TTL_S", 1800.0))
     PREFS_CACHE_TTL_S: float = float(_perf_default("PREFS_CACHE_TTL_S", 600.0))
     TTS_AUDIO_CACHE_ENABLED: bool = bool(_perf_default("TTS_AUDIO_CACHE_ENABLED", True))
-    TTS_AUDIO_CACHE_MAX_MB: int = int(_perf_default("TTS_AUDIO_CACHE_MAX_MB", 64))
+    TTS_AUDIO_CACHE_MAX_MB: int = int(_perf_default("TTS_AUDIO_CACHE_MAX_MB", 32))
     TTS_AUDIO_CACHE_ITEM_MAX_MB: int = int(_perf_default("TTS_AUDIO_CACHE_ITEM_MAX_MB", 8))
     TTS_AUDIO_CACHE_TTL_S: float = float(_perf_default("TTS_AUDIO_CACHE_TTL_S", 1200.0))
     EDGE_TTS_PARALLEL_CHUNKS: int = int(_perf_default("EDGE_TTS_PARALLEL_CHUNKS", 1))
@@ -9056,7 +9056,7 @@ RUN_STATE: dict[str, Any] = {
     "USER_SYNC_TTL_S": float(globals().get("_USER_SYNC_TTL", _perf_default("USER_SYNC_TTL_S", 1800.0))),
     "PREFS_CACHE_TTL_S": float(globals().get("_PREFS_TTL", _perf_default("PREFS_CACHE_TTL_S", 600.0))),
     "TTS_AUDIO_CACHE_ENABLED": bool(globals().get("TTS_AUDIO_CACHE_ENABLED", _perf_default("TTS_AUDIO_CACHE_ENABLED", True))),
-    "TTS_AUDIO_CACHE_MAX_MB": int(globals().get("TTS_AUDIO_CACHE_MAX_MB", _perf_default("TTS_AUDIO_CACHE_MAX_MB", 64))),
+    "TTS_AUDIO_CACHE_MAX_MB": int(globals().get("TTS_AUDIO_CACHE_MAX_MB", _perf_default("TTS_AUDIO_CACHE_MAX_MB", 32))),
     "TTS_AUDIO_CACHE_ITEM_MAX_MB": int(globals().get("TTS_AUDIO_CACHE_ITEM_MAX_MB", _perf_default("TTS_AUDIO_CACHE_ITEM_MAX_MB", 8))),
     "TTS_AUDIO_CACHE_TTL_S": float(globals().get("TTS_AUDIO_CACHE_TTL_S", _perf_default("TTS_AUDIO_CACHE_TTL_S", 1200.0))),
     "EDGE_TTS_PARALLEL_CHUNKS": int(globals().get("EDGE_TTS_PARALLEL_CHUNKS", _perf_default("EDGE_TTS_PARALLEL_CHUNKS", 1))),
@@ -10006,7 +10006,7 @@ ADMIN_IDS:  set[int]    = set()
 # These are real code defaults, not required Render/env values.  Operators can
 # still override them with env variables, but a missing OCR_PROVIDER,
 # OCR_AUTO_PREFER_PROVIDER, or GEMINI_MODEL now boots with Gemini OCR selected.
-DEFAULT_GEMINI_MODEL             = "gemini-2.0-flash"  # change this one line if you want another default Gemini model
+DEFAULT_GEMINI_MODEL             = "gemini-2.5-flash"  # change this one line if you want another default Gemini model
 DEFAULT_GEMINI_AUDIO_MODEL       = "gemini-2.5-flash-preview-tts"  # default Gemini TTS audio model
 DEFAULT_AI_PROVIDER              = "gemini"            # gemini | hf
 DEFAULT_OCR_PROVIDER             = "gemini"            # gemini | auto | hf
@@ -10058,7 +10058,7 @@ EDGE_TTS_CROSS_LANG_FALLBACK = _env_bool("EDGE_TTS_CROSS_LANG_FALLBACK", False)
 EDGE_TTS_PARALLEL_CHUNKS   = _env_int("EDGE_TTS_PARALLEL_CHUNKS", int(_perf_default("EDGE_TTS_PARALLEL_CHUNKS", 1)), minimum=1, maximum=4)
 TTS_AUDIO_CACHE_ENABLED    = _env_bool("TTS_AUDIO_CACHE_ENABLED", bool(_perf_default("TTS_AUDIO_CACHE_ENABLED", True)))
 TTS_AUDIO_CACHE_TTL_S      = _env_float("TTS_AUDIO_CACHE_TTL_S", float(_perf_default("TTS_AUDIO_CACHE_TTL_S", 1200.0)), minimum=30.0, maximum=86400.0)
-TTS_AUDIO_CACHE_MAX_MB     = _env_int("TTS_AUDIO_CACHE_MAX_MB", int(_perf_default("TTS_AUDIO_CACHE_MAX_MB", 64)), minimum=4, maximum=512)
+TTS_AUDIO_CACHE_MAX_MB     = _env_int("TTS_AUDIO_CACHE_MAX_MB", int(_perf_default("TTS_AUDIO_CACHE_MAX_MB", 32)), minimum=4, maximum=512)
 TTS_AUDIO_CACHE_ITEM_MAX_MB = _env_int("TTS_AUDIO_CACHE_ITEM_MAX_MB", int(_perf_default("TTS_AUDIO_CACHE_ITEM_MAX_MB", 8)), minimum=1, maximum=64)
 TTS_AUDIO_CACHE_MAX_BYTES  = TTS_AUDIO_CACHE_MAX_MB * 1024 * 1024
 TTS_AUDIO_CACHE_ITEM_MAX_BYTES = TTS_AUDIO_CACHE_ITEM_MAX_MB * 1024 * 1024
@@ -11621,7 +11621,7 @@ def ask_gemini_ocr(image_data: bytes, mime_type: str = "image/jpeg") -> str:
         "and Japanese exactly. Keep useful line breaks. If there is no readable text, "
         "output only NOTEXT. Do not describe the image and do not add explanations."
     )
-    models_to_try = [GEMINI_MODEL, "gemini-2.0-flash", "gemini-1.5-flash"]
+    models_to_try = [GEMINI_MODEL, "gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash", "gemini-3.6-flash"]
     unique_models: list[str] = []
     for m in models_to_try:
         if m and m not in unique_models:
@@ -11642,9 +11642,25 @@ def ask_gemini_ocr(image_data: bytes, mime_type: str = "image/jpeg") -> str:
             return text or "NOTEXT"
         except Exception as exc:
             last_err = exc
-            err_msg = str(exc)
-            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower():
-                logger.warning("Gemini OCR model %s quota exhausted (429); falling back to next model...", mdl)
+            err_msg = str(exc).lower()
+            from app.services.ai.gemini import is_retryable_gemini_error
+            if (
+                is_retryable_gemini_error(exc)
+                or any(
+                    k in err_msg
+                    for k in (
+                        "404",
+                        "not found",
+                        "not available",
+                        "no longer available",
+                        "unsupported",
+                        "not supported",
+                        "quota",
+                        "resource_exhausted",
+                    )
+                )
+            ):
+                logger.warning("Gemini OCR model %s error (%s); falling back to next model...", mdl, exc)
                 continue
             raise exc
 
@@ -18135,8 +18151,8 @@ async def _convert_uploaded_audio_to_telegram_voice(input_path: str, output_path
         "-y",
         "-fflags", "+discardcorrupt",
         "-err_detect", "ignore_err",
-        "-probesize", "100M",
-        "-analyzeduration", "100M",
+        "-probesize", "5M",
+        "-analyzeduration", "5M",
         "-i", input_path,
         "-map", "0:a:0",
         "-map_metadata", "-1",
@@ -19268,11 +19284,20 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
 
 
 
-async def _generate_voice_gemini(text: str, gender: str, speed: float, output_path: str) -> bytes:
-    """Generate speech using Google Gemini Audio Output / Multimodal TTS with Edge fallback."""
+async def _generate_voice_gemini(
+    text: str,
+    gender: str,
+    speed: float,
+    output_path: str,
+    *,
+    fallback_to_edge: bool = True,
+) -> bytes:
+    """Generate speech using Google Gemini Audio Output / Multimodal TTS with optional Edge fallback."""
     if _gemini is None:
-        logger.info("Gemini client not configured; routing to Edge TTS.")
-        return await _generate_voice_edge(text, gender, speed, output_path)
+        if fallback_to_edge:
+            logger.info("Gemini client not configured; routing to Edge TTS.")
+            return await _generate_voice_edge(text, gender, speed, output_path)
+        raise RuntimeError("Gemini client not configured.")
 
     voice_name = "Aoede" if gender == "female" else "Puck"
     prompt = (
@@ -19312,6 +19337,7 @@ async def _generate_voice_gemini(text: str, gender: str, speed: float, output_pa
 
             audio_models = [
                 _run_state_gemini_audio_model(),
+                "gemini-2.5-flash-preview-tts",
                 "gemini-2.0-flash-exp",
             ]
             unique_models: list[str] = []
@@ -19368,9 +19394,11 @@ async def _generate_voice_gemini(text: str, gender: str, speed: float, output_pa
             await asyncio.to_thread(_write_file_bytes_sync, raw_path, audio_bytes)
             return await _convert_audio_files_to_telegram_voice([raw_path], speed, output_path)
 
-    # Fallback to Edge TTS if Gemini model or API account does not support audio modalities
-    logger.info("Gemini did not return inline audio; falling back to Edge TTS for seamless delivery.")
-    return await _generate_voice_edge(text, gender, speed, output_path)
+    if fallback_to_edge:
+        # Fallback to Edge TTS if Gemini model or API account does not support audio modalities
+        logger.info("Gemini did not return inline audio; falling back to Edge TTS for seamless delivery.")
+        return await _generate_voice_edge(text, gender, speed, output_path)
+    raise RuntimeError("Gemini multimodal audio did not return audio data.")
 
 
 async def generate_voice(text: str, gender: str, speed: float, output_path: str, tts_model: str = "auto") -> bytes:
@@ -19395,7 +19423,7 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
         started = time.perf_counter()
         try:
             audio = await asyncio.wait_for(
-                _generate_voice_gemini(text, gender, speed, output_path),
+                _generate_voice_gemini(text, gender, speed, output_path, fallback_to_edge=False),
                 timeout=25.0,
             )
             if audio:
@@ -19435,8 +19463,9 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
     # Secondary Provider: Microsoft Edge TTS
     started = time.perf_counter()
     edge_err: Exception | None = None
+    edge_timeout = max(60.0, float(globals().get("EDGE_TTS_STREAM_TIMEOUT_S", 45.0)) + 15.0)
     try:
-        audio = await asyncio.wait_for(_generate_voice_edge(text, gender, speed, output_path), timeout=30.0)
+        audio = await asyncio.wait_for(_generate_voice_edge(text, gender, speed, output_path), timeout=edge_timeout)
         with suppress(Exception):
             provider_manager.record_success(
                 "edge_tts",
@@ -19447,22 +19476,29 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
         edge_err = exc
         with suppress(Exception):
             provider_manager.record_failure("edge_tts", exc)
-        logger.warning("Edge TTS failed (%s). Attempting Tier 3 Gemini emergency audio fallback...", exc)
+        edge_err_str = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        logger.warning("Edge TTS failed (%s). Attempting Tier 3 Gemini emergency audio fallback...", edge_err_str)
 
     # Tier 3 Emergency Provider: Google Gemini Multimodal Audio
     if _gemini is not None:
         try:
             started = time.perf_counter()
-            audio = await asyncio.wait_for(_generate_voice_gemini(text, gender, speed, output_path), timeout=25.0)
+            audio = await asyncio.wait_for(
+                _generate_voice_gemini(text, gender, speed, output_path, fallback_to_edge=False),
+                timeout=35.0,
+            )
             if audio:
                 with suppress(Exception):
                     provider_manager.record_success("gemini", (time.perf_counter() - started) * 1_000)
                 logger.info("Tier 3 Gemini Audio emergency fallback succeeded!")
                 return audio
         except Exception as gemini_exc:
-            logger.error("All 3 TTS engines failed: HF, Edge (%s), and Gemini (%s)", edge_err, gemini_exc)
+            gemini_err_str = f"{type(gemini_exc).__name__}: {gemini_exc}" if str(gemini_exc) else type(gemini_exc).__name__
+            edge_err_str = f"{type(edge_err).__name__}: {edge_err}" if (edge_err and str(edge_err)) else (type(edge_err).__name__ if edge_err else "None")
+            logger.error("All 3 TTS engines failed: HF, Edge (%s), and Gemini (%s)", edge_err_str, gemini_err_str)
 
-    raise RuntimeError(f"TTS synthesis failed across all providers: {edge_err}")
+    edge_desc = f"{type(edge_err).__name__}: {edge_err}" if (edge_err and str(edge_err)) else (type(edge_err).__name__ if edge_err else "Unknown error")
+    raise RuntimeError(f"TTS synthesis failed across all providers: {edge_desc}")
 
 
 async def generate_voice_limited(text: str, gender: str, speed: float, output_path: str, tts_model: str = "auto") -> bytes:
@@ -19872,12 +19908,14 @@ async def _deliver_paged_tts(
                     break
             finally:
                 _cleanup(file_path)
+                gc.collect()
 
             if i < total:
                 await asyncio.sleep(float(PAGED_TTS_SEND_DELAY_S))
     finally:
         _cleanup_voxcpm2_session(voxcpm2_session)
         _set_last_tts(user_id)
+        gc.collect()
 
     if sent_count == 0 and first_error is not None:
         raise first_error

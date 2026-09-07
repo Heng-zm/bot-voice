@@ -29,6 +29,7 @@ def classify_callback(
         "welcome_back": "welcome_back",
         "btn_help": "help",
         "btn_system_status": "system_status",
+        "noop": "admin",
     }
     if value in exact_actions:
         return exact_actions[value]
@@ -46,6 +47,9 @@ def classify_callback(
         ("needs_", "needs_admin"),
         ("api_", "api_admin"),
         ("admin_", "admin"),
+        ("cfg_cat:", "admin"),
+        ("cfg_set:", "admin"),
+        ("cfg_", "admin"),
     )
     for prefix, action in prefix_actions:
         if value.startswith(prefix):

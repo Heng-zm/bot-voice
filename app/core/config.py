@@ -19,7 +19,7 @@ try:
         TELEGRAM_BOT_TOKEN: str = ""
         ADMIN_IDS: str = ""
         GEMINI_API_KEY: str = ""
-        GEMINI_MODEL: str = "gemini-2.0-flash"
+        GEMINI_MODEL: str = "gemini-2.5-flash"
         HF_TOKEN: str = ""
         SUPABASE_URL: str = ""
         SUPABASE_KEY: str = ""
@@ -46,7 +46,7 @@ except (ImportError, ModuleNotFoundError):
             self.TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
             self.ADMIN_IDS: str = os.environ.get("ADMIN_IDS", "")
             self.GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
-            self.GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+            self.GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
             self.HF_TOKEN: str = os.environ.get("HF_TOKEN", "")
             self.SUPABASE_URL: str = os.environ.get("SUPABASE_URL", "")
             self.SUPABASE_KEY: str = os.environ.get("SUPABASE_KEY", "")
