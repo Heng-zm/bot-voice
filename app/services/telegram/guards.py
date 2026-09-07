@@ -39,7 +39,7 @@ async def _telegram_rate_limit_guard(update: Any, context: Any) -> None:
             _metric_inc("flood_blocked")
             raise ApplicationHandlerStop
 
-    allowed, remaining = await _rate_limit_check(key, _run_state_user_rate_limit(), _run_state_user_rate_window())
+    allowed, _remaining = await _rate_limit_check(key, _run_state_user_rate_limit(), _run_state_user_rate_window())
     if allowed:
         return
 
@@ -212,8 +212,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 __all__ = [
+    '_drop_stale_updates',
     '_telegram_rate_limit_guard',
     '_telegram_user_security_guard',
-    '_drop_stale_updates',
-    'error_handler'
+    'error_handler',
 ]

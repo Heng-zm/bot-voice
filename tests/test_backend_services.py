@@ -459,8 +459,13 @@ class TextUtilityServicesTests(unittest.TestCase):
     def test_take_escaped_prefix(self) -> None:
         from app.utils.text import take_escaped_prefix
 
-        prefix, rest = take_escaped_prefix("Hello <b>World</b>", 10)
+        prefix, _rest = take_escaped_prefix("Hello <b>World</b>", 10)
         self.assertTrue(len(prefix) > 0)
+
+        # Edge case: small limit with entity expansion (< escapes to &lt; of length 4)
+        prefix_empty, rest_all = take_escaped_prefix("<test>", 2)
+        self.assertEqual("", prefix_empty)
+        self.assertEqual("<test>", rest_all)
 
     def test_html_safe_cut(self) -> None:
         from app.utils.text import html_safe_cut
@@ -468,6 +473,43 @@ class TextUtilityServicesTests(unittest.TestCase):
         text = "<b>Hello World</b>"
         cut = html_safe_cut(text, 5)
         self.assertLessEqual(cut, len(text))
+
+        # Do not cut on space inside an HTML tag attribute
+        text_with_tag = '<a href="https://example.com/a path">Click here</a>'
+        cut_tag = html_safe_cut(text_with_tag, 35)
+        self.assertNotIn("<a href=\"https://example.com/a", text_with_tag[cut_tag:])
+        self.assertLessEqual(cut_tag, 35)
+
+    def test_format_safe_media_caption(self) -> None:
+        from app.utils.text import TELEGRAM_CAPTION_LIMIT, format_safe_media_caption
+
+        # 1. Empty caption
+        cap, overflow = format_safe_media_caption("Header:\n", "")
+        self.assertEqual("Header:", cap)
+        self.assertEqual("", overflow)
+
+        # 2. Normal caption fits entirely
+        cap, overflow = format_safe_media_caption("Header:\n", "Short message")
+        self.assertEqual("Header:\nShort message", cap)
+        self.assertEqual("", overflow)
+        self.assertLessEqual(len(cap), TELEGRAM_CAPTION_LIMIT)
+
+        # 3. Oversized caption (> 1024 chars) is bounded strictly to <= 1024
+        long_raw = "A" * 800 + " " + "B" * 800
+        header = "📩 <b>Admin:</b>\n"
+        cap, overflow = format_safe_media_caption(header, long_raw)
+        self.assertLessEqual(len(cap), TELEGRAM_CAPTION_LIMIT)
+        self.assertTrue(cap.startswith(header))
+        self.assertTrue(len(overflow) > 0)
+        # Content is preserved across caption + overflow
+        self.assertIn("A", cap)
+        self.assertIn("B", overflow)
+
+        # 4. Escaping characters (&, <, >) still obeys strict length limit
+        long_special = "<>&" * 400
+        cap, overflow = format_safe_media_caption(header, long_special)
+        self.assertLessEqual(len(cap), TELEGRAM_CAPTION_LIMIT)
+        self.assertTrue(len(overflow) > 0)
 
     def test_paginate_html(self) -> None:
         from app.utils.text import paginate_html
@@ -589,19 +631,20 @@ class GeminiTextExtractionAndRetryTests(unittest.TestCase):
         from app.services.ai.gemini import extract_gemini_text
 
         class MockBlockedResponse:
+            def __init__(self):
+                self.candidates = [
+                    SimpleNamespace(
+                        content=SimpleNamespace(
+                            parts=[
+                                SimpleNamespace(text="Partial safe text"),
+                            ]
+                        )
+                    )
+                ]
+
             @property
             def text(self):
                 raise ValueError("The candidate's response has no text due to safety.")
-
-            candidates = [
-                SimpleNamespace(
-                    content=SimpleNamespace(
-                        parts=[
-                            SimpleNamespace(text="Partial safe text"),
-                        ]
-                    )
-                )
-            ]
 
         self.assertEqual("Partial safe text", extract_gemini_text(MockBlockedResponse()))
 
@@ -609,11 +652,12 @@ class GeminiTextExtractionAndRetryTests(unittest.TestCase):
         from app.services.ai.gemini import extract_gemini_text
 
         class MockNoCandidateResponse:
+            def __init__(self):
+                self.candidates = []
+
             @property
             def text(self):
                 raise ValueError("No candidates.")
-
-            candidates = []
 
         self.assertEqual("", extract_gemini_text(MockNoCandidateResponse()))
 
@@ -666,7 +710,7 @@ class PerformanceSettingsAndFastFallbackTests(unittest.IsolatedAsyncioTestCase):
     async def test_apply_bot_perf_setting_in_memory_without_db(self) -> None:
         from app import legacy
 
-        ok, info = await legacy._apply_bot_performance_setting(
+        ok, _info = await legacy._apply_bot_performance_setting(
             "TELEGRAM_CONCURRENT_UPDATES",
             8,
             save_to_db=False,
@@ -679,7 +723,7 @@ class PerformanceSettingsAndFastFallbackTests(unittest.IsolatedAsyncioTestCase):
     def test_db_bot_settings_upsert_many_memory_fallback(self) -> None:
         from app import legacy
 
-        ok, msg = legacy.db_bot_settings_upsert_many({
+        ok, _msg = legacy.db_bot_settings_upsert_many({
             "TELEGRAM_CONCURRENT_UPDATES": "6",
             "HTTP_MAX_CONNECTIONS": "80",
         })

@@ -93,7 +93,7 @@ async def run_bot_async() -> None:
         f"TTS: {model_name} | Mode: {bot_mode} | Storage: Supabase]"
     )
 
-    asyncio.create_task(start_health_server(), name="health-server")
+    health_task = asyncio.create_task(start_health_server(), name="health-server")
 
     app = build_telegram_application(token, bot_mode=bot_mode)
 
@@ -145,6 +145,10 @@ async def run_bot_async() -> None:
         except (asyncio.CancelledError, KeyboardInterrupt):
             logger.info("Bot shutdown requested.")
         finally:
+            if health_task and not health_task.done():
+                health_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await health_task
             updater = getattr(app, "updater", None)
             if updater is not None and getattr(updater, "running", False):
                 with suppress(Exception):

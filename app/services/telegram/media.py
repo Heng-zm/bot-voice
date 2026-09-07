@@ -777,10 +777,10 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 __all__ = [
-    'on_photo',
-    'on_voice',
-    'on_audio_file',
     'on_any_media',
+    'on_audio_file',
+    'on_photo',
     'on_text',
-    'process_tts_for_text'
+    'on_voice',
+    'process_tts_for_text',
 ]

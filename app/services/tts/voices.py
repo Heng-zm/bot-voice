@@ -129,7 +129,7 @@ def tts_model_label(value: Any) -> str:
 
 
 _ZERO_WIDTH_MAP = {ord(c): None for c in ("\ufeff", "\u200b", "\u200c", "\u200d")}
-_CONTROL_MAP = {i: " " for i in (*range(0x00, 0x09), 0x0B, 0x0C, *range(0x0E, 0x20), 0x7F)}
+_CONTROL_MAP = {i: " " for i in (*range(0x09), 0x0B, 0x0C, *range(0x0E, 0x20), 0x7F)}
 _CLEAN_TRANSLATE_TABLE = str.maketrans({**_ZERO_WIDTH_MAP, **_CONTROL_MAP})
 
 _WHITESPACE_RE = re.compile(r"[ \t\r\f\v]+")

@@ -6,6 +6,7 @@ import html
 import re
 
 TELEGRAM_MSG_LIMIT = 4096
+TELEGRAM_CAPTION_LIMIT = 1024
 
 
 def truncate_text(text: str, max_len: int, ellipsis: str = "…") -> str:
@@ -18,7 +19,7 @@ def truncate_text(text: str, max_len: int, ellipsis: str = "…") -> str:
 
 def take_escaped_prefix(text: str, escaped_limit: int) -> tuple[str, str]:
     """Return the largest raw prefix whose html.escape() fits escaped_limit."""
-    if escaped_limit <= 0:
+    if escaped_limit <= 0 or not text:
         return "", text
     if len(html.escape(text)) <= escaped_limit:
         return text, ""
@@ -31,7 +32,7 @@ def take_escaped_prefix(text: str, escaped_limit: int) -> tuple[str, str]:
         else:
             hi = mid - 1
     if lo <= 0:
-        lo = 1
+        lo = 1 if len(html.escape(text[:1])) <= escaped_limit else 0
     return text[:lo], text[lo:]
 
 
@@ -53,12 +54,54 @@ def html_safe_cut(text: str, limit: int) -> int:
     if last_amp > last_semi and cut - last_amp <= 12:
         cut = max(1, last_amp)
 
-    # Prefer natural whitespace / newline boundaries
+    # Prefer natural whitespace / newline boundaries outside tags and entities
     for sep in ("\n\n", "\n", " "):
         boundary = text.rfind(sep, 0, cut)
         if boundary > 0:
+            last_lt_b = text.rfind("<", 0, boundary)
+            last_gt_b = text.rfind(">", 0, boundary)
+            if last_lt_b > last_gt_b:
+                continue
+            last_amp_b = text.rfind("&", 0, boundary)
+            last_semi_b = text.rfind(";", 0, boundary)
+            if last_amp_b > last_semi_b and boundary - last_amp_b <= 12:
+                continue
             return boundary
     return cut
+
+
+def format_safe_media_caption(
+    header: str = "",
+    raw_caption: str | None = None,
+    limit: int = TELEGRAM_CAPTION_LIMIT,
+) -> tuple[str, str]:
+    """Format an HTML-escaped media caption strictly bounded to limit (1024).
+
+    Returns:
+        (safe_caption_html, overflow_raw_text)
+        - safe_caption_html: Length is guaranteed to be <= limit characters.
+        - overflow_raw_text: Remaining unescaped text that did not fit in the caption.
+    """
+    raw = str(raw_caption or "").strip()
+    header_str = str(header or "")
+    if not raw:
+        return header_str.rstrip("\n")[:limit], ""
+
+    body_limit = max(0, limit - len(header_str))
+    if body_limit <= 0:
+        return header_str[:limit], raw
+
+    prefix, rest = take_escaped_prefix(raw, body_limit)
+    if rest:
+        for sep in ("\n", " "):
+            cut = prefix.rfind(sep)
+            if cut > 0 and len(html.escape(prefix[:cut].rstrip())) <= body_limit:
+                rest = prefix[cut:] + rest
+                prefix = prefix[:cut].rstrip()
+                break
+
+    caption_html = f"{header_str}{html.escape(prefix)}"
+    return caption_html, rest.lstrip()
 
 
 def paginate_pre_html(text: str, limit: int = TELEGRAM_MSG_LIMIT, header: str = "") -> list[str]:
@@ -130,7 +173,9 @@ def paginate_html(text: str, limit: int = TELEGRAM_MSG_LIMIT, header: str = "") 
 
 
 __all__ = [
+    "TELEGRAM_CAPTION_LIMIT",
     "TELEGRAM_MSG_LIMIT",
+    "format_safe_media_caption",
     "html_safe_cut",
     "paginate_html",
     "paginate_pre_html",

@@ -12782,6 +12782,8 @@ def _paginate_plain(text: str, limit: int = TELE_MSG_LIMIT, header: str = "") ->
 
 
 from app.utils.text import (
+    TELEGRAM_CAPTION_LIMIT as _TELEGRAM_CAPTION_LIMIT,
+    format_safe_media_caption as _format_safe_media_caption,
     html_safe_cut as _html_safe_cut,
     paginate_html as _paginate_html,
     paginate_pre_html as _paginate_pre_html,
@@ -21099,8 +21101,8 @@ def _broadcast_prepare_text(
     raw = raw.strip()
     if not raw:
         return None, mode, link_preview
-    if _broadcast_visible_len(raw, mode) > max_chars:
-        raise ValueError(f"Broadcast content too long. Max {max_chars} Telegram-visible characters.")
+    if len(raw) > max_chars or _broadcast_visible_len(raw, mode) > max_chars:
+        raise ValueError(f"Broadcast content too long. Max {max_chars} characters.")
     return raw, mode, link_preview
 
 
@@ -21145,10 +21147,13 @@ async def _send_telegram_broadcast_message(
     for telegram_parse_mode in parse_candidates:
         try:
             if photo_file_id:
+                caption = text if text else None
+                if caption and len(caption) > 1024:
+                    caption = _truncate_text(caption, 1024)
                 kwargs = {
                     "chat_id": int(chat_id),
                     "photo": photo_file_id,
-                    "caption": text if text else None,
+                    "caption": caption,
                 }
                 if telegram_parse_mode and text:
                     kwargs["parse_mode"] = telegram_parse_mode
@@ -24500,6 +24505,15 @@ async def _admin_show_broadcast_preview_message(message, bot, user_id: int, payl
         _broadcast_normalize_link_preview(payload.get("link_preview"), True),
     )
 
+    if photo_file_id and preview_content and (len(preview_content) > 1024 or _broadcast_visible_len(preview_content, preview_mode) > 1024):
+        await safe_send(lambda: message.reply_text(
+            f"❌ ចំណងជើងរូបភាពវែងពេក ({len(preview_content)}/1024 តួអក្សរ)។\n"
+            "Telegram អនុញ្ញាតអតិបរមា 1024 តួអក្សរសម្រាប់ Caption រូបភាព។\n"
+            "សូមកាត់បន្ថយ ឬផ្ញើជាអត្ថបទ (Text) ធម្មតាវិញ។",
+            parse_mode="HTML",
+        ))
+        return False
+
     await safe_send(lambda: message.reply_text(
         f"{summary}\n\n"
         "👁️ <b>Preview មាតិកានឹងបង្ហាញខាងក្រោម</b>\n"
@@ -24575,6 +24589,13 @@ async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.photo:
         photo_file_id = msg.photo[-1].file_id
         caption_text, parse_mode, link_preview = _broadcast_message_text_and_mode(msg, caption=True)
+        if caption_text and (len(caption_text) > 1024 or _broadcast_visible_len(caption_text, parse_mode) > 1024):
+            await safe_send(lambda: msg.reply_text(
+                f"⚠️ ចំណងជើងរូបភាពវែងពេក ({len(caption_text)}/1024 តួអក្សរ)។\n"
+                "Telegram អនុញ្ញាតអតិបរមា 1024 តួអក្សរសម្រាប់ Caption រូបភាព។\n"
+                "សូមកាត់បន្ថយ ឬផ្ញើជាអត្ថបទ (Text) ធម្មតាវិញ។"
+            ))
+            return
     elif msg.text:
         plain_text, parse_mode, link_preview = _broadcast_message_text_and_mode(msg, caption=False)
         if not plain_text.strip():
@@ -24645,6 +24666,13 @@ async def _handle_sched_content(update: Update, context: ContextTypes.DEFAULT_TY
     if msg.photo:
         photo_file_id = msg.photo[-1].file_id
         caption_text, parse_mode, link_preview = _broadcast_message_text_and_mode(msg, caption=True)
+        if caption_text and (len(caption_text) > 1024 or _broadcast_visible_len(caption_text, parse_mode) > 1024):
+            await safe_send(lambda: msg.reply_text(
+                f"⚠️ ចំណងជើងរូបភាពវែងពេក ({len(caption_text)}/1024 តួអក្សរ)។\n"
+                "Telegram អនុញ្ញាតអតិបរមា 1024 តួអក្សរសម្រាប់ Caption រូបភាព។\n"
+                "សូមកាត់បន្ថយ ឬផ្ញើជាអត្ថបទ (Text) ធម្មតាវិញ។"
+            ))
+            return True
     elif msg.text:
         plain_text, parse_mode, link_preview = _broadcast_message_text_and_mode(msg, caption=False)
         if not plain_text.strip():
@@ -24868,6 +24896,13 @@ async def _handle_sched_edit_photo(update: Update, context: ContextTypes.DEFAULT
         return True
     photo_file_id = msg.photo[-1].file_id
     caption = msg.caption or ""
+    if len(caption) > 1024 or _broadcast_visible_len(caption, _BROADCAST_PARSE_MODE_AUTO) > 1024:
+        await safe_send(lambda: msg.reply_text(
+            f"⚠️ ចំណងជើងរូបភាពវែងពេក ({len(caption)}/1024 តួអក្សរ)។\n"
+            "Telegram អនុញ្ញាតអតិបរមា 1024 តួអក្សរសម្រាប់ Caption រូបភាព។\n"
+            "សូមកាត់បន្ថយ ឬផ្ញើជាអត្ថបទ (Text) ធម្មតាវិញ។"
+        ))
+        return True
     ok, reason, row = await asyncio.get_running_loop().run_in_executor(
         None, db_sched_update_photo, row_id, user_id, photo_file_id, caption
     )
@@ -25957,10 +25992,15 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
     async def _do():
         if msg.text:
-            await bot.send_message(chat_id=target_id, text=f"📩 <b>Admin:</b>\n{html.escape(msg.text)}", parse_mode="HTML")
+            text_pages = _paginate_html(html.escape(msg.text), header="📩 <b>Admin:</b>\n")
+            for page in text_pages:
+                await bot.send_message(chat_id=target_id, text=page, parse_mode="HTML")
         elif msg.photo:
-            cap = f"📩 <b>Admin:</b>\n{html.escape(msg.caption)}" if msg.caption else "📩 <b>Admin:</b>"
+            cap, overflow = _format_safe_media_caption("📩 <b>Admin:</b>\n", msg.caption)
             await bot.send_photo(chat_id=target_id, photo=msg.photo[-1].file_id, caption=cap, parse_mode="HTML")
+            if overflow:
+                for page in _paginate_html(html.escape(overflow), header="📩 <b>Admin (បន្ត):</b>\n"):
+                    await bot.send_message(chat_id=target_id, text=page, parse_mode="HTML")
         elif msg.voice:
             await bot.send_voice(chat_id=target_id, voice=msg.voice.file_id, caption="📩 Admin voice message")
         elif msg.video_note:
@@ -25968,13 +26008,23 @@ async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
         elif msg.sticker:
             await bot.send_sticker(chat_id=target_id, sticker=msg.sticker.file_id)
         elif msg.document:
-            cap = f"📩 <b>Admin:</b>\n{html.escape(msg.caption)}" if msg.caption else "📩 <b>Admin:</b>"
+            cap, overflow = _format_safe_media_caption("📩 <b>Admin:</b>\n", msg.caption)
             await bot.send_document(chat_id=target_id, document=msg.document.file_id, caption=cap, parse_mode="HTML")
+            if overflow:
+                for page in _paginate_html(html.escape(overflow), header="📩 <b>Admin (បន្ត):</b>\n"):
+                    await bot.send_message(chat_id=target_id, text=page, parse_mode="HTML")
         elif msg.video:
-            cap = f"📩 <b>Admin:</b>\n{html.escape(msg.caption)}" if msg.caption else "📩 <b>Admin:</b>"
+            cap, overflow = _format_safe_media_caption("📩 <b>Admin:</b>\n", msg.caption)
             await bot.send_video(chat_id=target_id, video=msg.video.file_id, caption=cap, parse_mode="HTML")
+            if overflow:
+                for page in _paginate_html(html.escape(overflow), header="📩 <b>Admin (បន្ត):</b>\n"):
+                    await bot.send_message(chat_id=target_id, text=page, parse_mode="HTML")
         elif msg.audio:
-            await bot.send_audio(chat_id=target_id, audio=msg.audio.file_id)
+            cap, overflow = _format_safe_media_caption("📩 <b>Admin:</b>\n", msg.caption)
+            await bot.send_audio(chat_id=target_id, audio=msg.audio.file_id, caption=cap, parse_mode="HTML")
+            if overflow:
+                for page in _paginate_html(html.escape(overflow), header="📩 <b>Admin (បន្ត):</b>\n"):
+                    await bot.send_message(chat_id=target_id, text=page, parse_mode="HTML")
         else:
             await bot.forward_message(chat_id=target_id, from_chat_id=admin_id, message_id=msg.message_id)
     try:
@@ -25988,14 +26038,21 @@ async def _fwd_admin_to_user(bot, admin_id: int, target_id: int, msg) -> bool:
 
 
 async def _fwd_user_to_admin(bot, admin_id: int, user_id: int, username: str, msg) -> bool:
+    header = f"💬 <b>{html.escape(username)} ({user_id}):</b>\n"
     banner = f"💬 <b>{html.escape(username)} ({user_id}):</b>"
+    cont_header = f"💬 <b>{html.escape(username)} ({user_id}) (បន្ត):</b>\n"
 
     async def _do():
         if msg.text:
-            await bot.send_message(chat_id=admin_id, text=f"{banner}\n{html.escape(msg.text)}", parse_mode="HTML")
+            text_pages = _paginate_html(html.escape(msg.text), header=header)
+            for page in text_pages:
+                await bot.send_message(chat_id=admin_id, text=page, parse_mode="HTML")
         elif msg.photo:
-            cap = f"{banner}\n{html.escape(msg.caption)}" if msg.caption else banner
+            cap, overflow = _format_safe_media_caption(header, msg.caption)
             await bot.send_photo(chat_id=admin_id, photo=msg.photo[-1].file_id, caption=cap, parse_mode="HTML")
+            if overflow:
+                for page in _paginate_html(html.escape(overflow), header=cont_header):
+                    await bot.send_message(chat_id=admin_id, text=page, parse_mode="HTML")
         elif msg.voice:
             await bot.send_voice(chat_id=admin_id, voice=msg.voice.file_id, caption=banner, parse_mode="HTML")
         elif msg.video_note:
@@ -26005,14 +26062,23 @@ async def _fwd_user_to_admin(bot, admin_id: int, user_id: int, username: str, ms
             await bot.send_message(chat_id=admin_id, text=banner, parse_mode="HTML")
             await bot.send_sticker(chat_id=admin_id, sticker=msg.sticker.file_id)
         elif msg.document:
-            cap = f"{banner}\n{html.escape(msg.caption)}" if msg.caption else banner
+            cap, overflow = _format_safe_media_caption(header, msg.caption)
             await bot.send_document(chat_id=admin_id, document=msg.document.file_id, caption=cap, parse_mode="HTML")
+            if overflow:
+                for page in _paginate_html(html.escape(overflow), header=cont_header):
+                    await bot.send_message(chat_id=admin_id, text=page, parse_mode="HTML")
         elif msg.video:
-            cap = f"{banner}\n{html.escape(msg.caption)}" if msg.caption else banner
+            cap, overflow = _format_safe_media_caption(header, msg.caption)
             await bot.send_video(chat_id=admin_id, video=msg.video.file_id, caption=cap, parse_mode="HTML")
+            if overflow:
+                for page in _paginate_html(html.escape(overflow), header=cont_header):
+                    await bot.send_message(chat_id=admin_id, text=page, parse_mode="HTML")
         elif msg.audio:
-            await bot.send_message(chat_id=admin_id, text=banner, parse_mode="HTML")
-            await bot.send_audio(chat_id=admin_id, audio=msg.audio.file_id)
+            cap, overflow = _format_safe_media_caption(header, msg.caption)
+            await bot.send_audio(chat_id=admin_id, audio=msg.audio.file_id, caption=cap, parse_mode="HTML")
+            if overflow:
+                for page in _paginate_html(html.escape(overflow), header=cont_header):
+                    await bot.send_message(chat_id=admin_id, text=page, parse_mode="HTML")
         else:
             await bot.send_message(chat_id=admin_id, text=banner, parse_mode="HTML")
             await bot.forward_message(chat_id=admin_id, from_chat_id=user_id, message_id=msg.message_id)

@@ -74,6 +74,6 @@ except (ImportError, ModuleNotFoundError):
 SETTINGS = AppSettings()
 
 __all__ = [
-    "AppSettings",
     "SETTINGS",
+    "AppSettings",
 ]
