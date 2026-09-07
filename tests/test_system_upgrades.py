@@ -200,8 +200,8 @@ class TestBotConfigPanel(unittest.TestCase):
         flattened_home = [btn.callback_data for row in home_kb.inline_keyboard for btn in row]
         self.assertIn("cfg_cat:ai", flattened_home)
         self.assertIn("cfg_cat:channel", flattened_home)
-        self.assertIn("cfg_cat:features", flattened_home)
-        self.assertIn("cfg_cat:performance", flattened_home)
+        self.assertIn("admin_settings", flattened_home)
+        self.assertIn("admin_perf", flattened_home)
         self.assertIn("cfg_cat:all", flattened_home)
 
         # AI keyboard
@@ -222,7 +222,7 @@ class TestBotConfigPanel(unittest.TestCase):
         all_kb = legacy.get_bot_config_all_kb()
         self.assertIsNotNone(all_kb)
         flattened_all = [btn.callback_data for row in all_kb.inline_keyboard for btn in row]
-        self.assertIn("cfg_cat:home", flattened_all)
+        self.assertIn("admin_bot_config", flattened_all)
 
     def test_admin_config_text_renderers(self):
         settings = dict(legacy.BOT_SETTING_DEFAULTS)
@@ -230,18 +230,18 @@ class TestBotConfigPanel(unittest.TestCase):
 
         home_text = legacy._admin_bot_config_home_text(settings, status)
         self.assertIn("Bot Configuration Hub", home_text)
-        self.assertIn("Speech & AI Models", home_text)
-        self.assertIn("Channel Narrator", home_text)
+        self.assertIn("AI & TTS Engine", home_text)
+        self.assertIn("Channel Auto-Voice Narrator", home_text)
+        self.assertIn("Port:", home_text)
 
         ai_text = legacy._admin_bot_config_ai_text(settings)
-        self.assertIn("Speech & AI Models", ai_text)
+        self.assertIn("AI & TTS Models", ai_text)
 
         channel_text = legacy._admin_bot_config_channel_text(settings)
         self.assertIn("Channel Auto-Voice Narrator", channel_text)
 
         all_text = legacy._admin_bot_config_all_text(settings, status)
-        self.assertIn("Complete Configuration Dump", all_text)
-        self.assertIn("Environment & Secrets", all_text)
+        self.assertIn("All Bot Configurations", all_text)
 
     def test_admin_dashboard_cleaned_layout(self):
         kb = legacy.get_admin_dashboard_kb()

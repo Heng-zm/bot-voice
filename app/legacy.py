@@ -11796,10 +11796,10 @@ def ai_text_reply(prompt: str, history: list[dict] | None = None) -> tuple[str, 
 
 def _supabase_postgrest_timeout() -> httpx.Timeout:
     """Bound Supabase calls so an outage cannot occupy DB workers for minutes."""
-    request_timeout = _env_float("SUPABASE_HTTP_TIMEOUT_S", 12.0, minimum=2.0, maximum=60.0)
+    request_timeout = _env_float("SUPABASE_HTTP_TIMEOUT_S", 20.0, minimum=2.0, maximum=60.0)
     connect_timeout = _env_float(
         "SUPABASE_CONNECT_TIMEOUT_S",
-        min(5.0, request_timeout),
+        min(8.0, request_timeout),
         minimum=1.0,
         maximum=request_timeout,
     )
@@ -14918,7 +14918,6 @@ def db_lock_acquire(
                 "Scheduler lock store is temporarily unavailable; this tick will be deferred. Error: %s",
                 exc,
             )
-            supabase_breaker.record_failure(exc)
             return None
         _log_once(
             logging.WARNING,
@@ -15015,7 +15014,6 @@ def db_named_lock_acquire(lock_key: str, owner: str, ttl_s: int | float) -> bool
             exc,
         )
         if _is_retryable_store_error(exc):
-            supabase_breaker.record_failure(exc)
             return None
         return False
 
@@ -24120,6 +24118,7 @@ def _admin_bot_config_home_text(settings: dict[str, str], status: dict) -> str:
     gemini_key_masked = "Configured ✅" if GEMINI_API_KEY else "Not Set ❌"
     supabase_masked = "Connected ✅" if supabase else "Not Connected ⚠️"
     redis_masked = "Connected ✅" if redis_client else "None (Memory)"
+    port_str = str(os.environ.get("PORT") or os.environ.get("WEBHOOK_PORT") or "8000").strip()
 
     return (
         "🤖 <b>ផ្ទាំងគ្រប់គ្រងការកំណត់បូត (Bot Configuration Hub)</b>\n\n"
@@ -24142,7 +24141,7 @@ def _admin_bot_config_home_text(settings: dict[str, str], status: dict) -> str:
         "🔐 <b>System Credentials:</b>\n"
         f"• Telegram Token: <code>{html.escape(bot_token_masked)}</code>\n"
         f"• Gemini AI Key: <b>{gemini_key_masked}</b> | Supabase: <b>{supabase_masked}</b>\n"
-        f"• Redis Cache: <b>{redis_masked}</b> | Port: <code>{PORT}</code>\n\n"
+        f"• Redis Cache: <b>{redis_masked}</b> | Port: <code>{html.escape(port_str)}</code>\n\n"
         "💡 <i>ចុចប៊ូតុងខាងក្រោមដើម្បីកែប្រែការកំណត់នីមួយៗភ្លាមៗ៖</i>"
     )
 
