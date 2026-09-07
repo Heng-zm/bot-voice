@@ -140,6 +140,8 @@ create unique index if not exists conversation_history_id_uidx
   on public.conversation_history (id);
 create index if not exists conversation_history_user_created_idx
   on public.conversation_history (user_id, created_at desc);
+create index if not exists conversation_history_created_at_idx
+  on public.conversation_history (created_at desc);
 
 -- --------------------------------------------------------------------------
 -- 4. Scheduled Telegram broadcasts
