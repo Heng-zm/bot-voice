@@ -175,33 +175,58 @@ flowchart TD
     User([👤 Telegram User / DM]) <-->|Webhook / Polling| TG[🤖 Telegram Gateway]
     Channel([📢 Public Channel Post]) -->|channel_post| TG
     
-    subgraph "Core Domain Services"
+    subgraph "Ingress & Protection"
         TG --> Guard[🚦 Security Guard & Anti-Spam Shield]
-        Guard --> Router{Dispatcher}
+        Guard --> CB[⚡ 60s Sliding-Window Circuit Breaker]
+        CB --> Router{Dispatcher}
+    end
+
+    subgraph "Core Domain Services"
         Router --> TTS[🗣️ Resilient 4-Tier TTS Pipeline]
         Router --> ChanNarrator[📢 Channel Auto-Voice Narrator]
         Router --> OCR[🔍 Vision & PDF Document OCR]
-        Router --> STT[🎙️ Transcribe & Speech Engine]
+        Router --> AI[🧠 AI Assistant & Translator]
         Router --> Admin[🎛️ Admin CRM & Broadcast Scheduler]
         
         ChanNarrator -->|Sanitized Text| TTS
     end
     
     subgraph "Multi-Tier Resilient TTS Engine"
-        TTS --> T1[Tier 1: Hugging Face Khmer Space]
-        T1 -.->|Timeout / Cooldown| T2[Tier 2: Microsoft Edge TTS]
-        T2 -.->|Language / Retry| T3[Tier 3: Google Gemini Multimodal]
-        T3 -.->|Timeout >15s / Error| T4[Tier 4: Emergency Fast Edge Fallback]
+        TTS --> T1[Tier 1: Hugging Face Khmer Space ≤250 chars]
+        T1 -.->|Empty / Limit / Timeout <1s| T2[Tier 2: Microsoft Edge Neural TTS]
+        T2 -.->|Multilingual / Retry| T3[Tier 3: Google Gemini Multimodal]
+        T3 -.->|Timeout >10s / Quota| T4[Tier 4: Fast Edge Fallback]
+    end
+
+    subgraph "AI Multi-Model Fallback Chain"
+        AI & OCR --> G1[Primary: Gemini 2.0 Flash]
+        G1 -.->|429 Quota Exceeded| G2[Fallback: Gemini 1.5 Flash]
+        G2 -.->|Failover| G3[Emergency: Gemini 2.5 Flash / HF Qwen]
     end
     
     subgraph "High-Performance Persistence & Cache"
         T1 & T2 & T3 & T4 --> Cache[(💾 In-Memory Audio Cache SHA-256)]
         T1 & T2 & T3 & T4 --> FFmpeg[⚡ In-Memory FFmpeg Opus pipe:1]
-        Admin & Guard --> DB[(🗄️ Supabase PostgreSQL - Auto Reconnect)]
-        Admin & Guard --> Redis[(⚡ Redis 7 - Distributed Locks & Telemetry)]
-        OCR & STT --> Gemini[✨ Google Gemini 2.0 Flash API]
+        Admin & Guard --> MemCache[(⚡ Zero-Wait In-Memory Settings Cache)]
+        MemCache <--> Redis[(⚡ Redis 7 - Distributed Locks & Telemetry)]
+        MemCache <--> DB[(🗄️ Supabase PostgreSQL - Pooler / Transaction Mode)]
+        DB --> Pruner[🧹 Bounded Batch Pruning 500 records/batch]
     end
 ```
+
+### 🌟 Architectural Highlights
+
+1. **Zero-Wait In-Memory Cold Boot:**
+   - Bot settings load and hot-apply in memory in `< 1ms` during container boot, eliminating 16 sequential database write roundtrips.
+2. **Multi-Tier Khmer TTS with Sub-Second Failover:**
+   - Hugging Face Space ZeroGPU handles natural Khmer voices with safe `≤ 250` character chunking. If the Space returns empty audio or character limits, the pipeline instantly drops to Microsoft Edge TTS in `< 1s` without wasting retry backoff delays.
+3. **Sliding-Window Circuit Breakers:**
+   - Database and AI providers are shielded with a 60-second sliding window circuit breaker. Isolated errors do not accumulate into false infrastructure outages.
+   - If Supabase is restarting or temporarily paused, the bot operates **100% autonomously** in memory and Redis.
+4. **Database Resource Protection & Bounded Pruning:**
+   - Background maintenance jobs prune old history and cache in **bounded batches of 500 records** with dedicated indexes on `created_at DESC`, preventing table locks, memory spikes, and PostgREST timeouts.
+5. **Multi-Model Quota Resilience:**
+   - Vision OCR and AI chat automatically cascade across `gemini-2.0-flash` $\rightarrow$ `gemini-1.5-flash` $\rightarrow$ `gemini-2.5-flash` $\rightarrow$ `Qwen2.5-7B`, preventing 429 quota disruptions.
 
 ---
 
@@ -250,6 +275,7 @@ bot-voice/
 │   ├── bot.py                        # Telegram Bot builder & polling runner
 │   ├── legacy.py                     # Legacy engine compatibility & state
 │   └── main.py                       # FastAPI application & REST API endpoints
+├── backups/                          # Local Database Backups (JSON & CSV, git-ignored)
 ├── tests/                            # Comprehensive Automated Test Suite
 │   ├── test_backend_services.py      # Core service unit tests
 │   ├── test_channel_narrator.py      # Channel narrator & audio text cleaning tests
@@ -266,6 +292,7 @@ bot-voice/
 ├── Dockerfile                        # Multi-stage production container image
 ├── Procfile                          # Cloud platform process file
 ├── anajak-deploy.sh                  # 1-click Anajak Cloud deployment script
+├── backup_data.py                    # 1-click Standalone Supabase Data Backup Script
 ├── bot-voice.service                 # Linux systemd daemon definition
 ├── deploy.sh                         # 1-click Linux VPS automated installer
 ├── docker-compose.yml                # Docker Compose orchestration (Bot + Redis)
