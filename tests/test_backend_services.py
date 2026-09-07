@@ -650,6 +650,44 @@ HAS_SERVER_DEPS = (
 )
 
 
+@unittest.skipUnless(HAS_SERVER_DEPS, "Requires server dependencies (httpx, fastapi)")
+class PerformanceSettingsAndFastFallbackTests(unittest.IsolatedAsyncioTestCase):
+    def test_hf_tts_predict_should_not_retry_empty_or_character_limit(self) -> None:
+        from app.legacy import _hf_tts_predict_should_retry
+
+        # ValueError should fail fast
+        self.assertFalse(_hf_tts_predict_should_retry(ValueError("HF TTS Space returned no audio for text")))
+        # Tuple response with None and characters limit preview
+        err_msg = "HF TTS returned no valid audio data/file/url. result_type=tuple result=\"(None, 'Characters: 297/300')\""
+        self.assertFalse(_hf_tts_predict_should_retry(RuntimeError(err_msg)))
+        # Transient network error should still retry
+        self.assertTrue(_hf_tts_predict_should_retry(RuntimeError("Gradio client timed out")))
+
+    async def test_apply_bot_perf_setting_in_memory_without_db(self) -> None:
+        from app import legacy
+
+        ok, info = await legacy._apply_bot_performance_setting(
+            "TELEGRAM_CONCURRENT_UPDATES",
+            8,
+            save_to_db=False,
+            persist_runtime=False,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(8, legacy.TELEGRAM_CONCURRENT_UPDATES)
+        self.assertEqual("8", legacy._bot_settings_memory.get("TELEGRAM_CONCURRENT_UPDATES"))
+
+    def test_db_bot_settings_upsert_many_memory_fallback(self) -> None:
+        from app import legacy
+
+        ok, msg = legacy.db_bot_settings_upsert_many({
+            "TELEGRAM_CONCURRENT_UPDATES": "6",
+            "HTTP_MAX_CONNECTIONS": "80",
+        })
+        self.assertTrue(ok)
+        self.assertEqual("6", legacy._bot_settings_memory.get("TELEGRAM_CONCURRENT_UPDATES"))
+        self.assertEqual("80", legacy._bot_settings_memory.get("HTTP_MAX_CONNECTIONS"))
+
+
 @unittest.skipUnless(HAS_SERVER_DEPS, "Requires server dependencies (fastapi)")
 class LifespanSupervisorTests(unittest.IsolatedAsyncioTestCase):
     async def test_bot_runner_supervisor_cancels_cleanly(self) -> None:

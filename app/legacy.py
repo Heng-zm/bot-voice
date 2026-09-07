@@ -10078,7 +10078,7 @@ HF_TTS_TEMP              = _env_float("HF_TTS_TEMP", 0.6, minimum=0.05, maximum=
 HF_TTS_TOP_P             = _env_float("HF_TTS_TOP_P", 0.95, minimum=0.05, maximum=1.0)
 HF_TTS_REP_PEN           = _env_float("HF_TTS_REP_PEN", 1.1, minimum=0.5, maximum=3.0)
 HF_TTS_MAX_TOK           = _env_int("HF_TTS_MAX_TOK", 2048, minimum=128, maximum=4096)
-HF_TTS_MAX_CHARS         = _env_int("HF_TTS_MAX_CHARS", 300, minimum=50, maximum=1200)
+HF_TTS_MAX_CHARS         = _env_int("HF_TTS_MAX_CHARS", 250, minimum=50, maximum=1200)
 HF_TTS_TIMEOUT_S         = _env_float("HF_TTS_TIMEOUT_S", 90.0, minimum=15.0, maximum=240.0)
 HF_TTS_RETRIES           = _env_int("HF_TTS_RETRIES", 3, minimum=1, maximum=5)
 HF_TTS_RETRY_DELAY_S     = _env_float("HF_TTS_RETRY_DELAY_S", 2.0, minimum=0.2, maximum=20.0)
@@ -11818,14 +11818,24 @@ def _supabase_postgrest_timeout() -> httpx.Timeout:
 
 def _supabase_client_options(*, asynchronous: bool = False) -> Any | None:
     """Build version-compatible Supabase options with bounded PostgREST I/O."""
-    try:
-        if asynchronous:
-            from supabase.lib.client_options import AsyncClientOptions as options_type
-        else:
-            from supabase.lib.client_options import SyncClientOptions as options_type
-        return options_type(postgrest_client_timeout=_supabase_postgrest_timeout())
-    except (ImportError, TypeError):
-        return None
+    timeout_obj = _supabase_postgrest_timeout()
+    timeout_sec = _env_float("SUPABASE_HTTP_TIMEOUT_S", 20.0, minimum=2.0, maximum=60.0)
+    target_classes = ("AsyncClientOptions" if asynchronous else "SyncClientOptions", "ClientOptions")
+    for mod_name in ("supabase.lib.client_options", "supabase"):
+        try:
+            mod = __import__(mod_name, fromlist=list(target_classes))
+            for opt_cls_name in target_classes:
+                cls = getattr(mod, opt_cls_name, None)
+                if cls is None:
+                    continue
+                for to in (timeout_obj, timeout_sec):
+                    try:
+                        return cls(postgrest_client_timeout=to)
+                    except TypeError:
+                        continue
+        except Exception:
+            continue
+    return None
 
 
 def _init_clients() -> None:
@@ -13929,9 +13939,9 @@ def db_bot_setting_value_set(key: str, value: Any, admin_id: int) -> tuple[bool,
     if key not in BOT_SETTING_DEFAULTS:
         return False, f"Unknown setting: {key}"
     value = str(value).strip()
+    _bot_settings_memory[key] = value
+    _cache_bot_setting_runtime_value(key, value)
     if not supabase:
-        _bot_settings_memory[key] = value
-        _cache_bot_setting_runtime_value(key, value)
         _submit_db(_write_bot_settings_redis_sync)
         return True, "saved in memory only"
     try:
@@ -13941,8 +13951,6 @@ def db_bot_setting_value_set(key: str, value: Any, admin_id: int) -> tuple[bool,
             "updated_by": int(admin_id),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }, on_conflict="key").execute()
-        _bot_settings_memory[key] = value
-        _cache_bot_setting_runtime_value(key, value)
         try:
             _write_bot_settings_redis_sync()
         except Exception as exc:
@@ -13952,6 +13960,39 @@ def db_bot_setting_value_set(key: str, value: Any, admin_id: int) -> tuple[bool,
                 "Bot setting saved, but Redis write-through failed: %s",
                 exc,
             )
+        return True, "saved"
+    except Exception as e:
+        return False, str(e)
+
+
+def db_bot_settings_upsert_many(items: dict[str, Any], admin_id: int = 0) -> tuple[bool, str]:
+    """Batch-upsert multiple bot settings in a single Supabase round-trip."""
+    if not items:
+        return True, "no items"
+    valid_items = {k: str(v).strip() for k, v in items.items() if k in BOT_SETTING_DEFAULTS}
+    if not valid_items:
+        return False, "no valid settings in batch"
+    for k, v in valid_items.items():
+        _bot_settings_memory[k] = v
+        _cache_bot_setting_runtime_value(k, v)
+    if not supabase:
+        _submit_db(_write_bot_settings_redis_sync)
+        return True, "saved in memory only"
+    rows = [
+        {
+            "key": k,
+            "value": v,
+            "updated_by": int(admin_id),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        for k, v in valid_items.items()
+    ]
+    try:
+        supabase.table("bot_settings").upsert(rows, on_conflict="key").execute()
+        try:
+            _write_bot_settings_redis_sync()
+        except Exception:
+            pass
         return True, "saved"
     except Exception as e:
         return False, str(e)
@@ -17761,8 +17802,17 @@ def _hf_tts_get_client_sync():
 
 def _hf_tts_predict_should_retry(exc: Exception) -> bool:
     """Return True for transient Gradio/ZeroGPU cold-start style failures."""
+    if isinstance(exc, (ValueError, TypeError)):
+        return False
     msg = str(exc).lower()
     if _hf_tts_is_quota_error(exc):
+        return False
+    if (
+        "result='(none" in msg
+        or "characters:" in msg
+        or "(none," in msg
+        or "returned no audio for text" in msg
+    ):
         return False
     non_retryable = (
         "invalid api",
@@ -17793,8 +17843,6 @@ def _hf_tts_predict_should_retry(exc: Exception) -> bool:
         "504",
         "502",
         "too busy",
-        "no valid audio",
-        "empty audio",
     )
     return any(token in msg for token in retryable)
 
@@ -17845,6 +17893,10 @@ def _hf_tts_space_predict_sync(chunk_text: str) -> bytes:
         path_or_url = _extract_hf_audio_path_or_url(result)
         if not path_or_url:
             result_preview = _web_short(result, 240) if "_web_short" in globals() else str(result)[:240]
+            if result is None or (isinstance(result, (tuple, list)) and len(result) > 0 and result[0] is None):
+                raise ValueError(
+                    f"HF TTS Space returned no audio for text (Space response: {result_preview!r}). Immediately falling back to Edge TTS."
+                )
             raise RuntimeError(
                 f"HF TTS returned no valid audio data/file/url. result_type={type(result).__name__} result={result_preview!r}"
             )
@@ -23990,37 +24042,60 @@ async def _admin_open_schedules_panel(query, admin_id: int) -> None:
     ))
 
 
-async def _apply_bot_performance_setting(key: str, raw_value: Any, *, admin_id: int = 0, persist_runtime: bool = True) -> tuple[bool, str]:
-    """Validate, save to bot_settings, and hot-apply supported performance knobs."""
+async def _apply_bot_performance_setting(
+    key: str,
+    raw_value: Any,
+    *,
+    admin_id: int = 0,
+    persist_runtime: bool = True,
+    save_to_db: bool = True,
+) -> tuple[bool, str]:
+    """Validate, save to bot_settings if requested, and hot-apply supported performance knobs."""
     try:
         coerced = _coerce_bot_perf_setting(key, raw_value)
     except Exception as exc:
         return False, str(exc)
 
     stored = _bool_to_setting_value(coerced) if isinstance(coerced, bool) else str(coerced)
-    ok, info = await asyncio.get_running_loop().run_in_executor(
-        _DB_EXECUTOR,
-        lambda: db_bot_setting_value_set(key, stored, admin_id),
-    )
-    if not ok:
-        return False, info
+    info = "applied"
+    ok = True
+    if save_to_db:
+        ok, info = await asyncio.get_running_loop().run_in_executor(
+            _DB_EXECUTOR,
+            lambda: db_bot_setting_value_set(key, stored, admin_id),
+        )
+    else:
+        _bot_settings_memory[key] = stored
+        _cache_bot_setting_runtime_value(key, stored)
 
     try:
         await _update_run_state(key, coerced, persist=persist_runtime and key in _RUN_STATE_PERSISTED_KEYS)
     except Exception:
-        # Some startup-only settings are still saved and will apply on restart.
-        globals()[key] = coerced
+        pass
+    globals()[key] = coerced
     _bot_settings_cache["ts"] = 0.0
-    return True, "saved and applied"
+    return ok, info
 
 
-async def _apply_all_bot_performance_settings(admin_id: int = 0, *, force: bool = True) -> list[str]:
+async def _apply_all_bot_performance_settings(
+    admin_id: int = 0,
+    *,
+    force: bool = False,
+    save_to_db: bool = False,
+    persist_runtime: bool = False,
+) -> list[str]:
     settings, _status = await get_bot_settings_async(force=force)
     changed: list[str] = []
     for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items():
         raw = _setting_raw_from(settings, key, BOT_SETTING_DEFAULTS.get(key, ""))
-        ok, info = await _apply_bot_performance_setting(key, raw, admin_id=admin_id)
-        if ok:
+        ok, info = await _apply_bot_performance_setting(
+            key,
+            raw,
+            admin_id=admin_id,
+            persist_runtime=persist_runtime,
+            save_to_db=save_to_db,
+        )
+        if ok or not save_to_db:
             changed.append(key)
         else:
             logger.warning("Could not apply bot performance setting %s=%r: %s", key, raw, info)
@@ -25083,13 +25158,18 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         return
 
     if data == "admin_perf_apply":
-        changed = await _apply_all_bot_performance_settings(user_id, force=True)
+        changed = await _apply_all_bot_performance_settings(user_id, force=True, save_to_db=False, persist_runtime=False)
         await _admin_open_perf_settings_panel(query, force=True, notice=f"✅ Applied {len(changed)} performance settings.")
         return
 
     if data == "admin_perf_reset":
-        for perf_key in BOT_PERFORMANCE_SETTING_SPECS:
-            await _apply_bot_performance_setting(perf_key, _perf_default(perf_key, BOT_SETTING_DEFAULTS.get(perf_key, "")), admin_id=user_id)
+        to_save = {k: _perf_default(k, BOT_SETTING_DEFAULTS.get(k, "")) for k in BOT_PERFORMANCE_SETTING_SPECS}
+        await asyncio.get_running_loop().run_in_executor(
+            _DB_EXECUTOR,
+            lambda: db_bot_settings_upsert_many(to_save, user_id),
+        )
+        for perf_key, def_val in to_save.items():
+            await _apply_bot_performance_setting(perf_key, def_val, admin_id=user_id, save_to_db=False, persist_runtime=True)
         await _admin_open_perf_settings_panel(query, force=True, notice="✅ Reset to code defaults and applied.")
         return
 
@@ -27438,7 +27518,12 @@ async def _run_bot():
     # guarded separately by ACTIVE_POLLING_TASK for multi-instance ownership.
 
     with suppress(Exception):
-        applied = await _apply_all_bot_performance_settings(admin_id=0, force=True)
+        applied = await _apply_all_bot_performance_settings(
+            admin_id=0,
+            force=False,
+            save_to_db=False,
+            persist_runtime=False,
+        )
         if applied:
             logger.info("Applied %s persisted /admin performance settings before bot startup.", len(applied))
 
