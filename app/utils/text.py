@@ -36,6 +36,13 @@ def take_escaped_prefix(text: str, escaped_limit: int) -> tuple[str, str]:
     return text[:lo], text[lo:]
 
 
+_TELEGRAM_HTML_TAGS: frozenset[str] = frozenset({
+    "b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
+    "span", "tg-spoiler", "a", "tg-emoji", "code", "pre", "blockquote",
+})
+_TAG_PATTERN: re.Pattern[str] = re.compile(r"<\s*(/)?\s*([a-zA-Z0-9_-]+)(?:\s+[^>]*)?>", re.DOTALL)
+
+
 def html_safe_cut(text: str, limit: int) -> int:
     """Pick a cut position that does not land inside an HTML tag or entity."""
     if len(text) <= limit:
@@ -133,15 +140,15 @@ def paginate_pre_html(text: str, limit: int = TELEGRAM_MSG_LIMIT, header: str = 
 
 
 def paginate_html(text: str, limit: int = TELEGRAM_MSG_LIMIT, header: str = "") -> list[str]:
-    """Split already-escaped Telegram HTML without cutting through tags."""
+    """Split already-escaped Telegram HTML without cutting through tags, ensuring all tags are closed on each page."""
     text = str(text or "").strip()
     header = str(header or "")
     if not text and not header:
         return []
 
     limit = max(1, int(limit or TELEGRAM_MSG_LIMIT))
-    body_limit = max(1, limit - len(header))
-    pages: list[str] = []
+    body_limit = max(1, limit - len(header) - 32)
+    raw_pages: list[str] = []
     current = ""
 
     blocks = re.split(r"(\n{2,})", text)
@@ -153,7 +160,7 @@ def paginate_html(text: str, limit: int = TELEGRAM_MSG_LIMIT, header: str = "") 
             current = candidate
             continue
         if current.strip():
-            pages.append(header + current.strip())
+            raw_pages.append(current.strip())
             current = ""
 
         block = block.lstrip()
@@ -161,14 +168,41 @@ def paginate_html(text: str, limit: int = TELEGRAM_MSG_LIMIT, header: str = "") 
             cut = html_safe_cut(block, body_limit)
             piece = block[:cut].strip()
             if piece:
-                pages.append(header + piece)
+                raw_pages.append(piece)
             block = block[cut:].lstrip()
         current = block
 
     if current.strip():
-        pages.append(header + current.strip())
-    if not pages and header:
-        pages.append(header.rstrip())
+        raw_pages.append(current.strip())
+
+    if not raw_pages and header:
+        return [header.rstrip()]
+
+    # Balance unclosed HTML tags across pages
+    pages: list[str] = []
+    carry_over_open: list[tuple[str, str]] = []
+
+    for piece in raw_pages:
+        prefix = "".join(full_tag for full_tag, _ in carry_over_open)
+        combined = prefix + piece
+
+        open_stack: list[tuple[str, str]] = []
+        for m in _TAG_PATTERN.finditer(combined):
+            is_close, tag_name = bool(m.group(1)), m.group(2).lower()
+            if tag_name not in _TELEGRAM_HTML_TAGS:
+                continue
+            if is_close:
+                for idx in range(len(open_stack) - 1, -1, -1):
+                    if open_stack[idx][1] == tag_name:
+                        open_stack.pop(idx)
+                        break
+            else:
+                open_stack.append((m.group(0), tag_name))
+
+        suffix = "".join(f"</{tag_name}>" for _, tag_name in reversed(open_stack))
+        pages.append(header + combined + suffix)
+        carry_over_open = list(open_stack)
+
     return [p for p in pages if p]
 
 

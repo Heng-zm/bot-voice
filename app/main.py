@@ -502,9 +502,16 @@ async def tts_endpoint(
     if not text:
         raise HTTPException(status_code=400, detail="Missing required field: 'text'")
 
-    gender = str(body.get("gender", "female")).lower()
-    speed = float(body.get("speed", 1.0))
-    model = str(body.get("model", "auto")).lower()
+    gender = str(body.get("gender", "female") or "female").lower()
+    if gender not in ("female", "male"):
+        gender = "female"
+    try:
+        speed = float(body.get("speed", 1.0))
+        if speed <= 0.2 or speed > 3.0 or speed != speed:
+            speed = 1.0
+    except (ValueError, TypeError):
+        speed = 1.0
+    model = str(body.get("model", "auto") or "auto").lower()
 
     temp_path = make_temp_ogg()
     try:
@@ -531,6 +538,8 @@ async def tts_endpoint(
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
     finally:
         cleanup_files(temp_path)
+        import gc
+        gc.collect()
 
 
 @app.post("/translate")
@@ -568,8 +577,12 @@ async def translate_endpoint(
                 contents=prompt,
                 preferred_model=preferred_model,
             )
-        response = await loop.run_in_executor(None, _call_ai)
-        translated = (getattr(response, "text", "") or "").strip()
+        try:
+            response = await loop.run_in_executor(None, _call_ai)
+            translated = (getattr(response, "text", "") or "").strip()
+        except Exception as exc:
+            logger.warning("AI translation failed: %s", exc)
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
     else:
         translated = text
 
@@ -615,8 +628,12 @@ async def summarize_endpoint(
                 contents=prompt,
                 preferred_model=preferred_model,
             )
-        response = await loop.run_in_executor(None, _call_ai)
-        summary = (getattr(response, "text", "") or "").strip()
+        try:
+            response = await loop.run_in_executor(None, _call_ai)
+            summary = (getattr(response, "text", "") or "").strip()
+        except Exception as exc:
+            logger.warning("AI summarization failed: %s", exc)
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
     else:
         summary = text[:300] + "..."
 

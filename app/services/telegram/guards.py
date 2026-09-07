@@ -110,7 +110,7 @@ async def _telegram_user_security_guard(update: Any, context: Any) -> None:
 
     query = update.callback_query
     data = str(getattr(query, "data", "") or "") if query is not None else ""
-    admin_callback_prefixes = ("admin_", "needs_", "api_", "rtadmin_", "user_", "users_", "history_", "sched_", "bc_", "admin_report_")
+    admin_callback_prefixes = ("admin_", "needs_", "api_", "rtadmin_", "user_", "users_", "history_", "sched_", "bc_", "admin_report_", "cfg_", "cfg_cat:", "cfg_set:")
     if _env_bool("ADMIN_CALLBACK_GUARD_ENABLED", True) and data.startswith(admin_callback_prefixes):
         _metric_inc("admin_denied")
         await _security_notice_once(update, f"admin_cb:{user_id}", '⛔ សម្រាប់អ្នកគ្រប់គ្រងប៉ុណ្ណោះ។', alert=True)

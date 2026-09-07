@@ -9113,7 +9113,7 @@ _RUN_STATE_PERSISTED_KEYS = (
 
 _RUNTIME_CONFIG_SPECS: OrderedDict[str, dict[str, Any]] = OrderedDict([
     ("BOT_MODE", {"kind": "mode", "label": "Bot mode", "help": "POLLING for one node; WEBHOOK for scalable deployment."}),
-    ("GEMINI_MODEL", {"kind": "str", "label": "Gemini Model", "help": "Default Gemini text/chat model (e.g. gemini-2.0-flash, gemini-1.5-flash)."}),
+    ("GEMINI_MODEL", {"kind": "str", "label": "Gemini Model", "help": "Default Gemini text/chat model (e.g. gemini-2.5-flash, gemini-1.5-flash)."}),
     ("GEMINI_AUDIO_MODEL", {"kind": "str", "label": "Gemini Audio Model", "help": "Active Gemini Audio TTS model (e.g. gemini-2.5-flash-preview-tts, gemini-2.5-pro-preview-tts, gemini-3.1-flash-tts-preview)."}),
     ("DEFAULT_TTS_MODEL", {"kind": "str", "label": "Default TTS Model", "help": "Default engine for speech synthesis (auto, edge, hf, gemini)."}),
     ("OCR_PROVIDER", {"kind": "str", "label": "OCR Provider", "help": "Default OCR service for images/docs (gemini, hf, tesseract)."}),
@@ -13605,8 +13605,8 @@ BOT_SETTING_DEFAULTS: dict[str, str] = {
     "DEFAULT_TTS_MODEL": os.environ.get("DEFAULT_TTS_MODEL", "auto"),
     "DEFAULT_GENDER": os.environ.get("DEFAULT_GENDER", "female"),
     "DEFAULT_SPEED": os.environ.get("DEFAULT_SPEED", "1.0"),
-    "GEMINI_MODEL": os.environ.get("GEMINI_MODEL", "gemini-2.0-flash"),
-    "GEMINI_AUDIO_MODEL": os.environ.get("GEMINI_AUDIO_MODEL", "gemini-2.0-flash-exp"),
+    "GEMINI_MODEL": os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+    "GEMINI_AUDIO_MODEL": os.environ.get("GEMINI_AUDIO_MODEL", "gemini-2.5-flash-preview-tts"),
     "OCR_PROVIDER": os.environ.get("OCR_PROVIDER", "gemini"),
     "HF_MODEL": os.environ.get("HF_MODEL", "mrrtmob/khmer-tts"),
     **{key: str(_perf_default(key, spec.get("default", ""))) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
@@ -22822,7 +22822,7 @@ async def _admin_home_text(admin_id: int, title: str = ADMIN_UI_TITLE) -> str:
     redis_active = bool(os.environ.get("REDIS_URL") or getattr(SETTINGS, "REDIS_URL", ""))
     from app.services.tts.voices import get_default_tts_model, tts_model_label
     default_tts = tts_model_label(get_default_tts_model())
-    active_gemini = _setting_raw_from(settings, "GEMINI_MODEL", getattr(SETTINGS, "GEMINI_MODEL", "gemini-2.0-flash"))
+    active_gemini = _setting_raw_from(settings, "GEMINI_MODEL", getattr(SETTINGS, "GEMINI_MODEL", "gemini-2.5-flash"))
     db_ok = bool(supabase and settings_status.get("db_ok"))
 
     return (
@@ -24218,8 +24218,8 @@ def _admin_bot_config_home_text(settings: dict[str, str], status: dict) -> str:
 
     # AI & Speech
     tts_model = _setting_raw_from(settings, "DEFAULT_TTS_MODEL", "auto")
-    gemini_model = _setting_raw_from(settings, "GEMINI_MODEL", "gemini-2.0-flash")
-    gemini_audio = _setting_raw_from(settings, "GEMINI_AUDIO_MODEL", "gemini-2.0-flash-exp")
+    gemini_model = _setting_raw_from(settings, "GEMINI_MODEL", "gemini-2.5-flash")
+    gemini_audio = _setting_raw_from(settings, "GEMINI_AUDIO_MODEL", "gemini-2.5-flash-preview-tts")
     gender = _setting_raw_from(settings, "DEFAULT_GENDER", "female").title()
     speed = _setting_raw_from(settings, "DEFAULT_SPEED", "1.0")
     ocr = _setting_raw_from(settings, "OCR_PROVIDER", "gemini").upper()
@@ -24294,8 +24294,8 @@ def get_bot_config_home_kb() -> InlineKeyboardMarkup:
 
 def _admin_bot_config_ai_text(settings: dict[str, str]) -> str:
     tts = _setting_raw_from(settings, "DEFAULT_TTS_MODEL", "auto")
-    gemini = _setting_raw_from(settings, "GEMINI_MODEL", "gemini-2.0-flash")
-    gemini_audio = _setting_raw_from(settings, "GEMINI_AUDIO_MODEL", "gemini-2.0-flash-exp")
+    gemini = _setting_raw_from(settings, "GEMINI_MODEL", "gemini-2.5-flash")
+    gemini_audio = _setting_raw_from(settings, "GEMINI_AUDIO_MODEL", "gemini-2.5-flash-preview-tts")
     gender = _setting_raw_from(settings, "DEFAULT_GENDER", "female").title()
     speed = _setting_raw_from(settings, "DEFAULT_SPEED", "1.0")
     ocr = _setting_raw_from(settings, "OCR_PROVIDER", "gemini").upper()
@@ -24315,7 +24315,7 @@ def _admin_bot_config_ai_text(settings: dict[str, str]) -> str:
 
 def get_bot_config_ai_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
     active_tts = _setting_raw_from(settings, "DEFAULT_TTS_MODEL", "auto").lower()
-    active_gemini = _setting_raw_from(settings, "GEMINI_MODEL", "gemini-2.0-flash").lower()
+    active_gemini = _setting_raw_from(settings, "GEMINI_MODEL", "gemini-2.5-flash").lower()
     active_gender = _setting_raw_from(settings, "DEFAULT_GENDER", "female").lower()
     active_speed = _setting_raw_from(settings, "DEFAULT_SPEED", "1.0")
     active_ocr = _setting_raw_from(settings, "OCR_PROVIDER", "gemini").lower()
@@ -24333,9 +24333,9 @@ def get_bot_config_ai_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
          InlineKeyboardButton(_mark(active_tts, "hf_space"), callback_data="cfg_set:DEFAULT_TTS_MODEL:hf_space")],
         # Gemini Model
         [InlineKeyboardButton("Gemini:", callback_data="noop"),
-         InlineKeyboardButton(_mark(active_gemini, "gemini-2.0-flash"), callback_data="cfg_set:GEMINI_MODEL:gemini-2.0-flash"),
+         InlineKeyboardButton(_mark(active_gemini, "gemini-2.5-flash"), callback_data="cfg_set:GEMINI_MODEL:gemini-2.5-flash"),
          InlineKeyboardButton(_mark(active_gemini, "gemini-1.5-flash"), callback_data="cfg_set:GEMINI_MODEL:gemini-1.5-flash"),
-         InlineKeyboardButton(_mark(active_gemini, "gemini-2.5-flash"), callback_data="cfg_set:GEMINI_MODEL:gemini-2.5-flash")],
+         InlineKeyboardButton(_mark(active_gemini, "gemini-3.6-flash"), callback_data="cfg_set:GEMINI_MODEL:gemini-3.6-flash")],
         # Voice Gender
         [InlineKeyboardButton("Voice:", callback_data="noop"),
          InlineKeyboardButton(_mark(active_gender, "female") + " 👩", callback_data="cfg_set:DEFAULT_GENDER:female"),
@@ -25590,7 +25590,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             from google.genai import types as _gtypes
             from app.services.ai.gemini import generate_content_with_fallback
             loop = asyncio.get_running_loop()
-            preferred_m = getattr(globals().get("legacy", None), "GEMINI_MODEL", None) or GEMINI_MODEL or "gemini-2.0-flash"
+            preferred_m = getattr(globals().get("legacy", None), "GEMINI_MODEL", None) or GEMINI_MODEL or "gemini-2.5-flash"
             def _extract_pdf():
                 prompt = (
                     "Extract all readable text from this PDF document. Preserve Khmer, English, and other languages accurately. "

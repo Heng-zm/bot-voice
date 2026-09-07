@@ -94,7 +94,7 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
             extract_gemini_text,
             generate_content_with_fallback,
         )
-        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.0-flash")
+        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash")
         def _call_ai():
             return generate_content_with_fallback(
                 legacy._gemini,
@@ -146,7 +146,7 @@ async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             extract_gemini_text,
             generate_content_with_fallback,
         )
-        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.0-flash")
+        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash")
         def _call_ai():
             return generate_content_with_fallback(
                 legacy._gemini,
@@ -197,7 +197,7 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
             extract_gemini_text,
             generate_content_with_fallback,
         )
-        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.0-flash")
+        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash")
         def _call_ai():
             return generate_content_with_fallback(
                 legacy._gemini,

@@ -546,6 +546,14 @@ class TextUtilityServicesTests(unittest.TestCase):
         pages = paginate_html("First paragraph\n\nSecond paragraph", limit=20)
         self.assertGreaterEqual(len(pages), 1)
 
+        # Test tag balancing across pages
+        long_tagged = "<b>" + "word " * 50 + "</b>"
+        paged_tags = paginate_html(long_tagged, limit=50)
+        self.assertGreater(len(paged_tags), 1)
+        for p in paged_tags:
+            # Each page must have balanced <b> and </b> tags
+            self.assertEqual(p.count("<b>"), p.count("</b>"))
+
 
 class OCRServicesTests(unittest.TestCase):
     def test_ocr_service_initialization(self) -> None:

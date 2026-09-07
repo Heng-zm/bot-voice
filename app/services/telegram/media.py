@@ -729,7 +729,7 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
                 try:
                     audio_bytes = await asyncio.wait_for(
                         _generate_voice_edge(tts_text, gender, speed, file_path),
-                        timeout=20.0,
+                        timeout=45.0,
                     )
                 except Exception as fallback_exc:
                     logger.error("Emergency Edge-TTS fallback failed: %s", fallback_exc)
@@ -774,6 +774,8 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
         _release_tts_request(user_id)
         if file_path:
             _cleanup(file_path)
+        import gc
+        gc.collect()
 
 
 __all__ = [

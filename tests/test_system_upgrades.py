@@ -131,6 +131,99 @@ class TestFastAPISystemEndpoints(unittest.TestCase):
         data = resp.json()
         self.assertTrue(data.get("ok"))
 
+    def test_tts_endpoint_speed_and_gender_validation(self):
+        import os
+        from unittest.mock import AsyncMock, patch
+
+        with (
+            patch.dict(os.environ, {"BOT_API_KEY": "test_secret_key"}),
+            patch("app.legacy.generate_voice_limited", new_callable=AsyncMock) as mock_gen,
+        ):
+            mock_gen.return_value = b"fake_audio_bytes"
+            # Test with out-of-range speed and invalid gender
+            resp = self.client.post(
+                "/tts",
+                headers={"X-Api-Key": "test_secret_key"},
+                json={
+                    "text": "Hello world",
+                    "speed": 99.0,
+                    "gender": "unknown_gender",
+                },
+            )
+            self.assertEqual(200, resp.status_code)
+            data = resp.json()
+            self.assertTrue(data.get("ok"))
+            self.assertEqual(1.0, data.get("speed"))
+            self.assertEqual("female", data.get("gender"))
+            self.assertEqual("female", mock_gen.call_args.kwargs.get("gender"))
+            self.assertEqual(1.0, mock_gen.call_args.kwargs.get("speed"))
+
+    def test_tts_endpoint_nan_and_bad_speed(self):
+        import os
+        from unittest.mock import AsyncMock, patch
+
+        with (
+            patch.dict(os.environ, {"BOT_API_KEY": "test_secret_key"}),
+            patch("app.legacy.generate_voice_limited", new_callable=AsyncMock) as mock_gen,
+        ):
+            mock_gen.return_value = b"fake_audio_bytes"
+            resp = self.client.post(
+                "/tts",
+                headers={"X-Api-Key": "test_secret_key"},
+                json={
+                    "text": "Hello world",
+                    "speed": "not_a_number",
+                    "gender": "male",
+                },
+            )
+            self.assertEqual(200, resp.status_code)
+            data = resp.json()
+            self.assertTrue(data.get("ok"))
+            self.assertEqual(1.0, data.get("speed"))
+            self.assertEqual("male", data.get("gender"))
+            self.assertEqual("male", mock_gen.call_args.kwargs.get("gender"))
+            self.assertEqual(1.0, mock_gen.call_args.kwargs.get("speed"))
+
+    def test_translate_endpoint_error_handling(self):
+        import os
+        from unittest.mock import MagicMock, patch
+
+        mock_gemini = MagicMock()
+        with (
+            patch.dict(os.environ, {"BOT_API_KEY": "test_secret_key"}),
+            patch("app.legacy._gemini", mock_gemini),
+            patch("app.services.ai.gemini.generate_content_with_fallback", side_effect=RuntimeError("AI quota reached")),
+        ):
+            resp = self.client.post(
+                "/translate",
+                headers={"X-Api-Key": "test_secret_key"},
+                json={"text": "Hello"},
+            )
+            self.assertEqual(500, resp.status_code)
+            data = resp.json()
+            self.assertFalse(data.get("ok"))
+            self.assertIn("AI quota reached", data.get("error", ""))
+
+    def test_summarize_endpoint_error_handling(self):
+        import os
+        from unittest.mock import MagicMock, patch
+
+        mock_gemini = MagicMock()
+        with (
+            patch.dict(os.environ, {"BOT_API_KEY": "test_secret_key"}),
+            patch("app.legacy._gemini", mock_gemini),
+            patch("app.services.ai.gemini.generate_content_with_fallback", side_effect=RuntimeError("Model overloaded")),
+        ):
+            resp = self.client.post(
+                "/summarize",
+                headers={"X-Api-Key": "test_secret_key"},
+                json={"text": "Long document text to summarize"},
+            )
+            self.assertEqual(500, resp.status_code)
+            data = resp.json()
+            self.assertFalse(data.get("ok"))
+            self.assertIn("Model overloaded", data.get("error", ""))
+
 
 @unittest.skipUnless(HAS_SERVER_DEPS, "Requires full server dependencies")
 class TestAntiSpamAndUnlock(unittest.TestCase):

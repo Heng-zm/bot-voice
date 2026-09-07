@@ -257,14 +257,15 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             # Try replying to the post first so it anchors directly in discussion threads
             sent = False
             try:
-                await safe_send(lambda ab=audio_bytes, rm=reply_markup: context.bot.send_voice(
+                res = await safe_send(lambda ab=audio_bytes, rm=reply_markup: context.bot.send_voice(
                     chat_id=chat.id,
                     voice=io.BytesIO(ab),
                     caption=caption,
                     reply_markup=rm,
                     reply_to_message_id=post.message_id,
                 ))
-                sent = True
+                if res is not None:
+                    sent = True
             except Exception as reply_err:
                 logger.debug(
                     "reply_to_message_id failed in channel %s (%s); trying direct post: %s",
@@ -293,6 +294,8 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if file_path:
                 with suppress(FileNotFoundError, Exception):
                     os.remove(file_path)
+            import gc
+            gc.collect()
 
 
 __all__ = [
