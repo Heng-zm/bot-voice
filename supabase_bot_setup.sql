@@ -70,6 +70,8 @@ create index if not exists user_prefs_username_lower_idx
   on public.user_prefs (lower(username));
 create index if not exists user_prefs_last_active_idx
   on public.user_prefs (last_active desc);
+create index if not exists user_prefs_created_at_idx
+  on public.user_prefs (created_at desc);
 
 drop trigger if exists user_prefs_set_updated_at on public.user_prefs;
 create trigger user_prefs_set_updated_at

@@ -27748,29 +27748,69 @@ async def _run_startup_background_checks() -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def db_run_periodic_pruning() -> dict[str, Any]:
-    """Prune conversation history older than 30 days and text_cache older than 14 days."""
+def db_run_periodic_pruning(max_batches: int = 4, batch_size: int = 500) -> dict[str, Any]:
+    """Prune conversation history older than 30 days and text_cache older than 14 days.
+
+    Uses bounded chunk deletion so large cleanups never lock tables, exhaust CPU/RAM,
+    or cause PostgREST read timeouts.
+    """
     if not supabase:
         return {"ok": False, "reason": "no_supabase"}
-    
+
     cutoff_history = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
     cutoff_cache = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
     pruned_history = 0
     pruned_cache = 0
 
-    try:
-        res = supabase.table("conversation_history").delete().lt("created_at", cutoff_history).execute()
-        pruned_history = len(getattr(res, "data", []) or [])
-    except Exception as exc:
-        logger.debug("Prune conversation_history failed: %s", exc)
+    # 1. Bounded pruning for conversation_history
+    for _ in range(max(1, max_batches)):
+        try:
+            ids_res = (
+                supabase.table("conversation_history")
+                .select("id")
+                .lt("created_at", cutoff_history)
+                .limit(batch_size)
+                .execute()
+            )
+            old_ids = [r["id"] for r in (getattr(ids_res, "data", None) or []) if isinstance(r, dict) and "id" in r]
+            if not old_ids:
+                break
+            del_res = supabase.table("conversation_history").delete().in_("id", old_ids).execute()
+            count = len(getattr(del_res, "data", []) or old_ids)
+            pruned_history += count
+            if len(old_ids) < batch_size:
+                break
+        except Exception as exc:
+            logger.debug("Prune conversation_history batch failed: %s", exc)
+            break
 
-    try:
-        res = supabase.table("text_cache").delete().lt("created_at", cutoff_cache).execute()
-        pruned_cache = len(getattr(res, "data", []) or [])
-    except Exception as exc:
-        logger.debug("Prune text_cache failed: %s", exc)
+    # 2. Bounded pruning for text_cache
+    for _ in range(max(1, max_batches)):
+        try:
+            ids_res = (
+                supabase.table("text_cache")
+                .select("id")
+                .lt("created_at", cutoff_cache)
+                .limit(batch_size)
+                .execute()
+            )
+            old_ids = [r["id"] for r in (getattr(ids_res, "data", None) or []) if isinstance(r, dict) and "id" in r]
+            if not old_ids:
+                break
+            del_res = supabase.table("text_cache").delete().in_("id", old_ids).execute()
+            count = len(getattr(del_res, "data", []) or old_ids)
+            pruned_cache += count
+            if len(old_ids) < batch_size:
+                break
+        except Exception as exc:
+            logger.debug("Prune text_cache batch failed: %s", exc)
+            break
 
-    logger.info("Database periodic pruning finished: %d history rows, %d text cache rows pruned.", pruned_history, pruned_cache)
+    logger.info(
+        "Database periodic pruning finished: %d history rows, %d text cache rows pruned.",
+        pruned_history,
+        pruned_cache,
+    )
     return {
         "ok": True,
         "pruned_history": pruned_history,
