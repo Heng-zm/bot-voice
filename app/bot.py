@@ -139,6 +139,12 @@ async def run_bot_async() -> None:
                     )
                     logger.info("Telegram polling started successfully.")
 
+            # Register commands menu with Telegram
+            with suppress(Exception):
+                from app.main import auto_register_bot_commands
+
+                asyncio.create_task(auto_register_bot_commands(), name="bot-auto-register-commands")
+
             # Keep running until cancelled
             stop_event = asyncio.Event()
             await stop_event.wait()

@@ -131,7 +131,7 @@ async def auto_register_bot_commands() -> bool:
     if app_instance is None or getattr(app_instance, "bot", None) is None:
         return False
 
-    commands = [
+    user_commands = [
         BotCommand("start", "🚀 ចាប់ផ្ដើម / Start Bot"),
         BotCommand("help", "📖 របៀបប្រើប្រាស់ / Help"),
         BotCommand("ask", "🤖 សួរ AI / Ask AI"),
@@ -141,14 +141,49 @@ async def auto_register_bot_commands() -> bool:
         BotCommand("ttsmodel", "🎙️ ជ្រើសរើសម៉ូដែល TTS / TTS Engine"),
         BotCommand("clear", "🗑️ សម្អាតប្រវត្តិ / Clear Chat"),
         BotCommand("unlock", "🔓 ដោះសោររង់ចាំ / Force Unlock"),
-        BotCommand("system", "📊 ព័ត៌មានប្រព័ន្ធ / System Status"),
+        BotCommand("security", "🔐 សុវត្ថិភាព / Security Status"),
         BotCommand("privacy", "🔒 ឯកជនភាព / Privacy Policy"),
+        BotCommand("deleteme", "⚠️ លុបទិន្នន័យ / Delete My Data"),
         BotCommand("feedback", "💡 ផ្ញើមតិកែលម្អ / Feedback"),
+        BotCommand("system", "📊 ព័ត៌មានប្រព័ន្ធ / System Status"),
+        BotCommand("cancel", "🛑 បោះបង់ / Cancel Action"),
         BotCommand("admin", "👑 ផ្ទាំងគ្រប់គ្រង / Admin Panel"),
     ]
+
+    admin_commands = [
+        *user_commands,
+        BotCommand("health", "🏥 ស្ថានភាពម៉ាស៊ីន / Health Check"),
+        BotCommand("stats", "📈 ស្ថិតិបូតទូទៅ / Bot Stats"),
+        BotCommand("broadcast", "📢 ផ្ញើសារជូនដំណឹង / Broadcast"),
+        BotCommand("schedule", "📅 បង្កើតកាលវិភាគ / Schedule Broadcast"),
+        BotCommand("schedules", "📋 បញ្ជីកាលវិភាគ / List Schedules"),
+        BotCommand("cancelschedule", "❌ បោះបង់កាលវិភាគ / Cancel Schedule"),
+        BotCommand("users", "👥 គ្រប់គ្រងអ្នកប្រើ / Manage Users"),
+        BotCommand("botsettings", "🛠️ កំណត់រចនាសម្ព័ន្ធ / Bot Config"),
+        BotCommand("api", "🔑 គ្រប់គ្រង API / API Keys"),
+        BotCommand("runtime", "⚡ ព័ត៌មាន Runtime / Telemetry"),
+    ]
+
     try:
-        await app_instance.bot.set_my_commands(commands)
-        logger.info("Auto-registered %s Telegram Bot commands in menu.", len(commands))
+        from telegram import BotCommandScopeChat, BotCommandScopeDefault
+
+        await app_instance.bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+        logger.info("Auto-registered %s Telegram default commands in menu.", len(user_commands))
+
+        # Register extended admin commands for configured admins
+        admin_ids: set[int] = set()
+        legacy_admins = getattr(legacy, "ADMIN_IDS", None)
+        if isinstance(legacy_admins, (set, list, tuple)):
+            admin_ids.update(int(aid) for aid in legacy_admins if str(aid).isdigit())
+        for env_aid in os.environ.get("ADMIN_IDS", "").split(","):
+            env_aid = env_aid.strip()
+            if env_aid.isdigit():
+                admin_ids.add(int(env_aid))
+
+        for aid in admin_ids:
+            with suppress(Exception):
+                await app_instance.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(aid))
+
         return True
     except Exception as exc:
         logger.warning("Failed to auto-register bot commands: %s", exc)

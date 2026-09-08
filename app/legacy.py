@@ -11621,7 +11621,7 @@ def ask_gemini_ocr(image_data: bytes, mime_type: str = "image/jpeg") -> str:
         "and Japanese exactly. Keep useful line breaks. If there is no readable text, "
         "output only NOTEXT. Do not describe the image and do not add explanations."
     )
-    models_to_try = [GEMINI_MODEL, "gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash", "gemini-3.6-flash"]
+    models_to_try = [GEMINI_MODEL, "gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.5-pro", "gemini-3.6-flash"]
     unique_models: list[str] = []
     for m in models_to_try:
         if m and m not in unique_models:
@@ -19338,7 +19338,7 @@ async def _generate_voice_gemini(
             audio_models = [
                 _run_state_gemini_audio_model(),
                 "gemini-2.5-flash-preview-tts",
-                "gemini-2.0-flash-exp",
+                "gemini-2.5-flash",
             ]
             unique_models: list[str] = []
             for m in audio_models:
