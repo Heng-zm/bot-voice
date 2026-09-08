@@ -137,6 +137,7 @@ async def auto_register_bot_commands() -> bool:
         BotCommand("ask", "🤖 សួរ AI / Ask AI"),
         BotCommand("translate", "🌐 បកប្រែជាភាសាខ្មែរ / Translate"),
         BotCommand("summary", "📝 សង្ខេបអត្ថបទវែង / Summarize"),
+        BotCommand("narrate", "📰 អានអត្ថបទពីតំណភ្ជាប់ / Narrate URL"),
         BotCommand("myprefs", "⚙️ កំណត់សំឡេង & ល្បឿន / Settings"),
         BotCommand("ttsmodel", "🎙️ ជ្រើសរើសម៉ូដែល TTS / TTS Engine"),
         BotCommand("clear", "🗑️ សម្អាតប្រវត្តិ / Clear Chat"),
@@ -677,6 +678,95 @@ async def summarize_endpoint(
         "summary": summary,
         "model": preferred_model,
     })
+
+
+@app.post("/narrate")
+@app.post("/api/narrate")
+async def narrate_endpoint(
+    request: Request,
+    x_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """Scrape a public web article, summarize it, and return metadata and TTS voice audio."""
+    if not _validate_api_key(x_api_key, authorization):
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid X-Api-Key")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") from None
+
+    url = str(body.get("url") or body.get("link") or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing required field: 'url'")
+
+    from app.services.ai.article_reader import (
+        MIN_ARTICLE_CHARS,
+        extract_article_content,
+        fetch_article_html,
+        is_safe_public_url,
+        summarize_article_with_ai,
+    )
+
+    safe, reason = is_safe_public_url(url)
+    if not safe:
+        raise HTTPException(status_code=400, detail=f"Invalid or forbidden URL: {reason}")
+
+    try:
+        html_data = await fetch_article_html(url)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch remote article: {exc}") from exc
+
+    title, body_text = extract_article_content(html_data)
+    if len(body_text) < MIN_ARTICLE_CHARS:
+        raise HTTPException(status_code=422, detail="Could not extract readable article text from URL.")
+
+    gemini_client = getattr(legacy, "_gemini", None)
+    preferred_model = body.get("model", getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash"))
+    summary = summarize_article_with_ai(title, body_text, gemini_client, preferred_model)
+
+    gender = str(body.get("gender", "female") or "female").lower()
+    if gender not in ("female", "male"):
+        gender = "female"
+    try:
+        speed = float(body.get("speed", 1.0))
+        if speed <= 0.2 or speed > 3.0 or speed != speed:
+            speed = 1.0
+    except (ValueError, TypeError):
+        speed = 1.0
+    tts_model = str(body.get("tts_model", "auto") or "auto").lower()
+
+    temp_path = make_temp_ogg()
+    tts_script = f"{title}. {summary}" if title and not summary.startswith(title) else summary
+    try:
+        audio_bytes = await legacy.generate_voice_limited(
+            text=tts_script,
+            gender=gender,
+            speed=speed,
+            output_path=temp_path,
+            tts_model=tts_model,
+        )
+        audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+        return JSONResponse({
+            "ok": True,
+            "title": title,
+            "url": url,
+            "summary": summary,
+            "audio_base64": audio_b64,
+            "bytes_length": len(audio_bytes),
+            "mime_type": "audio/ogg",
+        })
+    except Exception as exc:
+        logger.warning("Article narration TTS synthesis failed: %s", exc)
+        return JSONResponse({
+            "ok": True,
+            "title": title,
+            "url": url,
+            "summary": summary,
+            "audio_error": str(exc),
+        })
+    finally:
+        cleanup_files(temp_path)
 
 
 def main() -> None:

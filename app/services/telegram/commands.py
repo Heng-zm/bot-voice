@@ -219,6 +219,110 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @legacy_bound_handler
+async def cmd_narrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Extract and narrate article text from a web link with voice and AI summary."""
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    user_id = int(user.id)
+    raw_text = msg.text or ""
+    url = re.sub(r"^/(?:narrate|read)(?:@\w+)?\s*", "", raw_text, flags=re.IGNORECASE).strip()
+    if not url:
+        match = re.search(r"https?://[^\s]+", raw_text)
+        if match:
+            url = match.group(0)
+
+    if not url or not (url.startswith("http://") or url.startswith("https://")):
+        await safe_send(lambda: msg.reply_text(
+            "📰 <b>របៀបប្រើប្រាស់ Web Link Article Narrator</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "• វាយ <code>/narrate https://news-site.com/article</code>\n"
+            "• ឬគ្រាន់តែផ្ញើតំណភ្ជាប់ (Link) ព័ត៌មាន ឬអត្ថបទមកកាន់ Bot ដោយផ្ទាល់\n\n"
+            "💡 <i>បូតនឹងទាញយកអត្ថបទ សង្ខេបចំណុចសំខាន់ៗ និងបង្កើតជាសំឡេង Voice Note ជូនភ្លាមៗ!</i>",
+            parse_mode="HTML",
+        ))
+        return
+
+    if await _check_cooldown(msg, user_id):
+        return
+    if not _reserve_tts_request(user_id):
+        await safe_send(lambda: msg.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
+        return
+
+    progress = await TelegramProgress.start(
+        bot=context.bot,
+        chat_id=msg.chat_id,
+        reply_target=msg,
+        title="📰 កំពុងដំណើរការ Web Article Narrator",
+        percent=10,
+        stage="កំពុងទាញយកទំព័រវិបសាយ",
+        detail="កំពុងភ្ជាប់ទៅកាន់តំណភ្ជាប់...",
+        minimal=True,
+    )
+
+    try:
+        from app.services.ai.article_reader import (
+            MIN_ARTICLE_CHARS,
+            extract_article_content,
+            fetch_article_html,
+            is_safe_public_url,
+            summarize_article_with_ai,
+        )
+
+        safe, reason = is_safe_public_url(url)
+        if not safe:
+            _release_tts_request(user_id)
+            await progress.fail(f"❌ តំណភ្ជាប់នេះមិនត្រូវបានអនុញ្ញាតទេ ({reason})")
+            return
+
+        await progress.update(25, "កំពុងទាញយកទំព័រ", "កំពុងទទួលទិន្នន័យ HTML ពីគេហទំព័រ...", force=True)
+        try:
+            html_data = await fetch_article_html(url)
+        except Exception as net_err:
+            _release_tts_request(user_id)
+            await progress.fail(f"❌ មិនអាចទាញយកព័ត៌មានពី Link នេះបានទេ ({net_err})")
+            return
+
+        await progress.update(45, "កំពុងសម្រង់អត្ថបទ", "កំពុងសម្អាតផ្ទាំងពាណិជ្ជកម្ម និងកូដគេហទំព័រ...", force=True)
+        title, body_text = extract_article_content(html_data)
+        if len(body_text) < MIN_ARTICLE_CHARS:
+            _release_tts_request(user_id)
+            await progress.fail("⚠️ មិនអាចទាញយកខ្លឹមសារអត្ថបទបានទេ (គេហទំព័រអាចទាមទារ Login ឬការពារដោយ Anti-Bot)។")
+            return
+
+        await progress.update(65, "កំពុងរៀបចំខ្លឹមសារ", f"រកឃើញ {len(body_text)} តួអក្សរ។ កំពុងសង្ខេបសម្រាប់អានជាសំឡេង...", force=True)
+
+        import asyncio
+        loop = asyncio.get_running_loop()
+        from app import legacy
+        gemini_client = getattr(legacy, "_gemini", None)
+        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash")
+
+        if len(body_text) > 800 and gemini_client is not None:
+            def _summarize():
+                return summarize_article_with_ai(title, body_text, gemini_client, preferred)
+            spoken_text = await loop.run_in_executor(None, _summarize)
+        else:
+            spoken_text = body_text[:800]
+
+        article_header = f"📰 <b>{html.escape(title or 'អត្ថបទព័ត៌មាន')}</b>\n🔗 <a href='{html.escape(url)}'>ប្រភពដើម (Original Link)</a>\n\n"
+        preview_text = article_header + html.escape(spoken_text)
+        await safe_send(lambda: msg.reply_text(preview_text, parse_mode="HTML", disable_web_page_preview=True))
+
+        await progress.update(85, "កំពុងបង្កើតសំឡេង", "កំពុងបម្លែងសេចក្ដីសង្ខេបទៅជា Voice Note...", force=True)
+        tts_script = f"{title}. {spoken_text}" if title and not spoken_text.startswith(title) else spoken_text
+
+        from app.services.telegram.media import process_tts_for_text
+        await progress.finish("🎙️ កំពុងផ្ញើសារសំឡេងជូនអ្នក...", delete_after_s=3.0)
+        await process_tts_for_text(update, context, tts_script, user_id)
+    except Exception as exc:
+        _release_tts_request(user_id)
+        logger.error("cmd_narrate failed for user %s: %s", user_id, exc, exc_info=True)
+        await progress.fail(f"❌ បរាជ័យក្នុងការអានអត្ថបទ: {exc}")
+
+
+@legacy_bound_handler
 async def send_user_profile(message, user_id: int, user: Any = None):
     prefs = await get_user_prefs_async(user_id)
     
@@ -1006,6 +1110,7 @@ __all__ = [
     'cmd_feature_request',
     'cmd_health',
     'cmd_myprefs',
+    'cmd_narrate',
     'cmd_privacy',
     'cmd_runtime',
     'cmd_schedule',

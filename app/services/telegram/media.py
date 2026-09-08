@@ -597,6 +597,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stripped = text.strip()
     if not stripped:
         return
+
+    import re
+
+    if re.match(r"^https?://[^\s]+$", stripped):
+        from app.services.telegram.commands import cmd_narrate
+
+        await cmd_narrate(update, context)
+        return
+
     if len(stripped) > MAX_INPUT_CHARS:
         await safe_send(lambda: msg.reply_text(
             f"❌ អត្ថបទវែងពេក។ អតិបរមា {MAX_INPUT_CHARS} តួអក្សរ។\n"
