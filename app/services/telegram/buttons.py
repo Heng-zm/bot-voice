@@ -7,6 +7,8 @@ via /admin without code modifications or redeployment.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from contextlib import suppress
 
 logger = logging.getLogger(__name__)
@@ -25,14 +27,19 @@ DEFAULT_BUTTON_LABELS: dict[str, str] = {
     "btn_welcome_profile": "👤 User Profile",
 }
 
-# Cache for loaded custom labels
-_CUSTOM_BUTTONS_CACHE: dict[str, str] = {}
+# Thread-safe cache with TTL for loaded custom labels
+_CUSTOM_BUTTONS_CACHE: dict[str, tuple[str, float]] = {}
+_CUSTOM_BUTTONS_LOCK = threading.RLock()
+_BUTTONS_CACHE_TTL_S = 300.0
 
 
 def get_button_label(key: str, default: str | None = None) -> str:
     """Get button text with dynamic Supabase override."""
-    if key in _CUSTOM_BUTTONS_CACHE:
-        return _CUSTOM_BUTTONS_CACHE[key]
+    now = time.monotonic()
+    with _CUSTOM_BUTTONS_LOCK:
+        entry = _CUSTOM_BUTTONS_CACHE.get(key)
+        if entry is not None and now - entry[1] < _BUTTONS_CACHE_TTL_S:
+            return entry[0]
 
     fallback = default if default is not None else DEFAULT_BUTTON_LABELS.get(key, key)
     with suppress(Exception):
@@ -40,7 +47,8 @@ def get_button_label(key: str, default: str | None = None) -> str:
 
         val = get_settings_store().get_text_sync(f"btn:{key}", "")
         if val:
-            _CUSTOM_BUTTONS_CACHE[key] = val
+            with _CUSTOM_BUTTONS_LOCK:
+                _CUSTOM_BUTTONS_CACHE[key] = (val, now)
             return val
 
     return fallback
@@ -48,8 +56,11 @@ def get_button_label(key: str, default: str | None = None) -> str:
 
 async def get_button_label_async(key: str, default: str | None = None) -> str:
     """Async variant for getting button label."""
-    if key in _CUSTOM_BUTTONS_CACHE:
-        return _CUSTOM_BUTTONS_CACHE[key]
+    now = time.monotonic()
+    with _CUSTOM_BUTTONS_LOCK:
+        entry = _CUSTOM_BUTTONS_CACHE.get(key)
+        if entry is not None and now - entry[1] < _BUTTONS_CACHE_TTL_S:
+            return entry[0]
 
     fallback = default if default is not None else DEFAULT_BUTTON_LABELS.get(key, key)
     with suppress(Exception):
@@ -57,7 +68,8 @@ async def get_button_label_async(key: str, default: str | None = None) -> str:
 
         val = await get_settings_store().get_text(f"btn:{key}", "")
         if val:
-            _CUSTOM_BUTTONS_CACHE[key] = val
+            with _CUSTOM_BUTTONS_LOCK:
+                _CUSTOM_BUTTONS_CACHE[key] = (val, now)
             return val
 
     return fallback
@@ -73,7 +85,8 @@ async def set_button_label(key: str, value: str) -> bool:
         from app.services.settings.store import get_settings_store
 
         await get_settings_store().set_text(f"btn:{key}", clean_val)
-        _CUSTOM_BUTTONS_CACHE[key] = clean_val
+        with _CUSTOM_BUTTONS_LOCK:
+            _CUSTOM_BUTTONS_CACHE[key] = (clean_val, time.monotonic())
         return True
     except Exception as exc:
         logger.warning("Failed to persist custom button %s: %s", key, exc)
@@ -86,7 +99,8 @@ async def reset_button_label(key: str) -> bool:
         from app.services.settings.store import get_settings_store
 
         await get_settings_store().delete_setting(f"btn:{key}")
-        _CUSTOM_BUTTONS_CACHE.pop(key, None)
+        with _CUSTOM_BUTTONS_LOCK:
+            _CUSTOM_BUTTONS_CACHE.pop(key, None)
         return True
     except Exception as exc:
         logger.warning("Failed to reset custom button %s: %s", key, exc)

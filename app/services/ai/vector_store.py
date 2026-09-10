@@ -27,6 +27,7 @@ class UpstashVectorStore:
         self.url = (url or os.environ.get("UPSTASH_VECTOR_REST_URL") or "").strip().rstrip("/")
         self.token = (token or os.environ.get("UPSTASH_VECTOR_REST_TOKEN") or "").strip().strip('"').strip("'")
         self.timeout = float(timeout_s)
+        self._client: Any = None
 
     @property
     def is_configured(self) -> bool:
@@ -38,6 +39,19 @@ class UpstashVectorStore:
             "Content-Type": "application/json",
         }
 
+    def _get_client(self) -> Any:
+        if httpx is None:
+            return None
+        if self._client is None or getattr(self._client, "is_closed", True):
+            self._client = httpx.AsyncClient(timeout=self.timeout)
+        return self._client
+
+    async def aclose(self) -> None:
+        """Close persistent HTTP client session."""
+        if self._client is not None and not getattr(self._client, "is_closed", True):
+            await self._client.aclose()
+            self._client = None
+
     async def upsert(
         self,
         id: str,
@@ -47,7 +61,8 @@ class UpstashVectorStore:
         metadata: dict[str, Any] | None = None,
     ) -> bool:
         """Upsert a single vector or raw text data (with Upstash auto-embedding)."""
-        if not self.is_configured or httpx is None:
+        client = self._get_client()
+        if not self.is_configured or client is None:
             return False
 
         payload: dict[str, Any] = {"id": str(id)}
@@ -60,27 +75,26 @@ class UpstashVectorStore:
 
         endpoint = f"{self.url}/upsert"
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                res = await client.post(endpoint, json=payload, headers=self._headers())
-                if res.status_code < 400:
-                    return True
-                logger.warning("Upstash Vector upsert failed status=%s: %s", res.status_code, res.text[:200])
+            res = await client.post(endpoint, json=payload, headers=self._headers())
+            if res.status_code < 400:
+                return True
+            logger.warning("Upstash Vector upsert failed status=%s: %s", res.status_code, res.text[:200])
         except Exception as exc:
             logger.warning("Upstash Vector upsert exception: %s", exc)
         return False
 
     async def upsert_many(self, documents: list[dict[str, Any]]) -> bool:
         """Upsert multiple documents/vectors in a batch."""
-        if not self.is_configured or not documents or httpx is None:
+        client = self._get_client()
+        if not self.is_configured or not documents or client is None:
             return False
 
         endpoint = f"{self.url}/upsert-data" if any("data" in doc for doc in documents) else f"{self.url}/upsert"
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                res = await client.post(endpoint, json=documents, headers=self._headers())
-                if res.status_code < 400:
-                    return True
-                logger.warning("Upstash Vector batch upsert failed status=%s: %s", res.status_code, res.text[:200])
+            res = await client.post(endpoint, json=documents, headers=self._headers())
+            if res.status_code < 400:
+                return True
+            logger.warning("Upstash Vector batch upsert failed status=%s: %s", res.status_code, res.text[:200])
         except Exception as exc:
             logger.warning("Upstash Vector batch upsert exception: %s", exc)
         return False
@@ -95,7 +109,8 @@ class UpstashVectorStore:
         include_vectors: bool = False,
     ) -> list[dict[str, Any]]:
         """Query similar vectors using raw text query (auto-embedded) or dense vector."""
-        if not self.is_configured or httpx is None:
+        client = self._get_client()
+        if not self.is_configured or client is None:
             return []
 
         payload: dict[str, Any] = {
@@ -113,42 +128,41 @@ class UpstashVectorStore:
             return []
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                res = await client.post(endpoint, json=payload, headers=self._headers())
-                if res.status_code < 400:
-                    data_obj = res.json()
-                    return list(data_obj.get("result") or [])
-                logger.warning("Upstash Vector query failed status=%s: %s", res.status_code, res.text[:200])
+            res = await client.post(endpoint, json=payload, headers=self._headers())
+            if res.status_code < 400:
+                data_obj = res.json()
+                return list(data_obj.get("result") or [])
+            logger.warning("Upstash Vector query failed status=%s: %s", res.status_code, res.text[:200])
         except Exception as exc:
             logger.warning("Upstash Vector query exception: %s", exc)
         return []
 
     async def delete(self, ids: list[str]) -> bool:
         """Delete vectors by ID."""
-        if not self.is_configured or not ids or httpx is None:
+        client = self._get_client()
+        if not self.is_configured or not ids or client is None:
             return False
 
         endpoint = f"{self.url}/delete"
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                res = await client.post(endpoint, json={"ids": ids}, headers=self._headers())
-                return res.status_code < 400
+            res = await client.post(endpoint, json={"ids": ids}, headers=self._headers())
+            return res.status_code < 400
         except Exception as exc:
             logger.warning("Upstash Vector delete exception: %s", exc)
             return False
 
     async def info(self) -> dict[str, Any] | None:
         """Retrieve index statistics (vector count, dimension, capacity)."""
-        if not self.is_configured or httpx is None:
+        client = self._get_client()
+        if not self.is_configured or client is None:
             return None
 
         endpoint = f"{self.url}/info"
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                res = await client.get(endpoint, headers=self._headers())
-                if res.status_code < 400:
-                    data_obj = res.json()
-                    return dict(data_obj.get("result") or {})
+            res = await client.get(endpoint, headers=self._headers())
+            if res.status_code < 400:
+                data_obj = res.json()
+                return dict(data_obj.get("result") or {})
         except Exception as exc:
             logger.warning("Upstash Vector info exception: %s", exc)
         return None

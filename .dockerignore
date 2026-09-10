@@ -1,8 +1,12 @@
 .git
 .gitignore
+.env
+.env.*
+!.env.example
 .venv
 venv
 env
+ev/
 __pycache__
 *.pyc
 *.pyo
@@ -20,3 +24,5 @@ Thumbs.db
 tmp/
 temp/
 scratch/
+backups/
+*.sql

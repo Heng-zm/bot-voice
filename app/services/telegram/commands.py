@@ -94,7 +94,7 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
             extract_gemini_text,
             generate_content_with_fallback,
         )
-        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash")
+        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-3.6-flash")
         def _call_ai():
             return generate_content_with_fallback(
                 legacy._gemini,
@@ -146,7 +146,7 @@ async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             extract_gemini_text,
             generate_content_with_fallback,
         )
-        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash")
+        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-3.6-flash")
         def _call_ai():
             return generate_content_with_fallback(
                 legacy._gemini,
@@ -197,7 +197,7 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
             extract_gemini_text,
             generate_content_with_fallback,
         )
-        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash")
+        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-3.6-flash")
         def _call_ai():
             return generate_content_with_fallback(
                 legacy._gemini,
@@ -262,12 +262,19 @@ async def cmd_narrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
+        import asyncio
+        loop = asyncio.get_running_loop()
+        from app import legacy
+        gemini_client = getattr(legacy, "_gemini", None)
+        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-3.6-flash")
+
         from app.services.ai.article_reader import (
             MIN_ARTICLE_CHARS,
             extract_article_content,
             fetch_article_html,
             is_safe_public_url,
             summarize_article_with_ai,
+            summarize_url_with_ai,
         )
 
         safe, reason = is_safe_public_url(url)
@@ -276,35 +283,54 @@ async def cmd_narrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await progress.fail(f"❌ តំណភ្ជាប់នេះមិនត្រូវបានអនុញ្ញាតទេ ({reason})")
             return
 
-        await progress.update(25, "កំពុងទាញយកទំព័រ", "កំពុងទទួលទិន្នន័យ HTML ពីគេហទំព័រ...", force=True)
+        await progress.update(25, "កំពុងទាញយកទំព័រ", "កំពុងទទួលទិន្នន័យពីគេហទំព័រ...", force=True)
+        title = ""
+        spoken_text = ""
+        body_text = ""
+        fetch_success = False
+
         try:
             html_data = await fetch_article_html(url)
+            await progress.update(45, "កំពុងសម្រង់អត្ថបទ", "កំពុងសម្អាតផ្ទាំងពាណិជ្ជកម្ម និងកូដគេហទំព័រ...", force=True)
+            title, body_text = extract_article_content(html_data)
+            if len(body_text) >= MIN_ARTICLE_CHARS:
+                fetch_success = True
         except Exception as net_err:
-            _release_tts_request(user_id)
-            await progress.fail(f"❌ មិនអាចទាញយកព័ត៌មានពី Link នេះបានទេ ({net_err})")
-            return
+            logger.info("Direct article scraping failed (%s); switching to AI URL extraction", net_err)
 
-        await progress.update(45, "កំពុងសម្រង់អត្ថបទ", "កំពុងសម្អាតផ្ទាំងពាណិជ្ជកម្ម និងកូដគេហទំព័រ...", force=True)
-        title, body_text = extract_article_content(html_data)
-        if len(body_text) < MIN_ARTICLE_CHARS:
-            _release_tts_request(user_id)
-            await progress.fail("⚠️ មិនអាចទាញយកខ្លឹមសារអត្ថបទបានទេ (គេហទំព័រអាចទាមទារ Login ឬការពារដោយ Anti-Bot)។")
-            return
+        if not fetch_success:
+            if gemini_client is not None:
+                await progress.update(
+                    50,
+                    "កំពុងស្រាវជ្រាវព័ត៌មាន",
+                    "គេហទំព័រមានប្រព័ន្ធការពារ Anti-Bot — កំពុងប្រើ Gemini AI ទាញយកខ្លឹមសារ...",
+                    force=True,
+                )
 
-        await progress.update(65, "កំពុងរៀបចំខ្លឹមសារ", f"រកឃើញ {len(body_text)} តួអក្សរ។ កំពុងសង្ខេបសម្រាប់អានជាសំឡេង...", force=True)
+                def _ai_url_extract():
+                    return summarize_url_with_ai(url, gemini_client, preferred)
 
-        import asyncio
-        loop = asyncio.get_running_loop()
-        from app import legacy
-        gemini_client = getattr(legacy, "_gemini", None)
-        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash")
+                try:
+                    title, spoken_text = await loop.run_in_executor(None, _ai_url_extract)
+                except Exception as ai_err:
+                    _release_tts_request(user_id)
+                    logger.warning("AI URL fallback failed for %s: %s", url, ai_err)
+                    await progress.fail("❌ មិនអាចទាញយកព័ត៌មានពី Link នេះបានទេ (គេហទំព័រការពារដោយ Anti-Bot)។")
+                    return
+            else:
+                _release_tts_request(user_id)
+                await progress.fail("❌ មិនអាចទាញយកព័ត៌មានពី Link នេះបានទេ (គេហទំព័រការពារដោយ Anti-Bot)។")
+                return
 
-        if len(body_text) > 800 and gemini_client is not None:
-            def _summarize():
-                return summarize_article_with_ai(title, body_text, gemini_client, preferred)
-            spoken_text = await loop.run_in_executor(None, _summarize)
-        else:
-            spoken_text = body_text[:800]
+        if not spoken_text:
+            await progress.update(65, "កំពុងរៀបចំខ្លឹមសារ", f"រកឃើញ {len(body_text)} តួអក្សរ។ កំពុងសង្ខេបសម្រាប់អានជាសំឡេង...", force=True)
+            if len(body_text) > 800 and gemini_client is not None:
+                def _summarize():
+                    return summarize_article_with_ai(title, body_text, gemini_client, preferred)
+
+                spoken_text = await loop.run_in_executor(None, _summarize)
+            else:
+                spoken_text = body_text[:800]
 
         article_header = f"📰 <b>{html.escape(title or 'អត្ថបទព័ត៌មាន')}</b>\n🔗 <a href='{html.escape(url)}'>ប្រភពដើម (Original Link)</a>\n\n"
         preview_text = article_header + html.escape(spoken_text)
@@ -737,6 +763,16 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if arg in {"optimize", "perf", "performance"}:
         await safe_send(lambda: msg.reply_text(_admin_optimize_text(), parse_mode="HTML", reply_markup=get_admin_optimize_kb(), disable_web_page_preview=True))
+        return
+    if arg in {"cache", "audiocache", "audio_cache", "cdn"}:
+        from app import legacy
+        text = legacy._admin_audio_cache_text()
+        await safe_send(lambda: msg.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=legacy.get_admin_audio_cache_kb(),
+            disable_web_page_preview=True,
+        ))
         return
     if arg in {"report", "pdf"}:
         await safe_send(lambda: msg.reply_text('📄 <b>របាយការណ៍ PDF</b>\n\nសូមជ្រើសរើសចន្លោះពេលរបាយការណ៍៖', parse_mode="HTML", reply_markup=get_admin_report_day_kb(), disable_web_page_preview=True))

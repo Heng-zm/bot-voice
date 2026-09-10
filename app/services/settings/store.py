@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -40,9 +41,11 @@ class SettingsStoreStatus:
 class SettingsStore:
     """Async facade over the synchronous Supabase client."""
 
-    def __init__(self, supabase_client: Any | None = None) -> None:
+    def __init__(self, supabase_client: Any | None = None, *, cache_ttl_seconds: float = 5.0) -> None:
         self.supabase = supabase_client
         self._memory: dict[str, str] = {}
+        self._cache_ts: dict[str, float] = {}
+        self.cache_ttl_seconds = max(0.5, float(cache_ttl_seconds))
         self._lock = asyncio.Lock()
 
     @property
@@ -63,11 +66,16 @@ class SettingsStore:
 
     async def get_text(self, key: str, default: str = "") -> str:
         clean = self._clean_key(key)
+        now = time.monotonic()
+        if clean in self._memory and (now - self._cache_ts.get(clean, 0.0) < self.cache_ttl_seconds):
+            return self._memory[clean]
+
         if self.supabase is not None:
             try:
                 value = await asyncio.to_thread(self._read_sync, clean)
                 if value is not None:
                     self._memory[clean] = value
+                    self._cache_ts[clean] = now
                     return value
             except Exception as exc:  # noqa: BLE001 - graceful DB degradation
                 logger.warning("Settings read fell back to memory key=%s: %s", clean, exc)
@@ -78,27 +86,29 @@ class SettingsStore:
         keys: Iterable[str],
         default: str = "",
     ) -> dict[str, str]:
-        """Load several settings with one Supabase request.
-
-        Runtime startup restores dozens of small settings together. Reading
-        them individually turns database latency into a long serial delay, so
-        this path keeps the same memory fallback semantics while batching the
-        persistent lookup.
-        """
-
+        """Load several settings with one Supabase request and TTL memory cache."""
         clean_keys = tuple(dict.fromkeys(self._clean_key(key) for key in keys))
         if not clean_keys:
             return {}
 
+        now = time.monotonic()
+        stale_or_missing = [
+            k for k in clean_keys
+            if k not in self._memory or (now - self._cache_ts.get(k, 0.0) >= self.cache_ttl_seconds)
+        ]
+
         values: dict[str, str] = {}
-        if self.supabase is not None:
+        if stale_or_missing and self.supabase is not None:
             try:
-                values = await asyncio.to_thread(self._read_many_sync, clean_keys)
-                self._memory.update(values)
+                fetched = await asyncio.to_thread(self._read_many_sync, tuple(stale_or_missing))
+                for k, v in fetched.items():
+                    self._memory[k] = v
+                    self._cache_ts[k] = now
+                values.update(fetched)
             except Exception as exc:  # noqa: BLE001 - graceful DB degradation
                 logger.warning(
                     "Settings batch read fell back to memory keys=%s: %s",
-                    len(clean_keys),
+                    len(stale_or_missing),
                     exc,
                 )
         return {
@@ -115,7 +125,10 @@ class SettingsStore:
     ) -> bool:
         clean = self._clean_key(key)
         text = str(value)
+        now = time.monotonic()
         async with self._lock:
+            self._memory[clean] = text
+            self._cache_ts[clean] = now
             if self.supabase is not None:
                 try:
                     await asyncio.to_thread(
@@ -124,11 +137,9 @@ class SettingsStore:
                         text,
                         updated_by,
                     )
-                    self._memory[clean] = text
                     return True
                 except Exception as exc:  # noqa: BLE001 - memory fallback is deliberate
                     logger.warning("Settings write fell back to memory key=%s: %s", clean, exc)
-            self._memory[clean] = text
             return False
 
     async def get_json(self, key: str, default: Any) -> Any:
@@ -158,6 +169,7 @@ class SettingsStore:
         clean = self._clean_key(key)
         async with self._lock:
             self._memory.pop(clean, None)
+            self._cache_ts.pop(clean, None)
             if self.supabase is not None:
                 try:
                     await asyncio.to_thread(

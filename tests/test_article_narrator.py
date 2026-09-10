@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 from app.services.ai.article_reader import (
     extract_article_content,
+    fetch_article_html,
     is_safe_public_url,
     summarize_article_with_ai,
 )
@@ -120,6 +121,28 @@ class TestArticleSummarization(unittest.TestCase):
 
         summary = summarize_article_with_ai("Test Title", "Long article body text", gemini_client=mock_client)
         self.assertIn("Summary point 1", summary)
+
+
+class TestFetchArticleHtmlRedirectValidation(unittest.IsolatedAsyncioTestCase):
+    """Test SSRF redirect protection in fetch_article_html."""
+
+    async def test_rejects_unsafe_initial_url(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            await fetch_article_html("http://127.0.0.1:8080/secret")
+        self.assertIn("security validation error", str(ctx.exception).lower())
+
+    async def test_rejects_redirect_to_private_ip(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        mock_redirect_resp = MagicMock()
+        mock_redirect_resp.is_redirect = True
+        mock_redirect_resp.headers = {"location": "http://169.254.169.254/latest/meta-data/"}
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = mock_redirect_resp
+            with self.assertRaises(ValueError) as ctx:
+                await fetch_article_html("https://example.com/redirect")
+            self.assertIn("security validation error on redirect", str(ctx.exception).lower())
 
 
 if __name__ == "__main__":

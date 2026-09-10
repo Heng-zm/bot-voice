@@ -19,8 +19,9 @@ def ask_gemini_ocr_bytes(
     image_bytes: bytes,
     mime_type: str = "image/jpeg",
     model: str = GEMINI_MODEL_DEFAULT,
+    user_prompt: str = "",
 ) -> str:
-    """Extract text from image bytes using Google Gemini Vision with model fallback."""
+    """Extract text or analyze image using Google Gemini Vision with model fallback."""
     if client is None:
         raise RuntimeError("Gemini client is not configured.")
     if not image_bytes:
@@ -28,11 +29,22 @@ def ask_gemini_ocr_bytes(
 
     from google.genai import types as _gtypes
 
-    prompt = (
-        "Extract all readable text from this image. Preserve Khmer, English, Chinese, Korean, "
-        "and Japanese exactly. Keep useful line breaks. If there is no readable text, "
-        "output only NOTEXT. Do not describe the image and do not add explanations."
-    )
+    if user_prompt.strip():
+        prompt = (
+            f"You are an expert AI Vision assistant.\n"
+            f"Please analyze this image and answer the user request precisely and clearly in natural Khmer:\n\n"
+            f"USER REQUEST: {user_prompt.strip()}\n\n"
+            f"Keep your explanation clear, well-structured, and suitable for spoken text-to-speech audio narration."
+        )
+    else:
+        prompt = (
+            "Extract all visible and readable text from this image with high fidelity.\n"
+            "- Accurately preserve Khmer script (ព្យញ្ជនៈ, ស្រៈ, ជើង, វណ្ណយុត្តិ, លេខខ្មែរ), English, Chinese, Vietnamese, Thai, etc.\n"
+            "- Maintain original structure, paragraphs, bullet points, and tables where appropriate.\n"
+            "- If the image contains zero readable text, return exactly: NOTEXT.\n"
+            "- Return only the extracted text without introductory or concluding remarks."
+        )
+
     contents = [
         _gtypes.Part.from_bytes(data=image_bytes, mime_type=mime_type or "image/jpeg"),
         prompt,
@@ -58,6 +70,7 @@ class OCRService:
         image_bytes: bytes,
         mime_type: str = "image/jpeg",
         preferred_provider: str = "gemini",
+        user_prompt: str = "",
     ) -> tuple[str, str, str]:
         """Extract text and return (text, provider_name, model_name)."""
         if not image_bytes:
@@ -68,7 +81,12 @@ class OCRService:
         # 1. Primary: Gemini Vision OCR
         if self.gemini_client is not None:
             try:
-                text = ask_gemini_ocr_bytes(self.gemini_client, image_bytes, mime_type)
+                text = ask_gemini_ocr_bytes(
+                    self.gemini_client,
+                    image_bytes,
+                    mime_type,
+                    user_prompt=user_prompt,
+                )
                 return text, "gemini", GEMINI_MODEL_DEFAULT
             except Exception as exc:
                 logger.warning("Gemini Vision OCR failed: %s", exc)
@@ -77,8 +95,22 @@ class OCRService:
         # 2. Fallback: Hugging Face TrOCR
         if self.hf_client is not None:
             try:
-                # HF Inference fallback
-                return "NOTEXT", "huggingface", "trocr"
+                if hasattr(self.hf_client, "image_to_text"):
+                    result = self.hf_client.image_to_text(image=image_bytes)
+                    if isinstance(result, list) and result and isinstance(result[0], dict):
+                        text = str(result[0].get("generated_text") or "").strip()
+                    elif isinstance(result, str):
+                        text = result.strip()
+                    else:
+                        text = str(getattr(result, "generated_text", "") or "").strip()
+                    if text:
+                        return text, "huggingface", "trocr"
+                elif callable(self.hf_client):
+                    result = self.hf_client(image_bytes)
+                    text = str(result or "").strip()
+                    if text:
+                        return text, "huggingface", "trocr"
+                errors.append("huggingface: empty OCR text returned")
             except Exception as exc:
                 errors.append(f"huggingface: {exc}")
 

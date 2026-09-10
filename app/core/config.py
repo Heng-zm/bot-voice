@@ -19,7 +19,7 @@ try:
         TELEGRAM_BOT_TOKEN: str = ""
         ADMIN_IDS: str = ""
         GEMINI_API_KEY: str = ""
-        GEMINI_MODEL: str = "gemini-2.5-flash"
+        GEMINI_MODEL: str = "gemini-3.6-flash"
         HF_TOKEN: str = ""
         SUPABASE_URL: str = ""
         SUPABASE_KEY: str = ""
@@ -29,6 +29,9 @@ try:
         UPSTASH_VECTOR_REST_TOKEN: str = ""
         PORT: int = 8080
         TELEGRAM_ALLOWED_UPDATES: str = "message,edited_message,callback_query,channel_post"
+        WEBHOOK_URL: str = ""
+        ANAJAK_URL: str = ""
+        ANAJAK_PUBLIC_URL: str = ""
 
         CHANNEL_NARRATOR_ENABLED: bool = True
         CHANNEL_NARRATOR_GENDER: str = "female"
@@ -46,7 +49,7 @@ except (ImportError, ModuleNotFoundError):
             self.TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
             self.ADMIN_IDS: str = os.environ.get("ADMIN_IDS", "")
             self.GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
-            self.GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+            self.GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
             self.HF_TOKEN: str = os.environ.get("HF_TOKEN", "")
             self.SUPABASE_URL: str = os.environ.get("SUPABASE_URL", "")
             self.SUPABASE_KEY: str = os.environ.get("SUPABASE_KEY", "")
@@ -58,6 +61,9 @@ except (ImportError, ModuleNotFoundError):
             self.TELEGRAM_ALLOWED_UPDATES: str = os.environ.get(
                 "TELEGRAM_ALLOWED_UPDATES", "message,edited_message,callback_query,channel_post"
             )
+            self.WEBHOOK_URL: str = os.environ.get("WEBHOOK_URL", "")
+            self.ANAJAK_URL: str = os.environ.get("ANAJAK_URL", "")
+            self.ANAJAK_PUBLIC_URL: str = os.environ.get("ANAJAK_PUBLIC_URL", "")
             self.CHANNEL_NARRATOR_ENABLED: bool = os.environ.get(
                 "CHANNEL_NARRATOR_ENABLED", "true"
             ).lower() in ("1", "true", "yes")
@@ -73,7 +79,40 @@ except (ImportError, ModuleNotFoundError):
 
 SETTINGS = AppSettings()
 
+_DETECTED_WEBHOOK_URL: str = ""
+
+
+def get_detected_webhook_url() -> str:
+    """Retrieve auto-detected webhook URL from platform env variables."""
+    global _DETECTED_WEBHOOK_URL
+    if _DETECTED_WEBHOOK_URL:
+        return _DETECTED_WEBHOOK_URL
+    for env_var in (
+        "WEBHOOK_URL",
+        "ANAJAK_URL",
+        "ANAJAK_PUBLIC_URL",
+        "ANAJAK_HOST",
+        "ANAJAK_DOMAIN",
+        "ANAJAK_EXTERNAL_URL",
+        "PUBLIC_URL",
+        "APP_URL",
+        "RENDER_EXTERNAL_URL",
+        "RAILWAY_STATIC_URL",
+        "RAILWAY_PUBLIC_DOMAIN",
+        "KOYEB_PUBLIC_DOMAIN",
+        "VERCEL_URL",
+    ):
+        val = (os.environ.get(env_var) or "").strip().rstrip("/")
+        if val:
+            if not val.startswith("http://") and not val.startswith("https://"):
+                val = f"https://{val}"
+            _DETECTED_WEBHOOK_URL = val
+            return val
+    return ""
+
+
 __all__ = [
     "SETTINGS",
     "AppSettings",
+    "get_detected_webhook_url",
 ]

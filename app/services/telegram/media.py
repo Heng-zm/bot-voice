@@ -6,12 +6,22 @@ These are live runtime handlers; app.legacy now contains compatibility wrappers 
 from __future__ import annotations
 
 import asyncio
+import re
 import time
+
+_URL_PATTERN = re.compile(r"^https?://\S+$")
 
 # Transitional V4.1 modules bind remaining legacy helpers at runtime.
 # ruff: noqa: F821
 from app.services.telegram._legacy_runtime import legacy_bound_handler
 from app.services.telegram.workloads import WorkloadBusy, run_telegram_workload
+from app.services.tts import (
+    get_cached_telegram_file_id,
+    get_global_tts_single_flight,
+    invalidate_cached_telegram_file_id,
+    make_tts_audio_cache_key,
+    set_cached_telegram_file_id,
+)
 
 
 @legacy_bound_handler
@@ -68,14 +78,18 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _metric_inc("ocr")
     sync_user_data(user)
     uname = user.username or user.first_name or str(user_id)
+    caption = (msg.caption or "").strip()
+    has_caption = bool(caption)
+    title = "កំពុងវិភាគរូបភាព (AI Vision)" if has_caption else "កំពុងអានអត្ថបទពីរូបភាព"
+    detail = f"សំណួរ: {caption[:40]}..." if has_caption else "កំពុងរៀបចំឯកសាររូបភាព។"
     progress = await TelegramProgress.start(
         bot=context.bot,
         chat_id=msg.chat_id,
         reply_target=msg,
-        title="កំពុងអានអត្ថបទពីរូបភាព",
+        title=title,
         percent=5,
         stage="កំពុងពិនិត្យរូបភាព",
-        detail="កំពុងរៀបចំឯកសាររូបភាព។",
+        detail=detail,
     )
     img_path: str | None = None
     try:
@@ -89,19 +103,30 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await progress.update(35, "បានទាញយករូបភាព", "កំពុងស្គាល់ប្រភេទរូបភាព។", force=True)
         mime_type = _detect_image_mime(img_path)
 
-        await progress.update(50, "កំពុងស្វែងរកអត្ថបទ", "រូបភាពកំពុងត្រូវបានផ្ញើទៅម៉ាស៊ីន OCR។", force=True)
+        stage_text = "រូបភាពកំពុងត្រូវបានវិភាគដោយ AI Vision..." if has_caption else "រូបភាពកំពុងត្រូវបានផ្ញើទៅម៉ាស៊ីន OCR។"
+        await progress.update(50, "កំពុងដំណើរការ", stage_text, force=True)
         ocr_text = await run_telegram_workload(
-            "ocr", lambda: ocr_image(img_path, mime_type=mime_type)
+            "ocr", lambda: ocr_image(img_path, mime_type=mime_type, user_prompt=caption)
         )
         if not ocr_text or ocr_text.upper() == "NOTEXT":
             await progress.finish("🖼️ រូបភាពនេះមិនមានអត្ថបទដែលអាចអានបានទេ។")
             return
 
-        await progress.update(85, "បានអានអត្ថបទរួច", f"រកឃើញ {len(ocr_text)} តួអក្សរ។", force=True)
-        record_turn(user_id, "user", f"[Image OCR]: {ocr_text[:500]}")
-        lang_key = _detect_lang(ocr_text)
-        lang_flag, lang_name = _language_display(lang_key)
-        header = f"🔍 <b>អត្ថបទពីរូបភាព {lang_flag} {html.escape(lang_name)}</b>\n\n"
+        finish_stage = "បានវិភាគរូបភាពរួចរាល់" if has_caption else "បានអានអត្ថបទរួច"
+        await progress.update(85, finish_stage, f"ទទួលបាន {len(ocr_text)} តួអក្សរ។", force=True)
+        record_turn(
+            user_id,
+            "user",
+            f"[Image Vision]: {caption} -> {ocr_text[:400]}" if has_caption else f"[Image OCR]: {ocr_text[:500]}",
+        )
+
+        if has_caption:
+            header = f"🤖 <b>AI Vision ឆ្លើយតប:</b>\n<i>សំណួរ: {html.escape(caption)}</i>\n\n"
+        else:
+            lang_key = _detect_lang(ocr_text)
+            lang_flag, lang_name = _language_display(lang_key)
+            header = f"🔍 <b>អត្ថបទពីរូបភាព {lang_flag} {html.escape(lang_name)}</b>\n\n"
+
         plain_pages = _paginate_plain(ocr_text, limit=max(500, TELE_MSG_LIMIT - len(header) - 64))
         if not plain_pages:
             await progress.fail("❌ មិនអាចរៀបចំអត្ថបទដែលបានអានទេ។")
@@ -598,9 +623,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not stripped:
         return
 
-    import re
-
-    if re.match(r"^https?://[^\s]+$", stripped):
+    if _URL_PATTERN.match(stripped):
         from app.services.telegram.commands import cmd_narrate
 
         await cmd_narrate(update, context)
@@ -631,25 +654,12 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
     user = update.effective_user
     if not msg or not user:
         return
+    file_path: str | None = None
+    progress: TelegramProgress | None = None
     try:
         _metric_inc("tts", user_id=user_id)
         sync_user_data(user)
-        progress = await TelegramProgress.start(
-            bot=context.bot,
-            chat_id=msg.chat_id,
-            reply_target=msg,
-            title="កំពុងបម្លែងអត្ថបទទៅជាសំឡេង",
-            percent=5,
-            stage="កំពុងពិនិត្យអត្ថបទ",
-            detail=f"មាន {len(stripped)} តួអក្សរ។",
-            minimal=True,
-        )
-    except BaseException:
-        _release_tts_request(user_id)
-        raise
-    file_path: str | None = None
-    try:
-        await progress.update(12, "កំពុងអានការកំណត់របស់អ្នក", "កំពុងជ្រើសសំឡេង ល្បឿន និងម៉ូដែល។", force=True)
+
         loop = asyncio.get_running_loop()
         prefs, tts_text = await asyncio.gather(
             get_user_prefs_async(user_id),
@@ -661,11 +671,60 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
         tts_text = tts_text.strip() or stripped
         model_key = _normalize_tts_model(tts_model)
         model_label = TTS_MODEL_OPTIONS.get(model_key, TTS_MODEL_OPTIONS["auto"])[0]
-        await progress.update(
-            25,
-            "បានរៀបចំអត្ថបទ និងការកំណត់",
-            f"ម៉ូដែល៖ {model_label} • អត្ថបទ {len(tts_text)} តួអក្សរ។",
-            force=True,
+
+        chat_type = str(getattr(msg.chat, "type", "private") or "private").lower()
+        is_channel_or_group = chat_type in ("channel", "group", "supergroup") or int(msg.chat_id) < 0
+        allow_channel_buttons = (
+            os.environ.get("CHANNEL_NARRATOR_SHOW_BUTTONS", "false").lower() in ("1", "true", "yes")
+            or (bot_setting_bool_cached("channel_narrator_show_buttons", False) if "bot_setting_bool_cached" in globals() else False)
+        )
+        voice_markup = get_main_kb(gender, tts_model) if (not is_channel_or_group or allow_channel_buttons) else None
+
+        # --- Fast Path: Instant Telegram CDN file_id Delivery (< 50ms, 0ms CPU, 0 VPS Bandwidth) ---
+        cache_key = ""
+        if len(tts_text) <= TTS_SINGLE_VOICE_MAX_CHARS:
+            cache_key = make_tts_audio_cache_key(
+                tts_text,
+                gender,
+                speed,
+                tts_model,
+                provider_context="",
+            )
+            cached_file_id = get_cached_telegram_file_id(cache_key)
+            if cached_file_id:
+                logger.info("⚡ Instant TTS CDN cache hit for user %s (key=%s)", user_id, cache_key[:12])
+                sent_msg = await safe_send(lambda fid=cached_file_id: msg.reply_voice(
+                    voice=fid,
+                    caption=f"🗣️ {BOT_TAG}",
+                    reply_markup=voice_markup,
+                ))
+                if sent_msg is not None:
+                    _metric_inc("tts_cache_hit", user_id=user_id)
+                    save_text_cache(
+                        sent_msg.message_id,
+                        tts_text,
+                        chat_id=msg.chat_id,
+                        user_id=user_id,
+                        username=user.username or user.first_name,
+                    )
+                    set_last_tts_text(user_id, tts_text)
+                    record_turn(user_id, "user", stripped)
+                    record_turn(user_id, "assistant", tts_text)
+                    _set_last_tts(user_id)
+                    return
+                else:
+                    invalidate_cached_telegram_file_id(cache_key)
+
+        # Cache Miss: Display minimal progress bar during speech synthesis
+        progress = await TelegramProgress.start(
+            bot=context.bot,
+            chat_id=msg.chat_id,
+            reply_target=msg,
+            title="កំពុងបម្លែងអត្ថបទទៅជាសំឡេង",
+            percent=15,
+            stage="កំពុងរៀបចំសំឡេង",
+            detail=f"ម៉ូដែល៖ {model_label} • អត្ថបទ {len(tts_text)} តួអក្សរ។",
+            minimal=True,
         )
 
         lock = _get_user_lock(user_id)
@@ -749,13 +808,6 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
                 duration_ms=(time.perf_counter() - generation_started) * 1_000,
             )
             await progress.update(88, "បានបង្កើតសំឡេង", "កំពុងផ្ញើសារសំឡេងទៅអ្នក។", force=True)
-            chat_type = str(getattr(msg.chat, "type", "private") or "private").lower()
-            is_channel_or_group = chat_type in ("channel", "group", "supergroup") or int(msg.chat_id) < 0
-            allow_channel_buttons = (
-                os.environ.get("CHANNEL_NARRATOR_SHOW_BUTTONS", "false").lower() in ("1", "true", "yes")
-                or (bot_setting_bool_cached("channel_narrator_show_buttons", False) if "bot_setting_bool_cached" in globals() else False)
-            )
-            voice_markup = get_main_kb(gender, tts_model) if (not is_channel_or_group or allow_channel_buttons) else None
 
             sent_msg = await safe_send(lambda ab=audio_bytes: msg.reply_voice(
                 voice=io.BytesIO(ab),
@@ -764,6 +816,8 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
             ))
             if sent_msg is None:
                 raise RuntimeError("Telegram មិនអាចផ្ញើសារសំឡេងបាន។")
+            if getattr(sent_msg, "voice", None) and sent_msg.voice.file_id and cache_key:
+                set_cached_telegram_file_id(cache_key, sent_msg.voice.file_id)
             save_text_cache(
                 sent_msg.message_id,
                 tts_text,
@@ -778,13 +832,14 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
             await progress.finish("✅ បានបង្កើត និងផ្ញើសំឡេងរួចរាល់។", delete_after_s=5.0)
     except Exception as exc:
         logger.error("on_text TTS error: %s", exc, exc_info=True)
-        await progress.fail(_tts_user_error_message(exc))
+        if progress is not None:
+            await progress.fail(_tts_user_error_message(exc))
+        else:
+            await safe_send(lambda: msg.reply_text(_tts_user_error_message(exc)))
     finally:
         _release_tts_request(user_id)
         if file_path:
             _cleanup(file_path)
-        import gc
-        gc.collect()
 
 
 __all__ = [

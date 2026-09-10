@@ -5494,6 +5494,49 @@ def web_admin_home():
     live_job_rows = _web_broadcast_job_rows_html(_web_csrf_token(), include_actions=False)
 
     feature_launcher = _web_feature_launcher_html(active="dashboard")
+    tts_summary = {}
+    with suppress(Exception):
+        from app.services.tts.cache import get_tts_cache_summary
+        tts_summary = get_tts_cache_summary()
+    fid_s = tts_summary.get("file_id", {})
+    aud_s = tts_summary.get("audio", {})
+    sf_cnt = tts_summary.get("single_flight_pending", 0)
+
+    csrf_val = _web_csrf_token()
+    audio_cache_card_html = f"""
+    <div class='card' style='margin-bottom:16px'>
+      <div class='actions' style='justify-content:space-between;align-items:center'>
+        <h2>🚀 Audio Cache & Telegram CDN Acceleration</h2>
+        <form method='post' action='/admin/control/action' data-confirm='Purge all in-memory and CDN audio caches?'>
+          <input type='hidden' name='csrf_token' value='{csrf_val}'>
+          <input type='hidden' name='action' value='clear_tts_cache'>
+          <button type='submit' class='warn' style='padding:6px 12px;font-size:12px'>🧹 Purge Audio Cache</button>
+        </form>
+      </div>
+      <div class='grid' style='margin-top:10px'>
+        <div class='stat-card' style='background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:8px;padding:12px'>
+          <div class='muted' style='font-size:12px'>Telegram CDN File IDs</div>
+          <div style='font-size:20px;font-weight:700;color:#10b981;margin-top:4px'>{fid_s.get('items', 0):,} <span style='font-size:12px;font-weight:400;color:var(--muted)'>/ {fid_s.get('max_items', 10000):,}</span></div>
+          <div class='muted' style='font-size:11px;margin-top:4px'>Hits: <b>{fid_s.get('hits', 0):,}</b> · Misses: <b>{fid_s.get('misses', 0):,}</b></div>
+        </div>
+        <div class='stat-card' style='background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.2);border-radius:8px;padding:12px'>
+          <div class='muted' style='font-size:12px'>CDN Hit Rate</div>
+          <div style='font-size:20px;font-weight:700;color:#3b82f6;margin-top:4px'>{fid_s.get('hit_rate_pct', 0.0)}%</div>
+          <div class='muted' style='font-size:11px;margin-top:4px'><b>0ms CPU</b> & <b>0 egress bytes</b> on hit</div>
+        </div>
+        <div class='stat-card' style='background:rgba(139,92,246,0.08);border:1px solid rgba(139,92,246,0.2);border-radius:8px;padding:12px'>
+          <div class='muted' style='font-size:12px'>Raw Audio Bytes (LRU)</div>
+          <div style='font-size:20px;font-weight:700;color:#8b5cf6;margin-top:4px'>{aud_s.get('current_mb', 0.0):.2f} MB <span style='font-size:12px;font-weight:400;color:var(--muted)'>/ {aud_s.get('max_mb', 64.0):.0f} MB</span></div>
+          <div class='muted' style='font-size:11px;margin-top:4px'>{aud_s.get('items', 0):,} audios · Hit: <b>{aud_s.get('hit_rate_pct', 0.0)}%</b></div>
+        </div>
+        <div class='stat-card' style='background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.2);border-radius:8px;padding:12px'>
+          <div class='muted' style='font-size:12px'>SingleFlight Coalescing</div>
+          <div style='font-size:20px;font-weight:700;color:#f59e0b;margin-top:4px'>{sf_cnt} active</div>
+          <div class='muted' style='font-size:11px;margin-top:4px'>Thundering-herd guard: <b>Active ✅</b></div>
+        </div>
+      </div>
+    </div>
+    """
     body = f"""
     <div data-live-status data-realtime-dashboard></div>
     {_web_command_hero_html(counts)}
@@ -5508,6 +5551,7 @@ def web_admin_home():
       {_web_count_card('api_keys', 'Active API keys', counts['api_keys'], 'generated admin access keys', 'ok' if counts['api_keys'] else '')}
     </div>
     {_optimization_score_card_html(_runtime_performance_snapshot(light=True))}
+    {audio_cache_card_html}
     {feature_launcher}
     <div class='grid2'>
       <div class='card'><h2>System health</h2><div class='table-wrap'><table class='table'>
@@ -7644,6 +7688,7 @@ def _runtime_performance_snapshot(light: bool = False) -> dict:
             "text_cache_memory": len(_text_cache_memory),
             "tts_audio_cache_items": len(_TTS_AUDIO_CACHE) if "_TTS_AUDIO_CACHE" in globals() else 0,
             "tts_audio_cache_mb": round((_TTS_AUDIO_CACHE_BYTES if "_TTS_AUDIO_CACHE_BYTES" in globals() else 0) / 1024 / 1024, 2),
+            "tts_file_id_cache_items": get_global_tts_file_id_cache().entry_count if "get_global_tts_file_id_cache" in globals() else 0,
             "prefs_load_locks": len(_prefs_load_locks) if "_prefs_load_locks" in globals() else 0,
             "api_key_cache": len(_api_key_validation_cache),
             "cache_snapshot": _admin_runtime_cache_snapshot_sync() if "_admin_runtime_cache_snapshot_sync" in globals() else {},
@@ -7961,6 +8006,7 @@ def _admin_runtime_cache_snapshot_sync() -> dict[str, Any]:
         "text_memory": _admin_cache_len("_text_cache_memory"),
         "tts_audio_items": _admin_cache_len("_TTS_AUDIO_CACHE"),
         "tts_audio_mb": round(float(globals().get("_TTS_AUDIO_CACHE_BYTES", 0) or 0) / 1024 / 1024, 2),
+        "tts_file_id_items": get_global_tts_file_id_cache().entry_count if "get_global_tts_file_id_cache" in globals() else 0,
         "crm_snapshot": 1 if (globals().get("_CRM_SNAPSHOT_CACHE") or {}).get("rows") else 0,
         "analytics_entries": len(analytics_cache) if analytics_cache is not None else 0,
         "sched_pending_admins": _admin_cache_len("_sched_admin_pending_cache"),
@@ -8360,6 +8406,7 @@ def web_admin_control():
     csrf = _web_csrf_token()
     actions = [
         ("refresh_caches", "Refresh dashboard caches", "Clear dashboard counts/live schedule cache and reload bot settings on next read.", "secondary"),
+        ("clear_tts_cache", "Purge Audio & CDN Cache", "Flush in-memory audio LRU and Telegram CDN file_id cache tiers.", "warn"),
         ("clear_runtime_metrics", "Reset runtime metrics", "Set in-memory runtime counters back to zero.", "warn"),
         ("reset_hf_tts", "Reset HF TTS cooldown", "Use after fixing Hugging Face / Gradio Space errors.", "warn"),
         ("reset_ocr", "Reset OCR cooldowns", "Use after fixing HF/Gemini OCR networking or quota problems.", "warn"),
@@ -8455,13 +8502,17 @@ def web_admin_control_action():
                 res = db_call_sync("web_control_lock_release", lambda: supabase.table("bot_locks").delete().eq("lock_key", _SCHED_LOCK_KEY).execute(), default=None, attempts=2, critical=False)
                 ok = res is not None
                 msg = "Scheduler lock release attempted." if ok else "Scheduler lock release failed."
+        elif action == "clear_tts_cache":
+            from app.services.tts.cache import clear_all_tts_caches
+            res = clear_all_tts_caches()
+            msg = f"Audio Cache purged: {res.get('audio_items_cleared', 0)} memory items, {res.get('file_ids_cleared', 0)} Telegram CDN file IDs."
         else:
             ok, msg = False, "Unknown control action."
     except Exception as exc:
         ok, msg = False, str(exc)[:500]
     _web_admin_audit(action, msg)
     flask_flash(("OK: " if ok else "ERROR: ") + msg, "success" if ok else "error")
-    return redirect(url_for("web_admin_control"))
+    return redirect(request.referrer or url_for("web_admin_control"))
 
 
 @app_flask.route("/admin/status.json")
@@ -10006,7 +10057,7 @@ ADMIN_IDS:  set[int]    = set()
 # These are real code defaults, not required Render/env values.  Operators can
 # still override them with env variables, but a missing OCR_PROVIDER,
 # OCR_AUTO_PREFER_PROVIDER, or GEMINI_MODEL now boots with Gemini OCR selected.
-DEFAULT_GEMINI_MODEL             = "gemini-2.5-flash"  # change this one line if you want another default Gemini model
+DEFAULT_GEMINI_MODEL             = "gemini-3.6-flash"  # default Gemini model
 DEFAULT_GEMINI_AUDIO_MODEL       = "gemini-2.5-flash-preview-tts"  # default Gemini TTS audio model
 DEFAULT_AI_PROVIDER              = "gemini"            # gemini | hf
 DEFAULT_OCR_PROVIDER             = "gemini"            # gemini | auto | hf
@@ -10376,6 +10427,19 @@ def _is_retryable_store_error(exc: BaseException | str) -> bool:
     return any(word in name for word in ("timeout", "connection", "network", "protocol", "disconnect", "remote"))
 
 
+def _is_disconnect_error(exc: BaseException | str) -> bool:
+    """Return True if exception is a severed idle socket / RemoteProtocolError from connection pool."""
+    msg = str(exc).lower()
+    name = exc.__class__.__name__.lower() if not isinstance(exc, str) else ""
+    return (
+        "server disconnected" in msg
+        or "remoteprotocolerror" in name
+        or "connection reset" in msg
+        or "connection reset" in name
+        or "broken pipe" in msg
+    )
+
+
 def retry_call_sync(
     name: str,
     factory: Callable[[], Any],
@@ -10429,8 +10493,12 @@ def retry_call_sync(
                 )
                 break
 
-            delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
-            logger.warning("%s temporary error attempt %d/%d: %s", name, attempt, attempts, _format_exception_detail(exc))
+            if attempt == 1 and _is_disconnect_error(exc):
+                delay = 0.01
+                logger.debug("%s idle socket disconnected by upstream; retrying immediately.", name)
+            else:
+                delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+                logger.warning("%s temporary error attempt %d/%d: %s", name, attempt, attempts, _format_exception_detail(exc))
             time.sleep(delay)
 
     if critical and last_exc:
@@ -10510,8 +10578,12 @@ async def retry_call(
                 )
                 break
 
-            delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
-            logger.warning("%s temporary error attempt %d/%d: %s", name, attempt, attempts, _format_exception_detail(exc))
+            if attempt == 1 and _is_disconnect_error(exc):
+                delay = 0.01
+                logger.debug("%s idle socket disconnected by upstream; retrying immediately.", name)
+            else:
+                delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+                logger.warning("%s temporary error attempt %d/%d: %s", name, attempt, attempts, _format_exception_detail(exc))
             await asyncio.sleep(delay)
 
     if critical and last_exc:
@@ -11610,18 +11682,28 @@ def ask_huggingface_ocr(image_data: bytes) -> str:
     raise _friendly_ocr_error(errors)
 
 
-def ask_gemini_ocr(image_data: bytes, mime_type: str = "image/jpeg") -> str:
+def ask_gemini_ocr(image_data: bytes, mime_type: str = "image/jpeg", user_prompt: str = "") -> str:
     if _gemini is None:
         raise RuntimeError("Gemini OCR is not configured. Set GEMINI_API_KEY; GEMINI_MODEL optional.")
     if not image_data:
         raise RuntimeError("Empty image data.")
     from google.genai import types as _gtypes
-    prompt = (
-        "Extract all readable text from this image. Preserve Khmer, English, Chinese, Korean, "
-        "and Japanese exactly. Keep useful line breaks. If there is no readable text, "
-        "output only NOTEXT. Do not describe the image and do not add explanations."
-    )
-    models_to_try = [GEMINI_MODEL, "gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.5-pro", "gemini-3.6-flash"]
+    if user_prompt.strip():
+        prompt = (
+            f"You are an expert AI Vision assistant.\n"
+            f"Please analyze this image and answer the user request precisely and clearly in natural Khmer:\n\n"
+            f"USER REQUEST: {user_prompt.strip()}\n\n"
+            f"Keep your explanation clear, well-structured, and suitable for spoken text-to-speech audio narration."
+        )
+    else:
+        prompt = (
+            "Extract all visible and readable text from this image with high fidelity.\n"
+            "- Accurately preserve Khmer script (ព្យញ្ជនៈ, ស្រៈ, ជើង, វណ្ណយុត្តិ, លេខខ្មែរ), English, Chinese, Vietnamese, Thai, etc.\n"
+            "- Maintain original structure, paragraphs, bullet points, and tables where appropriate.\n"
+            "- If the image contains zero readable text, return exactly: NOTEXT.\n"
+            "- Return only the extracted text without introductory or concluding remarks."
+        )
+    models_to_try = [GEMINI_MODEL, "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
     unique_models: list[str] = []
     for m in models_to_try:
         if m and m not in unique_models:
@@ -11669,7 +11751,7 @@ def ask_gemini_ocr(image_data: bytes, mime_type: str = "image/jpeg") -> str:
     return "NOTEXT"
 
 
-def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tuple[str, str, str]:
+def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg", user_prompt: str = "") -> tuple[str, str, str]:
     """Unified OCR with provider fallback. Returns (text, provider, model).
 
     v27 fixes:
@@ -11716,7 +11798,7 @@ def ask_ocr_image(image_data: bytes, mime_type: str = "image/jpeg") -> tuple[str
                 continue
             try:
                 started = time.perf_counter()
-                text = ask_gemini_ocr(image_data, mime_type)
+                text = ask_gemini_ocr(image_data, mime_type, user_prompt=user_prompt)
                 _mark_ocr_provider_success("gemini")
                 provider_manager.record_success(
                     "gemini",
@@ -16247,9 +16329,10 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🩺 Health", callback_data="admin_health"),
          InlineKeyboardButton("🚨 Error Inbox", callback_data="admin_errors")],
         [InlineKeyboardButton("⚡ Optimize", callback_data="admin_optimize"),
-         InlineKeyboardButton("📈 Stats", callback_data="admin_stats")],
-        [InlineKeyboardButton("🔄 Refresh", callback_data="admin_home"),
-         InlineKeyboardButton("❌ បិទ (Close)", callback_data="admin_close")],
+         InlineKeyboardButton("🚀 Audio Cache", callback_data="admin_audio_cache")],
+        [InlineKeyboardButton("📈 Stats", callback_data="admin_stats"),
+         InlineKeyboardButton("🔄 Refresh", callback_data="admin_home")],
+        [InlineKeyboardButton("❌ បិទ (Close)", callback_data="admin_close")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -16282,9 +16365,20 @@ def get_admin_compact_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("👥 Users", callback_data="admin_users"),
          InlineKeyboardButton("🚨 Errors", callback_data="admin_errors")],
         [InlineKeyboardButton("⚡ Optimize", callback_data="admin_optimize"),
-         InlineKeyboardButton("📄 Report", callback_data="admin_report")],
-        [InlineKeyboardButton("🏠 Full Admin", callback_data="admin_home"),
-         InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+         InlineKeyboardButton("🚀 Audio Cache", callback_data="admin_audio_cache")],
+        [InlineKeyboardButton("📄 Report", callback_data="admin_report"),
+         InlineKeyboardButton("🏠 Full Admin", callback_data="admin_home")],
+        [InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+    ])
+
+
+def get_admin_audio_cache_kb() -> InlineKeyboardMarkup:
+    """Sub-panel navigation keyboard for Audio Cache & CDN Delivery."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh Cache", callback_data="admin_cache_refresh"),
+         InlineKeyboardButton("🧹 Clear Audio Cache", callback_data="admin_cache_clear")],
+        [InlineKeyboardButton("⬅️ Admin Home", callback_data="admin_home"),
+         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
 
 
@@ -16560,10 +16654,11 @@ def get_admin_optimize_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🛠 Runtime", callback_data="admin_runtime"),
          InlineKeyboardButton("🩺 Health", callback_data="admin_health")],
-        [InlineKeyboardButton("🚨 Error Center", callback_data="admin_errors"),
-         InlineKeyboardButton("🔄 Refresh", callback_data="admin_optimize")],
-        [InlineKeyboardButton("⬅️ Admin V9", callback_data="admin_home"),
-         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
+        [InlineKeyboardButton("🚀 Audio Cache", callback_data="admin_audio_cache"),
+         InlineKeyboardButton("🚨 Error Center", callback_data="admin_errors")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="admin_optimize"),
+         InlineKeyboardButton("⬅️ Admin Dashboard", callback_data="admin_home")],
+        [InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
 
 
@@ -16597,6 +16692,44 @@ async def _admin_open_optimize_panel(query) -> None:
         _admin_optimize_text(),
         parse_mode="HTML",
         reply_markup=get_admin_optimize_kb(),
+        disable_web_page_preview=True,
+    ))
+
+
+def _admin_audio_cache_text(notice: str = "") -> str:
+    from app.services.tts.cache import get_tts_cache_summary
+    summary = get_tts_cache_summary()
+    fid = summary.get("file_id", {})
+    aud = summary.get("audio", {})
+    sf = summary.get("single_flight_pending", 0)
+
+    fid_hit_rate = fid.get("hit_rate_pct", 0.0)
+    aud_hit_rate = aud.get("hit_rate_pct", 0.0)
+
+    header = f"{notice}\n\n" if notice else ""
+    return (
+        f"{header}🚀 <b>Audio Cache & CDN Delivery Center</b>\n\n"
+        "⚡ <b>Telegram CDN File ID Cache (L1 Mem + L2 Redis):</b>\n"
+        f"• Active File IDs: <b>{fid.get('items', 0):,}</b> / {fid.get('max_items', 10000):,}\n"
+        f"• CDN Cache Hits: <b>{fid.get('hits', 0):,}</b> · Misses: <b>{fid.get('misses', 0):,}</b>\n"
+        f"• Hit Rate: <b>{fid_hit_rate}%</b> (0ms CPU & 0 byte VPS egress)\n\n"
+        "💾 <b>Raw Audio Bytes Cache (LRU In-Memory):</b>\n"
+        f"• Memory Usage: <b>{aud.get('current_mb', 0.0):.2f} MB</b> / {aud.get('max_mb', 64.0):.1f} MB\n"
+        f"• Cached Audio Items: <b>{aud.get('items', 0):,}</b>\n"
+        f"• Audio Hits: <b>{aud.get('hits', 0):,}</b> · Misses: <b>{aud.get('misses', 0):,}</b>\n"
+        f"• Hit Rate: <b>{aud_hit_rate}%</b>\n\n"
+        "🛡 <b>SingleFlight Deduplication:</b>\n"
+        f"• In-Flight Coalesced Requests: <b>{sf}</b>\n"
+        "• Thundering-Herd Protection: <b>Active ✅</b>\n\n"
+        "💡 <i>Clear cache will prune memory entries and force fresh voice synthesis on next queries.</i>"
+    )
+
+
+async def _admin_open_audio_cache_panel(query, notice: str = "") -> None:
+    await safe_send(lambda: query.message.edit_text(
+        _admin_audio_cache_text(notice=notice),
+        parse_mode="HTML",
+        reply_markup=get_admin_audio_cache_kb(),
         disable_web_page_preview=True,
     ))
 
@@ -17340,6 +17473,8 @@ def _hf_tts_record_failure(exc: BaseException | str) -> None:
         )
         if _hf_tts_is_quota_error(exc):
             cooldown = HF_TTS_QUOTA_COOLDOWN_S
+        elif "queue is full" in str(exc).lower():
+            cooldown = HF_TTS_COOLDOWN_S
         elif is_timeout:
             cooldown = HF_TTS_COOLDOWN_S
         elif _HF_TTS_FAILURES >= HF_TTS_FAILURE_LIMIT:
@@ -17831,6 +17966,8 @@ def _hf_tts_predict_should_retry(exc: Exception) -> bool:
         or "(none," in msg
         or "returned no audio for text" in msg
     ):
+        return False
+    if "queue is full" in msg or "zerogpu runs limit" in msg:
         return False
     non_retryable = (
         "invalid api",
@@ -19030,8 +19167,16 @@ def _tts_user_error_message(exc: Exception | str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# In-memory TTS audio cache
+# In-memory TTS audio cache & Telegram file_id deduplication
 # ---------------------------------------------------------------------------
+import unicodedata
+from app.services.tts.cache import (
+    get_cached_telegram_file_id as _tts_file_id_cache_get,
+    set_cached_telegram_file_id as _tts_file_id_cache_set,
+    invalidate_cached_telegram_file_id as _tts_file_id_cache_invalidate,
+    get_global_tts_file_id_cache,
+)
+
 _TTS_AUDIO_CACHE: OrderedDict[str, tuple[bytes, float, int]] = OrderedDict()
 _TTS_AUDIO_CACHE_LOCK = threading.RLock()
 _TTS_AUDIO_CACHE_BYTES = 0
@@ -19044,18 +19189,18 @@ def _tts_audio_cache_key(
     tts_model: str,
     provider_context: str = "",
 ) -> str:
-    cleaned = _clean_tts_text_for_edge(text)
+    cleaned = _clean_tts_text_for_edge(unicodedata.normalize("NFC", str(text or "")))
     lang = _detect_tts_lang_key(cleaned)
     payload = {
-        "v": 5,
-        "lang": lang,
+        "v": 6,
         "gender": gender if gender in ("female", "male") else "female",
-        "speed": _rounded_speed(speed),
-        "model": _normalize_tts_model(tts_model),
-        "tts_provider": TTS_PROVIDER,
         "khmer_provider": KHMER_TTS_PROVIDER,
+        "lang": lang,
+        "model": _normalize_tts_model(tts_model),
         "provider_context": str(provider_context or ""),
+        "speed": _rounded_speed(speed),
         "text_hash": hashlib.sha256(cleaned.encode("utf-8")).hexdigest(),
+        "tts_provider": TTS_PROVIDER,
     }
     raw = _json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -19068,97 +19213,40 @@ def _tts_audio_redis_key(key: str) -> str:
 def _tts_audio_cache_get(key: str) -> bytes | None:
     if not TTS_AUDIO_CACHE_ENABLED:
         return None
-    now = time.monotonic()
-    # 1. Check L1 Memory Cache
-    with _TTS_AUDIO_CACHE_LOCK:
-        item = _TTS_AUDIO_CACHE.get(key)
-        if item:
-            data, created, size = item
-            if now - created <= TTS_AUDIO_CACHE_TTL_S:
-                _TTS_AUDIO_CACHE.move_to_end(key)
-                return bytes(data)
-            else:
-                global _TTS_AUDIO_CACHE_BYTES
-                _TTS_AUDIO_CACHE.pop(key, None)
-                _TTS_AUDIO_CACHE_BYTES = max(0, _TTS_AUDIO_CACHE_BYTES - size)
-
-    # 2. Check L2 Redis Cache
-    if redis_client is not None:
-        try:
-            rkey = _tts_audio_redis_key(key)
-            raw = redis_client.get(rkey)
-            if raw:
-                if isinstance(raw, str):
-                    audio_data = base64.b64decode(raw.encode("ascii"))
-                else:
-                    audio_data = bytes(raw)
-                if audio_data:
-                    # Populate L1 cache for subsequent fast reads
-                    _tts_audio_cache_set_memory_only(key, audio_data)
-                    return audio_data
-        except Exception as exc:
-            logger.debug("Redis audio cache get error: %s", exc)
-
-    return None
+    from app.services.tts.cache import get_global_tts_cache
+    return get_global_tts_cache().get(key)
 
 
 def _tts_audio_cache_set_memory_only(key: str, data: bytes) -> None:
-    size = len(data)
-    if size > TTS_AUDIO_CACHE_ITEM_MAX_BYTES:
+    if not TTS_AUDIO_CACHE_ENABLED or not data:
         return
-    global _TTS_AUDIO_CACHE_BYTES
-    now = time.monotonic()
-    with _TTS_AUDIO_CACHE_LOCK:
-        old = _TTS_AUDIO_CACHE.pop(key, None)
-        if old:
-            _TTS_AUDIO_CACHE_BYTES = max(0, _TTS_AUDIO_CACHE_BYTES - old[2])
-        _TTS_AUDIO_CACHE[key] = (bytes(data), now, size)
-        _TTS_AUDIO_CACHE_BYTES += size
-        while _TTS_AUDIO_CACHE_BYTES > TTS_AUDIO_CACHE_MAX_BYTES and _TTS_AUDIO_CACHE:
-            _old_key, (_old_data, _old_created, old_size) = _TTS_AUDIO_CACHE.popitem(last=False)
-            _TTS_AUDIO_CACHE_BYTES = max(0, _TTS_AUDIO_CACHE_BYTES - old_size)
+    from app.services.tts.cache import get_global_tts_cache
+    get_global_tts_cache().set(key, data)
 
 
 def _tts_audio_cache_set(key: str, data: bytes) -> None:
     if not TTS_AUDIO_CACHE_ENABLED or not data:
         return
-    # Write to L1 Memory Cache
-    _tts_audio_cache_set_memory_only(key, data)
-
-    # Write to L2 Redis Cache asynchronously / in background
-    if redis_client is not None:
-        def _write_redis():
-            try:
-                rkey = _tts_audio_redis_key(key)
-                b64_str = base64.b64encode(data).decode("ascii")
-                redis_client.set(rkey, b64_str, ex=int(TTS_AUDIO_CACHE_TTL_S))
-            except Exception as exc:
-                logger.debug("Redis audio cache set error: %s", exc)
-        _submit_db(_write_redis)
+    from app.services.tts.cache import get_global_tts_cache
+    get_global_tts_cache().set(key, data)
 
 
 def _tts_audio_cache_trim_expired() -> int:
-    global _TTS_AUDIO_CACHE_BYTES
-    now = time.monotonic()
     removed = 0
-    with _TTS_AUDIO_CACHE_LOCK:
-        if not _TTS_AUDIO_CACHE:
-            return 0
-        for key, (_data, created, size) in list(_TTS_AUDIO_CACHE.items()):
-            if now - float(created or 0.0) > TTS_AUDIO_CACHE_TTL_S:
-                _TTS_AUDIO_CACHE.pop(key, None)
-                _TTS_AUDIO_CACHE_BYTES = max(0, _TTS_AUDIO_CACHE_BYTES - int(size or 0))
-                removed += 1
+    with suppress(Exception):
+        from app.services.tts.cache import get_global_tts_cache, get_global_tts_file_id_cache
+        removed += get_global_tts_cache().trim_expired()
+        removed += get_global_tts_file_id_cache().trim_expired()
     return removed
 
 
 def _tts_audio_cache_clear() -> int:
-    global _TTS_AUDIO_CACHE_BYTES
-    with _TTS_AUDIO_CACHE_LOCK:
-        removed = len(_TTS_AUDIO_CACHE)
-        _TTS_AUDIO_CACHE.clear()
-        _TTS_AUDIO_CACHE_BYTES = 0
-        return removed
+    removed = 0
+    with suppress(Exception):
+        from app.services.tts.cache import clear_all_tts_caches
+        res = clear_all_tts_caches()
+        removed = res.get("audio_items_cleared", 0) + res.get("file_ids_cleared", 0)
+    return removed
 
 
 def _write_cached_audio_to_path(path: str, data: bytes) -> None:
@@ -19238,11 +19326,12 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
     if af:
         cmd += ["-filter:a", af]
     cmd += [
+        "-threads", "0",
         "-c:a", "libopus",
         "-b:a", "32k",
         "-vbr", "on",
         "-application", "voip",
-        "-compression_level", "7",
+        "-compression_level", "5",
         "-frame_duration", "20",
         "-f", "ogg",
         "pipe:1",
@@ -19502,7 +19591,7 @@ async def generate_voice(text: str, gender: str, speed: float, output_path: str,
 
 
 async def generate_voice_limited(text: str, gender: str, speed: float, output_path: str, tts_model: str = "auto") -> bytes:
-    """Generate cached TTS audio using language detected from ``text``."""
+    """Generate cached TTS audio using language detected from ``text`` with TTSSingleFlight coalescing."""
     cleaned = _clean_tts_text_for_edge(str(text or ""))
     if not cleaned:
         raise ValueError("generate_voice_limited: text must not be empty")
@@ -19510,23 +19599,32 @@ async def generate_voice_limited(text: str, gender: str, speed: float, output_pa
     cache_key = _tts_audio_cache_key(cleaned, gender, speed, tts_model)
     cached = _tts_audio_cache_get(cache_key)
     if cached is not None:
-        await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
+        if output_path:
+            await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
         logger.debug("TTS audio cache hit lang=%s bytes=%s", _detect_tts_lang_key(cleaned), len(cached))
         return cached
 
-    sem = _TTS_CHUNK_SEMAPHORE
-    if sem is None:
-        audio = await generate_voice(cleaned, gender, speed, output_path, tts_model)
-    else:
-        async with sem:
-            # Re-check after waiting; another request may have generated the same audio.
-            cached = _tts_audio_cache_get(cache_key)
-            if cached is not None:
-                await asyncio.to_thread(_write_cached_audio_to_path, output_path, cached)
-                logger.debug("TTS audio cache hit after wait lang=%s bytes=%s", _detect_tts_lang_key(cleaned), len(cached))
-                return cached
-            audio = await generate_voice(cleaned, gender, speed, output_path, tts_model)
-    _tts_audio_cache_set(cache_key, audio)
+    async def _execute_synthesis() -> bytes:
+        c = _tts_audio_cache_get(cache_key)
+        if c is not None:
+            return c
+        sem = _TTS_CHUNK_SEMAPHORE
+        if sem is None:
+            result_bytes = await generate_voice(cleaned, gender, speed, output_path, tts_model)
+        else:
+            async with sem:
+                c = _tts_audio_cache_get(cache_key)
+                if c is not None:
+                    return c
+                result_bytes = await generate_voice(cleaned, gender, speed, output_path, tts_model)
+        _tts_audio_cache_set(cache_key, result_bytes)
+        return result_bytes
+
+    from app.services.tts.cache import get_global_tts_single_flight
+    sf = get_global_tts_single_flight()
+    audio, was_leader = await sf.execute_or_wait(cache_key, _execute_synthesis)
+    if not was_leader and output_path and audio:
+        await asyncio.to_thread(_write_cached_audio_to_path, output_path, audio)
     return audio
 
 
@@ -19722,7 +19820,7 @@ def _split_text_chunks(text: str, max_chars: int = TTS_CHUNK_CHARS) -> list[str]
 # ---------------------------------------------------------------------------
 # OCR (async wrapper)
 # ---------------------------------------------------------------------------
-async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
+async def ocr_image(image_path: str, mime_type: str = "image/jpeg", user_prompt: str = "") -> str:
     if not _ocr_configured():
         raise RuntimeError(_ocr_status_for_user())
     loop = asyncio.get_running_loop()
@@ -19738,7 +19836,7 @@ async def ocr_image(image_path: str, mime_type: str = "image/jpeg") -> str:
     async def _guarded_call():
         async with semaphore:
             return await loop.run_in_executor(
-                _AI_EXECUTOR, lambda: ask_ocr_image(image_bytes, mime_type)[0]
+                _AI_EXECUTOR, lambda: ask_ocr_image(image_bytes, mime_type, user_prompt=user_prompt)[0]
             )
 
     try:
@@ -19833,6 +19931,45 @@ async def _deliver_paged_tts(
                     force=(i == 1),
                 )
 
+            is_group_or_channel = int(chat_id) < 0
+            allow_channel_buttons = (
+                os.environ.get("CHANNEL_NARRATOR_SHOW_BUTTONS", "false").lower() in ("1", "true", "yes")
+                or (bot_setting_bool_cached("channel_narrator_show_buttons", False) if "bot_setting_bool_cached" in globals() else False)
+            )
+            voice_markup = get_main_kb(gender, model) if (not is_group_or_channel or allow_channel_buttons) else None
+
+            # Fast Path: Check Telegram file_id cache for chunk
+            chunk_cache_key = _tts_audio_cache_key(chunk, gender, speed, model)
+            cached_file_id = _tts_file_id_cache_get(chunk_cache_key) if "_tts_file_id_cache_get" in globals() else None
+            if cached_file_id:
+                sent = await safe_send(
+                    lambda fid=cached_file_id, ci=i, ct=total, vm=voice_markup: bot.send_voice(
+                        chat_id=chat_id,
+                        voice=fid,
+                        caption=f"🗣️ {BOT_TAG}  [{ci}/{ct}]",
+                        reply_markup=vm,
+                    )
+                )
+                if sent is not None:
+                    sent_count += 1
+                    save_text_cache(
+                        sent.message_id,
+                        chunk,
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        username=username,
+                    )
+                    set_last_tts_text(user_id, chunk)
+                    if progress is not None:
+                        await progress.update(
+                            after_pct,
+                            f"បានផ្ញើសំឡេង ផ្នែកទី {i} នៃ {total}",
+                            f"បានបញ្ចប់ {sent_count}/{total} ផ្នែក (⚡ ពី Cache)។",
+                        )
+                    continue
+                elif "_tts_file_id_cache_invalidate" in globals():
+                    _tts_file_id_cache_invalidate(chunk_cache_key)
+
             file_path = _make_temp_ogg()
             try:
                 request_chunk = chunk
@@ -19848,12 +19985,6 @@ async def _deliver_paged_tts(
                     chat_id=chat_id,
                     progress=progress,
                 )
-                is_group_or_channel = int(chat_id) < 0
-                allow_channel_buttons = (
-                    os.environ.get("CHANNEL_NARRATOR_SHOW_BUTTONS", "false").lower() in ("1", "true", "yes")
-                    or (bot_setting_bool_cached("channel_narrator_show_buttons", False) if "bot_setting_bool_cached" in globals() else False)
-                )
-                voice_markup = get_main_kb(gender, model) if (not is_group_or_channel or allow_channel_buttons) else None
                 sent = await safe_send(
                     lambda ab=audio_bytes, ci=i, ct=total, vm=voice_markup: bot.send_voice(
                         chat_id=chat_id,
@@ -19864,6 +19995,8 @@ async def _deliver_paged_tts(
                 )
                 if sent is None:
                     raise RuntimeError("Telegram មិនអាចផ្ញើសារសំឡេងបាន។")
+                if getattr(sent, "voice", None) and sent.voice.file_id and "_tts_file_id_cache_set" in globals():
+                    _tts_file_id_cache_set(chunk_cache_key, sent.voice.file_id)
                 sent_count += 1
                 save_text_cache(
                     sent.message_id,
@@ -19908,14 +20041,12 @@ async def _deliver_paged_tts(
                     break
             finally:
                 _cleanup(file_path)
-                gc.collect()
 
             if i < total:
                 await asyncio.sleep(float(PAGED_TTS_SEND_DELAY_S))
     finally:
         _cleanup_voxcpm2_session(voxcpm2_session)
         _set_last_tts(user_id)
-        gc.collect()
 
     if sent_count == 0 and first_error is not None:
         raise first_error
@@ -21359,6 +21490,9 @@ async def _run_broadcast_to_all(
                             "user is deactivated",
                             "bot can't initiate conversation",
                             "bot can’t initiate conversation",
+                            "user_bot_to_bot_disabled",
+                            "bot_to_bot",
+                            "have no rights to send a message",
                         )):
                             with _BLOCKED_USER_CACHE_LOCK:
                                 _blocked_users_memory.add(int(uid))
@@ -22921,6 +23055,15 @@ async def _admin_home_text(admin_id: int, title: str = ADMIN_UI_TITLE) -> str:
     active_gemini = _setting_raw_from(settings, "GEMINI_MODEL", getattr(SETTINGS, "GEMINI_MODEL", "gemini-2.5-flash"))
     db_ok = bool(supabase and settings_status.get("db_ok"))
 
+    tts_cache_line = ""
+    with suppress(Exception):
+        from app.services.tts.cache import get_tts_cache_summary
+        csum = get_tts_cache_summary()
+        fid_cnt = csum.get("file_id", {}).get("items", 0)
+        aud_mb = csum.get("audio", {}).get("current_mb", 0.0)
+        fid_hr = csum.get("file_id", {}).get("hit_rate_pct", 0.0)
+        tts_cache_line = f"\n• Audio Cache: <b>{fid_cnt:,}</b> CDN IDs · <b>{aud_mb:.1f} MB</b> · Hit: <b>{fid_hr}%</b>"
+
     return (
         f"{title}\n"
         f"<code>/admin › overview</code>\n\n"
@@ -22929,7 +23072,7 @@ async def _admin_home_text(admin_id: int, title: str = ADMIN_UI_TITLE) -> str:
         f"🤖 <b>AI & Speech Stack</b>\n"
         f"• Gemini Model: <code>{html.escape(active_gemini)}</code>\n"
         f"• Default TTS: <b>{html.escape(default_tts)}</b> · Voice: <b>{'ON ✅' if tts_on else 'OFF ⚠️'}</b>\n"
-        f"• Channel Narrator: <b>{'ON ✅' if channel_on else 'OFF ⚠️'}</b> · OCR: <b>{'ON ✅' if ocr_on else 'OFF ⚠️'}</b>\n"
+        f"• Channel Narrator: <b>{'ON ✅' if channel_on else 'OFF ⚠️'}</b> · OCR: <b>{'ON ✅' if ocr_on else 'OFF ⚠️'}</b>{tts_cache_line}\n"
         f"• Storage: Supabase <b>{_ok_bad(db_ok, 'OK', 'WARN')}</b> · Redis <b>{_ok_bad(redis_active, 'OK', 'LOCAL')}</b>\n\n"
         f"📊 <b>Audience & Activity</b>\n"
         f"• Users: <b>{int(counts.get('total_users') or 0):,}</b> · Blocked: <b>{int(counts.get('blocked_users') or 0):,}</b>\n"
@@ -25463,6 +25606,19 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         await _admin_open_optimize_panel(query)
         return
 
+    if data in ("admin_audio_cache", "admin_cache_refresh"):
+        await _clear_admin_transient_state(context, user_id)
+        await _admin_open_audio_cache_panel(query)
+        return
+
+    if data == "admin_cache_clear":
+        await _clear_admin_transient_state(context, user_id)
+        from app.services.tts.cache import clear_all_tts_caches
+        res = clear_all_tts_caches()
+        notice = f"✅ បានសម្អាត Audio Cache រួចរាល់ (Mem: {res.get('audio_items_cleared', 0)} | CDN IDs: {res.get('file_ids_cleared', 0)})"
+        await _admin_open_audio_cache_panel(query, notice=notice)
+        return
+
     if data == "admin_users":
         await _admin_open_users_panel(query)
         return
@@ -27332,6 +27488,46 @@ async def _regenerate_tts_voice_with_progress(
     chat_id = int(query.message.chat.id)
     model_key = _normalize_tts_model(tts_model)
     model_label = TTS_MODEL_OPTIONS.get(model_key, TTS_MODEL_OPTIONS["auto"])[0]
+    is_group_or_channel = int(chat_id) < 0
+    allow_channel_buttons = (
+        os.environ.get("CHANNEL_NARRATOR_SHOW_BUTTONS", "false").lower() in ("1", "true", "yes")
+        or (bot_setting_bool_cached("channel_narrator_show_buttons", False) if "bot_setting_bool_cached" in globals() else False)
+    )
+    voice_markup = get_main_kb(gender, tts_model) if (not is_group_or_channel or allow_channel_buttons) else None
+
+    # Fast Path: Check Telegram file_id cache before starting progress
+    regen_cache_key = _tts_audio_cache_key(original_text, gender, speed, tts_model)
+    cached_file_id = _tts_file_id_cache_get(regen_cache_key) if "_tts_file_id_cache_get" in globals() else None
+    if cached_file_id:
+        new_msg = await safe_send(lambda fid=cached_file_id: context.bot.send_voice(
+            chat_id=chat_id,
+            voice=fid,
+            caption=f"🗣️ {BOT_TAG}",
+            reply_markup=voice_markup,
+        ))
+        if new_msg is not None:
+            _release_tts_request(user_id)
+            _metric_inc("tts_cache_hit", user_id=user_id)
+            if delete_source:
+                with suppress(Exception):
+                    await query.message.delete()
+            else:
+                with suppress(Exception):
+                    await query.message.edit_reply_markup(reply_markup=None)
+            save_text_cache(
+                new_msg.message_id,
+                original_text,
+                chat_id=chat_id,
+                user_id=user_id,
+                username=query.from_user.username or query.from_user.first_name,
+            )
+            set_last_tts_text(user_id, original_text)
+            record_turn(user_id, "assistant", original_text)
+            _set_last_tts(user_id)
+            return True
+        elif "_tts_file_id_cache_invalidate" in globals():
+            _tts_file_id_cache_invalidate(regen_cache_key)
+
     try:
         progress = await TelegramProgress.start(
             bot=context.bot,
@@ -27345,6 +27541,7 @@ async def _regenerate_tts_voice_with_progress(
     except BaseException:
         _release_tts_request(user_id)
         raise
+
     file_path: str | None = None
     lock = _get_user_lock(user_id)
     try:
@@ -27363,12 +27560,6 @@ async def _regenerate_tts_voice_with_progress(
                 progress=progress,
             )
             await progress.update(88, "បានបង្កើតសំឡេង", "កំពុងផ្ញើសារសំឡេងថ្មី។", force=True)
-            is_group_or_channel = int(chat_id) < 0
-            allow_channel_buttons = (
-                os.environ.get("CHANNEL_NARRATOR_SHOW_BUTTONS", "false").lower() in ("1", "true", "yes")
-                or (bot_setting_bool_cached("channel_narrator_show_buttons", False) if "bot_setting_bool_cached" in globals() else False)
-            )
-            voice_markup = get_main_kb(gender, tts_model) if (not is_group_or_channel or allow_channel_buttons) else None
             new_msg = await safe_send(lambda ab=audio_bytes: context.bot.send_voice(
                 chat_id=chat_id,
                 voice=io.BytesIO(ab),
@@ -27377,6 +27568,8 @@ async def _regenerate_tts_voice_with_progress(
             ))
             if new_msg is None:
                 raise RuntimeError("Telegram មិនអាចផ្ញើសារសំឡេងបាន។")
+            if getattr(new_msg, "voice", None) and new_msg.voice.file_id and "_tts_file_id_cache_set" in globals():
+                _tts_file_id_cache_set(regen_cache_key, new_msg.voice.file_id)
             if delete_source:
                 with suppress(Exception):
                     await query.message.delete()
@@ -28035,7 +28228,9 @@ def _system_metrics_snapshot() -> dict[str, Any]:
     if redis_connected:
         try:
             t0 = time.perf_counter()
-            redis_client.ping()
+            with ThreadPoolExecutor(max_workers=1) as _executor:
+                future = _executor.submit(redis_client.ping)
+                future.result(timeout=1.5)
             redis_ping_ms = round((time.perf_counter() - t0) * 1000, 2)
         except Exception:
             redis_connected = False

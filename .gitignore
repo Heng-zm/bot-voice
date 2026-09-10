@@ -11,7 +11,8 @@ htmlcov/
 !.env.example
 /env
 env
-ev/env
+ev/
+ev/**
 *.key
 *.pem
 

@@ -95,14 +95,25 @@ chmod +x deploy.sh
 ### ☁️ Option 3: Anajak Cloud (https://anajak.cloud/)
 
 #### 🚀 Method 1: 1-Click Automated VPS Script (Recommended)
-Log in to your Anajak Cloud VPS and run:
+Log in to your Anajak Cloud VPS via SSH and run:
 ```bash
 git clone https://github.com/Heng-zm/bot-voice.git
 cd bot-voice
 chmod +x anajak-deploy.sh
 ./anajak-deploy.sh
 ```
-*The script automatically provisions Docker, FFmpeg, creates `.env`, and launches both Bot Voice and Redis 7 in background containers.*
+*The script automatically detects your public IP, provisions Docker Engine, configures UFW firewall, verifies container health, and launches both Bot Voice and Redis 7.*
+
+##### 🛠️ Anajak Cloud Management Toolkit:
+```bash
+./anajak-deploy.sh logs      # View live streaming container logs
+./anajak-deploy.sh status    # Check container health and memory usage
+./anajak-deploy.sh restart   # Restart bot and redis containers
+./anajak-deploy.sh test      # Run automated unit test suite inside Docker
+./anajak-deploy.sh backup    # Run Supabase database backup utility
+./anajak-deploy.sh update    # Pull latest Git code and rebuild containers
+./anajak-deploy.sh stop      # Stop all background services
+```
 
 #### 🐳 Method 2: Manual Docker Compose
 ```bash

@@ -131,6 +131,20 @@ class TestFastAPISystemEndpoints(unittest.TestCase):
         data = resp.json()
         self.assertTrue(data.get("ok"))
 
+    def test_auto_register_requires_auth(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"BOT_API_KEY": "test_secret_key"}):
+            resp = self.client.get("/auto-register")
+            self.assertEqual(401, resp.status_code)
+
+    def test_webhook_info_requires_auth(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"BOT_API_KEY": "test_secret_key"}):
+            resp = self.client.get("/webhook-info")
+            self.assertEqual(401, resp.status_code)
+
     def test_tts_endpoint_speed_and_gender_validation(self):
         import os
         from unittest.mock import AsyncMock, patch

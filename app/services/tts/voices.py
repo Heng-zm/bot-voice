@@ -134,7 +134,7 @@ _CLEAN_TRANSLATE_TABLE = str.maketrans({**_ZERO_WIDTH_MAP, **_CONTROL_MAP})
 
 _WHITESPACE_RE = re.compile(r"[ \t\r\f\v]+")
 _EXCESS_NEWLINES_RE = re.compile(r"\n{3,}")
-_SENTENCE_DELIM_RE = re.compile(r"([។.!?\n]+)")
+_SENTENCE_DELIM_RE = re.compile(r"([។៕.!?\n]+)")
 
 
 def clean_tts_text(text: str) -> str:

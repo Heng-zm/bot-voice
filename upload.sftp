@@ -1,7 +1,12 @@
-lcd "G:/bot-voice"
+# SFTP Batch File for Bot Voice — Anajak Cloud (my.anajak.cloud:2022)
+# Uploads all project directories and files to the server
+
+# 1. Upload project directories recursively
 put -r app
 put -r static
 put -r tests
+
+# 2. Upload core application and configuration files
 put main.py
 put requirements.txt
 put requirements-dev.txt
@@ -15,4 +20,10 @@ put supabase_bot_setup.sql
 put .env.example
 put README.md
 put backup_data.py
-put .env
+put .dockerignore
+put .gitignore
+put bot-voice.service
+put run_local.ps1
+
+# 3. Upload .env (ignore if missing locally)
+-put .env

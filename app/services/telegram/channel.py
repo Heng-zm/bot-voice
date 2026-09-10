@@ -21,6 +21,12 @@ if TYPE_CHECKING:
     from telegram.ext import ContextTypes
 
 from app.services.telegram._legacy_runtime import legacy_bound_handler
+from app.services.tts import (
+    get_cached_telegram_file_id,
+    invalidate_cached_telegram_file_id,
+    make_tts_audio_cache_key,
+    set_cached_telegram_file_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,11 +110,15 @@ def clean_channel_text(raw_text: str, max_chars: int = 2000) -> str:
 
 
 async def _get_channel_lock(chat_id: int) -> asyncio.Lock:
-    """Retrieve or create an async lock for the given channel chat ID."""
+    """Retrieve or create an async lock for the given channel chat ID with idle lock eviction."""
     if chat_id in _channel_locks:
         return _channel_locks[chat_id]
     async with _channel_locks_guard:
         if chat_id not in _channel_locks:
+            if len(_channel_locks) > 1000:
+                idle_keys = [k for k, lock in _channel_locks.items() if not lock.locked()]
+                for k in idle_keys[:500]:
+                    _channel_locks.pop(k, None)
             _channel_locks[chat_id] = asyncio.Lock()
         return _channel_locks[chat_id]
 
@@ -186,7 +196,94 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not tts_text:
         return
 
-    # 6. Acquire per-channel lock to prevent overlapping voice jobs
+    # 6. Resolve channel voice settings
+    gender = (
+        bot_setting_raw_cached("channel_narrator_gender", os.environ.get("CHANNEL_NARRATOR_GENDER", "female"))
+        if "bot_setting_raw_cached" in globals()
+        else os.environ.get("CHANNEL_NARRATOR_GENDER", "female")
+    ).strip().lower()
+    speed_str = (
+        bot_setting_raw_cached("channel_narrator_speed", os.environ.get("CHANNEL_NARRATOR_SPEED", "1.0"))
+        if "bot_setting_raw_cached" in globals()
+        else os.environ.get("CHANNEL_NARRATOR_SPEED", "1.0")
+    )
+    try:
+        speed = float(speed_str)
+    except Exception:
+        speed = 1.0
+    tts_model = (
+        bot_setting_raw_cached("channel_narrator_model", os.environ.get("CHANNEL_NARRATOR_MODEL", "auto"))
+        if "bot_setting_raw_cached" in globals()
+        else os.environ.get("CHANNEL_NARRATOR_MODEL", "auto")
+    ).strip().lower()
+    caption = (
+        f"🗣️ {BOT_TAG}"
+        if "BOT_TAG" in globals() and BOT_TAG
+        else "🗣️ សំឡេងអានអត្ថបទ (Audio Narration)"
+    )
+
+    show_buttons = (
+        bot_setting_bool_cached("channel_narrator_show_buttons", False)
+        if "bot_setting_bool_cached" in globals()
+        else os.environ.get("CHANNEL_NARRATOR_SHOW_BUTTONS", "0").lower() in ("1", "true", "yes")
+    )
+    reply_markup = None
+    if show_buttons and "get_audio_action_kb" in globals() and "_tts_text_cache_set" in globals():
+        text_cache_id = _tts_text_cache_set(tts_text)
+        reply_markup = get_audio_action_kb(text_cache_id, tts_text, gender=gender, speed=speed, model=tts_model)
+
+    # 7. Fast Path: Check Telegram file_id cache before acquiring lock
+    cache_key = make_tts_audio_cache_key(
+        tts_text,
+        gender=gender,
+        speed=speed,
+        tts_model=tts_model,
+    )
+    cached_file_id = get_cached_telegram_file_id(cache_key)
+    if cached_file_id:
+        logger.info(
+            "⚡ Instant channel narration from cached file_id for '%s' (post_id=%s, key=%s)",
+            chat.title,
+            post.message_id,
+            cache_key[:12],
+        )
+        sent = False
+        try:
+            res = await safe_send(lambda fid=cached_file_id, rm=reply_markup: context.bot.send_voice(
+                chat_id=chat.id,
+                voice=fid,
+                caption=caption,
+                reply_markup=rm,
+                reply_to_message_id=post.message_id,
+            ))
+            if res is not None:
+                sent = True
+        except Exception as reply_err:
+            logger.debug(
+                "reply_to_message_id failed in channel %s (%s); trying direct post: %s",
+                chat.title,
+                chat.id,
+                reply_err,
+            )
+
+        if not sent:
+            res = await safe_send(lambda fid=cached_file_id, rm=reply_markup: context.bot.send_voice(
+                chat_id=chat.id,
+                voice=fid,
+                caption=caption,
+                reply_markup=rm,
+            ))
+            if res is not None:
+                sent = True
+
+        if sent:
+            _metric_inc("channel_narrations")
+            _metric_inc("tts_cache_hit")
+            return
+        else:
+            invalidate_cached_telegram_file_id(cache_key)
+
+    # 8. Acquire per-channel lock to prevent overlapping voice generation
     lock = await _get_channel_lock(chat.id)
     if lock.locked():
         logger.info("Channel %s has active narration in progress; queuing...", chat.title)
@@ -194,25 +291,6 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     async with lock:
         file_path: str | None = None
         try:
-            gender = (
-                bot_setting_raw_cached("channel_narrator_gender", os.environ.get("CHANNEL_NARRATOR_GENDER", "female"))
-                if "bot_setting_raw_cached" in globals()
-                else os.environ.get("CHANNEL_NARRATOR_GENDER", "female")
-            ).strip().lower()
-            speed_str = (
-                bot_setting_raw_cached("channel_narrator_speed", os.environ.get("CHANNEL_NARRATOR_SPEED", "1.0"))
-                if "bot_setting_raw_cached" in globals()
-                else os.environ.get("CHANNEL_NARRATOR_SPEED", "1.0")
-            )
-            try:
-                speed = float(speed_str)
-            except Exception:
-                speed = 1.0
-            tts_model = (
-                bot_setting_raw_cached("channel_narrator_model", os.environ.get("CHANNEL_NARRATOR_MODEL", "auto"))
-                if "bot_setting_raw_cached" in globals()
-                else os.environ.get("CHANNEL_NARRATOR_MODEL", "auto")
-            ).strip().lower()
             file_path = _make_temp_ogg()
 
             logger.info(
@@ -238,22 +316,6 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 logger.warning("Empty audio generated for channel post %s in %s", post.message_id, chat.title)
                 return
 
-            caption = (
-                f"🗣️ {BOT_TAG}"
-                if "BOT_TAG" in globals() and BOT_TAG
-                else "🗣️ សំឡេងអានអត្ថបទ (Audio Narration)"
-            )
-
-            show_buttons = (
-                bot_setting_bool_cached("channel_narrator_show_buttons", False)
-                if "bot_setting_bool_cached" in globals()
-                else os.environ.get("CHANNEL_NARRATOR_SHOW_BUTTONS", "0").lower() in ("1", "true", "yes")
-            )
-            reply_markup = None
-            if show_buttons and "get_audio_action_kb" in globals() and "_tts_text_cache_set" in globals():
-                text_cache_id = _tts_text_cache_set(tts_text)
-                reply_markup = get_audio_action_kb(text_cache_id, tts_text, gender=gender, speed=speed, model=tts_model)
-
             # Try replying to the post first so it anchors directly in discussion threads
             sent = False
             try:
@@ -276,12 +338,17 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
             if not sent:
                 # Direct post without reply_to_message_id if replying is disabled in channel
-                await safe_send(lambda ab=audio_bytes, rm=reply_markup: context.bot.send_voice(
+                res = await safe_send(lambda ab=audio_bytes, rm=reply_markup: context.bot.send_voice(
                     chat_id=chat.id,
                     voice=io.BytesIO(ab),
                     caption=caption,
                     reply_markup=rm,
                 ))
+                if res is not None:
+                    sent = True
+
+            if res is not None and getattr(res, "voice", None) and res.voice.file_id and cache_key:
+                set_cached_telegram_file_id(cache_key, res.voice.file_id)
 
             _metric_inc("channel_narrations")
             logger.info("Successfully published channel narration for '%s' (post_id=%s)", chat.title, post.message_id)
@@ -294,8 +361,6 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if file_path:
                 with suppress(FileNotFoundError, Exception):
                     os.remove(file_path)
-            import gc
-            gc.collect()
 
 
 __all__ = [
