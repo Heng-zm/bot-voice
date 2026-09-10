@@ -289,6 +289,11 @@ async def lifespan(app_instance: FastAPI) -> AsyncGenerator[None, None]:
     try:
         yield
     finally:
+        with suppress(Exception):
+            from app.services.telegram.dispatcher import get_telegram_dispatcher
+
+            await get_telegram_dispatcher().drain(timeout=10.0)
+
         for t in tasks:
             t.cancel()
         for t in tasks:

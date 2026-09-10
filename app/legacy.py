@@ -1903,103 +1903,14 @@ async def _read_limited_webhook_body(req: FastAPIRequest, max_body: int) -> byte
 
 
 async def _process_telegram_webhook_request(req: FastAPIRequest, path_secret_token: str | None = None):
-    """Validate, parse, claim, and process a Telegram webhook update safely."""
-    if "_run_state_bot_mode" in globals() and _run_state_bot_mode() != "WEBHOOK":
-        webhook_logger.info("Webhook update ignored because BOT_MODE=%s.", _run_state_bot_mode())
-        return _FastJSONResponse({"status": "ignored", "reason": "not_webhook_mode"}, status_code=200)
+    """Validate, parse, claim, and process a Telegram webhook update safely.
 
-    expected_secret = _runtime_webhook_secret_token()
-    if not expected_secret:
-        webhook_logger.error("Rejected Telegram webhook request because TELEGRAM_WEBHOOK_SECRET_TOKEN is not configured.")
-        raise HTTPException(status_code=503, detail="Telegram webhook secret is not configured.")
-    if path_secret_token is not None and not hmac.compare_digest(str(path_secret_token), expected_secret):
-        webhook_logger.warning("Rejected Telegram webhook request with invalid path secret from %s", req.client.host if req.client else "unknown")
-        raise HTTPException(status_code=403, detail="Invalid webhook path secret.")
+    Delegates to the modern TelegramDispatcher for non-blocking asynchronous
+    worker dispatch, timing-safe authentication, and lease management.
+    """
+    from app.services.telegram.dispatcher import get_telegram_dispatcher
 
-    got_secret = (req.headers.get("X-Telegram-Bot-Api-Secret-Token") or "").strip()
-    if not hmac.compare_digest(got_secret, expected_secret):
-        webhook_logger.warning("Rejected Telegram webhook request with invalid secret header from %s", req.client.host if req.client else "unknown")
-        raise HTTPException(status_code=403, detail="Invalid webhook secret.")
-
-    app_obj = globals().get("telegram_application") or globals().get("_TELEGRAM_APP")
-    if app_obj is None or not bool(globals().get("_TELEGRAM_APP_READY", False)):
-        webhook_logger.warning("Telegram webhook rejected with 503 because application is not ready yet.")
-        raise HTTPException(status_code=503, detail="Telegram application is starting. Please retry.")
-    if not _telegram_should_process_webhook_update():
-        webhook_logger.info("Webhook update acknowledged by standby instance; active owner=%s", _telegram_leader_snapshot().get("owner"))
-        return _FastJSONResponse({"status": "ignored", "reason": "standby_instance"}, status_code=200)
-
-    max_body = min(_web_max_content_length(), 2 * 1024 * 1024)
-    try:
-        raw = await _read_limited_webhook_body(req, max_body)
-        data = _json_loads_fast(raw)
-        if not isinstance(data, dict):
-            raise ValueError("Telegram webhook JSON must be an object.")
-        update = Update.de_json(data, app_obj.bot)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        # Telegram itself should never send malformed JSON. Acknowledge an
-        # invalid payload once so a permanently bad body cannot create a retry
-        # storm, while keeping real handler failures retryable below.
-        error_id = secrets.token_hex(6)
-        webhook_logger.warning(
-            "Invalid Telegram webhook payload ignored error_id=%s: %s",
-            error_id,
-            exc,
-            exc_info=True,
-        )
-        return _FastJSONResponse({
-            "status": "ignored",
-            "reason": "invalid_payload",
-            "reference": error_id,
-        }, status_code=200)
-
-    update_id = getattr(update, "update_id", None)
-    claimed = False
-    claim_token: str | None = None
-    try:
-        claim_state, claim_token = await _telegram_webhook_update_claim(
-            update_id,
-            include_token=True,
-        )
-        if claim_state == "completed":
-            webhook_logger.info("Completed Telegram webhook update ignored update_id=%s", update_id)
-            _metric_inc("replay_dropped")
-            return _FastJSONResponse({"status": "ok", "duplicate": True}, status_code=200)
-        if claim_state == "processing":
-            response = _FastJSONResponse({"status": "retry", "reason": "already_processing"}, status_code=503)
-            response.headers["Retry-After"] = "2"
-            return response
-        claimed = claim_state == "claimed"
-        await app_obj.process_update(update)
-        await _telegram_webhook_update_complete(
-            update_id,
-            claim_token=claim_token,
-        )
-    except Exception as exc:
-        if claimed:
-            await _telegram_webhook_update_release(
-                update_id,
-                claim_token=claim_token,
-            )
-        error_id = secrets.token_hex(6)
-        webhook_logger.error(
-            "Telegram webhook processing failed error_id=%s update_id=%s: %s",
-            error_id,
-            update_id,
-            exc,
-            exc_info=True,
-        )
-        response = _FastJSONResponse({
-            "status": "retry",
-            "reason": "processing_failed",
-            "reference": error_id,
-        }, status_code=503)
-        response.headers["Retry-After"] = "2"
-        return response
-
-    return _FastJSONResponse({"status": "ok"}, status_code=200)
+    return await get_telegram_dispatcher().dispatch_webhook_request(req, path_secret_token)
 
 
 @app.post("/tg-webhook-{secret_token}", include_in_schema=False)
@@ -7652,6 +7563,11 @@ def _runtime_performance_snapshot(light: bool = False) -> dict:
             "api_rate_limit": _run_state_api_rate_limit(),
             "api_rate_window_s": _run_state_api_rate_window(),
             "allowed_updates": _telegram_allowed_updates(),
+            "dispatcher": (
+                __import__("app.services.telegram.dispatcher", fromlist=["get_telegram_dispatcher"])
+                .get_telegram_dispatcher()
+                .get_metrics()
+            ),
         },
         "semaphores": {
             "tts": _semaphore_snapshot(_TTS_CHUNK_SEMAPHORE, MAX_CONCURRENT_TTS_USERS),

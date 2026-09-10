@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from app import legacy
 from app.core.config import get_detected_webhook_url
 from app.core.security import validate_api_key
+from app.services.telegram.dispatcher import get_telegram_dispatcher
 
 router = APIRouter(tags=["Telegram Webhook & Lifecycle"])
 
@@ -22,7 +23,20 @@ async def telegram_webhook(
     path_token: str | None = None,
 ) -> Any:
     """Handle incoming Telegram webhook updates with deduplication and state tracking."""
-    return await legacy._process_telegram_webhook_request(request, path_token)
+    return await get_telegram_dispatcher().dispatch_webhook_request(request, path_token)
+
+
+@router.get("/dispatcher/metrics")
+@router.get("/dispatcher-status")
+async def get_dispatcher_metrics(
+    request: Request,
+    x_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """Return real-time metrics and worker health of the Telegram update dispatcher."""
+    if not validate_api_key(x_api_key, authorization):
+        raise HTTPException(status_code=401, detail="Unauthorized: Valid API key required")
+    return JSONResponse(get_telegram_dispatcher().get_metrics())
 
 
 @router.get("/setup-webhook")

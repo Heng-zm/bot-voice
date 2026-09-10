@@ -46,10 +46,16 @@ def classify_callback(
         ("audio_tts:", "audio_tts"),
         ("needs_", "needs_admin"),
         ("api_", "api_admin"),
+        ("rtadmin_", "admin"),
         ("admin_", "admin"),
         ("cfg_cat:", "admin"),
         ("cfg_set:", "admin"),
         ("cfg_", "admin"),
+        ("sched_", "sched"),
+        ("bc_", "broadcast"),
+        ("users_", "users"),
+        ("user_", "users"),
+        ("history_", "users"),
     )
     for prefix, action in prefix_actions:
         if value.startswith(prefix):
