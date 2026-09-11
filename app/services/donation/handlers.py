@@ -6,6 +6,7 @@ import html
 import io
 import logging
 import os
+import threading
 import time
 from typing import Any
 
@@ -18,11 +19,16 @@ from app.services.donation.khqr import (
     DEFAULT_BAKONG_ACCOUNT_ID,
     DEFAULT_BAKONG_MERCHANT_NAME,
     BakongKHQR,
+    generate_khqr_string,
     get_khqr_qr_image,
 )
 from app.services.donation.store import TIER_DETAILS, donation_store
 
 logger = logging.getLogger(__name__)
+
+# Concurrency & deduplication guards for admin approvals
+_PROCESSED_APPROVALS: set[str] = set()
+_APPROVALS_LOCK = threading.Lock()
 
 
 def is_admin_user(user_id: int) -> bool:
@@ -84,11 +90,110 @@ def _build_donation_menu_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
-async def cmd_donate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Display interactive donation tiers and voluntary support message."""
-    user = update.effective_user
-    user_name = html.escape(user.first_name or "បង") if user else "បង"
+async def _send_khqr_screen(
+    *,
+    chat_id: int,
+    user_name: str,
+    amount: float,
+    tier_key: str,
+    tier_title: str,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Reusable generator and sender for Bakong KHQR payment interface."""
+    khqr_text, bill_no = BakongKHQR.generate(
+        amount=amount,
+        currency="USD",
+        user_id=chat_id,
+        tier=tier_key,
+    )
 
+    caption = (
+        f"🇰🇭 <b>Bakong KHQR — {tier_title}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>ឈ្មោះគណនី:</b> <code>{DEFAULT_BAKONG_MERCHANT_NAME}</code>\n"
+        f"🆔 <b>Bakong ID:</b> <code>{DEFAULT_BAKONG_ACCOUNT_ID}</code>\n"
+        f"💵 <b>ចំនួនទឹកប្រាក់:</b> <b>${amount:.2f} USD</b>\n"
+        f"🧾 <b>លេខវិក្កយបត្រ:</b> <code>{bill_no}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📲 <b>របៀបបង់ប្រាក់៖</b>\n"
+        f"1. បើកកម្មវិធីធនាគាររបស់បង (ABA, ACLEDA, Wing, Canadia, Bakong...)\n"
+        f"2. ស្កេនរូបភាព QR កូដនេះ\n"
+        f"3. ផ្ទៀងផ្ទាត់ចំនួន <b>${amount:.2f}</b> រួចចុចផ្ទេរប្រាក់\n"
+        f"4. បន្ទាប់ពីផ្ទេររួច សូមចុចប៊ូតុង <b>«✅ ខ្ញុំបានផ្ទេរប្រាក់រួចរាល់»</b> ខាងក្រោម\n\n"
+        f"✨ <i>Bot នឹងផ្ញើសារសំឡេងអរគុណពិសេសជូនបងភ្លាមៗ!</i>"
+    )
+
+    action_buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ ខ្ញុំបានផ្ទេរប្រាក់រួចរាល់", callback_data=f"donate_paid:{tier_key}:{bill_no}:{amount:.2f}")],
+        [InlineKeyboardButton("🔙 ជ្រើសរើសចំនួនផ្សេង", callback_data="donate_menu")],
+    ])
+
+    qr_bytes = await get_khqr_qr_image(khqr_text)
+    if qr_bytes and context.bot:
+        try:
+            photo_file = io.BytesIO(qr_bytes)
+            photo_file.name = "khqr.png"
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=photo_file,
+                caption=caption,
+                reply_markup=action_buttons,
+                parse_mode="HTML",
+            )
+            return
+        except Exception as e:
+            logger.warning("Could not send QR as photo, falling back to message text: %s", e)
+
+    # Fallback text with KHQR payload if photo transmission fails
+    fallback_text = (
+        f"{caption}\n\n"
+        f"📋 <b>KHQR Payload String:</b>\n"
+        f"<pre><code>{khqr_text}</code></pre>"
+    )
+    if context.bot:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=fallback_text,
+            reply_markup=action_buttons,
+            parse_mode="HTML",
+        )
+
+
+async def cmd_donate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Display interactive donation tiers or direct custom amount QR code."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+
+    user_name = html.escape(user.first_name or "បង")
+
+    # Check for direct custom amount argument e.g. /donate 5 or /coffee 2.50
+    args = context.args or []
+    if args:
+        try:
+            custom_amount = float(args[0].replace("$", "").replace(",", ""))
+            if 0.1 <= custom_amount <= 5000.0:
+                tier_key = "custom"
+                if custom_amount in (1.0, 2.0, 3.0, 5.0, 10.0, 20.0):
+                    for k, v in TIER_DETAILS.items():
+                        if v["amount"] == custom_amount:
+                            tier_key = k
+                            break
+                tier_title = f"ឧបត្ថម្ភ ${custom_amount:.2f} USD"
+                await _send_khqr_screen(
+                    chat_id=user.id,
+                    user_name=user_name,
+                    amount=custom_amount,
+                    tier_key=tier_key,
+                    tier_title=tier_title,
+                    context=context,
+                )
+                return
+        except ValueError:
+            pass
+
+    # Standard donation menu
     text = (
         f"☕ <b>សូមស្វាគមន៍មកកាន់ការឧបត្ថម្ភ Bot Voice!</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
@@ -100,16 +205,15 @@ async def cmd_donate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"🏆 <b>ឈ្មោះក្នុងតារាងកិត្តិយស</b> (/donors — Hall of Fame)\n"
         f"🏅 <b>Badge កិត្តិយស</b> (🥇, 🥈, 🥉, ⭐ Supporter)\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"👇 <b>សូមជ្រើសរើសចំនួនដែលបងចង់ឧបត្ថម្ភ៖</b>"
+        f"👇 <b>សូមជ្រើសរើសចំនួនដែលបងចង់ឧបត្ថម្ភ៖</b>\n"
+        f"<i>(ឬវាយ <code>/donate ចំនួនទឹកប្រាក់</code> ឧទាហរណ៍ <code>/donate 5</code>)</i>"
     )
 
-    msg = update.effective_message
-    if msg:
-        await msg.reply_text(
-            text,
-            reply_markup=_build_donation_menu_markup(),
-            parse_mode="HTML",
-        )
+    await msg.reply_text(
+        text,
+        reply_markup=_build_donation_menu_markup(),
+        parse_mode="HTML",
+    )
 
 
 async def cmd_donors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -200,7 +304,19 @@ async def cmd_adddonor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     tier = args[2].lower() if len(args) > 2 and args[2].lower() in TIER_DETAILS else "coffee"
-    custom_name = " ".join(args[3:]) if len(args) > 3 else f"User {donor_uid}"
+    custom_name = " ".join(args[3:]) if len(args) > 3 else ""
+
+    # Attempt to auto-fetch donor's actual name from Telegram if omitted
+    if not custom_name and context.bot:
+        try:
+            chat = await context.bot.get_chat(donor_uid)
+            if chat and chat.first_name:
+                custom_name = chat.first_name
+        except Exception:
+            pass
+
+    if not custom_name:
+        custom_name = f"User {donor_uid}"
 
     # 1. Record in store
     record = await donation_store.record_donation(
@@ -266,7 +382,7 @@ async def cmd_testblessing(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 chat_id=user.id,
                 voice=voice_file,
                 caption=(
-                    f"🎙️ <b>AI Voice Blessing Preview</b> ({tier_info.get('title')})\n\n"
+                    f"🎙️ <b>AI Voice Blessing Preview</b> ({tier_info.get('title', tier)})\n\n"
                     f"📜 <b>អត្ថបទ៖</b> <i>«{script}»</i>"
                 ),
                 parse_mode="HTML",
@@ -334,64 +450,14 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         tier_title = tier_info["title"]
 
         await query.answer(f"កំពុងបង្កើត Bakong KHQR សម្រាប់ {tier_title}...")
-
-        khqr_text, bill_no = BakongKHQR.generate(
+        await _send_khqr_screen(
+            chat_id=user_id,
+            user_name=user_name,
             amount=amount,
-            currency="USD",
-            user_id=user_id,
-            tier=tier_key,
+            tier_key=tier_key,
+            tier_title=tier_title,
+            context=context,
         )
-
-        caption = (
-            f"🇰🇭 <b>Bakong KHQR — {tier_title}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 <b>ឈ្មោះគណនី:</b> <code>{DEFAULT_BAKONG_MERCHANT_NAME}</code>\n"
-            f"🆔 <b>Bakong ID:</b> <code>{DEFAULT_BAKONG_ACCOUNT_ID}</code>\n"
-            f"💵 <b>ចំនួនទឹកប្រាក់:</b> <b>${amount:.2f} USD</b>\n"
-            f"🧾 <b>លេខវិក្កយបត្រ:</b> <code>{bill_no}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"📲 <b>របៀបបង់ប្រាក់៖</b>\n"
-            f"1. បើកកម្មវិធីធនាគាររបស់បង (ABA, ACLEDA, Wing, Canadia, Bakong...)\n"
-            f"2. ស្កេនរូបភាព QR កូដនេះ\n"
-            f"3. ផ្ទៀងផ្ទាត់ចំនួន <b>${amount:.2f}</b> រួចចុចផ្ទេរប្រាក់\n"
-            f"4. បន្ទាប់ពីផ្ទេររួច សូមចុចប៊ូតុង <b>«✅ ខ្ញុំបានផ្ទេរប្រាក់រួចរាល់»</b> ខាងក្រោម\n\n"
-            f"✨ <i>Bot នឹងផ្ញើសារសំឡេងអរគុណពិសេសជូនបងភ្លាមៗ!</i>"
-        )
-
-        action_buttons = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ ខ្ញុំបានផ្ទេរប្រាក់រួចរាល់", callback_data=f"donate_paid:{tier_key}:{bill_no}")],
-            [InlineKeyboardButton("🔙 ជ្រើសរើសចំនួនផ្សេង", callback_data="donate_menu")],
-        ])
-
-        # Attempt to render QR Image
-        qr_bytes = await get_khqr_qr_image(khqr_text)
-        if qr_bytes and query.message and context.bot:
-            try:
-                photo_file = io.BytesIO(qr_bytes)
-                photo_file.name = "khqr.png"
-                await context.bot.send_photo(
-                    chat_id=user_id,
-                    photo=photo_file,
-                    caption=caption,
-                    reply_markup=action_buttons,
-                    parse_mode="HTML",
-                )
-                return
-            except Exception as e:
-                logger.warning("Could not send QR as photo, falling back to message text: %s", e)
-
-        # Fallback text with KHQR payload if photo fails
-        fallback_text = (
-            f"{caption}\n\n"
-            f"📋 <b>KHQR Payload String:</b>\n"
-            f"<pre><code>{khqr_text}</code></pre>"
-        )
-        if query.message:
-            await query.message.reply_text(
-                fallback_text,
-                reply_markup=action_buttons,
-                parse_mode="HTML",
-            )
         return
 
     # -------------------------------------------------------------------------
@@ -401,29 +467,35 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         parts = data.split(":")
         tier_key = parts[1] if len(parts) > 1 else "coffee"
         bill_no = parts[2] if len(parts) > 2 else ""
-        tier_info = TIER_DETAILS.get(tier_key, TIER_DETAILS["coffee"])
-        amount = tier_info["amount"]
-        tier_title = tier_info["title"]
+        try:
+            amount = float(parts[3]) if len(parts) > 3 else TIER_DETAILS.get(tier_key, {}).get("amount", 1.0)
+        except ValueError:
+            amount = 1.0
+
+        tier_info = TIER_DETAILS.get(tier_key, {})
+        tier_title = tier_info.get("title", f"${amount:.2f}")
 
         await query.answer("អរគុណបង! ប្រព័ន្ធកំពុងផ្ទៀងផ្ទាត់...", show_alert=False)
 
         # Acknowledge to user
-        await query.message.reply_text(
-            f"🙏 <b>សូមអរគុណបង {user_name}!</b>\n\n"
-            f"ប្រព័ន្ធបានទទួលការជូនដំណឹងពីការឧបត្ថម្ភ <b>{tier_title} (${amount:.2f})</b> រួចរាល់ហើយ។\n"
-            f"បន្ទាប់ពីការផ្ទៀងផ្ទាត់ Bot នឹងផ្ញើសារសំឡេងអរគុណ និងជូនពរពិសេស (AI Voice Blessing) ជូនបងភ្លាមៗ! ❤️☕\n\n"
-            f"🏆 <i>ពិនិត្យមើលតារាងកិត្តិយស៖</i> /donors",
-            parse_mode="HTML",
-        )
+        if query.message:
+            await query.message.reply_text(
+                f"🙏 <b>សូមអរគុណបង {user_name}!</b>\n\n"
+                f"ប្រព័ន្ធបានទទួលការជូនដំណឹងពីការឧបត្ថម្ភ <b>{tier_title} (${amount:.2f})</b> រួចរាល់ហើយ។\n"
+                f"បន្ទាប់ពីការផ្ទៀងផ្ទាត់ Bot នឹងផ្ញើសារសំឡេងអរគុណ និងជូនពរពិសេស (AI Voice Blessing) ជូនបងភ្លាមៗ! ❤️☕\n\n"
+                f"🏆 <i>ពិនិត្យមើលតារាងកិត្តិយស៖</i> /donors",
+                parse_mode="HTML",
+            )
 
         # Notify Administrators with 1-click Approval
+        approval_token = f"{user_id}:{amount:.2f}:{tier_key}:{bill_no}"
         admin_markup = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
                     "💖 អនុម័ត & ផ្ញើសំឡេងជូនពរ",
-                    callback_data=f"donate_approve:{user_id}:{amount}:{tier_key}",
+                    callback_data=f"donate_approve:{approval_token}",
                 ),
-                InlineKeyboardButton("❌ បដិសេធ", callback_data=f"donate_reject:{user_id}"),
+                InlineKeyboardButton("❌ បដិសេធ", callback_data=f"donate_reject:{user_id}:{bill_no}"),
             ],
         ])
 
@@ -455,24 +527,50 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     # -------------------------------------------------------------------------
-    # 5. Admin Approves Donation
+    # 5. Admin Approves Donation (with duplicate protection)
     # -------------------------------------------------------------------------
     if data.startswith("donate_approve:"):
         if not is_admin_user(user_id):
             await query.answer("⛔ មានតែ Admin ប៉ុណ្ណោះដែលអាចអនុម័តបាន!", show_alert=True)
             return
 
-        parts = data.split(":")
-        donor_uid = int(parts[1])
-        amount = float(parts[2])
-        tier_key = parts[3] if len(parts) > 3 else "coffee"
+        payload_part = data[len("donate_approve:"):]
+        parts = payload_part.split(":")
+        donor_uid = int(parts[0])
+        amount = float(parts[1])
+        tier_key = parts[2] if len(parts) > 2 else "coffee"
+        bill_no = parts[3] if len(parts) > 3 else f"{donor_uid}_{amount}"
+
+        # Deduplication guard: ensure donation is processed only once
+        dedup_key = f"{donor_uid}:{bill_no}"
+        with _APPROVALS_LOCK:
+            if dedup_key in _PROCESSED_APPROVALS:
+                await query.answer("⚠️ ការឧបត្ថម្ភនេះត្រូវបានអនុម័តរួចរាល់ហើយ!", show_alert=True)
+                if query.message:
+                    await query.message.edit_text(
+                        f"{query.message.text}\n\n"
+                        f"ℹ️ <b>ការឧបត្ថម្ភនេះត្រូវបានអនុម័តរួចរាល់ជាស្ថាពរហើយ។</b>",
+                        parse_mode="HTML",
+                    )
+                return
+            _PROCESSED_APPROVALS.add(dedup_key)
 
         await query.answer("កំពុងអនុម័ត និងបង្កើតសំឡេងជូនពរ...")
+
+        # Resolve donor's real name
+        donor_name = "បង"
+        if context.bot:
+            try:
+                chat = await context.bot.get_chat(donor_uid)
+                if chat and chat.first_name:
+                    donor_name = chat.first_name
+            except Exception:
+                pass
 
         # 1. Record donation
         record = await donation_store.record_donation(
             user_id=donor_uid,
-            full_name=f"User {donor_uid}",
+            full_name=donor_name if donor_name != "បង" else f"User {donor_uid}",
             amount=amount,
             tier=tier_key,
             blessing_sent=True,
@@ -484,7 +582,7 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             blessing_ok = await deliver_voice_blessing(
                 context.bot,
                 user_id=donor_uid,
-                donor_name="បង",
+                donor_name=donor_name,
                 tier=tier_key,
                 amount=amount,
             )

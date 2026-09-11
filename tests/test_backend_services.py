@@ -830,13 +830,15 @@ class DonationAndKHQRTests(unittest.IsolatedAsyncioTestCase):
 
         # Test vector for CRC-16/CCITT-FALSE
         self.assertEqual("29B1", crc16_ccitt("123456789"))
+        self.assertEqual("E5CC", crc16_ccitt("botvoice@nbc"))
+        self.assertEqual("D057", crc16_ccitt("chuo_kimheng@bkrt"))
 
     def test_generate_khqr_string(self) -> None:
         from app.services.donation.khqr import generate_khqr_string
 
         khqr = generate_khqr_string(
-            account_id="botvoice@nbc",
-            merchant_name="BOT VOICE",
+            account_id="chuo_kimheng@bkrt",
+            merchant_name="CHUO KIMHENG",
             merchant_city="Phnom Penh",
             amount=1.00,
             currency="USD",
@@ -844,6 +846,8 @@ class DonationAndKHQRTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(khqr.startswith("000201010212"))
         self.assertIn("bakong@nbc", khqr)
+        self.assertIn("chuo_kimheng@bkrt", khqr)
+        self.assertIn("CHUO KIMHENG", khqr)
         self.assertIn("5303840", khqr)  # USD
         self.assertIn("54041.00", khqr)  # $1.00
         self.assertIn("6304", khqr)  # CRC tag
@@ -868,7 +872,7 @@ class DonationAndKHQRTests(unittest.IsolatedAsyncioTestCase):
             store_file = os.path.join(tmpdir, "test_donations.json")
             store = DonationStore(file_path=store_file)
 
-            # Record two donors
+            # Record donors
             await store.record_donation(user_id=101, full_name="Donor One", amount=2.0, tier="milktea")
             await store.record_donation(user_id=102, full_name="Donor Two", amount=5.0, tier="server")
             await store.record_donation(user_id=101, full_name="Donor One", amount=1.0, tier="coffee")
@@ -884,6 +888,16 @@ class DonationAndKHQRTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("🥇", top[0]["badge"])
             self.assertEqual(101, top[1]["user_id"])
             self.assertEqual("🥈", top[1]["badge"])
+
+            # Test cache invalidation upon new donation
+            await store.record_donation(user_id=103, full_name="Donor Three", amount=10.0, tier="patron")
+            new_stats = await store.get_donation_stats()
+            self.assertEqual(18.0, new_stats["total_usd"])
+            self.assertEqual(3, new_stats["total_donors"])
+
+            new_top = await store.get_top_supporters(10)
+            self.assertEqual(103, new_top[0]["user_id"])
+            self.assertEqual("🥇", new_top[0]["badge"])
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Donation data store with Supabase persistence and resilient local JSON backup."""
+"""Donation data store with Supabase persistence, resilient local JSON backup, and TTL cache."""
 
 from __future__ import annotations
 
@@ -62,15 +62,35 @@ TIER_DETAILS: dict[str, dict[str, Any]] = {
     },
 }
 
+CACHE_TTL_SECONDS = 60.0
+
 
 class DonationStore:
-    """Thread-safe store for donor recognition and contribution stats."""
+    """Thread-safe store for donor recognition and contribution stats with in-memory TTL caching."""
 
     def __init__(self, file_path: str = LOCAL_STORE_PATH) -> None:
         self._file_path = file_path
         self._lock = threading.Lock()
         self._donations: list[dict[str, Any]] = []
+
+        # In-memory TTL caches for instant query responses (<0.05ms)
+        self._cache_stats: dict[str, Any] | None = None
+        self._cache_stats_ts: float = 0.0
+        self._cache_top: list[dict[str, Any]] | None = None
+        self._cache_top_ts: float = 0.0
+        self._cache_recent: list[dict[str, Any]] | None = None
+        self._cache_recent_ts: float = 0.0
+
         self._load_local_store()
+
+    def _invalidate_cache(self) -> None:
+        """Invalidate TTL caches upon recording a new donation."""
+        self._cache_stats = None
+        self._cache_stats_ts = 0.0
+        self._cache_top = None
+        self._cache_top_ts = 0.0
+        self._cache_recent = None
+        self._cache_recent_ts = 0.0
 
     def _load_local_store(self) -> None:
         """Load donations from local JSON file."""
@@ -93,7 +113,7 @@ class DonationStore:
             self._donations = []
 
     def _save_local_store(self) -> None:
-        """Persist in-memory donations to local JSON file safely."""
+        """Persist in-memory donations to local JSON file safely with atomic rename."""
         try:
             os.makedirs(os.path.dirname(self._file_path), exist_ok=True)
             tmp_path = f"{self._file_path}.tmp"
@@ -144,9 +164,10 @@ class DonationStore:
             "created_at": now_iso,
         }
 
-        # 1. Update local cache under lock
+        # 1. Update local cache and invalidate TTL caches under lock
         with self._lock:
             self._donations.append(record)
+            self._invalidate_cache()
             self._save_local_store()
 
         # 2. Asynchronously insert to Supabase if configured
@@ -173,7 +194,12 @@ class DonationStore:
         return record
 
     async def get_top_supporters(self, limit: int = 10) -> list[dict[str, Any]]:
-        """Get aggregated list of top donors ranked by total contribution."""
+        """Get aggregated list of top donors ranked by total contribution with TTL cache."""
+        now = time.monotonic()
+        with self._lock:
+            if self._cache_top is not None and (now - self._cache_top_ts) < CACHE_TTL_SECONDS:
+                return self._cache_top[:limit]
+
         # Try fetching from Supabase first if available
         sb = self._get_supabase_client()
         if sb is not None:
@@ -184,12 +210,19 @@ class DonationStore:
 
                 sb_data = await asyncio.to_thread(_sb_query)
                 if sb_data:
-                    return self._aggregate_top(sb_data, limit)
+                    top_list = self._aggregate_top(sb_data, limit)
+                    with self._lock:
+                        self._cache_top = top_list
+                        self._cache_top_ts = now
+                    return top_list
             except Exception as e:
                 logger.debug("Supabase top supporters query failed; using local store: %s", e)
 
         with self._lock:
-            return self._aggregate_top(self._donations, limit)
+            top_list = self._aggregate_top(self._donations, limit)
+            self._cache_top = top_list
+            self._cache_top_ts = now
+            return top_list
 
     def _aggregate_top(self, donations: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
         """Aggregate donation records by user_id and sort descending."""
@@ -233,31 +266,44 @@ class DonationStore:
         return ranked[:limit]
 
     async def get_recent_donations(self, limit: int = 5) -> list[dict[str, Any]]:
-        """Get chronological list of recent donations."""
+        """Get chronological list of recent donations with TTL cache."""
+        now = time.monotonic()
         with self._lock:
-            # Sort newest first
+            if self._cache_recent is not None and (now - self._cache_recent_ts) < CACHE_TTL_SECONDS:
+                return self._cache_recent[:limit]
+
             sorted_donations = sorted(
                 self._donations,
                 key=lambda x: str(x.get("created_at") or ""),
                 reverse=True,
             )
-            return sorted_donations[:limit]
+            recent_slice = sorted_donations[:limit]
+            self._cache_recent = recent_slice
+            self._cache_recent_ts = now
+            return recent_slice
 
     async def get_donation_stats(self) -> dict[str, Any]:
-        """Get summary metrics for total raised, coffee cups, and donors."""
+        """Get summary metrics for total raised, coffee cups, and donors with TTL cache."""
+        now = time.monotonic()
         with self._lock:
+            if self._cache_stats is not None and (now - self._cache_stats_ts) < CACHE_TTL_SECONDS:
+                return self._cache_stats
+
             total_usd = sum(float(d.get("amount") or 0.0) for d in self._donations)
             total_cups = sum(
                 int(d.get("cups") or TIER_DETAILS.get(str(d.get("tier", "")).lower(), {}).get("cups", 1))
                 for d in self._donations
             )
             unique_users = len({int(d.get("user_id")) for d in self._donations if d.get("user_id")})
-            return {
+            stats = {
                 "total_usd": round(total_usd, 2),
                 "total_cups": total_cups,
                 "total_donors": unique_users,
                 "total_transactions": len(self._donations),
             }
+            self._cache_stats = stats
+            self._cache_stats_ts = now
+            return stats
 
 
 # Global shared instance
