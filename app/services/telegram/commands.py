@@ -51,7 +51,10 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <code>/myprefs</code> — មើល និងកែប្រែការកំណត់សំឡេង\n"
         "• <code>/ttsmodel</code> — ជ្រើសរើសម៉ូដែលសំឡេង (Kiri, Gemini AI, Edge)\n"
         "• <code>/unlock</code> — ដោះសោររង់ចាំ\n"
-        "• <code>/clear</code> — សម្អាតប្រវត្តិសន្ទនា\n"
+        "• <code>/clear</code> — សម្អាតប្រវត្តិសន្ទនា\n\n"
+        "7️⃣ <b>ឧបត្ថម្ភ & តារាងកិត្តិយស:</b>\n"
+        "• <code>/donate</code> — ឧបត្ថម្ភកាហ្វេជួយទ្រទ្រង់ដំណើរការ Bot\n"
+        "• <code>/donors</code> — មើលតារាងកិត្តិយសអ្នកឧបត្ថម្ភ\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "💬 <i>ផ្ញើសារ ឬសំណួររបស់អ្នកមកឥឡូវនេះបាន!</i>"
     )
@@ -60,7 +63,8 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("⚙️ ការកំណត់ / Settings", callback_data="welcome_profile"),
          InlineKeyboardButton("🤖 ម៉ូដែល TTS", callback_data="show_tts_model")],
         [InlineKeyboardButton("📢 Channel", url="https://t.me/m11mmm112"),
-         InlineKeyboardButton("☕ Support Creator", url="https://pay-coffee-topaz.vercel.app/")],
+         InlineKeyboardButton("☕ ឧបត្ថម្ភកាហ្វេ", callback_data="donate_menu")],
+        [InlineKeyboardButton("🏆 តារាងកិត្តិយស (/donors)", callback_data="donate_halloffame")],
     ])
     await safe_send(lambda: msg.reply_text(help_text, parse_mode="HTML", reply_markup=kb))
 

@@ -13826,7 +13826,8 @@ async def _send_welcome_message(message: Any) -> Any:
          InlineKeyboardButton("🤖 ម៉ូដែល TTS", callback_data="show_tts_model")],
         [InlineKeyboardButton("🎚️ ល្បឿនសំឡេង", callback_data="show_speed"),
          InlineKeyboardButton("📢 Channel", url="https://t.me/m11mmm112")],
-        [InlineKeyboardButton("☕ Support Creator", url="https://pay-coffee-topaz.vercel.app/")],
+        [InlineKeyboardButton("☕ ឧបត្ថម្ភកាហ្វេ / Buy Coffee", callback_data="donate_menu"),
+         InlineKeyboardButton("🏆 តារាងកិត្តិយស", callback_data="donate_halloffame")],
     ])
 
     if photo_file_id:

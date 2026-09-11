@@ -280,10 +280,34 @@ async def cmd_donors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     lines.append("💖 <i>សូមថ្លែងអំណរគុណយ៉ាងជ្រាលជ្រៅដល់បងប្អូនទាំងអស់ដែលបានចូលរួមចំណែកគាំទ្រ Bot Voice!</i>")
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("☕ ចូលរួមឧបត្ថម្ភ / Buy Coffee", callback_data="donate_menu")],
+        [
+            InlineKeyboardButton("☕ ចូលរួមឧបត្ថម្ភ / Buy Coffee", callback_data="donate_menu"),
+            InlineKeyboardButton("🔄 ធ្វើបច្ចុប្បន្នភាព / Refresh", callback_data="donate_halloffame_refresh"),
+        ],
     ])
 
     text = "\n".join(lines)
+    query = update.callback_query
+    if query and query.message:
+        if query.message.photo:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            if context.bot and user:
+                await context.bot.send_message(
+                    chat_id=user.id,
+                    text=text,
+                    reply_markup=keyboard,
+                    parse_mode="HTML",
+                )
+            return
+        try:
+            await query.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+
     msg = update.effective_message
     if msg:
         await msg.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
@@ -440,6 +464,19 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             f"👇 <b>សូមជ្រើសរើសចំនួនដែលបងចង់ឧបត្ថម្ភ៖</b>"
         )
         if query.message:
+            if query.message.photo:
+                try:
+                    await query.message.delete()
+                except Exception:
+                    pass
+                if context.bot:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=text,
+                        reply_markup=_build_donation_menu_markup(),
+                        parse_mode="HTML",
+                    )
+                return
             try:
                 await query.message.edit_text(
                     text,
@@ -457,8 +494,12 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # -------------------------------------------------------------------------
     # 2. View Hall of Fame from callback
     # -------------------------------------------------------------------------
-    if data == "donate_halloffame":
-        await query.answer()
+    if data in ("donate_halloffame", "donate_halloffame_refresh"):
+        if data == "donate_halloffame_refresh":
+            donation_store._invalidate_cache()
+            await query.answer("🔄 បានធ្វើបច្ចុប្បន្នភាពតារាងកិត្តិយសរួចរាល់!")
+        else:
+            await query.answer()
         await cmd_donors(update, context)
         return
 
