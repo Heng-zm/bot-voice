@@ -17382,14 +17382,13 @@ def _hf_tts_record_failure(exc: BaseException | str) -> None:
         _HF_TTS_FAILURES += 1
         previous_until = _HF_TTS_DISABLED_UNTIL
 
-        is_timeout = (
-            isinstance(exc, (TimeoutError, asyncio.TimeoutError))
-            or "timeout" in str(exc).lower()
-            or "timed out" in str(exc).lower()
-        )
+        msg_low = str(exc).lower()
+        is_space_crashed = "invalid state" in msg_low or "runtime_error" in msg_low or "build_error" in msg_low
         if _hf_tts_is_quota_error(exc):
             cooldown = HF_TTS_QUOTA_COOLDOWN_S
-        elif "queue is full" in str(exc).lower():
+        elif is_space_crashed:
+            cooldown = HF_TTS_COOLDOWN_S
+        elif "queue is full" in msg_low:
             cooldown = HF_TTS_COOLDOWN_S
         elif is_timeout:
             cooldown = HF_TTS_COOLDOWN_S
@@ -17894,6 +17893,9 @@ def _hf_tts_predict_should_retry(exc: Exception) -> bool:
         "unauthorized",
         "forbidden",
         "invalid token",
+        "invalid state",
+        "runtime_error",
+        "build_error",
     )
     if any(token in msg for token in non_retryable):
         return False
