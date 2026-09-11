@@ -19,12 +19,16 @@
 ```
 
 <p align="center">
+  <b>Production-focused UI • Async-first architecture • Khmer-first experience • Telegram-native interactions</b>
+</p>
+
+<p align="center">
   <b>High-speed studio-grade voice synthesis in Khmer & 10+ languages, image OCR transcription, intelligent multimodal chat, hardened non-blocking webhook dispatcher, and full-featured broadcast scheduling.</b>
 </p>
 
 <p align="center">
   <a href="#-key-features"><b>✨ Key Features</b></a> •
-  <a href="#-telegram-ui-experience-preview"><b>📱 Bot UI Preview</b></a> •
+  <a href="#-telegram-ui-experience-preview"><b>📱 UI Preview</b></a> •
   <a href="#-quickstart-in-3-steps"><b>⚡ Quickstart</b></a> •
   <a href="#-easy-server-deployment"><b>☁️ Deployment</b></a> •
   <a href="#-telegram-dispatcher--performance-architecture"><b>🛡️ Dispatcher Engine</b></a> •
@@ -56,111 +60,126 @@
 
 ## 📱 Telegram UI Experience Preview
 
-A tour of the polished, interactive surfaces Bot Voice presents across private chats, public channels, and the admin console.
+A clean, compact UI system designed around Telegram's native interaction patterns: short labels, clear hierarchy, inline actions, and minimal visual noise.
 
-### 1. Interactive Voice Message Playback
+### 1. Voice Playback
 
-```
-╭──────────────────────────────────────────────────────────╮
-│  🗣️  Bot Voice                                    ✓✓ 09:41 │
-├──────────────────────────────────────────────────────────┤
-│   ▶️  ━━━━━━━●───────────────────────────  0:07 / 0:24     │
-│   🎧  waveform ▂▃▅▇▆▄▂▁▂▃▅▇▆▃▂▁▃▅▇▆▄▂▁▂▃▅▇                 │
-├───────────────────────────┬──────────────────────────────┤
-│  👩 ស្រី (Female)  ✅       │  👨 ប្រុស (Male)              │
-├───────────────────────────┼──────────────────────────────┤
-│  🐢 0.75x   ⚡ 1.00x ✅     │  🚀 1.50x        ⏫ 2.00x      │
-├───────────────────────────┴──────────────────────────────┤
-│  🎙️ ម៉ូដែល: Kiri (Cambodia) ✅   🌐 Edge Neural   🧠 Gemini │
-╰──────────────────────────────────────────────────────────╯
-```
-
-### 2. Live Synthesis Progress Indicator
-
-```
-╭──────────────────────────────────────────────────────────╮
-│  🗣️  កំពុងបម្លែងអត្ថបទទៅជាសំឡេង...                            │
-│  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░  68%              │
-│  ម៉ូដែល: Kiri (Cambodia)  •  អត្ថបទ 142 តួអក្សរ               │
-│  ⏱️ Est. 0.4s remaining   •   🔁 Tier 1 → Tier 2 fallback   │
-╰──────────────────────────────────────────────────────────╯
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  Bot Voice                                      ✓✓ 09:41   │
+│                                                             │
+│  ▶  ━━━━━━━━━━━●━━━━━━━━━━━━━━━  0:07 / 0:24             │
+│     ▂▃▅▇▆▄▂▁▂▃▅▇▆▃▂▁▃▅▇▆▄▂▁▂▃▅▇                         │
+│                                                             │
+│  Voice                                                      │
+│  [ ស្រី · Female ✓ ]        [ ប្រុស · Male ]              │
+│                                                             │
+│  Speed                                                      │
+│  [ 0.75× ]  [ 1.00× ✓ ]  [ 1.50× ]  [ 2.00× ]            │
+│                                                             │
+│  Model                                                      │
+│  Kiri · Cambodia                    Edge Neural · Gemini   │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 3. Vision OCR & Document Extraction
+### 2. Live Synthesis Progress
 
-```
-╭──────────────────────────────────────────────────────────╮
-│  🔍  Vision OCR — Image Received                          │
-│  📎 receipt_scan.jpg  •  1.2 MB  •  Gemini 2.0 Flash       │
-├──────────────────────────────────────────────────────────┤
-│  ✅ Extracted Text (page 1/1)                              │
-│  ┌────────────────────────────────────────────────────┐  │
-│  │ Invoice #04821 — Total: $128.50                     │  │
-│  │ Date: 2026-09-08   Vendor: Golden Palace Co.        │  │
-│  └────────────────────────────────────────────────────┘  │
-│  🔊 [ Listen to Extraction ]   📋 [ Copy Text ]  🌐 [ Translate ] │
-╰──────────────────────────────────────────────────────────╯
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  កំពុងបម្លែងអត្ថបទទៅជាសំឡេង...                              │
+│                                                             │
+│  ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱  68%             │
+│                                                             │
+│  Kiri · Cambodia        142 characters       ~0.4s         │
+│  Tier 1 → Tier 2 fallback                                  │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 4. Channel Auto-Narrator (Public Post)
+### 3. Vision OCR
 
-```
-╭──────────────────────────────────────────────────────────╮
-│  📢  Khmer Daily News                             ✓ 08:00  │
-├──────────────────────────────────────────────────────────┤
-│  ព័ត៌មានថ្មីៗពីទីក្រុងភ្នំពេញ ប្រចាំថ្ងៃនេះ...                        │
-│  🔗 link cleaned  •  #tags stripped  •  #notts respected    │
-│  🔊 [▶ ═══════════════════════════════ 0:31]  Auto-Voice   │
-╰──────────────────────────────────────────────────────────╯
-```
-
-### 5. Telegram In-App Admin Control Center (`/admin`)
-
-```
-╭─────────────────────────────────────────────────────────────╮
-│  🎛️  ប្រព័ន្ធគ្រប់គ្រង Bot Voice  •  Admin Dashboard             │
-├───────────────────────────┬───────────────────────────────┤
-│  ⚙️  ការកំណត់ទូទៅ            │  🚀  Audio Cache & CDN         │
-│      General Settings       │      12,480 entries cached    │
-├───────────────────────────┼───────────────────────────────┤
-│  ⚡  Performance Tuning     │  📢  Broadcast & Schedule      │
-│      Workers: 32 / Queue 100│      Next run: 09:00 (UTC+7)  │
-├───────────────────────────┼───────────────────────────────┤
-│  👥  User CRM & Lookup      │  📊  Live Metrics & Latency    │
-│      4,213 active users     │      p99: 47ms                │
-├───────────────────────────┴───────────────────────────────┤
-│  🚨  Error Center & Health Probes     🟢 All systems normal  │
-╰─────────────────────────────────────────────────────────────╯
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  Vision OCR                              Image received     │
+│                                                             │
+│  receipt_scan.jpg · 1.2 MB · Gemini 2.0 Flash              │
+│                                                             │
+│  Extracted text                              Page 1 / 1    │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │ Invoice #04821 — Total: $128.50                       │  │
+│  │ Date: 2026-09-08 · Vendor: Golden Palace Co.          │  │
+│  └───────────────────────────────────────────────────────┘  │
+│                                                             │
+│  [ Listen ]        [ Copy ]        [ Translate ]             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 6. Web Dashboard — At a Glance
+### 4. Channel Auto-Narrator
 
-```
-╭──────────────────────────────────────────────────────────╮
-│  🌐  Bot Voice Web Dashboard                    🟢 Online  │
-├───────────────────────┬───────────────┬───────────────────┤
-│  Requests / min        │  Cache Hit %   │  Avg Latency      │
-│      1,284             │     94.7%      │     46ms          │
-├───────────────────────┴───────────────┴───────────────────┤
-│  📈  Latency (last 60 min)                                 │
-│   80┤            ╭╮                                        │
-│   60┤   ╭╮   ╭╮  ││  ╭╮                                    │
-│   40┤╭╮ ││╭╮ ││╭╮││╭╮││╭╮╭╮                                 │
-│   20┤││╭╯│││╰─╯│││╰╯│││╰╯│╰─╮                               │
-│    0└┴┴┴──┴┴┴───┴┴┴──┴┴┴───┴──────────────────────────────  │
-╰──────────────────────────────────────────────────────────╯
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  Khmer Daily News                              ✓ 08:00     │
+│                                                             │
+│  ព័ត៌មានថ្មីៗពីទីក្រុងភ្នំពេញ ប្រចាំថ្ងៃនេះ...                │
+│                                                             │
+│  link cleaned · tags stripped · #notts respected           │
+│                                                             │
+│  🔊  ▶  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  0:31                │
+│      Auto-Voice                                              │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-#### 🎨 UI Highlights
+### 5. Telegram Admin Center
 
-| Surface | What It Shows | Why It Matters |
+```text
+┌──────────────────────────────────────────────────────────────┐
+│  ប្រព័ន្ធគ្រប់គ្រង Bot Voice                    Admin        │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  General Settings              Audio Cache & CDN             │
+│  Runtime configuration         12,480 entries                │
+│                                                              │
+│  Performance                   Broadcast & Schedule          │
+│  Workers 32 · Queue 100        Next run · 09:00 UTC+7        │
+│                                                              │
+│  User CRM & Lookup             Live Metrics                   │
+│  4,213 active users            p99 · 47 ms                   │
+│                                                              │
+│  Error Center & Health                         ● Normal      │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 6. Web Dashboard
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  Bot Voice Web Dashboard                         ● Online   │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Requests / min        Cache Hit %        Avg Latency       │
+│       1,284                94.7%                46ms         │
+│                                                             │
+│  Latency · Last 60 minutes                                  │
+│                                                             │
+│  80 ┤          ╭╮                                            │
+│  60 ┤   ╭╮  ╭╮ ││  ╭╮                                       │
+│  40 ┤╭╮ ││╭╮││╭╯││╭╮││╭╮                                    │
+│  20 ┤││╭╯│││╰╯│││╰╯│╰─╮                                    │
+│   0 └┴┴┴──┴┴───┴┴┴──┴────────────────────────────────────  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### UI Design Principles
+
+| Surface | Updated UI Direction | User Benefit |
 | :--- | :--- | :--- |
-| Voice Playback Card | Waveform, speed presets, voice/gender toggle | Users tune output without retyping commands |
-| Synthesis Progress | Live percentage, tier fallback path, ETA | Transparency during the 4-tier TTS pipeline |
-| OCR Result Card | Extracted text block + listen/copy/translate actions | Turns a photo into usable text or audio in one tap |
-| Channel Narrator | Cleaned post preview + inline voice bar | Keeps channel posts skimmable and listenable |
-| Admin Dashboard | 2-column grid of live operational controls | One tap to purge cache, tune workers, or broadcast |
-| Web Dashboard | Real-time throughput, hit-rate, latency sparkline | At-a-glance health without opening logs |
+| Voice Playback | Compact hierarchy, native-style controls, grouped voice/speed/model settings | Faster voice selection without command-heavy flows |
+| Synthesis Progress | Single progress surface with model, character count, ETA, and fallback state | Clear feedback without clutter |
+| OCR Result | Document-style result card with three primary actions | Extract → listen/copy/translate in one place |
+| Channel Narrator | Minimal post preview with a compact audio player | Keeps channel content readable and listenable |
+| Admin Center | Structured 2-column control grid with status-first information | Faster operational decisions |
+| Web Dashboard | KPI cards + focused latency visualization | Immediate visibility into system health |
+
+> **UI goal:** Keep the interface clean and production-oriented. Prioritize hierarchy, whitespace, concise labels, native Telegram interaction patterns, and clear status feedback over decorative elements.
 
 ---
 
@@ -197,7 +216,7 @@ python -m app.main
 
 ## ☁️ Easy Server Deployment
 
-### 🌟 Option 1: Anajak Cloud VPS (https://anajak.cloud/)
+### Option 1: Anajak Cloud VPS (https://anajak.cloud/)
 
 > [!TIP]
 > **Recommended & Fastest**: Deploying via the Pterodactyl Web Panel takes under 1 minute and bypasses SSH password/key setup completely.
@@ -227,7 +246,7 @@ chmod +x anajak-deploy.sh
 
 ---
 
-### 🐳 Option 2: Docker Compose
+### Option 2: Docker Compose
 Deploy in a production-ready isolated container with automated health management:
 ```bash
 cp .env.example .env
@@ -237,7 +256,7 @@ docker compose logs -f
 
 ---
 
-### ⚡ Option 3: Automated Linux VPS Script (`deploy.sh`)
+### Option 3: Automated Linux VPS Script (`deploy.sh`)
 Works out-of-the-box on **Ubuntu 22.04 / 24.04, Debian 12, CentOS, AlmaLinux**:
 ```bash
 chmod +x deploy.sh
@@ -246,7 +265,7 @@ chmod +x deploy.sh
 
 ---
 
-### ⚙️ Option 4: Linux Systemd Service
+### Option 4: Linux Systemd Service
 ```bash
 sudo cp bot-voice.service /etc/systemd/system/bot-voice.service
 sudo nano /etc/systemd/system/bot-voice.service
