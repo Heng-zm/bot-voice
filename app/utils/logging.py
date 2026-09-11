@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 TRANSIENT_NETWORK_ERRORS = (
@@ -29,15 +30,32 @@ def is_transient_network_error(exc_or_msg: Any) -> bool:
 class TelegramPollingNetworkFilter(logging.Filter):
     """Demote transient Telegram upstream polling network errors to clean warnings without tracebacks."""
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._last_logged: float = 0.0
+        self._suppressed_count: int = 0
+
     def filter(self, record: logging.LogRecord) -> bool:
         msg_str = str(record.msg or "")
         if "Exception happened while polling for updates" in msg_str or "Exception happened in polling action" in msg_str:
             exc = record.exc_info[1] if record.exc_info else None
             exc_str = str(exc or "")
             if is_transient_network_error(exc_str):
+                now = time.monotonic()
+                if now - self._last_logged < 20.0:
+                    self._suppressed_count += 1
+                    return False
+
+                suppressed_msg = (
+                    f" (+{self._suppressed_count} consecutive retries suppressed)"
+                    if self._suppressed_count > 0
+                    else ""
+                )
+                self._suppressed_count = 0
+                self._last_logged = now
                 record.levelno = logging.WARNING
                 record.levelname = "WARNING"
-                record.msg = f"Telegram polling transient network hiccup ({exc_str or 'NetworkError'}); retrying automatically in background..."
+                record.msg = f"Telegram polling transient network hiccup ({exc_str or 'NetworkError'}){suppressed_msg}; retrying automatically in background..."
                 record.exc_info = None
         return True
 

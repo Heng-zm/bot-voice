@@ -8,7 +8,80 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-GEMINI_MODEL_DEFAULT = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash").strip() or "gemini-3.6-flash"
+def normalize_gemini_model(model: str | None) -> str:
+    """Normalize model identifier, resolving discontinued or fictitious model aliases to real production models."""
+    if not model or not isinstance(model, str):
+        return "gemini-2.5-flash"
+    m = model.strip()
+    if not m:
+        return "gemini-2.5-flash"
+    lower = m.lower()
+    if lower in (
+        "gemini-3.6-flash",
+        "gemini-3.6",
+        "gemini-3-flash",
+        "gemini-3.0-flash",
+        "gemini-3.5-flash",
+        "models/gemini-3.6-flash",
+    ):
+        return "gemini-2.5-flash"
+    if lower in ("gemini-3.1-pro-preview", "gemini-3-pro", "models/gemini-3.1-pro-preview"):
+        return "gemini-2.5-pro"
+    return m
+
+
+GEMINI_MODEL_DEFAULT = normalize_gemini_model(os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash")
+
+_GEMINI_CLIENT_POOL: list[Any] = []
+_ACTIVE_POOL_INDEX: int = 0
+
+
+def parse_gemini_api_keys(raw_key: str | None) -> list[str]:
+    """Parse comma, semicolon, or newline-separated API keys."""
+    if not raw_key or not isinstance(raw_key, str):
+        return []
+    import re
+    tokens = [k.strip() for k in re.split(r"[,;\n\r\t]+", raw_key) if k.strip()]
+    seen = set()
+    result = []
+    for k in tokens:
+        if k not in seen:
+            seen.add(k)
+            result.append(k)
+    return result
+
+
+def get_primary_gemini_api_key(raw_key: str | None = None) -> str:
+    """Get first valid Gemini API key from parameter or environment."""
+    raw = raw_key or os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
+    keys = parse_gemini_api_keys(raw)
+    return keys[0] if keys else ""
+
+
+def register_gemini_client(client: Any) -> None:
+    """Register a client into the pool for key-rotation failover."""
+    if client is not None and client not in _GEMINI_CLIENT_POOL:
+        _GEMINI_CLIENT_POOL.append(client)
+
+
+def get_next_gemini_client(current_client: Any = None) -> Any | None:
+    """Rotate to the next registered client in pool if available."""
+    global _ACTIVE_POOL_INDEX
+    if len(_GEMINI_CLIENT_POOL) <= 1:
+        return None
+    _ACTIVE_POOL_INDEX = (_ACTIVE_POOL_INDEX + 1) % len(_GEMINI_CLIENT_POOL)
+    next_client = _GEMINI_CLIENT_POOL[_ACTIVE_POOL_INDEX]
+    if next_client is current_client and len(_GEMINI_CLIENT_POOL) > 1:
+        _ACTIVE_POOL_INDEX = (_ACTIVE_POOL_INDEX + 1) % len(_GEMINI_CLIENT_POOL)
+        next_client = _GEMINI_CLIENT_POOL[_ACTIVE_POOL_INDEX]
+    return next_client
+
+
+def clear_gemini_client_pool() -> None:
+    """Clear pool (useful for testing or re-initialization)."""
+    global _GEMINI_CLIENT_POOL, _ACTIVE_POOL_INDEX
+    _GEMINI_CLIENT_POOL.clear()
+    _ACTIVE_POOL_INDEX = 0
 
 
 def is_retryable_gemini_error(exc: BaseException | str) -> bool:
@@ -70,16 +143,21 @@ def generate_content_with_fallback(
     preferred_model: str = GEMINI_MODEL_DEFAULT,
     config: Any = None,
 ) -> Any:
-    """Generate content with automatic fallback across models if quota, transient error, or unavailable."""
+    """Generate content with automatic fallback across models and API key rotation if quota or transient error."""
     if client is None:
         raise RuntimeError("Gemini client is not configured.")
 
+    register_gemini_client(client)
+    active_client = client
+
+    norm_preferred = normalize_gemini_model(preferred_model)
     candidates = [
-        preferred_model,
-        "gemini-3.6-flash",
+        norm_preferred,
         "gemini-2.5-flash",
-        "gemini-3.1-pro-preview",
         "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",
     ]
     unique_models: list[str] = []
     for m in candidates:
@@ -92,12 +170,36 @@ def generate_content_with_fallback(
             kwargs: dict[str, Any] = {"model": model_name, "contents": contents}
             if config is not None:
                 kwargs["config"] = config
-            return client.models.generate_content(**kwargs)
+            return active_client.models.generate_content(**kwargs)
         except Exception as exc:
             last_exc = exc
             err_text = str(exc)
             err_lower = err_text.lower()
-            if is_retryable_gemini_error(exc) or any(
+            is_quota = any(
+                q in err_lower
+                for q in ("429", "resource_exhausted", "quota", "rate limit", "ratelimit")
+            )
+
+            # If quota exhausted (429), attempt rotating API key client if pool has alternatives
+            if is_quota and len(_GEMINI_CLIENT_POOL) > 1:
+                alt_client = get_next_gemini_client(active_client)
+                if alt_client is not None and alt_client is not active_client:
+                    logger.warning(
+                        "Gemini model %s quota hit (429); rotating to alternate API key in pool...",
+                        model_name,
+                    )
+                    active_client = alt_client
+                    try:
+                        kwargs = {"model": model_name, "contents": contents}
+                        if config is not None:
+                            kwargs["config"] = config
+                        return active_client.models.generate_content(**kwargs)
+                    except Exception as alt_exc:
+                        last_exc = alt_exc
+                        err_text = str(alt_exc)
+                        err_lower = err_text.lower()
+
+            if is_retryable_gemini_error(last_exc) or any(
                 k in err_lower
                 for k in (
                     "404",
@@ -114,10 +216,10 @@ def generate_content_with_fallback(
                 logger.warning(
                     "Gemini model %s failed (%s); falling back to next available model...",
                     model_name,
-                    exc,
+                    last_exc,
                 )
                 continue
-            raise exc
+            raise last_exc
 
     if last_exc:
         raise last_exc
@@ -149,9 +251,15 @@ def detect_image_mime(path: str) -> str:
 
 __all__ = [
     "GEMINI_MODEL_DEFAULT",
+    "clear_gemini_client_pool",
     "detect_image_mime",
     "detect_image_mime_from_bytes",
     "extract_gemini_text",
     "generate_content_with_fallback",
+    "get_next_gemini_client",
+    "get_primary_gemini_api_key",
     "is_retryable_gemini_error",
+    "normalize_gemini_model",
+    "parse_gemini_api_keys",
+    "register_gemini_client",
 ]

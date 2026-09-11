@@ -64,7 +64,7 @@ async def ai_assistant_endpoint(
     if not message:
         raise HTTPException(status_code=400, detail="Missing required field: 'message'")
 
-    model = body.get("model", getattr(legacy, "GEMINI_MODEL", "gemini-3.6-flash"))
+    model = body.get("model", getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash"))
     system_prompt = body.get(
         "system_instruction",
         "You are an intelligent, helpful, and polite multilingual AI assistant. "
@@ -127,7 +127,7 @@ async def translate_endpoint(
 
     target_lang = body.get("target_language", "Khmer")
     gemini_client = getattr(legacy, "_gemini", None)
-    preferred_model = getattr(legacy, "GEMINI_MODEL", "gemini-3.6-flash")
+    preferred_model = getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash")
     if gemini_client is not None:
         loop = asyncio.get_running_loop()
         prompt = f"Translate the following text accurately and naturally into {target_lang}. Return only the translated text without extra explanation:\n\n{text}"
@@ -177,7 +177,7 @@ async def summarize_endpoint(
         raise HTTPException(status_code=400, detail="Missing required field: 'text'")
 
     gemini_client = getattr(legacy, "_gemini", None)
-    preferred_model = getattr(legacy, "GEMINI_MODEL", "gemini-3.6-flash")
+    preferred_model = getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash")
     if gemini_client is not None:
         loop = asyncio.get_running_loop()
         prompt = f"Summarize the following text into clear, actionable bullet points preserving key details:\n\n{text}"
@@ -247,7 +247,7 @@ async def narrate_endpoint(
         raise HTTPException(status_code=422, detail="Could not extract readable article text from URL.")
 
     gemini_client = getattr(legacy, "_gemini", None)
-    preferred_model = body.get("model", getattr(legacy, "GEMINI_MODEL", "gemini-3.6-flash"))
+    preferred_model = body.get("model", getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash"))
     summary = summarize_article_with_ai(title, body_text, gemini_client, preferred_model)
 
     gender = str(body.get("gender", "female") or "female").lower()

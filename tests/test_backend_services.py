@@ -308,7 +308,7 @@ class GeminiServicesTests(unittest.TestCase):
             attempts.append(model)
             if model == "gemini-2.0-flash":
                 raise RuntimeError(
-                    "404 NOT_FOUND. This model models/gemini-2.0-flash is no longer available. Please update your code to use models/gemini-3.6-flash"
+                    "404 NOT_FOUND. This model models/gemini-2.0-flash is no longer available. Please update your code to use models/gemini-2.5-flash"
                 )
             return MagicMock(text="Success from modern model")
 

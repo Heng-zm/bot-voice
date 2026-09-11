@@ -5,6 +5,7 @@ These are live runtime handlers; app.legacy now contains compatibility wrappers 
 
 from __future__ import annotations
 
+import html
 import re
 import threading
 
@@ -94,7 +95,7 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
             extract_gemini_text,
             generate_content_with_fallback,
         )
-        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-3.6-flash")
+        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash")
         def _call_ai():
             return generate_content_with_fallback(
                 legacy._gemini,
@@ -108,6 +109,9 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_send(lambda: msg.reply_text("⚠️ មិនអាចឆ្លើយបានទេ (អាចដោយសារគោលការណ៍សុវត្ថិភាព AI ឬគ្មានចម្លើយ)។"))
             return
         
+        ai_header = f"🤖 <b>AI Assistant:</b>\n\n{html.escape(ai_text)}"
+        await safe_send(lambda: msg.reply_text(ai_header, parse_mode="HTML"))
+
         from app.services.telegram.media import process_tts_for_text
         await process_tts_for_text(update, context, ai_text, user_id)
     except Exception as exc:
@@ -146,7 +150,7 @@ async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             extract_gemini_text,
             generate_content_with_fallback,
         )
-        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-3.6-flash")
+        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash")
         def _call_ai():
             return generate_content_with_fallback(
                 legacy._gemini,
@@ -159,6 +163,10 @@ async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _release_tts_request(user_id)
             await safe_send(lambda: msg.reply_text("⚠️ មិនអាចបកប្រែបានទេ (អាចដោយសារគោលការណ៍សុវត្ថិភាព AI ឬគ្មានចម្លើយ)។"))
             return
+
+        trans_header = f"🌐 <b>បកប្រែជាភាសាខ្មែរ:</b>\n\n{html.escape(khmer_text)}"
+        await safe_send(lambda: msg.reply_text(trans_header, parse_mode="HTML"))
+
         from app.services.telegram.media import process_tts_for_text
         await process_tts_for_text(update, context, khmer_text, user_id)
     except Exception as exc:
@@ -197,7 +205,7 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
             extract_gemini_text,
             generate_content_with_fallback,
         )
-        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-3.6-flash")
+        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash")
         def _call_ai():
             return generate_content_with_fallback(
                 legacy._gemini,
@@ -210,6 +218,10 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _release_tts_request(user_id)
             await safe_send(lambda: msg.reply_text("⚠️ មិនអាចសង្ខេបបានទេ (អាចដោយសារគោលការណ៍សុវត្ថិភាព AI ឬគ្មានចម្លើយ)។"))
             return
+
+        summary_header = f"📝 <b>សង្ខេបអត្ថបទ (Summary):</b>\n\n{html.escape(summary_text)}"
+        await safe_send(lambda: msg.reply_text(summary_header, parse_mode="HTML"))
+
         from app.services.telegram.media import process_tts_for_text
         await process_tts_for_text(update, context, summary_text, user_id)
     except Exception as exc:
@@ -266,7 +278,7 @@ async def cmd_narrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop = asyncio.get_running_loop()
         from app import legacy
         gemini_client = getattr(legacy, "_gemini", None)
-        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-3.6-flash")
+        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash")
 
         from app.services.ai.article_reader import (
             MIN_ARTICLE_CHARS,

@@ -508,7 +508,7 @@ def summarize_article_with_ai(
     title: str,
     body_text: str,
     gemini_client: Any = None,
-    preferred_model: str = "gemini-3.6-flash",
+    preferred_model: str = "gemini-2.5-flash",
 ) -> str:
     """Generate an executive, spoken audio-friendly news bulletin summary from article text."""
     if not body_text:
@@ -559,7 +559,7 @@ def summarize_article_with_ai(
 def summarize_url_with_ai(
     url: str,
     gemini_client: Any = None,
-    preferred_model: str = "gemini-3.6-flash",
+    preferred_model: str = "gemini-2.5-flash",
 ) -> tuple[str, str]:
     """Extract and summarize a news story directly using Gemini when web scraping is blocked by anti-bot/WAF."""
     if not url:

@@ -9973,7 +9973,7 @@ ADMIN_IDS:  set[int]    = set()
 # These are real code defaults, not required Render/env values.  Operators can
 # still override them with env variables, but a missing OCR_PROVIDER,
 # OCR_AUTO_PREFER_PROVIDER, or GEMINI_MODEL now boots with Gemini OCR selected.
-DEFAULT_GEMINI_MODEL             = "gemini-3.6-flash"  # default Gemini model
+DEFAULT_GEMINI_MODEL             = "gemini-2.5-flash"  # default Gemini model
 DEFAULT_GEMINI_AUDIO_MODEL       = "gemini-2.5-flash-preview-tts"  # default Gemini TTS audio model
 DEFAULT_AI_PROVIDER              = "gemini"            # gemini | hf
 DEFAULT_OCR_PROVIDER             = "gemini"            # gemini | auto | hf
@@ -10036,7 +10036,7 @@ PAGED_TTS_SEND_DELAY_S     = _env_float("PAGED_TTS_SEND_DELAY_S", float(_perf_de
 #   client.predict(text, "kiri", 0.6, 0.95, 1.1, 2048, api_name="/lambda")
 # Keep Edge TTS as fallback because public Spaces can cold-start, sleep, or rate-limit.
 TTS_PROVIDER             = (os.environ.get("TTS_PROVIDER") or "auto").strip().lower()       # auto | edge | hf_space | khmer_hf_space
-KHMER_TTS_PROVIDER       = (os.environ.get("KHMER_TTS_PROVIDER") or "hf_space").strip().lower()  # hf_space | edge
+KHMER_TTS_PROVIDER       = (os.environ.get("KHMER_TTS_PROVIDER") or "edge").strip().lower()      # edge | hf_space
 HF_TTS_SPACE             = (os.environ.get("HF_TTS_SPACE") or "mrrtmob/khmer-tts").strip()
 HF_TTS_API_NAME          = (os.environ.get("HF_TTS_API_NAME") or "/lambda").strip()
 HF_TTS_TOKEN             = (os.environ.get("HF_TTS_TOKEN") or os.environ.get("HF_TOKEN") or "").strip()
@@ -11619,7 +11619,15 @@ def ask_gemini_ocr(image_data: bytes, mime_type: str = "image/jpeg", user_prompt
             "- If the image contains zero readable text, return exactly: NOTEXT.\n"
             "- Return only the extracted text without introductory or concluding remarks."
         )
-    models_to_try = [GEMINI_MODEL, "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+    from app.services.ai.gemini import normalize_gemini_model
+    models_to_try = [
+        normalize_gemini_model(GEMINI_MODEL),
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",
+    ]
     unique_models: list[str] = []
     for m in models_to_try:
         if m and m not in unique_models:
@@ -11947,22 +11955,40 @@ def _init_clients() -> None:
                 redis_client = None
 
 
-    gemini_sdk_available = bool(GEMINI_API_KEY and GEMINI_MODEL and _load_google_genai_sdk())
-    if GEMINI_API_KEY and GEMINI_MODEL and gemini_sdk_available:
+    from app.services.ai.gemini import (
+        get_primary_gemini_api_key,
+        normalize_gemini_model,
+        parse_gemini_api_keys,
+        register_gemini_client,
+    )
+    GEMINI_MODEL = normalize_gemini_model(GEMINI_MODEL)
+    gemini_keys = parse_gemini_api_keys(GEMINI_API_KEY)
+    gemini_sdk_available = bool(gemini_keys and GEMINI_MODEL and _load_google_genai_sdk())
+    if gemini_keys and GEMINI_MODEL and gemini_sdk_available:
         try:
-            _gemini = genai.Client(api_key=GEMINI_API_KEY)
-            logger.info(f"Gemini legacy fallback initialised (model: {GEMINI_MODEL}).")
+            primary_key = gemini_keys[0]
+            _gemini = genai.Client(api_key=primary_key)
+            register_gemini_client(_gemini)
+            for extra_key in gemini_keys[1:]:
+                try:
+                    alt_client = genai.Client(api_key=extra_key)
+                    register_gemini_client(alt_client)
+                except Exception as extra_err:
+                    logger.debug("Failed to register alternate Gemini API key: %s", extra_err)
+            logger.info(
+                f"Gemini client pool initialised with {len(gemini_keys)} key(s) (model: {GEMINI_MODEL})."
+            )
         except Exception as e:
             logger.error(f"Gemini init failed: {e}")
             _gemini = None
     else:
         _gemini = None
         missing = []
-        if not GEMINI_API_KEY:
+        if not gemini_keys:
             missing.append("GEMINI_API_KEY")
         if not GEMINI_MODEL:
             GEMINI_MODEL = DEFAULT_GEMINI_MODEL
-        if GEMINI_API_KEY and not gemini_sdk_available:
+        if gemini_keys and not gemini_sdk_available:
             missing.append("google-genai package")
         logger.info("Gemini disabled (%s). Using Hugging Face for chat/OCR when available.", ", ".join(missing) or "not configured")
 
@@ -17384,10 +17410,11 @@ def _hf_tts_record_failure(exc: BaseException | str) -> None:
 
         msg_low = str(exc).lower()
         is_space_crashed = "invalid state" in msg_low or "runtime_error" in msg_low or "build_error" in msg_low
+        is_timeout = "timeout" in msg_low or "timed out" in msg_low or isinstance(exc, (TimeoutError, asyncio.TimeoutError))
         if _hf_tts_is_quota_error(exc):
             cooldown = HF_TTS_QUOTA_COOLDOWN_S
         elif is_space_crashed:
-            cooldown = HF_TTS_COOLDOWN_S
+            cooldown = max(1800.0, HF_TTS_COOLDOWN_S * 6)
         elif "queue is full" in msg_low:
             cooldown = HF_TTS_COOLDOWN_S
         elif is_timeout:
@@ -19280,8 +19307,10 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
                     await asyncio.to_thread(_write_cached_audio_to_path, output_path, stdout_data)
             return stdout_data
         else:
+            await _terminate_subprocess(proc, "edge-tts FFmpeg")
             logger.warning("FFmpeg conversion returned code %s; delivering direct audio.", proc.returncode)
     except Exception as exc:
+        await _terminate_subprocess(proc, "edge-tts FFmpeg")
         logger.warning("FFmpeg subprocess execution exception (%s); delivering direct audio.", exc)
 
     if output_path:
@@ -24492,7 +24521,7 @@ def get_bot_config_ai_kb(settings: dict[str, str]) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Gemini:", callback_data="noop"),
          InlineKeyboardButton(_mark(active_gemini, "gemini-2.5-flash"), callback_data="cfg_set:GEMINI_MODEL:gemini-2.5-flash"),
          InlineKeyboardButton(_mark(active_gemini, "gemini-1.5-flash"), callback_data="cfg_set:GEMINI_MODEL:gemini-1.5-flash"),
-         InlineKeyboardButton(_mark(active_gemini, "gemini-3.6-flash"), callback_data="cfg_set:GEMINI_MODEL:gemini-3.6-flash")],
+         InlineKeyboardButton(_mark(active_gemini, "gemini-2.0-flash"), callback_data="cfg_set:GEMINI_MODEL:gemini-2.0-flash")],
         # Voice Gender
         [InlineKeyboardButton("Voice:", callback_data="noop"),
          InlineKeyboardButton(_mark(active_gender, "female") + " 👩", callback_data="cfg_set:DEFAULT_GENDER:female"),

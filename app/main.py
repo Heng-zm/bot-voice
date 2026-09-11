@@ -40,6 +40,10 @@ from app.core.security import (
     validate_api_key as _validate_api_key,
 )
 
+from app.utils.logging import install_telegram_polling_filter
+
+install_telegram_polling_filter()
+
 logger = logging.getLogger("app.webhook")
 
 
