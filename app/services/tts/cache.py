@@ -82,6 +82,11 @@ def _get_redis_client() -> Any | None:
     try:
         import sys
         legacy = sys.modules.get("app.legacy")
+        if legacy is None:
+            try:
+                from app import legacy
+            except Exception:
+                legacy = None
         if legacy is not None:
             client = getattr(legacy, "redis_client", None)
             if client is not None:

@@ -30,6 +30,8 @@ BROWSER_USER_AGENTS = [
     ),
     # Social crawler (whitelisted by Cloudflare, Incapsula, and major publisher firewalls)
     "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+    # Telegram link preview bot (widely whitelisted by news publishers)
+    "Mozilla/5.0 (compatible; TelegramBot/1.0; +https://core.telegram.org/bots/webpages)",
     # Googlebot crawler fallback
     "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
 ]
@@ -40,11 +42,18 @@ MAX_ARTICLE_BYTES = 2 * 1024 * 1024  # 2MB max download
 MAX_ARTICLE_CHARS = 15_000  # Cap extracted text length
 MIN_ARTICLE_CHARS = 60  # Minimum readable text to be considered an article
 
-# Module-global lock guarding the temporary socket.getaddrinfo monkeypatch used
-# for DNS-pinning (see `_pinned_dns` below). httpx's async client and the
-# urllib fallback (run in a thread executor) both go through this lock so the
-# patch is never active for two overlapping requests at once.
-_dns_pin_lock = threading.Lock()
+# Dedicated locks for DNS-pinning (see `_pinned_dns_async` and `_pinned_dns_sync`).
+# Async requests use asyncio.Lock to avoid blocking the event loop thread;
+# worker threads use threading.Lock.
+_async_dns_lock: asyncio.Lock | None = None
+_thread_dns_lock = threading.Lock()
+
+
+def _get_async_dns_lock() -> asyncio.Lock:
+    global _async_dns_lock
+    if _async_dns_lock is None:
+        _async_dns_lock = asyncio.Lock()
+    return _async_dns_lock
 
 _UNSAFE_HOSTNAMES = frozenset({
     "localhost",
@@ -135,43 +144,72 @@ def is_safe_public_url(url: str) -> tuple[bool, str]:
         return False, f"URL validation failed: {exc}"
 
 
-@contextlib.contextmanager
-def _pinned_dns(hostname: str, validated_ips: list[str]):
+@contextlib.asynccontextmanager
+async def _pinned_dns_async(hostname: str, validated_ips: list[str]):
     """Temporarily force `socket.getaddrinfo(hostname, ...)` to return only
-    `validated_ips`, so whatever HTTP client resolves the name next (httpx,
-    urllib, etc.) is guaranteed to connect to an address we already checked —
-    closing the TOCTOU window that lets an attacker's DNS server answer
-    differently on a second lookup (DNS rebinding).
-
-    Guarded by a process-wide lock: only one fetch may hold the pin at a time.
+    `validated_ips` during an async fetch without blocking the asyncio event loop.
     """
-    original_getaddrinfo = socket.getaddrinfo
-    target_host = hostname
+    lock = _get_async_dns_lock()
+    async with lock:
+        original_getaddrinfo = socket.getaddrinfo
+        target_host = hostname
 
-    def _pinned_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-        if host == target_host:
-            results = []
-            for ip_str in validated_ips:
-                ip_obj = ipaddress.ip_address(ip_str)
-                if ip_obj.version == 6:
-                    results.append(
-                        (socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip_str, port, 0, 0))
-                    )
-                else:
-                    results.append(
-                        (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip_str, port))
-                    )
-            if results:
-                return results
-        return original_getaddrinfo(host, port, family, type, proto, flags)
+        def _pinned_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+            if host == target_host:
+                results = []
+                for ip_str in validated_ips:
+                    ip_obj = ipaddress.ip_address(ip_str)
+                    if ip_obj.version == 6:
+                        results.append(
+                            (socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip_str, port, 0, 0))
+                        )
+                    else:
+                        results.append(
+                            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip_str, port))
+                        )
+                if results:
+                    return results
+            return original_getaddrinfo(host, port, family, type, proto, flags)
 
-    _dns_pin_lock.acquire()
-    socket.getaddrinfo = _pinned_getaddrinfo
-    try:
-        yield
-    finally:
-        socket.getaddrinfo = original_getaddrinfo
-        _dns_pin_lock.release()
+        socket.getaddrinfo = _pinned_getaddrinfo
+        try:
+            yield
+        finally:
+            socket.getaddrinfo = original_getaddrinfo
+
+
+@contextlib.contextmanager
+def _pinned_dns_sync(hostname: str, validated_ips: list[str]):
+    """Thread-safe synchronous context manager for worker thread fallbacks."""
+    with _thread_dns_lock:
+        original_getaddrinfo = socket.getaddrinfo
+        target_host = hostname
+
+        def _pinned_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+            if host == target_host:
+                results = []
+                for ip_str in validated_ips:
+                    ip_obj = ipaddress.ip_address(ip_str)
+                    if ip_obj.version == 6:
+                        results.append(
+                            (socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip_str, port, 0, 0))
+                        )
+                    else:
+                        results.append(
+                            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip_str, port))
+                        )
+                if results:
+                    return results
+            return original_getaddrinfo(host, port, family, type, proto, flags)
+
+        socket.getaddrinfo = _pinned_getaddrinfo
+        try:
+            yield
+        finally:
+            socket.getaddrinfo = original_getaddrinfo
+
+
+_pinned_dns = _pinned_dns_sync
 
 
 class ArticleHTMLParser(HTMLParser):
@@ -348,7 +386,11 @@ async def fetch_article_html(url: str, timeout_s: float = 12.0, max_redirects: i
             "Accept": "*/*",
         },
         {
-            "User-Agent": BROWSER_USER_AGENTS[2],  # Googlebot crawler fallback
+            "User-Agent": BROWSER_USER_AGENTS[2],  # Telegram link preview bot
+            "Accept": "*/*",
+        },
+        {
+            "User-Agent": BROWSER_USER_AGENTS[3],  # Googlebot crawler fallback
             "Accept": "*/*",
         },
     ]
@@ -371,7 +413,7 @@ async def fetch_article_html(url: str, timeout_s: float = 12.0, max_redirects: i
                     req_host = parsed_initial.hostname
                     req_ips = validated_ips
                     while True:
-                        with _pinned_dns(req_host, req_ips):
+                        async with _pinned_dns_async(req_host, req_ips):
                             resp = await client.get(req_url)
                         if resp.is_redirect:
                             hops += 1
@@ -552,12 +594,32 @@ def summarize_url_with_ai(
         f"Do not include markdown headers (#) or extra notes."
     )
 
+    search_config = None
     try:
-        response = generate_content_with_fallback(
-            client=gemini_client,
-            contents=prompt,
-            preferred_model=preferred_model,
-        )
+        from google.genai import types as genai_types
+        search_config = genai_types.GenerateContentConfig(tools=[{"google_search": {}}])
+    except Exception:
+        search_config = None
+
+    try:
+        try:
+            response = generate_content_with_fallback(
+                client=gemini_client,
+                contents=prompt,
+                preferred_model=preferred_model,
+                config=search_config,
+            )
+        except Exception as search_err:
+            if search_config is not None:
+                logger.debug("Gemini with search config failed (%s); retrying without config", search_err)
+                response = generate_content_with_fallback(
+                    client=gemini_client,
+                    contents=prompt,
+                    preferred_model=preferred_model,
+                    config=None,
+                )
+            else:
+                raise
         text = extract_gemini_text(response).strip()
         if not text:
             raise RuntimeError("Gemini returned empty text for URL summarization.")
