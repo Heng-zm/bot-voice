@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 import html
 import io
 import json
@@ -20,7 +21,6 @@ from app.services.donation.khqr import (
     DEFAULT_BAKONG_ACCOUNT_ID,
     DEFAULT_BAKONG_MERCHANT_NAME,
     BakongKHQR,
-    generate_khqr_string,
     get_khqr_qr_image,
 )
 from app.services.donation.store import TIER_DETAILS, donation_store
@@ -75,13 +75,11 @@ _load_pending_tickets()
 
 def is_admin_user(user_id: int) -> bool:
     """Check whether a given user_id is an authorized administrator."""
-    try:
+    with suppress(Exception):
         from app.legacy import _is_admin  # type: ignore
 
         if _is_admin(user_id):
             return True
-    except Exception:
-        pass
 
     admin_str = os.getenv("ADMIN_IDS", "") or getattr(SETTINGS, "ADMIN_IDS", "")
     for part in admin_str.split(","):
@@ -94,13 +92,11 @@ def is_admin_user(user_id: int) -> bool:
 def get_admin_ids() -> set[int]:
     """Retrieve all configured administrator Telegram IDs."""
     admin_ids: set[int] = set()
-    try:
+    with suppress(Exception):
         from app.legacy import ADMIN_IDS  # type: ignore
 
         if isinstance(ADMIN_IDS, (set, list, tuple)):
             admin_ids.update(int(aid) for aid in ADMIN_IDS if str(aid).isdigit())
-    except Exception:
-        pass
 
     admin_str = os.getenv("ADMIN_IDS", "") or getattr(SETTINGS, "ADMIN_IDS", "")
     for part in admin_str.split(","):
@@ -267,6 +263,10 @@ async def cmd_donate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_donors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Display Hall of Fame (/donors) with top contributors and metrics. Protects donor privacy."""
+    user = update.effective_user
+    chat = update.effective_chat
+    target_chat_id = chat.id if chat else (user.id if user else 0)
+
     stats = await donation_store.get_donation_stats()
     top_supporters = await donation_store.get_top_supporters(10)
     recent = await donation_store.get_recent_donations(5)
@@ -329,23 +329,19 @@ async def cmd_donors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     query = update.callback_query
     if query and query.message:
         if query.message.photo:
-            try:
+            with suppress(Exception):
                 await query.message.delete()
-            except Exception:
-                pass
-            if context.bot and user:
+            if context.bot and target_chat_id:
                 await context.bot.send_message(
-                    chat_id=user.id,
+                    chat_id=target_chat_id,
                     text=text,
                     reply_markup=keyboard,
                     parse_mode="HTML",
                 )
             return
-        try:
+        with suppress(Exception):
             await query.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
             return
-        except Exception:
-            pass
 
     msg = update.effective_message
     if msg:
@@ -393,18 +389,16 @@ async def cmd_adddonor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     # Attempt to auto-fetch donor's actual name from Telegram if omitted
     if not custom_name and context.bot:
-        try:
+        with suppress(Exception):
             chat = await context.bot.get_chat(donor_uid)
             if chat and chat.first_name:
                 custom_name = chat.first_name
-        except Exception:
-            pass
 
     if not custom_name:
         custom_name = f"User {donor_uid}"
 
     # 1. Record in store
-    record = await donation_store.record_donation(
+    await donation_store.record_donation(
         user_id=donor_uid,
         full_name=custom_name,
         amount=amount,
@@ -506,10 +500,8 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         if query.message:
             if query.message.photo:
-                try:
+                with suppress(Exception):
                     await query.message.delete()
-                except Exception:
-                    pass
                 if context.bot:
                     await context.bot.send_message(
                         chat_id=target_chat_id,
@@ -701,15 +693,13 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # Resolve donor's real name from Telegram
         donor_name = "បង"
         if context.bot:
-            try:
+            with suppress(Exception):
                 chat = await context.bot.get_chat(donor_uid)
                 if chat and chat.first_name:
                     donor_name = chat.first_name
-            except Exception:
-                pass
 
         # 1. Record donation
-        record = await donation_store.record_donation(
+        await donation_store.record_donation(
             user_id=donor_uid,
             full_name=donor_name if donor_name != "បង" else f"Supporter *{str(donor_uid)[-4:]}",
             amount=amount,

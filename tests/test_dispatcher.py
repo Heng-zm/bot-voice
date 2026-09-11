@@ -13,7 +13,6 @@ from telegram import Update
 
 from app.services.telegram.deduplication import (
     _telegram_webhook_update_claim,
-    get_webhook_replay_snapshot,
     reset_webhook_replay_store,
 )
 from app.services.telegram.dispatcher import TelegramDispatcher, get_telegram_dispatcher

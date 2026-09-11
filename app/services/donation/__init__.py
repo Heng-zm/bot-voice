@@ -10,7 +10,11 @@ from app.services.donation.handlers import (
     cmd_testblessing,
     donation_callback,
 )
-from app.services.donation.khqr import BakongKHQR, generate_khqr_string, get_khqr_qr_image
+from app.services.donation.khqr import (
+    BakongKHQR,
+    generate_khqr_string,
+    get_khqr_qr_image,
+)
 from app.services.donation.store import DonationStore, donation_store
 
 __all__ = [
@@ -24,5 +28,6 @@ __all__ = [
     "donation_callback",
     "donation_store",
     "generate_khqr_string",
+    "generate_voice_blessing",
     "get_khqr_qr_image",
 ]

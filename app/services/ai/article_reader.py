@@ -489,11 +489,10 @@ async def fetch_article_html(url: str, timeout_s: float = 12.0, max_redirects: i
                         current_url,
                         headers={"User-Agent": ua, "Accept": "text/html,*/*"},
                     )
-                    with _pinned_dns(parsed_initial.hostname, validated_ips):
-                        with opener.open(req, timeout=timeout_s) as response:  # noqa: S310
-                            data = response.read(MAX_ARTICLE_BYTES)
-                            encoding = response.headers.get_content_charset() or "utf-8"
-                            return data.decode(encoding, errors="replace")
+                    with _pinned_dns(parsed_initial.hostname, validated_ips), opener.open(req, timeout=timeout_s) as response:  # noqa: S310
+                        data = response.read(MAX_ARTICLE_BYTES)
+                        encoding = response.headers.get_content_charset() or "utf-8"
+                        return data.decode(encoding, errors="replace")
                 except urllib.error.HTTPError as h_err:
                     if h_err.code in (401, 403, 503):
                         continue

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
 import hashlib
 import logging
 import os
 import threading
 import time
+from collections import OrderedDict
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -288,7 +288,7 @@ def generate_content_with_fallback(
                     last_exc,
                 )
                 continue
-            raise last_exc
+            raise last_exc from None
 
     if last_exc:
         raise last_exc

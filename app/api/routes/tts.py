@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import logging
+
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 

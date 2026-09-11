@@ -8,7 +8,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -105,7 +105,7 @@ class DonationStore:
             return
 
         try:
-            with open(self._file_path, "r", encoding="utf-8") as f:
+            with open(self._file_path, encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, list):
                     self._donations = data
@@ -148,7 +148,7 @@ class DonationStore:
         """Record a successful donation into Supabase and local cache."""
         tier_info = TIER_DETAILS.get(tier.lower(), {})
         cups = tier_info.get("cups", max(1, int(round(amount))))
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now_iso = datetime.now(UTC).isoformat()
 
         record: dict[str, Any] = {
             "id": int(time.time() * 1000),

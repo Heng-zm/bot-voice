@@ -3,43 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-import base64
+import gc
 import logging
 import os
-import secrets
 import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
-if __package__ in {None, ""}:
-    project_root = str(Path(__file__).resolve().parent.parent)
-    if project_root not in sys.path:
-        sys.path.insert(0, project_root)
-
-try:
-    from dotenv import load_dotenv
-
-    _root_env = Path(__file__).resolve().parent.parent / ".env"
-    if _root_env.is_file():
-        load_dotenv(dotenv_path=_root_env, override=False)
-    else:
-        load_dotenv(override=False)
-except Exception:
-    pass
-
 from fastapi import FastAPI
-try:
-    from fastapi.responses import ORJSONResponse
-    _default_response_class = ORJSONResponse
-except Exception:
-    _default_response_class = None
-
-import gc
-with suppress(Exception):
-    gc.set_threshold(50000, 10, 10)
-
 from telegram import BotCommand
 
 from app import legacy
@@ -49,8 +22,30 @@ from app.core.security import (
     get_allowed_api_keys as _get_allowed_api_keys,
     validate_api_key as _validate_api_key,
 )
-
 from app.utils.logging import install_telegram_polling_filter
+
+if __package__ in {None, ""}:
+    project_root = str(Path(__file__).resolve().parent.parent)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+with suppress(Exception):
+    from dotenv import load_dotenv
+
+    _root_env = Path(__file__).resolve().parent.parent / ".env"
+    if _root_env.is_file():
+        load_dotenv(dotenv_path=_root_env, override=False)
+    else:
+        load_dotenv(override=False)
+
+_default_response_class = None
+with suppress(Exception):
+    from fastapi.responses import ORJSONResponse
+
+    _default_response_class = ORJSONResponse
+
+with suppress(Exception):
+    gc.set_threshold(50000, 10, 10)
 
 install_telegram_polling_filter()
 

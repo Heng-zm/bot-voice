@@ -10,14 +10,14 @@ Usage:
 from __future__ import annotations
 
 import csv
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import UTC, datetime, timezone
+from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -79,10 +79,10 @@ def fetch_table_rows(
             "offset": offset,
         })
         req_url = f"{endpoint}?{query_params}"
-        req = urllib.request.Request(req_url, headers=headers, method="GET")
+        req = urllib.request.Request(req_url, headers=headers, method="GET")  # noqa: S310
 
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
                 data = json.loads(resp.read().decode("utf-8"))
                 if not data or not isinstance(data, list):
                     break
@@ -109,7 +109,7 @@ def export_csv(filepath: Path, rows: list[dict]) -> None:
     # Collect all fieldnames across all rows
     fields: list[str] = []
     for r in rows:
-        for k in r.keys():
+        for k in r:
             if k not in fields:
                 fields.append(k)
 
@@ -147,7 +147,7 @@ def main() -> int:
         print("Please check your .env file in the project root.")
         return 1
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     backup_dir = root_dir / "backups" / f"backup_{timestamp}"
     backup_dir.mkdir(parents=True, exist_ok=True)
 
@@ -190,7 +190,7 @@ def main() -> int:
 
     # Save metadata
     metadata = {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "timestamp_utc": datetime.now(UTC).isoformat(),
         "supabase_url": sb_url,
         "summary": summary,
         "total_records": sum(c for c in summary.values() if c > 0),

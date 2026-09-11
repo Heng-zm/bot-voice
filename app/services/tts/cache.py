@@ -19,7 +19,9 @@ import threading
 import time
 import unicodedata
 from collections import OrderedDict
-from typing import Any, Callable, Coroutine
+from collections.abc import Callable, Coroutine
+from contextlib import suppress
+from typing import Any
 
 from app.services.tts.voices import clean_tts_text, normalize_tts_model
 
@@ -79,34 +81,28 @@ def make_tts_audio_cache_key(
 
 def _get_redis_client() -> Any | None:
     """Safely obtain the shared Redis client without tight circular import."""
-    try:
+    with suppress(Exception):
         import sys
         legacy = sys.modules.get("app.legacy")
         if legacy is None:
-            try:
+            with suppress(Exception):
                 from app import legacy
-            except Exception:
-                legacy = None
         if legacy is not None:
             client = getattr(legacy, "redis_client", None)
             if client is not None:
                 return client
-    except Exception:
-        pass
     return None
 
 
 def _async_submit(fn: Callable[[], Any]) -> None:
     """Dispatch a background task to legacy db threadpool or daemon thread."""
-    try:
+    with suppress(Exception):
         import sys
         legacy = sys.modules.get("app.legacy")
         submit_func = getattr(legacy, "_submit_db", None) if legacy else None
         if callable(submit_func):
             submit_func(fn)
             return
-    except Exception:
-        pass
     t = threading.Thread(target=fn, daemon=True)
     t.start()
 

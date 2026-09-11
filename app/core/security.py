@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import secrets
+
 from fastapi import Header, HTTPException
 
 

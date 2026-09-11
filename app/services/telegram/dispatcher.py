@@ -150,7 +150,7 @@ class TelegramDispatcher:
     @staticmethod
     def _extract_chat_id(update: Update) -> int | None:
         """Extract chat_id from effective_chat, message, callback_query, or channel_post."""
-        try:
+        with suppress(Exception):
             if update.effective_chat and update.effective_chat.id is not None:
                 return int(update.effective_chat.id)
             if update.message and update.message.chat_id is not None:
@@ -159,8 +159,6 @@ class TelegramDispatcher:
                 return int(update.callback_query.message.chat_id)
             if update.channel_post and update.channel_post.chat_id is not None:
                 return int(update.channel_post.chat_id)
-        except Exception:
-            pass
         return None
 
     def _get_chat_lock(self, chat_id: int) -> asyncio.Lock:
@@ -419,7 +417,7 @@ class TelegramDispatcher:
             )
         return JSONResponse({"status": "ok"}, status_code=200)
 
-    async def drain(self, timeout: float = 10.0) -> None:
+    async def drain(self, timeout: float = 10.0) -> None:  # noqa: ASYNC109
         """Gracefully wait for all in-flight update handlers to finish before shutdown.
 
         If timeout expires, tasks are cancelled and awaited so their CancelledError

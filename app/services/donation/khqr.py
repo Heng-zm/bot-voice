@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import hashlib
 import io
 import logging
 import os
 import threading
+import time
 import urllib.parse
-from typing import Any
 
 import httpx
 
@@ -32,10 +33,7 @@ _CRC_TABLE: list[int] = []
 for _i in range(256):
     _curr = _i << 8
     for _ in range(8):
-        if _curr & 0x8000:
-            _curr = ((_curr << 1) ^ 0x1021) & 0xFFFF
-        else:
-            _curr = (_curr << 1) & 0xFFFF
+        _curr = ((_curr << 1) ^ 0x1021) & 0xFFFF if (_curr & 0x8000) else ((_curr << 1) & 0xFFFF)
     _CRC_TABLE.append(_curr)
 
 
@@ -93,10 +91,7 @@ def generate_khqr_string(
 
     # Tag 54: Transaction Amount
     if is_dynamic and amount is not None:
-        if currency == "USD":
-            amount_str = f"{amount:.2f}"
-        else:
-            amount_str = f"{int(round(amount))}"
+        amount_str = f"{amount:.2f}" if currency == "USD" else f"{int(round(amount))}"
         payload += _format_tlv("54", amount_str)
 
     # Tag 58: Country Code
@@ -149,16 +144,23 @@ async def _get_shared_http_client() -> httpx.AsyncClient:
     return _HTTP_CLIENT
 
 
-async def get_khqr_qr_image(khqr_text: str) -> bytes | None:
-    """Render or retrieve cached QR code image bytes (PNG) for a given KHQR string.
+def _read_static_qr_file(paths: list[str]) -> bytes | None:
+    for p in paths:
+        if p and os.path.isfile(p):
+            try:
+                with open(p, "rb") as f:
+                    data = f.read()
+                    if data:
+                        return data
+            except Exception as e:
+                logger.warning("Failed to read static QR image path %s: %s", p, e)
+    return None
 
-    1. Checks in-memory LRU cache (<0.01ms response time)
-    2. Checks local static image files in static/ (e.g. static/khqr.png, static/aba.png)
-    3. Uses local `qrcode` Python library if installed
-    4. Downloads from remote QR service via pooled connection
-    """
-    # 0. Check in-memory cache first
-    cache_key = khqr_text.strip()
+
+async def get_khqr_qr_image(khqr_text: str) -> bytes | None:
+    """Render or retrieve cached QR code image bytes (PNG) for a given KHQR string."""
+    cache_key = hashlib.sha256(khqr_text.encode("utf-8")).hexdigest()
+
     with _QR_CACHE_LOCK:
         if cache_key in _QR_IMAGE_CACHE:
             _QR_IMAGE_CACHE.move_to_end(cache_key)
@@ -186,17 +188,12 @@ async def get_khqr_qr_image(khqr_text: str) -> bytes | None:
         os.path.join(os.getcwd(), "static", "qr.png"),
         os.path.join(os.getcwd(), "static", "qr.jpg"),
     ]
-    for p in candidate_paths:
-        if p and os.path.isfile(p):
-            try:
-                with open(p, "rb") as f:
-                    data = f.read()
-                    if data:
-                        with _QR_CACHE_LOCK:
-                            _QR_IMAGE_CACHE[cache_key] = data
-                        return data
-            except Exception as e:
-                logger.warning("Failed to read static QR image path %s: %s", p, e)
+    loop = asyncio.get_running_loop()
+    static_bytes = await loop.run_in_executor(None, _read_static_qr_file, candidate_paths)
+    if static_bytes:
+        with _QR_CACHE_LOCK:
+            _QR_IMAGE_CACHE[cache_key] = static_bytes
+        return static_bytes
 
     # 2. Try python qrcode package
     try:

@@ -9,19 +9,18 @@ import asyncio
 import re
 import time
 
-_URL_PATTERN = re.compile(r"^https?://\S+$")
-
 # Transitional V4.1 modules bind remaining legacy helpers at runtime.
 # ruff: noqa: F821
 from app.services.telegram._legacy_runtime import legacy_bound_handler
 from app.services.telegram.workloads import WorkloadBusy, run_telegram_workload
 from app.services.tts import (
     get_cached_telegram_file_id,
-    get_global_tts_single_flight,
     invalidate_cached_telegram_file_id,
     make_tts_audio_cache_key,
     set_cached_telegram_file_id,
 )
+
+_URL_PATTERN = re.compile(r"^https?://\S+$")
 
 
 @legacy_bound_handler

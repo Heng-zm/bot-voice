@@ -340,7 +340,10 @@ class GeminiServicesTests(unittest.TestCase):
     def test_gemini_response_cache(self) -> None:
         from unittest.mock import MagicMock
 
-        from app.services.ai.gemini import clear_gemini_response_cache, generate_content_with_fallback
+        from app.services.ai.gemini import (
+            clear_gemini_response_cache,
+            generate_content_with_fallback,
+        )
 
         clear_gemini_response_cache()
         mock_client = MagicMock()
@@ -866,6 +869,7 @@ class DonationAndKHQRTests(unittest.IsolatedAsyncioTestCase):
     async def test_donation_store_lifecycle(self) -> None:
         import os
         import tempfile
+
         from app.services.donation.store import DonationStore
 
         with tempfile.TemporaryDirectory() as tmpdir:
