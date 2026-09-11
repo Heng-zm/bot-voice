@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import io
+import json
 import logging
 import os
 import threading
@@ -26,13 +27,50 @@ from app.services.donation.store import TIER_DETAILS, donation_store
 
 logger = logging.getLogger(__name__)
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+DATA_DIR = os.getenv("DATA_DIR") or os.path.join(PROJECT_ROOT, "data")
+PENDING_TICKETS_PATH = os.path.join(DATA_DIR, "pending_donations.json")
+
 # Concurrency & deduplication guards for admin approvals
 _PROCESSED_APPROVALS: set[str] = set()
 _APPROVALS_LOCK = threading.Lock()
 
-# Bounded in-memory store for pending approval tickets (guarantees callback_data <= 64 bytes)
+# Bounded store for pending approval tickets (guarantees callback_data <= 64 bytes)
 _PENDING_DONATIONS: dict[str, dict[str, Any]] = {}
 _PENDING_LOCK = threading.Lock()
+
+
+def _load_pending_tickets() -> None:
+    """Load pending donation tickets from persistent store on startup."""
+    global _PENDING_DONATIONS
+    if not os.path.isfile(PENDING_TICKETS_PATH):
+        return
+    try:
+        with open(PENDING_TICKETS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                with _PENDING_LOCK:
+                    _PENDING_DONATIONS.update(data)
+    except Exception as e:
+        logger.warning("Failed to load pending donations from %s: %s", PENDING_TICKETS_PATH, e)
+
+
+def _save_pending_tickets() -> None:
+    """Safely persist pending donation tickets to disk with atomic write."""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = f"{PENDING_TICKETS_PATH}.tmp"
+        with _PENDING_LOCK:
+            data = dict(_PENDING_DONATIONS)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, PENDING_TICKETS_PATH)
+    except Exception as e:
+        logger.warning("Failed to save pending donations to %s: %s", PENDING_TICKETS_PATH, e)
+
+
+# Initialize persisted tickets on module load
+_load_pending_tickets()
 
 
 def is_admin_user(user_id: int) -> bool:
@@ -191,8 +229,9 @@ async def cmd_donate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                             tier_key = k
                             break
                 tier_title = f"ឧបត្ថម្ភ ${custom_amount:.2f} USD"
+                target_chat_id = update.effective_chat.id if update.effective_chat else user.id
                 await _send_khqr_screen(
-                    chat_id=user.id,
+                    chat_id=target_chat_id,
                     user_name=user_name,
                     amount=custom_amount,
                     tier_key=tier_key,
@@ -451,6 +490,8 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     user = query.from_user
     user_name = html.escape(user.first_name or "បង") if user else "បង"
     user_id = user.id if user else 0
+    chat = update.effective_chat
+    target_chat_id = chat.id if chat else user_id
 
     # -------------------------------------------------------------------------
     # 1. Back to main donation menu
@@ -471,7 +512,7 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     pass
                 if context.bot:
                     await context.bot.send_message(
-                        chat_id=user_id,
+                        chat_id=target_chat_id,
                         text=text,
                         reply_markup=_build_donation_menu_markup(),
                         parse_mode="HTML",
@@ -514,7 +555,7 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         await query.answer(f"កំពុងបង្កើត Bakong KHQR សម្រាប់ {tier_title}...")
         await _send_khqr_screen(
-            chat_id=user_id,
+            chat_id=target_chat_id,
             user_name=user_name,
             amount=amount,
             tier_key=tier_key,
@@ -563,6 +604,7 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 "bill_no": bill_no,
                 "user_name": user_name,
             }
+        _save_pending_tickets()
 
         admin_markup = InlineKeyboardMarkup([
             [
@@ -614,6 +656,7 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         amount = 1.0
         tier_key = "coffee"
         bill_no = ""
+        ticket_id = ""
 
         if data.startswith("donate_appr:"):
             ticket_id = data[len("donate_appr:"):]
@@ -636,16 +679,20 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             bill_no = parts[3] if len(parts) > 3 else f"{donor_uid}_{amount}"
 
         # Deduplication guard: ensure donation is processed only once
-        dedup_key = f"{donor_uid}:{bill_no or amount}"
+        dedup_key = f"{donor_uid}:{bill_no or ticket_id or amount}"
         with _APPROVALS_LOCK:
             if dedup_key in _PROCESSED_APPROVALS:
                 await query.answer("⚠️ ការឧបត្ថម្ភនេះត្រូវបានអនុម័តរួចរាល់ហើយ!", show_alert=True)
                 if query.message:
-                    await query.message.edit_text(
-                        f"{query.message.text}\n\n"
-                        f"ℹ️ <b>ការឧបត្ថម្ភនេះត្រូវបានអនុម័តរួចរាល់ជាស្ថាពរហើយ។</b>",
-                        parse_mode="HTML",
-                    )
+                    orig_text = html.escape(query.message.text or "")
+                    try:
+                        await query.message.edit_text(
+                            f"{orig_text}\n\n"
+                            f"ℹ️ <b>ការឧបត្ថម្ភនេះត្រូវបានអនុម័តរួចរាល់ជាស្ថាពរហើយ។</b>",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
                 return
             _PROCESSED_APPROVALS.add(dedup_key)
 
@@ -681,15 +728,25 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 amount=amount,
             )
 
+        # Remove approved ticket from pending
+        if ticket_id:
+            with _PENDING_LOCK:
+                _PENDING_DONATIONS.pop(ticket_id, None)
+            _save_pending_tickets()
+
         status_txt = "🎙️ បានផ្ញើសារសំឡេងជូនពររួចរាល់!" if blessing_ok else "⚠️ មិនអាចផ្ញើសំឡេងទៅ Telegram បានទេ"
         if query.message:
-            await query.message.edit_text(
-                f"{query.message.text}\n\n"
-                f"✅ <b>បានអនុម័តជោគជ័យដោយ Admin!</b>\n"
-                f"{status_txt}\n"
-                f"🏆 បានបញ្ចូលក្នុងតារាងកិត្តិយស (/donors)!",
-                parse_mode="HTML",
-            )
+            orig_text = html.escape(query.message.text or "")
+            try:
+                await query.message.edit_text(
+                    f"{orig_text}\n\n"
+                    f"✅ <b>បានអនុម័តជោគជ័យដោយ Admin!</b>\n"
+                    f"{status_txt}\n"
+                    f"🏆 បានបញ្ចូលក្នុងតារាងកិត្តិយស (/donors)!",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
         return
 
     # -------------------------------------------------------------------------
@@ -700,11 +757,21 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await query.answer("⛔ មានតែ Admin ប៉ុណ្ណោះដែលអាចបដិសេធបាន!", show_alert=True)
             return
 
+        if data.startswith("donate_rej:"):
+            rej_ticket_id = data[len("donate_rej:"):]
+            with _PENDING_LOCK:
+                _PENDING_DONATIONS.pop(rej_ticket_id, None)
+            _save_pending_tickets()
+
         await query.answer("បានបដិសេធការជូនដំណឹងនេះ។")
         if query.message:
-            await query.message.edit_text(
-                f"{query.message.text}\n\n"
-                f"❌ <b>ការជូនដំណឹងនេះត្រូវបានបដិសេធដោយ Admin។</b>",
-                parse_mode="HTML",
-            )
+            orig_text = html.escape(query.message.text or "")
+            try:
+                await query.message.edit_text(
+                    f"{orig_text}\n\n"
+                    f"❌ <b>ការជូនដំណឹងនេះត្រូវបានបដិសេធដោយ Admin។</b>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
         return

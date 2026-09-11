@@ -13,7 +13,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = os.path.join(os.getcwd(), "data")
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+DATA_DIR = os.getenv("DATA_DIR") or os.path.join(PROJECT_ROOT, "data")
 LOCAL_STORE_PATH = os.path.join(DATA_DIR, "donations.json")
 
 # Tier definitions and coffee cup equivalents

@@ -20,6 +20,7 @@ DEFAULT_BAKONG_ACCOUNT_ID = os.getenv("BAKONG_ACCOUNT_ID", "chuo_kimheng@bkrt").
 DEFAULT_BAKONG_MERCHANT_NAME = os.getenv("BAKONG_MERCHANT_NAME", "CHUO KIMHENG").strip() or "CHUO KIMHENG"
 DEFAULT_BAKONG_MERCHANT_CITY = os.getenv("BAKONG_MERCHANT_CITY", "Phnom Penh").strip() or "Phnom Penh"
 DEFAULT_BAKONG_CURRENCY = os.getenv("BAKONG_CURRENCY", "USD").strip().upper() or "USD"
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 STATIC_QR_IMAGE_URL = os.getenv("KHQR_STATIC_IMAGE_URL", "").strip()
 STATIC_QR_IMAGE_PATH = os.getenv("KHQR_STATIC_IMAGE_PATH", "").strip()
 
@@ -166,9 +167,16 @@ async def get_khqr_qr_image(khqr_text: str) -> bytes | None:
     # 1. If static file path is provided and exists
     candidate_paths = [
         STATIC_QR_IMAGE_PATH,
+        os.path.join(PROJECT_ROOT, "asset", "my_khqr.webp"),
+        os.path.join(PROJECT_ROOT, "asset", "my_khqr.png"),
+        os.path.join(PROJECT_ROOT, "asset", "my_khqr.jpg"),
         os.path.join(os.getcwd(), "asset", "my_khqr.webp"),
         os.path.join(os.getcwd(), "asset", "my_khqr.png"),
         os.path.join(os.getcwd(), "asset", "my_khqr.jpg"),
+        os.path.join(PROJECT_ROOT, "static", "my_khqr.webp"),
+        os.path.join(PROJECT_ROOT, "static", "khqr.png"),
+        os.path.join(PROJECT_ROOT, "static", "khqr.jpg"),
+        os.path.join(PROJECT_ROOT, "static", "khqr.jpeg"),
         os.path.join(os.getcwd(), "static", "my_khqr.webp"),
         os.path.join(os.getcwd(), "static", "khqr.png"),
         os.path.join(os.getcwd(), "static", "khqr.jpg"),
