@@ -13,8 +13,8 @@ import httpx
 logger = logging.getLogger(__name__)
 
 # Default Bakong configuration (can be customized via environment variables)
-DEFAULT_BAKONG_ACCOUNT_ID = os.getenv("BAKONG_ACCOUNT_ID", "botvoice@nbc").strip() or "botvoice@nbc"
-DEFAULT_BAKONG_MERCHANT_NAME = os.getenv("BAKONG_MERCHANT_NAME", "BOT VOICE KHMER").strip() or "BOT VOICE KHMER"
+DEFAULT_BAKONG_ACCOUNT_ID = os.getenv("BAKONG_ACCOUNT_ID", "chuo_kimheng@bkrt").strip() or "chuo_kimheng@bkrt"
+DEFAULT_BAKONG_MERCHANT_NAME = os.getenv("BAKONG_MERCHANT_NAME", "CHUO KIMHENG").strip() or "CHUO KIMHENG"
 DEFAULT_BAKONG_MERCHANT_CITY = os.getenv("BAKONG_MERCHANT_CITY", "Phnom Penh").strip() or "Phnom Penh"
 DEFAULT_BAKONG_CURRENCY = os.getenv("BAKONG_CURRENCY", "USD").strip().upper() or "USD"
 STATIC_QR_IMAGE_URL = os.getenv("KHQR_STATIC_IMAGE_URL", "").strip()
