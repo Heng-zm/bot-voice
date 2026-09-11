@@ -8,7 +8,7 @@ import logging
 import os
 import threading
 import time
-from datetime import UTC, datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)

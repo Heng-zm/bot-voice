@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from contextlib import suppress
 import html
 import io
 import json
@@ -10,13 +9,17 @@ import logging
 import os
 import threading
 import time
+from contextlib import suppress
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from app.core.config import SETTINGS
-from app.services.donation.blessing import deliver_voice_blessing, generate_voice_blessing
+from app.services.donation.blessing import (
+    deliver_voice_blessing,
+    generate_voice_blessing,
+)
 from app.services.donation.khqr import (
     DEFAULT_BAKONG_ACCOUNT_ID,
     DEFAULT_BAKONG_MERCHANT_NAME,
@@ -46,7 +49,7 @@ def _load_pending_tickets() -> None:
     if not os.path.isfile(PENDING_TICKETS_PATH):
         return
     try:
-        with open(PENDING_TICKETS_PATH, "r", encoding="utf-8") as f:
+        with open(PENDING_TICKETS_PATH, encoding="utf-8") as f:
             data = json.load(f)
             if isinstance(data, dict):
                 with _PENDING_LOCK:
@@ -677,14 +680,12 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 await query.answer("⚠️ ការឧបត្ថម្ភនេះត្រូវបានអនុម័តរួចរាល់ហើយ!", show_alert=True)
                 if query.message:
                     orig_text = html.escape(query.message.text or "")
-                    try:
+                    with suppress(Exception):
                         await query.message.edit_text(
                             f"{orig_text}\n\n"
                             f"ℹ️ <b>ការឧបត្ថម្ភនេះត្រូវបានអនុម័តរួចរាល់ជាស្ថាពរហើយ។</b>",
                             parse_mode="HTML",
                         )
-                    except Exception:
-                        pass
                 return
             _PROCESSED_APPROVALS.add(dedup_key)
 
@@ -727,7 +728,7 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         status_txt = "🎙️ បានផ្ញើសារសំឡេងជូនពររួចរាល់!" if blessing_ok else "⚠️ មិនអាចផ្ញើសំឡេងទៅ Telegram បានទេ"
         if query.message:
             orig_text = html.escape(query.message.text or "")
-            try:
+            with suppress(Exception):
                 await query.message.edit_text(
                     f"{orig_text}\n\n"
                     f"✅ <b>បានអនុម័តជោគជ័យដោយ Admin!</b>\n"
@@ -735,8 +736,6 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     f"🏆 បានបញ្ចូលក្នុងតារាងកិត្តិយស (/donors)!",
                     parse_mode="HTML",
                 )
-            except Exception:
-                pass
         return
 
     # -------------------------------------------------------------------------
@@ -756,12 +755,10 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.answer("បានបដិសេធការជូនដំណឹងនេះ។")
         if query.message:
             orig_text = html.escape(query.message.text or "")
-            try:
+            with suppress(Exception):
                 await query.message.edit_text(
                     f"{orig_text}\n\n"
                     f"❌ <b>ការជូនដំណឹងនេះត្រូវបានបដិសេធដោយ Admin។</b>",
                     parse_mode="HTML",
                 )
-            except Exception:
-                pass
         return

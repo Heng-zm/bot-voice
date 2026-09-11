@@ -20,6 +20,8 @@ from app.api import api_router
 from app.core.config import get_detected_webhook_url
 from app.core.security import (
     get_allowed_api_keys as _get_allowed_api_keys,
+)
+from app.core.security import (
     validate_api_key as _validate_api_key,
 )
 from app.utils.logging import install_telegram_polling_filter

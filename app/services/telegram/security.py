@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import threading
 import time
 from contextlib import suppress
@@ -12,8 +11,6 @@ try:
     from telegram import Update
 except (ImportError, ModuleNotFoundError):
     Update = Any  # type: ignore[assignment,misc]
-
-from app._legacy_bridge import legacy_module
 
 ADMIN_ONLY_COMMANDS: frozenset[str] = frozenset({
     "admin",
