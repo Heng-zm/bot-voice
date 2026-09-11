@@ -32,6 +32,7 @@
   <a href="#-quickstart-in-3-steps"><b>⚡ Quickstart</b></a> •
   <a href="#-easy-server-deployment"><b>☁️ Deployment</b></a> •
   <a href="#-telegram-dispatcher--performance-architecture"><b>🛡️ Dispatcher Engine</b></a> •
+  <a href="#-bakong-khqr-voluntary-donation--recognition-system"><b>☕ Bakong KHQR</b></a> •
   <a href="#-architecture"><b>🏗️ Architecture</b></a> •
   <a href="#-project-structure"><b>📁 Project Tree</b></a>
 </p>
@@ -55,6 +56,9 @@
 | 🎛️ **Live Admin Center** | Dynamic in-app Telegram (`/admin`) and Web Dashboard controls. | Instant Audio Cache & CDN purge, performance tuning, maintenance toggle, and CRM user lookups. |
 | 📢 **Broadcast Engine** | Scheduled mass announcements (Phnom Penh UTC+7), templates, and daily recurrence. | Bulk blocked-user persistence saving 99% Supabase database queries. |
 | ⚡ **Multi-Core Opus Encoding** | In-memory FFmpeg Opus pipeline with `-threads 0` and VoIP `-compression_level 5`. | ~30% faster transcoding with zero perceptual quality degradation. |
+| ☕ **Bakong KHQR Voluntary Support** | National Bank of Cambodia Bakong KHQR integration (`chuo_kimheng@bkrt`). | EMVCo generator with 256-entry precomputed CRC16 table, dynamic QR with LRU caching, and direct scan. |
+| 🎙️ **Automated AI Voice Blessing** | Studio-grade Khmer voice note blessing delivered upon verified voluntary support. | Personalized warm blessing with multi-tier audio fallback chain (Hugging Face → Edge TTS → Gemini). |
+| 🏆 **Hall of Fame (`/donors`)** | Community recognition leaderboard honoring generous contributors. | Tiered badges (🥇 Gold, 🥈 Silver, 🥉 Bronze, ⭐ Supporter), privacy name masking, and live refresh. |
 
 ---
 
@@ -168,6 +172,26 @@ A clean, compact UI system designed around Telegram's native interaction pattern
 └─────────────────────────────────────────────────────────────┘
 ```
 
+### 7. Bakong KHQR & AI Voice Blessing (/donate & /donors)
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  ☕ ឧបត្ថម្ភកាហ្វេលើកទឹកចិត្ត Bot Voice                      │
+├─────────────────────────────────────────────────────────────┤
+│  សូមអរគុណបងប្អូនសម្រាប់ការគាំទ្រដំណើរការ Bot!               │
+│  Account: CHUO KIMHENG (chuo_kimheng@bkrt)                   │
+│                                                             │
+│  [ ☕ $1 · កាហ្វេ ១កែវ ]       [ ☕ $3 · កាហ្វេ ៣កែវ ]      │
+│  [ 🚀 $5 · ជួយថ្លៃ Server ]    [ 💖 តាមទឹកចិត្ត / Other ]   │
+│                                                             │
+│  [ 🏆 តារាងកិត្តិយស (/donors) ]                             │
+├─────────────────────────────────────────────────────────────┤
+│  🎙️ សារសំឡេងជូនពរពិសេស (AI Voice Blessing)                 │
+│  ▶  ━━━━━━━━━━━●━━━━━━━━━━━━━━  0:08 / 0:08             │
+│  «សូមអរគុណបងយ៉ាងជ្រាលជ្រៅ... សូមជូនពរមានសុខភាពល្អ...» ❤️    │
+└─────────────────────────────────────────────────────────────┘
+```
+
 #### UI Design Principles
 
 | Surface | Updated UI Direction | User Benefit |
@@ -178,6 +202,7 @@ A clean, compact UI system designed around Telegram's native interaction pattern
 | Channel Narrator | Minimal post preview with a compact audio player | Keeps channel content readable and listenable |
 | Admin Center | Structured 2-column control grid with status-first information | Faster operational decisions |
 | Web Dashboard | KPI cards + focused latency visualization | Immediate visibility into system health |
+| Bakong Support & Hall of Fame | Preset coffee tiers, real-time KHQR generation, in-place navigation, and AI voice blessing note | Frictionless appreciation with zero paywalls and instant community recognition |
 
 > **UI goal:** Keep the interface clean and production-oriented. Prioritize hierarchy, whitespace, concise labels, native Telegram interaction patterns, and clear status feedback over decorative elements.
 
@@ -203,6 +228,11 @@ ADMIN_IDS=1272791365
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=your-supabase-service-role-key
 GEMINI_API_KEY=your-gemini-api-key
+
+# Optional: Bakong KHQR Voluntary Donation & Recognition
+BAKONG_ACCOUNT_ID=chuo_kimheng@bkrt
+BAKONG_MERCHANT_NAME="CHUO KIMHENG"
+BAKONG_MERCHANT_CITY="Phnom Penh"
 ```
 
 ### 3. Launch the Bot
@@ -320,6 +350,59 @@ Telegram Webhook ──> Timing-Safe HMAC Auth ──> Replay Deduplication ─�
 
 ---
 
+## ☕ Bakong KHQR Voluntary Donation & Recognition System
+
+Bot Voice is **100% free to use**, with zero feature paywalls. The voluntary donation system allows grateful users to buy the maintainer a coffee (`/coffee` or `/donate`), helping sustain VPS hosting, domain renewals, and AI compute costs.
+
+```
+/donate or /coffee ──> Interactive Tier Selection ($1, $3, $5, Custom)
+                                   │
+                    ┌──────────────┴──────────────┐
+                    ▼                             ▼
+         Dynamic EMVCo KHQR String        Static Asset Fallback
+         CRC16-CCITT Lookup (0ms)         `asset/my_khqr.webp`
+                    │                             │
+                    └──────────────┬──────────────┘
+                                   ▼
+                       Supporter Scans & Transfers
+                                   │
+                    Supporter Taps [ ✅ ខ្ញុំបានផ្ញើរួចរាល់ ]
+                                   │
+                    Admin Verification (Ticket Token)
+                                   │
+              ┌────────────────────┴────────────────────┐
+              ▼                                         ▼
+   🎙️ AI Khmer Voice Blessing               🏆 Hall of Fame (/donors)
+   Personalized Audio Note                  Supporter Badges & Leaderboard
+   (HF ➔ Edge ➔ Gemini)                     Privacy-Masked Recognition
+```
+
+### 1. High-Performance EMVCo KHQR Generation ([`app/services/donation/khqr.py`](app/services/donation/khqr.py))
+- **Precomputed CRC16-CCITT Table**: Implements a 256-entry precomputed lookup table (`POLYNOMIAL = 0x1021`) for bitwise calculation of the 16-bit CRC checksum in $O(N)$ time with 0ms CPU wait.
+- **LRU In-Memory QR Cache**: Dynamic KHQR images are generated in-memory and cached by SHA-256 hash using `@lru_cache(maxsize=128)` to prevent repetitive encoding overhead.
+- **Async Asset Fallback**: If the `qrcode` image library is unavailable, the bot seamlessly falls back to the pre-rendered static KHQR image (`asset/my_khqr.webp`), reading the file asynchronously on a worker thread (`loop.run_in_executor`) to keep the event loop completely unblocked.
+
+### 2. State-Preserving Compact Ticket Tokens & Approval Workflow ([`app/services/donation/handlers.py`](app/services/donation/handlers.py))
+- **Telegram 64-Byte Callback Limit Compliance**: Encodes donor verification intents into compact tickets (`donate_appr:t...`, ~18 bytes), entirely eliminating `BUTTON_DATA_INVALID` errors.
+- **Persistent Ticket Storage**: Stores pending verification tickets in `data/pending_donations.json`, ensuring unconfirmed submissions survive server restarts and container reboots.
+- **Deduplication Lock**: Uses an `asyncio.Lock()` around confirmation processing to prevent double-approvals or duplicate blessing notes if an admin double-clicks verification buttons.
+
+### 3. Automated AI Voice Blessing ([`app/services/donation/blessing.py`](app/services/donation/blessing.py))
+- **Contextual Khmer Scripts**: Formats heartfelt Khmer blessings tailored to the donation tier ($1 Coffee, $3 Coffee, $5 Server, Custom).
+- **Multi-Tier Voice Fallback Chain**: Generates studio-grade audio through Hugging Face Kiri Space → Microsoft Edge Neural TTS → Google Gemini Audio, guaranteeing prompt voice delivery.
+- **Direct Voice Dispatch**: Sends the blessing directly to the supporter's private chat as a Telegram voice note with waveform visualization.
+
+### 4. Hall of Fame & Supporter Recognition ([`app/services/donation/store.py`](app/services/donation/store.py))
+- **Community Leaderboard (`/donors`)**: Displays top contributors and recent supporters with tiered honor badges:
+  - 🥇 **Champion Donor** ($10+)
+  - 🥈 **Gold Supporter** ($5+)
+  - 🥉 **Silver Supporter** ($3+)
+  - ⭐ **Coffee Supporter** ($1+)
+- **Privacy Protection**: Automatically masks donor names (e.g., `Supporter *4521`) unless public display is chosen.
+- **Resilient Dual Storage**: Persists records to Supabase PostgreSQL with an automatic atomic local JSON fallback (`data/donations.json`) and a 60-second TTL in-memory cache with immediate cache invalidation on newly approved donations.
+
+---
+
 ## 🏗️ Architecture
 
 ```mermaid
@@ -341,8 +424,10 @@ flowchart TD
         ChatLock --> OCR[🔍 Vision & PDF Document OCR]
         ChatLock --> AI[🧠 AI Assistant & Translator]
         ChatLock --> Admin[🎛️ Admin CRM & Broadcast Scheduler]
+        ChatLock --> Donate[☕ Bakong KHQR & Voice Blessing]
         
         ChanNarrator -->|Sanitized Text| TTS
+        Donate -->|Blessing Audio| TTS
     end
     
     subgraph "Multi-Tier Resilient TTS Engine"
@@ -373,13 +458,14 @@ flowchart TD
         OCR --> OCRCard[🔍 OCR Result Card<br/>listen · copy · translate]
         ChanNarrator --> ChannelCard[📢 Channel Auto-Voice Card]
         Admin --> AdminUI[🎛️ /admin Control Center<br/>cache · workers · broadcast · CRM]
+        Donate --> DonateCard[☕ /donate & /donors UI<br/>interactive tiers · QR · blessing]
         MemCache --> AdminUI
         Redis --> WebDash[🌐 Web Dashboard<br/>throughput · hit-rate · latency]
         DB --> WebDash
     end
 ```
 
-> **Presentation-layer legend:** `VoiceCard`, `OCRCard`, and `ChannelCard` map to the in-chat mockups in [📱 Telegram UI Experience Preview](#-telegram-ui-experience-preview); `AdminUI` and `WebDash` map to the `/admin` console and web dashboard mockups in the same section.
+> **Presentation-layer legend:** `VoiceCard`, `OCRCard`, `ChannelCard`, and `DonateCard` map to the in-chat mockups in [📱 Telegram UI Experience Preview](#-telegram-ui-experience-preview); `AdminUI` and `WebDash` map to the `/admin` console and web dashboard mockups in the same section.
 
 ---
 
@@ -408,6 +494,11 @@ bot-voice/
 │   │   │   └── vector_store.py       # Upstash / Supabase Vector similarity search
 │   │   ├── broadcast/                # Mass Messaging & Scheduled Announcements
 │   │   │   └── templates.py          # Broadcast layout templates & presets
+│   │   ├── donation/                 # ☕ Bakong KHQR & Recognition System
+│   │   │   ├── blessing.py           # Studio Khmer AI voice blessing generator
+│   │   │   ├── handlers.py           # Donation UI flows, compact tokens & approvals
+│   │   │   ├── khqr.py               # EMVCo KHQR generator, CRC16 table & QR cache
+│   │   │   └── store.py              # Supabase + local atomic JSON fallback store
 │   │   ├── settings/                 # Dynamic Runtime Configuration Store
 │   │   │   └── store.py              # Supabase/PostgreSQL settings key-value store
 │   │   ├── telegram/                 # Modular Telegram Bot System
@@ -437,11 +528,14 @@ bot-voice/
 │   ├── bot.py                        # Telegram Bot builder & polling runner
 │   ├── legacy.py                     # Legacy engine compatibility & state
 │   └── main.py                       # FastAPI application & lifespan management
+├── asset/                            # Media Assets & Static Resources
+│   └── my_khqr.webp                  # Bakong KHQR official payment QR asset
 ├── tests/                            # Comprehensive Automated Test Suite
 │   ├── test_article_narrator.py      # Web article & long text narrator tests
 │   ├── test_backend_services.py      # Core service unit tests
 │   ├── test_channel_narrator.py      # Channel narrator & audio text cleaning tests
 │   ├── test_dispatcher.py            # ⚡ Telegram Dispatcher & concurrency tests
+│   ├── test_donation.py              # ☕ Bakong KHQR, CRC16, store & blessing tests
 │   ├── test_startup_script.py        # Startup script validation
 │   ├── test_system_upgrades.py       # API & webhook regression tests
 │   ├── test_telegram.py              # Telegram command & message tests
@@ -477,6 +571,9 @@ python -m unittest tests.test_dispatcher
 
 # Test Audio Cache & SingleFlight
 python -m unittest tests.test_tts_cache
+
+# Test Bakong KHQR & Donation Engine
+python -m unittest tests.test_donation
 
 # Run Ruff code linter
 python -m ruff check .
