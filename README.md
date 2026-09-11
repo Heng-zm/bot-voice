@@ -330,6 +330,7 @@ flowchart TD
         TTS --> FastPath{⚡ CDN file_id Hit?}
         FastPath -->|Yes <50ms| DirectSend[🚀 Instant Telegram Delivery]
         FastPath -->|No| SF[🛡️ TTSSingleFlight Coalescing]
+        SF --> Progress[📊 Live Synthesis Progress Indicator]
         SF --> T1[Tier 1: Hugging Face Khmer Space ≤250 chars]
         T1 -.->|Empty / Limit / Timeout <1s| T2[Tier 2: Microsoft Edge Neural TTS]
         T2 -.->|Multilingual / Retry| T3[Tier 3: Google Gemini Multimodal]
@@ -345,7 +346,21 @@ flowchart TD
         MemCache <--> DB[(🗄️ Supabase PostgreSQL - Pooler / Transaction Mode)]
         DB --> Pruner[🧹 Bounded Batch Pruning 500 records/batch]
     end
+
+    subgraph "Presentation Layer — Telegram & Web UI"
+        DirectSend --> VoiceCard[🎧 Voice Playback Card<br/>waveform · speed · voice toggle]
+        FFmpeg --> VoiceCard
+        Progress -.->|streamed edits| VoiceCard
+        OCR --> OCRCard[🔍 OCR Result Card<br/>listen · copy · translate]
+        ChanNarrator --> ChannelCard[📢 Channel Auto-Voice Card]
+        Admin --> AdminUI[🎛️ /admin Control Center<br/>cache · workers · broadcast · CRM]
+        MemCache --> AdminUI
+        Redis --> WebDash[🌐 Web Dashboard<br/>throughput · hit-rate · latency]
+        DB --> WebDash
+    end
 ```
+
+> **Presentation-layer legend:** `VoiceCard`, `OCRCard`, and `ChannelCard` map to the in-chat mockups in [📱 Telegram UI Experience Preview](#-telegram-ui-experience-preview); `AdminUI` and `WebDash` map to the `/admin` console and web dashboard mockups in the same section.
 
 ---
 
