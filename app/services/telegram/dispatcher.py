@@ -334,7 +334,11 @@ class TelegramDispatcher:
             data = json.loads(raw_body)
             if not isinstance(data, dict):
                 raise ValueError("Payload root must be a JSON object.")
-            update = Update.de_json(data, app_obj.bot)
+            bot = getattr(app_obj, "bot", None)
+            try:
+                update = Update.de_json(data, bot)
+            except TypeError:
+                update = Update.de_json(data, None)
         except HTTPException:
             raise
         except Exception as exc:

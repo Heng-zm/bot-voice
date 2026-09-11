@@ -78,6 +78,7 @@ class TelegramDispatcherTests(unittest.IsolatedAsyncioTestCase):
     async def test_successful_dispatch_and_deduplication(self) -> None:
         mock_app = MagicMock()
         mock_app.bot = MagicMock()
+        mock_app.bot.defaults = None
         mock_app.process_update = AsyncMock()
 
         with patch.object(self.dispatcher, "_get_expected_secret", return_value="my_secret_token"), \
@@ -108,6 +109,7 @@ class TelegramDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.dispatcher.async_dispatch = True
         mock_app = MagicMock()
         mock_app.bot = MagicMock()
+        mock_app.bot.defaults = None
         started_event = asyncio.Event()
 
         async def slow_process(update: Update) -> None:
@@ -147,6 +149,7 @@ class TelegramDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.dispatcher.async_dispatch = True
         mock_app = MagicMock()
         mock_app.bot = MagicMock()
+        mock_app.bot.defaults = None
         started_event = asyncio.Event()
 
         async def hung_process(update: Update) -> None:
@@ -182,6 +185,7 @@ class TelegramDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
         mock_app = MagicMock()
         mock_app.bot = MagicMock()
+        mock_app.bot.defaults = None
         mock_app.process_update = AsyncMock(side_effect=lambda u: asyncio.sleep(1.0))
 
         with patch.object(self.dispatcher, "_get_expected_secret", return_value="token123"), \
