@@ -458,20 +458,20 @@ except ImportError:
 # values at runtime.
 PERFORMANCE_CODE_DEFAULTS: dict[str, Any] = {
     "BOT_MODE": "WEBHOOK",
-    "TELEGRAM_CONCURRENT_UPDATES": 4,
-    "TELEGRAM_CONNECTION_POOL_SIZE": 24,
+    "TELEGRAM_CONCURRENT_UPDATES": 8,
+    "TELEGRAM_CONNECTION_POOL_SIZE": 32,
     "HTTP_MAX_CONNECTIONS": 100,
     "HTTP_MAX_KEEPALIVE_CONNECTIONS": 20,
-    "DB_EXECUTOR_MAX_WORKERS": 3,
-    "MAX_CONCURRENT_TTS_USERS": 2,
+    "DB_EXECUTOR_MAX_WORKERS": 4,
+    "MAX_CONCURRENT_TTS_USERS": 4,
     "USER_SYNC_TTL_S": 1800.0,
     "PREFS_CACHE_TTL_S": 600.0,
     "TTS_AUDIO_CACHE_ENABLED": True,
-    "TTS_AUDIO_CACHE_MAX_MB": 32,
+    "TTS_AUDIO_CACHE_MAX_MB": 64,
     "TTS_AUDIO_CACHE_ITEM_MAX_MB": 8,
-    "TTS_AUDIO_CACHE_TTL_S": 1200.0,
-    "EDGE_TTS_PARALLEL_CHUNKS": 1,
-    "PAGED_TTS_SEND_DELAY_S": 0.10,
+    "TTS_AUDIO_CACHE_TTL_S": 1800.0,
+    "EDGE_TTS_PARALLEL_CHUNKS": 2,
+    "PAGED_TTS_SEND_DELAY_S": 0.08,
     "WEB_STATUS_POLL_SECONDS": 30,
     "WEB_LIVE_POLL_SECONDS": 30,
 }
@@ -17275,13 +17275,13 @@ def _tts_voice_candidates(text: str, gender: str) -> list[str]:
     return unique
 
 
-async def _edge_tts_stream_once(chunk_text: str, voice: str) -> bytes:
+async def _edge_tts_stream_once(chunk_text: str, voice: str, rate: str = "+0%") -> bytes:
     if edge_tts is None:
         raise RuntimeError("edge-tts is not installed. Add `edge-tts` to requirements.txt or choose another TTS provider.")
 
     async def _collect() -> bytes:
         audio_chunks: list[bytes] = []
-        communicate = edge_tts.Communicate(chunk_text, voice)
+        communicate = edge_tts.Communicate(chunk_text, voice, rate=rate)
         async for message in communicate.stream():
             msg_type = message.get("type") if isinstance(message, dict) else getattr(message, "type", None)
             msg_data = message.get("data") if isinstance(message, dict) else getattr(message, "data", None)
@@ -17293,12 +17293,16 @@ async def _edge_tts_stream_once(chunk_text: str, voice: str) -> bytes:
 
 
 
-async def _edge_tts_stream_with_retry(chunk_text: str, voices: list[str]) -> tuple[bytes, str]:
+async def _edge_tts_stream_with_retry(
+    chunk_text: str,
+    voices: list[str],
+    rate: str = "+0%",
+) -> tuple[bytes, str]:
     last_errors: list[str] = []
     for voice in voices:
         for attempt in range(1, EDGE_TTS_RETRIES + 1):
             try:
-                mp3_data = await _edge_tts_stream_once(chunk_text, voice)
+                mp3_data = await _edge_tts_stream_once(chunk_text, voice, rate=rate)
                 if mp3_data:
                     if attempt > 1:
                         logger.info("edge-tts recovered on attempt %s with voice=%s", attempt, voice)
@@ -19197,12 +19201,14 @@ def _tts_audio_cache_clear() -> int:
 def _write_cached_audio_to_path(path: str, data: bytes) -> None:
     if not path or not data:
         return
+    # Ephemeral temp files are sent directly from in-memory BytesIO to Telegram;
+    # skipping disk write prevents redundant I/O wear and container latency.
+    if os.path.basename(path).startswith("tgbot_"):
+        return
     try:
         with open(path, "wb") as fh:
             fh.write(data)
     except OSError:
-        # The caller primarily uses the returned bytes. Disk cache write-through
-        # is only for compatibility with cleanup/output_path expectations.
         pass
 
 async def _generate_voice_edge(text: str, gender: str, speed: float, output_path: str) -> bytes:
@@ -19214,6 +19220,10 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
     if not text_chunks:
         raise ValueError("generate_voice: no speakable text chunks")
 
+    speed_key = _rounded_speed(speed)
+    rate_pct = int(round((speed_key - 1.0) * 100))
+    edge_rate = f"{'+' if rate_pct >= 0 else ''}{rate_pct}%"
+
     async def _render_edge_chunk(idx: int, chunk_text: str) -> tuple[int, bytes, str]:
         # Detect voice per chunk, not only for the whole message.  This keeps
         # mixed English/Korean/Japanese/Chinese/Khmer text readable after
@@ -19221,7 +19231,7 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
         # the same voice.
         chunk_voices = _tts_voice_candidates(chunk_text, gender)
         try:
-            chunk_mp3, used_voice = await _edge_tts_stream_with_retry(chunk_text, chunk_voices)
+            chunk_mp3, used_voice = await _edge_tts_stream_with_retry(chunk_text, chunk_voices, rate=edge_rate)
             return idx, chunk_mp3, used_voice
         except Exception as e:
             preview = chunk_text[:80].replace("\n", " ")
@@ -19258,9 +19268,10 @@ async def _generate_voice_edge(text: str, gender: str, speed: float, output_path
     if len(set(used_voices)) > 1:
         logger.info("edge-tts used multiple voices/languages: %s", sorted(set(used_voices)))
 
-    speed_key = _rounded_speed(speed)
-    af        = _build_atempo_chain(speed_key) if abs(speed_key - DEFAULT_SPEED) > 1e-4 else None
-    cmd       = [
+    # Edge TTS applies rate natively (+25%, -25%), completely eliminating
+    # CPU-intensive FFmpeg atempo audio resampling and yielding natural neural cadence.
+    af = None
+    cmd = [
         _FFMPEG_EXE,
         "-hide_banner",
         "-loglevel", "error",

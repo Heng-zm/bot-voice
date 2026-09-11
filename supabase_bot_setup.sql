@@ -375,6 +375,44 @@ before update on public.feature_requests
 for each row execute function public.bot_set_updated_at();
 
 -- --------------------------------------------------------------------------
+-- 8. Donations and Hall of Fame (តារាងកិត្តិយសអ្នកឧបត្ថម្ភ)
+-- --------------------------------------------------------------------------
+create table if not exists public.donations (
+  id bigserial primary key,
+  user_id bigint not null,
+  username text,
+  full_name text,
+  amount double precision not null default 1.0,
+  currency text not null default 'USD',
+  tier text not null default 'coffee',
+  note text,
+  blessing_sent boolean not null default false,
+  status text not null default 'completed',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+alter table public.donations add column if not exists username text;
+alter table public.donations add column if not exists full_name text;
+alter table public.donations add column if not exists amount double precision default 1.0;
+alter table public.donations add column if not exists currency text default 'USD';
+alter table public.donations add column if not exists tier text default 'coffee';
+alter table public.donations add column if not exists note text;
+alter table public.donations add column if not exists blessing_sent boolean default false;
+alter table public.donations add column if not exists status text default 'completed';
+alter table public.donations add column if not exists created_at timestamptz default now();
+alter table public.donations add column if not exists updated_at timestamptz default now();
+
+create index if not exists idx_donations_user_id on public.donations(user_id);
+create index if not exists idx_donations_status on public.donations(status);
+create index if not exists idx_donations_created_at on public.donations(created_at desc);
+
+drop trigger if exists donations_set_updated_at on public.donations;
+create trigger donations_set_updated_at
+before update on public.donations
+for each row execute function public.bot_set_updated_at();
+
+-- --------------------------------------------------------------------------
 -- Row Level Security
 -- The bot is server-side only. No anon/authenticated access is granted.
 -- --------------------------------------------------------------------------
@@ -387,6 +425,7 @@ alter table public.bot_settings enable row level security;
 alter table public.bot_locks enable row level security;
 alter table public.ai_api_keys enable row level security;
 alter table public.feature_requests enable row level security;
+alter table public.donations enable row level security;
 
 revoke all on table
   public.user_prefs,
@@ -397,7 +436,8 @@ revoke all on table
   public.bot_settings,
   public.bot_locks,
   public.ai_api_keys,
-  public.feature_requests
+  public.feature_requests,
+  public.donations
 from anon, authenticated;
 
 grant select, insert, update, delete on table
@@ -409,7 +449,8 @@ grant select, insert, update, delete on table
   public.bot_settings,
   public.bot_locks,
   public.ai_api_keys,
-  public.feature_requests
+  public.feature_requests,
+  public.donations
 to service_role;
 
 grant usage, select on all sequences in schema public to service_role;
@@ -429,7 +470,8 @@ begin
     'bot_settings',
     'bot_locks',
     'ai_api_keys',
-    'feature_requests'
+    'feature_requests',
+    'donations'
   ]
   loop
     execute format('drop policy if exists %I on public.%I', 'service_role_' || table_name || '_all', table_name);
@@ -448,7 +490,7 @@ notify pgrst, 'reload schema';
 commit;
 
 -- --------------------------------------------------------------------------
--- Verification: this should return 9 rows, each with table_exists = true.
+-- Verification: this should return 10 rows, each with table_exists = true.
 -- --------------------------------------------------------------------------
 select required.table_name,
        to_regclass('public.' || required.table_name) is not null as table_exists
@@ -462,6 +504,8 @@ from (
     ('bot_settings'),
     ('bot_locks'),
     ('ai_api_keys'),
-    ('feature_requests')
+    ('feature_requests'),
+    ('donations')
 ) as required(table_name)
 order by required.table_name;
+

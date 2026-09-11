@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+import hashlib
 import logging
 import os
+import threading
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -84,6 +88,58 @@ def clear_gemini_client_pool() -> None:
     _ACTIVE_POOL_INDEX = 0
 
 
+_GEMINI_RESPONSE_CACHE: OrderedDict[str, tuple[Any, float]] = OrderedDict()
+_GEMINI_RESPONSE_CACHE_LOCK = threading.RLock()
+_GEMINI_RESPONSE_CACHE_MAX_ITEMS = 500
+_GEMINI_RESPONSE_CACHE_TTL_S = 1800.0  # 30 minutes
+
+
+def _make_gemini_cache_key(contents: Any, model: str) -> str | None:
+    """Generate deterministic cache key for text prompts only."""
+    if not isinstance(contents, str) or not contents.strip():
+        return None
+    raw = f"{model}:{contents.strip()}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def get_cached_gemini_content(contents: Any, model: str) -> Any | None:
+    """Lookup cached Gemini response if available and not expired."""
+    key = _make_gemini_cache_key(contents, model)
+    if not key:
+        return None
+    now = time.monotonic()
+    with _GEMINI_RESPONSE_CACHE_LOCK:
+        item = _GEMINI_RESPONSE_CACHE.get(key)
+        if item is not None:
+            resp, ts = item
+            if now - ts <= _GEMINI_RESPONSE_CACHE_TTL_S:
+                _GEMINI_RESPONSE_CACHE.move_to_end(key)
+                return resp
+            _GEMINI_RESPONSE_CACHE.pop(key, None)
+    return None
+
+
+def set_cached_gemini_content(contents: Any, model: str, response: Any) -> None:
+    """Cache successful Gemini response."""
+    key = _make_gemini_cache_key(contents, model)
+    if not key or response is None:
+        return
+    now = time.monotonic()
+    with _GEMINI_RESPONSE_CACHE_LOCK:
+        _GEMINI_RESPONSE_CACHE.pop(key, None)
+        _GEMINI_RESPONSE_CACHE[key] = (response, now)
+        while len(_GEMINI_RESPONSE_CACHE) > _GEMINI_RESPONSE_CACHE_MAX_ITEMS:
+            _GEMINI_RESPONSE_CACHE.popitem(last=False)
+
+
+def clear_gemini_response_cache() -> int:
+    """Clear all in-memory Gemini responses."""
+    with _GEMINI_RESPONSE_CACHE_LOCK:
+        count = len(_GEMINI_RESPONSE_CACHE)
+        _GEMINI_RESPONSE_CACHE.clear()
+        return count
+
+
 def is_retryable_gemini_error(exc: BaseException | str) -> bool:
     """Determine if a Gemini API failure is transient and can be retried."""
     msg = str(exc).lower()
@@ -151,6 +207,13 @@ def generate_content_with_fallback(
     active_client = client
 
     norm_preferred = normalize_gemini_model(preferred_model)
+    # Check in-memory response cache for standard text prompts
+    if config is None:
+        cached = get_cached_gemini_content(contents, norm_preferred)
+        if cached is not None:
+            logger.debug("Gemini response served from in-memory cache for %s", norm_preferred)
+            return cached
+
     candidates = [
         norm_preferred,
         "gemini-2.5-flash",
@@ -170,7 +233,10 @@ def generate_content_with_fallback(
             kwargs: dict[str, Any] = {"model": model_name, "contents": contents}
             if config is not None:
                 kwargs["config"] = config
-            return active_client.models.generate_content(**kwargs)
+            res = active_client.models.generate_content(**kwargs)
+            if config is None:
+                set_cached_gemini_content(contents, model_name, res)
+            return res
         except Exception as exc:
             last_exc = exc
             err_text = str(exc)
@@ -193,7 +259,10 @@ def generate_content_with_fallback(
                         kwargs = {"model": model_name, "contents": contents}
                         if config is not None:
                             kwargs["config"] = config
-                        return active_client.models.generate_content(**kwargs)
+                        res = active_client.models.generate_content(**kwargs)
+                        if config is None:
+                            set_cached_gemini_content(contents, model_name, res)
+                        return res
                     except Exception as alt_exc:
                         last_exc = alt_exc
                         err_text = str(alt_exc)
@@ -252,14 +321,17 @@ def detect_image_mime(path: str) -> str:
 __all__ = [
     "GEMINI_MODEL_DEFAULT",
     "clear_gemini_client_pool",
+    "clear_gemini_response_cache",
     "detect_image_mime",
     "detect_image_mime_from_bytes",
     "extract_gemini_text",
     "generate_content_with_fallback",
+    "get_cached_gemini_content",
     "get_next_gemini_client",
     "get_primary_gemini_api_key",
     "is_retryable_gemini_error",
     "normalize_gemini_model",
     "parse_gemini_api_keys",
     "register_gemini_client",
+    "set_cached_gemini_content",
 ]

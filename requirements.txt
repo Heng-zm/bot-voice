@@ -16,3 +16,6 @@ orjson>=3.9.0
 ujson>=5.9.0
 reportlab>=4.0.0
 redis>=5.0.0
+uvloop>=0.20.0; sys_platform != 'win32'
+httptools>=0.6.0
+qrcode[pil]>=7.4.2

@@ -12,6 +12,13 @@ from telegram.ext import (
     filters,
 )
 
+from app.services.donation import (
+    cmd_adddonor,
+    cmd_donate,
+    cmd_donors,
+    cmd_testblessing,
+    donation_callback,
+)
 from app.services.telegram.callbacks import (
     _runtime_admin_callback,
     broadcast_callback,
@@ -109,6 +116,12 @@ def register_telegram_handlers(application: Application, *, bot_mode: str) -> No
         ("reset", cmd_unlock),
         ("system", cmd_system),
         ("metrics", cmd_system),
+        ("donate", cmd_donate),
+        ("coffee", cmd_donate),
+        ("donors", cmd_donors),
+        ("halloffame", cmd_donors),
+        ("adddonor", cmd_adddonor),
+        ("testblessing", cmd_testblessing),
     )
     for command, callback in command_handlers:
         application.add_handler(CommandHandler(command, callback))
@@ -129,6 +142,7 @@ def register_telegram_handlers(application: Application, *, bot_mode: str) -> No
     application.add_handler(
         CallbackQueryHandler(_runtime_admin_callback, pattern=r"^rtadmin_")
     )
+    application.add_handler(CallbackQueryHandler(donation_callback, pattern=r"^donate_"))
     application.add_handler(CallbackQueryHandler(on_callback))
 
     application.add_handler(

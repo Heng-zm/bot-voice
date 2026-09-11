@@ -337,6 +337,40 @@ class GeminiServicesTests(unittest.TestCase):
                 preferred_model="gemini-2.0-flash",
             )
 
+    def test_gemini_response_cache(self) -> None:
+        from unittest.mock import MagicMock
+
+        from app.services.ai.gemini import clear_gemini_response_cache, generate_content_with_fallback
+
+        clear_gemini_response_cache()
+        mock_client = MagicMock()
+        call_count = 0
+
+        def mock_generate_content(model, contents, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return MagicMock(text=f"Response for {contents}")
+
+        mock_client.models.generate_content.side_effect = mock_generate_content
+
+        # First call: cache miss -> invokes client
+        resp1 = generate_content_with_fallback(
+            client=mock_client,
+            contents="Cached prompt test",
+            preferred_model="gemini-2.5-flash",
+        )
+        self.assertEqual("Response for Cached prompt test", resp1.text)
+        self.assertEqual(1, call_count)
+
+        # Second call with exact same prompt: cache hit -> 0 extra client calls
+        resp2 = generate_content_with_fallback(
+            client=mock_client,
+            contents="Cached prompt test",
+            preferred_model="gemini-2.5-flash",
+        )
+        self.assertEqual("Response for Cached prompt test", resp2.text)
+        self.assertEqual(1, call_count)
+
 
 class VectorStoreServicesTests(unittest.TestCase):
     def test_vector_store_initialization(self) -> None:
@@ -790,6 +824,69 @@ class LifespanSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 await task
 
 
+class DonationAndKHQRTests(unittest.IsolatedAsyncioTestCase):
+    def test_crc16_ccitt(self) -> None:
+        from app.services.donation.khqr import crc16_ccitt
+
+        # Test vector for CRC-16/CCITT-FALSE
+        self.assertEqual("29B1", crc16_ccitt("123456789"))
+
+    def test_generate_khqr_string(self) -> None:
+        from app.services.donation.khqr import generate_khqr_string
+
+        khqr = generate_khqr_string(
+            account_id="botvoice@nbc",
+            merchant_name="BOT VOICE",
+            merchant_city="Phnom Penh",
+            amount=1.00,
+            currency="USD",
+            bill_number="TEST1234",
+        )
+        self.assertTrue(khqr.startswith("000201010212"))
+        self.assertIn("bakong@nbc", khqr)
+        self.assertIn("5303840", khqr)  # USD
+        self.assertIn("54041.00", khqr)  # $1.00
+        self.assertIn("6304", khqr)  # CRC tag
+
+    def test_generate_blessing_script(self) -> None:
+        from app.services.donation.blessing import generate_blessing_script
+
+        script_coffee = generate_blessing_script("Sokha", tier="coffee", amount=1.0)
+        self.assertIn("Sokha", script_coffee)
+        self.assertIn("កាហ្វេ ១ កែវ", script_coffee)
+
+        script_server = generate_blessing_script("Dara", tier="server", amount=5.0)
+        self.assertIn("Dara", script_server)
+        self.assertIn("Server", script_server)
+
+    async def test_donation_store_lifecycle(self) -> None:
+        import os
+        import tempfile
+        from app.services.donation.store import DonationStore
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_file = os.path.join(tmpdir, "test_donations.json")
+            store = DonationStore(file_path=store_file)
+
+            # Record two donors
+            await store.record_donation(user_id=101, full_name="Donor One", amount=2.0, tier="milktea")
+            await store.record_donation(user_id=102, full_name="Donor Two", amount=5.0, tier="server")
+            await store.record_donation(user_id=101, full_name="Donor One", amount=1.0, tier="coffee")
+
+            stats = await store.get_donation_stats()
+            self.assertEqual(8.0, stats["total_usd"])
+            self.assertEqual(2, stats["total_donors"])
+
+            top = await store.get_top_supporters(10)
+            self.assertEqual(2, len(top))
+            # Donor Two ($5.0) should be rank 1 (🥇), Donor One ($3.0) should be rank 2 (🥈)
+            self.assertEqual(102, top[0]["user_id"])
+            self.assertEqual("🥇", top[0]["badge"])
+            self.assertEqual(101, top[1]["user_id"])
+            self.assertEqual("🥈", top[1]["badge"])
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

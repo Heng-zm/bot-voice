@@ -30,6 +30,16 @@ except Exception:
     pass
 
 from fastapi import FastAPI
+try:
+    from fastapi.responses import ORJSONResponse
+    _default_response_class = ORJSONResponse
+except Exception:
+    _default_response_class = None
+
+import gc
+with suppress(Exception):
+    gc.set_threshold(50000, 10, 10)
+
 from telegram import BotCommand
 
 from app import legacy
@@ -132,6 +142,8 @@ async def auto_register_bot_commands() -> bool:
         BotCommand("deleteme", "⚠️ លុបទិន្នន័យ / Delete My Data"),
         BotCommand("feedback", "💡 ផ្ញើមតិកែលម្អ / Feedback"),
         BotCommand("system", "📊 ព័ត៌មានប្រព័ន្ធ / System Status"),
+        BotCommand("donate", "☕ ឧបត្ថម្ភកាហ្វេ / Buy Coffee"),
+        BotCommand("donors", "🏆 តារាងកិត្តិយស / Hall of Fame"),
         BotCommand("cancel", "🛑 បោះបង់ / Cancel Action"),
         BotCommand("admin", "👑 ផ្ទាំងគ្រប់គ្រង / Admin Panel"),
     ]
@@ -148,6 +160,8 @@ async def auto_register_bot_commands() -> bool:
         BotCommand("botsettings", "🛠️ កំណត់រចនាសម្ព័ន្ធ / Bot Config"),
         BotCommand("api", "🔑 គ្រប់គ្រង API / API Keys"),
         BotCommand("runtime", "⚡ ព័ត៌មាន Runtime / Telemetry"),
+        BotCommand("adddonor", "➕ បន្ថែមអ្នកឧបត្ថម្ភ / Add Donor"),
+        BotCommand("testblessing", "🎙️ សាកល្បងសំឡេងជូនពរ / Test Blessing"),
     ]
 
     try:
@@ -305,12 +319,16 @@ async def lifespan(app_instance: FastAPI) -> AsyncGenerator[None, None]:
                 await t
 
 
-app = FastAPI(
-    title="Telegram Bot Voice & AI Assistant Suite",
-    description="Multilingual Voice Synthesis, AI Vision OCR, and Gemini Assistant API.",
-    version="4.2.0",
-    lifespan=lifespan,
-)
+fastapi_kwargs: dict[str, Any] = {
+    "title": "Telegram Bot Voice & AI Assistant Suite",
+    "description": "Multilingual Voice Synthesis, AI Vision OCR, and Gemini Assistant API.",
+    "version": "4.2.0",
+    "lifespan": lifespan,
+}
+if _default_response_class is not None:
+    fastapi_kwargs["default_response_class"] = _default_response_class
+
+app = FastAPI(**fastapi_kwargs)
 
 # Include modular API routers
 app.include_router(api_router)
