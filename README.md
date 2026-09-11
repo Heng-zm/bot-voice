@@ -56,45 +56,111 @@
 
 ## 📱 Telegram UI Experience Preview
 
-Experience the polished, interactive interface that Bot Voice delivers to Telegram users and channels:
+A tour of the polished, interactive surfaces Bot Voice presents across private chats, public channels, and the admin console.
 
 ### 1. Interactive Voice Message Playback
+
 ```
-🗣️ @khmer_voice_bot
-┌────────────────────────────────────────────────────────┐
-│ 🔊 [▶ ═════════════════════════════════════════ 0:24]  │
-│ 🗣️ @khmer_voice_bot                                   │
-├───────────────────────────┬────────────────────────────┤
-│ 👩 ស្រី (Female) ✅        │ 👨 ប្រុស (Male)             │
-├───────────────────────────┴────────────────────────────┤
-│ ⚡ ល្បឿន៖ 1.00x                                         │
-├────────────────────────────────────────────────────────┤
-│ 🎙️ ម៉ូដែល៖ Kiri (Cambodia) ✅                          │
-└────────────────────────────────────────────────────────┘
+╭──────────────────────────────────────────────────────────╮
+│  🗣️  Bot Voice                                    ✓✓ 09:41 │
+├──────────────────────────────────────────────────────────┤
+│   ▶️  ━━━━━━━●───────────────────────────  0:07 / 0:24     │
+│   🎧  waveform ▂▃▅▇▆▄▂▁▂▃▅▇▆▃▂▁▃▅▇▆▄▂▁▂▃▅▇                 │
+├───────────────────────────┬──────────────────────────────┤
+│  👩 ស្រី (Female)  ✅       │  👨 ប្រុស (Male)              │
+├───────────────────────────┼──────────────────────────────┤
+│  🐢 0.75x   ⚡ 1.00x ✅     │  🚀 1.50x        ⏫ 2.00x      │
+├───────────────────────────┴──────────────────────────────┤
+│  🎙️ ម៉ូដែល: Kiri (Cambodia) ✅   🌐 Edge Neural   🧠 Gemini │
+╰──────────────────────────────────────────────────────────╯
 ```
 
 ### 2. Live Synthesis Progress Indicator
+
 ```
-┌────────────────────────────────────────────────────────┐
-│ 🗣️ កំពុងបម្លែងអត្ថបទទៅជាសំឡេង...                         │
-│ [██████████████████░░░░░░░░] 68%                       │
-│ ម៉ូដែល៖ Kiri (Cambodia) • អត្ថបទ 142 តួអក្សរ              │
-└────────────────────────────────────────────────────────┘
+╭──────────────────────────────────────────────────────────╮
+│  🗣️  កំពុងបម្លែងអត្ថបទទៅជាសំឡេង...                            │
+│  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░  68%              │
+│  ម៉ូដែល: Kiri (Cambodia)  •  អត្ថបទ 142 តួអក្សរ               │
+│  ⏱️ Est. 0.4s remaining   •   🔁 Tier 1 → Tier 2 fallback   │
+╰──────────────────────────────────────────────────────────╯
 ```
 
-### 3. Telegram In-App Admin Control Center (`/admin`)
+### 3. Vision OCR & Document Extraction
+
 ```
-🎛️ ប្រព័ន្ធគ្រប់គ្រង Bot Voice (Admin Dashboard)
-┌───────────────────────────┬────────────────────────────┐
-│ ⚙️ ការកំណត់ទូទៅ (Settings)  │ 🚀 Audio Cache & CDN        │
-├───────────────────────────┼────────────────────────────┤
-│ ⚡ Performance Tuning     │ 📢 Broadcast & Schedule    │
-├───────────────────────────┼────────────────────────────┤
-│ 👥 User CRM & Lookup      │ 📊 Live Metrics & Latency  │
-├───────────────────────────┴────────────────────────────┤
-│ 🚨 Error Center & Health Probes                        │
-└────────────────────────────────────────────────────────┘
+╭──────────────────────────────────────────────────────────╮
+│  🔍  Vision OCR — Image Received                          │
+│  📎 receipt_scan.jpg  •  1.2 MB  •  Gemini 2.0 Flash       │
+├──────────────────────────────────────────────────────────┤
+│  ✅ Extracted Text (page 1/1)                              │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │ Invoice #04821 — Total: $128.50                     │  │
+│  │ Date: 2026-09-08   Vendor: Golden Palace Co.        │  │
+│  └────────────────────────────────────────────────────┘  │
+│  🔊 [ Listen to Extraction ]   📋 [ Copy Text ]  🌐 [ Translate ] │
+╰──────────────────────────────────────────────────────────╯
 ```
+
+### 4. Channel Auto-Narrator (Public Post)
+
+```
+╭──────────────────────────────────────────────────────────╮
+│  📢  Khmer Daily News                             ✓ 08:00  │
+├──────────────────────────────────────────────────────────┤
+│  ព័ត៌មានថ្មីៗពីទីក្រុងភ្នំពេញ ប្រចាំថ្ងៃនេះ...                        │
+│  🔗 link cleaned  •  #tags stripped  •  #notts respected    │
+│  🔊 [▶ ═══════════════════════════════ 0:31]  Auto-Voice   │
+╰──────────────────────────────────────────────────────────╯
+```
+
+### 5. Telegram In-App Admin Control Center (`/admin`)
+
+```
+╭─────────────────────────────────────────────────────────────╮
+│  🎛️  ប្រព័ន្ធគ្រប់គ្រង Bot Voice  •  Admin Dashboard             │
+├───────────────────────────┬───────────────────────────────┤
+│  ⚙️  ការកំណត់ទូទៅ            │  🚀  Audio Cache & CDN         │
+│      General Settings       │      12,480 entries cached    │
+├───────────────────────────┼───────────────────────────────┤
+│  ⚡  Performance Tuning     │  📢  Broadcast & Schedule      │
+│      Workers: 32 / Queue 100│      Next run: 09:00 (UTC+7)  │
+├───────────────────────────┼───────────────────────────────┤
+│  👥  User CRM & Lookup      │  📊  Live Metrics & Latency    │
+│      4,213 active users     │      p99: 47ms                │
+├───────────────────────────┴───────────────────────────────┤
+│  🚨  Error Center & Health Probes     🟢 All systems normal  │
+╰─────────────────────────────────────────────────────────────╯
+```
+
+### 6. Web Dashboard — At a Glance
+
+```
+╭──────────────────────────────────────────────────────────╮
+│  🌐  Bot Voice Web Dashboard                    🟢 Online  │
+├───────────────────────┬───────────────┬───────────────────┤
+│  Requests / min        │  Cache Hit %   │  Avg Latency      │
+│      1,284             │     94.7%      │     46ms          │
+├───────────────────────┴───────────────┴───────────────────┤
+│  📈  Latency (last 60 min)                                 │
+│   80┤            ╭╮                                        │
+│   60┤   ╭╮   ╭╮  ││  ╭╮                                    │
+│   40┤╭╮ ││╭╮ ││╭╮││╭╮││╭╮╭╮                                 │
+│   20┤││╭╯│││╰─╯│││╰╯│││╰╯│╰─╮                               │
+│    0└┴┴┴──┴┴┴───┴┴┴──┴┴┴───┴──────────────────────────────  │
+╰──────────────────────────────────────────────────────────╯
+```
+
+#### 🎨 UI Highlights
+
+| Surface | What It Shows | Why It Matters |
+| :--- | :--- | :--- |
+| Voice Playback Card | Waveform, speed presets, voice/gender toggle | Users tune output without retyping commands |
+| Synthesis Progress | Live percentage, tier fallback path, ETA | Transparency during the 4-tier TTS pipeline |
+| OCR Result Card | Extracted text block + listen/copy/translate actions | Turns a photo into usable text or audio in one tap |
+| Channel Narrator | Cleaned post preview + inline voice bar | Keeps channel posts skimmable and listenable |
+| Admin Dashboard | 2-column grid of live operational controls | One tap to purge cache, tune workers, or broadcast |
+| Web Dashboard | Real-time throughput, hit-rate, latency sparkline | At-a-glance health without opening logs |
 
 ---
 
@@ -360,6 +426,7 @@ bot-voice/
 ├── requirements-dev.txt              # Development & testing dependencies
 ├── start.sh                          # Production container startup script
 └── supabase_bot_setup.sql            # PostgreSQL schema, migrations & RLS
+```
 
 ---
 
