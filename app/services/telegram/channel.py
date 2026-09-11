@@ -13,6 +13,7 @@ import io
 import logging
 import os
 import re
+import sys
 from contextlib import suppress
 from typing import TYPE_CHECKING
 
@@ -127,8 +128,10 @@ def _is_channel_allowed(chat_id: int, username: str | None) -> bool:
     """Check if the channel is allowed based on ALLOWED_CHANNEL_IDS configuration."""
     raw_allowed = ""
     try:
-        from app import legacy
-        get_setting = getattr(legacy, "bot_setting_raw_cached", None)
+        legacy_mod = sys.modules.get("app.legacy")
+        if legacy_mod is None:
+            from app import legacy as legacy_mod
+        get_setting = getattr(legacy_mod, "bot_setting_raw_cached", None)
         if callable(get_setting):
             raw_allowed = str(get_setting("allowed_channel_ids", "") or "").strip()
     except Exception:

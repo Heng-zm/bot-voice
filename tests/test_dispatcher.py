@@ -24,6 +24,9 @@ def _make_mock_request(
     headers: dict[str, str] | None = None,
     client_host: str = "127.0.0.1",
 ) -> Request:
+    if "message" in body_dict and isinstance(body_dict["message"], dict):
+        body_dict["message"].setdefault("date", 1700000000)
+        body_dict["message"].setdefault("chat", {"id": 12345, "type": "private"})
     raw_body = json.dumps(body_dict).encode("utf-8")
 
     async def receive() -> dict:
