@@ -120,12 +120,24 @@ async def get_khqr_qr_image(khqr_text: str) -> bytes | None:
     then remote QR generation API fallback.
     """
     # 1. If static file path is provided and exists
-    if STATIC_QR_IMAGE_PATH and os.path.isfile(STATIC_QR_IMAGE_PATH):
-        try:
-            with open(STATIC_QR_IMAGE_PATH, "rb") as f:
-                return f.read()
-        except Exception as e:
-            logger.warning("Failed to read static QR image path %s: %s", STATIC_QR_IMAGE_PATH, e)
+    candidate_paths = [
+        STATIC_QR_IMAGE_PATH,
+        os.path.join(os.getcwd(), "static", "khqr.png"),
+        os.path.join(os.getcwd(), "static", "khqr.jpg"),
+        os.path.join(os.getcwd(), "static", "khqr.jpeg"),
+        os.path.join(os.getcwd(), "static", "aba.png"),
+        os.path.join(os.getcwd(), "static", "aba.jpg"),
+        os.path.join(os.getcwd(), "static", "qr.png"),
+        os.path.join(os.getcwd(), "static", "qr.jpg"),
+    ]
+    for p in candidate_paths:
+        if p and os.path.isfile(p):
+            try:
+                with open(p, "rb") as f:
+                    return f.read()
+            except Exception as e:
+                logger.warning("Failed to read static QR image path %s: %s", p, e)
+
 
     # 2. Try python qrcode package
     try:
