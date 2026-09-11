@@ -3720,61 +3720,8 @@ def _web_progress_bar(done: Any, total: Any) -> str:
 
 
 def _web_blocked_ids_for_users(users: list[Any]) -> set[int]:
-    """Batch-load blocked status to avoid one Supabase query per table row/user."""
-    ids: list[int] = []
-    seen_ids: set[int] = set()
-    for item in users or []:
-        raw = item.get("user_id") if isinstance(item, dict) else item
-        try:
-            uid = int(raw)
-        except Exception:
-            continue
-        if uid not in seen_ids:
-            seen_ids.add(uid)
-            ids.append(uid)
-
-    if not ids:
-        return set()
-
-    with _BLOCKED_USER_CACHE_LOCK:
-        blocked = {uid for uid in ids if uid in _blocked_users_memory}
-    unknown: list[int] = []
-    for uid in ids:
-        cached = _blocked_cache_get(uid)
-        if cached is True:
-            blocked.add(uid)
-        elif cached is None:
-            unknown.append(uid)
-
-    if not unknown or not supabase:
-        for uid in unknown:
-            _blocked_cache_set(uid, uid in blocked)
-        return blocked
-
-    try:
-        found: set[int] = set()
-        chunk_size = 200
-        for start in range(0, len(unknown), chunk_size):
-            chunk = unknown[start:start + chunk_size]
-            res = db_call_sync(
-                f"web_blocked_batch:{start}",
-                lambda c=chunk: supabase.table("blocked_users").select("user_id").in_("user_id", c).execute(),
-                default=None,
-                attempts=2,
-                critical=False,
-            )
-            for row in list(getattr(res, "data", None) or []):
-                try:
-                    found.add(int(row.get("user_id")))
-                except Exception:
-                    pass
-        blocked.update(found)
-        for uid in unknown:
-            _blocked_cache_set(uid, uid in blocked)
-        return blocked
-    except Exception as exc:
-        logger.warning("web blocked batch lookup failed; falling back to per-user cache: %s", exc)
-        return {uid for uid in ids if db_user_is_blocked(uid)}
+    """User blocking feature removed: always returns an empty set."""
+    return set()
 
 
 def _web_status_card(label: str, value: Any, hint: str = "", kind: str = "") -> str:
@@ -5946,12 +5893,6 @@ def _web_send_telegram_message(
                 json=payload,
                 timeout=20,
             )
-            if resp.status_code == 403:
-                blocker_admin_id = int(admin_id or 0)
-                if not blocker_admin_id:
-                    with suppress(Exception):
-                        blocker_admin_id = _web_current_admin_id()
-                db_user_set_blocked(int(chat_id), blocker_admin_id, True, "Telegram Forbidden from web send")
             if not (200 <= resp.status_code < 300):
                 last_error = f"Telegram HTTP {resp.status_code}: {resp.text[:300]}"
                 if telegram_parse_mode and _is_telegram_parse_error(last_error):
@@ -6262,9 +6203,9 @@ def web_admin_users_action():
         flask_flash("Missing user ID.", "error")
         return redirect(_web_safe_return("web_admin_users"))
     if action == "block":
-        ok, msg = db_user_set_blocked(user_id, admin_id, True, "Blocked from web dashboard")
+        ok, msg = True, "User blocking feature is disabled."
     elif action == "unblock":
-        ok, msg = db_user_set_blocked(user_id, admin_id, False)
+        ok, msg = True, "User is active."
     elif action == "reset":
         ok, msg = db_user_reset_prefs(user_id)
     elif action == "clear_history":
@@ -14068,100 +14009,48 @@ def _blocked_cache_get(user_id: int) -> bool | None:
         return blocked
 
 
-def db_user_is_blocked(user_id: int) -> bool:
-    user_id = int(user_id)
-    cached = _blocked_cache_get(user_id)
-    if cached is not None:
-        return cached
+def db_unblock_all_users() -> tuple[bool, str]:
+    """Unblock all users across in-memory state and Supabase blocked_users table."""
     with _BLOCKED_USER_CACHE_LOCK:
-        memory_blocked = user_id in _blocked_users_memory
-    if memory_blocked:
-        _blocked_cache_set(user_id, True)
-        return True
+        _blocked_users_memory.clear()
+        _blocked_user_cache.clear()
     if not supabase:
-        _blocked_cache_set(user_id, False)
-        return False
+        return True, "memory-cleared"
     try:
-        def _fetch():
-            return supabase.table("blocked_users").select("user_id").eq("user_id", user_id).limit(1).execute()
-
-        res = db_call_sync(f"is_user_blocked:{user_id}", _fetch, default=None, attempts=2)
-        blocked = bool(getattr(res, "data", None))
-        _blocked_cache_set(user_id, blocked)
-        return blocked
+        supabase.table("blocked_users").delete().neq("user_id", 0).execute()
+        logger.info("Successfully unblocked all users in Supabase database.")
+        return True, "database-cleared"
     except Exception as e:
-        logger.warning(f"blocked_users check skipped user={user_id}: {e}")
-        _blocked_cache_set(user_id, False)
-        return False
+        logger.warning(f"Failed to clear blocked_users table in Supabase: {e}")
+        return False, str(e)
+
+
+def db_user_is_blocked(user_id: int) -> bool:
+    """User blocking feature removed: always returns False."""
+    return False
 
 
 def db_blocked_user_count() -> int:
-    if not supabase:
-        with _BLOCKED_USER_CACHE_LOCK:
-            return len(_blocked_users_memory)
-    try:
-        res = (
-            supabase.table("blocked_users")
-            .select("user_id", count="exact")
-            .limit(1)
-            .execute()
-        )
-        db_count = int(getattr(res, "count", None) or 0)
-        with _BLOCKED_USER_CACHE_LOCK:
-            memory_count = len(_blocked_users_memory)
-        return max(db_count, memory_count)
-    except Exception:
-        with _BLOCKED_USER_CACHE_LOCK:
-            return len(_blocked_users_memory)
+    """User blocking feature removed: always returns 0."""
+    return 0
 
 
 def db_user_set_blocked(user_id: int, admin_id: int, blocked: bool, reason: str = "") -> tuple[bool, str]:
+    """User blocking feature removed: safely discards block requests."""
     user_id = int(user_id)
-    admin_id = int(admin_id)
     with _BLOCKED_USER_CACHE_LOCK:
-        if blocked:
-            _blocked_users_memory.add(user_id)
-        else:
-            _blocked_users_memory.discard(user_id)
-    _blocked_cache_set(user_id, blocked)
-    if not supabase:
-        return True, "memory-only"
-    try:
-        if blocked:
-            supabase.table("blocked_users").upsert({
-                "user_id": user_id,
-                "admin_id": admin_id,
-                "reason": reason or "blocked from admin panel",
-                "blocked_at": datetime.now(timezone.utc).isoformat(),
-            }, on_conflict="user_id").execute()
-        else:
+        _blocked_users_memory.discard(user_id)
+        _blocked_user_cache.pop(user_id, None)
+    if supabase and not blocked:
+        with suppress(Exception):
             supabase.table("blocked_users").delete().eq("user_id", user_id).execute()
-        return True, "saved"
-    except Exception as e:
-        return False, str(e)
+    return True, "feature_removed"
 
 
 def db_users_set_blocked_batch(records: list[dict[str, Any]]) -> tuple[bool, str]:
-    """Persist multiple blocked user records to Supabase in a single batch operation."""
-    if not records:
-        return True, "empty"
-    with _BLOCKED_USER_CACHE_LOCK:
-        for rec in records:
-            uid = int(rec.get("user_id", 0) or 0)
-            if uid:
-                _blocked_users_memory.add(uid)
-                _blocked_cache_set(uid, True)
-    if not supabase:
-        return True, "memory-only"
-    try:
-        chunk_size = 100
-        for i in range(0, len(records), chunk_size):
-            chunk = records[i:i + chunk_size]
-            supabase.table("blocked_users").upsert(chunk, on_conflict="user_id").execute()
-        return True, "saved"
-    except Exception as e:
-        logger.warning("db_users_set_blocked_batch error: %s", e)
-        return False, str(e)
+    """User blocking feature removed: no-op."""
+    return True, "feature_removed"
+
 
 
 def db_user_reset_prefs(user_id: int) -> tuple[bool, str]:
@@ -14216,7 +14105,7 @@ def db_user_detail(user_id: int) -> dict:
             row.update(res.data[0])
         elif res is None:
             row["error"] = "User detail database read temporarily unavailable."
-    row["blocked"] = db_user_is_blocked(user_id)
+    row["blocked"] = False
     # Admin Recent History/User Detail must read from text_cache, not conversation_history.
     row["history"] = db_user_history_fetch(user_id, limit=ADMIN_DETAIL_HISTORY_TURNS)
     return row
@@ -14229,7 +14118,6 @@ def _format_user_detail_text(row: dict) -> str:
     speed = html.escape(str(row.get("speed") or DEFAULT_SPEED))
     tts_model = html.escape(_tts_model_label(row.get("tts_model") or DEFAULT_TTS_MODEL))
     last_active = html.escape(str(row.get("last_active") or "-")[:19].replace("T", " "))
-    blocked = "🚫 BLOCKED" if row.get("blocked") else "✅ ACTIVE"
     history_rows = row.get("history") or []
     last_lines = []
     for h in history_rows[-ADMIN_DETAIL_HISTORY_TURNS:]:
@@ -14243,7 +14131,7 @@ def _format_user_detail_text(row: dict) -> str:
         "👤 <b>User Detail</b>\n\n"
         f"ID: <code>{user_id}</code>\n"
         f"Username: <b>{username}</b>\n"
-        f"Status: <b>{blocked}</b>\n"
+        "Status: <b>✅ ACTIVE</b>\n"
         f"Voice: <b>{gender}</b>\n"
         f"Speed: <b>{speed}x</b>\n"
         f"TTS model: <b>{tts_model}</b>\n"
@@ -20803,20 +20691,16 @@ def get_user_history_kb(user_id: int, back_ref: str = "p0", page: int = 0, total
     return InlineKeyboardMarkup(rows)
 
 
-def get_user_detail_kb(user_id: int, blocked: bool, back_ref: str = "p0") -> InlineKeyboardMarkup:
+def get_user_detail_kb(user_id: int, blocked: bool = False, back_ref: str = "p0") -> InlineKeyboardMarkup:
     back_callback, back_label = _user_back_callback(back_ref)
     rows = [
         [InlineKeyboardButton("💬 Chat", callback_data=f"user_chat:{user_id}"),
          InlineKeyboardButton("📜 Full History", callback_data=f"user_history:{user_id}:{back_ref}")],
         [InlineKeyboardButton("🧹 Clear History", callback_data=f"user_clearhist:{user_id}:{back_ref}"),
          InlineKeyboardButton("♻️ Reset Prefs", callback_data=f"user_resetprefs:{user_id}:{back_ref}")],
+        [InlineKeyboardButton(back_label, callback_data=back_callback),
+         InlineKeyboardButton("⬅️ Admin", callback_data="admin_home")],
     ]
-    if blocked:
-        rows.append([InlineKeyboardButton("✅ Unblock User", callback_data=f"user_unblock:{user_id}:{back_ref}")])
-    else:
-        rows.append([InlineKeyboardButton("🚫 Block User", callback_data=f"user_block:{user_id}:{back_ref}")])
-    rows.append([InlineKeyboardButton(back_label, callback_data=back_callback),
-                 InlineKeyboardButton("⬅️ Admin", callback_data="admin_home")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -21428,16 +21312,8 @@ async def _run_broadcast_to_all(
                         record = {"chat_id": int(uid), "message_id": message_id} if message_id else None
                         return "sent", record
                     except Forbidden as exc:
-                        with _BLOCKED_USER_CACHE_LOCK:
-                            _blocked_users_memory.add(int(uid))
-                        _blocked_cache_set(int(uid), True)
-                        blocked_record = {
-                            "user_id": int(uid),
-                            "admin_id": int(admin_id),
-                            "reason": f"Telegram Forbidden during broadcast: {str(exc)[:180]}",
-                            "blocked_at": datetime.now(timezone.utc).isoformat(),
-                        }
-                        return "blocked", blocked_record
+                        logger.info("%s Telegram Forbidden uid=%s: %s", label, uid, exc)
+                        return "unreachable", None
                     except RetryAfter as exc:
                         await asyncio.sleep(_retry_after_seconds(exc))
                         if attempt == 1:
@@ -21453,16 +21329,7 @@ async def _run_broadcast_to_all(
                             "bot_to_bot",
                             "have no rights to send a message",
                         )):
-                            with _BLOCKED_USER_CACHE_LOCK:
-                                _blocked_users_memory.add(int(uid))
-                            _blocked_cache_set(int(uid), True)
-                            blocked_record = {
-                                "user_id": int(uid),
-                                "admin_id": int(admin_id),
-                                "reason": f"Telegram unreachable during broadcast: {str(exc)[:180]}",
-                                "blocked_at": datetime.now(timezone.utc).isoformat(),
-                            }
-                            return "blocked", blocked_record
+                            return "unreachable", None
                         logger.error("%s Telegram BadRequest uid=%s: %s", label, uid, exc)
                         return "failed", None
                     except Exception as exc:
@@ -21493,10 +21360,8 @@ async def _run_broadcast_to_all(
                     sent += 1
                     if isinstance(record, dict):
                         sent_records.append(record)
-                elif status == "blocked":
+                elif status in ("blocked", "unreachable"):
                     blocked += 1
-                    if isinstance(record, dict):
-                        newly_blocked_records.append(record)
                 else:
                     failed += 1
 
@@ -21510,12 +21375,6 @@ async def _run_broadcast_to_all(
             )
             if completed < total:
                 await asyncio.sleep(max(0.0, _run_state_broadcast_delay()))
-
-        if newly_blocked_records:
-            await loop.run_in_executor(
-                None,
-                functools.partial(db_users_set_blocked_batch, list(newly_blocked_records)),
-            )
 
         delete_job_id = _broadcast_sent_delete_register(admin_id, label, sent_records)
         delete_note = (
@@ -23034,7 +22893,7 @@ async def _admin_home_text(admin_id: int, title: str = ADMIN_UI_TITLE) -> str:
         f"• Channel Narrator: <b>{'ON ✅' if channel_on else 'OFF ⚠️'}</b> · OCR: <b>{'ON ✅' if ocr_on else 'OFF ⚠️'}</b>{tts_cache_line}\n"
         f"• Storage: Supabase <b>{_ok_bad(db_ok, 'OK', 'WARN')}</b> · Redis <b>{_ok_bad(redis_active, 'OK', 'LOCAL')}</b>\n\n"
         f"📊 <b>Audience & Activity</b>\n"
-        f"• Users: <b>{int(counts.get('total_users') or 0):,}</b> · Blocked: <b>{int(counts.get('blocked_users') or 0):,}</b>\n"
+        f"• Users: <b>{int(counts.get('total_users') or 0):,}</b> (All Active)\n"
         f"• Broadcasts Sent: <b>{int(counts.get('total_broadcasts') or 0):,}</b> · Schedules: <b>{int(counts.get('pending_sched') or 0):,}</b>\n"
         f"• Maintenance: <b>{'ACTIVE ⚠️' if maintenance else 'NORMAL ✅'}</b>\n\n"
         f"🔔 <b>System Alerts:</b>\n"
@@ -23911,7 +23770,7 @@ async def _admin_health_text() -> str:
         f"🔒 TTS concurrency: <b>{_run_state_max_concurrent_tts_users()}</b>",
         "",
         "<b>Broadcast / Schedule</b>",
-        f"👥 Users: <b>{int(counts.get('total_users') or 0)}</b> | 🚫 Blocked: <b>{int(counts.get('blocked_users') or 0)}</b>",
+        f"👥 Users: <b>{int(counts.get('total_users') or 0)}</b> (All Active)",
         f"⏰ Pending schedules: <b>{int(counts.get('pending_sched') or 0)}</b>",
         f"📚 Templates: <b>{int(template_count)}/{BROADCAST_TEMPLATE_LIBRARY_MAX}</b>",
         f"🗑️ Sent-delete jobs: <b>{int(delete_jobs)}</b>",
@@ -23926,7 +23785,7 @@ async def _admin_health_text() -> str:
         "",
         "<b>Since Restart</b>",
         f"🗣️ TTS: <b>{_RUNTIME_METRICS.get('tts', 0)}</b> | 🔍 OCR: <b>{_RUNTIME_METRICS.get('ocr', 0)}</b> | 🎙️ Voice: <b>{_RUNTIME_METRICS.get('voice', 0)}</b>",
-        f"❌ Errors: <b>{_RUNTIME_METRICS.get('errors', 0)}</b> | ⛔ Blocked hits: <b>{_RUNTIME_METRICS.get('blocked_hits', 0)}</b>",
+        f"❌ Errors: <b>{_RUNTIME_METRICS.get('errors', 0)}</b>",
         f"⏱️ Uptime: <b>{html.escape(_format_uptime())}</b>",
     ])
 
@@ -23937,7 +23796,6 @@ async def _admin_stats_text(admin_id: int) -> str:
     return (
         "📊 <b>Admin Analytics & Telemetry</b>\n\n"
         f"👥 Total users: <b>{int(counts.get('total_users') or 0):,}</b>\n"
-        f"🚫 Blocked users: <b>{int(counts.get('blocked_users') or 0):,}</b>\n"
         f"⏰ Pending schedules: <b>{int(counts.get('pending_sched') or 0):,}</b>\n"
         f"🔑 Active API keys: <b>{int(counts.get('active_api_keys') or 0):,}</b>\n"
         f"💬 Active admin chats: <b>{len(_admin_chat_target)}</b>\n"
@@ -23950,7 +23808,6 @@ async def _admin_stats_text(admin_id: int) -> str:
         f"🔍 OCR requests: <b>{_RUNTIME_METRICS.get('ocr', 0):,}</b>\n"
         f"🎙️ Voice transcripts: <b>{_RUNTIME_METRICS.get('voice', 0):,}</b>\n"
         f"🎵 Audio transcripts: <b>{_RUNTIME_METRICS.get('audio', 0):,}</b>\n"
-        f"⛔ Blocked hits: <b>{_RUNTIME_METRICS.get('blocked_hits', 0):,}</b>\n"
         f"⚠️ Disabled hits: <b>{_RUNTIME_METRICS.get('disabled_hits', 0):,}</b>\n"
         f"❌ Errors: <b>{_RUNTIME_METRICS.get('errors', 0):,}</b>\n\n"
         f"⏱️ Uptime: <b>{html.escape(_format_uptime())}</b>"

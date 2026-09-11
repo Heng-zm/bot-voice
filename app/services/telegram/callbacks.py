@@ -211,7 +211,7 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             await safe_send(lambda: query.message.edit_text(
                 _format_user_detail_text(row),
                 parse_mode="HTML",
-                reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=f"h{page}"),
+                reply_markup=get_user_detail_kb(target_id, False, back_ref=f"h{page}"),
             ))
             return
 
@@ -251,7 +251,7 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             await safe_send(lambda: query.message.edit_text(
                 _format_user_detail_text(row),
                 parse_mode="HTML",
-                reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
+                reply_markup=get_user_detail_kb(target_id, False, back_ref=back_ref),
             ))
             return
 
@@ -294,25 +294,21 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         if data.startswith(("user_block:", "user_unblock:")):
             parts = data.split(":")
-            action = parts[0]
             target_id = _int_part(parts, 1, 0)
             back_ref = parts[2] if len(parts) > 2 else "p0"
             if target_id <= 0:
                 await _invalid_callback()
                 return
-            blocked = action == "user_block"
-            ok, info = await asyncio.get_running_loop().run_in_executor(
+            await asyncio.get_running_loop().run_in_executor(
                 _DB_EXECUTOR,
-                lambda: db_user_set_blocked(target_id, user_id, blocked),
+                lambda: db_user_set_blocked(target_id, user_id, False),
             )
             row = await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, lambda: db_user_detail(target_id))
-            notice = "✅ User blocked." if blocked else "✅ User unblocked."
-            if not ok:
-                notice = f"⚠️ Saved memory only / DB issue: {info[:500]}"
+            notice = "ℹ️ មុខងារ Block User ត្រូវបានបិទ/ដកចេញហើយ។ អ្នកប្រើប្រាស់ទាំងអស់អាចប្រើប្រាស់ Bot បានធម្មតា។"
             await safe_send(lambda: query.message.edit_text(
                 notice + "\n\n" + _format_user_detail_text(row),
                 parse_mode="HTML",
-                reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
+                reply_markup=get_user_detail_kb(target_id, False, back_ref=back_ref),
             ))
             return
 
@@ -329,7 +325,7 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             await safe_send(lambda: query.message.edit_text(
                 notice + "\n\n" + _format_user_detail_text(row),
                 parse_mode="HTML",
-                reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
+                reply_markup=get_user_detail_kb(target_id, False, back_ref=back_ref),
             ))
             return
 
@@ -345,7 +341,7 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             await safe_send(lambda: query.message.edit_text(
                 "✅ User conversation history cleared.\n\n" + _format_user_detail_text(row),
                 parse_mode="HTML",
-                reply_markup=get_user_detail_kb(target_id, bool(row.get("blocked")), back_ref=back_ref),
+                reply_markup=get_user_detail_kb(target_id, False, back_ref=back_ref),
             ))
             return
 

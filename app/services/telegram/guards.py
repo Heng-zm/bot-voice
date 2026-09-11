@@ -12,7 +12,6 @@ from app.services.telegram.security import (
     _ADMIN_ONLY_COMMANDS,
     _security_notice_once,
     _telegram_command_name,
-    is_user_blocked,
 )
 
 
@@ -96,8 +95,6 @@ async def _telegram_user_security_guard(update: Any, context: Any) -> None:
     """Cheap global user-safety gate before expensive handlers.
 
     - Blocks non-admin access to admin commands/callbacks.
-    - Stops blocked users before OCR/TTS/AI work begins.
-    - Uses cached blocked lookups to avoid DB pressure under normal traffic.
     """
     if not isinstance(update, Update):
         return
@@ -122,20 +119,7 @@ async def _telegram_user_security_guard(update: Any, context: Any) -> None:
         await _security_notice_once(update, f"admin_cmd:{user_id}", "⛔ ពាក្យបញ្ជានេះសម្រាប់ Admin ប៉ុណ្ណោះ។")
         raise ApplicationHandlerStop
     if cmd in {"security", "privacy", "deleteme"}:
-        # Privacy/self-service commands stay available even if the user is blocked.
         return
-
-    # Cache hits stay on the event loop; only a Supabase miss enters the bounded
-    # database executor.
-    try:
-        blocked = await is_user_blocked(user_id)
-    except Exception as exc:
-        blocked = False
-        _log_once(logging.WARNING, f"blocked_guard_failed:{user_id}", "Blocked-user guard skipped user=%s: %s", user_id, exc)
-    if blocked:
-        _metric_inc("blocked_hits")
-        await _security_notice_once(update, f"blocked:{user_id}", "⛔ អ្នកត្រូវបាន Block មិនអាចប្រើ Bot នេះបានទេ។")
-        raise ApplicationHandlerStop
 
 
 @legacy_bound_handler

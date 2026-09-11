@@ -229,6 +229,12 @@ async def auto_register_all() -> dict[str, Any]:
         await get_settings_store().get_text("DEFAULT_TTS_MODEL", "")
         results["default_tts_model"] = get_default_tts_model()
 
+    # 4. Ensure all users are unblocked (Feature removed)
+    with suppress(Exception):
+        if hasattr(legacy, "db_unblock_all_users"):
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, legacy.db_unblock_all_users)
+
     return results
 
 

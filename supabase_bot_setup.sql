@@ -220,6 +220,9 @@ alter table public.blocked_users add column if not exists blocked_at timestamptz
 create index if not exists blocked_users_blocked_at_idx
   on public.blocked_users (blocked_at desc);
 
+-- Unblock all users (User blocking feature permanently removed)
+delete from public.blocked_users;
+
 -- --------------------------------------------------------------------------
 -- 6. Runtime bot settings
 -- --------------------------------------------------------------------------
