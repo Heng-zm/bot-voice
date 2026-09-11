@@ -23,3 +23,7 @@ venv/
 tmp/
 temp/
 backups/
+data/
+*.db
+*.sqlite
+*.sqlite3

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import io
 import logging
 from typing import Any
@@ -99,11 +100,12 @@ async def deliver_voice_blessing(
     """Synthesize and send personalized Khmer Voice Note to donor via Telegram."""
     tier_info = TIER_DETAILS.get(tier.lower(), {})
     tier_title = tier_info.get("title", f"${amount:.2f}")
+    escaped_name = html.escape(donor_name)
 
     caption = (
         f"🎙️ <b>សារសំឡេងអរគុណពិសេសពី Bot Voice</b> ❤️\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"ជូនចំពោះបង៖ <b>{donor_name}</b>\n"
+        f"ជូនចំពោះបង៖ <b>{escaped_name}</b>\n"
         f"កញ្ចប់ឧបត្ថម្ភ៖ <b>{tier_title}</b> (${amount:.2f} USD)\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"<i>«សូមអរគុណបងយ៉ាងជ្រាលជ្រៅបំផុតសម្រាប់ការគាំទ្រ និងលើកទឹកចិត្ត! បងជាចំណែកដ៏សំខាន់ដែលជួយឱ្យ Bot Voice បន្តដំណើរការដោយឥតគិតថ្លៃសម្រាប់បងប្អូនខ្មែរទាំងអស់គ្នា!»</i> ☕💖\n\n"
@@ -128,11 +130,12 @@ async def deliver_voice_blessing(
 
     # Fallback to rich text message if voice synthesis / sending encountered an error
     try:
+        script_text = generate_blessing_script(donor_name, tier, amount)
         text_message = (
             f"🎉 <b>សារអរគុណ និងជូនពរពិសេស!</b> ❤️\n\n"
             f"{caption}\n\n"
             f"📜 <b>ពាក្យជូនពរ៖</b>\n"
-            f"<i>«{generate_blessing_script(donor_name, tier, amount)}»</i>"
+            f"<i>«{html.escape(script_text)}»</i>"
         )
         await bot.send_message(
             chat_id=user_id,
@@ -143,3 +146,4 @@ async def deliver_voice_blessing(
     except Exception as e:
         logger.error("Could not deliver fallback blessing text to %s: %s", user_id, e)
         return False
+

@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 _PROCESSED_APPROVALS: set[str] = set()
 _APPROVALS_LOCK = threading.Lock()
 
+# Bounded in-memory store for pending approval tickets (guarantees callback_data <= 64 bytes)
+_PENDING_DONATIONS: dict[str, dict[str, Any]] = {}
+_PENDING_LOCK = threading.Lock()
+
 
 def is_admin_user(user_id: int) -> bool:
     """Check whether a given user_id is an authorized administrator."""
@@ -110,10 +114,10 @@ async def _send_khqr_screen(
     caption = (
         f"🇰🇭 <b>Bakong KHQR — {tier_title}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 <b>ឈ្មោះគណនី:</b> <code>{DEFAULT_BAKONG_MERCHANT_NAME}</code>\n"
-        f"🆔 <b>Bakong ID:</b> <code>{DEFAULT_BAKONG_ACCOUNT_ID}</code>\n"
+        f"👤 <b>ឈ្មោះគណនី:</b> <code>{html.escape(DEFAULT_BAKONG_MERCHANT_NAME)}</code>\n"
+        f"🆔 <b>Bakong ID:</b> <code>{html.escape(DEFAULT_BAKONG_ACCOUNT_ID)}</code>\n"
         f"💵 <b>ចំនួនទឹកប្រាក់:</b> <b>${amount:.2f} USD</b>\n"
-        f"🧾 <b>លេខវិក្កយបត្រ:</b> <code>{bill_no}</code>\n"
+        f"🧾 <b>លេខវិក្កយបត្រ:</b> <code>{html.escape(bill_no)}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📲 <b>របៀបបង់ប្រាក់៖</b>\n"
         f"1. បើកកម្មវិធីធនាគាររបស់បង (ABA, ACLEDA, Wing, Canadia, Bakong...)\n"
@@ -123,8 +127,13 @@ async def _send_khqr_screen(
         f"✨ <i>Bot នឹងផ្ញើសារសំឡេងអរគុណពិសេសជូនបងភ្លាមៗ!</i>"
     )
 
+    # Compact callback_data ensuring it stays well under the 64-byte Telegram limit
+    tier_short = tier_key[:8]
+    bill_short = bill_no[:10]
+    paid_cb = f"donate_paid:{tier_short}:{bill_short}:{amount:.2f}"
+
     action_buttons = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ ខ្ញុំបានផ្ទេរប្រាក់រួចរាល់", callback_data=f"donate_paid:{tier_key}:{bill_no}:{amount:.2f}")],
+        [InlineKeyboardButton("✅ ខ្ញុំបានផ្ទេរប្រាក់រួចរាល់", callback_data=paid_cb)],
         [InlineKeyboardButton("🔙 ជ្រើសរើសចំនួនផ្សេង", callback_data="donate_menu")],
     ])
 
@@ -132,7 +141,8 @@ async def _send_khqr_screen(
     if qr_bytes and context.bot:
         try:
             photo_file = io.BytesIO(qr_bytes)
-            photo_file.name = "khqr.png"
+            ext = "webp" if qr_bytes.startswith(b"RIFF") else ("jpg" if qr_bytes.startswith(b"\xff\xd8") else "png")
+            photo_file.name = f"khqr.{ext}"
             await context.bot.send_photo(
                 chat_id=chat_id,
                 photo=photo_file,
@@ -217,7 +227,7 @@ async def cmd_donate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_donors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Display Hall of Fame (/donors) with top contributors and metrics."""
+    """Display Hall of Fame (/donors) with top contributors and metrics. Protects donor privacy."""
     stats = await donation_store.get_donation_stats()
     top_supporters = await donation_store.get_top_supporters(10)
     recent = await donation_store.get_recent_donations(5)
@@ -239,7 +249,12 @@ async def cmd_donors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         lines.append("🌟 <b>កំពូលអ្នកឧបត្ថម្ភ (Top Supporters):</b>")
         for item in top_supporters:
             badge = item.get("badge", "⭐")
-            name = html.escape(item.get("full_name") or f"User {item.get('user_id')}")
+            raw_name = str(item.get("full_name") or "").strip()
+            # Privacy guard: mask raw user IDs from being exposed publicly
+            if not raw_name or raw_name.lower().startswith("user ") or raw_name.isdigit():
+                uid_str = str(item.get("user_id", ""))
+                raw_name = f"Supporter *{uid_str[-4:]}" if len(uid_str) >= 4 else "សប្បុរសជន"
+            name = html.escape(raw_name)
             amount = float(item.get("total_amount") or 0.0)
             cups = item.get("total_cups", 1)
             lines.append(f"{badge} <b>{name}</b> — ${amount:.2f} ({cups} កែវ)")
@@ -250,7 +265,11 @@ async def cmd_donors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if recent:
         lines.append("🕒 <b>អ្នកឧបត្ថម្ភថ្មីៗ (Recent Supporters):</b>")
         for r in recent:
-            name = html.escape(r.get("full_name") or f"User {r.get('user_id')}")
+            raw_name = str(r.get("full_name") or "").strip()
+            if not raw_name or raw_name.lower().startswith("user ") or raw_name.isdigit():
+                uid_str = str(r.get("user_id", ""))
+                raw_name = f"Supporter *{uid_str[-4:]}" if len(uid_str) >= 4 else "សប្បុរសជន"
+            name = html.escape(raw_name)
             amt = float(r.get("amount") or 0.0)
             tier = r.get("tier", "coffee")
             tier_info = TIER_DETAILS.get(tier, {})
@@ -299,6 +318,9 @@ async def cmd_adddonor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         donor_uid = int(args[0])
         amount = float(args[1])
+        if amount <= 0 or amount > 10000.0:
+            await msg.reply_text("❌ ចំនួនទឹកប្រាក់ត្រូវតែចន្លោះពី $0.01 ដល់ $10,000.00 USD។")
+            return
     except ValueError:
         await msg.reply_text("❌ user_id និង amount ត្រូវតែជាតួលេខ។")
         return
@@ -383,7 +405,7 @@ async def cmd_testblessing(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 voice=voice_file,
                 caption=(
                     f"🎙️ <b>AI Voice Blessing Preview</b> ({tier_info.get('title', tier)})\n\n"
-                    f"📜 <b>អត្ថបទ៖</b> <i>«{script}»</i>"
+                    f"📜 <b>អត្ថបទ៖</b> <i>«{html.escape(script)}»</i>"
                 ),
                 parse_mode="HTML",
             )
@@ -487,26 +509,39 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 parse_mode="HTML",
             )
 
-        # Notify Administrators with 1-click Approval
-        approval_token = f"{user_id}:{amount:.2f}:{tier_key}:{bill_no}"
+        # Register compact ticket in memory (only ~18 bytes callback_data)
+        ticket_id = f"t{int(time.time() * 1000) % 100000000:08x}"
+        with _PENDING_LOCK:
+            if len(_PENDING_DONATIONS) > 200:
+                for k in list(_PENDING_DONATIONS.keys())[:50]:
+                    _PENDING_DONATIONS.pop(k, None)
+            _PENDING_DONATIONS[ticket_id] = {
+                "user_id": user_id,
+                "amount": amount,
+                "tier_key": tier_key,
+                "bill_no": bill_no,
+                "user_name": user_name,
+            }
+
         admin_markup = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
                     "💖 អនុម័ត & ផ្ញើសំឡេងជូនពរ",
-                    callback_data=f"donate_approve:{approval_token}",
+                    callback_data=f"donate_appr:{ticket_id}",
                 ),
-                InlineKeyboardButton("❌ បដិសេធ", callback_data=f"donate_reject:{user_id}:{bill_no}"),
+                InlineKeyboardButton("❌ បដិសេធ", callback_data=f"donate_rej:{ticket_id}"),
             ],
         ])
 
+        username_text = f"@{html.escape(user.username)}" if user and user.username else "N/A"
         admin_notification = (
             f"🎉 <b>មានការជូនដំណឹងឧបត្ថម្ភថ្មី!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 <b>សប្បុរសជន:</b> {user_name} (@{user.username or 'N/A'})\n"
+            f"👤 <b>សប្បុរសជន:</b> {user_name} ({username_text})\n"
             f"🆔 <b>Telegram ID:</b> <code>{user_id}</code>\n"
             f"☕ <b>កញ្ចប់:</b> {tier_title}\n"
             f"💵 <b>ចំនួនទឹកប្រាក់:</b> <b>${amount:.2f} USD</b>\n"
-            f"🧾 <b>វិក្កយបត្រ:</b> <code>{bill_no}</code>\n"
+            f"🧾 <b>វិក្កយបត្រ:</b> <code>{html.escape(bill_no)}</code>\n"
             f"⏰ <b>ម៉ោង:</b> {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"សូមពិនិត្យគណនីធនាគារ Bakong/ABA របស់បង រួចចុចប៊ូតុងខាងក្រោមដើម្បីអនុម័ត៖"
@@ -527,22 +562,40 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     # -------------------------------------------------------------------------
-    # 5. Admin Approves Donation (with duplicate protection)
+    # 5. Admin Approves Donation (supports both donate_appr: and donate_approve:)
     # -------------------------------------------------------------------------
-    if data.startswith("donate_approve:"):
+    if data.startswith("donate_appr:") or data.startswith("donate_approve:"):
         if not is_admin_user(user_id):
             await query.answer("⛔ មានតែ Admin ប៉ុណ្ណោះដែលអាចអនុម័តបាន!", show_alert=True)
             return
 
-        payload_part = data[len("donate_approve:"):]
-        parts = payload_part.split(":")
-        donor_uid = int(parts[0])
-        amount = float(parts[1])
-        tier_key = parts[2] if len(parts) > 2 else "coffee"
-        bill_no = parts[3] if len(parts) > 3 else f"{donor_uid}_{amount}"
+        donor_uid = 0
+        amount = 1.0
+        tier_key = "coffee"
+        bill_no = ""
+
+        if data.startswith("donate_appr:"):
+            ticket_id = data[len("donate_appr:"):]
+            with _PENDING_LOCK:
+                info = _PENDING_DONATIONS.get(ticket_id)
+            if info:
+                donor_uid = int(info["user_id"])
+                amount = float(info["amount"])
+                tier_key = str(info["tier_key"])
+                bill_no = str(info["bill_no"])
+            else:
+                await query.answer("⚠️ ព័ត៌មានសំណើនេះផុតកំណត់ ឬត្រូវបានអនុម័តរួចហើយ!", show_alert=True)
+                return
+        else:
+            payload_part = data[len("donate_approve:"):]
+            parts = payload_part.split(":")
+            donor_uid = int(parts[0])
+            amount = float(parts[1])
+            tier_key = parts[2] if len(parts) > 2 else "coffee"
+            bill_no = parts[3] if len(parts) > 3 else f"{donor_uid}_{amount}"
 
         # Deduplication guard: ensure donation is processed only once
-        dedup_key = f"{donor_uid}:{bill_no}"
+        dedup_key = f"{donor_uid}:{bill_no or amount}"
         with _APPROVALS_LOCK:
             if dedup_key in _PROCESSED_APPROVALS:
                 await query.answer("⚠️ ការឧបត្ថម្ភនេះត្រូវបានអនុម័តរួចរាល់ហើយ!", show_alert=True)
@@ -557,7 +610,7 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         await query.answer("កំពុងអនុម័ត និងបង្កើតសំឡេងជូនពរ...")
 
-        # Resolve donor's real name
+        # Resolve donor's real name from Telegram
         donor_name = "បង"
         if context.bot:
             try:
@@ -570,7 +623,7 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # 1. Record donation
         record = await donation_store.record_donation(
             user_id=donor_uid,
-            full_name=donor_name if donor_name != "បង" else f"User {donor_uid}",
+            full_name=donor_name if donor_name != "បង" else f"Supporter *{str(donor_uid)[-4:]}",
             amount=amount,
             tier=tier_key,
             blessing_sent=True,
@@ -599,9 +652,9 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     # -------------------------------------------------------------------------
-    # 6. Admin Rejects Donation Notification
+    # 6. Admin Rejects Donation Notification (supports donate_rej: & donate_reject:)
     # -------------------------------------------------------------------------
-    if data.startswith("donate_reject:"):
+    if data.startswith("donate_rej:") or data.startswith("donate_reject:"):
         if not is_admin_user(user_id):
             await query.answer("⛔ មានតែ Admin ប៉ុណ្ណោះដែលអាចបដិសេធបាន!", show_alert=True)
             return

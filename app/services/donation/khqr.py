@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import collections
 import io
 import logging
@@ -165,6 +166,10 @@ async def get_khqr_qr_image(khqr_text: str) -> bytes | None:
     # 1. If static file path is provided and exists
     candidate_paths = [
         STATIC_QR_IMAGE_PATH,
+        os.path.join(os.getcwd(), "asset", "my_khqr.webp"),
+        os.path.join(os.getcwd(), "asset", "my_khqr.png"),
+        os.path.join(os.getcwd(), "asset", "my_khqr.jpg"),
+        os.path.join(os.getcwd(), "static", "my_khqr.webp"),
         os.path.join(os.getcwd(), "static", "khqr.png"),
         os.path.join(os.getcwd(), "static", "khqr.jpg"),
         os.path.join(os.getcwd(), "static", "khqr.jpeg"),
@@ -253,10 +258,9 @@ class BakongKHQR:
         tier: str = "coffee",
     ) -> tuple[str, str]:
         """Generate KHQR string and bill reference. Returns (khqr_text, bill_no)."""
-        import time
-
         ts = int(time.time())
-        bill_no = f"{tier.upper()}-{ts}"[-20:]
+        tier_clean = tier[:4].upper()
+        bill_no = f"{tier_clean}{ts:x}"[-12:]
         khqr = generate_khqr_string(
             amount=amount,
             currency=currency,
