@@ -221,8 +221,8 @@ async def get_khqr_qr_image(khqr_text: str) -> bytes | None:
                     _QR_IMAGE_CACHE.popitem(last=False)
                 _QR_IMAGE_CACHE[cache_key] = result
             return result
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.debug("Local qrcode library not installed: %s", exc)
     except Exception as e:
         logger.warning("Local qrcode library generation failed: %s", e)
 

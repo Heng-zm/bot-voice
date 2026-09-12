@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 
 from fastapi import Header, HTTPException
+
+logger = logging.getLogger(__name__)
 
 
 def get_allowed_api_keys() -> set[str]:
@@ -46,8 +49,8 @@ def validate_api_key(x_api_key: str | None, authorization: str | None) -> bool:
         validate_dynamic = getattr(legacy, "_validate_dynamic_ai_api_key", None)
         if callable(validate_dynamic) and validate_dynamic(api_key):
             return True
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Dynamic API key check failed: %s", exc)
 
     return False
 
