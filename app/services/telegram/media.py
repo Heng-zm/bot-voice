@@ -32,6 +32,34 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if _is_admin(user_id):
+        caption = (msg.caption or "").strip()
+        if caption.lower().startswith("#khqr") or context.user_data.get("khqr_state") == "wait_photo":
+            context.user_data.pop("khqr_state", None)
+            try:
+                photo = msg.photo[-1]
+                f = await context.bot.get_file(photo.file_id)
+                buf = io.BytesIO()
+                await f.download_to_memory(buf)
+                img_data = buf.getvalue()
+                if img_data:
+                    from app.services.donation.khqr import PROJECT_ROOT, _QR_IMAGE_CACHE, _QR_CACHE_LOCK
+                    dest_path = os.path.join(PROJECT_ROOT, "asset", "my_khqr.webp")
+                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                    with open(dest_path, "wb") as out_f:
+                        out_f.write(img_data)
+                    with _QR_CACHE_LOCK:
+                        _QR_IMAGE_CACHE.clear()
+                    await safe_send(lambda: msg.reply_text(
+                        "✅ <b>បានផ្លាស់ប្តូររូបភាព Bakong KHQR (Static QR) ជោគជ័យ!</b>\n\n"
+                        f"📁 រក្សាទុកនៅ: <code>asset/my_khqr.webp</code> ({len(img_data):,} bytes)",
+                        parse_mode="HTML"
+                    ))
+                    return
+            except Exception as exc:
+                logger.warning("Failed to save admin KHQR photo: %s", exc)
+                await safe_send(lambda: msg.reply_text(f"❌ បរាជ័យក្នុងការរក្សាទុករូបភាព KHQR: {exc}"))
+                return
+
         if await _handle_admin_welcome_photo(update, context):
             return
         sched_state = context.user_data.get("sched_state")

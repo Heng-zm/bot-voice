@@ -45,6 +45,7 @@ from app.services.telegram.commands import (
     cmd_endchat,
     cmd_feature_request,
     cmd_health,
+    cmd_khqr,
     cmd_migrate,
     cmd_myprefs,
     cmd_narrate,
@@ -132,6 +133,8 @@ def register_telegram_handlers(application: Application, *, bot_mode: str) -> No
         ("testblessing", cmd_testblessing),
         ("bakongstatus", cmd_bakongstatus),
         ("bakong", cmd_bakongstatus),
+        ("khqr", cmd_khqr),
+        ("setkhqr", cmd_khqr),
     )
     for command, callback in command_handlers:
         application.add_handler(CommandHandler(command, callback))

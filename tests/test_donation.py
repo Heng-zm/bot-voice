@@ -67,6 +67,42 @@ class DonationKHQRTests(unittest.TestCase):
         self.assertIn("010211", static_khqr)
         self.assertNotIn("54", static_khqr)
 
+    def test_nbc_tag29_individual(self) -> None:
+        khqr = generate_khqr_string(account_id="chuo_kimheng@bkrt", amount=1.0)
+        # In NBC EMVCo spec: account_id is 17 chars (0017...), Tag 29 value is 21 chars (2921...)
+        self.assertIn("29210017chuo_kimheng@bkrt", khqr)
+
+    def test_nbc_tag30_merchant(self) -> None:
+        khqr = generate_khqr_string(
+            account_id="chuo_kimheng@bkrt",
+            merchant_id="MERCHANT123",
+            amount=1.0,
+        )
+        self.assertIn("30360017chuo_kimheng@bkrt0111MERCHANT123", khqr)
+
+    def test_nbc_tag99_timestamp(self) -> None:
+        khqr = generate_khqr_string(amount=2.0)
+        self.assertIn("99", khqr)
+        self.assertIn("0013", khqr)  # 13 digits ms timestamp
+        self.assertIn("0113", khqr)  # 13 digits ms expiration
+
+    def test_khr_currency_formatting(self) -> None:
+        khqr = generate_khqr_string(amount=4000, currency="KHR")
+        self.assertIn("5303116", khqr)  # KHR code 116
+        self.assertIn("54044000", khqr)  # 4000 Riel
+
+    def test_runtime_config_update(self) -> None:
+        from app.services.donation.khqr import get_khqr_config, update_khqr_config
+        old_cfg = get_khqr_config()
+        update_khqr_config(merchant_name="TEST SHOP", currency="KHR")
+        new_cfg = get_khqr_config()
+        self.assertEqual("TEST SHOP", new_cfg["merchant_name"])
+        self.assertEqual("KHR", new_cfg["currency"])
+        update_khqr_config(
+            merchant_name=old_cfg["merchant_name"],
+            currency=old_cfg["currency"],
+        )
+
 
 class BlessingScriptTests(unittest.TestCase):
     def test_coffee_tier_script(self) -> None:
@@ -691,6 +727,64 @@ class BakongOpenApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Bakong Open API", status_text)
         self.assertIn("b5204fce0cd64a78", status_text)
         self.assertIn("Connected", status_text)
+
+    async def test_generate_deeplink_by_qr(self) -> None:
+        from app.services.donation.bakong_api import generate_deeplink_by_qr
+
+        mock_resp = {
+            "responseCode": 0,
+            "responseMessage": "Success",
+            "data": {
+                "shortLink": "https://bakong-deeplink.nbc.gov.kh/bakong/mock123",
+                "fullLink": "https://bakong-deeplink.nbc.gov.kh/bakong/payment?mock=1",
+            },
+        }
+        with patch("app.services.donation.bakong_api._execute_http_post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = (200, mock_resp)
+            res = await generate_deeplink_by_qr("dummy_qr_string", token="dummy_token")
+            self.assertIsNotNone(res)
+            self.assertEqual("https://bakong-deeplink.nbc.gov.kh/bakong/mock123", res.get("shortLink"))
+
+    async def test_cmd_khqr_overview(self) -> None:
+        from app.services.telegram.commands import cmd_khqr
+
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 9999
+        mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
+        mock_msg.chat_id = 12345
+        mock_update.effective_message = mock_msg
+        mock_context = MagicMock()
+        mock_context.args = []
+        mock_context.bot = MagicMock()
+        mock_context.bot.send_photo = AsyncMock()
+
+        with patch("app.legacy._is_admin", return_value=True):
+            await cmd_khqr(mock_update, mock_context)
+
+        self.assertTrue(mock_msg.reply_text.called or mock_context.bot.send_photo.called)
+
+    async def test_cmd_khqr_update_account(self) -> None:
+        from app.services.telegram.commands import cmd_khqr
+        from app.services.donation.khqr import get_khqr_config, update_khqr_config
+
+        old_acc = get_khqr_config()["account_id"]
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 9999
+        mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
+        mock_update.effective_message = mock_msg
+        mock_context = MagicMock()
+        mock_context.args = ["account", "test_new_acc@bkrt"]
+
+        with patch("app.legacy._is_admin", return_value=True):
+            await cmd_khqr(mock_update, mock_context)
+
+        mock_msg.reply_text.assert_awaited_once()
+        self.assertIn("test_new_acc@bkrt", mock_msg.reply_text.call_args[0][0])
+        self.assertEqual("test_new_acc@bkrt", get_khqr_config()["account_id"])
+
+        update_khqr_config(account_id=old_acc)
 
 
 if __name__ == "__main__":

@@ -17,12 +17,14 @@ import os
 import time
 import urllib.error
 import urllib.request
+import threading
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 BAKONG_BASE_URL = os.getenv("BAKONG_BASE_URL", "https://api-bakong.nbc.gov.kh/v1").rstrip("/")
 CHECK_TRANSACTION_BY_MD5_URL = f"{BAKONG_BASE_URL}/check_transaction_by_md5"
+GENERATE_DEEPLINK_URL = f"{BAKONG_BASE_URL}/generate_deeplink_by_qr"
 
 
 def get_bakong_token() -> str:
@@ -256,3 +258,67 @@ async def test_connection(token: str = "") -> dict[str, Any]:
         "is_expired": token_meta.get("is_expired", False),
         "message": msg if is_authenticated else f"HTTP {res.get('http_status')}: {msg}",
     }
+
+
+_DEEPLINK_CACHE: dict[str, dict[str, str]] = {}
+_DEEPLINK_CACHE_LOCK = threading.Lock()
+
+
+async def generate_deeplink_by_qr(
+    khqr_text: str,
+    *,
+    app_name: str = "Bot Voice",
+    callback_url: str = "https://t.me/khmer_voice_bot",
+    app_icon_url: str = "https://bakong.nbc.gov.kh/images/logo.svg",
+    token: str = "",
+    timeout: float = 8.0,
+) -> dict[str, Any] | None:
+    """Generate 1-tap mobile banking payment deep link from NBC Bakong Open API.
+
+    Returns dict with 'shortLink' and 'fullLink', or None if unavailable/failed.
+    """
+    if not khqr_text:
+        return None
+
+    token = (token or get_bakong_token()).strip()
+    if not token:
+        return None
+
+    md5_hash = hashlib.md5(khqr_text.encode("utf-8")).hexdigest()
+    with _DEEPLINK_CACHE_LOCK:
+        if md5_hash in _DEEPLINK_CACHE:
+            return dict(_DEEPLINK_CACHE[md5_hash])
+
+    payload = {
+        "qr": khqr_text,
+        "sourceInfo": {
+            "appIconUrl": app_icon_url,
+            "appName": app_name,
+            "appDeepLinkCallback": callback_url,
+        },
+    }
+
+    try:
+        status, resp_data = await _execute_http_post(
+            GENERATE_DEEPLINK_URL,
+            payload=payload,
+            token=token,
+            timeout=timeout,
+        )
+        if status == 200 and isinstance(resp_data, dict) and resp_data.get("responseCode") == 0:
+            data = resp_data.get("data")
+            if isinstance(data, dict) and data.get("shortLink"):
+                res = {
+                    "shortLink": data["shortLink"],
+                    "fullLink": data.get("fullLink", data["shortLink"]),
+                }
+                with _DEEPLINK_CACHE_LOCK:
+                    if len(_DEEPLINK_CACHE) > 300:
+                        _DEEPLINK_CACHE.clear()
+                    _DEEPLINK_CACHE[md5_hash] = res
+                return res
+    except Exception as exc:
+        logger.debug("Failed to generate NBC Bakong deeplink: %s", exc)
+
+    return None
+

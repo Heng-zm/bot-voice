@@ -26,6 +26,7 @@ from app.services.donation.khqr import (
     DEFAULT_BAKONG_MERCHANT_NAME,
     BakongKHQR,
     generate_khqr_string,
+    get_khqr_config,
     get_khqr_qr_image,
 )
 from app.services.donation.store import TIER_DETAILS, donation_store
@@ -115,28 +116,57 @@ def get_admin_ids() -> set[int]:
     return admin_ids
 
 
-def _build_donation_menu_markup() -> InlineKeyboardMarkup:
-    """Construct main donation tiers inline keyboard."""
-    buttons = [
-        [
-            InlineKeyboardButton("☕ $1.00 កាហ្វេ ១ កែវ", callback_data="donate_tier:coffee"),
-            InlineKeyboardButton("🧋 $2.00 តែទឹកដោះគោ", callback_data="donate_tier:milktea"),
-        ],
-        [
-            InlineKeyboardButton("🍜 $3.00 គុយទាវ ១ ចាន", callback_data="donate_tier:lunch"),
-            InlineKeyboardButton("🖥️ $5.00 ថ្លៃ Server", callback_data="donate_tier:server"),
-        ],
-        [
-            InlineKeyboardButton("🌟 $10.00 ឧបត្ថម្ភពិសេស", callback_data="donate_tier:patron"),
-            InlineKeyboardButton("💎 $20.00 អ្នកគាំទ្រឆ្នើម", callback_data="donate_tier:gold"),
-        ],
-        [
-            InlineKeyboardButton("🏆 តារាងកិត្តិយស (Hall of Fame)", callback_data="donate_halloffame"),
-        ],
-        [
-            InlineKeyboardButton("🔙 ត្រឡប់ទៅម៉ឺនុយដើម", callback_data="donate_close"),
-        ],
-    ]
+def _build_donation_menu_markup(currency: str = "USD") -> InlineKeyboardMarkup:
+    """Construct main donation tiers inline keyboard with dual currency support."""
+    is_khr = (currency.upper() == "KHR")
+    if is_khr:
+        buttons = [
+            [
+                InlineKeyboardButton("☕ 4,000៛ កាហ្វេ ១ កែវ", callback_data="donate_tier:coffee_khr"),
+                InlineKeyboardButton("🧋 8,000៛ តែទឹកដោះគោ", callback_data="donate_tier:milktea_khr"),
+            ],
+            [
+                InlineKeyboardButton("🍜 12,000៛ គុយទាវ ១ ចាន", callback_data="donate_tier:lunch_khr"),
+                InlineKeyboardButton("🖥️ 20,000៛ ថ្លៃ Server", callback_data="donate_tier:server_khr"),
+            ],
+            [
+                InlineKeyboardButton("🌟 40,000៛ ឧបត្ថម្ភពិសេស", callback_data="donate_tier:patron_khr"),
+                InlineKeyboardButton("💎 80,000៛ អ្នកគាំទ្រឆ្នើម", callback_data="donate_tier:gold_khr"),
+            ],
+            [
+                InlineKeyboardButton("💵 ប្តូរទៅប្រាក់ដុល្លារ (Switch to USD)", callback_data="donate_curr:USD"),
+            ],
+            [
+                InlineKeyboardButton("🏆 តារាងកិត្តិយស (Hall of Fame)", callback_data="donate_halloffame"),
+            ],
+            [
+                InlineKeyboardButton("🔙 ត្រឡប់ទៅម៉ឺនុយដើម", callback_data="donate_close"),
+            ],
+        ]
+    else:
+        buttons = [
+            [
+                InlineKeyboardButton("☕ $1.00 កាហ្វេ ១ កែវ", callback_data="donate_tier:coffee"),
+                InlineKeyboardButton("🧋 $2.00 តែទឹកដោះគោ", callback_data="donate_tier:milktea"),
+            ],
+            [
+                InlineKeyboardButton("🍜 $3.00 គុយទាវ ១ ចាន", callback_data="donate_tier:lunch"),
+                InlineKeyboardButton("🖥️ $5.00 ថ្លៃ Server", callback_data="donate_tier:server"),
+            ],
+            [
+                InlineKeyboardButton("🌟 $10.00 ឧបត្ថម្ភពិសេស", callback_data="donate_tier:patron"),
+                InlineKeyboardButton("💎 $20.00 អ្នកគាំទ្រឆ្នើម", callback_data="donate_tier:gold"),
+            ],
+            [
+                InlineKeyboardButton("🇰🇭 ប្តូរទៅប្រាក់រៀល (Switch to KHR)", callback_data="donate_curr:KHR"),
+            ],
+            [
+                InlineKeyboardButton("🏆 តារាងកិត្តិយស (Hall of Fame)", callback_data="donate_halloffame"),
+            ],
+            [
+                InlineKeyboardButton("🔙 ត្រឡប់ទៅម៉ឺនុយដើម", callback_data="donate_close"),
+            ],
+        ]
     return InlineKeyboardMarkup(buttons)
 
 
@@ -148,28 +178,37 @@ async def _send_khqr_screen(
     tier_key: str,
     tier_title: str,
     context: ContextTypes.DEFAULT_TYPE,
+    currency: str = "USD",
 ) -> None:
-    """Reusable generator and sender for Bakong KHQR payment interface."""
+    """Reusable generator and sender for Bakong KHQR payment interface with NBC 1-Tap Deeplink."""
+    cfg = get_khqr_config()
+    curr_merchant_name = cfg.get("merchant_name") or DEFAULT_BAKONG_MERCHANT_NAME
+    curr_account_id = cfg.get("account_id") or DEFAULT_BAKONG_ACCOUNT_ID
+    curr_merchant_id = cfg.get("merchant_id", "")
+    curr_code = (currency or cfg.get("currency", "USD")).strip().upper()
+
     khqr_text, bill_no = BakongKHQR.generate(
         amount=amount,
-        currency="USD",
+        currency=curr_code,
         user_id=chat_id,
         tier=tier_key,
+        merchant_id=curr_merchant_id,
     )
+
+    amt_display = f"${amount:.2f} USD" if curr_code == "USD" else f"{int(round(amount)):,} KHR (៛)"
 
     caption = (
         f"🇰🇭 <b>Bakong KHQR — {tier_title}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 <b>ឈ្មោះគណនី:</b> <code>{html.escape(DEFAULT_BAKONG_MERCHANT_NAME)}</code>\n"
-        f"🆔 <b>Bakong ID:</b> <code>{html.escape(DEFAULT_BAKONG_ACCOUNT_ID)}</code>\n"
-        f"💵 <b>ចំនួនទឹកប្រាក់:</b> <b>${amount:.2f} USD</b>\n"
+        f"👤 <b>ឈ្មោះគណនី:</b> <code>{html.escape(curr_merchant_name)}</code>\n"
+        f"🆔 <b>Bakong ID:</b> <code>{html.escape(curr_account_id)}</code>\n"
+        f"💵 <b>ចំនួនទឹកប្រាក់:</b> <b>{amt_display}</b>\n"
         f"🧾 <b>លេខវិក្កយបត្រ:</b> <code>{html.escape(bill_no)}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📲 <b>របៀបបង់ប្រាក់៖</b>\n"
-        f"1. បើកកម្មវិធីធនាគាររបស់បង (ABA, ACLEDA, Wing, Canadia, Bakong...)\n"
-        f"2. ស្កេនរូបភាព QR កូដនេះ\n"
-        f"3. ផ្ទៀងផ្ទាត់ចំនួន <b>${amount:.2f}</b> រួចចុចផ្ទេរប្រាក់\n"
-        f"4. បន្ទាប់ពីផ្ទេររួច សូមចុចប៊ូតុង <b>«✅ ខ្ញុំបានផ្ទេរប្រាក់រួចរាល់»</b> ខាងក្រោម\n\n"
+        f"1. ចុចប៊ូតុង <b>«📲 បង់ប្រាក់តាម App ធនាគារ»</b> (ឬស្កេនរូបភាព QR នេះ)\n"
+        f"2. ផ្ទៀងផ្ទាត់ចំនួន <b>{amt_display}</b> រួចចុចផ្ទេរប្រាក់\n"
+        f"3. បន្ទាប់ពីផ្ទេររួច សូមចុចប៊ូតុង <b>«✅ ខ្ញុំបានផ្ទេរប្រាក់រួចរាល់»</b> ខាងក្រោម\n\n"
         f"✨ <i>Bot នឹងផ្ញើសារសំឡេងអរគុណពិសេសជូនបងភ្លាមៗ!</i>"
     )
 
@@ -188,16 +227,39 @@ async def _send_khqr_screen(
             "khqr_text": khqr_text,
             "md5": khqr_md5,
             "amount": amount,
+            "currency": curr_code,
             "tier_key": tier_key,
             "bill_no": bill_no,
             "chat_id": chat_id,
             "created_at": time.time(),
         }
 
-    action_buttons = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ ខ្ញុំបានផ្ទេរប្រាក់រួចរាល់", callback_data=paid_cb)],
-        [InlineKeyboardButton("🔙 ជ្រើសរើសចំនួនផ្សេង", callback_data="donate_menu")],
-    ])
+    # Generate NBC Bakong 1-Tap Mobile Deeplink if configured
+    deeplink_data = None
+    if bakong_api.is_bakong_api_configured():
+        try:
+            bot_username = (
+                getattr(context.bot, "username", None)
+                if (context and context.bot)
+                else "khmer_voice_bot"
+            ) or "khmer_voice_bot"
+            deeplink_data = await bakong_api.generate_deeplink_by_qr(
+                khqr_text,
+                app_name="Bot Voice",
+                callback_url=f"https://t.me/{bot_username}",
+            )
+        except Exception as exc:
+            logger.debug("Failed to generate NBC deeplink: %s", exc)
+
+    button_rows = []
+    if deeplink_data and deeplink_data.get("shortLink"):
+        button_rows.append([
+            InlineKeyboardButton("📲 បង់ប្រាក់តាម App ធនាគារ (1-Tap Pay)", url=deeplink_data["shortLink"])
+        ])
+    button_rows.append([InlineKeyboardButton("✅ ខ្ញុំបានផ្ទេរប្រាក់រួចរាល់", callback_data=paid_cb)])
+    button_rows.append([InlineKeyboardButton("🔙 ជ្រើសរើសចំនួនផ្សេង", callback_data="donate_menu")])
+
+    action_buttons = InlineKeyboardMarkup(button_rows)
 
     qr_bytes = await get_khqr_qr_image(khqr_text)
     if qr_bytes and context.bot:
@@ -1041,22 +1103,49 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     # -------------------------------------------------------------------------
+    # 2.5 Currency switch (USD <-> KHR)
+    # -------------------------------------------------------------------------
+    if data.startswith("donate_curr:"):
+        curr = data.split(":", 1)[1].upper()
+        if curr not in ("USD", "KHR"):
+            curr = "USD"
+        keyboard = _build_donation_menu_markup(currency=curr)
+        curr_label = "ប្រាក់រៀល (KHR)" if curr == "KHR" else "ប្រាក់ដុល្លារ (USD)"
+        await query.answer(f"បានប្តូរទៅ {curr_label}")
+        if query.message:
+            try:
+                await query.message.edit_reply_markup(reply_markup=keyboard)
+            except Exception:
+                pass
+        return
+
+    # -------------------------------------------------------------------------
     # 3. User selects a tier: generate Bakong KHQR
     # -------------------------------------------------------------------------
     if data.startswith("donate_tier:"):
-        tier_key = data.split(":", 1)[1].lower()
-        tier_info = TIER_DETAILS.get(tier_key, TIER_DETAILS["coffee"])
-        amount = tier_info["amount"]
-        tier_title = tier_info["title"]
+        tier_arg = data.split(":", 1)[1].lower()
+        is_khr = tier_arg.endswith("_khr")
+        base_tier = tier_arg[:-4] if is_khr else tier_arg
+        tier_info = TIER_DETAILS.get(base_tier, TIER_DETAILS["coffee"])
+
+        currency = "KHR" if is_khr else "USD"
+        if is_khr:
+            amount = float(int(round(tier_info["amount"] * 4000)))
+            clean_name = tier_info.get("title", "").split(" ", 2)[-1]
+            tier_title = f"{tier_info['emoji']} {int(amount):,}៛ {clean_name}"
+        else:
+            amount = float(tier_info["amount"])
+            tier_title = tier_info["title"]
 
         await query.answer(f"កំពុងបង្កើត Bakong KHQR សម្រាប់ {tier_title}...")
         await _send_khqr_screen(
             chat_id=target_chat_id,
             user_name=user_name,
             amount=amount,
-            tier_key=tier_key,
+            tier_key=tier_arg,
             tier_title=tier_title,
             context=context,
+            currency=currency,
         )
         return
 

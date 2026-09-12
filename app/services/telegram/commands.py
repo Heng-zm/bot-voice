@@ -900,6 +900,131 @@ async def cmd_bakongstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @legacy_bound_handler
+async def cmd_khqr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin inspection and runtime configuration of Bakong KHQR settings."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+
+    if not _is_admin(int(user.id)):
+        await safe_send(lambda: msg.reply_text("⛔ <b>សិទ្ធិត្រូវបានបដិសេធ (Admin only)</b>", parse_mode="HTML"))
+        return
+
+    from app.services.donation.khqr import (
+        BakongKHQR,
+        get_khqr_config,
+        get_khqr_qr_image,
+        update_khqr_config,
+    )
+    from app.services.donation import bakong_api
+
+    args = context.args or []
+    if args:
+        sub = args[0].lower()
+        if sub in ("set", "update") and len(args) > 2:
+            key = args[1].lower()
+            val = " ".join(args[2:]).strip()
+        elif len(args) > 1:
+            key = sub
+            val = " ".join(args[1:]).strip()
+        else:
+            key = sub
+            val = ""
+
+        if key in ("account", "account_id", "id"):
+            if not val:
+                await safe_send(lambda: msg.reply_text("⚠️ សូមបញ្ជាក់ Bakong Account ID ថ្មី (ឧ. <code>/khqr account name@bkrt</code>)", parse_mode="HTML"))
+                return
+            new_cfg = update_khqr_config(account_id=val)
+            await safe_send(lambda: msg.reply_text(f"✅ បានកែប្រែ <b>Bakong Account ID</b> ទៅជា <code>{html.escape(new_cfg['account_id'])}</code> ជោគជ័យ!", parse_mode="HTML"))
+            return
+
+        elif key in ("name", "merchant", "merchant_name"):
+            if not val:
+                await safe_send(lambda: msg.reply_text("⚠️ សូមបញ្ជាក់ឈ្មោះ Merchant ថ្មី (ឧ. <code>/khqr name CHUO KIMHENG</code>)", parse_mode="HTML"))
+                return
+            new_cfg = update_khqr_config(merchant_name=val)
+            await safe_send(lambda: msg.reply_text(f"✅ បានកែប្រែ <b>Merchant Name</b> ទៅជា <code>{html.escape(new_cfg['merchant_name'])}</code> ជោគជ័យ!", parse_mode="HTML"))
+            return
+
+        elif key in ("city", "merchant_city"):
+            if not val:
+                await safe_send(lambda: msg.reply_text("⚠️ សូមបញ្ជាក់ទីក្រុងថ្មី (ឧ. <code>/khqr city Phnom Penh</code>)", parse_mode="HTML"))
+                return
+            new_cfg = update_khqr_config(merchant_city=val)
+            await safe_send(lambda: msg.reply_text(f"✅ បានកែប្រែ <b>Merchant City</b> ទៅជា <code>{html.escape(new_cfg['merchant_city'])}</code> ជោគជ័យ!", parse_mode="HTML"))
+            return
+
+        elif key in ("currency", "curr"):
+            c = val.upper()
+            if c not in ("USD", "KHR"):
+                await safe_send(lambda: msg.reply_text("⚠️ រូបិយប័ណ្ណត្រឹមត្រូវគឺ <code>USD</code> ឬ <code>KHR</code> (ឧ. <code>/khqr currency KHR</code>)", parse_mode="HTML"))
+                return
+            new_cfg = update_khqr_config(currency=c)
+            await safe_send(lambda: msg.reply_text(f"✅ បានកែប្រែ <b>Default Currency</b> ទៅជា <code>{new_cfg['currency']}</code> ជោគជ័យ!", parse_mode="HTML"))
+            return
+
+        elif key in ("photo", "image", "pic"):
+            context.user_data["khqr_state"] = "wait_photo"
+            await safe_send(lambda: msg.reply_text(
+                "📸 <b>សូមផ្ញើរូបភាព QR កូដថ្មីមកកាន់ទីនេះ</b>\n\n"
+                "💡 <i>ឬបងអាចផ្ញើរូបភាពជាមួយ Caption <code>#khqr</code> នៅពេលណាក៏បានដើម្បីផ្លាស់ប្តូរ Static QR ផ្លូវការ។</i>",
+                parse_mode="HTML"
+            ))
+            return
+
+    # No args: Display overview, current config, and test QR preview
+    cfg = get_khqr_config()
+    test_khqr, test_bill = BakongKHQR.generate(
+        amount=1.0,
+        currency=cfg.get("currency", "USD"),
+        user_id=int(user.id),
+        tier="test",
+    )
+    test_md5 = BakongKHQR.get_md5(test_khqr)
+    has_api = bakong_api.is_bakong_api_configured()
+    api_status_badge = "🟢 ភ្ជាប់រួចរាល់ (Active)" if has_api else "⚪ មិនទាន់កំណត់"
+
+    overview_text = (
+        f"🇰🇭 <b>ព័ត៌មាន & ការកំណត់ Bakong KHQR</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>Merchant Name:</b> <code>{html.escape(cfg.get('merchant_name', ''))}</code>\n"
+        f"🆔 <b>Bakong Account ID:</b> <code>{html.escape(cfg.get('account_id', ''))}</code>\n"
+        f"🏙️ <b>Merchant City:</b> <code>{html.escape(cfg.get('merchant_city', ''))}</code>\n"
+        f"💵 <b>Default Currency:</b> <code>{cfg.get('currency', 'USD')}</code>\n"
+        f"🏛️ <b>Bakong Open API:</b> {api_status_badge}\n"
+        f"🧾 <b>Test Bill Ref:</b> <code>{test_bill}</code>\n"
+        f"🔐 <b>Test MD5 Hash:</b> <code>{test_md5}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🛠️ <b>ពាក្យបញ្ជាកែប្រែ (Quick Commands):</b>\n"
+        f"• <code>/khqr account &lt;id&gt;</code> — កំណត់ Account ID (ឧ. name@bkrt)\n"
+        f"• <code>/khqr name &lt;name&gt;</code> — កំណត់ឈ្មោះ Merchant\n"
+        f"• <code>/khqr city &lt;city&gt;</code> — កំណត់ទីក្រុង (ឧ. Phnom Penh)\n"
+        f"• <code>/khqr currency &lt;USD|KHR&gt;</code> — កំណត់រូបិយប័ណ្ណ\n"
+        f"• <code>/khqr photo</code> — ផ្លាស់ប្តូររូបភាព Static QR កូដ\n"
+        f"• <code>/bakongstatus</code> — ពិនិត្យសុពលភាព Token & Latency"
+    )
+
+    qr_bytes = await get_khqr_qr_image(test_khqr)
+    if qr_bytes and context.bot:
+        try:
+            photo_file = io.BytesIO(qr_bytes)
+            photo_file.name = "khqr_preview.png"
+            await context.bot.send_photo(
+                chat_id=msg.chat_id,
+                photo=photo_file,
+                caption=overview_text,
+                parse_mode="HTML",
+            )
+            return
+        except Exception as e:
+            logger.debug("Failed to send test QR photo: %s", e)
+
+    await safe_send(lambda: msg.reply_text(overview_text, parse_mode="HTML"))
+
+
+@legacy_bound_handler
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Telegram /admin entry point with mobile shortcuts.
 
@@ -986,8 +1111,13 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.args = context.args[1:]
         await cmd_migrate(update, context)
         return
-    if arg in {"bakong", "bakongstatus", "khqr"}:
+    if arg in {"bakong", "bakongstatus"}:
         await cmd_bakongstatus(update, context)
+        return
+    if arg in {"khqr", "setkhqr"}:
+        if context.args:
+            context.args = context.args[1:]
+        await cmd_khqr(update, context)
         return
     if arg in {"adddonor", "add_donor"}:
         from app.services.donation.handlers import cmd_adddonor
@@ -1356,6 +1486,7 @@ __all__ = [
     'cmd_endchat',
     'cmd_feature_request',
     'cmd_health',
+    'cmd_khqr',
     'cmd_migrate',
     'cmd_myprefs',
     'cmd_narrate',

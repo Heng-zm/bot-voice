@@ -21,9 +21,53 @@ DEFAULT_BAKONG_ACCOUNT_ID = os.getenv("BAKONG_ACCOUNT_ID", "chuo_kimheng@bkrt").
 DEFAULT_BAKONG_MERCHANT_NAME = os.getenv("BAKONG_MERCHANT_NAME", "CHUO KIMHENG").strip() or "CHUO KIMHENG"
 DEFAULT_BAKONG_MERCHANT_CITY = os.getenv("BAKONG_MERCHANT_CITY", "Phnom Penh").strip() or "Phnom Penh"
 DEFAULT_BAKONG_CURRENCY = os.getenv("BAKONG_CURRENCY", "USD").strip().upper() or "USD"
+DEFAULT_BAKONG_MERCHANT_ID = os.getenv("BAKONG_MERCHANT_ID", "").strip()
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 STATIC_QR_IMAGE_URL = os.getenv("KHQR_STATIC_IMAGE_URL", "").strip()
 STATIC_QR_IMAGE_PATH = os.getenv("KHQR_STATIC_IMAGE_PATH", "").strip()
+
+# -----------------------------------------------------------------------------
+# Dynamic Runtime Configuration Store
+# -----------------------------------------------------------------------------
+_CONFIG_LOCK = threading.Lock()
+_RUNTIME_CONFIG: dict[str, str] = {
+    "account_id": DEFAULT_BAKONG_ACCOUNT_ID,
+    "merchant_name": DEFAULT_BAKONG_MERCHANT_NAME,
+    "merchant_city": DEFAULT_BAKONG_MERCHANT_CITY,
+    "currency": DEFAULT_BAKONG_CURRENCY,
+    "merchant_id": DEFAULT_BAKONG_MERCHANT_ID,
+}
+
+
+def get_khqr_config() -> dict[str, str]:
+    """Retrieve currently active KHQR configuration."""
+    with _CONFIG_LOCK:
+        return dict(_RUNTIME_CONFIG)
+
+
+def update_khqr_config(
+    *,
+    account_id: str | None = None,
+    merchant_name: str | None = None,
+    merchant_city: str | None = None,
+    currency: str | None = None,
+    merchant_id: str | None = None,
+) -> dict[str, str]:
+    """Update runtime KHQR configuration without restarting the application."""
+    with _CONFIG_LOCK:
+        if account_id is not None and account_id.strip():
+            _RUNTIME_CONFIG["account_id"] = account_id.strip()
+        if merchant_name is not None and merchant_name.strip():
+            _RUNTIME_CONFIG["merchant_name"] = merchant_name.strip()[:25]
+        if merchant_city is not None and merchant_city.strip():
+            _RUNTIME_CONFIG["merchant_city"] = merchant_city.strip()[:15]
+        if currency is not None and currency.strip():
+            c = currency.strip().upper()
+            if c in ("USD", "KHR"):
+                _RUNTIME_CONFIG["currency"] = c
+        if merchant_id is not None:
+            _RUNTIME_CONFIG["merchant_id"] = merchant_id.strip()[:32]
+        return dict(_RUNTIME_CONFIG)
 
 # -----------------------------------------------------------------------------
 # High-Performance CRC16-CCITT Lookup Table (256 entries)
@@ -57,36 +101,47 @@ def generate_khqr_string(
     account_id: str = "",
     merchant_name: str = "",
     merchant_city: str = "",
+    merchant_id: str = "",
     amount: float | None = None,
-    currency: str = "USD",
+    currency: str = "",
     bill_number: str = "",
+    mobile_number: str = "",
+    store_label: str = "",
     reference_label: str = "",
     terminal_label: str = "BOTVOICE",
+    expiration_days: float = 1.0,
 ) -> str:
-    """Generate official Bakong KHQR EMVCo payload string."""
-    account_id = account_id.strip() or DEFAULT_BAKONG_ACCOUNT_ID
-    merchant_name = (merchant_name.strip() or DEFAULT_BAKONG_MERCHANT_NAME)[:25]
-    merchant_city = (merchant_city.strip() or DEFAULT_BAKONG_MERCHANT_CITY)[:15]
-    currency = (currency.strip().upper() or DEFAULT_BAKONG_CURRENCY)
+    """Generate official Bakong KHQR EMVCo payload string compliant with NBC standards."""
+    cfg = get_khqr_config()
+    account_id = (account_id.strip() or cfg["account_id"])
+    merchant_name = (merchant_name.strip() or cfg["merchant_name"])[:25]
+    merchant_city = (merchant_city.strip() or cfg["merchant_city"])[:15]
+    merchant_id = (merchant_id.strip() or cfg.get("merchant_id", ""))[:32]
+    currency = (currency.strip().upper() or cfg["currency"])
 
-    # Tag 00: Payload Format Indicator
+    # Tag 00: Payload Format Indicator (01)
     payload = _format_tlv("00", "01")
 
     # Tag 01: Point of Initiation Method (12 = dynamic with amount, 11 = static)
     is_dynamic = amount is not None and amount > 0
     payload += _format_tlv("01", "12" if is_dynamic else "11")
 
-    # Tag 29: Merchant Account Information (Bakong)
-    sub29_guid = _format_tlv("00", "bakong@nbc")
-    sub29_acc = _format_tlv("01", account_id)
-    tag29_val = sub29_guid + sub29_acc
-    payload += _format_tlv("29", tag29_val)
+    # Tag 29 / Tag 30: Merchant Account Information
+    # If merchant_id is specified -> Tag 30 (Merchant)
+    # Otherwise -> Tag 29 (Individual) with subtag 00 containing account_id
+    if merchant_id:
+        sub30_acc = _format_tlv("00", account_id)
+        sub30_mid = _format_tlv("01", merchant_id)
+        payload += _format_tlv("30", sub30_acc + sub30_mid)
+    else:
+        sub29_acc = _format_tlv("00", account_id)
+        payload += _format_tlv("29", sub29_acc)
 
     # Tag 52: Merchant Category Code (5999 = Miscellaneous/Specialty Retail)
     payload += _format_tlv("52", "5999")
 
     # Tag 53: Transaction Currency (840 = USD, 116 = KHR)
-    currency_code = "840" if currency == "USD" else "116"
+    currency_code = "116" if currency == "KHR" else "840"
     payload += _format_tlv("53", currency_code)
 
     # Tag 54: Transaction Amount
@@ -107,6 +162,10 @@ def generate_khqr_string(
     tag62_val = ""
     if bill_number:
         tag62_val += _format_tlv("01", bill_number[:25])
+    if mobile_number:
+        tag62_val += _format_tlv("02", mobile_number[:25])
+    if store_label:
+        tag62_val += _format_tlv("03", store_label[:25])
     if reference_label:
         tag62_val += _format_tlv("05", reference_label[:25])
     if terminal_label:
@@ -114,6 +173,14 @@ def generate_khqr_string(
 
     if tag62_val:
         payload += _format_tlv("62", tag62_val)
+
+    # Tag 99: Timestamp & Expiration (NBC EMVCo Standard)
+    now_ms = int(time.time() * 1000)
+    tag99_val = _format_tlv("00", str(now_ms))
+    if is_dynamic:
+        exp_ms = now_ms + int(max(0.1, expiration_days) * 86400 * 1000)
+        tag99_val += _format_tlv("01", str(exp_ms))
+    payload += _format_tlv("99", tag99_val)
 
     # Tag 63: CRC16-CCITT (Checksum of payload up to 6304)
     payload_for_crc = payload + "6304"
@@ -273,6 +340,8 @@ class BakongKHQR:
         currency: str = "USD",
         user_id: int | str = "",
         tier: str = "coffee",
+        merchant_id: str = "",
+        expiration_days: float = 1.0,
     ) -> tuple[str, str]:
         """Generate KHQR string and bill reference. Returns (khqr_text, bill_no)."""
         ts = int(time.time())
@@ -281,8 +350,10 @@ class BakongKHQR:
         khqr = generate_khqr_string(
             amount=amount,
             currency=currency,
+            merchant_id=merchant_id,
             bill_number=bill_no,
             reference_label=str(user_id),
+            expiration_days=expiration_days,
         )
         return khqr, bill_no
 
