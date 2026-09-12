@@ -120,8 +120,8 @@ class TTSFileIdCache:
         max_items: int = 10_000,
         ttl_seconds: float = 7 * 86400.0,  # 7 days
     ) -> None:
-        self.max_items = max(100, int(max_items))
-        self.ttl_seconds = max(60.0, float(ttl_seconds))
+        self.max_items = max(1, int(max_items))
+        self.ttl_seconds = max(0.0, float(ttl_seconds))
         self._cache: OrderedDict[str, tuple[str, float]] = OrderedDict()
         self._lock = threading.RLock()
         self._hits = 0
@@ -326,9 +326,9 @@ class TTSAudioCache:
         item_max_bytes: int = 8 * 1024 * 1024,  # 8 MB max single audio
         ttl_seconds: float = 3600.0,  # 1 hour TTL
     ) -> None:
-        self.max_bytes = max(1024 * 1024, int(max_bytes))
-        self.item_max_bytes = max(64 * 1024, int(item_max_bytes))
-        self.ttl_seconds = max(10.0, float(ttl_seconds))
+        self.max_bytes = max(1, int(max_bytes))
+        self.item_max_bytes = max(1, int(item_max_bytes))
+        self.ttl_seconds = max(0.0, float(ttl_seconds))
         self._cache: OrderedDict[str, tuple[bytes, float, int]] = OrderedDict()
         self._lock = threading.RLock()
         self._current_bytes = 0
@@ -458,7 +458,7 @@ class TTSUserHistoryTracker:
     """Thread-safe bounded tracker for user last TTS timestamps and text history."""
 
     def __init__(self, *, max_users: int = 10_000) -> None:
-        self.max_users = max(100, int(max_users))
+        self.max_users = max(1, int(max_users))
         self._last_tts: OrderedDict[int, float] = OrderedDict()
         self._last_text: OrderedDict[int, tuple[str, float]] = OrderedDict()
         self._lock = threading.RLock()

@@ -25,6 +25,11 @@ DEFAULT_BUTTON_LABELS: dict[str, str] = {
     "btn_ocr_read": "▶️ អាន",
     "btn_audio_tts": "📢 បំលែងទៅសំឡេង TTS",
     "btn_welcome_profile": "👤 User Profile",
+    "btn_settings": "⚙️ ការកំណត់ / Settings",
+    "btn_help": "📖 របៀបប្រើ / Help",
+    "btn_donate": "☕ ឧបត្ថម្ភកាហ្វេ",
+    "btn_halloffame": "🏆 តារាងកិត្តិយស",
+    "btn_channel": "📢 Channel ព័ត៌មាន",
 }
 
 # Thread-safe cache with TTL for loaded custom labels

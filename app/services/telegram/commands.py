@@ -27,9 +27,12 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @legacy_bound_handler
 async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
+    msg = update.effective_message
     if not msg:
         return
+    if getattr(update, "callback_query", None):
+        with suppress(Exception):
+            await update.callback_query.answer()
     help_text = (
         "📖 <b>សៀវភៅណែនាំរបៀបប្រើប្រាស់ Bot Voice</b> 🎙️\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -64,6 +67,7 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📢 Channel", url="https://t.me/m11mmm112"),
          InlineKeyboardButton("☕ ឧបត្ថម្ភកាហ្វេ", callback_data="donate_menu")],
         [InlineKeyboardButton("🏆 តារាងកិត្តិយស (/donors)", callback_data="donate_halloffame")],
+        [InlineKeyboardButton("🔙 ត្រឡប់ / Close", callback_data="welcome_back")],
     ])
     await safe_send(lambda: msg.reply_text(help_text, parse_mode="HTML", reply_markup=kb))
 
@@ -401,6 +405,7 @@ async def send_user_profile(message, user_id: int, user: Any = None):
         reply_markup=get_main_kb(
             prefs.get("gender", "female"),
             prefs.get("tts_model", "auto"),
+            speed=prefs.get("speed", 1.0),
             include_back=True,
         ),
     ))

@@ -406,7 +406,7 @@ class TestBotConfigPanel(unittest.TestCase):
             self.assertIn("Admin Control Center", text)
             self.assertIn("AI & Speech Stack", text)
             self.assertIn("Audience & Activity", text)
-            self.assertNotIn("2.5-flash", text)
+            self.assertNotIn("2.0-flash", text)
         finally:
             loop.close()
 

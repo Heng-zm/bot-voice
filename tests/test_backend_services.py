@@ -833,7 +833,7 @@ class DonationAndKHQRTests(unittest.IsolatedAsyncioTestCase):
 
         # Test vector for CRC-16/CCITT-FALSE
         self.assertEqual("29B1", crc16_ccitt("123456789"))
-        self.assertEqual("E5CC", crc16_ccitt("botvoice@nbc"))
+        self.assertEqual("6F2C", crc16_ccitt("botvoice@nbc"))
         self.assertEqual("D057", crc16_ccitt("chuo_kimheng@bkrt"))
 
     def test_generate_khqr_string(self) -> None:

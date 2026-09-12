@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from app import legacy
 from app.core.config import get_detected_webhook_url
 from app.core.security import validate_api_key
-from app.services.ai.gemini import generate_content_with_fallback
+from app.services.ai import gemini
 from app.utils.file_io import cleanup_files, make_temp_ogg
 
 logger = logging.getLogger("app.api.ai")
@@ -134,7 +134,7 @@ async def translate_endpoint(
         prompt = f"Translate the following text accurately and naturally into {target_lang}. Return only the translated text without extra explanation:\n\n{text}"
 
         def _call_ai():
-            return generate_content_with_fallback(
+            return gemini.generate_content_with_fallback(
                 client=gemini_client,
                 contents=prompt,
                 preferred_model=preferred_model,
@@ -184,7 +184,7 @@ async def summarize_endpoint(
         prompt = f"Summarize the following text into clear, actionable bullet points preserving key details:\n\n{text}"
 
         def _call_ai():
-            return generate_content_with_fallback(
+            return gemini.generate_content_with_fallback(
                 client=gemini_client,
                 contents=prompt,
                 preferred_model=preferred_model,

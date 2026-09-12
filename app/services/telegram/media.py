@@ -677,7 +677,7 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
             os.environ.get("CHANNEL_NARRATOR_SHOW_BUTTONS", "false").lower() in ("1", "true", "yes")
             or (bot_setting_bool_cached("channel_narrator_show_buttons", False) if "bot_setting_bool_cached" in globals() else False)
         )
-        voice_markup = get_main_kb(gender, tts_model) if (not is_channel_or_group or allow_channel_buttons) else None
+        voice_markup = get_main_kb(gender, tts_model, speed=speed) if (not is_channel_or_group or allow_channel_buttons) else None
 
         # --- Fast Path: Instant Telegram CDN file_id Delivery (< 50ms, 0ms CPU, 0 VPS Bandwidth) ---
         cache_key = ""

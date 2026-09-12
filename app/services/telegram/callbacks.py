@@ -780,8 +780,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
 
-    with suppress(Exception):
-        await query.answer()
+    if action not in ("speed", "gender", "tts_model"):
+        with suppress(Exception):
+            await query.answer()
 
     try:
         if callback_requires_tts_access(action, data) and not await _ensure_user_allowed(

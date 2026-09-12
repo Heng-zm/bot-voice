@@ -39,7 +39,14 @@ class TelegramOnlyRuntimeTests(unittest.TestCase):
         self.assertFalse(hasattr(legacy, "run_flask"))
 
     def test_webhook_routes_registered(self) -> None:
-        route_paths = [route.path for route in bot_entrypoint.app.routes]
+        route_paths: list[str] = []
+        for route in bot_entrypoint.app.routes:
+            if hasattr(route, "path"):
+                route_paths.append(route.path)
+            elif hasattr(route, "routes"):
+                for sub in route.routes:
+                    if hasattr(sub, "path"):
+                        route_paths.append(sub.path)
         self.assertIn("/webhook", route_paths)
         self.assertIn("/telegram/webhook", route_paths)
         self.assertIn("/healthz", route_paths)

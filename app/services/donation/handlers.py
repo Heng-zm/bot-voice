@@ -127,6 +127,9 @@ def _build_donation_menu_markup() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("🏆 តារាងកិត្តិយស (Hall of Fame)", callback_data="donate_halloffame"),
         ],
+        [
+            InlineKeyboardButton("🔙 ត្រឡប់ទៅម៉ឺនុយដើម", callback_data="donate_close"),
+        ],
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -326,6 +329,9 @@ async def cmd_donors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             InlineKeyboardButton("☕ ចូលរួមឧបត្ថម្ភ / Buy Coffee", callback_data="donate_menu"),
             InlineKeyboardButton("🔄 ធ្វើបច្ចុប្បន្នភាព / Refresh", callback_data="donate_halloffame_refresh"),
         ],
+        [
+            InlineKeyboardButton("🔙 ត្រឡប់ទៅម៉ឺនុយដើម", callback_data="donate_close"),
+        ],
     ])
 
     text = "\n".join(lines)
@@ -489,6 +495,16 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     user_id = user.id if user else 0
     chat = update.effective_chat
     target_chat_id = chat.id if chat else user_id
+
+    # -------------------------------------------------------------------------
+    # 0. Close/dismiss donation menu
+    # -------------------------------------------------------------------------
+    if data in ("donate_close", "donate_back"):
+        await query.answer()
+        if query.message:
+            with suppress(Exception):
+                await query.message.delete()
+        return
 
     # -------------------------------------------------------------------------
     # 1. Back to main donation menu

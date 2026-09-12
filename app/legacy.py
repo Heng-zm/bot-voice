@@ -13574,6 +13574,8 @@ BOT_SETTING_DEFAULTS: dict[str, str] = {
     "GEMINI_AUDIO_MODEL": os.environ.get("GEMINI_AUDIO_MODEL", "gemini-2.5-flash-preview-tts"),
     "OCR_PROVIDER": os.environ.get("OCR_PROVIDER", "gemini"),
     "HF_MODEL": os.environ.get("HF_MODEL", "mrrtmob/khmer-tts"),
+    "voice_reply_mode": os.environ.get("VOICE_REPLY_MODE", "voice"),
+    "anti_spam_window": os.environ.get("ANTI_SPAM_WINDOW", "10"),
     **{key: str(_perf_default(key, spec.get("default", ""))) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 BOT_SETTING_LABELS: dict[str, str] = {
@@ -13598,6 +13600,8 @@ BOT_SETTING_LABELS: dict[str, str] = {
     "GEMINI_AUDIO_MODEL": "🎙️ Gemini Audio TTS Model",
     "OCR_PROVIDER": "🔍 OCR Provider",
     "HF_MODEL": "🎙️ Hugging Face Model",
+    "voice_reply_mode": "🎙️ Voice Reply Mode",
+    "anti_spam_window": "⏱️ Anti-Spam Window",
     **{key: str(spec.get("label", key)) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 BOT_SETTING_DESCRIPTIONS: dict[str, str] = {
@@ -13622,6 +13626,8 @@ BOT_SETTING_DESCRIPTIONS: dict[str, str] = {
     "GEMINI_AUDIO_MODEL": "Active model for direct Gemini Audio speech generation.",
     "OCR_PROVIDER": "Active OCR vision engine provider (gemini or hf).",
     "HF_MODEL": "Hugging Face Space repository name for external Khmer TTS.",
+    "voice_reply_mode": "Delivery mode for voice messages.",
+    "anti_spam_window": "Rate limiting window in seconds.",
     **{key: str(spec.get("help", "")) for key, spec in BOT_PERFORMANCE_SETTING_SPECS.items()},
 }
 BOT_SETTING_LABELS["maintenance_message"] = "Maintenance Message"
@@ -13748,6 +13754,8 @@ def _setting_raw_from(settings: dict | None, key: str, default: Any = None) -> s
 
 def bot_setting_raw_cached(key: str, default: Any = "") -> str:
     """Retrieve raw setting string from memory cache with code defaults fallback."""
+    if key in _bot_settings_cache and key not in ("data", "status", "ts"):
+        return str(_bot_settings_cache[key]).strip()
     return _setting_raw_from(_bot_settings_cache.get("data") or BOT_SETTING_DEFAULTS, key, default)
 
 
@@ -13762,14 +13770,7 @@ async def _send_welcome_message(message: Any) -> Any:
 
     text = _setting_raw_from(settings, "welcome_message", WELCOME_TEXT) or WELCOME_TEXT
     photo_file_id = _setting_raw_from(settings, "welcome_photo_file_id", "")
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚙️ ការកំណត់ / Settings", callback_data="welcome_profile"),
-         InlineKeyboardButton("🤖 ម៉ូដែល TTS", callback_data="show_tts_model")],
-        [InlineKeyboardButton("🎚️ ល្បឿនសំឡេង", callback_data="show_speed"),
-         InlineKeyboardButton("📢 Channel", url="https://t.me/m11mmm112")],
-        [InlineKeyboardButton("☕ ឧបត្ថម្ភកាហ្វេ / Buy Coffee", callback_data="donate_menu"),
-         InlineKeyboardButton("🏆 តារាងកិត្តិយស", callback_data="donate_halloffame")],
-    ])
+    keyboard = get_welcome_kb()
 
     if photo_file_id:
         try:
@@ -16160,10 +16161,9 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🩺 Health", callback_data="admin_health"),
          InlineKeyboardButton("🚨 Error Inbox", callback_data="admin_errors")],
         [InlineKeyboardButton("⚡ Optimize", callback_data="admin_optimize"),
-         InlineKeyboardButton("🚀 Audio Cache", callback_data="admin_audio_cache")],
-        [InlineKeyboardButton("📈 Stats", callback_data="admin_stats"),
-         InlineKeyboardButton("🔄 Refresh", callback_data="admin_home")],
-        [InlineKeyboardButton("❌ បិទ (Close)", callback_data="admin_close")],
+         InlineKeyboardButton("📈 Stats", callback_data="admin_stats")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="admin_home"),
+         InlineKeyboardButton("❌ បិទ (Close)", callback_data="admin_close")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -19051,26 +19051,109 @@ def _tts_audio_redis_key(key: str) -> str:
 def _tts_audio_cache_get(key: str) -> bytes | None:
     if not TTS_AUDIO_CACHE_ENABLED:
         return None
-    from app.services.tts.cache import get_global_tts_cache
-    return get_global_tts_cache().get(key)
+    now = time.monotonic()
+    # 1. Check L1 Memory Cache
+    with _TTS_AUDIO_CACHE_LOCK:
+        item = _TTS_AUDIO_CACHE.get(key)
+        if item:
+            data, created, size = item
+            if now - created <= TTS_AUDIO_CACHE_TTL_S:
+                _TTS_AUDIO_CACHE.move_to_end(key)
+                return bytes(data)
+            else:
+                global _TTS_AUDIO_CACHE_BYTES
+                _TTS_AUDIO_CACHE.pop(key, None)
+                _TTS_AUDIO_CACHE_BYTES = max(0, _TTS_AUDIO_CACHE_BYTES - size)
+
+    # 2. Check L2 Redis Cache
+    curr_redis = globals().get("redis_client")
+    if curr_redis is not None:
+        try:
+            rkey = _tts_audio_redis_key(key)
+            raw = curr_redis.get(rkey)
+            if raw:
+                if isinstance(raw, str):
+                    audio_data = base64.b64decode(raw.encode("ascii"))
+                elif isinstance(raw, (bytes, bytearray)):
+                    try:
+                        audio_data = base64.b64decode(raw)
+                    except Exception:
+                        audio_data = bytes(raw)
+                else:
+                    audio_data = bytes(raw)
+                if audio_data:
+                    # Populate L1 cache for subsequent fast reads
+                    _tts_audio_cache_set_memory_only(key, audio_data)
+                    return audio_data
+        except Exception as exc:
+            logger.debug("Redis audio cache get error: %s", exc)
+
+    # 3. Check modular TTS cache
+    with suppress(Exception):
+        from app.services.tts.cache import get_global_tts_cache
+        res = get_global_tts_cache().get(key)
+        if res:
+            _tts_audio_cache_set_memory_only(key, res)
+            return res
+
+    return None
 
 
 def _tts_audio_cache_set_memory_only(key: str, data: bytes) -> None:
     if not TTS_AUDIO_CACHE_ENABLED or not data:
         return
-    from app.services.tts.cache import get_global_tts_cache
-    get_global_tts_cache().set(key, data)
+    size = len(data)
+    if size > TTS_AUDIO_CACHE_ITEM_MAX_BYTES:
+        return
+    global _TTS_AUDIO_CACHE_BYTES
+    now = time.monotonic()
+    with _TTS_AUDIO_CACHE_LOCK:
+        old = _TTS_AUDIO_CACHE.pop(key, None)
+        if old:
+            _TTS_AUDIO_CACHE_BYTES = max(0, _TTS_AUDIO_CACHE_BYTES - old[2])
+        _TTS_AUDIO_CACHE[key] = (bytes(data), now, size)
+        _TTS_AUDIO_CACHE_BYTES += size
+        while _TTS_AUDIO_CACHE_BYTES > TTS_AUDIO_CACHE_MAX_BYTES and _TTS_AUDIO_CACHE:
+            _old_key, (_old_data, _old_created, old_size) = _TTS_AUDIO_CACHE.popitem(last=False)
+            _TTS_AUDIO_CACHE_BYTES = max(0, _TTS_AUDIO_CACHE_BYTES - old_size)
+
+    with suppress(Exception):
+        from app.services.tts.cache import get_global_tts_cache
+        get_global_tts_cache().set(key, data)
 
 
 def _tts_audio_cache_set(key: str, data: bytes) -> None:
     if not TTS_AUDIO_CACHE_ENABLED or not data:
         return
-    from app.services.tts.cache import get_global_tts_cache
-    get_global_tts_cache().set(key, data)
+    # Write to L1 Memory Cache
+    _tts_audio_cache_set_memory_only(key, data)
+
+    # Write to L2 Redis Cache asynchronously / in background
+    curr_redis = globals().get("redis_client")
+    if curr_redis is not None:
+        def _write_redis():
+            try:
+                active_redis = globals().get("redis_client")
+                if active_redis is not None:
+                    rkey = _tts_audio_redis_key(key)
+                    b64_str = base64.b64encode(data).decode("ascii")
+                    active_redis.set(rkey, b64_str, ex=int(TTS_AUDIO_CACHE_TTL_S))
+            except Exception as exc:
+                logger.debug("Redis audio cache set error: %s", exc)
+        _submit_db(_write_redis)
 
 
 def _tts_audio_cache_trim_expired() -> int:
+    global _TTS_AUDIO_CACHE_BYTES
+    now = time.monotonic()
     removed = 0
+    with _TTS_AUDIO_CACHE_LOCK:
+        if _TTS_AUDIO_CACHE:
+            for key, (_data, created, size) in list(_TTS_AUDIO_CACHE.items()):
+                if now - float(created or 0.0) > TTS_AUDIO_CACHE_TTL_S:
+                    _TTS_AUDIO_CACHE.pop(key, None)
+                    _TTS_AUDIO_CACHE_BYTES = max(0, _TTS_AUDIO_CACHE_BYTES - int(size or 0))
+                    removed += 1
     with suppress(Exception):
         from app.services.tts.cache import get_global_tts_cache, get_global_tts_file_id_cache
         removed += get_global_tts_cache().trim_expired()
@@ -19079,11 +19162,15 @@ def _tts_audio_cache_trim_expired() -> int:
 
 
 def _tts_audio_cache_clear() -> int:
-    removed = 0
+    global _TTS_AUDIO_CACHE_BYTES
+    with _TTS_AUDIO_CACHE_LOCK:
+        removed = len(_TTS_AUDIO_CACHE)
+        _TTS_AUDIO_CACHE.clear()
+        _TTS_AUDIO_CACHE_BYTES = 0
     with suppress(Exception):
         from app.services.tts.cache import clear_all_tts_caches
         res = clear_all_tts_caches()
-        removed = res.get("audio_items_cleared", 0) + res.get("file_ids_cleared", 0)
+        removed += res.get("audio_items_cleared", 0) + res.get("file_ids_cleared", 0)
     return removed
 
 
@@ -19783,7 +19870,7 @@ async def _deliver_paged_tts(
                 os.environ.get("CHANNEL_NARRATOR_SHOW_BUTTONS", "false").lower() in ("1", "true", "yes")
                 or (bot_setting_bool_cached("channel_narrator_show_buttons", False) if "bot_setting_bool_cached" in globals() else False)
             )
-            voice_markup = get_main_kb(gender, model) if (not is_group_or_channel or allow_channel_buttons) else None
+            voice_markup = get_main_kb(gender, model, speed=speed) if (not is_group_or_channel or allow_channel_buttons) else None
 
             # Fast Path: Check Telegram file_id cache for chunk
             chunk_cache_key = _tts_audio_cache_key(chunk, gender, speed, model)
@@ -19904,29 +19991,86 @@ async def _deliver_paged_tts(
 # ---------------------------------------------------------------------------
 # Keyboard builders
 # ---------------------------------------------------------------------------
+def _is_welcome_message(message: Any) -> bool:
+    """Detect whether a message originates from the welcome screen."""
+    if not message:
+        return False
+    text = getattr(message, "caption", None) or getattr(message, "text", None) or ""
+    return bool(
+        "ស្វាគមន៍" in text
+        or "Welcome" in text
+        or "m11mmm112" in text
+        or ("Bot Voice" in text and "Channel" in text)
+    )
+
+
+def _is_profile_message(message: Any) -> bool:
+    """Detect whether a message originates from user preferences/profile."""
+    if not message:
+        return False
+    text = getattr(message, "caption", None) or getattr(message, "text", None) or ""
+    return bool("កម្រងព័ត៌មាន" in text or "User Profile" in text)
+
+
+def get_welcome_kb() -> InlineKeyboardMarkup:
+    """Build modern, modular welcome keyboard with customized button labels."""
+    from app.services.telegram.buttons import get_button_label
+
+    settings_label = get_button_label("btn_settings", "⚙️ ការកំណត់ / Settings")
+    tts_label = get_button_label("btn_tts_model", "🤖 ម៉ូដែល TTS")
+    spd_label = get_button_label("btn_speed", "🎚️ ល្បឿនសំឡេង")
+    help_label = get_button_label("btn_help", "📖 របៀបប្រើ / Help")
+    donate_label = get_button_label("btn_donate", "☕ ឧបត្ថម្ភកាហ្វេ")
+    hof_label = get_button_label("btn_halloffame", "🏆 តារាងកិត្តិយស")
+    channel_label = get_button_label("btn_channel", "📢 Channel ព័ត៌មាន")
+
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(settings_label, callback_data="welcome_profile"),
+         InlineKeyboardButton(tts_label, callback_data="show_tts_model")],
+        [InlineKeyboardButton(spd_label, callback_data="show_speed"),
+         InlineKeyboardButton(help_label, callback_data="help")],
+        [InlineKeyboardButton(donate_label, callback_data="donate_menu"),
+         InlineKeyboardButton(hof_label, callback_data="donate_halloffame")],
+        [InlineKeyboardButton(channel_label, url="https://t.me/m11mmm112")],
+    ])
+
+
 def get_main_kb(
     gender: str,
     tts_model: str = "auto",
     *,
+    speed: float = 1.0,
     include_back: bool = False,
 ) -> InlineKeyboardMarkup:
+    """Build ergonomic, 2-row voice note keyboard with active speed and model info."""
     from app.services.telegram.buttons import get_button_label
 
     f_label = get_button_label("btn_female", "👩 សំឡេងស្រី")
     m_label = get_button_label("btn_male", "👨 សំឡេងប្រុស")
-    spd_label = get_button_label("btn_speed", "🎚️ ល្បឿនសំឡេង")
-    tts_label = get_button_label("btn_tts_model", "🤖 ម៉ូដែល TTS")
-    back_label = get_button_label("btn_back", "🔙 Back")
+    spd_label = get_button_label("btn_speed", "🎚️ ល្បឿន")
+    tts_label = get_button_label("btn_tts_model", "🤖 ម៉ូដែល")
+    back_label = get_button_label("btn_back", "🔙 ត្រឡប់")
 
     f_btn = f_label + (" ✅" if gender == "female" else "")
     m_btn = m_label + (" ✅" if gender == "male" else "")
     model_key = _normalize_tts_model(tts_model)
-    model_btn = f"{tts_label}: {TTS_MODEL_OPTIONS.get(model_key, TTS_MODEL_OPTIONS['auto'])[0]}"
+    model_short_map = {
+        "auto": "ស្វ័យប្រវត្តិ",
+        "gemini": "Gemini AI",
+        "edge": "Edge TTS",
+        "hf_space": "Kiri TTS",
+        "voxcpm2": "VoxCPM2",
+    }
+    model_short = model_short_map.get(model_key, TTS_MODEL_OPTIONS.get(model_key, TTS_MODEL_OPTIONS["auto"])[0])
+    speed_display = f"{speed:.1f}x" if abs(speed - round(speed, 1)) < 0.05 else f"{speed}x"
+
+    spd_btn = f"{spd_label}: {speed_display}"
+    tts_btn = f"{tts_label}: {model_short}"
     rows = [
         [InlineKeyboardButton(f_btn, callback_data="tg_female"),
          InlineKeyboardButton(m_btn, callback_data="tg_male")],
-        [InlineKeyboardButton(spd_label, callback_data="show_speed")],
-        [InlineKeyboardButton(model_btn, callback_data="show_tts_model")],
+        [InlineKeyboardButton(spd_btn, callback_data="show_speed"),
+         InlineKeyboardButton(tts_btn, callback_data="show_tts_model")],
     ]
     if include_back:
         rows.append([InlineKeyboardButton(back_label, callback_data="welcome_back")])
@@ -19948,20 +20092,26 @@ def get_tts_model_kb(current_model: str = "auto") -> InlineKeyboardMarkup:
 
 
 def get_speed_kb(current_speed: float) -> InlineKeyboardMarkup:
+    """Build 2x2 grid speed keyboard for mobile ease of tapping."""
     from app.services.telegram.buttons import get_button_label
 
-    speed_row = [
-        InlineKeyboardButton(
-            lbl + (" ✅" if abs(val - current_speed) < 0.01 else ""),
-            callback_data=cb,
-        )
-        for cb, (lbl, val) in SPEED_OPTIONS.items()
-    ]
+    items = list(SPEED_OPTIONS.items())
+    rows: list[list[InlineKeyboardButton]] = []
+    current_row: list[InlineKeyboardButton] = []
+    for cb, (_lbl, val) in items:
+        clean_lbl = "1.0x (ធម្មតា)" if abs(val - 1.0) < 0.01 else f"{val:.1f}x"
+        if abs(val - current_speed) < 0.01:
+            clean_lbl += " ✅"
+        current_row.append(InlineKeyboardButton(clean_lbl, callback_data=cb))
+        if len(current_row) == 2:
+            rows.append(current_row)
+            current_row = []
+    if current_row:
+        rows.append(current_row)
+
     back_label = get_button_label("btn_back", "🔙 ត្រឡប់")
-    return InlineKeyboardMarkup([
-        speed_row,
-        [InlineKeyboardButton(back_label, callback_data="hide_speed")],
-    ])
+    rows.append([InlineKeyboardButton(back_label, callback_data="hide_speed")])
+    return InlineKeyboardMarkup(rows)
 
 
 def get_transcription_kb(transcript_msg_id: int) -> InlineKeyboardMarkup:
@@ -24257,13 +24407,13 @@ async def _admin_open_settings_panel(query, force: bool = False, notice: str = "
     ))
 
 
-def _mask_secret(val: str, prefix_len: int = 4, suffix_len: int = 4) -> str:
+def _mask_secret(val: str | None, prefix_len: int = 3, suffix_len: int = 3) -> str:
     s = str(val or "").strip()
     if not s:
-        return "⚪ Not Set"
+        return "Not configured"
     if len(s) <= prefix_len + suffix_len:
-        return "✅ Set (***)"
-    return f"{s[:prefix_len]}...{s[-suffix_len:]}"
+        return "******"
+    return f"{s[:prefix_len]}******{s[-suffix_len:]}"
 
 
 def _admin_bot_config_home_text(settings: dict[str, str], status: dict) -> str:
@@ -27256,10 +27406,32 @@ async def _cb_show_speed(query, user_id: int, context):
 
 
 async def _cb_hide_speed(query, user_id: int, context):
+    if query.message is None:
+        return
     prefs = await get_user_prefs_async(user_id)
-    await safe_send(lambda: query.message.edit_reply_markup(
-        reply_markup=get_main_kb(prefs["gender"], prefs.get("tts_model", "auto"))
-    ))
+    if _is_welcome_message(query.message):
+        await safe_send(lambda: query.message.edit_reply_markup(reply_markup=get_welcome_kb()))
+    elif _is_profile_message(query.message):
+        await safe_send(lambda: query.message.edit_reply_markup(
+            reply_markup=get_main_kb(
+                prefs["gender"],
+                prefs.get("tts_model", "auto"),
+                speed=prefs.get("speed", 1.0),
+                include_back=True,
+            )
+        ))
+    elif not getattr(query.message, "voice", None) and not getattr(query.message, "audio", None):
+        with suppress(Exception):
+            await query.message.delete()
+    else:
+        await safe_send(lambda: query.message.edit_reply_markup(
+            reply_markup=get_main_kb(
+                prefs["gender"],
+                prefs.get("tts_model", "auto"),
+                speed=prefs.get("speed", 1.0),
+                include_back=False,
+            )
+        ))
 
 
 async def _cb_show_tts_model(query, user_id: int, context):
@@ -27270,10 +27442,32 @@ async def _cb_show_tts_model(query, user_id: int, context):
 
 
 async def _cb_hide_tts_model(query, user_id: int, context):
+    if query.message is None:
+        return
     prefs = await get_user_prefs_async(user_id)
-    await safe_send(lambda: query.message.edit_reply_markup(
-        reply_markup=get_main_kb(prefs["gender"], prefs.get("tts_model", "auto"))
-    ))
+    if _is_welcome_message(query.message):
+        await safe_send(lambda: query.message.edit_reply_markup(reply_markup=get_welcome_kb()))
+    elif _is_profile_message(query.message):
+        await safe_send(lambda: query.message.edit_reply_markup(
+            reply_markup=get_main_kb(
+                prefs["gender"],
+                prefs.get("tts_model", "auto"),
+                speed=prefs.get("speed", 1.0),
+                include_back=True,
+            )
+        ))
+    elif not getattr(query.message, "voice", None) and not getattr(query.message, "audio", None):
+        with suppress(Exception):
+            await query.message.delete()
+    else:
+        await safe_send(lambda: query.message.edit_reply_markup(
+            reply_markup=get_main_kb(
+                prefs["gender"],
+                prefs.get("tts_model", "auto"),
+                speed=prefs.get("speed", 1.0),
+                include_back=False,
+            )
+        ))
 
 
 async def _regenerate_tts_voice_with_progress(
@@ -27309,7 +27503,7 @@ async def _regenerate_tts_voice_with_progress(
         os.environ.get("CHANNEL_NARRATOR_SHOW_BUTTONS", "false").lower() in ("1", "true", "yes")
         or (bot_setting_bool_cached("channel_narrator_show_buttons", False) if "bot_setting_bool_cached" in globals() else False)
     )
-    voice_markup = get_main_kb(gender, tts_model) if (not is_group_or_channel or allow_channel_buttons) else None
+    voice_markup = get_main_kb(gender, tts_model, speed=speed) if (not is_group_or_channel or allow_channel_buttons) else None
 
     # Fast Path: Check Telegram file_id cache before starting progress
     regen_cache_key = _tts_audio_cache_key(original_text, gender, speed, tts_model)
@@ -27445,19 +27639,18 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
 
     if not original_text:
         model = update_user_tts_model(user_id, model)
-        await safe_send(lambda: query.message.edit_reply_markup(reply_markup=get_main_kb(gender, model)))
-        await safe_send(lambda: query.message.reply_text(
-            "✅ បានប្តូរម៉ូដែល TTS រួច។\n"
-            "⚠️ រកអត្ថបទដើមមិនឃើញ ដូច្នេះមិនអាចបង្កើតសំឡេងឡើងវិញបានទេ។\n"
-            "សូមផ្ញើអត្ថបទម្តងទៀត។"
-        ))
+        model_label = TTS_MODEL_OPTIONS.get(model, TTS_MODEL_OPTIONS["auto"])[0]
+        with suppress(Exception):
+            await query.message.edit_reply_markup(reply_markup=get_tts_model_kb(model))
+        with suppress(Exception):
+            await query.answer(f"✅ បានកំណត់ម៉ូដែល {model_label}")
         return
 
     if not await _claim_tts_request(query.message, user_id):
         return
     try:
         model = update_user_tts_model(user_id, model)
-        await safe_send(lambda: query.message.edit_reply_markup(reply_markup=get_main_kb(gender, model)))
+        await safe_send(lambda: query.message.edit_reply_markup(reply_markup=get_main_kb(gender, model, speed=speed)))
     except BaseException:
         _release_tts_request(user_id)
         raise
@@ -27529,9 +27722,11 @@ async def _cb_speed(query, user_id: int, context, data: str):
         get_user_prefs_async(user_id),
     )
     if not original_text:
-        await safe_send(lambda: query.message.reply_text(
-            "❌ រកអត្ថបទដើមមិនឃើញ។ សូមផ្ញើអត្ថបទម្តងទៀត រួចប្តូរល្បឿន។"
-        ))
+        update_user_speed(user_id, new_speed)
+        with suppress(Exception):
+            await query.message.edit_reply_markup(reply_markup=get_speed_kb(new_speed))
+        with suppress(Exception):
+            await query.answer(f"✅ បានកំណត់ល្បឿន {speed_label}")
         return
     gender = prefs["gender"]
     tts_model = prefs.get("tts_model", "auto")
@@ -27565,10 +27760,18 @@ async def _cb_gender(query, user_id: int, context, data: str):
         get_callback_original_text(query, user_id),
         get_user_prefs_async(user_id),
     )
+    gender_label = "ស្រី" if new_gender == "female" else "ប្រុស"
     if not original_text:
-        await safe_send(lambda: query.message.reply_text(
-            "❌ រកអត្ថបទដើមមិនឃើញ។ សូមផ្ញើអត្ថបទម្តងទៀត រួចប្តូរសំឡេង។"
-        ))
+        update_user_gender(user_id, new_gender)
+        speed = prefs.get("speed", 1.0)
+        tts_model = prefs.get("tts_model", "auto")
+        is_profile = _is_profile_message(query.message)
+        with suppress(Exception):
+            await query.message.edit_reply_markup(
+                reply_markup=get_main_kb(new_gender, tts_model, speed=speed, include_back=is_profile)
+            )
+        with suppress(Exception):
+            await query.answer(f"✅ បានកំណត់សំឡេង{gender_label}")
         return
     speed = prefs["speed"]
     tts_model = prefs.get("tts_model", "auto")
