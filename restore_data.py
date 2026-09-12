@@ -18,16 +18,19 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import csv
 import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 
 from _migration_core import (
     SCHEMA_GRAPH,
@@ -111,9 +114,36 @@ def find_latest_backup_dir(base_dir: Path) -> Path | None:
     return dirs[0]
 
 
+def load_rows_from_csv(csv_path: Path) -> list[dict[str, Any]]:
+    """Load and parse records from a CSV file into Python dicts."""
+    rows: list[dict[str, Any]] = []
+    if not csv_path.is_file():
+        return rows
+    with csv_path.open("r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            parsed_row: dict[str, Any] = {}
+            for k, v in r.items():
+                if v == "" or v is None:
+                    parsed_row[k] = None
+                elif v.lower() == "true":
+                    parsed_row[k] = True
+                elif v.lower() == "false":
+                    parsed_row[k] = False
+                elif (v.startswith("{") and v.endswith("}")) or (v.startswith("[") and v.endswith("]")):
+                    try:
+                        parsed_row[k] = json.loads(v)
+                    except Exception:
+                        parsed_row[k] = v
+                else:
+                    parsed_row[k] = v
+            rows.append(parsed_row)
+    return rows
+
+
 def load_table_data_from_backup(backup_dir: Path, table_name: str) -> list[dict[str, Any]]:
-    """Load records for a table from {table}.json, handling legacy names and full_backup.json."""
-    # 1. Direct table file
+    """Load records for a table from {table}.json or {table}.csv, handling legacy names and full_backup.json."""
+    # 1. Direct table JSON file
     json_path = backup_dir / f"{table_name}.json"
     if json_path.is_file():
         try:
@@ -125,7 +155,16 @@ def load_table_data_from_backup(backup_dir: Path, table_name: str) -> list[dict[
             with _print_lock:
                 print(f"⚠️ Error reading {json_path.name}: {exc}")
 
-    # 2. Legacy alias check (broadcast_schedules -> scheduled_broadcasts)
+    # 2. Direct table CSV file
+    csv_path = backup_dir / f"{table_name}.csv"
+    if csv_path.is_file():
+        try:
+            return load_rows_from_csv(csv_path)
+        except Exception as exc:
+            with _print_lock:
+                print(f"⚠️ Error reading {csv_path.name}: {exc}")
+
+    # 3. Legacy alias check (broadcast_schedules -> scheduled_broadcasts)
     if table_name == "scheduled_broadcasts":
         legacy_path = backup_dir / "broadcast_schedules.json"
         if legacy_path.is_file():
@@ -138,7 +177,7 @@ def load_table_data_from_backup(backup_dir: Path, table_name: str) -> list[dict[
                 with _print_lock:
                     print(f"⚠️ Error reading legacy broadcast_schedules.json: {exc}")
 
-    # 3. Fallback to full_backup.json
+    # 4. Fallback to full_backup.json
     full_path = backup_dir / "full_backup.json"
     if full_path.is_file():
         try:
@@ -398,6 +437,121 @@ def run_restore(
             print("✅ Row counts verified against target PostgREST API.")
 
     return 0
+
+
+def restore_single_table_from_rows(
+    table_name: str,
+    rows: list[dict[str, Any]],
+    target_url: str,
+    target_key: str,
+    *,
+    batch_size: int = 500,
+    dry_run: bool = False,
+    timeout: int = 30,
+) -> tuple[int, int]:
+    """Restores a list of in-memory rows into target Supabase table using merge-duplicates."""
+    spec = SCHEMA_GRAPH.get(table_name, {})
+    conflict_key = spec.get("conflict") or spec.get("pk")
+    total = len(rows)
+    restored = 0
+
+    for i in range(0, total, batch_size):
+        chunk = rows[i : i + batch_size]
+        if not dry_run:
+            upserted = upsert_batch_rows(
+                target_url,
+                target_key,
+                table_name,
+                chunk,
+                conflict_key=conflict_key,
+                timeout=timeout,
+            )
+            restored += upserted
+        else:
+            restored += len(chunk)
+    return total, restored
+
+
+def restore_from_file_or_dir(
+    target_url: str,
+    target_key: str,
+    path: Path,
+    *,
+    dry_run: bool = False,
+    timeout: int = 30,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> dict[str, Any]:
+    """Restores data from a backup folder, ZIP bundle, or single JSON/CSV file."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Path not found: {path}")
+
+    # Case A: Directory
+    if path.is_dir():
+        code = run_restore(
+            backup_dir=path,
+            target_url=target_url,
+            target_key=target_key,
+            dry_run=dry_run,
+            timeout=timeout,
+        )
+        return {"success": code == 0, "path": str(path), "type": "directory"}
+
+    # Case B: ZIP Archive
+    if path.suffix.lower() == ".zip":
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with zipfile.ZipFile(path, "r") as zf:
+                zf.extractall(tmp_path)
+            code = run_restore(
+                backup_dir=tmp_path,
+                target_url=target_url,
+                target_key=target_key,
+                dry_run=dry_run,
+                timeout=timeout,
+            )
+            return {"success": code == 0, "path": str(path), "type": "zip"}
+
+    # Case C: Single CSV or JSON file
+    tbl = path.stem.lower()
+    if tbl == "broadcast_schedules":
+        tbl = "scheduled_broadcasts"
+
+    if tbl not in SCHEMA_GRAPH:
+        raise ValueError(
+            f"Filename '{path.name}' does not correspond to a known schema table ({', '.join(SCHEMA_GRAPH.keys())})"
+        )
+
+    if path.suffix.lower() == ".csv":
+        rows = load_rows_from_csv(path)
+    elif path.suffix.lower() == ".json":
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+            rows = data if isinstance(data, list) else []
+    else:
+        raise ValueError(f"Unsupported file format: {path.suffix}")
+
+    total, restored = restore_single_table_from_rows(
+        tbl,
+        rows,
+        target_url,
+        target_key,
+        dry_run=dry_run,
+        timeout=timeout,
+    )
+    if progress_callback:
+        try:
+            progress_callback(tbl, restored, total)
+        except Exception:
+            pass
+
+    return {
+        "success": True,
+        "table": tbl,
+        "total_rows": total,
+        "restored_rows": restored,
+        "type": "single_file",
+    }
 
 
 def main() -> int:

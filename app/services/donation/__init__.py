@@ -12,6 +12,7 @@ from app.services.donation.handlers import (
     cmd_donors,
     cmd_testblessing,
     donation_callback,
+    handle_adddonor_text,
 )
 from app.services.donation.khqr import (
     BakongKHQR,
@@ -33,4 +34,6 @@ __all__ = [
     "generate_khqr_string",
     "generate_voice_blessing",
     "get_khqr_qr_image",
+    "handle_adddonor_text",
 ]
+

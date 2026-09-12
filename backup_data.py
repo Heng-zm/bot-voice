@@ -23,6 +23,7 @@ from typing import Any, Callable
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 
 from _migration_core import (
     SCHEMA_GRAPH,
@@ -221,6 +222,166 @@ def export_csv(filepath: Path, rows: list[dict[str, Any]]) -> None:
             writer.writerow(formatted_row)
 
 
+
+def format_sql_value(val: Any) -> str:
+    """Safely format a Python value as a PostgreSQL SQL literal."""
+    if val is None:
+        return "NULL"
+    if isinstance(val, bool):
+        return "TRUE" if val else "FALSE"
+    if isinstance(val, (int, float)):
+        return str(val)
+    if isinstance(val, (dict, list)):
+        serialized = json.dumps(val, ensure_ascii=False).replace("'", "''")
+        return f"'{serialized}'::jsonb"
+    escaped = str(val).replace("'", "''")
+    return f"'{escaped}'"
+
+
+def generate_table_sql_inserts(table_name: str, rows: list[dict[str, Any]]) -> str:
+    """Generate PostgreSQL INSERT ... ON CONFLICT DO UPDATE statements for a table."""
+    if not rows:
+        return f"-- Table {table_name}: 0 rows\n"
+
+    meta = SCHEMA_GRAPH.get(table_name, {})
+    conflict_cols_str = meta.get("conflict") or meta.get("pk") or "id"
+    conflict_cols = [c.strip() for c in conflict_cols_str.split(",") if c.strip()]
+
+    # Collect all unique columns in stable insertion order
+    columns: list[str] = []
+    for r in rows:
+        for c in r:
+            if c not in columns:
+                columns.append(c)
+
+    non_conflict_cols = [c for c in columns if c not in conflict_cols]
+    quoted_cols = ", ".join(f'"{c}"' for c in columns)
+    lines = [f"-- Table: {table_name} ({len(rows)} records)"]
+
+    for row in rows:
+        vals = ", ".join(format_sql_value(row.get(c)) for c in columns)
+        conflict_target = ", ".join(f'"{c}"' for c in conflict_cols)
+        if non_conflict_cols:
+            update_clause = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in non_conflict_cols)
+            sql = f'INSERT INTO "{table_name}" ({quoted_cols}) VALUES ({vals}) ON CONFLICT ({conflict_target}) DO UPDATE SET {update_clause};'
+        else:
+            sql = f'INSERT INTO "{table_name}" ({quoted_cols}) VALUES ({vals}) ON CONFLICT ({conflict_target}) DO NOTHING;'
+        lines.append(sql)
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def export_sql_dump(
+    supabase_url: str,
+    api_key: str,
+    output_path: Path,
+    tables: tuple[str, ...] | list[str] | None = None,
+    page_size: int = 1000,
+    verbose: bool = True,
+    progress_callback: Callable[[str, int, int, int], None] | None = None,
+) -> tuple[int, Path]:
+    """Generates an idempotent PostgreSQL SQL dump file from Supabase PostgREST API."""
+    target_tables = list(tables or TABLES)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    total_records = 0
+    now_utc = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    with output_path.open("w", encoding="utf-8") as f:
+        f.write("-- ==========================================================================\n")
+        f.write("-- Khmer Telegram Voice Bot - Supabase PostgreSQL Database Dump\n")
+        f.write(f"-- Generated At: {now_utc}\n")
+        f.write(f"-- Source URL  : {supabase_url}\n")
+        f.write(f"-- Tables      : {', '.join(target_tables)}\n")
+        f.write("-- Zero-downtime idempotent upserts with ON CONFLICT DO UPDATE\n")
+        f.write("-- ==========================================================================\n\n")
+        f.write("BEGIN;\n\n")
+
+        for idx, tbl in enumerate(target_tables, 1):
+            if verbose:
+                sys.stdout.write(f"⏳ Generating SQL for {tbl:22} ... ")
+                sys.stdout.flush()
+            rows = fetch_table_rows(supabase_url, api_key, tbl, page_size=page_size)
+            count = len(rows)
+            total_records += count
+            sql_block = generate_table_sql_inserts(tbl, rows)
+            f.write(sql_block + "\n")
+            if verbose:
+                print(f"✅ {count:>5} rows generated")
+            if progress_callback:
+                try:
+                    progress_callback(tbl, idx, len(target_tables), total_records)
+                except Exception:
+                    pass
+
+        f.write("COMMIT;\n")
+        f.write("-- End of Supabase PostgreSQL Database Dump\n")
+
+    return total_records, output_path
+
+
+def bundle_csv_zip(csv_dir: Path, zip_path: Path) -> Path:
+    """Packages all CSV files in a directory into a compressed ZIP archive."""
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    csv_files = sorted(csv_dir.glob("*.csv"))
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for f in csv_files:
+            zf.write(f, arcname=f.name)
+        meta_file = csv_dir / "backup_metadata.json"
+        if meta_file.is_file():
+            zf.write(meta_file, arcname="backup_metadata.json")
+    return zip_path
+
+
+def generate_cli_script(
+    output_path: Path,
+    source_url: str = "",
+    source_key: str = "",
+    target_url: str = "",
+    target_key: str = "",
+) -> Path:
+    """Generates an executable migration script for CLI usage."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    src_url = source_url or "%SUPABASE_URL%"
+    src_k = source_key or "%SUPABASE_SERVICE_ROLE_KEY%"
+    tgt_url = target_url or "%TARGET_SUPABASE_URL%"
+    tgt_k = target_key or "%TARGET_SUPABASE_KEY%"
+
+    content = f"""@echo off
+rem ============================================================================
+rem Khmer Telegram Bot - Automated Supabase Migration & Disaster Recovery CLI
+rem ============================================================================
+rem Usage:
+rem   1. Set target credentials below or pass via environment variables
+rem   2. Run this script in terminal (cmd / powershell / bash)
+rem ============================================================================
+
+set SOURCE_URL={src_url}
+set SOURCE_KEY={src_k}
+set TARGET_URL={tgt_url}
+set TARGET_KEY={tgt_k}
+
+echo [1/3] Testing connectivity and executing online migration...
+python migrate_data.py --source-url "%SOURCE_URL%" --source-key "%SOURCE_KEY%" --target-url "%TARGET_URL%" --target-key "%TARGET_KEY%" --concurrency 4 --batch-size 500 --verify
+
+if %ERRORLEVEL% NEQ 0 (
+    echo [ERROR] Direct migration failed or was interrupted.
+    echo You can resume at any time by rerunning this script.
+    pause
+    exit /b %ERRORLEVEL%
+)
+
+echo [2/3] Performing local streaming backup snapshot...
+python backup_data.py --all
+
+echo [3/3] Migration & verification finished successfully!
+pause
+"""
+    output_path.write_text(content, encoding="utf-8")
+    return output_path
+
+
 def perform_backup(
     supabase_url: str,
     api_key: str,
@@ -230,8 +391,11 @@ def perform_backup(
     page_size: int = 1000,
     verbose: bool = True,
     progress_callback: Callable[[str, int, int, int], None] | None = None,
+    export_sql: bool = False,
+    export_csv_zip: bool = False,
+    export_cli: bool = False,
 ) -> dict[str, Any]:
-    """Perform full database backup with disk streaming and concurrent count inspection."""
+    """Perform full database backup with disk streaming, and optional SQL, CSV.ZIP, and CLI generation."""
     root_dir = Path(__file__).resolve().parent
     if output_dir is None:
         timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
@@ -304,10 +468,45 @@ def perform_backup(
     with (backup_dir / "backup_metadata.json").open("w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
+    sql_file: Path | None = None
+    if export_sql:
+        sql_file = backup_dir / f"{backup_dir.name}.sql"
+        if verbose:
+            print("📝 Exporting PostgreSQL SQL dump file...")
+        export_sql_dump(
+            supabase_url,
+            api_key,
+            sql_file,
+            tables=target_tables,
+            page_size=page_size,
+            verbose=verbose,
+            progress_callback=progress_callback,
+        )
+
+    zip_file: Path | None = None
+    if export_csv_zip:
+        zip_file = backup_dir / f"{backup_dir.name}_csv.zip"
+        if verbose:
+            print("📦 Bundling CSV files into ZIP archive...")
+        bundle_csv_zip(backup_dir, zip_file)
+
+    cli_file: Path | None = None
+    if export_cli:
+        cli_file = backup_dir / "run_migration.cli"
+        if verbose:
+            print("💻 Generating CLI migration script...")
+        generate_cli_script(cli_file, source_url=supabase_url, source_key=api_key)
+
     if verbose:
         print("=" * 60)
         print(f"🎉 Backup completed successfully! Total records: {total_records}")
         print(f"📁 Files stored in: {backup_dir}")
+        if sql_file:
+            print(f"📥 SQL Dump      : {sql_file}")
+        if zip_file:
+            print(f"📊 CSV ZIP       : {zip_file}")
+        if cli_file:
+            print(f"💻 CLI Script    : {cli_file}")
         print("=" * 60)
 
     return {
@@ -316,14 +515,21 @@ def perform_backup(
         "summary": summary,
         "total_records": total_records,
         "success": True,
+        "sql_path": str(sql_file) if sql_file else None,
+        "zip_path": str(zip_file) if zip_file else None,
+        "cli_path": str(cli_file) if cli_file else None,
     }
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Backup Supabase data to JSON & CSV files.")
+    parser = argparse.ArgumentParser(description="Backup Supabase data to JSON, CSV, SQL, & CLI files.")
     parser.add_argument("--output-dir", help="Custom output directory for backup files")
     parser.add_argument("--tables", help="Comma-separated list of tables to backup (default: all)")
     parser.add_argument("--page-size", type=int, default=1000, help="Page size for pagination (default: 1000)")
+    parser.add_argument("--sql", action="store_true", help="Generate SQL dump file")
+    parser.add_argument("--csv-zip", action="store_true", help="Bundle CSV files into a ZIP archive")
+    parser.add_argument("--cli", action="store_true", help="Generate CLI migration script")
+    parser.add_argument("--all", action="store_true", help="Generate JSON, CSV, SQL dump, CSV ZIP, and CLI script")
 
     args = parser.parse_args()
 
@@ -346,6 +552,10 @@ def main() -> int:
     custom_output_dir = Path(args.output_dir).resolve() if args.output_dir else None
     target_tables = [t.strip() for t in args.tables.split(",") if t.strip()] if args.tables else None
 
+    export_sql = args.sql or args.all
+    export_csv_zip = args.csv_zip or args.all
+    export_cli = args.cli or args.all
+
     result = perform_backup(
         supabase_url=sb_url,
         api_key=sb_key,
@@ -353,6 +563,9 @@ def main() -> int:
         tables=target_tables,
         page_size=args.page_size,
         verbose=True,
+        export_sql=export_sql,
+        export_csv_zip=export_csv_zip,
+        export_cli=export_cli,
     )
 
     return 0 if result.get("success") else 1

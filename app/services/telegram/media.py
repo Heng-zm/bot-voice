@@ -41,6 +41,11 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if sched_state == SCHED_WAIT_MSG:
             await _handle_sched_content(update, context)
             return
+        if context.user_data.get("adddonor_state") == "wait_user_id":
+            from app.services.donation.handlers import handle_adddonor_text
+
+            if await handle_adddonor_text(update, context):
+                return
         if context.user_data.get("bc_state") == BROADCAST_WAIT_MESSAGE:
             await broadcast_receive(update, context)
             return
@@ -144,7 +149,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if progress.message is not None:
             await safe_send(lambda: progress.message.edit_reply_markup(
-                reply_markup=get_ocr_confirm_kb(result_id)
+                reply_markup=get_ocr_confirm_kb(result_id, is_khmer=(lang_key == "km"))
             ))
 
         total_pages = len(plain_pages)
@@ -569,6 +574,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if await _handle_admin_report_day_text(update, context):
             return
+        if context.user_data.get("adddonor_state"):
+            from app.services.donation.handlers import handle_adddonor_text
+
+            if await handle_adddonor_text(update, context):
+                return
         sched_state = context.user_data.get("sched_state")
         if sched_state == SCHED_WAIT_MSG:
             await _handle_sched_content(update, context)

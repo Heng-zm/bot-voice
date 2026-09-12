@@ -357,11 +357,218 @@ async def cmd_donors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await msg.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
 
 
-async def cmd_adddonor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin command to manually credit a donor and trigger voice blessing.
+def _build_adddonor_amount_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("☕ $1.00 (Coffee)", callback_data="donate_add_tier:coffee:1.0"),
+            InlineKeyboardButton("🧋 $2.00 (Milk Tea)", callback_data="donate_add_tier:milktea:2.0"),
+        ],
+        [
+            InlineKeyboardButton("🍜 $3.00 (Lunch)", callback_data="donate_add_tier:lunch:3.0"),
+            InlineKeyboardButton("🖥️ $5.00 (Server)", callback_data="donate_add_tier:server:5.0"),
+        ],
+        [
+            InlineKeyboardButton("🌟 $10.00 (Patron)", callback_data="donate_add_tier:patron:10.0"),
+            InlineKeyboardButton("💎 $20.00 (Gold)", callback_data="donate_add_tier:gold:20.0"),
+        ],
+        [
+            InlineKeyboardButton("✍️ វាយចំនួនផ្សេង (Custom)", callback_data="donate_add_custom"),
+            InlineKeyboardButton("❌ បោះបង់", callback_data="donate_add_cancel"),
+        ],
+    ])
 
-    Usage: /adddonor <user_id> <amount> [tier] [custom_name]
-    Example: /adddonor 1272791365 2.0 milktea Sokha
+
+async def _show_adddonor_step_amount(target_msg: Any, data: dict[str, Any], *, edit: bool = False) -> None:
+    donor_uid = data.get("user_id", 0)
+    auto_name = data.get("auto_name") or f"User {donor_uid}"
+    text = (
+        "➕ <b>បន្ថែមអ្នកឧបត្ថម្ភ (Add Donor) — ជំហានទី ២/៤</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>អ្នកឧបត្ថម្ភ:</b> {html.escape(auto_name)}\n"
+        f"🆔 <b>Telegram ID:</b> <code>{donor_uid}</code>\n\n"
+        "💵 <b>សូមជ្រើសរើសកម្រិតឧបត្ថម្ភ (Tier) ឬវាយបញ្ចូលចំនួនទឹកប្រាក់ ($ USD)៖</b>\n"
+        "<i>(អ្នកអាចចុចប៊ូតុងខាងក្រោម ឬវាយលេខដូចជា 1.5, 5, 25 ផ្ញើមកទីនេះ)</i>"
+    )
+    markup = _build_adddonor_amount_markup()
+    if edit and hasattr(target_msg, "edit_text"):
+        with suppress(Exception):
+            await target_msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
+            return
+    await target_msg.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+def _build_adddonor_name_markup(data: dict[str, Any]) -> InlineKeyboardMarkup:
+    donor_uid = data.get("user_id", 0)
+    auto_name = (data.get("auto_name") or "").strip()
+    rows = []
+    if auto_name and auto_name != f"User {donor_uid}":
+        rows.append([InlineKeyboardButton(f"✅ ប្រើឈ្មោះ: {auto_name[:25]}", callback_data="donate_add_use_auto")])
+    rows.append([InlineKeyboardButton(f"👤 ប្រើឈ្មោះ: User {donor_uid}", callback_data="donate_add_use_id")])
+    rows.append([InlineKeyboardButton("❌ បោះបង់", callback_data="donate_add_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _show_adddonor_step_name(target_msg: Any, data: dict[str, Any], *, edit: bool = False) -> None:
+    donor_uid = data.get("user_id", 0)
+    amount = float(data.get("amount", 1.0))
+    tier = data.get("tier", "coffee")
+    tier_info = TIER_DETAILS.get(tier, {})
+    tier_title = tier_info.get("title", tier)
+    auto_name = data.get("auto_name") or f"User {donor_uid}"
+
+    text = (
+        "➕ <b>បន្ថែមអ្នកឧបត្ថម្ភ (Add Donor) — ជំហានទី ៣/៤</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 <b>Telegram ID:</b> <code>{donor_uid}</code>\n"
+        f"💵 <b>ចំនួន:</b> ${amount:.2f} USD ({tier_title})\n\n"
+        f"📝 <b>តើអ្នកចង់ដាក់ឈ្មោះអ្វីសម្រាប់បង្ហាញក្នុងតារាងកិត្តិយស?</b>\n"
+        f"• ឈ្មោះ Telegram ស្វ័យប្រវត្តិ: <b>{html.escape(auto_name)}</b>\n\n"
+        "<i>👉 ចុចប៊ូតុងខាងក្រោមដើម្បីជ្រើសឈ្មោះ ឬវាយឈ្មោះថ្មីផ្ញើមកទីនេះ (ឧ. Dara, លោកពូសុខ)៖</i>"
+    )
+    markup = _build_adddonor_name_markup(data)
+    if edit and hasattr(target_msg, "edit_text"):
+        with suppress(Exception):
+            await target_msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
+            return
+    await target_msg.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+def _build_adddonor_confirm_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ បញ្ជាក់ & កត់ត្រា (Confirm)", callback_data="donate_add_confirm"),
+            InlineKeyboardButton("❌ បោះបង់", callback_data="donate_add_cancel"),
+        ]
+    ])
+
+
+async def _show_adddonor_step_confirm(target_msg: Any, data: dict[str, Any], *, edit: bool = False) -> None:
+    donor_uid = data.get("user_id", 0)
+    amount = float(data.get("amount", 1.0))
+    tier = data.get("tier", "coffee")
+    custom_name = data.get("custom_name") or f"User {donor_uid}"
+    tier_info = TIER_DETAILS.get(tier, {})
+    tier_title = tier_info.get("title", tier)
+    tier_emoji = tier_info.get("emoji", "☕")
+
+    text = (
+        "📋 <b>ផ្ទៀងផ្ទាត់ព័ត៌មាន (ជំហានទី ៤/៤)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>សប្បុរសជន:</b> {html.escape(custom_name)}\n"
+        f"🆔 <b>Telegram ID:</b> <code>{donor_uid}</code>\n"
+        f"💵 <b>ចំនួនទឹកប្រាក់:</b> ${amount:.2f} USD\n"
+        f"🎖️ <b>កម្រិត (Tier):</b> {tier_emoji} {tier_title}\n"
+        "🎙️ <b>AI Voice Blessing:</b> បង្កើត និងផ្ញើសំឡេងជូនពរ\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "តើអ្នកពិតជាចង់កត់ត្រាការឧបត្ថម្ភនេះមែនទេ?"
+    )
+    markup = _build_adddonor_confirm_markup()
+    if edit and hasattr(target_msg, "edit_text"):
+        with suppress(Exception):
+            await target_msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
+            return
+    await target_msg.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+async def handle_adddonor_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Handles text input and forwarded messages during the interactive /adddonor wizard."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg or not is_admin_user(int(user.id)):
+        return False
+
+    state = context.user_data.get("adddonor_state")
+    if not state:
+        return False
+
+    text = (msg.text or msg.caption or "").strip()
+    if text.lower() in ("/cancel", "cancel", "បោះបង់"):
+        context.user_data.pop("adddonor_state", None)
+        context.user_data.pop("adddonor_data", None)
+        await msg.reply_text("❌ <b>បានបោះបង់ការបន្ថែមអ្នកឧបត្ថម្ភ។</b>", parse_mode="HTML")
+        return True
+
+    data = context.user_data.setdefault("adddonor_data", {})
+
+    # Step 1: Wait for User ID
+    if state == "wait_user_id":
+        donor_uid = None
+        donor_auto_name = ""
+
+        fwd_user = getattr(msg, "forward_from", None)
+        if fwd_user and getattr(fwd_user, "id", None):
+            donor_uid = int(fwd_user.id)
+            donor_auto_name = fwd_user.first_name or fwd_user.full_name or ""
+        elif getattr(msg, "forward_from_chat", None):
+            donor_uid = int(msg.forward_from_chat.id)
+            donor_auto_name = msg.forward_from_chat.title or ""
+
+        if donor_uid is None and text.isdigit():
+            donor_uid = int(text)
+
+        if donor_uid is None:
+            await msg.reply_text(
+                "⚠️ <b>មិនស្គាល់ Telegram User ID ទេ។</b>\n\n"
+                "សូមវាយលេខសម្គាល់ជាលេខសុទ្ធ (ឧ. <code>1272791365</code>) ឬ Forward សារពីគាត់មកទីនេះ។\n"
+                "<i>(ផ្ញើ /cancel ដើម្បីបោះបង់)</i>",
+                parse_mode="HTML",
+            )
+            return True
+
+        if not donor_auto_name and context.bot:
+            with suppress(Exception):
+                chat = await context.bot.get_chat(donor_uid)
+                if chat and (chat.first_name or chat.title):
+                    donor_auto_name = chat.first_name or chat.title or ""
+
+        if not donor_auto_name:
+            donor_auto_name = f"User {donor_uid}"
+
+        data["user_id"] = donor_uid
+        data["auto_name"] = donor_auto_name
+        data["custom_name"] = donor_auto_name
+        context.user_data["adddonor_state"] = "wait_amount"
+        await _show_adddonor_step_amount(msg, data)
+        return True
+
+    # Step 2: Wait for Amount
+    if state == "wait_amount":
+        clean_text = text.replace("$", "").strip()
+        try:
+            amt = float(clean_text)
+            if amt <= 0 or amt > 10000.0:
+                await msg.reply_text("❌ ចំនួនទឹកប្រាក់ត្រូវតែចន្លោះពី $0.01 ដល់ $10,000.00 USD។")
+                return True
+        except ValueError:
+            await msg.reply_text(
+                "❌ សូមវាយចំនួនទឹកប្រាក់ជាលេខ (ឧទាហរណ៍៖ <code>1.0</code>, <code>2.5</code>, <code>5</code>) ឬចុចប៊ូតុងខាងលើ៖",
+                parse_mode="HTML",
+            )
+            return True
+
+        tier = next((k for k, v in TIER_DETAILS.items() if abs(v.get("amount", 0.0) - amt) < 0.01), "coffee")
+        data["amount"] = amt
+        data["tier"] = tier
+        context.user_data["adddonor_state"] = "wait_name"
+        await _show_adddonor_step_name(msg, data)
+        return True
+
+    # Step 3: Wait for Name
+    if state == "wait_name":
+        data["custom_name"] = text[:60]
+        context.user_data["adddonor_state"] = "confirm"
+        await _show_adddonor_step_confirm(msg, data)
+        return True
+
+    return False
+
+
+async def cmd_adddonor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command to credit a donor and trigger voice blessing.
+
+    Supports:
+    1. Direct 1-line execution: /adddonor <user_id> <amount> [tier] [name]
+    2. Interactive Step-by-Step wizard: /adddonor (with 0 arguments)
     """
     user = update.effective_user
     msg = update.effective_message
@@ -372,17 +579,57 @@ async def cmd_adddonor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await msg.reply_text("⛔ អ្នកមិនមានសិទ្ធិប្រើប្រាស់ពាក្យបញ្ជានេះទេ។")
         return
 
+    help_message = (
+        "ℹ️ <b>របៀបប្រើប្រាស់ពាក្យបញ្ជា /adddonor:</b>\n\n"
+        "<code>/adddonor &lt;user_id&gt; &lt;amount&gt; [tier] [name]</code>\n\n"
+        "• ឧទាហរណ៍៖ <code>/adddonor 1272791365 1.0 coffee Dara</code>\n"
+        "• Tiers: <code>coffee</code> ($1), <code>milktea</code> ($2), <code>lunch</code> ($3), <code>server</code> ($5), <code>patron</code> ($10)\n\n"
+        "💡 ឬវាយ <code>/adddonor</code> ដោយមិនដាក់ parameter ដើម្បីដំណើរការតាមជំហាន (Step by Step)!"
+    )
+
     args = context.args or []
-    if len(args) < 2:
+
+    # Case A: Explicit help requested
+    if len(args) == 1 and args[0].lower() in {"help", "info", "?"}:
+        await msg.reply_text(help_message, parse_mode="HTML")
+        return
+
+    # Case B: Launch Step-by-Step flow (no args or only user_id provided)
+    if not args:
+        context.user_data["adddonor_state"] = "wait_user_id"
+        context.user_data["adddonor_data"] = {}
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ បោះបង់ (Cancel)", callback_data="donate_add_cancel")]])
         await msg.reply_text(
-            "ℹ️ <b>របៀបប្រើប្រាស់ពាក្យបញ្ជា /adddonor:</b>\n\n"
-            "<code>/adddonor &lt;user_id&gt; &lt;amount&gt; [tier] [name]</code>\n\n"
-            "• ឧទាហរណ៍៖ <code>/adddonor 1272791365 1.0 coffee Dara</code>\n"
-            "• Tiers: <code>coffee</code> ($1), <code>milktea</code> ($2), <code>lunch</code> ($3), <code>server</code> ($5), <code>patron</code> ($10)",
+            "➕ <b>បន្ថែមអ្នកឧបត្ថម្ភ (Add Donor) — ជំហានទី ១/៤</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🆔 <b>សូមបញ្ចូល Telegram User ID របស់អ្នកឧបត្ថម្ភ៖</b>\n\n"
+            "• វាយលេខសម្គាល់ ឧទាហរណ៍៖ <code>1272791365</code>\n"
+            "• ឬ <b>Forward</b> សារពីគាត់មកកាន់ទីនេះ\n\n"
+            "<i>ផ្ញើ /cancel ដើម្បីបោះបង់</i>",
             parse_mode="HTML",
+            reply_markup=kb,
         )
         return
 
+    if len(args) == 1 and args[0].isdigit():
+        donor_uid = int(args[0])
+        donor_name = f"User {donor_uid}"
+        if context.bot:
+            with suppress(Exception):
+                chat = await context.bot.get_chat(donor_uid)
+                if chat and (chat.first_name or chat.title):
+                    donor_name = chat.first_name or chat.title or donor_name
+        data = {
+            "user_id": donor_uid,
+            "auto_name": donor_name,
+            "custom_name": donor_name,
+        }
+        context.user_data["adddonor_data"] = data
+        context.user_data["adddonor_state"] = "wait_amount"
+        await _show_adddonor_step_amount(msg, data)
+        return
+
+    # Case C: Direct one-line execution
     try:
         donor_uid = int(args[0])
         amount = float(args[1])
@@ -390,11 +637,21 @@ async def cmd_adddonor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await msg.reply_text("❌ ចំនួនទឹកប្រាក់ត្រូវតែចន្លោះពី $0.01 ដល់ $10,000.00 USD។")
             return
     except ValueError:
-        await msg.reply_text("❌ user_id និង amount ត្រូវតែជាតួលេខ។")
+        await msg.reply_text(
+            f"❌ <b>user_id និង amount ត្រូវតែជាតួលេខ។</b>\n\n{help_message}",
+            parse_mode="HTML",
+        )
         return
 
-    tier = args[2].lower() if len(args) > 2 and args[2].lower() in TIER_DETAILS else "coffee"
-    custom_name = " ".join(args[3:]) if len(args) > 3 else ""
+    if len(args) > 2 and args[2].lower() in TIER_DETAILS:
+        tier = args[2].lower()
+        custom_name = " ".join(args[3:]) if len(args) > 3 else ""
+    elif len(args) > 2:
+        custom_name = " ".join(args[2:])
+        tier = next((k for k, v in TIER_DETAILS.items() if abs(v.get("amount", 0.0) - amount) < 0.01), "coffee")
+    else:
+        custom_name = ""
+        tier = next((k for k, v in TIER_DETAILS.items() if abs(v.get("amount", 0.0) - amount) < 0.01), "coffee")
 
     # Attempt to auto-fetch donor's actual name from Telegram if omitted
     if not custom_name and context.bot:
@@ -495,6 +752,147 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     user_id = user.id if user else 0
     chat = update.effective_chat
     target_chat_id = chat.id if chat else user_id
+
+    # -------------------------------------------------------------------------
+    # 0. Add Donor Step-by-Step Callbacks
+    # -------------------------------------------------------------------------
+    if data == "donate_add_cancel":
+        await query.answer()
+        context.user_data.pop("adddonor_state", None)
+        context.user_data.pop("adddonor_data", None)
+        if query.message:
+            with suppress(Exception):
+                await query.message.edit_text("❌ <b>បានបោះបង់ការបន្ថែមអ្នកឧបត្ថម្ភ។</b>", parse_mode="HTML")
+        return
+
+    if data == "donate_add_start":
+        await query.answer()
+        if not is_admin_user(user_id):
+            await query.answer("⛔ សម្រាប់អ្នកគ្រប់គ្រងប៉ុណ្ណោះ។", show_alert=True)
+            return
+        context.user_data["adddonor_state"] = "wait_user_id"
+        context.user_data["adddonor_data"] = {}
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ បោះបង់", callback_data="donate_add_cancel")]])
+        if query.message:
+            await query.message.reply_text(
+                "➕ <b>បន្ថែមអ្នកឧបត្ថម្ភ (Add Donor) — ជំហានទី ១/៤</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "🆔 <b>សូមបញ្ចូល Telegram User ID របស់អ្នកឧបត្ថម្ភ៖</b>\n\n"
+                "• វាយលេខសម្គាល់ ឧទាហរណ៍៖ <code>1272791365</code>\n"
+                "• ឬ <b>Forward</b> សារពីគាត់មកកាន់ទីនេះ\n\n"
+                "<i>ផ្ញើ /cancel ដើម្បីបោះបង់</i>",
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+        return
+
+    if data.startswith("donate_add_tier:"):
+        await query.answer()
+        parts = data.split(":")
+        tier = parts[1] if len(parts) > 1 else "coffee"
+        amt = float(parts[2]) if len(parts) > 2 else 1.0
+
+        step_data = context.user_data.setdefault("adddonor_data", {})
+        step_data["tier"] = tier
+        step_data["amount"] = amt
+        context.user_data["adddonor_state"] = "wait_name"
+        if query.message:
+            await _show_adddonor_step_name(query.message, step_data, edit=True)
+        return
+
+    if data == "donate_add_custom":
+        await query.answer()
+        context.user_data["adddonor_state"] = "wait_amount"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ បោះបង់", callback_data="donate_add_cancel")]])
+        if query.message:
+            await query.message.reply_text(
+                "💵 <b>សូមវាយចំនួនទឹកប្រាក់ ($ USD) ដែលចង់កត់ត្រា៖</b>\n\n"
+                "ឧទាហរណ៍៖ <code>1.0</code>, <code>2.5</code>, <code>15.0</code>",
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+        return
+
+    if data in ("donate_add_use_auto", "donate_add_use_id"):
+        await query.answer()
+        step_data = context.user_data.setdefault("adddonor_data", {})
+        donor_uid = step_data.get("user_id", 0)
+        if data == "donate_add_use_auto":
+            step_data["custom_name"] = step_data.get("auto_name") or f"User {donor_uid}"
+        else:
+            step_data["custom_name"] = f"User {donor_uid}"
+        context.user_data["adddonor_state"] = "confirm"
+        if query.message:
+            await _show_adddonor_step_confirm(query.message, step_data, edit=True)
+        return
+
+    if data == "donate_add_confirm":
+        await query.answer()
+        if not is_admin_user(user_id):
+            await query.answer("⛔ សម្រាប់អ្នកគ្រប់គ្រងប៉ុណ្ណោះ។", show_alert=True)
+            return
+
+        step_data = context.user_data.pop("adddonor_data", {}) or {}
+        context.user_data.pop("adddonor_state", None)
+
+        donor_uid = int(step_data.get("user_id") or 0)
+        amount = float(step_data.get("amount", 1.0))
+        tier = step_data.get("tier", "coffee")
+        custom_name = step_data.get("custom_name") or f"User {donor_uid}"
+        tier_info = TIER_DETAILS.get(tier, {})
+
+        if not donor_uid:
+            if query.message:
+                with suppress(Exception):
+                    await query.message.edit_text("❌ ព័ត៌មានមិនត្រឹមត្រូវ។ សូមចាប់ផ្ដើមម្ដងទៀត /adddonor")
+            return
+
+        if query.message:
+            with suppress(Exception):
+                await query.message.edit_text("⏳ <b>កំពុងកត់ត្រា និងបង្កើតសំឡេងជូនពរ AI Voice Blessing...</b>", parse_mode="HTML")
+
+        await donation_store.record_donation(
+            user_id=donor_uid,
+            full_name=custom_name,
+            amount=amount,
+            tier=tier,
+            note=f"Added via wizard by admin {user_id}",
+            blessing_sent=True,
+        )
+
+        blessing_sent = False
+        if context.bot:
+            blessing_sent = await deliver_voice_blessing(
+                context.bot,
+                user_id=donor_uid,
+                donor_name=custom_name,
+                tier=tier,
+                amount=amount,
+            )
+
+        status_blessing = "🎙️ បានផ្ញើសារសំឡេងជូនពររួចរាល់" if blessing_sent else "⚠️ មិនអាចផ្ញើសំឡេងបានទេ (User មិនទាន់ /start)"
+
+        success_text = (
+            "🎉 <b>បានកត់ត្រាការឧបត្ថម្ភជោគជ័យ!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 <b>សប្បុរសជន:</b> {html.escape(custom_name)} (ID: <code>{donor_uid}</code>)\n"
+            f"💵 <b>ចំនួន:</b> ${amount:.2f} USD ({tier_info.get('title', tier)})\n"
+            f"✨ <b>ស្ថានភាព:</b> {status_blessing}\n"
+            f"🏆 <b>តារាងកិត្តិយស:</b> បានធ្វើបច្ចុប្បន្នភាព (/donors)"
+        )
+        success_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🏆 តារាងកិត្តិយស (/donors)", callback_data="donate_halloffame"),
+                InlineKeyboardButton("➕ បន្ថែមអ្នកថ្មី", callback_data="donate_add_start"),
+            ],
+            [
+                InlineKeyboardButton("❌ បិទ (Close)", callback_data="donate_close")
+            ]
+        ])
+        if query.message:
+            with suppress(Exception):
+                await query.message.edit_text(success_text, parse_mode="HTML", reply_markup=success_kb)
+        return
 
     # -------------------------------------------------------------------------
     # 0. Close/dismiss donation menu

@@ -64,12 +64,19 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⚙️ ការកំណត់ / Settings", callback_data="welcome_profile"),
          InlineKeyboardButton("🤖 ម៉ូដែល TTS", callback_data="show_tts_model")],
-        [InlineKeyboardButton("📢 Channel", url="https://t.me/m11mmm112"),
-         InlineKeyboardButton("☕ ឧបត្ថម្ភកាហ្វេ", callback_data="donate_menu")],
-        [InlineKeyboardButton("🏆 តារាងកិត្តិយស (/donors)", callback_data="donate_halloffame")],
-        [InlineKeyboardButton("🔙 ត្រឡប់ / Close", callback_data="welcome_back")],
+        [InlineKeyboardButton("☕ ឧបត្ថម្ភកាហ្វេ", callback_data="donate_menu"),
+         InlineKeyboardButton("🏆 តារាងកិត្តិយស", callback_data="donate_halloffame")],
+        [InlineKeyboardButton("📢 Channel ព័ត៌មាន", url="https://t.me/m11mmm112")],
+        [InlineKeyboardButton("🏠 ម៉ឺនុយដើម", callback_data="welcome_menu"),
+         InlineKeyboardButton("❌ បិទ (Close)", callback_data="welcome_back")],
     ])
-    await safe_send(lambda: msg.reply_text(help_text, parse_mode="HTML", reply_markup=kb))
+
+    if getattr(update, "callback_query", None) and hasattr(msg, "edit_text"):
+        with suppress(Exception):
+            await msg.edit_text(help_text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+            return
+
+    await safe_send(lambda: msg.reply_text(help_text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True))
 
 
 @legacy_bound_handler
@@ -371,7 +378,7 @@ async def cmd_narrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @legacy_bound_handler
-async def send_user_profile(message, user_id: int, user: Any = None):
+async def send_user_profile(message, user_id: int, user: Any = None, *, edit: bool = False):
     prefs = await get_user_prefs_async(user_id)
     
     # Extract user display name & username
@@ -402,15 +409,25 @@ async def send_user_profile(message, user_id: int, user: Any = None):
         f"💡 <i>ចុចប៊ូតុងខាងក្រោមដើម្បីកែប្រែការកំណត់បានភ្លាមៗ៖</i>"
     )
 
+    markup = get_main_kb(
+        prefs.get("gender", "female"),
+        prefs.get("tts_model", "auto"),
+        speed=prefs.get("speed", 1.0),
+        include_back=True,
+    )
+
+    if edit and message:
+        if getattr(message, "photo", None) and hasattr(message, "edit_caption"):
+            with suppress(Exception):
+                return await message.edit_caption(caption=text, parse_mode="HTML", reply_markup=markup)
+        elif hasattr(message, "edit_text"):
+            with suppress(Exception):
+                return await message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+
     await safe_send(lambda: message.reply_text(
         text,
         parse_mode="HTML",
-        reply_markup=get_main_kb(
-            prefs.get("gender", "female"),
-            prefs.get("tts_model", "auto"),
-            speed=prefs.get("speed", 1.0),
-            include_back=True,
-        ),
+        reply_markup=markup,
     ))
 
 
@@ -766,7 +783,7 @@ async def cmd_dbstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @legacy_bound_handler
 async def cmd_dbbackup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin on-demand database backup trigger."""
+    """Admin on-demand database backup trigger. Supports format args: /dbbackup [sql|csv|cli|all]."""
     user = update.effective_user
     msg = update.effective_message
     if not user or not msg:
@@ -778,7 +795,56 @@ async def cmd_dbbackup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     import asyncio
     from app import legacy
-    asyncio.create_task(legacy._admin_trigger_backup(msg, user.id))
+
+    arg = ""
+    with suppress(Exception):
+        arg = str((context.args or [""])[0]).strip().lower()
+
+    if arg in ("sql", "dump"):
+        asyncio.create_task(legacy._admin_send_db_export(msg, int(user.id), "sql", context))
+    elif arg in ("csv", "zip"):
+        asyncio.create_task(legacy._admin_send_db_export(msg, int(user.id), "csv", context))
+    elif arg in ("cli", "script", "bat"):
+        asyncio.create_task(legacy._admin_send_db_export(msg, int(user.id), "cli", context))
+    else:
+        asyncio.create_task(legacy._admin_trigger_backup(msg, int(user.id)))
+
+
+@legacy_bound_handler
+async def cmd_migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only Supabase online database migration command."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+
+    if not _is_admin(int(user.id)):
+        await safe_send(lambda: msg.reply_text("⛔ <b>សិទ្ធិត្រូវបានបដិសេធ (Admin only)</b>", parse_mode="HTML"))
+        return
+
+    args = context.args or []
+    target_url = ""
+    target_key = ""
+    dry_run = False
+
+    for a in args:
+        val = str(a).strip()
+        if val.lower() in ("--dry-run", "dryrun", "-d"):
+            dry_run = True
+        elif val.startswith("http://") or val.startswith("https://"):
+            target_url = val
+        elif len(val) > 20 and not val.startswith("-"):
+            target_key = val
+
+    from app import legacy
+    await legacy._admin_handle_db_migration(
+        msg,
+        int(user.id),
+        context,
+        target_url=target_url,
+        target_key=target_key,
+        dry_run=dry_run,
+    )
 
 
 @legacy_bound_handler
@@ -862,6 +928,17 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if arg in {"backup", "dbbackup"}:
         await cmd_dbbackup(update, context)
+        return
+    if arg in {"migrate", "migration"}:
+        if context.args:
+            context.args = context.args[1:]
+        await cmd_migrate(update, context)
+        return
+    if arg in {"adddonor", "add_donor"}:
+        from app.services.donation.handlers import cmd_adddonor
+        if context.args:
+            context.args = context.args[1:]
+        await cmd_adddonor(update, context)
         return
     if arg in {"api", "apikeys"}:
         await cmd_api(update, context)
@@ -1223,6 +1300,7 @@ __all__ = [
     'cmd_endchat',
     'cmd_feature_request',
     'cmd_health',
+    'cmd_migrate',
     'cmd_myprefs',
     'cmd_narrate',
     'cmd_privacy',

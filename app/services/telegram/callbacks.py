@@ -796,10 +796,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action == "welcome_profile":
             from app.services.telegram.commands import send_user_profile
             user = update.effective_user or getattr(query, "from_user", None)
-            await send_user_profile(query.message, user_id, user=user)
-        elif action == "welcome_back":
-            with suppress(Exception):
-                await query.message.delete()
+            await send_user_profile(query.message, user_id, user=user, edit=True)
+        elif action in ("welcome_back", "welcome_menu"):
+            if action == "welcome_menu" or _is_profile_message(query.message):
+                settings, _ = await get_bot_settings_async()
+                w_text = _setting_raw_from(settings, "welcome_message", WELCOME_TEXT) or WELCOME_TEXT
+                if query.message.photo:
+                    with suppress(Exception):
+                        await query.message.edit_caption(caption=w_text, parse_mode="HTML", reply_markup=get_welcome_kb())
+                else:
+                    with suppress(Exception):
+                        await query.message.edit_text(w_text, parse_mode="HTML", reply_markup=get_welcome_kb(), disable_web_page_preview=True)
+            else:
+                with suppress(Exception):
+                    await query.message.delete()
         elif action == "help":
             from app.services.telegram.commands import on_help
             await on_help(update, context)
@@ -829,6 +839,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.delete()
         elif action == "doc_read":
             await _cb_doc_read(query, user_id, context, data)
+        elif action == "doc_trans":
+            await _cb_doc_trans(query, user_id, context, data)
         elif action == "audio_tts":
             await _cb_audio_tts(query, user_id, context, data)
         elif action == "needs_admin":

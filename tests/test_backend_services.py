@@ -82,7 +82,9 @@ class TelegramFlowTests(unittest.TestCase):
         self.assertEqual("show_speed", classify_callback("show_speed"))
         self.assertEqual("gender", classify_callback("tg_female"))
         self.assertEqual("welcome_profile", classify_callback("welcome_profile"))
+        self.assertEqual("help", classify_callback("help"))
         self.assertEqual("help", classify_callback("btn_help"))
+        self.assertEqual("system_status", classify_callback("system_status"))
         self.assertEqual("system_status", classify_callback("btn_system_status"))
         self.assertEqual("admin", classify_callback("noop"))
 

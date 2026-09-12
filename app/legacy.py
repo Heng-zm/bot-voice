@@ -16207,10 +16207,14 @@ def get_admin_compact_kb() -> InlineKeyboardMarkup:
 
 
 def get_admin_db_kb() -> InlineKeyboardMarkup:
-    """Sub-panel navigation keyboard for Database Metrics & Backup."""
+    """Sub-panel navigation keyboard for Database Metrics, Export (.SQL, .CSV, .CLI), & Migration."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 ពិនិត្យឡើងវិញ (Refresh)", callback_data="admin_db_refresh"),
          InlineKeyboardButton("📦 បង្កើត Backup ឥឡូវ", callback_data="admin_db_backup")],
+        [InlineKeyboardButton("📥 .SQL Dump", callback_data="admin_db_export_sql"),
+         InlineKeyboardButton("📊 .CSV (Zip)", callback_data="admin_db_export_csv")],
+        [InlineKeyboardButton("💻 .CLI Script", callback_data="admin_db_export_cli"),
+         InlineKeyboardButton("🚀 ផ្លាស់ប្តូរ DB", callback_data="admin_db_migrate")],
         [InlineKeyboardButton("⬅️ Admin Home", callback_data="admin_home"),
          InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
@@ -20086,7 +20090,10 @@ def get_main_kb(
          InlineKeyboardButton(tts_btn, callback_data="show_tts_model")],
     ]
     if include_back:
-        rows.append([InlineKeyboardButton(back_label, callback_data="welcome_back")])
+        rows.append([
+            InlineKeyboardButton("🏠 ម៉ឺនុយដើម", callback_data="welcome_menu"),
+            InlineKeyboardButton(back_label, callback_data="welcome_back"),
+        ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -20149,15 +20156,16 @@ def get_audio_file_kb(msg_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
-def get_ocr_confirm_kb(msg_id: int) -> InlineKeyboardMarkup:
+def get_ocr_confirm_kb(msg_id: int, *, is_khmer: bool = True) -> InlineKeyboardMarkup:
     from app.services.telegram.buttons import get_button_label
 
     read_label = get_button_label("btn_ocr_read", "▶️ អាន")
     del_label = get_button_label("btn_delete", "🗑️ លុប")
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(read_label, callback_data=f"doc_read:{msg_id}"),
-        InlineKeyboardButton(del_label,  callback_data=f"doc_del:{msg_id}"),
-    ]])
+    row = [InlineKeyboardButton(read_label, callback_data=f"doc_read:{msg_id}")]
+    if not is_khmer:
+        row.append(InlineKeyboardButton("🌐 បកប្រែជាខ្មែរ", callback_data=f"doc_trans:{msg_id}"))
+    row.append(InlineKeyboardButton(del_label, callback_data=f"doc_del:{msg_id}"))
+    return InlineKeyboardMarkup([row])
 
 
 
@@ -23959,6 +23967,7 @@ async def _admin_trigger_backup(target_msg: Any, user_id: int) -> None:
     """Asynchronously triggers database backup and streams throttled live progress."""
     import html
     import time
+    from pathlib import Path
     from backup_data import perform_backup
 
     sb_url = os.environ.get("SUPABASE_URL", "")
@@ -24019,8 +24028,11 @@ async def _admin_trigger_backup(target_msg: Any, user_id: int) -> None:
             "💡 <i>ឯកសារត្រូវបានរក្សាទុកជា JSON និង CSV រួចរាល់។</i>"
         )
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗄️ មើល DB Status", callback_data="admin_db"),
-             InlineKeyboardButton("❌ បិទ", callback_data="admin_close")]
+            [InlineKeyboardButton("📥 ទាញយក .SQL", callback_data="admin_db_export_sql"),
+             InlineKeyboardButton("📊 ទាញយក .CSV", callback_data="admin_db_export_csv")],
+            [InlineKeyboardButton("💻 ទាញយក .CLI", callback_data="admin_db_export_cli"),
+             InlineKeyboardButton("🗄️ មើល DB Status", callback_data="admin_db")],
+            [InlineKeyboardButton("❌ បិទ", callback_data="admin_close")]
         ])
         if status_msg:
             await safe_send(lambda: status_msg.edit_text(success_text, parse_mode="HTML", reply_markup=kb))
@@ -24032,6 +24044,365 @@ async def _admin_trigger_backup(target_msg: Any, user_id: int) -> None:
             await safe_send(lambda: status_msg.edit_text(err_text, parse_mode="HTML"))
         else:
             await safe_send(lambda: target_msg.reply_text(err_text, parse_mode="HTML"))
+
+
+async def _admin_send_db_export(
+    target_msg: Any,
+    user_id: int,
+    export_type: str,
+    context: Any = None,
+) -> None:
+    """Exports and sends .SQL, .CSV (ZIP), or .CLI script directly to Telegram admin."""
+    import html
+    from datetime import datetime, UTC
+    from pathlib import Path
+    import backup_data
+
+    sb_url = os.environ.get("SUPABASE_URL", "")
+    sb_key = (
+        os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        or os.environ.get("SUPABASE_KEY")
+        or ""
+    )
+
+    if not sb_url or not sb_key:
+        await safe_send(lambda: target_msg.reply_text(
+            "❌ <b>បរាជ័យ:</b> មិនមាន <code>SUPABASE_URL</code> ឬ <code>SUPABASE_SERVICE_ROLE_KEY</code> ក្នុង <code>.env</code> ឡើយ។",
+            parse_mode="HTML",
+        ))
+        return
+
+    exp = export_type.lower().strip()
+    type_labels = {
+        "sql": (".SQL Dump", "📝"),
+        "csv": (".CSV ZIP Bundle", "📊"),
+        "cli": (".CLI Migration Script", "💻"),
+    }
+    label, icon = type_labels.get(exp, ("Export", "📦"))
+
+    status_msg = await safe_send(lambda: target_msg.reply_text(
+        f"⏳ <b>កំពុងបង្កើតឯកសារ {icon} {label}...</b>\n\nសូមរង់ចាំបន្តិច...",
+        parse_mode="HTML",
+    ))
+
+    loop = asyncio.get_running_loop()
+    root_dir = Path(__file__).resolve().parent.parent if "app" in Path(__file__).resolve().parts else Path(__file__).resolve().parent
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    export_dir = root_dir / "backups" / "exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        file_to_send: Path | None = None
+        caption: str = ""
+
+        if exp == "sql":
+            sql_path = export_dir / f"supabase_dump_{timestamp}.sql"
+            total_records, _ = await loop.run_in_executor(
+                _DB_EXECUTOR,
+                lambda: backup_data.export_sql_dump(sb_url, sb_key, sql_path, verbose=False),
+            )
+            file_to_send = sql_path
+            caption = (
+                f"📥 <b>Supabase PostgreSQL Database Dump (.SQL)</b>\n\n"
+                f"• កំណត់ត្រាសរុប: <b>{total_records:,}</b> rows\n"
+                f"• កាលបរិច្ឆេទ: <code>{timestamp}</code>\n"
+                f"• សុវត្ថិភាព: Idempotent (ON CONFLICT DO UPDATE)\n\n"
+                f"💡 <i>អាច Run ក្នុង Supabase Dashboard ➔ SQL Editor ឬ psql ដោយសុវត្ថិភាព។</i>"
+            )
+
+        elif exp == "csv":
+            temp_backup_dir = export_dir / f"csv_tmp_{timestamp}"
+            res = await loop.run_in_executor(
+                _DB_EXECUTOR,
+                lambda: backup_data.perform_backup(
+                    sb_url,
+                    sb_key,
+                    output_dir=temp_backup_dir,
+                    export_csv_zip=True,
+                    verbose=False,
+                ),
+            )
+            zip_path = Path(res.get("zip_path") or (temp_backup_dir / f"{temp_backup_dir.name}_csv.zip"))
+            final_zip = export_dir / f"supabase_csv_{timestamp}.zip"
+            if zip_path.is_file():
+                zip_path.rename(final_zip)
+            file_to_send = final_zip
+            total = res.get("total_records", 0)
+            caption = (
+                f"📊 <b>Supabase Table Archives (.CSV ZIP)</b>\n\n"
+                f"• កំណត់ត្រាសរុប: <b>{total:,}</b> rows\n"
+                f"• តារាង: {len(backup_data.TABLES)} tables\n"
+                f"• កាលបរិច្ឆេទ: <code>{timestamp}</code>\n\n"
+                f"💡 <i>រួមបញ្ចូលគ្រប់តារាងទាំងអស់ក្នុងទម្រង់ UTF-8 CSV។</i>"
+            )
+
+        elif exp == "cli":
+            cli_path = export_dir / f"migrate_script_{timestamp}.bat"
+            await loop.run_in_executor(
+                _DB_EXECUTOR,
+                lambda: backup_data.generate_cli_script(
+                    cli_path,
+                    source_url=sb_url,
+                    source_key=sb_key,
+                ),
+            )
+            file_to_send = cli_path
+            caption = (
+                f"💻 <b>Supabase Automated Migration Script (.CLI / .BAT)</b>\n\n"
+                f"• Source DB: <code>{sb_url}</code>\n"
+                f"• ប្រព័ន្ធ: Windows & Cross-platform CLI\n\n"
+                f"💡 <i>ដំណើរការ script នេះក្នុង Terminal ដើម្បី Migration ដោយស្វ័យប្រវត្តិជាមួយ Concurrent Waves & Adaptive Batching!</i>"
+            )
+
+        if file_to_send and file_to_send.is_file():
+            bot = getattr(context, "bot", None) or getattr(target_msg, "bot", None)
+            chat_id = target_msg.chat_id if hasattr(target_msg, "chat_id") else user_id
+            if bot:
+                with file_to_send.open("rb") as f:
+                    await bot.send_document(
+                        chat_id=chat_id,
+                        document=f,
+                        filename=file_to_send.name,
+                        caption=caption,
+                        parse_mode="HTML",
+                    )
+            if status_msg:
+                await safe_send(lambda: status_msg.edit_text(
+                    f"✅ <b>បានផ្ញើឯកសារ {icon} {label} រួចរាល់!</b>",
+                    parse_mode="HTML",
+                    reply_markup=get_admin_db_kb(),
+                ))
+        else:
+            raise FileNotFoundError(f"Failed to produce {label} file.")
+
+    except Exception as exc:
+        err_msg = f"❌ <b>បរាជ័យក្នុងការ Export {label}:</b> <code>{html.escape(str(exc))}</code>"
+        if status_msg:
+            await safe_send(lambda: status_msg.edit_text(err_msg, parse_mode="HTML", reply_markup=get_admin_db_kb()))
+        else:
+            await safe_send(lambda: target_msg.reply_text(err_msg, parse_mode="HTML", reply_markup=get_admin_db_kb()))
+
+
+async def _admin_handle_db_migration(
+    target_msg: Any,
+    user_id: int,
+    context: Any = None,
+    target_url: str = "",
+    target_key: str = "",
+    dry_run: bool = False,
+) -> None:
+    """Executes online migration with live progress streaming to Telegram."""
+    import html
+    import time
+    from pathlib import Path
+    import migrate_data
+
+    sb_url = os.environ.get("SUPABASE_URL", "")
+    sb_key = (
+        os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        or os.environ.get("SUPABASE_KEY")
+        or ""
+    )
+
+    if not sb_url or not sb_key:
+        await safe_send(lambda: target_msg.reply_text(
+            "❌ <b>បរាជ័យ:</b> មិនមាន Source <code>SUPABASE_URL</code> ឬ <code>SUPABASE_KEY</code> ក្នុង <code>.env</code> ឡើយ។",
+            parse_mode="HTML",
+        ))
+        return
+
+    # If target credentials not provided, show guided help message with buttons
+    if not target_url or not target_key:
+        guide_text = (
+            "🚀 <b>ប្រព័ន្ធផ្លាស់ប្តូរទិន្នន័យ Supabase (Database Migration)</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "ប្រព័ន្ធនេះអាចផ្ទេរទិន្នន័យពី Source DB ទៅកាន់ Target DB ថ្មីដោយផ្ទាល់ គ្មានការរំខាន (Zero Downtime)!\n\n"
+            "<b>របៀបប្រើប្រាស់តាម Command:</b>\n"
+            "<code>/migrate &lt;TARGET_URL&gt; &lt;TARGET_SERVICE_ROLE_KEY&gt; [--dry-run]</code>\n\n"
+            "<b>ឧទាហរណ៍៖</b>\n"
+            "<code>/migrate https://newproject.supabase.co eyJhbGci...</code>\n\n"
+            "💡 <i>អ្នកក៏អាចទាញយក <b>.CLI Script</b> ទៅដំណើរការលើ Terminal កុំព្យូទ័របានផងដែរ។</i>"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💻 ទាញយក .CLI Script", callback_data="admin_db_export_cli"),
+             InlineKeyboardButton("📥 ទាញយក .SQL Dump", callback_data="admin_db_export_sql")],
+            [InlineKeyboardButton("⬅️ ត្រឡប់", callback_data="admin_db"),
+             InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
+        ])
+        await safe_send(lambda: target_msg.reply_text(guide_text, parse_mode="HTML", reply_markup=kb))
+        return
+
+    mode_label = "DRY RUN (សាកល្បង)" if dry_run else "LIVE MIGRATION"
+    status_msg = await safe_send(lambda: target_msg.reply_text(
+        f"🚀 <b>កំពុងចាប់ផ្តើម Migration ({mode_label})...</b>\n\n"
+        f"• Source: <code>{sb_url}</code>\n"
+        f"• Target: <code>{target_url}</code>\n\n"
+        f"<i>កំពុងតភ្ជាប់ និងរៀបចំ Topological Dependency Waves...</i>",
+        parse_mode="HTML",
+    ))
+
+    loop = asyncio.get_running_loop()
+    last_edit = 0.0
+    current_wave = 1
+    total_waves = 2
+    migrated_counter = 0
+
+    def on_progress(info: dict[str, Any]) -> None:
+        nonlocal last_edit, current_wave, total_waves, migrated_counter
+        now = time.monotonic()
+        stage = info.get("stage")
+
+        if stage == "wave_start":
+            current_wave = info.get("wave", 1)
+            total_waves = info.get("total_waves", 2)
+        elif stage == "table_done":
+            migrated_counter += info.get("migrated", 0)
+
+        if (now - last_edit) >= 1.2 and status_msg:
+            last_edit = now
+            tbl = info.get("table", "Processing...")
+            mig = info.get("migrated", 0)
+            txt = (
+                f"🚀 <b>កំពុងដំណើរការ Migration ({mode_label})</b>\n\n"
+                f"🌊 Wave: <b>{current_wave}/{total_waves}</b>\n"
+                f"📋 តារាងបច្ចុប្បន្ន: <code>{tbl}</code> (+{mig:,})\n"
+                f"📦 ទិន្នន័យ Upserted សរុប: <b>{migrated_counter:,}</b> rows\n\n"
+                f"<i>ដំណើរការដោយសុវត្ថិភាពជាមួយ Adaptive Batching & Checkpoints...</i>"
+            )
+            asyncio.run_coroutine_threadsafe(
+                safe_send(lambda: status_msg.edit_text(txt, parse_mode="HTML")),
+                loop,
+            )
+
+    try:
+        summary = await loop.run_in_executor(
+            _DB_EXECUTOR,
+            lambda: migrate_data.run_migration(
+                source_url=sb_url,
+                source_key=sb_key,
+                target_url=target_url,
+                target_key=target_key,
+                concurrency=4,
+                dry_run=dry_run,
+                verify=True,
+                progress_callback=on_progress,
+            ),
+        )
+
+        total_m = getattr(summary, "total_migrated", migrated_counter)
+        success = bool(summary == 0)
+
+        if success:
+            res_text = (
+                f"🎉 <b>Migration ទទួលបានជោគជ័យ!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"• របៀប: <b>{mode_label}</b>\n"
+                f"• Target DB: <code>{target_url}</code>\n"
+                f"• ទិន្នន័យ Upserted: <b>{total_m:,}</b> records\n"
+                f"• ការផ្ទៀងផ្ទាត់: ✅ Row counts reconciled\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"💡 <i>ទិន្នន័យត្រូវបានផ្ទេរដោយសុវត្ថិភាព និងរួចរាល់សម្រាប់ការប្រើប្រាស់។</i>"
+            )
+        else:
+            res_text = "❌ <b>Migration បរាជ័យ</b> សូមពិនិត្យ URL ឬ Service Role Key របស់ Target DB។"
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗄️ មើល DB Status", callback_data="admin_db"),
+             InlineKeyboardButton("❌ បិទ", callback_data="admin_close")]
+        ])
+        if status_msg:
+            await safe_send(lambda: status_msg.edit_text(res_text, parse_mode="HTML", reply_markup=kb))
+        else:
+            await safe_send(lambda: target_msg.reply_text(res_text, parse_mode="HTML", reply_markup=kb))
+
+    except Exception as exc:
+        err_msg = f"❌ <b>បរាជ័យក្នុងការ Migration:</b> <code>{html.escape(str(exc))}</code>"
+        if status_msg:
+            await safe_send(lambda: status_msg.edit_text(err_msg, parse_mode="HTML", reply_markup=get_admin_db_kb()))
+        else:
+            await safe_send(lambda: target_msg.reply_text(err_msg, parse_mode="HTML", reply_markup=get_admin_db_kb()))
+
+
+async def _admin_restore_file_action(
+    target_msg: Any,
+    user_id: int,
+    filename: str,
+    context: Any = None,
+) -> None:
+    """Restores database from an uploaded file (.sql, .csv, .zip)."""
+    import html
+    from pathlib import Path
+    import restore_data
+
+    sb_url = os.environ.get("SUPABASE_URL", "")
+    sb_key = (
+        os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        or os.environ.get("SUPABASE_KEY")
+        or ""
+    )
+    if not sb_url or not sb_key:
+        await safe_send(lambda: target_msg.reply_text(
+            "❌ <b>បរាជ័យ:</b> មិនមាន <code>SUPABASE_URL</code> ឬ <code>SUPABASE_KEY</code> ក្នុង <code>.env</code> ឡើយ។",
+            parse_mode="HTML",
+        ))
+        return
+
+    root_dir = Path(__file__).resolve().parent.parent if "app" in Path(__file__).resolve().parts else Path(__file__).resolve().parent
+    file_path = root_dir / "backups" / "imports" / filename
+    if not file_path.is_file():
+        await safe_send(lambda: target_msg.reply_text(
+            f"❌ រកមិនឃើញឯកសារ <code>{html.escape(filename)}</code> ឡើយ។",
+            parse_mode="HTML",
+        ))
+        return
+
+    status_msg = await safe_send(lambda: target_msg.reply_text(
+        f"⏳ <b>កំពុងនាំចូលទិន្នន័យពី <code>{html.escape(filename)}</code>...</b>\n\nសូមរង់ចាំបន្តិច...",
+        parse_mode="HTML",
+    ))
+
+    loop = asyncio.get_running_loop()
+    try:
+        if file_path.suffix.lower() == ".sql":
+            res_text = (
+                f"ℹ️ <b>ឯកសារ SQL Dump: <code>{html.escape(filename)}</code></b>\n\n"
+                f"💡 សម្រាប់ឯកសារ PostgreSQL <code>.sql</code> សូមបើក Supabase Dashboard ➔ <b>SQL Editor</b> រួច Copy & Paste មាតិកាឯកសារនេះដើម្បី Execute ដោយសុវត្ថិភាព និងលឿនបំផុត។"
+            )
+        else:
+            res = await loop.run_in_executor(
+                _DB_EXECUTOR,
+                lambda: restore_data.restore_from_file_or_dir(
+                    target_url=sb_url,
+                    target_key=sb_key,
+                    path=file_path,
+                ),
+            )
+            total = res.get("total_rows", 0)
+            restored = res.get("restored_rows", 0)
+            res_text = (
+                f"🎉 <b>បាននាំចូលទិន្នន័យ (Restore) ជោគជ័យ!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📁 <b>ឯកសារ:</b> <code>{html.escape(filename)}</code>\n"
+                f"📦 <b>ទិន្នន័យ:</b> <b>{restored:,} / {total:,}</b> កំណត់ត្រា\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"💡 <i>ទិន្នន័យត្រូវបានបញ្ចូលទៅក្នុង Supabase រួចរាល់។</i>"
+            )
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗄️ មើល DB Status", callback_data="admin_db"),
+             InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
+        ])
+        if status_msg:
+            await safe_send(lambda: status_msg.edit_text(res_text, parse_mode="HTML", reply_markup=kb))
+        else:
+            await safe_send(lambda: target_msg.reply_text(res_text, parse_mode="HTML", reply_markup=kb))
+
+    except Exception as exc:
+        err_msg = f"❌ <b>បរាជ័យក្នុងការ Restore:</b> <code>{html.escape(str(exc))}</code>"
+        if status_msg:
+            await safe_send(lambda: status_msg.edit_text(err_msg, parse_mode="HTML", reply_markup=get_admin_db_kb()))
+        else:
+            await safe_send(lambda: target_msg.reply_text(err_msg, parse_mode="HTML", reply_markup=get_admin_db_kb()))
 
 
 async def _admin_health_text() -> str:
@@ -25435,6 +25806,37 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         await _admin_trigger_backup(query.message, user_id)
         return
 
+    if data == "admin_db_export_sql":
+        with suppress(Exception):
+            await query.answer("⏳ កំពុងបង្កើត .SQL Dump...")
+        await _admin_send_db_export(query.message, user_id, "sql", context)
+        return
+
+    if data == "admin_db_export_csv":
+        with suppress(Exception):
+            await query.answer("⏳ កំពុងបង្កើត .CSV Bundle...")
+        await _admin_send_db_export(query.message, user_id, "csv", context)
+        return
+
+    if data == "admin_db_export_cli":
+        with suppress(Exception):
+            await query.answer("⏳ កំពុងបង្កើត .CLI Script...")
+        await _admin_send_db_export(query.message, user_id, "cli", context)
+        return
+
+    if data == "admin_db_migrate":
+        with suppress(Exception):
+            await query.answer()
+        await _admin_handle_db_migration(query.message, user_id, context)
+        return
+
+    if data.startswith("admin_db_restore_file:"):
+        filename = data.split(":", 1)[1].strip()
+        with suppress(Exception):
+            await query.answer("⏳ កំពុងនាំចូលទិន្នន័យ...")
+        await _admin_restore_file_action(query.message, user_id, filename, context)
+        return
+
     if data == "admin_web_key":
         await _admin_generate_web_key(query, user_id, context)
         return
@@ -25975,6 +26377,32 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = msg.document
     filename = document.file_name or ""
     is_pdf = bool(filename and filename.lower().endswith(".pdf")) or (document.mime_type == "application/pdf")
+    is_db_file = bool(filename and filename.lower().endswith((".sql", ".csv", ".zip"))) and _is_admin(user_id)
+
+    if is_db_file:
+        file_size_kb = (document.file_size or 0) // 1024
+        import html
+        from pathlib import Path
+        root_dir = Path(__file__).resolve().parent.parent if "app" in Path(__file__).resolve().parts else Path(__file__).resolve().parent
+        imports_dir = root_dir / "backups" / "imports"
+        imports_dir.mkdir(parents=True, exist_ok=True)
+        saved_file = imports_dir / filename
+
+        tg_file = await context.bot.get_file(document.file_id)
+        await tg_file.download_to_drive(str(saved_file))
+
+        prompt_text = (
+            f"📥 <b>រកឃើញឯកសារទិន្នន័យ Database:</b> <code>{html.escape(filename)}</code>\n"
+            f"📦 <b>ទំហំ:</b> {file_size_kb} KB\n\n"
+            f"តើអ្នកចង់នាំចូល (Restore / Import) ឯកសារនេះទៅក្នុង Supabase Database ដែរឬទេ?\n"
+            f"⚠️ <i>ទិន្នន័យនឹងត្រូវបញ្ចូលដោយស្វ័យប្រវត្តិ (Upsert: Merge Duplicates)។</i>"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📥 នាំចូលទិន្នន័យ (Restore)", callback_data=f"admin_db_restore_file:{saved_file.name}")],
+            [InlineKeyboardButton("❌ បោះបង់", callback_data="admin_close")],
+        ])
+        await safe_send(lambda: msg.reply_text(prompt_text, parse_mode="HTML", reply_markup=kb))
+        return
 
     if not _is_subtitle_file(filename) and not is_pdf:
         await safe_send(lambda: msg.reply_text(
@@ -26145,6 +26573,82 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
         await progress.fail(_tts_user_error_message(exc))
     finally:
         _release_tts_request(user_id)
+
+
+async def _cb_doc_trans(query, user_id: int, context, data: str):
+    """Translate cached document/OCR text into Khmer and offer immediate playback."""
+    try:
+        src_msg_id = int(data.split(":")[1])
+    except Exception:
+        await safe_send(lambda: query.message.reply_text("❌ លេខសម្គាល់ឯកសារមិនត្រឹមត្រូវ។"))
+        return
+    if query.message is None:
+        return
+    with suppress(Exception):
+        await query.answer("🌐 កំពុងបកប្រែជាភាសាខ្មែរ...")
+
+    chat_id = int(query.message.chat.id)
+    full_text = await get_text_cache_async(src_msg_id, chat_id)
+    if not full_text:
+        full_text = get_last_tts_text(user_id) or ""
+    if not full_text:
+        await safe_send(lambda: query.message.reply_text("❌ រកអត្ថបទមិនឃើញ។ សូមផ្ញើរូបភាព ឬឯកសារម្តងទៀត។"))
+        return
+
+    gemini_client = globals().get("_gemini") or getattr(sys.modules.get("app.legacy"), "_gemini", None)
+    if gemini_client is None:
+        await safe_send(lambda: query.message.reply_text("❌ សេវា AI បកប្រែមិនទាន់បានបើកដំណើរការទេ។"))
+        return
+
+    try:
+        from app.services.ai.gemini import (
+            extract_gemini_text,
+            generate_content_with_fallback,
+        )
+        loop = asyncio.get_running_loop()
+        preferred = globals().get("GEMINI_MODEL", "gemini-2.5-flash")
+        prompt = (
+            "Translate the following text accurately and fluently into Khmer. "
+            "Return ONLY the Khmer translation without any introductory or concluding comments:\n\n"
+            + full_text[:3500]
+        )
+        def _call_ai():
+            return generate_content_with_fallback(
+                gemini_client,
+                contents=prompt,
+                preferred_model=preferred,
+            )
+        resp = await loop.run_in_executor(None, _call_ai)
+        khmer_text = (extract_gemini_text(resp) or "").strip()
+        if not khmer_text:
+            await safe_send(lambda: query.message.reply_text("⚠️ មិនអាចបកប្រែបានទេ (គ្មានលទ្ធផលពី AI)។"))
+            return
+
+        reply_body = (
+            "🌐 <b>អត្ថបទបកប្រែជាភាសាខ្មែរ:</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{html.escape(khmer_text[:3500])}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>ចុច ▶️ អានសំឡេងខ្មែរ ដើម្បីស្តាប់ជាសំឡេង៖</i>"
+        )
+        sent_msg = await safe_send(lambda: query.message.reply_text(
+            reply_body,
+            parse_mode="HTML",
+        ))
+        if sent_msg is not None:
+            new_id = sent_msg.message_id
+            uname = query.from_user.username or query.from_user.first_name or str(user_id)
+            save_text_cache(new_id, khmer_text, chat_id=chat_id, user_id=user_id, username=uname)
+            trans_kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("▶️ អានសំឡេងខ្មែរ", callback_data=f"doc_read:{new_id}"),
+                    InlineKeyboardButton("🗑️ លុប", callback_data=f"doc_del:{new_id}"),
+                ]
+            ])
+            await safe_send(lambda: sent_msg.edit_reply_markup(reply_markup=trans_kb))
+    except Exception as exc:
+        logger.error("_cb_doc_trans error: %s", exc, exc_info=True)
+        await safe_send(lambda: query.message.reply_text(f"❌ បរាជ័យក្នុងការបកប្រែ: {exc}"))
 
 
 async def _fire_scheduled_broadcast(bot, row: dict, already_claimed: bool = False) -> None:
@@ -26878,6 +27382,8 @@ async def _clear_admin_transient_state(context: Any, admin_id: int) -> list[str]
     _pop_state("user_search_state", "user-search")
     _pop_state("users_search_query", "user-search")
     _pop_state("users_search_results", "user-search")
+    _pop_state("adddonor_state", "adddonor")
+    _pop_state("adddonor_data", "adddonor")
     prefix = f"admin:{int(admin_id)}:"
     for state_key in list(user_data.keys()):
         if str(state_key).startswith(prefix):

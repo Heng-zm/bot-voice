@@ -23,7 +23,7 @@ from pathlib import Path
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -269,6 +269,33 @@ def migrate_single_table(
     }
 
 
+class MigrationSummary(int):
+    """Integer return code (0=success, 1=failure) with rich migration statistics."""
+    success: bool
+    total_migrated: int
+    total_source: int
+    results: list[dict[str, Any]]
+    waves: int
+
+    def __new__(
+        cls,
+        code: int,
+        *,
+        success: bool = True,
+        total_migrated: int = 0,
+        total_source: int = 0,
+        results: list[dict[str, Any]] | None = None,
+        waves: int = 0,
+    ):
+        obj = super().__new__(cls, code)
+        obj.success = success
+        obj.total_migrated = total_migrated
+        obj.total_source = total_source
+        obj.results = results or []
+        obj.waves = waves
+        return obj
+
+
 def run_migration(
     source_url: str,
     source_key: str,
@@ -285,7 +312,8 @@ def run_migration(
     tables_filter: list[str] | None = None,
     days: int | None = None,
     timeout: int = 30,
-) -> int:
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> MigrationSummary:
     """Concurrent, resumable migration engine."""
     source_url = source_url.rstrip("/")
     target_url = target_url.rstrip("/")
@@ -313,12 +341,22 @@ def run_migration(
 
     print("\n🔍 Verifying database connectivity...")
     if not test_connection(source_url, source_key, "Source DB"):
-        return 1
+        if progress_callback:
+            try:
+                progress_callback({"stage": "error", "message": "Failed to connect to Source DB"})
+            except Exception:
+                pass
+        return MigrationSummary(1, success=False, total_migrated=0, total_source=0, results=[])
     print("  ✅ Source DB connected successfully")
 
     if not dry_run:
         if not test_connection(target_url, target_key, "Target DB"):
-            return 1
+            if progress_callback:
+                try:
+                    progress_callback({"stage": "error", "message": "Failed to connect to Target DB"})
+                except Exception:
+                    pass
+            return MigrationSummary(1, success=False, total_migrated=0, total_source=0, results=[])
         print("  ✅ Target DB connected successfully")
     else:
         print("  ℹ️ Skipping target write validation (dry-run mode)")
@@ -335,7 +373,7 @@ def run_migration(
         active_graph = {k: v for k, v in active_graph.items() if k.lower() in valid}
         if not active_graph:
             print(f"❌ Error: No matching tables in filter: {tables_filter}")
-            return 1
+            return MigrationSummary(1, success=False, total_migrated=0, total_source=0, results=[])
 
     # Dynamically compute execution waves
     waves = get_dependency_waves(active_graph)
@@ -349,6 +387,17 @@ def run_migration(
     # Execute wave by wave
     for wave_idx, wave in enumerate(waves, 1):
         print(f"\n🌊 Executing Wave {wave_idx}/{len(waves)} ({len(wave)} tables in parallel)...")
+        if progress_callback:
+            try:
+                progress_callback({
+                    "stage": "wave_start",
+                    "wave": wave_idx,
+                    "total_waves": len(waves),
+                    "tables": wave,
+                })
+            except Exception:
+                pass
+
         wave_workers = min(concurrency, len(wave))
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=wave_workers) as executor:
@@ -372,6 +421,19 @@ def run_migration(
             for future in concurrent.futures.as_completed(future_to_table):
                 res = future.result()
                 results.append(res)
+                if progress_callback:
+                    try:
+                        progress_callback({
+                            "stage": "table_done",
+                            "table": res.get("table", ""),
+                            "migrated": res.get("migrated", 0),
+                            "source_count": res.get("source_count", 0),
+                            "status": res.get("status", "OK"),
+                            "wave": wave_idx,
+                            "total_waves": len(waves),
+                        })
+                    except Exception:
+                        pass
 
     # Post-migration single-pass concurrent verification
     target_counts: dict[str, int] = {}
@@ -420,7 +482,26 @@ def run_migration(
         if verify:
             print("✅ All target row counts reconciled via concurrent PostgREST checks.")
 
-    return 0
+    if progress_callback:
+        try:
+            progress_callback({
+                "stage": "complete",
+                "total_migrated": total_migrated,
+                "total_source": total_source,
+                "results": results,
+                "success": True,
+            })
+        except Exception:
+            pass
+
+    return MigrationSummary(
+        0,
+        success=True,
+        total_migrated=total_migrated,
+        total_source=total_source,
+        results=results,
+        waves=len(waves),
+    )
 
 
 def main() -> int:

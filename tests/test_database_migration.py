@@ -309,6 +309,149 @@ class TestAdminDatabaseUIAndCache(unittest.TestCase):
 
         mock_backup.assert_called_once_with(mock_msg, 123)
 
+    @patch("backup_data.perform_backup")
+    def test_admin_trigger_backup_resolves_path_safely(self, mock_backup: MagicMock) -> None:
+        from app import legacy
+
+        mock_backup.return_value = {
+            "status": "success",
+            "backup_dir": "/tmp/backups/backup_20260912_120000",
+            "total_records": 42,
+            "timestamp_utc": "2026-09-12T12:00:00Z",
+        }
+
+        mock_target = MagicMock()
+        mock_status = MagicMock()
+        mock_status.edit_text = AsyncMock()
+        mock_target.reply_text = AsyncMock(return_value=mock_status)
+
+        with patch.dict("os.environ", {"SUPABASE_URL": "https://test.supabase.co", "SUPABASE_KEY": "test_key"}):
+            asyncio.run(legacy._admin_trigger_backup(mock_target, 123))
+
+        mock_backup.assert_called_once()
+        mock_status.edit_text.assert_awaited()
+        last_edit = mock_status.edit_text.call_args[0][0]
+        self.assertIn("បានបង្កើត Backup ជោគជ័យ", last_edit)
+        self.assertNotIn("NameError", last_edit)
+        self.assertNotIn("Path", last_edit)
+
+
+class TestFileExportsAndMigrationUI(unittest.TestCase):
+    """Test SQL dump, CSV ZIP bundle, CLI script generation, and Admin migration tools."""
+
+    def test_format_sql_value(self) -> None:
+        self.assertEqual(backup_data.format_sql_value(None), "NULL")
+        self.assertEqual(backup_data.format_sql_value(True), "TRUE")
+        self.assertEqual(backup_data.format_sql_value(False), "FALSE")
+        self.assertEqual(backup_data.format_sql_value(123), "123")
+        self.assertEqual(backup_data.format_sql_value(45.67), "45.67")
+        self.assertEqual(backup_data.format_sql_value("hello 'world'"), "'hello ''world'''")
+        self.assertEqual(backup_data.format_sql_value({"key": "val"}), "'{\"key\": \"val\"}'::jsonb")
+
+    def test_generate_table_sql_inserts(self) -> None:
+        rows = [
+            {"key": "maintenance", "value": "0"},
+            {"key": "greeting", "value": "welcome"},
+        ]
+        sql = backup_data.generate_table_sql_inserts("bot_settings", rows)
+        self.assertIn('INSERT INTO "bot_settings"', sql)
+        self.assertIn('ON CONFLICT ("key") DO UPDATE SET "value" = EXCLUDED."value"', sql)
+        self.assertIn("'maintenance'", sql)
+
+    @patch("backup_data.fetch_table_rows")
+    def test_export_sql_dump(self, mock_fetch: MagicMock) -> None:
+        mock_fetch.return_value = [{"key": "test_k", "value": "test_v"}]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sql_file = Path(tmpdir) / "dump.sql"
+            total, out_path = backup_data.export_sql_dump(
+                "https://test.supabase.co",
+                "test_key",
+                sql_file,
+                tables=["bot_settings"],
+                verbose=False,
+            )
+            self.assertEqual(total, 1)
+            self.assertTrue(out_path.is_file())
+            content = out_path.read_text(encoding="utf-8")
+            self.assertIn("BEGIN;", content)
+            self.assertIn("COMMIT;", content)
+            self.assertIn('INSERT INTO "bot_settings"', content)
+
+    def test_bundle_csv_zip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dir_path = Path(tmpdir) / "csvs"
+            dir_path.mkdir()
+            (dir_path / "bot_settings.csv").write_text("key,value\ntest,1\n", encoding="utf-8")
+            zip_path = Path(tmpdir) / "test.zip"
+            bundled = backup_data.bundle_csv_zip(dir_path, zip_path)
+            self.assertTrue(bundled.is_file())
+
+            import zipfile
+            with zipfile.ZipFile(bundled, "r") as zf:
+                names = zf.namelist()
+                self.assertIn("bot_settings.csv", names)
+
+    def test_generate_cli_script(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cli_path = Path(tmpdir) / "migrate.bat"
+            backup_data.generate_cli_script(
+                cli_path,
+                source_url="https://source.supabase.co",
+                source_key="src_key",
+                target_url="https://target.supabase.co",
+                target_key="tgt_key",
+            )
+            self.assertTrue(cli_path.is_file())
+            content = cli_path.read_text(encoding="utf-8")
+            self.assertIn("python migrate_data.py", content)
+            self.assertIn("https://source.supabase.co", content)
+
+    def test_admin_db_keyboard_has_export_buttons(self) -> None:
+        kb = get_admin_db_kb()
+        callbacks = [btn.callback_data for row in kb.inline_keyboard for btn in row]
+        self.assertIn("admin_db_export_sql", callbacks)
+        self.assertIn("admin_db_export_csv", callbacks)
+        self.assertIn("admin_db_export_cli", callbacks)
+        self.assertIn("admin_db_migrate", callbacks)
+
+    @patch("app.legacy._admin_handle_db_migration", new_callable=AsyncMock)
+    def test_cmd_migrate_dispatch(self, mock_migrate: MagicMock) -> None:
+        from app.services.telegram.commands import cmd_migrate
+
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 123
+        mock_msg = MagicMock()
+        mock_update.effective_message = mock_msg
+        mock_context = MagicMock()
+        mock_context.args = ["https://target.supabase.co", "secret_key_12345678901234567890", "--dry-run"]
+
+        with patch("app.services.telegram.commands._is_admin", return_value=True):
+            asyncio.run(cmd_migrate(mock_update, mock_context))
+
+        mock_migrate.assert_called_once_with(
+            mock_msg,
+            123,
+            mock_context,
+            target_url="https://target.supabase.co",
+            target_key="secret_key_12345678901234567890",
+            dry_run=True,
+        )
+
+    def test_restore_single_table_from_rows(self) -> None:
+        with patch("restore_data.upsert_batch_rows", return_value=2) as mock_upsert:
+            rows = [{"key": "k1", "value": "v1"}, {"key": "k2", "value": "v2"}]
+            total, restored = restore_data.restore_single_table_from_rows(
+                "bot_settings",
+                rows,
+                "https://target.supabase.co",
+                "test_key",
+                batch_size=10,
+                dry_run=False,
+            )
+            self.assertEqual(total, 2)
+            self.assertEqual(restored, 2)
+            mock_upsert.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

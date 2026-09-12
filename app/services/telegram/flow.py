@@ -27,7 +27,10 @@ def classify_callback(
         "tg_male": "gender",
         "welcome_profile": "welcome_profile",
         "welcome_back": "welcome_back",
+        "welcome_menu": "welcome_menu",
+        "help": "help",
         "btn_help": "help",
+        "system_status": "system_status",
         "btn_system_status": "system_status",
         "noop": "admin",
     }
@@ -43,6 +46,7 @@ def classify_callback(
         ("doc_del:", "delete"),
         ("audio_del:", "delete"),
         ("doc_read:", "doc_read"),
+        ("doc_trans:", "doc_trans"),
         ("audio_tts:", "audio_tts"),
         ("needs_", "needs_admin"),
         ("api_", "api_admin"),
@@ -72,6 +76,7 @@ def callback_requires_tts_access(action: str, data: str | None) -> bool:
         "tts_model",
         "tts_transcript",
         "doc_read",
+        "doc_trans",
         "audio_tts",
     }
 

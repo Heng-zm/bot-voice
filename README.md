@@ -15,7 +15,7 @@
 <br/>
 
 ```
-⚡ CDN Cache Hit: < 50ms  •  🌐 VPS Egress: 0 MB  •  🛡️ Worker Pool: Bounded 32x  •  🎧 Audio: Multi-Core Opus HD
+⚡ CDN Cache Hit: < 50ms  •  🌐 VPS Egress: 0 MB  •  🛡️ Worker Pool: Bounded 32x  •  🗄️ Resumable Migration CLI
 ```
 
 <p align="center">
@@ -23,7 +23,7 @@
 </p>
 
 <p align="center">
-  <b>High-speed studio-grade voice synthesis in Khmer & 10+ languages, image OCR transcription, intelligent multimodal chat, hardened non-blocking webhook dispatcher, and full-featured broadcast scheduling.</b>
+  <b>High-speed studio-grade voice synthesis in Khmer & 10+ languages, image OCR transcription, intelligent multimodal chat, hardened non-blocking webhook dispatcher, full-featured broadcast scheduling, and zero-dependency database migration suite.</b>
 </p>
 
 <p align="center">
@@ -32,6 +32,7 @@
   <a href="#-quickstart-in-3-steps"><b>⚡ Quickstart</b></a> •
   <a href="#-easy-server-deployment"><b>☁️ Deployment</b></a> •
   <a href="#-telegram-dispatcher--performance-architecture"><b>🛡️ Dispatcher Engine</b></a> •
+  <a href="#-supabase-database-migration-backup--disaster-recovery-cli"><b>🗄️ Database Tools</b></a> •
   <a href="#-bakong-khqr-voluntary-donation--recognition-system"><b>☕ Bakong KHQR</b></a> •
   <a href="#-architecture"><b>🏗️ Architecture</b></a> •
   <a href="#-project-structure"><b>📁 Project Tree</b></a>
@@ -46,17 +47,21 @@
 | :--- | :--- | :--- |
 | 🗣️ **Text-to-Speech (TTS)** | High-speed Microsoft Edge Neural & Hugging Face Kiri Space integration. | Supports **Khmer**, English, Chinese, Korean, Japanese, Hindi, Malay, Indonesian, Filipino, and Arabic. |
 | ⚡ **Zero-Latency Fast-Path** | Telegram CDN `file_id` multi-tier caching with deterministic Unicode NFC SHA-256 keys. | **< 50ms voice delivery** with 0ms synthesis wait, 0 CPU cycles, and 0 VPS egress bytes. |
+| 🗄️ **Zero-Downtime Migration** | Concurrent Supabase-to-Supabase data migration CLI (`migrate_data.py`). | **Kahn's topological sort**, multi-wave concurrency, adaptive batching (50–2,000), and `.migration_checkpoint.jsonl` crash recovery. |
+| 📦 **Streaming Disk Backup** | Low-RAM JSON & CSV streaming disk exporter (`backup_data.py`) & restore (`restore_data.py`). | Concurrent table row counting, page-by-page streaming directly to disk, and offline restore. |
+| 📊 **Admin Database Tools** | Live PostgREST row telemetry (`/dbstatus`) and background backup (`/dbbackup`). | **30s TTL cache** prevents spam; background tasks stream live progress edits every ~1.2s without event loop blocking. |
 | 🛡️ **Hardened Dispatcher** | Non-blocking async webhook ingestion engine with tracked background worker pool. | Responds with **`200 OK` in < 5ms**, completely eliminating Telegram retry storms. |
 | ⚖️ **Bounded Concurrency** | Configurable worker pool (`DISPATCHER_MAX_CONCURRENCY=32`) and backpressure queue (`100`). | Prevents OOM crashes under traffic spikes with graceful `503 Retry-After: 2` load shedding. |
 | 🔄 **Per-Chat FIFO Ordering** | Dynamic LRU `_get_chat_lock(chat_id)` isolates message sequencing per chat. | Bursts from the same user run in strict arrival order without blocking other users. |
 | 🔒 **Timing-Safe Auth** | Constant-time HMAC validation (`hmac.compare_digest`) on secret tokens before mode checks. | Eliminates timing attacks and server configuration/mode discovery leaks. |
 | 📢 **Channel Auto-Narrator** | Studio voice note narration for Telegram public channel posts (text & captions). | Smart URL/tag cleaning, sentence-level boundary cuts, `#notts` opt-out tags, and whitelist control. |
-| 🔍 **Multimodal Vision OCR** | Instant text extraction from photos, PDF documents, and camera screenshots. | Powered by Google Gemini 2.0 Flash with automatic fallback chain to Gemini 1.5 & Qwen. |
-| 🎙️ **Audio Transcription** | Transcribes inbound Telegram voice notes and uploaded audio files (`.mp3`, `.wav`, `.ogg`). | Converts speech to text with language auto-detection and clean pagination. |
-| 🎛️ **Live Admin Center** | Dynamic in-app Telegram (`/admin`) and Web Dashboard controls. | Instant Audio Cache & CDN purge, performance tuning, maintenance toggle, and CRM user lookups. |
+| 🔍 **Multimodal Vision OCR** | Instant text extraction from photos, PDF documents, and camera screenshots. | Powered by Google Gemini 2.0 Flash with automatic fallback chain and **1-tap Khmer translation** (`[🌐 បកប្រែជាខ្មែរ]`). |
+| 🎙️ **Audio Transcription** | Transcribes inbound Telegram voice notes and uploaded audio files (`.mp3`, `.wav`, `.ogg`). | Converts speech to text with language auto-detection, clean pagination, and 1-tap TTS reading. |
+| 🎛️ **Live Admin Center** | Dynamic in-app Telegram (`/admin`) and Web Dashboard controls. | Instant Audio Cache & CDN purge, performance tuning, database tools, maintenance toggle, and CRM user lookups. |
 | 📢 **Broadcast Engine** | Scheduled mass announcements (Phnom Penh UTC+7), templates, and daily recurrence. | High-throughput batch dispatch with real-time delivery progress and sent-message revoke. |
 | ⚡ **Multi-Core Opus Encoding** | In-memory FFmpeg Opus pipeline with `-threads 0` and VoIP `-compression_level 5`. | ~30% faster transcoding with zero perceptual quality degradation. |
 | ☕ **Bakong KHQR Voluntary Support** | National Bank of Cambodia Bakong KHQR integration (`chuo_kimheng@bkrt`). | EMVCo generator with 256-entry precomputed CRC16 table, dynamic QR with LRU caching, and direct scan. |
+| 🧙‍♂️ **Step-by-Step `/adddonor`** | 4-step guided admin wizard with receipt forward detection and one-liner fallback. | Step 1 (Forward/ID) ➔ Step 2 (Tiers) ➔ Step 3 (Hall of Fame Name) ➔ Step 4 (Confirm & Bless). |
 | 🎙️ **Automated AI Voice Blessing** | Studio-grade Khmer voice note blessing delivered upon verified voluntary support. | Personalized warm blessing with multi-tier audio fallback chain (Hugging Face → Edge TTS → Gemini). |
 | 🏆 **Hall of Fame (`/donors`)** | Community recognition leaderboard honoring generous contributors. | Tiered badges (🥇 Gold, 🥈 Silver, 🥉 Bronze, ⭐ Supporter), privacy name masking, and live refresh. |
 
@@ -99,7 +104,7 @@ A clean, compact UI system designed around Telegram's native interaction pattern
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 3. Vision OCR
+### 3. Vision OCR & 1-Tap Translation
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
@@ -107,13 +112,13 @@ A clean, compact UI system designed around Telegram's native interaction pattern
 │                                                             │
 │  receipt_scan.jpg · 1.2 MB · Gemini 2.0 Flash              │
 │                                                             │
-│  Extracted text                              Page 1 / 1    │
+│  Extracted text (English 🇺🇸)                  Page 1 / 1    │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │ Invoice #04821 — Total: $128.50                       │  │
 │  │ Date: 2026-09-08 · Vendor: Golden Palace Co.          │  │
 │  └───────────────────────────────────────────────────────┘  │
 │                                                             │
-│  [ Listen ]        [ Copy ]        [ Translate ]             │
+│  [ ▶️ អាន (Listen) ]  [ 🌐 បកប្រែជាខ្មែរ ]  [ 🗑️ លុប ]       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -129,6 +134,7 @@ A clean, compact UI system designed around Telegram's native interaction pattern
 │                                                             │
 │  🔊  ▶  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  0:31                │
 │      Auto-Voice                                              │
+│      Voice: ស្រី (Female) · Speed: 1.0x · Kiri Space         │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -145,34 +151,58 @@ A clean, compact UI system designed around Telegram's native interaction pattern
 │  Performance                   Broadcast & Schedule          │
 │  Workers 32 · Queue 100        Next run · 09:00 UTC+7        │
 │                                                              │
-│  User CRM & Lookup             Live Metrics                   │
-│  4,213 active users            p99 · 47 ms                   │
+│  User CRM & Lookup             🗄️ Database Management        │
+│  4,213 active users            PostgREST live telemetry      │
 │                                                              │
 │  Error Center & Health                         ● Normal      │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### 6. Web Dashboard
+### 6. Admin Database Telemetry & Streaming Backup (/dbstatus & /dbbackup)
 
 ```text
-┌─────────────────────────────────────────────────────────────┐
-│  Bot Voice Web Dashboard                         ● Online   │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  Requests / min        Cache Hit %        Avg Latency       │
-│       1,284                94.7%                46ms         │
-│                                                             │
-│  Latency · Last 60 minutes                                  │
-│                                                             │
-│  80 ┤          ╭╮                                            │
-│  60 ┤   ╭╮  ╭╮ ││  ╭╮                                       │
-│  40 ┤╭╮ ││╭╮││╭╯││╭╮││╭╮                                    │
-│  20 ┤││╭╯│││╰╯│││╰╯│╰─╮                                    │
-│   0 └┴┴┴──┴┴───┴┴┴──┴────────────────────────────────────  │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  🗄️ ស្ថានភាពទិន្នន័យ Supabase Database          (30s Cached) │
+├──────────────────────────────────────────────────────────────┤
+│  • bot_settings:             24 ជួរ                           │
+│  • ai_api_keys:               6 ជួរ                           │
+│  • user_prefs:            4,213 ជួរ                           │
+│  • scheduled_broadcasts:     18 ជួរ                           │
+│  • text_cache:           12,480 ជួរ                           │
+│  • blocked_users:             2 ជួរ                           │
+│  • donations:                89 ជួរ                           │
+│  • feature_requests:         42 ជួរ                           │
+│  • conversation_history:  8,920 ជួរ                           │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                │
+│  📊 សរុបទាំងអស់:          25,794 ជួរ (9 តារាង)                 │
+│                                                              │
+│  [ 🔄 ពិនិត្យឡើងវិញ ]     [ 📦 បង្កើត Backup ឥឡូវ ]          │
+├──────────────────────────────────────────────────────────────┤
+│  📦 Live Backup Progress:                                    │
+│  ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▱▱  92%  (text_cache)        │
+│  Streamed 12,000 / 12,480 rows directly to disk              │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### 7. Bakong KHQR & AI Voice Blessing (/donate & /donors)
+### 7. Interactive 4-Step /adddonor Wizard
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│  ➕ បន្ថែមអ្នកឧបត្ថម្ភ (Add Donor) — ជំហានទី ៤/៤             │
+├──────────────────────────────────────────────────────────────┤
+│  👤 សប្បុរសជន:      Dara Official                            │
+│  🆔 Telegram ID:     1272791365  (via forwarded message)     │
+│  💵 ចំនួនទឹកប្រាក់:     $5.00 USD                                │
+│  🎖️ កម្រិត (Tier):     🖥️ Server Support                        │
+│  🎙️ AI Voice Blessing: បង្កើត និងផ្ញើសំឡេងជូនពរ            │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                │
+│  តើអ្នកពិតជាចង់កត់ត្រាការឧបត្ថម្ភនេះមែនទេ?                   │
+│                                                              │
+│  [ ✅ បញ្ជាក់ & កត់ត្រា (Confirm) ]        [ ❌ បោះបង់ ]      │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 8. Bakong KHQR & AI Voice Blessing (/donate & /donors)
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
@@ -198,10 +228,11 @@ A clean, compact UI system designed around Telegram's native interaction pattern
 | :--- | :--- | :--- |
 | Voice Playback | Compact hierarchy, native-style controls, grouped voice/speed/model settings | Faster voice selection without command-heavy flows |
 | Synthesis Progress | Single progress surface with model, character count, ETA, and fallback state | Clear feedback without clutter |
-| OCR Result | Document-style result card with three primary actions | Extract → listen/copy/translate in one place |
+| OCR Result | Document-style result card with listen, 1-tap Khmer translate, and delete | Instant transcription → Khmer translation → speech in 1 tap |
 | Channel Narrator | Minimal post preview with a compact audio player | Keeps channel content readable and listenable |
-| Admin Center | Structured 2-column control grid with status-first information | Faster operational decisions |
-| Web Dashboard | KPI cards + focused latency visualization | Immediate visibility into system health |
+| Admin Center | Structured 2-column control grid with direct Database subpanel | Faster operational control and immediate telemetry |
+| Database Dashboard | Live row counts with 30s TTL caching and non-blocking background backup | Instant DB health visibility with zero Telegram event-loop freezing |
+| Add Donor Wizard | 4-step guided wizard with auto-detected forwarded user IDs and presets | Error-free donor recording with automatic voice blessings |
 | Bakong Support & Hall of Fame | Preset coffee tiers, real-time KHQR generation, in-place navigation, and AI voice blessing note | Frictionless appreciation with zero paywalls and instant community recognition |
 
 > **UI goal:** Keep the interface clean and production-oriented. Prioritize hierarchy, whitespace, concise labels, native Telegram interaction patterns, and clear status feedback over decorative elements.
@@ -350,6 +381,127 @@ Telegram Webhook ──> Timing-Safe HMAC Auth ──> Replay Deduplication ─�
 
 ---
 
+## 🗄️ Supabase Database Migration, Backup & Disaster Recovery CLI
+
+A production-grade, zero-dependency data migration, streaming backup, and offline restore architecture built into the root repository. Enables seamless, idempotent data transfers between Supabase projects with zero downtime and crash recovery.
+
+```
+Source Supabase ──> Kahn's Topological Linearization ──> Wave Concurrency (ThreadPoolExecutor)
+                                                                 │
+                                ┌────────────────────────────────┴────────────────────────────────┐
+                                ▼                                                                 ▼
+                     Adaptive Batching (50 - 2,000)                                   Streamed Disk Writes
+                     Latency-scaled HTTP/2 PostgREST                                  JSON & CSV page-by-page
+                                │                                                                 │
+                                ▼                                                                 ▼
+                     Append-Only Checkpoint File                                      Target Supabase / Cloud
+                     `.migration_checkpoint.jsonl`                                    `restore_data.py`
+```
+
+### 1. Architectural Highlights
+- **Zero-Dependency Core (`_migration_core.py`)**: Built entirely with Python's standard library (`urllib.request`, `json`, `concurrent.futures`, `hashlib`), eliminating external pip dependencies and making it runnable on any machine, container, or CI/CD pipeline.
+- **Kahn's Topological Graph Sorting**: Computes table insertion order mathematically from canonical foreign-key dependencies. Prevents foreign-key constraint violations without disabling constraints on target databases.
+  - **Wave 1 (Independent)**: `bot_settings`, `ai_api_keys`, `user_prefs`, `scheduled_broadcasts`, `text_cache`, `blocked_users`
+  - **Wave 2 (Dependent on `user_prefs`)**: `donations`, `feature_requests`, `conversation_history`
+- **Multi-Tier Wave Concurrency**: Tables within the same topological wave migrate concurrently via a bounded `ThreadPoolExecutor` (`--concurrency 4`), saturating available network bandwidth.
+- **Adaptive Batching (`AdaptiveBatcher`)**: Automatically adjusts batch sizes between 50 and 2,000 records based on round-trip PostgREST latency. Expands by +25% on low latency (<300ms) and halves immediately on HTTP 413 (Payload Too Large).
+- **Append-Only Checkpointing (`Checkpoint`)**: Records atomic page commits to `.migration_checkpoint.jsonl`. If network drops or a crash occurs, `--resume` picks up from the exact row offset without duplicating writes.
+- **Concurrent PostgREST HEAD Counts**: Uses HTTP HEAD queries with `Range: 0-0` and `Prefer: count=exact` across all 9 tables in parallel to display accurate pre-flight statistics in < 200ms.
+
+### 2. Online Direct Migration (`migrate_data.py`)
+
+Migrates all tables directly from Source Supabase to Target Supabase over HTTPS.
+
+```bash
+# 1. Test connection and verify schema without writing (Dry-Run)
+python migrate_data.py --target-url https://new.supabase.co --target-key NEW_KEY --dry-run
+
+# 2. Live migration with 4 concurrent table workers and row verification
+python migrate_data.py --target-url https://new.supabase.co --target-key NEW_KEY --concurrency 4 --verify
+
+# 3. Resume interrupted migration from last checkpoint
+python migrate_data.py --target-url https://new.supabase.co --target-key NEW_KEY --resume
+
+# 4. Discard previous checkpoint and start completely fresh
+python migrate_data.py --target-url https://new.supabase.co --target-key NEW_KEY --fresh
+
+# 5. Migrate only recent data (e.g., last 30 days of cache & history)
+python migrate_data.py --target-url https://new.supabase.co --target-key NEW_KEY --days 30
+```
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `--target-url` | `os.environ` | Target Supabase project URL (`https://xyz.supabase.co`) |
+| `--target-key` | `os.environ` | Target Supabase `service_role` key |
+| `--concurrency` | `4` | Number of concurrent table migration workers per wave |
+| `--adaptive-batch` | `True` | Scale batch sizes dynamically between 50 and 2,000 |
+| `--verify` | `False` | Run post-migration count checks across all tables |
+| `--resume` | `False` | Resume from `.migration_checkpoint.jsonl` |
+| `--fresh` | `False` | Clear checkpoints and start from row 0 |
+| `--days` | `None` | Restrict time-series tables to the last $N$ days |
+| `--dry-run` | `False` | Test connectivity and print plan without writing |
+
+### 3. Streaming Disk Backup & Multi-Format Exporter (`backup_data.py`)
+
+Exports the entire database page-by-page directly to local disk without buffering large tables into memory. Supports generating PostgreSQL `.SQL` dumps, compressed `.CSV` ZIP archives, and pre-configured `.CLI` executable migration scripts.
+
+```bash
+# Generate all formats: JSON, CSV, SQL Dump, CSV ZIP, and CLI Script
+python backup_data.py --all
+
+# Generate specific formats
+python backup_data.py --sql       # Generate idempotent PostgreSQL .sql dump
+python backup_data.py --csv-zip   # Bundle all table CSVs into a .zip archive
+python backup_data.py --cli       # Generate cross-platform executable migration script (.bat/.cli)
+python backup_data.py --tables bot_settings,user_prefs --page-size 500
+```
+
+### 4. Offline Restoration & File Ingestion (`restore_data.py`)
+
+Restores data from local backup directories, ZIP archives, or single CSV/JSON files directly to any Supabase database using topological wave ordering and adaptive batching.
+
+```bash
+# Auto-detects and restores the latest backup directory
+python restore_data.py --target-url https://new.supabase.co --target-key NEW_KEY --verify
+
+# Restore from a specific backup folder
+python restore_data.py --backup-dir backups/backup_20260912_043000 --target-url https://new.supabase.co --target-key NEW_KEY
+
+# Ingest single CSV or ZIP archive programmatically
+from pathlib import Path
+from restore_data import restore_from_file_or_dir
+restore_from_file_or_dir("https://new.supabase.co", "SERVICE_ROLE_KEY", Path("user_prefs.csv"))
+```
+
+### 5. In-App Telegram Database Telemetry, File Export & Migration Panel
+
+Admins can perform all database operations directly from Telegram without SSH or CLI access:
+
+- **Interactive Admin Database Panel (`/admin ➔ 🗄️ Database` or `/dbstatus`)**:
+  - `[🔄 ពិនិត្យឡើងវិញ (Refresh)]`: Live PostgREST row counts across all 9 tables (cached for 30s to prevent spam).
+  - `[📦 បង្កើត Backup ឥឡូវ]`: Triggers background streaming backup with live percentage progress edits every ~1.2s.
+  - `[📥 .SQL Dump]`: Generates a PostgreSQL dump with idempotent `ON CONFLICT DO UPDATE` statements and sends the `.sql` document to Telegram.
+  - `[📊 .CSV (Zip)]`: Bundles all table CSV archives into a compressed ZIP file and sends it to Telegram.
+  - `[💻 .CLI Script]`: Generates a ready-to-run `.cli` / `.bat` migration script with pre-configured project credentials sent as a document.
+  - `[🚀 ផ្លាស់ប្តូរ DB (Migrate)]`: Guided interactive migration wizard with connectivity checks and live progress streaming.
+
+- **Direct Migration Command (`/migrate`)**:
+  ```text
+  /migrate <TARGET_URL> <TARGET_SERVICE_ROLE_KEY> [--dry-run]
+  
+  # Example:
+  /migrate https://newproject.supabase.co eyJhbGci... --dry-run
+  ```
+  Streams real-time Wave and Table progress to Telegram without blocking the event loop!
+
+- **1-Click Telegram Document Ingestion (Restore)**:
+  - Simply drag-and-drop or send any `.sql`, `.csv`, or `.zip` backup file into the Telegram chat as an Admin.
+  - The bot automatically verifies file size, saves it into `backups/imports/`, and displays an instant confirmation card:
+    `[📥 នាំចូលទិន្នន័យ (Restore)]` `[❌ បោះបង់]`
+  - Clicking Restore executes the import in the background and reports exact restored vs total record counts.
+
+---
+
 ## ☕ Bakong KHQR Voluntary Donation & Recognition System
 
 Bot Voice is **100% free to use**, with zero feature paywalls. The voluntary donation system allows grateful users to buy the maintainer a coffee (`/coffee` or `/donate`), helping sustain VPS hosting, domain renewals, and AI compute costs.
@@ -401,7 +553,15 @@ Bot Voice is **100% free to use**, with zero feature paywalls. The voluntary don
 - **Privacy Protection**: Automatically masks donor names (e.g., `Supporter *4521`) unless public display is chosen.
 - **Resilient Dual Storage**: Persists records to Supabase PostgreSQL with an automatic atomic local JSON fallback (`data/donations.json`) and a 60-second TTL in-memory cache with immediate cache invalidation on newly approved donations.
 
----
+### 5. Interactive 4-Step `/adddonor` Admin Wizard
+- **Zero-Friction Forwarding**: Admins can simply forward a receipt message from the donor in private chat — the bot extracts the user ID and name automatically.
+- **Guided 4-Step State Machine**:
+  - **Step 1 (ID)**: Prompt for numeric Telegram ID or forwarded receipt.
+  - **Step 2 (Amount & Tier)**: Inline buttons for `☕ Coffee ($1)`, `🧋 Milk Tea ($2)`, `🍱 Lunch ($3)`, `🖥️ Server ($5)`, `👑 Patron ($10)` or custom input.
+  - **Step 3 (Donor Name)**: Choose auto-detected Telegram name, `User <ID>`, or custom name.
+  - **Step 4 (Confirmation)**: Review summary card and execute. Dispatches AI Voice Blessing and updates Hall of Fame instantly.
+- **Power-User One-Liner**: `/adddonor <user_id> <amount> [tier] [name]`.
+- **Clean State Teardown**: Automatically purges transient wizard state on `/cancel` or admin dashboard navigation.
 
 ## 🏗️ Architecture
 
@@ -423,7 +583,7 @@ flowchart TD
         ChatLock --> ChanNarrator[📢 Channel Auto-Voice Narrator]
         ChatLock --> OCR[🔍 Vision & PDF Document OCR]
         ChatLock --> AI[🧠 AI Assistant & Translator]
-        ChatLock --> Admin[🎛️ Admin CRM & Broadcast Scheduler]
+        ChatLock --> Admin[🎛️ Admin CRM, Broadcast & Database]
         ChatLock --> Donate[☕ Bakong KHQR & Voice Blessing]
         
         ChanNarrator -->|Sanitized Text| TTS
@@ -451,14 +611,22 @@ flowchart TD
         DB --> Pruner[🧹 Bounded Batch Pruning 500 records/batch]
     end
 
+    subgraph "Database Migration & Disaster Recovery Suite"
+        DB <--> CoreEngine[⚡ _migration_core: Kahn's Topological Linearization]
+        CoreEngine <--> Migrator[🚀 migrate_data.py: Concurrent Multi-Wave Transfer]
+        CoreEngine <--> BackupCLI[📦 backup_data.py: Streamed JSON & CSV Disk Exporter]
+        CoreEngine <--> Restorer[📥 restore_data.py: Resumable Checkpoint Restorer]
+        CoreEngine <--> CheckpointFile[📝 .migration_checkpoint.jsonl]
+    end
+
     subgraph "Presentation Layer — Telegram & Web UI"
         DirectSend --> VoiceCard[🎧 Voice Playback Card<br/>waveform · speed · voice toggle]
         FFmpeg --> VoiceCard
         Progress -.->|streamed edits| VoiceCard
-        OCR --> OCRCard[🔍 OCR Result Card<br/>listen · copy · translate]
+        OCR --> OCRCard[🔍 OCR Result Card<br/>listen · translate · copy · delete]
         ChanNarrator --> ChannelCard[📢 Channel Auto-Voice Card]
-        Admin --> AdminUI[🎛️ /admin Control Center<br/>cache · workers · broadcast · CRM]
-        Donate --> DonateCard[☕ /donate & /donors UI<br/>interactive tiers · QR · blessing]
+        Admin --> AdminUI[🎛️ /admin Control Center<br/>cache · database · workers · broadcast]
+        Donate --> DonateCard[☕ /donate & /donors UI<br/>interactive wizard · QR · blessing]
         MemCache --> AdminUI
         Redis --> WebDash[🌐 Web Dashboard<br/>throughput · hit-rate · latency]
         DB --> WebDash
@@ -473,6 +641,10 @@ flowchart TD
 
 ```
 bot-voice/
+├── _migration_core.py                # 🗄️ Zero-dependency Supabase migration engine & topological sort
+├── migrate_data.py                   # 🚀 Concurrent online Supabase-to-Supabase migration CLI
+├── backup_data.py                    # 📦 Streaming disk backup exporter (JSON & CSV page-by-page)
+├── restore_data.py                   # 📥 Multi-wave offline Supabase restoration CLI
 ├── app/                              # Core Application Codebase
 │   ├── api/                          # FastAPI Modular Routes
 │   │   ├── routes/
@@ -496,7 +668,7 @@ bot-voice/
 │   │   │   └── templates.py          # Broadcast layout templates & presets
 │   │   ├── donation/                 # ☕ Bakong KHQR & Recognition System
 │   │   │   ├── blessing.py           # Studio Khmer AI voice blessing generator
-│   │   │   ├── handlers.py           # Donation UI flows, compact tokens & approvals
+│   │   │   ├── handlers.py           # 🧙‍♂️ Step-by-step wizard, compact tokens & approvals
 │   │   │   ├── khqr.py               # EMVCo KHQR generator, CRC16 table & QR cache
 │   │   │   └── store.py              # Supabase + local atomic JSON fallback store
 │   │   ├── settings/                 # Dynamic Runtime Configuration Store
@@ -505,7 +677,7 @@ bot-voice/
 │   │   │   ├── buttons.py            # Inline keyboard layouts & UI builders
 │   │   │   ├── callbacks.py          # Inline button callback queries & state machine
 │   │   │   ├── channel.py            # Channel Auto-Voice Narrator & fast-path
-│   │   │   ├── commands.py           # Command handlers (/ask, /tts, /admin, /help)
+│   │   │   ├── commands.py           # Command handlers (/ask, /tts, /admin, /dbstatus)
 │   │   │   ├── deduplication.py      # WebhookReplayStore & atomic claim leases
 │   │   │   ├── dispatcher.py         # ⚡ Hardened Telegram Update Dispatcher Engine
 │   │   │   ├── flow.py               # Pure callback classification & error helpers
@@ -534,8 +706,9 @@ bot-voice/
 │   ├── test_article_narrator.py      # Web article & long text narrator tests
 │   ├── test_backend_services.py      # Core service unit tests
 │   ├── test_channel_narrator.py      # Channel narrator & audio text cleaning tests
+│   ├── test_database_migration.py    # 🗄️ Database migration, Kahn's sort, checkpoint & adaptive tests
 │   ├── test_dispatcher.py            # ⚡ Telegram Dispatcher & concurrency tests
-│   ├── test_donation.py              # ☕ Bakong KHQR, CRC16, store & blessing tests
+│   ├── test_donation.py              # ☕ Bakong KHQR, CRC16, store, blessing & wizard tests
 │   ├── test_startup_script.py        # Startup script validation
 │   ├── test_system_upgrades.py       # API & webhook regression tests
 │   ├── test_telegram.py              # Telegram command & message tests
@@ -560,20 +733,23 @@ bot-voice/
 
 ## 🧪 Testing & Verification
 
-Run the full automated test suite (50+ tests covering language detection, security, replay stores, TTS caching, SingleFlight, and the Telegram Dispatcher):
+Run the full automated test suite (65+ tests covering language detection, security, replay stores, TTS caching, SingleFlight, Supabase database migration, and the Telegram Dispatcher):
 
 ```bash
 # Run all unit tests
 python -m unittest discover -s tests -v
 
-# Test Dispatcher specifically
+# Test Supabase Database Migration & Topological Linearization
+python -m unittest tests.test_database_migration
+
+# Test Bakong KHQR, Donation Engine & Step-by-Step Wizard
+python -m unittest tests.test_donation
+
+# Test Telegram Dispatcher specifically
 python -m unittest tests.test_dispatcher
 
 # Test Audio Cache & SingleFlight
 python -m unittest tests.test_tts_cache
-
-# Test Bakong KHQR & Donation Engine
-python -m unittest tests.test_donation
 
 # Run Ruff code linter
 python -m ruff check .
@@ -584,3 +760,4 @@ python -m ruff check .
 ## 📄 License
 
 This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
+
