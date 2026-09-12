@@ -16143,13 +16143,14 @@ def get_sched_detail_kb(row: dict) -> InlineKeyboardMarkup:
 def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
     """Clean, mobile-first Telegram admin home keyboard.
 
-    Organized into 6 balanced rows with clear operational categories:
+    Organized into balanced rows with clear operational categories:
     1. Primary Controls: Bot Config & Instant Broadcast
     2. Audience & Automation: Users/CRM & Scheduled Broadcasts
     3. Intelligence & Reporting: User Feedback/Needs & PDF Reports
     4. Diagnostics & Monitoring: Health Deep-Check & Error Inbox
-    5. Maintenance & Telemetry: One-Tap Optimizer & Live Stats
-    6. Navigation: Refresh & Dismiss
+    5. Maintenance & Database: One-Tap Optimizer & Supabase Database
+    6. Telemetry & Navigation: Live Stats & Refresh
+    7. Dismiss
     """
     rows = [
         [InlineKeyboardButton("🤖 Bot Config", callback_data="admin_bot_config"),
@@ -16161,9 +16162,10 @@ def get_admin_dashboard_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🩺 Health", callback_data="admin_health"),
          InlineKeyboardButton("🚨 Error Inbox", callback_data="admin_errors")],
         [InlineKeyboardButton("⚡ Optimize", callback_data="admin_optimize"),
-         InlineKeyboardButton("📈 Stats", callback_data="admin_stats")],
-        [InlineKeyboardButton("🔄 Refresh", callback_data="admin_home"),
-         InlineKeyboardButton("❌ បិទ (Close)", callback_data="admin_close")],
+         InlineKeyboardButton("🗄️ Database", callback_data="admin_db")],
+        [InlineKeyboardButton("📈 Stats", callback_data="admin_stats"),
+         InlineKeyboardButton("🔄 Refresh", callback_data="admin_home")],
+        [InlineKeyboardButton("❌ បិទ (Close)", callback_data="admin_close")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -16196,10 +16198,21 @@ def get_admin_compact_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("👥 Users", callback_data="admin_users"),
          InlineKeyboardButton("🚨 Errors", callback_data="admin_errors")],
         [InlineKeyboardButton("⚡ Optimize", callback_data="admin_optimize"),
-         InlineKeyboardButton("🚀 Audio Cache", callback_data="admin_audio_cache")],
-        [InlineKeyboardButton("📄 Report", callback_data="admin_report"),
-         InlineKeyboardButton("🏠 Full Admin", callback_data="admin_home")],
-        [InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+         InlineKeyboardButton("🗄️ Database", callback_data="admin_db")],
+        [InlineKeyboardButton("🚀 Audio Cache", callback_data="admin_audio_cache"),
+         InlineKeyboardButton("📄 Report", callback_data="admin_report")],
+        [InlineKeyboardButton("🏠 Full Admin", callback_data="admin_home"),
+         InlineKeyboardButton("❌ Close", callback_data="admin_close")],
+    ])
+
+
+def get_admin_db_kb() -> InlineKeyboardMarkup:
+    """Sub-panel navigation keyboard for Database Metrics & Backup."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 ពិនិត្យឡើងវិញ (Refresh)", callback_data="admin_db_refresh"),
+         InlineKeyboardButton("📦 បង្កើត Backup ឥឡូវ", callback_data="admin_db_backup")],
+        [InlineKeyboardButton("⬅️ Admin Home", callback_data="admin_home"),
+         InlineKeyboardButton("❌ បិទ", callback_data="admin_close")],
     ])
 
 
@@ -16856,7 +16869,7 @@ class TelegramProgress:
     async def _animate_minimal(self) -> None:
         try:
             while not self.closed:
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(1.5)
                 async with self.lock:
                     if self.closed:
                         return
@@ -23850,6 +23863,177 @@ async def _cb_user_needs_admin(query, user_id: int, context: ContextTypes.DEFAUL
     ))
 
 
+_DB_STATUS_CACHE: dict[str, Any] = {"timestamp": 0.0, "text": ""}
+
+
+async def _get_admin_db_text(*, force: bool = False) -> str:
+    """Fetch live row counts and connectivity metrics across Supabase tables for Admin.
+
+    Includes a 30-second cache to prevent redundant roundtrips on rapid UI refreshes.
+    """
+    import html
+    import time
+    from _migration_core import fetch_all_row_counts
+    from backup_data import TABLES
+
+    now = time.monotonic()
+    if not force and (now - _DB_STATUS_CACHE["timestamp"]) < 30.0 and _DB_STATUS_CACHE["text"]:
+        return _DB_STATUS_CACHE["text"]
+
+    sb_url = os.environ.get("SUPABASE_URL", "")
+    sb_key = (
+        os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        or os.environ.get("SUPABASE_KEY")
+        or ""
+    )
+
+    if not sb_url or not sb_key:
+        return (
+            "⚠️ <b>ការកំណត់ Supabase មិនទាន់ពេញលេញ</b>\n\n"
+            "មិនមាន <code>SUPABASE_URL</code> ឬ <code>SUPABASE_SERVICE_ROLE_KEY</code> ក្នុង <code>.env</code> ឡើយ។"
+        )
+
+    t0 = time.perf_counter()
+    loop = asyncio.get_running_loop()
+
+    try:
+        counts = await loop.run_in_executor(
+            _DB_EXECUTOR,
+            lambda: fetch_all_row_counts(sb_url, sb_key, TABLES, max_workers=4, timeout=8),
+        )
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        status_icon = "🟢"
+        conn_text = f"✅ Connected ({elapsed_ms}ms)"
+    except Exception as exc:
+        counts = {t: -1 for t in TABLES}
+        status_icon = "🔴"
+        conn_text = f"❌ Error: {exc}"
+
+    host_display = sb_url.replace("https://", "").replace("http://", "").split("/")[0]
+
+    table_icons = {
+        "bot_settings": "⚙️",
+        "ai_api_keys": "🔑",
+        "user_prefs": "👥",
+        "donations": "☕",
+        "feature_requests": "💡",
+        "scheduled_broadcasts": "📢",
+        "text_cache": "💬",
+        "conversation_history": "🧠",
+        "blocked_users": "🚫",
+    }
+
+    total_records = sum(c for c in counts.values() if c > 0)
+
+    lines = [
+        f"{status_icon} <b>ស្ថានភាពទិន្នន័យ Supabase Database (DB Status)</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"⚡ <b>ស្ថានភាពតភ្ជាប់:</b> {conn_text}",
+        f"🌐 <b>Project Host:</b> <code>{html.escape(host_display)}</code>\n",
+        "📊 <b>ចំនួនទិន្នន័យតាមតារាងនីមួយៗ (Row Counts):</b>",
+    ]
+
+    for tbl in TABLES:
+        icon = table_icons.get(tbl, "📄")
+        cnt = counts.get(tbl, -1)
+        if cnt >= 0:
+            cnt_str = f"<b>{cnt:,}</b> rows"
+        else:
+            cnt_str = "<i>(0 ឬ មិនទាន់បង្កើត)</i>"
+        lines.append(f"• {icon} <code>{tbl}</code>: {cnt_str}")
+
+    lines.extend([
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"📦 <b>សរុបទិន្នន័យ:</b> <b>{total_records:,}</b> កំណត់ត្រា (Records)",
+        "💾 <b>ការបម្រុងទុក:</b> <code>/dbbackup</code> ឬចុចប៊ូតុងខាងក្រោម",
+        "🚀 <b>Migration Tool:</b> <code>python migrate_data.py</code>",
+    ])
+
+    formatted_text = "\n".join(lines)
+    _DB_STATUS_CACHE["timestamp"] = now
+    _DB_STATUS_CACHE["text"] = formatted_text
+    return formatted_text
+
+
+async def _admin_trigger_backup(target_msg: Any, user_id: int) -> None:
+    """Asynchronously triggers database backup and streams throttled live progress."""
+    import html
+    import time
+    from backup_data import perform_backup
+
+    sb_url = os.environ.get("SUPABASE_URL", "")
+    sb_key = (
+        os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        or os.environ.get("SUPABASE_KEY")
+        or ""
+    )
+
+    if not sb_url or not sb_key:
+        await safe_send(lambda: target_msg.reply_text(
+            "❌ <b>បរាជ័យ:</b> មិនមាន <code>SUPABASE_URL</code> ឬ <code>SUPABASE_SERVICE_ROLE_KEY</code> ក្នុង <code>.env</code> ឡើយ។",
+            parse_mode="HTML"
+        ))
+        return
+
+    status_msg = await safe_send(lambda: target_msg.reply_text(
+        "⏳ <b>កំពុងដំណើរការ Backup ទិន្នន័យទាំងអស់...</b>\n\nកំពុងតភ្ជាប់ទៅកាន់ Supabase សូមរង់ចាំបន្តិច...",
+        parse_mode="HTML"
+    ))
+
+    loop = asyncio.get_running_loop()
+    last_progress_edit = 0.0
+
+    def on_progress(tbl: str, idx: int, total: int, rows_count: int) -> None:
+        nonlocal last_progress_edit
+        now = time.monotonic()
+        if (now - last_progress_edit) >= 1.2 and status_msg:
+            last_progress_edit = now
+            pct = int(idx / total * 100)
+            progress_txt = (
+                f"⏳ <b>កំពុងដំណើរការ Backup... ({pct}%)</b>\n\n"
+                f"• តារាងបច្ចុប្បន្ន: <code>{tbl}</code> ({idx}/{total})\n"
+                f"• ទិន្នន័យរក្សាទុកបាន: <b>{rows_count:,}</b> rows\n\n"
+                f"<i>សូមរង់ចាំបន្តិច ប្រព័ន្ធកំពុងដំណើរការដោយសុវត្ថិភាព...</i>"
+            )
+            asyncio.run_coroutine_threadsafe(
+                safe_send(lambda: status_msg.edit_text(progress_txt, parse_mode="HTML")),
+                loop,
+            )
+
+    try:
+        res = await loop.run_in_executor(
+            _DB_EXECUTOR,
+            lambda: perform_backup(sb_url, sb_key, verbose=False, progress_callback=on_progress),
+        )
+        total = res.get("total_records", 0)
+        backup_dir = res.get("backup_dir", "")
+        dir_name = Path(backup_dir).name if backup_dir else "backups/"
+
+        success_text = (
+            "🎉 <b>បានបង្កើត Backup ជោគជ័យ!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📁 <b>ទីតាំង:</b> <code>backups/{dir_name}</code>\n"
+            f"📦 <b>ទិន្នន័យសរុប:</b> <b>{total:,}</b> កំណត់ត្រា\n"
+            f"⏱️ <b>ពេលវេលា:</b> {res.get('timestamp_utc', '')[:19].replace('T', ' ')} UTC\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "💡 <i>ឯកសារត្រូវបានរក្សាទុកជា JSON និង CSV រួចរាល់។</i>"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗄️ មើល DB Status", callback_data="admin_db"),
+             InlineKeyboardButton("❌ បិទ", callback_data="admin_close")]
+        ])
+        if status_msg:
+            await safe_send(lambda: status_msg.edit_text(success_text, parse_mode="HTML", reply_markup=kb))
+        else:
+            await safe_send(lambda: target_msg.reply_text(success_text, parse_mode="HTML", reply_markup=kb))
+    except Exception as exc:
+        err_text = f"❌ <b>បរាជ័យក្នុងការ Backup:</b> <code>{html.escape(str(exc))}</code>"
+        if status_msg:
+            await safe_send(lambda: status_msg.edit_text(err_text, parse_mode="HTML"))
+        else:
+            await safe_send(lambda: target_msg.reply_text(err_text, parse_mode="HTML"))
+
+
 async def _admin_health_text() -> str:
     """Admin-facing whole-bot health snapshot.
 
@@ -25233,6 +25417,24 @@ async def _cb_admin_dashboard(query, user_id: int, context, data: str):
         ))
         return
 
+    if data in ("admin_db", "admin_db_refresh"):
+        with suppress(Exception):
+            await query.answer("🔄 កំពុងពិនិត្យទិន្នន័យ...")
+        text = await _get_admin_db_text()
+        await safe_send(lambda: query.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=get_admin_db_kb(),
+            disable_web_page_preview=True,
+        ))
+        return
+
+    if data == "admin_db_backup":
+        with suppress(Exception):
+            await query.answer("⏳ កំពុងចាប់ផ្តើម Backup...")
+        await _admin_trigger_backup(query.message, user_id)
+        return
+
     if data == "admin_web_key":
         await _admin_generate_web_key(query, user_id, context)
         return
@@ -25877,6 +26079,8 @@ async def _cb_doc_read(query, user_id: int, context, data: str):
         return
     if query.message is None:
         return
+    with suppress(Exception):
+        await query.answer("📢 កំពុងរៀបចំអានឯកសារ...")
 
     chat_id = int(query.message.chat.id)
     full_text, prefs = await asyncio.gather(
@@ -27399,6 +27603,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Callback helpers
 # ---------------------------------------------------------------------------
 async def _cb_show_speed(query, user_id: int, context):
+    with suppress(Exception):
+        await query.answer()
     prefs = await get_user_prefs_async(user_id)
     await safe_send(lambda: query.message.edit_reply_markup(
         reply_markup=get_speed_kb(prefs["speed"])
@@ -27408,6 +27614,8 @@ async def _cb_show_speed(query, user_id: int, context):
 async def _cb_hide_speed(query, user_id: int, context):
     if query.message is None:
         return
+    with suppress(Exception):
+        await query.answer()
     prefs = await get_user_prefs_async(user_id)
     if _is_welcome_message(query.message):
         await safe_send(lambda: query.message.edit_reply_markup(reply_markup=get_welcome_kb()))
@@ -27435,6 +27643,8 @@ async def _cb_hide_speed(query, user_id: int, context):
 
 
 async def _cb_show_tts_model(query, user_id: int, context):
+    with suppress(Exception):
+        await query.answer()
     prefs = await get_user_prefs_async(user_id)
     await safe_send(lambda: query.message.edit_reply_markup(
         reply_markup=get_tts_model_kb(prefs.get("tts_model", "auto"))
@@ -27444,6 +27654,8 @@ async def _cb_show_tts_model(query, user_id: int, context):
 async def _cb_hide_tts_model(query, user_id: int, context):
     if query.message is None:
         return
+    with suppress(Exception):
+        await query.answer()
     prefs = await get_user_prefs_async(user_id)
     if _is_welcome_message(query.message):
         await safe_send(lambda: query.message.edit_reply_markup(reply_markup=get_welcome_kb()))
@@ -27596,7 +27808,7 @@ async def _regenerate_tts_voice_with_progress(
             set_last_tts_text(user_id, original_text)
             record_turn(user_id, "assistant", original_text)
             _set_last_tts(user_id)
-            await progress.finish(final_text, delete_after_s=5.0)
+            await progress.finish(final_text, delete_after_s=1.5)
             return True
     except Exception as exc:
         logger.error("TTS regeneration failed: %s", exc, exc_info=True)
@@ -27655,6 +27867,8 @@ async def _cb_tts_model(query, user_id: int, context, data: str):
         _release_tts_request(user_id)
         raise
     model_label = TTS_MODEL_OPTIONS.get(model, TTS_MODEL_OPTIONS["auto"])[0]
+    with suppress(Exception):
+        await query.answer(f"🔄 កំពុងប្តូរទៅ {model_label}...")
     await _regenerate_tts_voice_with_progress(
         query=query,
         context=context,
@@ -27737,6 +27951,8 @@ async def _cb_speed(query, user_id: int, context, data: str):
     except BaseException:
         _release_tts_request(user_id)
         raise
+    with suppress(Exception):
+        await query.answer(f"🔄 កំពុងប្តូរល្បឿនទៅ {speed_label}...")
     await _regenerate_tts_voice_with_progress(
         query=query,
         context=context,
@@ -27783,6 +27999,8 @@ async def _cb_gender(query, user_id: int, context, data: str):
         _release_tts_request(user_id)
         raise
     gender_label = "ស្រី" if new_gender == "female" else "ប្រុស"
+    with suppress(Exception):
+        await query.answer(f"🔄 កំពុងប្តូរសំឡេងទៅ{gender_label}...")
     await _regenerate_tts_voice_with_progress(
         query=query,
         context=context,
@@ -27805,6 +28023,8 @@ async def _cb_tts_transcript(query, user_id: int, context, data: str):
         return
     if query.message is None:
         return
+    with suppress(Exception):
+        await query.answer("📢 កំពុងរៀបចំអានអត្ថបទ...")
     chat_id = int(query.message.chat.id)
     original_text, prefs = await asyncio.gather(
         get_text_cache_async(transcript_msg_id, chat_id),
@@ -27834,6 +28054,8 @@ async def _cb_audio_tts(query, user_id: int, context, data: str):
     if src_msg_id is None:
         await safe_send(lambda: query.message.reply_text("❌ លេខសម្គាល់អត្ថបទសំឡេងមិនត្រឹមត្រូវ។"))
         return
+    with suppress(Exception):
+        await query.answer("📢 កំពុងរៀបចំអានអត្ថបទអូឌីយ៉ូ...")
     chat_id = int(query.message.chat.id)
     full_text, prefs = await asyncio.gather(
         get_text_cache_async(src_msg_id, chat_id),

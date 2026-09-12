@@ -27,3 +27,11 @@ data/
 *.db
 *.sqlite
 *.sqlite3
+
+# Cache, checkpoints & temporary bundles
+.migration_checkpoint.jsonl
+*.checkpoint.jsonl
+*.tmp
+*.zip
+.DS_Store
+Thumbs.db

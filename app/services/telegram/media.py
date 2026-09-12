@@ -75,6 +75,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     _metric_inc("ocr")
+    await safe_send(lambda: context.bot.send_chat_action(chat_id=msg.chat_id, action="typing"))
     sync_user_data(user)
     uname = user.username or user.first_name or str(user_id)
     caption = (msg.caption or "").strip()
@@ -217,6 +218,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     _metric_inc("voice")
+    await safe_send(lambda: context.bot.send_chat_action(chat_id=msg.chat_id, action="typing"))
     sync_user_data(user)
     progress = await TelegramProgress.start(
         bot=context.bot,
@@ -350,6 +352,7 @@ async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _check_cooldown(msg, user_id):
         return
 
+    await safe_send(lambda: context.bot.send_chat_action(chat_id=msg.chat_id, action="typing"))
     sync_user_data(user)
     uname = user.username or user.first_name or str(user_id)
     ext = os.path.splitext(filename)[1].lower() if filename else ".mp3"
@@ -657,6 +660,7 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
     progress: TelegramProgress | None = None
     try:
         _metric_inc("tts", user_id=user_id)
+        await safe_send(lambda: context.bot.send_chat_action(chat_id=msg.chat_id, action="record_voice"))
         sync_user_data(user)
 
         loop = asyncio.get_running_loop()
@@ -682,13 +686,16 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
         # --- Fast Path: Instant Telegram CDN file_id Delivery (< 50ms, 0ms CPU, 0 VPS Bandwidth) ---
         cache_key = ""
         if len(tts_text) <= TTS_SINGLE_VOICE_MAX_CHARS:
-            cache_key = make_tts_audio_cache_key(
-                tts_text,
-                gender,
-                speed,
-                tts_model,
-                provider_context="",
-            )
+            if "_tts_audio_cache_key" in globals():
+                cache_key = _tts_audio_cache_key(tts_text, gender, speed, tts_model)
+            else:
+                cache_key = make_tts_audio_cache_key(
+                    tts_text,
+                    gender,
+                    speed,
+                    tts_model,
+                    provider_context="",
+                )
             cached_file_id = get_cached_telegram_file_id(cache_key)
             if cached_file_id:
                 logger.info("⚡ Instant TTS CDN cache hit for user %s (key=%s)", user_id, cache_key[:12])
@@ -759,7 +766,7 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
                 else:
                     await progress.finish(
                         f"✅ បានបង្កើត និងផ្ញើសំឡេងរួចរាល់ ({sent_count} ផ្នែក)។",
-                        delete_after_s=5.0,
+                        delete_after_s=1.5,
                     )
                 return
 
@@ -828,7 +835,7 @@ async def process_tts_for_text(update: Update, context: ContextTypes.DEFAULT_TYP
             record_turn(user_id, "user", stripped)
             record_turn(user_id, "assistant", tts_text)
             _set_last_tts(user_id)
-            await progress.finish("✅ បានបង្កើត និងផ្ញើសំឡេងរួចរាល់។", delete_after_s=5.0)
+            await progress.finish("✅ បានបង្កើត និងផ្ញើសំឡេងរួចរាល់។", delete_after_s=1.5)
     except Exception as exc:
         logger.error("on_text TTS error: %s", exc, exc_info=True)
         if progress is not None:

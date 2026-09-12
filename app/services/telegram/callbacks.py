@@ -824,6 +824,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cb_tts_transcript(query, user_id, context, data)
         elif action == "delete":
             with suppress(Exception):
+                await query.answer("🗑️ បានលុប")
+            with suppress(Exception):
                 await query.message.delete()
         elif action == "doc_read":
             await _cb_doc_read(query, user_id, context, data)

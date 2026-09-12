@@ -118,6 +118,7 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         ai_header = f"🤖 <b>AI Assistant:</b>\n\n{html.escape(ai_text)}"
         await safe_send(lambda: msg.reply_text(ai_header, parse_mode="HTML"))
+        await safe_send(lambda: context.bot.send_chat_action(chat_id=msg.chat_id, action="record_voice"))
 
         from app.services.telegram.media import process_tts_for_text
         await process_tts_for_text(update, context, ai_text, user_id)
@@ -173,6 +174,7 @@ async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         trans_header = f"🌐 <b>បកប្រែជាភាសាខ្មែរ:</b>\n\n{html.escape(khmer_text)}"
         await safe_send(lambda: msg.reply_text(trans_header, parse_mode="HTML"))
+        await safe_send(lambda: context.bot.send_chat_action(chat_id=msg.chat_id, action="record_voice"))
 
         from app.services.telegram.media import process_tts_for_text
         await process_tts_for_text(update, context, khmer_text, user_id)
@@ -228,6 +230,7 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         summary_header = f"📝 <b>សង្ខេបអត្ថបទ (Summary):</b>\n\n{html.escape(summary_text)}"
         await safe_send(lambda: msg.reply_text(summary_header, parse_mode="HTML"))
+        await safe_send(lambda: context.bot.send_chat_action(chat_id=msg.chat_id, action="record_voice"))
 
         from app.services.telegram.media import process_tts_for_text
         await process_tts_for_text(update, context, summary_text, user_id)
@@ -732,12 +735,60 @@ async def cmd_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @legacy_bound_handler
+async def cmd_dbstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin inspection of Supabase tables, row counts, and database health."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+
+    if not _is_admin(int(user.id)):
+        status_text = (
+            "🟢 <b>ស្ថានភាពទិន្នន័យ (Database Status)</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚡ <b>ស្ថានភាព:</b> ដំណើរការធម្មតា (Online 24/7)\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "💡 <i>សម្រាប់តែអ្នកគ្រប់គ្រងបូត (Admin only)</i>"
+        )
+        await safe_send(lambda: msg.reply_text(status_text, parse_mode="HTML"))
+        return
+
+    from app import legacy
+    text = await legacy._get_admin_db_text()
+    kb = legacy.get_admin_db_kb()
+    await safe_send(lambda: msg.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=kb,
+        disable_web_page_preview=True,
+    ))
+
+
+@legacy_bound_handler
+async def cmd_dbbackup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin on-demand database backup trigger."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+
+    if not _is_admin(int(user.id)):
+        await safe_send(lambda: msg.reply_text("⛔ <b>សិទ្ធិត្រូវបានបដិសេធ (Admin only)</b>", parse_mode="HTML"))
+        return
+
+    import asyncio
+    from app import legacy
+    asyncio.create_task(legacy._admin_trigger_backup(msg, user.id))
+
+
+@legacy_bound_handler
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Telegram /admin entry point with mobile shortcuts.
 
     Supported shortcuts:
       /admin compact, /admin health, /admin errors, /admin broadcast,
-      /admin report, /admin optimize, /admin users, /admin settings, /admin runtime, /admin needs
+      /admin report, /admin optimize, /admin users, /admin settings, /admin runtime, /admin needs,
+      /admin db, /admin backup
     """
     user_id = update.effective_user.id if update.effective_user else 0
     msg = update.effective_message
@@ -805,6 +856,12 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if arg in {"system", "metrics"}:
         await cmd_system(update, context)
+        return
+    if arg in {"db", "database", "supabase", "dbstatus"}:
+        await cmd_dbstatus(update, context)
+        return
+    if arg in {"backup", "dbbackup"}:
+        await cmd_dbbackup(update, context)
         return
     if arg in {"api", "apikeys"}:
         await cmd_api(update, context)
@@ -1160,6 +1217,8 @@ __all__ = [
     'cmd_cancelschedule',
     'cmd_chat',
     'cmd_clear',
+    'cmd_dbbackup',
+    'cmd_dbstatus',
     'cmd_delete_my_data',
     'cmd_endchat',
     'cmd_feature_request',
