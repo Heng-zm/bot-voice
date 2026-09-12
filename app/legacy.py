@@ -23872,6 +23872,7 @@ async def _cb_user_needs_admin(query, user_id: int, context: ContextTypes.DEFAUL
 
 
 _DB_STATUS_CACHE: dict[str, Any] = {"timestamp": 0.0, "text": ""}
+_PENDING_RESTORE_FILES: dict[str, str] = {}
 
 
 async def _get_admin_db_text(*, force: bool = False) -> str:
@@ -24155,17 +24156,29 @@ async def _admin_send_db_export(
             )
 
         if file_to_send and file_to_send.is_file():
-            bot = getattr(context, "bot", None) or getattr(target_msg, "bot", None)
-            chat_id = target_msg.chat_id if hasattr(target_msg, "chat_id") else user_id
-            if bot:
-                with file_to_send.open("rb") as f:
-                    await bot.send_document(
+            bot = (
+                getattr(context, "bot", None)
+                or getattr(target_msg, "bot", None)
+                or getattr(target_msg, "_bot", None)
+            )
+            chat_id = getattr(target_msg, "chat_id", None) or (target_msg.chat.id if hasattr(target_msg, "chat") and target_msg.chat else user_id)
+
+            with file_to_send.open("rb") as f:
+                if hasattr(target_msg, "reply_document"):
+                    await safe_send(lambda: target_msg.reply_document(
+                        document=f,
+                        filename=file_to_send.name,
+                        caption=caption,
+                        parse_mode="HTML",
+                    ))
+                elif bot:
+                    await safe_send(lambda: bot.send_document(
                         chat_id=chat_id,
                         document=f,
                         filename=file_to_send.name,
                         caption=caption,
                         parse_mode="HTML",
-                    )
+                    ))
             if status_msg:
                 await safe_send(lambda: status_msg.edit_text(
                     f"✅ <b>បានផ្ញើឯកសារ {icon} {label} រួចរាល់!</b>",
@@ -24348,16 +24361,24 @@ async def _admin_restore_file_action(
         return
 
     root_dir = Path(__file__).resolve().parent.parent if "app" in Path(__file__).resolve().parts else Path(__file__).resolve().parent
-    file_path = root_dir / "backups" / "imports" / filename
-    if not file_path.is_file():
+    file_path: Path | None = None
+    if filename in _PENDING_RESTORE_FILES:
+        file_path = Path(_PENDING_RESTORE_FILES[filename])
+    else:
+        candidate = root_dir / "backups" / "imports" / filename
+        if candidate.is_file():
+            file_path = candidate
+
+    if not file_path or not file_path.is_file():
         await safe_send(lambda: target_msg.reply_text(
             f"❌ រកមិនឃើញឯកសារ <code>{html.escape(filename)}</code> ឡើយ។",
             parse_mode="HTML",
         ))
         return
 
+    display_name = file_path.name
     status_msg = await safe_send(lambda: target_msg.reply_text(
-        f"⏳ <b>កំពុងនាំចូលទិន្នន័យពី <code>{html.escape(filename)}</code>...</b>\n\nសូមរង់ចាំបន្តិច...",
+        f"⏳ <b>កំពុងនាំចូលទិន្នន័យពី <code>{html.escape(display_name)}</code>...</b>\n\nសូមរង់ចាំបន្តិច...",
         parse_mode="HTML",
     ))
 
@@ -24365,7 +24386,7 @@ async def _admin_restore_file_action(
     try:
         if file_path.suffix.lower() == ".sql":
             res_text = (
-                f"ℹ️ <b>ឯកសារ SQL Dump: <code>{html.escape(filename)}</code></b>\n\n"
+                f"ℹ️ <b>ឯកសារ SQL Dump: <code>{html.escape(display_name)}</code></b>\n\n"
                 f"💡 សម្រាប់ឯកសារ PostgreSQL <code>.sql</code> សូមបើក Supabase Dashboard ➔ <b>SQL Editor</b> រួច Copy & Paste មាតិកាឯកសារនេះដើម្បី Execute ដោយសុវត្ថិភាព និងលឿនបំផុត។"
             )
         else:
@@ -24382,7 +24403,7 @@ async def _admin_restore_file_action(
             res_text = (
                 f"🎉 <b>បាននាំចូលទិន្នន័យ (Restore) ជោគជ័យ!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📁 <b>ឯកសារ:</b> <code>{html.escape(filename)}</code>\n"
+                f"📁 <b>ឯកសារ:</b> <code>{html.escape(display_name)}</code>\n"
                 f"📦 <b>ទិន្នន័យ:</b> <b>{restored:,} / {total:,}</b> កំណត់ត្រា\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"💡 <i>ទិន្នន័យត្រូវបានបញ្ចូលទៅក្នុង Supabase រួចរាល់។</i>"
@@ -26397,8 +26418,12 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"តើអ្នកចង់នាំចូល (Restore / Import) ឯកសារនេះទៅក្នុង Supabase Database ដែរឬទេ?\n"
             f"⚠️ <i>ទិន្នន័យនឹងត្រូវបញ្ចូលដោយស្វ័យប្រវត្តិ (Upsert: Merge Duplicates)។</i>"
         )
+        import uuid
+        restore_token = uuid.uuid4().hex[:12]
+        _PENDING_RESTORE_FILES[restore_token] = str(saved_file)
+
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📥 នាំចូលទិន្នន័យ (Restore)", callback_data=f"admin_db_restore_file:{saved_file.name}")],
+            [InlineKeyboardButton("📥 នាំចូលទិន្នន័យ (Restore)", callback_data=f"admin_db_restore_file:{restore_token}")],
             [InlineKeyboardButton("❌ បោះបង់", callback_data="admin_close")],
         ])
         await safe_send(lambda: msg.reply_text(prompt_text, parse_mode="HTML", reply_markup=kb))

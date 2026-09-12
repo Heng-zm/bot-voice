@@ -848,6 +848,58 @@ async def cmd_migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @legacy_bound_handler
+async def cmd_bakongstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin inspection of Bakong Open API connectivity, token validity, and merchant details."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+
+    if not _is_admin(int(user.id)):
+        await safe_send(lambda: msg.reply_text("⛔ <b>សិទ្ធិត្រូវបានបដិសេធ (Admin only)</b>", parse_mode="HTML"))
+        return
+
+    from app.services.donation import bakong_api
+    from app.services.donation.khqr import DEFAULT_BAKONG_ACCOUNT_ID, DEFAULT_BAKONG_MERCHANT_NAME
+
+    status_msg = await safe_send(lambda: msg.reply_text("⏳ <b>កំពុងធ្វើតេស្តការតភ្ជាប់ទៅ Bakong Open API Gateway...</b>", parse_mode="HTML"))
+
+    res = await bakong_api.test_connection()
+    token_info = bakong_api.decode_token_payload()
+
+    if res.get("ok"):
+        status_icon = "🟢"
+        conn_text = f"<b>ភ្ជាប់ជោគជ័យ (Connected)</b> — {res.get('latency_ms', 0)}ms"
+    else:
+        status_icon = "🔴"
+        conn_text = f"<b>បរាជ័យ (Failed)</b> — {html.escape(str(res.get('error') or res.get('message') or 'Unknown error'))}"
+
+    account_id = DEFAULT_BAKONG_ACCOUNT_ID
+    merchant_name = DEFAULT_BAKONG_MERCHANT_NAME
+    merchant_id = res.get("merchant_id") or token_info.get("merchant_id") or "N/A"
+    expires_at = res.get("expires_at") or token_info.get("expires_at") or "N/A"
+    is_exp = res.get("is_expired") or token_info.get("is_expired") or False
+    exp_badge = "⚠️ ផុតកំណត់ (Expired)" if is_exp else "✅ មានសុពលភាព (Valid)"
+
+    response_text = (
+        f"{status_icon} <b>ស្ថានភាព Bakong Open API Gateway</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚡ <b>ស្ថានភាពតភ្ជាប់:</b> {conn_text}\n"
+        f"👤 <b>Merchant Name:</b> <code>{html.escape(merchant_name)}</code>\n"
+        f"🆔 <b>Bakong ID:</b> <code>{html.escape(account_id)}</code>\n"
+        f"🏢 <b>Developer ID:</b> <code>{html.escape(merchant_id)}</code>\n"
+        f"📅 <b>កាលបរិច្ឆេទផុតកំណត់:</b> <code>{html.escape(expires_at)}</code> ({exp_badge})\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 <i>ប្រព័ន្ធផ្ទៀងផ្ទាត់ការបង់ប្រាក់ KHQR ដោយស្វ័យប្រវត្តិ (Real-time Auto Verification) កំពុងដំណើរការ 24/7។</i>"
+    )
+
+    if status_msg:
+        await safe_send(lambda: status_msg.edit_text(response_text, parse_mode="HTML"))
+    else:
+        await safe_send(lambda: msg.reply_text(response_text, parse_mode="HTML"))
+
+
+@legacy_bound_handler
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Telegram /admin entry point with mobile shortcuts.
 
@@ -933,6 +985,9 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if context.args:
             context.args = context.args[1:]
         await cmd_migrate(update, context)
+        return
+    if arg in {"bakong", "bakongstatus", "khqr"}:
+        await cmd_bakongstatus(update, context)
         return
     if arg in {"adddonor", "add_donor"}:
         from app.services.donation.handlers import cmd_adddonor
@@ -1289,6 +1344,7 @@ __all__ = [
     'cmd_admin',
     'cmd_api',
     'cmd_ask',
+    'cmd_bakongstatus',
     'cmd_botsettings',
     'cmd_cancel',
     'cmd_cancelschedule',

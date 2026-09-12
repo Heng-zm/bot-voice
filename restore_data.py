@@ -124,6 +124,11 @@ def load_rows_from_csv(csv_path: Path) -> list[dict[str, Any]]:
         for r in reader:
             parsed_row: dict[str, Any] = {}
             for k, v in r.items():
+                if k is None:
+                    continue
+                k = k.strip()
+                if not k:
+                    continue
                 if v == "" or v is None:
                     parsed_row[k] = None
                 elif v.lower() == "true":
@@ -133,6 +138,11 @@ def load_rows_from_csv(csv_path: Path) -> list[dict[str, Any]]:
                 elif (v.startswith("{") and v.endswith("}")) or (v.startswith("[") and v.endswith("]")):
                     try:
                         parsed_row[k] = json.loads(v)
+                    except Exception:
+                        parsed_row[k] = v
+                elif k in ("user_id", "chat_id", "message_id") and (v.isdigit() or (v.startswith("-") and v[1:].isdigit())):
+                    try:
+                        parsed_row[k] = int(v)
                     except Exception:
                         parsed_row[k] = v
                 else:
@@ -304,6 +314,33 @@ def restore_single_table(
     }
 
 
+class RestoreSummary(int):
+    """Integer return code (0=success, 1=failure) with rich restore statistics."""
+    success: bool
+    total_restored: int
+    total_backup: int
+    results: list[dict[str, Any]]
+    waves: int
+
+    def __new__(
+        cls,
+        code: int,
+        *,
+        success: bool = True,
+        total_restored: int = 0,
+        total_backup: int = 0,
+        results: list[dict[str, Any]] | None = None,
+        waves: int = 0,
+    ):
+        obj = super().__new__(cls, code)
+        obj.success = success
+        obj.total_restored = total_restored
+        obj.total_backup = total_backup
+        obj.results = results or []
+        obj.waves = waves
+        return obj
+
+
 def run_restore(
     backup_dir: Path,
     target_url: str,
@@ -342,12 +379,12 @@ def run_restore(
 
     if not backup_dir.is_dir():
         print(f"❌ Error: Backup directory not found: {backup_dir}")
-        return 1
+        return RestoreSummary(1, success=False)
 
     if not dry_run:
         print("\n🔍 Checking target database connectivity...")
         if not test_connection(target_url, target_key):
-            return 1
+            return RestoreSummary(1, success=False)
         print("  ✅ Target DB connected successfully")
     else:
         print("\nℹ️ Skipping target write validation (dry-run mode)")
@@ -358,7 +395,7 @@ def run_restore(
         active_graph = {k: v for k, v in active_graph.items() if k.lower() in valid}
         if not active_graph:
             print(f"❌ Error: No matching tables in filter: {tables_filter}")
-            return 1
+            return RestoreSummary(1, success=False)
 
     waves = get_dependency_waves(active_graph)
     total_tables = sum(len(w) for w in waves)
@@ -436,7 +473,14 @@ def run_restore(
         if verify:
             print("✅ Row counts verified against target PostgREST API.")
 
-    return 0
+    return RestoreSummary(
+        0,
+        success=True,
+        total_restored=total_restored,
+        total_backup=total_backup,
+        results=results,
+        waves=len(waves),
+    )
 
 
 def restore_single_table_from_rows(
@@ -488,14 +532,20 @@ def restore_from_file_or_dir(
 
     # Case A: Directory
     if path.is_dir():
-        code = run_restore(
+        summary = run_restore(
             backup_dir=path,
             target_url=target_url,
             target_key=target_key,
             dry_run=dry_run,
             timeout=timeout,
         )
-        return {"success": code == 0, "path": str(path), "type": "directory"}
+        return {
+            "success": summary == 0,
+            "path": str(path),
+            "type": "directory",
+            "total_rows": getattr(summary, "total_backup", 0),
+            "restored_rows": getattr(summary, "total_restored", 0),
+        }
 
     # Case B: ZIP Archive
     if path.suffix.lower() == ".zip":
@@ -503,14 +553,20 @@ def restore_from_file_or_dir(
             tmp_path = Path(tmpdir)
             with zipfile.ZipFile(path, "r") as zf:
                 zf.extractall(tmp_path)
-            code = run_restore(
+            summary = run_restore(
                 backup_dir=tmp_path,
                 target_url=target_url,
                 target_key=target_key,
                 dry_run=dry_run,
                 timeout=timeout,
             )
-            return {"success": code == 0, "path": str(path), "type": "zip"}
+            return {
+                "success": summary == 0,
+                "path": str(path),
+                "type": "zip",
+                "total_rows": getattr(summary, "total_backup", 0),
+                "restored_rows": getattr(summary, "total_restored", 0),
+            }
 
     # Case C: Single CSV or JSON file
     tbl = path.stem.lower()
@@ -518,9 +574,17 @@ def restore_from_file_or_dir(
         tbl = "scheduled_broadcasts"
 
     if tbl not in SCHEMA_GRAPH:
-        raise ValueError(
-            f"Filename '{path.name}' does not correspond to a known schema table ({', '.join(SCHEMA_GRAPH.keys())})"
-        )
+        matched = None
+        for k in SCHEMA_GRAPH:
+            if k in tbl:
+                matched = k
+                break
+        if matched:
+            tbl = matched
+        else:
+            raise ValueError(
+                f"Filename '{path.name}' does not correspond to a known schema table ({', '.join(SCHEMA_GRAPH.keys())})"
+            )
 
     if path.suffix.lower() == ".csv":
         rows = load_rows_from_csv(path)

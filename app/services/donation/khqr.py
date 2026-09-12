@@ -285,3 +285,8 @@ class BakongKHQR:
             reference_label=str(user_id),
         )
         return khqr, bill_no
+
+    @staticmethod
+    def get_md5(khqr_text: str) -> str:
+        """Compute the MD5 hash of the KHQR payload required by Bakong Open API."""
+        return hashlib.md5(khqr_text.encode("utf-8")).hexdigest()

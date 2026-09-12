@@ -33,6 +33,7 @@ from app.services.telegram.commands import (
     cmd_admin,
     cmd_api,
     cmd_ask,
+    cmd_bakongstatus,
     cmd_botsettings,
     cmd_cancel,
     cmd_cancelschedule,
@@ -129,6 +130,8 @@ def register_telegram_handlers(application: Application, *, bot_mode: str) -> No
         ("halloffame", cmd_donors),
         ("adddonor", cmd_adddonor),
         ("testblessing", cmd_testblessing),
+        ("bakongstatus", cmd_bakongstatus),
+        ("bakong", cmd_bakongstatus),
     )
     for command, callback in command_handlers:
         application.add_handler(CommandHandler(command, callback))

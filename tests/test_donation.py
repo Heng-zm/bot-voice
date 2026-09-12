@@ -3,10 +3,22 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import shutil
+import sys
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+if "httpx" not in sys.modules:
+    try:
+        import httpx  # noqa: F401
+    except ImportError:
+        sys.modules["httpx"] = MagicMock()
 
 from app.services.ai.gemini import normalize_gemini_model
 from app.services.donation.blessing import generate_blessing_script
@@ -532,6 +544,156 @@ class AddDonorWizardFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("បោះបង់", mock_query.message.edit_text.call_args[0][0])
 
 
+class BakongOpenApiTests(unittest.IsolatedAsyncioTestCase):
+    """Unit tests for Bakong Open API client, token decoding, and real-time payment auto-approval."""
+
+    SAMPLE_TOKEN = (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJkYXRhIjp7ImlkIjoiYjUyMDRmY2UwY2Q2NGE3OCJ9LCJpYXQiOjE3ODkxMDM2MjMsImV4cCI6MTc5Njg3OTYyM30."
+        "NrWjrH7dqOXoQTWYHJiU9p523NU72ywH6WV4Cb57bjw"
+    )
+
+    def test_decode_token_payload(self) -> None:
+        from app.services.donation.bakong_api import decode_token_payload
+
+        meta = decode_token_payload(self.SAMPLE_TOKEN)
+        self.assertTrue(meta.get("configured"))
+        self.assertEqual(meta.get("merchant_id"), "b5204fce0cd64a78")
+        self.assertFalse(meta.get("is_expired"))
+        self.assertIn("2026", meta.get("expires_at", ""))
+
+    async def test_check_transaction_by_md5_success(self) -> None:
+        from app.services.donation.bakong_api import check_transaction_by_md5
+
+        mock_resp = {
+            "responseCode": 0,
+            "responseMessage": "Success",
+            "data": {
+                "hash": "tx_hash_12345",
+                "amount": 2.0,
+                "currency": "USD",
+                "toAccountId": "chuo_kimheng@bkrt",
+            },
+        }
+
+        with patch("app.services.donation.bakong_api._execute_http_post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = (200, mock_resp)
+            res = await check_transaction_by_md5("d41d8cd98f00b204e9800998ecf8427e", token=self.SAMPLE_TOKEN)
+
+            self.assertTrue(res["success"])
+            self.assertEqual(res["response_code"], 0)
+            self.assertIsNotNone(res["data"])
+            self.assertEqual(res["data"]["hash"], "tx_hash_12345")
+
+    async def test_check_transaction_by_md5_not_found(self) -> None:
+        from app.services.donation.bakong_api import check_transaction_by_md5
+
+        mock_resp = {
+            "responseCode": 1,
+            "responseMessage": "Transaction could not be found.",
+            "data": None,
+        }
+
+        with patch("app.services.donation.bakong_api._execute_http_post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = (200, mock_resp)
+            res = await check_transaction_by_md5("d41d8cd98f00b204e9800998ecf8427e", token=self.SAMPLE_TOKEN)
+
+            self.assertFalse(res["success"])
+            self.assertEqual(res["response_code"], 1)
+            self.assertIsNone(res["data"])
+
+    async def test_verify_khqr_payment_hashes_correctly(self) -> None:
+        import hashlib
+        from app.services.donation.bakong_api import verify_khqr_payment
+
+        sample_khqr = "00020101021129370010bakong@nbc0119chuo_kimheng@bkrt5204599953038405802KH5912CHUO KIMHENG6010Phnom Penh6304ABCD"
+        expected_md5 = hashlib.md5(sample_khqr.encode("utf-8")).hexdigest()
+
+        with patch("app.services.donation.bakong_api.check_transaction_by_md5", new_callable=AsyncMock) as mock_check:
+            mock_check.return_value = {"success": True, "data": {"amount": 1.0}, "response_message": "Success"}
+            is_paid, data, msg = await verify_khqr_payment(sample_khqr, token=self.SAMPLE_TOKEN)
+
+            self.assertTrue(is_paid)
+            mock_check.assert_awaited_once_with(expected_md5, token=self.SAMPLE_TOKEN, timeout=12.0)
+
+    async def test_donate_paid_auto_approved_via_bakong(self) -> None:
+        from app.services.donation.handlers import donation_callback
+
+        mock_update = MagicMock()
+        mock_user = MagicMock()
+        mock_user.id = 12345678
+        mock_user.first_name = "Sophea"
+        mock_user.username = "sophea_kh"
+        mock_update.effective_user = mock_user
+
+        mock_query = MagicMock()
+        mock_query.data = "donate_paid:coffee:BILL123:1.00"
+        mock_query.answer = AsyncMock()
+        mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
+        mock_query.message = mock_msg
+        mock_update.callback_query = mock_query
+
+        mock_context = MagicMock()
+        mock_context.bot.send_message = AsyncMock()
+
+        with patch("app.services.donation.bakong_api.is_bakong_api_configured", return_value=True), \
+             patch("app.services.donation.bakong_api.check_transaction_by_md5", new_callable=AsyncMock) as mock_check, \
+             patch("app.services.donation.handlers.deliver_voice_blessing", new_callable=AsyncMock) as mock_voice, \
+             patch("app.services.donation.handlers.donation_store.record_donation", new_callable=AsyncMock) as mock_record:
+
+            mock_check.return_value = {
+                "success": True,
+                "response_code": 0,
+                "response_message": "Success",
+                "data": {"hash": "tx_paid_123"},
+            }
+            mock_voice.return_value = True
+
+            await donation_callback(mock_update, mock_context)
+
+            mock_record.assert_awaited_once()
+            mock_voice.assert_awaited_once()
+            mock_msg.reply_text.assert_awaited_once()
+            # Assert confirmation caption sent to donor
+            reply_text = mock_msg.reply_text.call_args[0][0]
+            self.assertIn("Bakong Open API (ស្វ័យប្រវត្តិ 100%)", reply_text)
+            self.assertIn("ផ្ទៀងផ្ទាត់ជោគជ័យ", reply_text)
+
+    async def test_cmd_bakongstatus_admin_output(self) -> None:
+        from app.services.telegram.commands import cmd_bakongstatus
+
+        mock_status_msg = MagicMock()
+        mock_status_msg.edit_text = AsyncMock()
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 123
+        mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock(return_value=mock_status_msg)
+        mock_update.effective_message = mock_msg
+        mock_context = MagicMock()
+
+        mock_res = {
+            "ok": True,
+            "latency_ms": 125.4,
+            "merchant_id": "b5204fce0cd64a78",
+            "expires_at": "2026-12-10 05:13:43 UTC",
+            "is_expired": False,
+            "message": "Connected",
+        }
+
+        with patch("app.legacy._is_admin", return_value=True), \
+             patch("app.services.donation.bakong_api.test_connection", new_callable=AsyncMock, return_value=mock_res):
+            await cmd_bakongstatus(mock_update, mock_context)
+
+        mock_msg.reply_text.assert_awaited()
+        mock_status_msg.edit_text.assert_awaited_once()
+        status_text = mock_status_msg.edit_text.call_args[0][0]
+        self.assertIn("Bakong Open API", status_text)
+        self.assertIn("b5204fce0cd64a78", status_text)
+        self.assertIn("Connected", status_text)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

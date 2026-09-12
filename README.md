@@ -264,6 +264,7 @@ GEMINI_API_KEY=your-gemini-api-key
 BAKONG_ACCOUNT_ID=chuo_kimheng@bkrt
 BAKONG_MERCHANT_NAME="CHUO KIMHENG"
 BAKONG_MERCHANT_CITY="Phnom Penh"
+BAKONG_OPEN_API_TOKEN="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
 ```
 
 ### 3. Launch the Bot
@@ -563,6 +564,17 @@ Bot Voice is **100% free to use**, with zero feature paywalls. The voluntary don
 - **Power-User One-Liner**: `/adddonor <user_id> <amount> [tier] [name]`.
 - **Clean State Teardown**: Automatically purges transient wizard state on `/cancel` or admin dashboard navigation.
 
+### 6. Real-Time Bakong Open API Auto-Verification & Diagnostics ([`app/services/donation/bakong_api.py`](app/services/donation/bakong_api.py))
+- **Direct NBC Gateway Integration**: Connects securely to the National Bank of Cambodia (NBC) Bakong Open API endpoint (`https://api-bakong.nbc.gov.kh/v1/check_transaction_by_md5`) with bearer JWT token authorization.
+- **Zero-Latency MD5 Hashing**: KHQR payment strings are hashed via MD5 upon generation and tracked in `_ACTIVE_BILLS` cache. When a donor taps `[ ✅ ខ្ញុំបានផ្ញើរួចរាល់ ]` (`donate_paid:`), the bot checks the payment status in real time.
+- **Automated Instant Approval**: When the NBC API confirms the transaction (`responseCode: 0`):
+  - Automatically records the donation in Supabase & local JSON cache.
+  - Generates and dispatches the personalized AI Khmer voice blessing immediately to the donor.
+  - Updates the Hall of Fame (`/donors`) leaderboard instantly.
+  - Sends a detailed notification receipt to the admin channel with donor username, amount, currency, and Bakong transaction hash.
+- **Graceful Retries & Admin Fallback**: If the transaction is still pending settlement, the bot offers the user a `[ 🔄 ផ្ទៀងផ្ទាត់ម្តងទៀត (Check Again) ]` button and alerts the admin with an inline `[ 🔍 ផ្ទៀងផ្ទាត់តាម Bakong API ]` one-click check alongside manual approval options.
+- **Live Diagnostics (`/bakongstatus` & `/admin bakong`)**: Admins can inspect the configured token, view the merchant ID, check remaining validity days, and measure live round-trip gateway latency in milliseconds.
+
 ## 🏗️ Architecture
 
 ```mermaid
@@ -667,6 +679,7 @@ bot-voice/
 │   │   ├── broadcast/                # Mass Messaging & Scheduled Announcements
 │   │   │   └── templates.py          # Broadcast layout templates & presets
 │   │   ├── donation/                 # ☕ Bakong KHQR & Recognition System
+│   │   │   ├── bakong_api.py         # ⚡ NBC Bakong Open API client & MD5 verification
 │   │   │   ├── blessing.py           # Studio Khmer AI voice blessing generator
 │   │   │   ├── handlers.py           # 🧙‍♂️ Step-by-step wizard, compact tokens & approvals
 │   │   │   ├── khqr.py               # EMVCo KHQR generator, CRC16 table & QR cache

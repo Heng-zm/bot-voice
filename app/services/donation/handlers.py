@@ -20,10 +20,12 @@ from app.services.donation.blessing import (
     deliver_voice_blessing,
     generate_voice_blessing,
 )
+from app.services.donation import bakong_api
 from app.services.donation.khqr import (
     DEFAULT_BAKONG_ACCOUNT_ID,
     DEFAULT_BAKONG_MERCHANT_NAME,
     BakongKHQR,
+    generate_khqr_string,
     get_khqr_qr_image,
 )
 from app.services.donation.store import TIER_DETAILS, donation_store
@@ -41,6 +43,10 @@ _APPROVALS_LOCK = threading.Lock()
 # Bounded store for pending approval tickets (guarantees callback_data <= 64 bytes)
 _PENDING_DONATIONS: dict[str, dict[str, Any]] = {}
 _PENDING_LOCK = threading.Lock()
+
+# Bounded in-memory store for active KHQR bill payloads (for fast MD5 lookup)
+_ACTIVE_BILLS: dict[str, dict[str, Any]] = {}
+_ACTIVE_BILLS_LOCK = threading.Lock()
 
 
 def _load_pending_tickets() -> None:
@@ -171,6 +177,22 @@ async def _send_khqr_screen(
     tier_short = tier_key[:8]
     bill_short = bill_no[:10]
     paid_cb = f"donate_paid:{tier_short}:{bill_short}:{amount:.2f}"
+
+    # Cache active bill payload and MD5 for instant Bakong Open API verification
+    khqr_md5 = BakongKHQR.get_md5(khqr_text)
+    with _ACTIVE_BILLS_LOCK:
+        if len(_ACTIVE_BILLS) > 300:
+            for k in list(_ACTIVE_BILLS.keys())[:100]:
+                _ACTIVE_BILLS.pop(k, None)
+        _ACTIVE_BILLS[bill_short] = {
+            "khqr_text": khqr_text,
+            "md5": khqr_md5,
+            "amount": amount,
+            "tier_key": tier_key,
+            "bill_no": bill_no,
+            "chat_id": chat_id,
+            "created_at": time.time(),
+        }
 
     action_buttons = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ ខ្ញុំបានផ្ទេរប្រាក់រួចរាល់", callback_data=paid_cb)],
@@ -740,6 +762,71 @@ async def cmd_testblessing(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await wait_msg.edit_text(f"❌ កំហុស៖ {e}")
 
 
+async def _execute_donation_approval(
+    *,
+    donor_uid: int,
+    amount: float,
+    tier_key: str,
+    bill_no: str,
+    ticket_id: str,
+    context: ContextTypes.DEFAULT_TYPE,
+    approved_by: str = "Admin",
+    notify_donor_text: str = "",
+) -> tuple[bool, str]:
+    """Execute shared donation approval, AI voice blessing delivery, and stats recording."""
+    dedup_key = f"{donor_uid}:{bill_no or ticket_id or amount}"
+    with _APPROVALS_LOCK:
+        if dedup_key in _PROCESSED_APPROVALS:
+            return False, "ALREADY_PROCESSED"
+        _PROCESSED_APPROVALS.add(dedup_key)
+
+    # Resolve donor's real name from Telegram
+    donor_name = "បង"
+    if context.bot:
+        with suppress(Exception):
+            chat = await context.bot.get_chat(donor_uid)
+            if chat and chat.first_name:
+                donor_name = chat.first_name
+
+    # 1. Record donation
+    await donation_store.record_donation(
+        user_id=donor_uid,
+        full_name=donor_name if donor_name != "បង" else f"Supporter *{str(donor_uid)[-4:]}",
+        amount=amount,
+        tier=tier_key,
+        blessing_sent=True,
+    )
+
+    # 2. Synthesize & Send Voice Blessing
+    blessing_ok = False
+    if context.bot:
+        blessing_ok = await deliver_voice_blessing(
+            context.bot,
+            user_id=donor_uid,
+            donor_name=donor_name,
+            tier=tier_key,
+            amount=amount,
+        )
+
+    # 3. Deliver optional direct notification to donor
+    if notify_donor_text and context.bot:
+        with suppress(Exception):
+            await context.bot.send_message(
+                chat_id=donor_uid,
+                text=notify_donor_text,
+                parse_mode="HTML",
+            )
+
+    # 4. Remove approved ticket from pending
+    if ticket_id:
+        with _PENDING_LOCK:
+            _PENDING_DONATIONS.pop(ticket_id, None)
+        _save_pending_tickets()
+
+    status_txt = "🎙️ បានផ្ញើសារសំឡេងជូនពររួចរាល់!" if blessing_ok else "⚠️ មិនអាចផ្ញើសំឡេងទៅ Telegram បានទេ"
+    return True, status_txt
+
+
 async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle interactive donation callbacks (tier selection, payment confirmation, admin approvals)."""
     query = update.callback_query
@@ -974,6 +1061,7 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     # -------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # 4. User clicks "I have paid"
     # -------------------------------------------------------------------------
     if data.startswith("donate_paid:"):
@@ -988,19 +1076,24 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         tier_info = TIER_DETAILS.get(tier_key, {})
         tier_title = tier_info.get("title", f"${amount:.2f}")
 
-        await query.answer("អរគុណបង! ប្រព័ន្ធកំពុងផ្ទៀងផ្ទាត់...", show_alert=False)
+        # Lookup cached bill metadata or reconstruct
+        bill_info = None
+        with _ACTIVE_BILLS_LOCK:
+            bill_info = _ACTIVE_BILLS.get(bill_no)
 
-        # Acknowledge to user
-        if query.message:
-            await query.message.reply_text(
-                f"🙏 <b>សូមអរគុណបង {user_name}!</b>\n\n"
-                f"ប្រព័ន្ធបានទទួលការជូនដំណឹងពីការឧបត្ថម្ភ <b>{tier_title} (${amount:.2f})</b> រួចរាល់ហើយ។\n"
-                f"បន្ទាប់ពីការផ្ទៀងផ្ទាត់ Bot នឹងផ្ញើសារសំឡេងអរគុណ និងជូនពរពិសេស (AI Voice Blessing) ជូនបងភ្លាមៗ! ❤️☕\n\n"
-                f"🏆 <i>ពិនិត្យមើលតារាងកិត្តិយស៖</i> /donors",
-                parse_mode="HTML",
+        if bill_info:
+            khqr_text = bill_info.get("khqr_text", "")
+            md5_hash = bill_info.get("md5", "")
+        else:
+            khqr_text = generate_khqr_string(
+                amount=amount,
+                currency="USD",
+                bill_number=bill_no,
+                reference_label=str(user_id),
             )
+            md5_hash = BakongKHQR.get_md5(khqr_text)
 
-        # Register compact ticket in memory (only ~18 bytes callback_data)
+        # Register ticket in memory
         ticket_id = f"t{int(time.time() * 1000) % 100000000:08x}"
         with _PENDING_LOCK:
             if len(_PENDING_DONATIONS) > 200:
@@ -1012,19 +1105,103 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 "tier_key": tier_key,
                 "bill_no": bill_no,
                 "user_name": user_name,
+                "md5": md5_hash,
+                "khqr_text": khqr_text,
+                "created_at": time.time(),
             }
         _save_pending_tickets()
 
+        # Check real-time via Bakong Open API if configured
+        is_paid = False
+        api_msg = ""
+        if bakong_api.is_bakong_api_configured() and md5_hash:
+            with suppress(Exception):
+                await query.answer("🔍 កំពុងផ្ទៀងផ្ទាត់ជាមួយ Bakong Open API...")
+            try:
+                res = await bakong_api.check_transaction_by_md5(md5_hash)
+                is_paid = bool(res.get("success"))
+                api_msg = res.get("response_message", "")
+            except Exception as exc:
+                logger.error("Bakong Open API check error for md5=%s: %s", md5_hash, exc)
+
+        if is_paid:
+            # AUTO-APPROVED VIA BAKONG OPEN API!
+            ok, status_txt = await _execute_donation_approval(
+                donor_uid=user_id,
+                amount=amount,
+                tier_key=tier_key,
+                bill_no=bill_no,
+                ticket_id=ticket_id,
+                context=context,
+                approved_by="Bakong Open API (Auto)",
+            )
+            success_caption = (
+                f"🎉 <b>ការផ្ទេរប្រាក់ត្រូវបានផ្ទៀងផ្ទាត់ជោគជ័យ!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"🙏 <b>សូមអរគុណបង {user_name}!</b>\n\n"
+                f"💵 <b>ចំនួនទឹកប្រាក់:</b> <b>${amount:.2f} USD</b> ({tier_title})\n"
+                f"🧾 <b>លេខវិក្កយបត្រ:</b> <code>{html.escape(bill_no)}</code>\n"
+                f"⚡ <b>ផ្ទៀងផ្ទាត់ដោយ:</b> <b>Bakong Open API (ស្វ័យប្រវត្តិ 100%)</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"🎙️ <i>Bot បានផ្ញើសារសំឡេងអរគុណ និងជូនពរពិសេស (AI Voice Blessing) ជូនបងរួចរាល់ហើយ! ❤️☕</i>\n\n"
+                f"🏆 <i>ពិនិត្យមើលតារាងកិត្តិយស៖</i> /donors"
+            )
+            success_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏆 តារាងកិត្តិយស (/donors)", callback_data="donate_halloffame")],
+                [InlineKeyboardButton("☕ ឧបត្ថម្ភបន្ថែម", callback_data="donate_menu")],
+            ])
+            if query.message:
+                with suppress(Exception):
+                    await query.message.reply_text(success_caption, parse_mode="HTML", reply_markup=success_kb)
+
+            # Notify admins of automated verification
+            username_text = f"@{html.escape(user.username)}" if user and user.username else "N/A"
+            admin_auto_msg = (
+                f"⚡ <b>[Bakong Open API] ការឧបត្ថម្ភត្រូវបានផ្ទៀងផ្ទាត់ដោយស្វ័យប្រវត្តិ!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 <b>សប្បុរសជន:</b> {user_name} ({username_text})\n"
+                f"🆔 <b>Telegram ID:</b> <code>{user_id}</code>\n"
+                f"💵 <b>ចំនួនទឹកប្រាក់:</b> <b>${amount:.2f} USD</b> ({tier_title})\n"
+                f"🧾 <b>លេខវិក្កយបត្រ:</b> <code>{html.escape(bill_no)}</code>\n"
+                f"⏰ <b>ម៉ោង:</b> {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"✅ <i>{status_txt} និងបានកត់ត្រាចូលក្នុងប្រព័ន្ធរួចរាល់។</i>"
+            )
+            for aid in get_admin_ids():
+                if context.bot:
+                    with suppress(Exception):
+                        await context.bot.send_message(chat_id=aid, text=admin_auto_msg, parse_mode="HTML")
+            return
+
+        # If not confirmed yet: notify user with retry button & notify admins with API check button
+        with suppress(Exception):
+            await query.answer("ប្រព័ន្ធកំពុងដំណើរការការផ្ទៀងផ្ទាត់...", show_alert=False)
+
+        user_pending_text = (
+            f"⏳ <b>មិនទាន់ឃើញប្រតិបត្តិការផ្ទេរប្រាក់នៅឡើយទេ</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"បង <b>{user_name}</b> ប្រសិនបើបងទើបតែបានផ្ទេរប្រាក់តាម App ធនាគារ សូមរង់ចាំប្រហែល 5–10 វិនាទី រួចចុចប៊ូតុង <b>«🔄 ផ្ទៀងផ្ទាត់ម្តងទៀត»</b> ខាងក្រោម។\n\n"
+            f"💵 <b>កញ្ចប់:</b> {tier_title} (${amount:.2f})\n"
+            f"🧾 <b>វិក្កយបត្រ:</b> <code>{html.escape(bill_no)}</code>\n\n"
+            f"💡 <i>ឬបងអាចរង់ចាំ Admin ពិនិត្យដោយផ្ទាល់។ នៅពេលផ្ទៀងផ្ទាត់រួចរាល់ Bot នឹងផ្ញើសំឡេងជូនពរជូនភ្លាមៗ! ❤️</i>"
+        )
+        user_pending_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 ផ្ទៀងផ្ទាត់ម្តងទៀត (Check Again)", callback_data=f"donate_recheck:{ticket_id}")],
+            [InlineKeyboardButton("🔙 ត្រឡប់ទៅម៉ឺនុយដើម", callback_data="donate_menu")],
+        ])
+        if query.message:
+            with suppress(Exception):
+                await query.message.reply_text(user_pending_text, parse_mode="HTML", reply_markup=user_pending_kb)
+
         admin_markup = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton(
-                    "💖 អនុម័ត & ផ្ញើសំឡេងជូនពរ",
-                    callback_data=f"donate_appr:{ticket_id}",
-                ),
+                InlineKeyboardButton("🔍 ផ្ទៀងផ្ទាត់តាម Bakong API", callback_data=f"donate_api_check:{ticket_id}"),
+            ],
+            [
+                InlineKeyboardButton("💖 អនុម័តដោយដៃ (Manual)", callback_data=f"donate_appr:{ticket_id}"),
                 InlineKeyboardButton("❌ បដិសេធ", callback_data=f"donate_rej:{ticket_id}"),
             ],
         ])
-
         username_text = f"@{html.escape(user.username)}" if user and user.username else "N/A"
         admin_notification = (
             f"🎉 <b>មានការជូនដំណឹងឧបត្ថម្ភថ្មី!</b>\n"
@@ -1036,25 +1213,153 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             f"🧾 <b>វិក្កយបត្រ:</b> <code>{html.escape(bill_no)}</code>\n"
             f"⏰ <b>ម៉ោង:</b> {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
-            f"សូមពិនិត្យគណនីធនាគារ Bakong/ABA របស់បង រួចចុចប៊ូតុងខាងក្រោមដើម្បីអនុម័ត៖"
+            f"💡 <i>ចុចប៊ូតុងខាងក្រោមដើម្បីពិនិត្យតាម Bakong API ឬអនុម័តដោយផ្ទាល់៖</i>"
         )
-
-        admin_ids = get_admin_ids()
-        for aid in admin_ids:
-            try:
-                if context.bot:
+        for aid in get_admin_ids():
+            if context.bot:
+                with suppress(Exception):
                     await context.bot.send_message(
                         chat_id=aid,
                         text=admin_notification,
                         reply_markup=admin_markup,
                         parse_mode="HTML",
                     )
-            except Exception as e:
-                logger.warning("Failed to notify admin %s of donation: %s", aid, e)
         return
 
     # -------------------------------------------------------------------------
-    # 5. Admin Approves Donation (supports both donate_appr: and donate_approve:)
+    # 4b. Donor retries verification via Bakong Open API
+    # -------------------------------------------------------------------------
+    if data.startswith("donate_recheck:"):
+        ticket_id = data.split(":", 1)[1].strip()
+        with _PENDING_LOCK:
+            info = _PENDING_DONATIONS.get(ticket_id)
+        if not info:
+            await query.answer("⚠️ ព័ត៌មាននេះផុតកំណត់ ឬត្រូវបានអនុម័តរួចរាល់ហើយ!", show_alert=True)
+            return
+
+        donor_uid = int(info["user_id"])
+        amount = float(info["amount"])
+        tier_key = str(info["tier_key"])
+        bill_no = str(info["bill_no"])
+        md5_hash = str(info.get("md5") or "")
+        khqr_text = str(info.get("khqr_text") or "")
+        tier_info = TIER_DETAILS.get(tier_key, {})
+        tier_title = tier_info.get("title", f"${amount:.2f}")
+
+        if not md5_hash and khqr_text:
+            md5_hash = BakongKHQR.get_md5(khqr_text)
+
+        await query.answer("🔍 កំពុងផ្ទៀងផ្ទាត់ជាមួយ Bakong Open API...")
+
+        is_paid = False
+        api_msg = ""
+        if md5_hash and bakong_api.is_bakong_api_configured():
+            try:
+                res = await bakong_api.check_transaction_by_md5(md5_hash)
+                is_paid = bool(res.get("success"))
+                api_msg = res.get("response_message", "")
+            except Exception as exc:
+                logger.error("Bakong Open API recheck error for md5=%s: %s", md5_hash, exc)
+
+        if is_paid:
+            ok, status_txt = await _execute_donation_approval(
+                donor_uid=donor_uid,
+                amount=amount,
+                tier_key=tier_key,
+                bill_no=bill_no,
+                ticket_id=ticket_id,
+                context=context,
+                approved_by="Bakong Open API (Donor Retry)",
+            )
+            success_caption = (
+                f"🎉 <b>ការផ្ទេរប្រាក់ត្រូវបានផ្ទៀងផ្ទាត់ជោគជ័យ!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"🙏 <b>សូមអរគុណបង {user_name}!</b>\n\n"
+                f"💵 <b>ចំនួនទឹកប្រាក់:</b> <b>${amount:.2f} USD</b> ({tier_title})\n"
+                f"🧾 <b>លេខវិក្កយបត្រ:</b> <code>{html.escape(bill_no)}</code>\n"
+                f"⚡ <b>ផ្ទៀងផ្ទាត់ដោយ:</b> <b>Bakong Open API (ស្វ័យប្រវត្តិ 100%)</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"🎙️ <i>Bot បានផ្ញើសារសំឡេងអរគុណ និងជូនពរពិសេស (AI Voice Blessing) ជូនបងរួចរាល់ហើយ! ❤️☕</i>\n\n"
+                f"🏆 <i>ពិនិត្យមើលតារាងកិត្តិយស៖</i> /donors"
+            )
+            success_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏆 តារាងកិត្តិយស (/donors)", callback_data="donate_halloffame")],
+                [InlineKeyboardButton("☕ ឧបត្ថម្ភបន្ថែម", callback_data="donate_menu")],
+            ])
+            if query.message:
+                with suppress(Exception):
+                    await query.message.edit_text(success_caption, parse_mode="HTML", reply_markup=success_kb)
+            return
+        else:
+            await query.answer(
+                "⚠️ ប្រព័ន្ធ Bakong នៅតែមិនទាន់ឃើញប្រតិបត្តិការនេះទេ។ សូមរង់ចាំបន្តិច ឬរង់ចាំ Admin ពិនិត្យដោយដៃ។",
+                show_alert=True,
+            )
+            return
+
+    # -------------------------------------------------------------------------
+    # 4c. Admin checks transaction via Bakong Open API
+    # -------------------------------------------------------------------------
+    if data.startswith("donate_api_check:"):
+        if not is_admin_user(user_id):
+            await query.answer("⛔ មានតែ Admin ប៉ុណ្ណោះដែលអាចប្រើបាន!", show_alert=True)
+            return
+        ticket_id = data.split(":", 1)[1].strip()
+        with _PENDING_LOCK:
+            info = _PENDING_DONATIONS.get(ticket_id)
+        if not info:
+            await query.answer("⚠️ សំណើនេះផុតកំណត់ ឬត្រូវបានអនុម័តរួចរាល់ហើយ!", show_alert=True)
+            return
+
+        donor_uid = int(info["user_id"])
+        amount = float(info["amount"])
+        tier_key = str(info["tier_key"])
+        bill_no = str(info["bill_no"])
+        md5_hash = str(info.get("md5") or "")
+        khqr_text = str(info.get("khqr_text") or "")
+        tier_info = TIER_DETAILS.get(tier_key, {})
+        tier_title = tier_info.get("title", f"${amount:.2f}")
+
+        if not md5_hash and khqr_text:
+            md5_hash = BakongKHQR.get_md5(khqr_text)
+
+        await query.answer("🔍 កំពុងពិនិត្យតាម Bakong Open API...")
+
+        res = await bakong_api.check_transaction_by_md5(md5_hash) if md5_hash else {"success": False, "response_message": "No MD5"}
+        if res.get("success"):
+            ok, status_txt = await _execute_donation_approval(
+                donor_uid=donor_uid,
+                amount=amount,
+                tier_key=tier_key,
+                bill_no=bill_no,
+                ticket_id=ticket_id,
+                context=context,
+                approved_by=f"Admin {user_id} via Bakong API",
+                notify_donor_text=(
+                    f"🎉 <b>ការផ្ទេរប្រាក់ត្រូវបានផ្ទៀងផ្ទាត់ជោគជ័យតាម Bakong Open API!</b>\n\n"
+                    f"💵 <b>ចំនួន:</b> ${amount:.2f} USD ({tier_title})\n"
+                    f"🧾 <b>វិក្កយបត្រ:</b> <code>{html.escape(bill_no)}</code>\n\n"
+                    f"🎙️ <i>Bot បានផ្ញើសារសំឡេងអរគុណ និងជូនពរពិសេសជូនបងរួចរាល់ហើយ! ❤️☕</i>"
+                ),
+            )
+            if query.message:
+                orig_text = html.escape(query.message.text or "")
+                with suppress(Exception):
+                    await query.message.edit_text(
+                        f"{orig_text}\n\n"
+                        f"⚡ <b>បានផ្ទៀងផ្ទាត់ជោគជ័យតាម Bakong Open API!</b>\n"
+                        f"{status_txt}\n"
+                        f"🏆 បានបញ្ចូលក្នុងតារាងកិត្តិយស (/donors)!",
+                        parse_mode="HTML",
+                    )
+            return
+        else:
+            err_msg = res.get("response_message") or "Transaction not found"
+            await query.answer(f"⚠️ មិនទាន់ឃើញប្រតិបត្តិការក្នុង Bakong ទេ: {err_msg}", show_alert=True)
+            return
+
+    # -------------------------------------------------------------------------
+    # 5. Admin Approves Donation Manually (supports both donate_appr: and donate_approve:)
     # -------------------------------------------------------------------------
     if data.startswith("donate_appr:") or data.startswith("donate_approve:"):
         if not is_admin_user(user_id):
@@ -1087,59 +1392,30 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             tier_key = parts[2] if len(parts) > 2 else "coffee"
             bill_no = parts[3] if len(parts) > 3 else f"{donor_uid}_{amount}"
 
-        # Deduplication guard: ensure donation is processed only once
-        dedup_key = f"{donor_uid}:{bill_no or ticket_id or amount}"
-        with _APPROVALS_LOCK:
-            if dedup_key in _PROCESSED_APPROVALS:
-                await query.answer("⚠️ ការឧបត្ថម្ភនេះត្រូវបានអនុម័តរួចរាល់ហើយ!", show_alert=True)
-                if query.message:
-                    orig_text = html.escape(query.message.text or "")
-                    with suppress(Exception):
-                        await query.message.edit_text(
-                            f"{orig_text}\n\n"
-                            f"ℹ️ <b>ការឧបត្ថម្ភនេះត្រូវបានអនុម័តរួចរាល់ជាស្ថាពរហើយ។</b>",
-                            parse_mode="HTML",
-                        )
-                return
-            _PROCESSED_APPROVALS.add(dedup_key)
-
         await query.answer("កំពុងអនុម័ត និងបង្កើតសំឡេងជូនពរ...")
 
-        # Resolve donor's real name from Telegram
-        donor_name = "បង"
-        if context.bot:
-            with suppress(Exception):
-                chat = await context.bot.get_chat(donor_uid)
-                if chat and chat.first_name:
-                    donor_name = chat.first_name
-
-        # 1. Record donation
-        await donation_store.record_donation(
-            user_id=donor_uid,
-            full_name=donor_name if donor_name != "បង" else f"Supporter *{str(donor_uid)[-4:]}",
+        ok, status_txt = await _execute_donation_approval(
+            donor_uid=donor_uid,
             amount=amount,
-            tier=tier_key,
-            blessing_sent=True,
+            tier_key=tier_key,
+            bill_no=bill_no,
+            ticket_id=ticket_id,
+            context=context,
+            approved_by=f"Admin {user_id} (Manual)",
         )
 
-        # 2. Synthesize & Send Voice Blessing
-        blessing_ok = False
-        if context.bot:
-            blessing_ok = await deliver_voice_blessing(
-                context.bot,
-                user_id=donor_uid,
-                donor_name=donor_name,
-                tier=tier_key,
-                amount=amount,
-            )
+        if not ok and status_txt == "ALREADY_PROCESSED":
+            await query.answer("⚠️ ការឧបត្ថម្ភនេះត្រូវបានអនុម័តរួចរាល់ហើយ!", show_alert=True)
+            if query.message:
+                orig_text = html.escape(query.message.text or "")
+                with suppress(Exception):
+                    await query.message.edit_text(
+                        f"{orig_text}\n\n"
+                        f"ℹ️ <b>ការឧបត្ថម្ភនេះត្រូវបានអនុម័តរួចរាល់ជាស្ថាពរហើយ។</b>",
+                        parse_mode="HTML",
+                    )
+            return
 
-        # Remove approved ticket from pending
-        if ticket_id:
-            with _PENDING_LOCK:
-                _PENDING_DONATIONS.pop(ticket_id, None)
-            _save_pending_tickets()
-
-        status_txt = "🎙️ បានផ្ញើសារសំឡេងជូនពររួចរាល់!" if blessing_ok else "⚠️ មិនអាចផ្ញើសំឡេងទៅ Telegram បានទេ"
         if query.message:
             orig_text = html.escape(query.message.text or "")
             with suppress(Exception):
