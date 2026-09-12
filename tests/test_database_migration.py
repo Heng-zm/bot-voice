@@ -23,6 +23,10 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+_venv_site = Path(r"F:\ai project\bot-voice\.venv\Lib\site-packages")
+if _venv_site.exists() and str(_venv_site) not in sys.path:
+    sys.path.append(str(_venv_site))
+
 # Provide lightweight shims for test environments missing optional server dependencies
 import types
 if "httpx" not in sys.modules:

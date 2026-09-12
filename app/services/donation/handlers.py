@@ -122,52 +122,66 @@ def _build_donation_menu_markup(currency: str = "USD") -> InlineKeyboardMarkup:
     if is_khr:
         buttons = [
             [
-                InlineKeyboardButton("☕ 4,000៛ កាហ្វេ ១ កែវ", callback_data="donate_tier:coffee_khr"),
-                InlineKeyboardButton("🧋 8,000៛ តែទឹកដោះគោ", callback_data="donate_tier:milktea_khr"),
+                InlineKeyboardButton("☕ 4,000៛ · កាហ្វេ", callback_data="donate_tier:coffee_khr"),
+                InlineKeyboardButton("🧋 8,000៛ · តែដោះគោ", callback_data="donate_tier:milktea_khr"),
             ],
             [
-                InlineKeyboardButton("🍜 12,000៛ គុយទាវ ១ ចាន", callback_data="donate_tier:lunch_khr"),
-                InlineKeyboardButton("🖥️ 20,000៛ ថ្លៃ Server", callback_data="donate_tier:server_khr"),
+                InlineKeyboardButton("🍜 12,000៛ · គុយទាវ", callback_data="donate_tier:lunch_khr"),
+                InlineKeyboardButton("🖥️ 20,000៛ · Server", callback_data="donate_tier:server_khr"),
             ],
             [
-                InlineKeyboardButton("🌟 40,000៛ ឧបត្ថម្ភពិសេស", callback_data="donate_tier:patron_khr"),
-                InlineKeyboardButton("💎 80,000៛ អ្នកគាំទ្រឆ្នើម", callback_data="donate_tier:gold_khr"),
+                InlineKeyboardButton("🌟 40,000៛ · ពិសេស", callback_data="donate_tier:patron_khr"),
+                InlineKeyboardButton("💎 80,000៛ · ឆ្នើម", callback_data="donate_tier:gold_khr"),
             ],
             [
-                InlineKeyboardButton("💵 ប្តូរទៅប្រាក់ដុល្លារ (Switch to USD)", callback_data="donate_curr:USD"),
+                InlineKeyboardButton("💵 ប្តូរទៅប្រាក់ដុល្លារ ($ USD)", callback_data="donate_curr:USD"),
             ],
             [
-                InlineKeyboardButton("🏆 តារាងកិត្តិយស (Hall of Fame)", callback_data="donate_halloffame"),
-            ],
-            [
-                InlineKeyboardButton("🔙 ត្រឡប់ទៅម៉ឺនុយដើម", callback_data="donate_close"),
+                InlineKeyboardButton("🏆 តារាងកិត្តិយស", callback_data="donate_halloffame"),
+                InlineKeyboardButton("❌ បិទ", callback_data="donate_close"),
             ],
         ]
     else:
         buttons = [
             [
-                InlineKeyboardButton("☕ $1.00 កាហ្វេ ១ កែវ", callback_data="donate_tier:coffee"),
-                InlineKeyboardButton("🧋 $2.00 តែទឹកដោះគោ", callback_data="donate_tier:milktea"),
+                InlineKeyboardButton("☕ $1.00 · កាហ្វេ", callback_data="donate_tier:coffee"),
+                InlineKeyboardButton("🧋 $2.00 · តែដោះគោ", callback_data="donate_tier:milktea"),
             ],
             [
-                InlineKeyboardButton("🍜 $3.00 គុយទាវ ១ ចាន", callback_data="donate_tier:lunch"),
-                InlineKeyboardButton("🖥️ $5.00 ថ្លៃ Server", callback_data="donate_tier:server"),
+                InlineKeyboardButton("🍜 $3.00 · គុយទាវ", callback_data="donate_tier:lunch"),
+                InlineKeyboardButton("🖥️ $5.00 · Server", callback_data="donate_tier:server"),
             ],
             [
-                InlineKeyboardButton("🌟 $10.00 ឧបត្ថម្ភពិសេស", callback_data="donate_tier:patron"),
-                InlineKeyboardButton("💎 $20.00 អ្នកគាំទ្រឆ្នើម", callback_data="donate_tier:gold"),
+                InlineKeyboardButton("🌟 $10.00 · ពិសេស", callback_data="donate_tier:patron"),
+                InlineKeyboardButton("💎 $20.00 · ឆ្នើម", callback_data="donate_tier:gold"),
             ],
             [
-                InlineKeyboardButton("🇰🇭 ប្តូរទៅប្រាក់រៀល (Switch to KHR)", callback_data="donate_curr:KHR"),
+                InlineKeyboardButton("🇰🇭 ប្តូរទៅប្រាក់រៀល (៛ KHR)", callback_data="donate_curr:KHR"),
             ],
             [
-                InlineKeyboardButton("🏆 តារាងកិត្តិយស (Hall of Fame)", callback_data="donate_halloffame"),
-            ],
-            [
-                InlineKeyboardButton("🔙 ត្រឡប់ទៅម៉ឺនុយដើម", callback_data="donate_close"),
+                InlineKeyboardButton("🏆 តារាងកិត្តិយស", callback_data="donate_halloffame"),
+                InlineKeyboardButton("❌ បិទ", callback_data="donate_close"),
             ],
         ]
     return InlineKeyboardMarkup(buttons)
+
+
+def _get_donation_menu_text(user_name: str) -> str:
+    """Standardized clean donation menu presentation text."""
+    return (
+        f"☕ <b>ឧបត្ថម្ភគាំទ្រ Bot Voice</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"សួស្តីបង <b>{user_name}</b>! Bot Voice បម្រើបងប្អូនខ្មែរក្នុងការបម្លែងអត្ថបទជាសំឡេង (Khmer TTS) "
+        f"និងឆ្លើយសំណួរ AI ដោយឥតគិតថ្លៃ។\n\n"
+        f"ការឧបត្ថម្ភកាហ្វេ ១ កែវ ឬជួយថ្លៃ Server ជួយឱ្យ Bot ដំណើរការលឿន ឥតគាំង និងបន្តអភិវឌ្ឍមុខងារថ្មីៗជានិច្ច! 💖\n\n"
+        f"🎁 <b>រាល់ការឧបត្ថម្ភទទួលបាន៖</b>\n"
+        f"• 🎙️ សារសំឡេងអរគុណ & ជូនពរពិសេស (AI Voice Blessing)\n"
+        f"• 🏆 ឈ្មោះក្នុងតារាងកិត្តិយស (/donors)\n"
+        f"• 🏅 Badge កិត្តិយស (🥇, 🥈, 🥉, ⭐ Supporter)\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"👇 <b>សូមជ្រើសរើសចំនួនទឹកប្រាក់ឧបត្ថម្ភ៖</b>\n"
+        f"<i>(ឬវាយបញ្ជាផ្ទាល់: <code>/donate 5</code>)</i>"
+    )
 
 
 async def _send_khqr_screen(
@@ -179,6 +193,7 @@ async def _send_khqr_screen(
     tier_title: str,
     context: ContextTypes.DEFAULT_TYPE,
     currency: str = "USD",
+    query: Any = None,
 ) -> None:
     """Reusable generator and sender for Bakong KHQR payment interface with NBC 1-Tap Deeplink."""
     cfg = get_khqr_config()
@@ -257,9 +272,17 @@ async def _send_khqr_screen(
             InlineKeyboardButton("📲 បង់ប្រាក់តាម App ធនាគារ (1-Tap Pay)", url=deeplink_data["shortLink"])
         ])
     button_rows.append([InlineKeyboardButton("✅ ខ្ញុំបានផ្ទេរប្រាក់រួចរាល់", callback_data=paid_cb)])
-    button_rows.append([InlineKeyboardButton("🔙 ជ្រើសរើសចំនួនផ្សេង", callback_data="donate_menu")])
+    button_rows.append([
+        InlineKeyboardButton("🔙 ជ្រើសរើសចំនួនផ្សេង", callback_data="donate_menu"),
+        InlineKeyboardButton("❌ បិទ", callback_data="donate_close"),
+    ])
 
     action_buttons = InlineKeyboardMarkup(button_rows)
+
+    # Delete previous menu message to keep the chat interface clean and avoid message stacking
+    if query and getattr(query, "message", None):
+        with suppress(Exception):
+            await query.message.delete()
 
     qr_bytes = await get_khqr_qr_image(khqr_text)
     if qr_bytes and context.bot:
@@ -329,23 +352,8 @@ async def cmd_donate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             pass
 
     # Standard donation menu
-    text = (
-        f"☕ <b>សូមស្វាគមន៍មកកាន់ការឧបត្ថម្ភ Bot Voice!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"សួស្តីបង <b>{user_name}</b>! Bot Voice ត្រូវបានបង្កើតឡើងដើម្បីបម្រើបងប្អូនខ្មែរក្នុងការបម្លែងអត្ថបទជាសំឡេង (Khmer TTS) "
-        f"និងឆ្លើយសំណួរ AI ដោយឥតគិតថ្លៃ ១០០%។\n\n"
-        f"ការឧបត្ថម្ភកាហ្វេ ១ កែវ ឬជួយថ្លៃ Server របស់បង គឺជាកម្លាំងចិត្តដ៏ធំធេង និងជួយទ្រទ្រង់ឱ្យ Bot ដំណើរការបានលឿន ឥតគាំង និងមានមុខងារថ្មីៗជានិច្ច! 💖\n\n"
-        f"✨ <b>រាល់ការឧបត្ថម្ភ បងនឹងទទួលបាន៖</b>\n"
-        f"🎙️ <b>សារសំឡេងអរគុណ និងជូនពរពិសេស</b> (AI Voice Blessing) ផ្ទាល់ខ្លួន\n"
-        f"🏆 <b>ឈ្មោះក្នុងតារាងកិត្តិយស</b> (/donors — Hall of Fame)\n"
-        f"🏅 <b>Badge កិត្តិយស</b> (🥇, 🥈, 🥉, ⭐ Supporter)\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"👇 <b>សូមជ្រើសរើសចំនួនដែលបងចង់ឧបត្ថម្ភ៖</b>\n"
-        f"<i>(ឬវាយ <code>/donate ចំនួនទឹកប្រាក់</code> ឧទាហរណ៍ <code>/donate 5</code>)</i>"
-    )
-
     await msg.reply_text(
-        text,
+        _get_donation_menu_text(user_name),
         reply_markup=_build_donation_menu_markup(),
         parse_mode="HTML",
     )
@@ -410,11 +418,11 @@ async def cmd_donors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("☕ ចូលរួមឧបត្ថម្ភ / Buy Coffee", callback_data="donate_menu"),
-            InlineKeyboardButton("🔄 ធ្វើបច្ចុប្បន្នភាព / Refresh", callback_data="donate_halloffame_refresh"),
+            InlineKeyboardButton("☕ ចូលរួមឧបត្ថម្ភ", callback_data="donate_menu"),
+            InlineKeyboardButton("🔄 Refresh", callback_data="donate_halloffame_refresh"),
         ],
         [
-            InlineKeyboardButton("🔙 ត្រឡប់ទៅម៉ឺនុយដើម", callback_data="donate_close"),
+            InlineKeyboardButton("❌ បិទ", callback_data="donate_close"),
         ],
     ])
 
@@ -1058,12 +1066,7 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # -------------------------------------------------------------------------
     if data == "donate_menu":
         await query.answer()
-        text = (
-            f"☕ <b>សូមស្វាគមន៍មកកាន់ការឧបត្ថម្ភ Bot Voice!</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"ការឧបត្ថម្ភរបស់បង <b>{user_name}</b> ជួយឱ្យ Bot ដំណើរការបានលឿន ឥតគាំង និងឥតគិតថ្លៃសម្រាប់បងប្អូនខ្មែរទាំងអស់! 💖\n\n"
-            f"👇 <b>សូមជ្រើសរើសចំនួនដែលបងចង់ឧបត្ថម្ភ៖</b>"
-        )
+        text = _get_donation_menu_text(user_name)
         if query.message:
             if query.message.photo:
                 with suppress(Exception):
@@ -1083,11 +1086,15 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     parse_mode="HTML",
                 )
             except Exception:
-                await query.message.reply_text(
-                    text,
-                    reply_markup=_build_donation_menu_markup(),
-                    parse_mode="HTML",
-                )
+                with suppress(Exception):
+                    await query.message.delete()
+                if context.bot:
+                    await context.bot.send_message(
+                        chat_id=target_chat_id,
+                        text=text,
+                        reply_markup=_build_donation_menu_markup(),
+                        parse_mode="HTML",
+                    )
         return
 
     # -------------------------------------------------------------------------
@@ -1113,10 +1120,8 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         curr_label = "ប្រាក់រៀល (KHR)" if curr == "KHR" else "ប្រាក់ដុល្លារ (USD)"
         await query.answer(f"បានប្តូរទៅ {curr_label}")
         if query.message:
-            try:
+            with suppress(Exception):
                 await query.message.edit_reply_markup(reply_markup=keyboard)
-            except Exception:
-                pass
         return
 
     # -------------------------------------------------------------------------
@@ -1146,6 +1151,7 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             tier_title=tier_title,
             context=context,
             currency=currency,
+            query=query,
         )
         return
 
@@ -1276,7 +1282,10 @@ async def donation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         user_pending_kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 ផ្ទៀងផ្ទាត់ម្តងទៀត (Check Again)", callback_data=f"donate_recheck:{ticket_id}")],
-            [InlineKeyboardButton("🔙 ត្រឡប់ទៅម៉ឺនុយដើម", callback_data="donate_menu")],
+            [
+                InlineKeyboardButton("🔙 ជ្រើសរើសចំនួនផ្សេង", callback_data="donate_menu"),
+                InlineKeyboardButton("❌ បិទ", callback_data="donate_close"),
+            ],
         ])
         if query.message:
             with suppress(Exception):

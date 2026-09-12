@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 # Default Bakong configuration (configured for user chuo_kimheng@bkrt)
 DEFAULT_BAKONG_ACCOUNT_ID = os.getenv("BAKONG_ACCOUNT_ID", "chuo_kimheng@bkrt").strip() or "chuo_kimheng@bkrt"
-DEFAULT_BAKONG_MERCHANT_NAME = os.getenv("BAKONG_MERCHANT_NAME", "CHUO KIMHENG").strip() or "CHUO KIMHENG"
+DEFAULT_BAKONG_MERCHANT_NAME = os.getenv("BAKONG_MERCHANT_NAME", "KIMHENG CHUO").strip() or "KIMHENG CHUO"
 DEFAULT_BAKONG_MERCHANT_CITY = os.getenv("BAKONG_MERCHANT_CITY", "Phnom Penh").strip() or "Phnom Penh"
 DEFAULT_BAKONG_CURRENCY = os.getenv("BAKONG_CURRENCY", "USD").strip().upper() or "USD"
 DEFAULT_BAKONG_MERCHANT_ID = os.getenv("BAKONG_MERCHANT_ID", "").strip()
@@ -257,24 +257,23 @@ async def get_khqr_qr_image(khqr_text: str) -> bytes | None:
         os.path.join(os.getcwd(), "static", "qr.jpg"),
     ]
 
-    # For static QR codes (no specific amount), prefer the existing branded static file if present
-    if not is_dynamic_amount:
-        loop = asyncio.get_running_loop()
-        static_bytes = await loop.run_in_executor(None, _read_static_qr_file, candidate_paths)
-        if static_bytes:
-            with _QR_CACHE_LOCK:
-                _QR_IMAGE_CACHE[cache_key] = static_bytes
-            return static_bytes
+    # 1. Primary priority: Branded static card asset (e.g. asset/my_khqr.webp)
+    loop = asyncio.get_running_loop()
+    static_bytes = await loop.run_in_executor(None, _read_static_qr_file, candidate_paths)
+    if static_bytes:
+        with _QR_CACHE_LOCK:
+            _QR_IMAGE_CACHE[cache_key] = static_bytes
+        return static_bytes
 
-    # Generate exact dynamic QR code: 1. Try local python qrcode package
+    # 2. Dynamic generation fallback if no static branded file exists: Try local qrcode
     try:
         import qrcode
 
         qr = qrcode.QRCode(
             version=None,
             error_correction=qrcode.constants.ERROR_CORRECT_M,
-            box_size=10,
-            border=3,
+            box_size=8,
+            border=2,
         )
         qr.add_data(khqr_text)
         qr.make(fit=True)
@@ -293,10 +292,10 @@ async def get_khqr_qr_image(khqr_text: str) -> bytes | None:
     except Exception as e:
         logger.warning("Local qrcode library generation failed: %s", e)
 
-    # 2. Try public QR code generation service with pooled client for dynamic payload
+    # 3. Clean compact public QR generation service fallback (350x350)
     try:
         encoded_data = urllib.parse.quote(khqr_text)
-        api_url = f"https://api.qrserver.com/v1/create-qr-code/?size=500x500&margin=15&data={encoded_data}"
+        api_url = f"https://api.qrserver.com/v1/create-qr-code/?size=350x350&margin=10&data={encoded_data}"
         client = await _get_shared_http_client()
         resp = await client.get(api_url)
         if resp.status_code == 200 and resp.content:

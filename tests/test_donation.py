@@ -14,11 +14,27 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+_venv_site = Path(r"F:\ai project\bot-voice\.venv\Lib\site-packages")
+if _venv_site.exists() and str(_venv_site) not in sys.path:
+    sys.path.append(str(_venv_site))
+
+import types
+
 if "httpx" not in sys.modules:
     try:
         import httpx  # noqa: F401
     except ImportError:
         sys.modules["httpx"] = MagicMock()
+
+if "fastapi" not in sys.modules:
+    try:
+        import fastapi  # noqa: F401
+    except ImportError:
+        fastapi_mod = types.ModuleType("fastapi")
+        fastapi_responses = types.ModuleType("fastapi.responses")
+        fastapi_responses.JSONResponse = type("JSONResponse", (), {"media_type": "application/json"})
+        sys.modules["fastapi"] = fastapi_mod
+        sys.modules["fastapi.responses"] = fastapi_responses
 
 from app.services.ai.gemini import normalize_gemini_model
 from app.services.donation.blessing import generate_blessing_script
@@ -28,6 +44,7 @@ from app.services.donation.khqr import (
     generate_khqr_string,
 )
 from app.services.donation.store import DonationStore
+import app.legacy  # noqa: F401
 
 
 class DonationKHQRTests(unittest.TestCase):
@@ -785,6 +802,125 @@ class BakongOpenApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("test_new_acc@bkrt", get_khqr_config()["account_id"])
 
         update_khqr_config(account_id=old_acc)
+
+
+class DonationUICleanupTests(unittest.IsolatedAsyncioTestCase):
+    """Unit tests for clean UI layout, compact button labels, and single-message transitions."""
+
+    def test_donation_menu_markup_usd(self) -> None:
+        from app.services.donation.handlers import _build_donation_menu_markup
+
+        markup = _build_donation_menu_markup(currency="USD")
+        keyboard = markup.inline_keyboard
+        # 6 tiers in 3 rows (2 per row) + 1 currency switch row + 1 bottom row (2 buttons: Hall of fame & Close)
+        self.assertEqual(5, len(keyboard))
+        # Check tier buttons have compact labels
+        self.assertIn("$1.00 · កាហ្វេ", keyboard[0][0].text)
+        self.assertEqual("donate_tier:coffee", keyboard[0][0].callback_data)
+        self.assertIn("$2.00 · តែដោះគោ", keyboard[0][1].text)
+        self.assertEqual("donate_tier:milktea", keyboard[0][1].callback_data)
+
+        # Check currency switch row
+        self.assertIn("ប្តូរទៅប្រាក់រៀល (៛ KHR)", keyboard[3][0].text)
+        self.assertEqual("donate_curr:KHR", keyboard[3][0].callback_data)
+
+        # Check bottom row has both Hall of fame and Close button side by side
+        self.assertEqual(2, len(keyboard[4]))
+        self.assertIn("តារាងកិត្តិយស", keyboard[4][0].text)
+        self.assertEqual("donate_halloffame", keyboard[4][0].callback_data)
+        self.assertIn("បិទ", keyboard[4][1].text)
+        self.assertEqual("donate_close", keyboard[4][1].callback_data)
+
+    def test_donation_menu_markup_khr(self) -> None:
+        from app.services.donation.handlers import _build_donation_menu_markup
+
+        markup = _build_donation_menu_markup(currency="KHR")
+        keyboard = markup.inline_keyboard
+        self.assertEqual(5, len(keyboard))
+        self.assertIn("4,000៛ · កាហ្វេ", keyboard[0][0].text)
+        self.assertEqual("donate_tier:coffee_khr", keyboard[0][0].callback_data)
+        self.assertIn("ប្តូរទៅប្រាក់ដុល្លារ ($ USD)", keyboard[3][0].text)
+        self.assertEqual("donate_curr:USD", keyboard[3][0].callback_data)
+        self.assertIn("បិទ", keyboard[4][1].text)
+
+    def test_clean_menu_text(self) -> None:
+        from app.services.donation.handlers import _get_donation_menu_text
+
+        text = _get_donation_menu_text("Dara")
+        self.assertIn("Dara", text)
+        self.assertIn("ឧបត្ថម្ភគាំទ្រ Bot Voice", text)
+        self.assertIn("AI Voice Blessing", text)
+        self.assertIn("/donors", text)
+
+    async def test_send_khqr_screen_deletes_previous_menu(self) -> None:
+        from app.services.donation.handlers import _send_khqr_screen
+
+        mock_query = MagicMock()
+        mock_msg = MagicMock()
+        mock_msg.delete = AsyncMock()
+        mock_query.message = mock_msg
+
+        mock_context = MagicMock()
+        mock_context.bot = MagicMock()
+        mock_context.bot.send_photo = AsyncMock()
+
+        with patch("app.services.donation.handlers.get_khqr_qr_image", new_callable=AsyncMock) as mock_qr:
+            mock_qr.return_value = b"RIFFmockwebp"
+            await _send_khqr_screen(
+                chat_id=12345,
+                user_name="Dara",
+                amount=1.0,
+                tier_key="coffee",
+                tier_title="កាហ្វេ",
+                context=mock_context,
+                currency="USD",
+                query=mock_query,
+            )
+
+        # Previous message must be deleted to avoid stacking duplicate messages
+        mock_msg.delete.assert_awaited_once()
+        mock_context.bot.send_photo.assert_awaited_once()
+
+    async def test_donate_close_callback_deletes_message(self) -> None:
+        from app.services.donation.handlers import donation_callback
+
+        mock_update = MagicMock()
+        mock_query = MagicMock()
+        mock_query.data = "donate_close"
+        mock_query.answer = AsyncMock()
+        mock_msg = MagicMock()
+        mock_msg.delete = AsyncMock()
+        mock_query.message = mock_msg
+        mock_update.callback_query = mock_query
+        mock_context = MagicMock()
+
+        await donation_callback(mock_update, mock_context)
+
+        mock_query.answer.assert_awaited_once()
+        mock_msg.delete.assert_awaited_once()
+
+    async def test_donate_menu_deletes_photo_message(self) -> None:
+        from app.services.donation.handlers import donation_callback
+
+        mock_update = MagicMock()
+        mock_update.effective_chat.id = 555
+        mock_query = MagicMock()
+        mock_query.data = "donate_menu"
+        mock_query.answer = AsyncMock()
+        mock_msg = MagicMock()
+        mock_msg.photo = [MagicMock()]
+        mock_msg.delete = AsyncMock()
+        mock_query.message = mock_msg
+        mock_update.callback_query = mock_query
+
+        mock_context = MagicMock()
+        mock_context.bot = MagicMock()
+        mock_context.bot.send_message = AsyncMock()
+
+        await donation_callback(mock_update, mock_context)
+
+        mock_msg.delete.assert_awaited_once()
+        mock_context.bot.send_message.assert_awaited_once()
 
 
 if __name__ == "__main__":
