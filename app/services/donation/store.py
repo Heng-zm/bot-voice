@@ -273,6 +273,31 @@ class DonationStore:
             if self._cache_recent is not None and (now - self._cache_recent_ts) < CACHE_TTL_SECONDS:
                 return self._cache_recent[:limit]
 
+        # Try fetching from Supabase first if available
+        sb = self._get_supabase_client()
+        if sb is not None:
+            try:
+                def _sb_query_recent() -> list[dict[str, Any]]:
+                    res = (
+                        sb.table("donations")
+                        .select("*")
+                        .eq("status", "completed")
+                        .order("created_at", desc=True)
+                        .limit(limit)
+                        .execute()
+                    )
+                    return res.data or []
+
+                sb_data = await asyncio.to_thread(_sb_query_recent)
+                if sb_data:
+                    with self._lock:
+                        self._cache_recent = sb_data
+                        self._cache_recent_ts = now
+                    return sb_data
+            except Exception as e:
+                logger.debug("Supabase recent donations query failed; using local store: %s", e)
+
+        with self._lock:
             sorted_donations = sorted(
                 self._donations,
                 key=lambda x: str(x.get("created_at") or ""),
@@ -290,6 +315,41 @@ class DonationStore:
             if self._cache_stats is not None and (now - self._cache_stats_ts) < CACHE_TTL_SECONDS:
                 return self._cache_stats
 
+        # Try fetching aggregated metrics from Supabase if available
+        sb = self._get_supabase_client()
+        if sb is not None:
+            try:
+                def _sb_query_stats() -> list[dict[str, Any]]:
+                    res = (
+                        sb.table("donations")
+                        .select("amount, cups, user_id, tier")
+                        .eq("status", "completed")
+                        .execute()
+                    )
+                    return res.data or []
+
+                sb_data = await asyncio.to_thread(_sb_query_stats)
+                if sb_data:
+                    total_usd = sum(float(d.get("amount") or 0.0) for d in sb_data)
+                    total_cups = sum(
+                        int(d.get("cups") or TIER_DETAILS.get(str(d.get("tier", "")).lower(), {}).get("cups", 1))
+                        for d in sb_data
+                    )
+                    unique_users = len({int(d.get("user_id")) for d in sb_data if d.get("user_id")})
+                    stats = {
+                        "total_usd": round(total_usd, 2),
+                        "total_cups": total_cups,
+                        "total_donors": unique_users,
+                        "total_transactions": len(sb_data),
+                    }
+                    with self._lock:
+                        self._cache_stats = stats
+                        self._cache_stats_ts = now
+                    return stats
+            except Exception as e:
+                logger.debug("Supabase donation stats query failed; using local store: %s", e)
+
+        with self._lock:
             total_usd = sum(float(d.get("amount") or 0.0) for d in self._donations)
             total_cups = sum(
                 int(d.get("cups") or TIER_DETAILS.get(str(d.get("tier", "")).lower(), {}).get("cups", 1))

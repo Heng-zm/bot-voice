@@ -1,4 +1,4 @@
-﻿"""Unit tests for donation system, KHQR generation, blessing scripts, and store."""
+"""Unit tests for donation system, KHQR generation, blessing scripts, and store."""
 
 from __future__ import annotations
 
@@ -44,6 +44,15 @@ class DonationKHQRTests(unittest.TestCase):
         self.assertTrue(bill_no.startswith("MILK"))
         self.assertTrue(len(khqr_text) > 50)
         self.assertIn("2.00", khqr_text)
+
+    def test_dynamic_khqr_detection(self) -> None:
+        dynamic_khqr, _ = BakongKHQR.generate(amount=5.0, currency="USD", user_id=123, tier="server")
+        self.assertIn("010212", dynamic_khqr)
+        self.assertIn("54045.00", dynamic_khqr)
+
+        static_khqr = generate_khqr_string(amount=None)
+        self.assertIn("010211", static_khqr)
+        self.assertNotIn("54", static_khqr)
 
 
 class BlessingScriptTests(unittest.TestCase):

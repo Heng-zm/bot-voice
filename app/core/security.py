@@ -11,7 +11,7 @@ from fastapi import Header, HTTPException
 def get_allowed_api_keys() -> set[str]:
     """Retrieve authorized API keys from environment variables."""
     keys: set[str] = set()
-    for var in ("BOT_API_KEY", "API_KEY", "BOT_API_KEYS"):
+    for var in ("BOT_API_KEY", "API_KEY", "BOT_API_KEYS", "AI_API_KEY"):
         val = (os.environ.get(var) or "").strip()
         if val:
             keys.update(k.strip() for k in val.split(",") if k.strip())
@@ -19,7 +19,7 @@ def get_allowed_api_keys() -> set[str]:
 
 
 def validate_api_key(x_api_key: str | None, authorization: str | None) -> bool:
-    """Validate incoming API key against configured environment keys.
+    """Validate incoming API key against configured environment keys or dynamic DB keys.
 
     Accepts key from either 'X-Api-Key' header or 'Authorization: Bearer <key>'.
     Uses constant-time comparison to prevent timing attacks.
@@ -36,9 +36,20 @@ def validate_api_key(x_api_key: str | None, authorization: str | None) -> bool:
         return False
 
     allowed = get_allowed_api_keys()
-    if not allowed:
-        return False
-    return any(secrets.compare_digest(api_key, valid_key) for valid_key in allowed)
+    if allowed and any(secrets.compare_digest(api_key, valid_key) for valid_key in allowed):
+        return True
+
+    # Check dynamic API keys generated via Telegram /api create
+    try:
+        from app import legacy
+
+        validate_dynamic = getattr(legacy, "_validate_dynamic_ai_api_key", None)
+        if callable(validate_dynamic) and validate_dynamic(api_key):
+            return True
+    except Exception:
+        pass
+
+    return False
 
 
 def verify_api_key_dependency(
@@ -46,9 +57,6 @@ def verify_api_key_dependency(
     authorization: str | None = Header(default=None),
 ) -> bool:
     """FastAPI dependency to enforce API key authentication on protected endpoints."""
-    allowed = get_allowed_api_keys()
-    if not allowed:
-        return True
     if not validate_api_key(x_api_key, authorization):
         raise HTTPException(status_code=401, detail="Unauthorized: Valid API key required")
     return True

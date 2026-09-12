@@ -289,18 +289,25 @@ class TelegramDispatcher:
                 detail="Telegram webhook secret token is not configured on this server.",
             )
 
-        if path_secret_token is not None and not hmac.compare_digest(
-            str(path_secret_token), expected_secret
-        ):
-            client_ip = req.client.host if req.client else "unknown"
-            logger.warning("Rejected webhook with invalid path secret token from %s", client_ip)
-            raise HTTPException(status_code=403, detail="Invalid webhook path secret token.")
-
         header_secret = (req.headers.get("X-Telegram-Bot-Api-Secret-Token") or "").strip()
-        if not hmac.compare_digest(header_secret, expected_secret):
+        path_valid = (
+            path_secret_token is not None
+            and hmac.compare_digest(str(path_secret_token), expected_secret)
+        )
+        header_valid = (
+            bool(header_secret)
+            and hmac.compare_digest(header_secret, expected_secret)
+        )
+
+        if not (path_valid or header_valid):
             client_ip = req.client.host if req.client else "unknown"
-            logger.warning("Rejected webhook with invalid X-Telegram-Bot-Api-Secret-Token from %s", client_ip)
-            raise HTTPException(status_code=403, detail="Invalid webhook secret token header.")
+            logger.warning(
+                "Rejected webhook with invalid secret token (path_valid=%s, header_valid=%s) from %s",
+                path_valid,
+                header_valid,
+                client_ip,
+            )
+            raise HTTPException(status_code=403, detail="Invalid webhook secret token.")
 
         # 2. Mode Validation (Now safe after authentication)
         if not self._is_webhook_mode():

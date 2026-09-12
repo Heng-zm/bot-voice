@@ -166,7 +166,8 @@ async def get_khqr_qr_image(khqr_text: str) -> bytes | None:
             _QR_IMAGE_CACHE.move_to_end(cache_key)
             return _QR_IMAGE_CACHE[cache_key]
 
-    # 1. If static file path is provided and exists
+    is_dynamic_amount = "010212" in khqr_text
+
     candidate_paths = [
         STATIC_QR_IMAGE_PATH,
         os.path.join(PROJECT_ROOT, "asset", "my_khqr.webp"),
@@ -188,14 +189,17 @@ async def get_khqr_qr_image(khqr_text: str) -> bytes | None:
         os.path.join(os.getcwd(), "static", "qr.png"),
         os.path.join(os.getcwd(), "static", "qr.jpg"),
     ]
-    loop = asyncio.get_running_loop()
-    static_bytes = await loop.run_in_executor(None, _read_static_qr_file, candidate_paths)
-    if static_bytes:
-        with _QR_CACHE_LOCK:
-            _QR_IMAGE_CACHE[cache_key] = static_bytes
-        return static_bytes
 
-    # 2. Try python qrcode package
+    # For static QR codes (no specific amount), prefer the existing branded static file if present
+    if not is_dynamic_amount:
+        loop = asyncio.get_running_loop()
+        static_bytes = await loop.run_in_executor(None, _read_static_qr_file, candidate_paths)
+        if static_bytes:
+            with _QR_CACHE_LOCK:
+                _QR_IMAGE_CACHE[cache_key] = static_bytes
+            return static_bytes
+
+    # Generate exact dynamic QR code: 1. Try local python qrcode package
     try:
         import qrcode
 
@@ -222,19 +226,7 @@ async def get_khqr_qr_image(khqr_text: str) -> bytes | None:
     except Exception as e:
         logger.warning("Local qrcode library generation failed: %s", e)
 
-    # 3. If static QR URL is provided
-    if STATIC_QR_IMAGE_URL:
-        try:
-            client = await _get_shared_http_client()
-            resp = await client.get(STATIC_QR_IMAGE_URL)
-            if resp.status_code == 200 and resp.content:
-                with _QR_CACHE_LOCK:
-                    _QR_IMAGE_CACHE[cache_key] = resp.content
-                return resp.content
-        except Exception as e:
-            logger.warning("Failed to fetch static QR image URL: %s", e)
-
-    # 4. Fallback to public QR code generation service with pooled client
+    # 2. Try public QR code generation service with pooled client for dynamic payload
     try:
         encoded_data = urllib.parse.quote(khqr_text)
         api_url = f"https://api.qrserver.com/v1/create-qr-code/?size=500x500&margin=15&data={encoded_data}"
@@ -248,6 +240,26 @@ async def get_khqr_qr_image(khqr_text: str) -> bytes | None:
             return resp.content
     except Exception as e:
         logger.error("QR Code API generation failed: %s", e)
+
+    # 3. Fallback to static QR URL if configured
+    if STATIC_QR_IMAGE_URL:
+        try:
+            client = await _get_shared_http_client()
+            resp = await client.get(STATIC_QR_IMAGE_URL)
+            if resp.status_code == 200 and resp.content:
+                with _QR_CACHE_LOCK:
+                    _QR_IMAGE_CACHE[cache_key] = resp.content
+                return resp.content
+        except Exception as e:
+            logger.warning("Failed to fetch static QR image URL: %s", e)
+
+    # 4. Final fallback to static local file if dynamic generation and API both failed
+    loop = asyncio.get_running_loop()
+    static_bytes = await loop.run_in_executor(None, _read_static_qr_file, candidate_paths)
+    if static_bytes:
+        with _QR_CACHE_LOCK:
+            _QR_IMAGE_CACHE[cache_key] = static_bytes
+        return static_bytes
 
     return None
 

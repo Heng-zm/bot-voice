@@ -298,7 +298,7 @@ class TTSSingleFlight:
             try:
                 result = await asyncio.shield(fut)
                 return result, False
-            except Exception:
+            except BaseException:
                 return None, False
 
         # Leader executes the synthesis coroutine

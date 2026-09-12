@@ -36,6 +36,15 @@ class TestSafePublicUrlValidation(unittest.TestCase):
         self.assertFalse(safe)
         self.assertIn("forbidden", reason.lower())
 
+    def test_blocks_ipv4_mapped_ipv6(self) -> None:
+        safe, reason = is_safe_public_url("http://[::ffff:127.0.0.1]/admin")
+        self.assertFalse(safe)
+        self.assertIn("forbidden", reason.lower())
+
+        safe, reason = is_safe_public_url("http://[::ffff:169.254.169.254]/latest/meta-data/")
+        self.assertFalse(safe)
+        self.assertIn("forbidden", reason.lower())
+
     def test_blocks_non_http_schemes(self) -> None:
         safe, reason = is_safe_public_url("ftp://example.com/file.txt")
         self.assertFalse(safe)

@@ -212,6 +212,24 @@ class TelegramDispatcherTests(unittest.IsolatedAsyncioTestCase):
             # Clean up active tasks
             await self.dispatcher.drain(timeout=0.05)
 
+    async def test_path_secret_token_accepted_without_header(self) -> None:
+        mock_app = MagicMock()
+        mock_app.bot = MagicMock()
+        mock_app.bot.defaults = None
+        mock_app.process_update = AsyncMock()
+
+        with patch.object(self.dispatcher, "_get_expected_secret", return_value="path_secret_xyz"), \
+             patch.object(self.dispatcher, "_is_webhook_mode", return_value=True), \
+             patch.object(self.dispatcher, "_get_app_instance", return_value=mock_app), \
+             patch.object(self.dispatcher, "_is_app_ready", return_value=True), \
+             patch.object(self.dispatcher, "_should_process_update", return_value=True):
+
+            # No X-Telegram-Bot-Api-Secret-Token header, but valid path secret token
+            req = _make_mock_request({"update_id": 9999, "message": {"message_id": 99}})
+            resp = await self.dispatcher.dispatch_webhook_request(req, path_secret_token="path_secret_xyz")
+            self.assertEqual(resp.status_code, 200)
+            mock_app.process_update.assert_awaited_once()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,6 +26,8 @@ ADMIN_ONLY_COMMANDS: frozenset[str] = frozenset({
     "users",
     "chat",
     "endchat",
+    "adddonor",
+    "testblessing",
 })
 
 _ADMIN_SECURITY_NOTICE_MEMORY: dict[str, float] = {}
