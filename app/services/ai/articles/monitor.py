@@ -32,7 +32,7 @@ from app.services.ai.article_storage import (
     save_pending_article,
     update_pending_status,
 )
-from app.services.ai.article_translator import translate_text
+from app.services.ai.article_translator import translate_text, translate_text_async
 from app.services.ai.categorizer import analyze_article_metadata
 from app.services.ai.deduplicator import find_cross_source_duplicate
 from app.services.ai.extractor import get_new_articles, verify_article_sources
@@ -116,15 +116,21 @@ def _safe_format_article_message(**kwargs: Any) -> tuple[str, InlineKeyboardMark
 async def _safe_verify_sources(query: str) -> dict[str, Any]:
     """Execute news source verification safely across sync or async implementations."""
     try:
-        res = verify_article_sources(query)
+        if asyncio.iscoroutinefunction(verify_article_sources):
+            res = await verify_article_sources(query)
+        else:
+            res = await asyncio.to_thread(verify_article_sources, query)
+
         if asyncio.iscoroutine(res):
-            return await res
-        if callable(res):
-            called = res()
-            if asyncio.iscoroutine(called):
-                return await called
-            return called
-        return await asyncio.to_thread(verify_article_sources, query)
+            res = await res
+        elif callable(res):
+            res = res()
+            if asyncio.iscoroutine(res):
+                res = await res
+
+        if isinstance(res, dict):
+            return res
+        return {"verified": False, "is_verified": False, "sources": 0, "publishers": []}
     except Exception as exc:
         logger.debug("Source verification fallback: %s", exc)
         return {"verified": False, "is_verified": False, "sources": 0, "publishers": []}
@@ -214,7 +220,7 @@ async def scan_sources_and_notify_admin(bot: Bot | None = None) -> list[dict[str
                         source_name=src.get("name") or "",
                     )
                     verify_task = _safe_verify_sources(raw_title)
-                    body_trans_task = translate_text(raw_text[:2500])
+                    body_trans_task = translate_text_async(raw_text[:2500])
 
                     smart_res, verification, khmer_body_text = await asyncio.gather(
                         smart_task,
@@ -611,8 +617,11 @@ async def periodic_article_monitor_scheduler(poll_interval: float = 180.0) -> No
         await asyncio.sleep(effective_interval)
 
 
+send_pending_article_for_review = _send_review_card_to_admins
+
 __all__ = [
     "broadcast_approved_article",
     "periodic_article_monitor_scheduler",
     "scan_sources_and_notify_admin",
+    "send_pending_article_for_review",
 ]

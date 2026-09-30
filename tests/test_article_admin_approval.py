@@ -303,6 +303,36 @@ class TestAdminCommands(unittest.IsolatedAsyncioTestCase):
             status_msg.edit_text.assert_called_once()
             self.assertIn("រកឃើញ <b>2</b> ព័ត៌មានថ្មី", status_msg.edit_text.call_args[0][0])
 
+    async def test_scan_sources_and_notify_admin_executes_without_coroutine_error(self) -> None:
+        from app.services.ai.articles.monitor import scan_sources_and_notify_admin
+
+        mock_bot = MagicMock()
+        mock_bot.send_message = AsyncMock()
+        mock_bot.send_photo = AsyncMock()
+
+        test_article = {
+            "title": "Quantum Computing Breakthrough in 2026",
+            "text": "Researchers have built a fault-tolerant logical qubit processor operating at room temperature.",
+            "url": "https://example.com/quantum-breakthrough",
+            "hash": "hash_quantum_999",
+            "image_url": None,
+        }
+
+        with patch("app.services.ai.articles.monitor.get_article_sources", new_callable=AsyncMock) as mock_srcs, \
+             patch("app.services.ai.articles.monitor.get_new_articles", new_callable=AsyncMock) as mock_get_articles, \
+             patch("app.services.ai.articles.monitor.is_article_handled", new_callable=AsyncMock, return_value=False), \
+             patch("app.services.ai.articles.monitor.find_cross_source_duplicate", new_callable=AsyncMock, return_value=(False, None, 0.0)), \
+             patch("app.services.ai.articles.monitor.save_pending_article", new_callable=AsyncMock, return_value=True), \
+             patch("app.services.ai.articles.monitor._get_admin_user_ids", new_callable=AsyncMock, return_value=[99999]):
+            mock_srcs.return_value = [{"name": "Tech Outlet", "url": "https://example.com/rss"}]
+            mock_get_articles.return_value = [test_article]
+
+            discovered = await scan_sources_and_notify_admin(bot=mock_bot)
+
+            self.assertEqual(len(discovered), 1)
+            self.assertEqual(discovered[0]["hash"], "hash_quantum_999")
+            self.assertTrue(mock_bot.send_message.called or mock_bot.send_photo.called)
+
 
 if __name__ == "__main__":
     unittest.main()

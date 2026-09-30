@@ -22,8 +22,12 @@ import time
 from typing import Any
 import urllib.parse
 import urllib.request
+import warnings
 
 import feedparser
+
+# Suppress DuckDuckGo package rename warning if duckduckgo_search is loaded
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=r".*renamed to `ddgs`.*")
 
 logger = logging.getLogger(__name__)
 
@@ -69,17 +73,19 @@ TRUSTED_PUBLISHER_NAMES: set[str] = {
     "voa", "rfa", "radio free asia", "cna",
 }
 
-# Resilient DDGS import
+# Resilient DDGS import (prefer modern 'ddgs' package over legacy 'duckduckgo_search')
 _HAS_DDGS = False
 DDGS: Any = None
 
 try:
-    from duckduckgo_search import DDGS as _DDGS  # type: ignore[assignment]
+    from ddgs import DDGS as _DDGS  # type: ignore[assignment]
     DDGS = _DDGS
     _HAS_DDGS = True
 except ImportError:
     try:
-        from ddgs import DDGS as _DDGS  # type: ignore[assignment]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            from duckduckgo_search import DDGS as _DDGS  # type: ignore[assignment]
         DDGS = _DDGS
         _HAS_DDGS = True
     except ImportError:

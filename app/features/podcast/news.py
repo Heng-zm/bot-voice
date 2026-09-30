@@ -5,8 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from app.services.ai.articles.reader import fetch_and_clean_article
-from app.services.ai.articles.summarizer import summarize_article_khmer
+from app.services.ai.articles.reader import extract_article_content_with_image, fetch_article_html
+from app.services.ai.articles.summarizer import extractive_summary
 
 logger = logging.getLogger("app.features.podcast.news")
 
@@ -14,13 +14,17 @@ logger = logging.getLogger("app.features.podcast.news")
 async def get_article_narrated_digest(url: str) -> dict[str, Any] | None:
     """Fetch article, summarize into key points, and prepare narration data."""
     try:
-        article = await fetch_and_clean_article(url)
-        if not article or not article.get("text"):
+        html = await fetch_article_html(url)
+        if not html:
             return None
-        summary = summarize_article_khmer(article["text"])
+        title, text, image_url = extract_article_content_with_image(html, url)
+        if not text:
+            return None
+        summary = extractive_summary(text)
         return {
-            "title": article.get("title", ""),
+            "title": title,
             "summary": summary,
+            "image_url": image_url,
             "url": url,
         }
     except Exception as exc:

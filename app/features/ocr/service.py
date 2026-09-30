@@ -119,7 +119,16 @@ class OCRService:
         raise RuntimeError("No OCR provider configured or available.")
 
 
+_GLOBAL_OCR_SERVICE = OCRService()
+
+
+def get_ocr_service() -> OCRService:
+    """Return the global OCRService singleton."""
+    return _GLOBAL_OCR_SERVICE
+
+
 __all__ = [
     "OCRService",
     "ask_gemini_ocr_bytes",
+    "get_ocr_service",
 ]

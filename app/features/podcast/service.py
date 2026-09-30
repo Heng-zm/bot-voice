@@ -429,7 +429,26 @@ async def generate_morning_podcast(force_refresh: bool = False) -> tuple[str, st
     return full_html, speech_text
 
 
+class MorningPodcastGenerator:
+    """Service class for morning podcast generation."""
+
+    def __init__(self) -> None:
+        pass
+
+    async def generate(self, force_refresh: bool = False) -> tuple[str, str]:
+        return await generate_morning_podcast(force_refresh=force_refresh)
+
+
+_GLOBAL_PODCAST_GENERATOR = MorningPodcastGenerator()
+
+
+def get_podcast_generator() -> MorningPodcastGenerator:
+    """Return the global MorningPodcastGenerator singleton."""
+    return _GLOBAL_PODCAST_GENERATOR
+
+
 __all__ = [
+    "MorningPodcastGenerator",
     "build_podcast_card_html",
     "clean_podcast_speech_text",
     "fetch_cambodia_weather",
@@ -437,6 +456,7 @@ __all__ = [
     "format_khmer_date",
     "generate_morning_podcast",
     "get_cambodia_now",
+    "get_podcast_generator",
     "strip_podcast_unwanted_sections",
     "to_khmer_numeral",
 ]

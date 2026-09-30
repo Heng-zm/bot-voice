@@ -54,7 +54,7 @@
 | 📥 **Facebook Ultra-Downloader** | Universal Facebook Video & Reels engine (`/reel/`, `/share/r/`, `/share/v/`, `fb.watch/`, `/watch/?v=`, `/videos/`). | **Dual HD/SD stream selector**, zero-OOM disk chunk streaming, 50MB Bot API shield with direct link fallback, MP3 extraction, AI summary (`fb_ai`), and animated status cards. |
 | 📸 **Instagram Ultra-Downloader** | Reels, Posts, IGTV, and carousel downloader with universal regex (`/reel/`, `/p/`, `/tv/`, `/share/`). | **Zero-OOM disk chunk streaming**, Telegram 50MB shield, high-fidelity MP3 extraction, Gemini AI structured summary (`ig_ai`), and instant Telegram `file_id` caching. |
 | 🎥 **YouTube Ultra-Downloader** | Full video & YouTube Shorts downloader with multi-mirror streaming resolution. | **Zero-OOM streaming**, automatic Long Video card with browser stream link (>50MB), 1-tap MP3 extraction (`yt_audio`), and AI video takeaways (`yt_ai`). |
-| 🛡️ **Hardened Linux Systemd** | Production-ready Linux service configuration with sandboxing, process limits, and crash recovery. | **`NoNewPrivileges=true`**, `ProtectSystem=full`, `LimitNOFILE=65536`, `MemoryMax=1800M`, unbuffered journal logging, and automated `./deploy.sh --service` installer. |
+| 🛡️ **Hardened Linux Systemd** | Production-ready Linux service configuration with sandboxing, process limits, and crash recovery. | **`NoNewPrivileges=true`**, `ProtectSystem=full`, `LimitNOFILE=65536`, `MemoryMax=1800M`, unbuffered journal logging, and automated `./deploy/deploy.sh --service` installer. |
 | ⚡ **Real-Time Request Logging** | Non-blocking in-memory ring buffer (500 records), live `/logs` dark dashboard & SSE stream. | **Immediate unbuffered stdout streaming** with `FlushStreamHandler` (Windows cp1252 shield) and Telegram Update Telemetry Guard (`group=-4`). |
 | 👑 **Full-Option Admin Hub** | In-bot controller for interaction modes, news podcast, Bakong diagnostics, UI editor, and maintenance. | Toggle **Auto / TTS Only / AI Chat**, instant audio cache purge, deduplication lease reset, and one-tap database pruning. |
 | 📻 **Daily Morning Podcast** | Automated Cambodian & Global news aggregation, studio voice narration, and dynamic banner. | Delivers a **curated audio news digest** with source attribution, professional cover art, and scheduled daily broadcasts. |
@@ -312,58 +312,33 @@ python -m app.main
 
 ## ☁️ Easy Server Deployment
 
-### Option 1: Anajak Cloud VPS (https://anajak.cloud/)
-
-> [!TIP]
-> **Recommended & Fastest**: Deploying via the Pterodactyl Web Panel takes under 1 minute and bypasses SSH password/key setup completely.
-
-#### 🚀 Method A: Web Panel Archive Upload (Recommended)
-1. Open **[my.anajak.cloud](https://my.anajak.cloud)** and select your server.
-2. Navigate to **Files** and drag-and-drop **`bot-voice-update.zip`** (464 KB).
-3. Click the three dots **`...`** next to `bot-voice-update.zip` and choose **Unarchive**.
-4. Navigate to **Console** and click **Restart**.
-
-#### ⚡ Method B: Automated SFTP Uploader
-Run the pre-configured Windows batch script:
-```cmd
-.\upload-zip.bat
-# or upload entire directory tree:
-.\upload.bat
-```
-*(When prompted for password, enter your Anajak Cloud account web login password)*
-
-#### 🛠️ Method C: 1-Click SSH Installer
-```bash
-git clone https://github.com/Heng-zm/bot-voice.git
-cd bot-voice
-chmod +x anajak-deploy.sh
-./anajak-deploy.sh
-```
-
----
-
-### Option 2: Docker Compose
+### Option 1: Docker Compose (Recommended)
 Deploy in a production-ready isolated container with automated health management:
 ```bash
 cp .env.example .env
-docker compose up -d --build
-docker compose logs -f
+docker compose -f docker/docker-compose.yml up -d --build
+docker compose -f docker/docker-compose.yml logs -f
 ```
 
 ---
 
-### Option 3: Automated Linux VPS Script (`deploy.sh`)
+### Option 2: Automated Linux VPS Script (`deploy/deploy.sh`)
 Works out-of-the-box on **Ubuntu 22.04 / 24.04, Debian 12, CentOS, AlmaLinux**:
 ```bash
-chmod +x deploy.sh
-./deploy.sh
+chmod +x deploy/deploy.sh
+./deploy/deploy.sh
+```
+
+To automatically configure and launch as a managed systemd service:
+```bash
+sudo ./deploy/deploy.sh --service
 ```
 
 ---
 
-### Option 4: Linux Systemd Service
+### Option 3: Linux Systemd Service
 ```bash
-sudo cp bot-voice.service /etc/systemd/system/bot-voice.service
+sudo cp deploy/systemd/bot-voice.service /etc/systemd/system/bot-voice.service
 sudo nano /etc/systemd/system/bot-voice.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now bot-voice
@@ -775,7 +750,7 @@ Bot Voice expands its media ingestion suite with dedicated, zero-OOM downloaders
 
 ## 🛡️ Hardened Linux Systemd Service & VPS Automation
 
-A production-hardened systemd service file ([`bot-voice.service`](bot-voice.service)) and automated installer script ([`deploy.sh`](deploy.sh)) designed for 24/7 reliability on modern Linux servers (Ubuntu 22.04 / 24.04, Debian 12, CentOS, AlmaLinux).
+A production-hardened systemd service file ([`deploy/systemd/bot-voice.service`](deploy/systemd/bot-voice.service)) and automated installer script ([`deploy/deploy.sh`](deploy/deploy.sh)) designed for 24/7 reliability on modern Linux servers (Ubuntu 22.04 / 24.04, Debian 12, CentOS, AlmaLinux).
 
 ```ini
 [Unit]
@@ -829,7 +804,7 @@ WantedBy=multi-user.target
 ### 1-Click Automated Systemd Service Installer
 Run the automated deployment script with the `--service` flag:
 ```bash
-sudo ./deploy.sh --service
+sudo ./deploy/deploy.sh --service
 ```
 This automatically:
 1. Copies and configures `bot-voice.service` in `/etc/systemd/system/`.

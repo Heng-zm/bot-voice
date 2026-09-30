@@ -43,13 +43,16 @@ mkdir -p data/cache data/exports data/temp logs
 # 2. Prefer Docker Compose if Docker is installed (unless explicit systemd requested)
 if [ "$INSTALL_SERVICE" = false ] && command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     echo "🐳 Docker & Docker Compose detected."
-    echo "🚀 Building and starting container in background..."
-    docker compose down --remove-orphans 2>/dev/null || true
-    docker compose up -d --build
+    COMPOSE_FILE="docker/docker-compose.yml"
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        COMPOSE_FILE="docker-compose.yml"
+    fi
+    docker compose -f "$COMPOSE_FILE" down --remove-orphans 2>/dev/null || true
+    docker compose -f "$COMPOSE_FILE" up -d --build
     echo ""
     echo "✅ Bot is running in Docker!"
-    echo "📊 View logs with:   docker compose logs -f"
-    echo "🛑 Stop bot with:    docker compose down"
+    echo "📊 View logs with:   docker compose -f $COMPOSE_FILE logs -f"
+    echo "🛑 Stop bot with:    docker compose -f $COMPOSE_FILE down"
     exit 0
 fi
 

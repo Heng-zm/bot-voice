@@ -7,12 +7,12 @@ The fastest and most reliable way to run Bot Voice in production:
 cp .env.example .env
 # Edit .env with your TELEGRAM_BOT_TOKEN and other credentials
 
-docker compose up -d --build
+docker compose -f docker/docker-compose.yml up -d --build
 ```
 
 View live logs:
 ```bash
-docker compose logs -f bot-voice
+docker compose -f docker/docker-compose.yml logs -f bot-voice
 ```
 
 ## 2. Linux VPS Native Deployment (Systemd)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from typing import Any
 
@@ -43,6 +44,21 @@ def translate_text(text: str, target_lang: str = "km") -> str:
 
 
 translate_text_sync = translate_text
+
+
+async def translate_text_async(text: str, target_lang: str = "km") -> str:
+    """Translate text into target language asynchronously with caching and Khmer bypass."""
+    if not text or not text.strip():
+        return text
+    if target_lang == "km" and is_khmer(text):
+        return text
+
+    cache_key = (text.strip(), target_lang)
+    if cache_key in _TRANSLATION_CACHE:
+        return _TRANSLATION_CACHE[cache_key]
+
+    return await asyncio.to_thread(translate_text, text, target_lang=target_lang)
+
 
 
 def generate_smart_article_summary_sync(
@@ -172,3 +188,13 @@ def generate_smart_article_summary_sync(
         "khmer_summary": f"{hook}\n\n{sections}",
         "original_summary": paragraph_excerpt,
     }
+
+
+__all__ = [
+    "is_khmer",
+    "translate_chunk",
+    "translate_text",
+    "translate_text_async",
+    "translate_text_sync",
+    "generate_smart_article_summary_sync",
+]

@@ -757,10 +757,19 @@ async def instagram_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 handle_instagram_url = handle_instagram_download
 
 __all__ = [
+    "cmd_instagram",
+    "download_ig_media_to_file",
+    "extract_instagram_shortcode",
+    "extract_instagram_url",
+    "fetch_instagram_video_info",
+    "get_instagram_video_kb",
+    "handle_instagram_ai_summary",
     "handle_instagram_download",
     "handle_instagram_file_download",
     "handle_instagram_mp3_download",
     "handle_instagram_stats",
     "handle_instagram_url",
     "instagram_callback",
+    "is_instagram_url",
+    "resolve_instagram_redirect",
 ]
