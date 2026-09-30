@@ -30,6 +30,7 @@ logs/
 *.db
 
 # Temporary disassembly and reconstruction artifacts
+scratch/
 disasm.txt
 missing_disasm.txt
 reconstructed.py
