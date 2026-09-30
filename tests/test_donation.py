@@ -1,0 +1,1255 @@
+"""Unit tests for donation system, KHQR generation, blessing scripts, and store."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+import time
+import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+_venv_site = Path(r"F:\ai project\bot-voice\.venv\Lib\site-packages")
+if _venv_site.exists() and str(_venv_site) not in sys.path:
+    sys.path.append(str(_venv_site))
+
+import types
+
+if "httpx" not in sys.modules:
+    try:
+        import httpx  # noqa: F401
+    except ImportError:
+        sys.modules["httpx"] = MagicMock()
+
+if "fastapi" not in sys.modules:
+    try:
+        import fastapi  # noqa: F401
+    except ImportError:
+        fastapi_mod = types.ModuleType("fastapi")
+        fastapi_responses = types.ModuleType("fastapi.responses")
+        fastapi_responses.JSONResponse = type("JSONResponse", (), {"media_type": "application/json"})
+        sys.modules["fastapi"] = fastapi_mod
+        sys.modules["fastapi.responses"] = fastapi_responses
+
+from app.services.ai.gemini import normalize_gemini_model
+from app.services.donation.blessing import generate_blessing_script
+from app.services.donation.khqr import (
+    BakongKHQR,
+    crc16_ccitt,
+    generate_khqr_string,
+)
+from app.services.donation.store import DonationStore
+import app.legacy  # noqa: F401
+
+
+class DonationKHQRTests(unittest.TestCase):
+    def test_crc16_ccitt(self) -> None:
+        test_str = "00020101021229300010bakong@nbc0114chuo_kimheng@bkrt52045999530384054041.005802KH5912CHUO KIMHENG6010Phnom Penh62180108COFF00010708BOTVOICE6304"
+        crc = crc16_ccitt(test_str)
+        self.assertEqual(4, len(crc))
+        self.assertTrue(all(c in "0123456789ABCDEF" for c in crc))
+
+    def test_generate_khqr_string_dynamic(self) -> None:
+        khqr = generate_khqr_string(
+            account_id="chuo_kimheng@bkrt",
+            merchant_name="CHUO KIMHENG",
+            merchant_city="Phnom Penh",
+            amount=1.0,
+            currency="USD",
+            bill_number="COFF01",
+        )
+        self.assertTrue(khqr.startswith("000201"))
+        self.assertIn("chuo_kimheng@bkrt", khqr)
+        self.assertIn("CHUO KIMHENG", khqr)
+        self.assertIn("1.00", khqr)
+        self.assertIn("6304", khqr)
+
+    def test_bakong_khqr_wrapper(self) -> None:
+        khqr_text, bill_no = BakongKHQR.generate(amount=2.0, currency="USD", user_id=123456, tier="milktea")
+        self.assertTrue(bill_no.startswith("MILK"))
+        self.assertTrue(len(khqr_text) > 50)
+        self.assertIn("2.00", khqr_text)
+
+    def test_dynamic_khqr_detection(self) -> None:
+        dynamic_khqr, _ = BakongKHQR.generate(amount=5.0, currency="USD", user_id=123, tier="server")
+        self.assertIn("010212", dynamic_khqr)
+        self.assertIn("54045.00", dynamic_khqr)
+
+        static_khqr = generate_khqr_string(amount=None)
+        self.assertIn("010211", static_khqr)
+        self.assertNotIn("540", static_khqr)
+
+    def test_nbc_tag29_individual(self) -> None:
+        khqr = generate_khqr_string(account_id="chuo_kimheng@bkrt", amount=1.0)
+        # In NBC EMVCo spec: account_id is 17 chars (0017...), Tag 29 value is 21 chars (2921...)
+        self.assertIn("29210017chuo_kimheng@bkrt", khqr)
+
+    def test_nbc_tag30_merchant(self) -> None:
+        khqr = generate_khqr_string(
+            account_id="chuo_kimheng@bkrt",
+            merchant_id="MERCHANT123",
+            amount=1.0,
+        )
+        self.assertIn("30360017chuo_kimheng@bkrt0111MERCHANT123", khqr)
+
+    def test_nbc_tag99_timestamp(self) -> None:
+        khqr = generate_khqr_string(amount=2.0)
+        self.assertIn("99", khqr)
+        self.assertIn("0013", khqr)  # 13 digits ms timestamp
+        self.assertIn("0113", khqr)  # 13 digits ms expiration
+
+    def test_khr_currency_formatting(self) -> None:
+        khqr = generate_khqr_string(amount=4000, currency="KHR")
+        self.assertIn("5303116", khqr)  # KHR code 116
+        self.assertIn("54044000", khqr)  # 4000 Riel
+
+    def test_runtime_config_update(self) -> None:
+        from app.services.donation.khqr import get_khqr_config, update_khqr_config
+        old_cfg = get_khqr_config()
+        update_khqr_config(merchant_name="TEST SHOP", currency="KHR")
+        new_cfg = get_khqr_config()
+        self.assertEqual("TEST SHOP", new_cfg["merchant_name"])
+        self.assertEqual("KHR", new_cfg["currency"])
+        update_khqr_config(
+            merchant_name=old_cfg["merchant_name"],
+            currency=old_cfg["currency"],
+        )
+
+
+class DonationQRImageTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        from app.services.donation.khqr import invalidate_branded_card_cache
+        invalidate_branded_card_cache()
+
+    async def asyncTearDown(self) -> None:
+        from app.services.donation.khqr import invalidate_branded_card_cache
+        invalidate_branded_card_cache()
+
+    async def test_get_khqr_qr_image_dynamic_success(self) -> None:
+        from app.services.donation.khqr import get_khqr_qr_image
+        test_khqr = "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912KIMHENG CHUO6010Phnom Penh62180108COFF00010708BOTVOICE6304ABCD"
+        mock_png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"X" * 120
+
+        with patch("app.services.donation.khqr._fetch_url_bytes", new_callable=AsyncMock) as mock_fetch:
+            mock_fetch.return_value = mock_png
+            qr_bytes = await get_khqr_qr_image(test_khqr)
+
+            self.assertEqual(qr_bytes, mock_png)
+            mock_fetch.assert_awaited()
+
+    async def test_get_khqr_qr_image_fallback_to_static_on_dynamic_failure(self) -> None:
+        from app.services.donation.khqr import get_khqr_qr_image
+        test_khqr = "00020101021229210017chuo_kimheng@bkrt52045999530384054042.005802KH5912KIMHENG CHUO6010Phnom Penh62180108MILK00010708BOTVOICE6304DCBA"
+        mock_card = b"RIFF\x00\x00\x00\x00WEBPVP8mockfallbackcard"
+
+        with patch("app.services.donation.khqr._fetch_url_bytes", new_callable=AsyncMock) as mock_fetch:
+            mock_fetch.return_value = None  # simulate dynamic generation failure
+            with patch("app.services.donation.khqr.get_static_khqr_card", new_callable=AsyncMock) as mock_static:
+                mock_static.return_value = mock_card
+                qr_bytes = await get_khqr_qr_image(test_khqr)
+
+                self.assertEqual(qr_bytes, mock_card)
+                mock_static.assert_awaited_once()
+
+    async def test_get_khqr_qr_image_cache_reuse(self) -> None:
+        from app.services.donation.khqr import get_khqr_qr_image
+        test_khqr = "00020101021229210017chuo_kimheng@bkrt52045999530384054045.005802KH5912KIMHENG CHUO6010Phnom Penh62180108SERV00010708BOTVOICE63041234"
+        mock_png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"Y" * 120
+
+        with patch("app.services.donation.khqr._fetch_url_bytes", new_callable=AsyncMock) as mock_fetch:
+            mock_fetch.return_value = mock_png
+            res1 = await get_khqr_qr_image(test_khqr)
+            self.assertEqual(res1, mock_png)
+            self.assertEqual(mock_fetch.await_count, 1)
+
+            # Second call must hit cache without re-fetching
+            res2 = await get_khqr_qr_image(test_khqr)
+            self.assertEqual(res2, mock_png)
+            self.assertEqual(mock_fetch.await_count, 1)
+
+    async def test_get_static_khqr_card_reads_disk_and_caches(self) -> None:
+        from app.services.donation.khqr import get_static_khqr_card
+        card = await get_static_khqr_card()
+        if card is not None:
+            self.assertTrue(len(card) > 100)
+
+
+class BlessingScriptTests(unittest.TestCase):
+    def test_coffee_tier_script(self) -> None:
+        script = generate_blessing_script("Dara", tier="coffee", amount=1.0)
+        self.assertIn("Dara", script)
+        self.assertIn("កាហ្វេ ១ កែវ", script)
+
+    def test_milktea_tier_script(self) -> None:
+        script = generate_blessing_script("Sokha", tier="milktea", amount=2.0)
+        self.assertIn("Sokha", script)
+        self.assertIn("តែទឹកដោះគោ", script)
+
+    def test_server_tier_script(self) -> None:
+        script = generate_blessing_script("Bona", tier="server", amount=5.0)
+        self.assertIn("Bona", script)
+        self.assertIn("Server", script)
+
+    def test_patron_tier_script(self) -> None:
+        script = generate_blessing_script("Vireak", tier="patron", amount=10.0)
+        self.assertIn("Vireak", script)
+        self.assertIn("សប្បុរសធម៌", script)
+
+
+class DonationStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.test_dir = tempfile.mkdtemp()
+        self.store_file = os.path.join(self.test_dir, "donations_test.json")
+        self.store = DonationStore(file_path=self.store_file)
+
+    async def asyncTearDown(self) -> None:
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    async def test_record_and_aggregate_donations(self) -> None:
+        d1 = await self.store.record_donation(
+            user_id=1001,
+            full_name="User Alpha",
+            amount=1.0,
+            tier="coffee",
+            blessing_sent=True,
+        )
+        self.assertEqual(1001, d1["user_id"])
+        self.assertEqual(1.0, d1["amount"])
+
+        await self.store.record_donation(
+            user_id=1002,
+            full_name="User Beta",
+            amount=5.0,
+            tier="server",
+            blessing_sent=True,
+        )
+
+        await self.store.record_donation(
+            user_id=1001,
+            full_name="User Alpha",
+            amount=2.0,
+            tier="milktea",
+            blessing_sent=True,
+        )
+
+        stats = await self.store.get_donation_stats()
+        self.assertEqual(8.0, stats["total_usd"])
+        self.assertEqual(2, stats["total_donors"])
+
+        top = await self.store.get_top_supporters(10)
+        self.assertEqual(2, len(top))
+        self.assertEqual(1002, top[0]["user_id"])
+        self.assertEqual(5.0, top[0]["total_amount"])
+        self.assertEqual("🥇", top[0]["badge"])
+
+        self.assertEqual(1001, top[1]["user_id"])
+        self.assertEqual(3.0, top[1]["total_amount"])
+        self.assertEqual("🥈", top[1]["badge"])
+
+        recent = await self.store.get_recent_donations(5)
+        self.assertEqual(3, len(recent))
+        self.assertEqual("milktea", recent[0]["tier"])
+
+    async def test_stats_derived_when_cups_missing(self) -> None:
+        # Simulate records where 'cups' key is missing or None
+        self.store._donations = [
+            {"id": 1, "user_id": 99, "amount": 1.0, "tier": "coffee"},
+            {"id": 2, "user_id": 99, "amount": 2.0, "tier": "milktea"},
+        ]
+        stats = await self.store.get_donation_stats()
+        self.assertEqual(3.0, stats["total_usd"])
+        self.assertEqual(3, stats["total_cups"])  # 1 for coffee + 2 for milktea
+        self.assertEqual(1, stats["total_donors"])
+
+
+class GeminiModelNormalizationTests(unittest.TestCase):
+    def test_normalizes_fictitious_models(self) -> None:
+        self.assertEqual("gemini-2.5-flash", normalize_gemini_model("gemini-3.6-flash"))
+        self.assertEqual("gemini-2.5-flash", normalize_gemini_model("gemini-3.0-flash"))
+        self.assertEqual("gemini-2.5-flash", normalize_gemini_model("gemini-3.5-flash"))
+        self.assertEqual("gemini-2.5-flash", normalize_gemini_model("gemini-3.6"))
+        self.assertEqual("gemini-2.5-pro", normalize_gemini_model("gemini-3.1-pro-preview"))
+
+    def test_preserves_valid_models(self) -> None:
+        self.assertEqual("gemini-2.5-flash", normalize_gemini_model("gemini-2.5-flash"))
+        self.assertEqual("gemini-2.0-flash", normalize_gemini_model("gemini-2.0-flash"))
+        self.assertEqual("gemini-1.5-flash", normalize_gemini_model("gemini-1.5-flash"))
+        self.assertEqual("gemini-2.5-pro", normalize_gemini_model("gemini-2.5-pro"))
+
+
+class AddDonorCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.test_dir = tempfile.mkdtemp()
+        self.store_file = os.path.join(self.test_dir, "test_donations.json")
+        from app.services.donation import handlers
+        handlers.donation_store = DonationStore(file_path=self.store_file)
+
+    async def asyncTearDown(self) -> None:
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    @patch("app.services.donation.handlers.deliver_voice_blessing", new_callable=AsyncMock)
+    async def test_adddonor_full_args(self, mock_blessing: AsyncMock) -> None:
+        from app.services.donation.handlers import cmd_adddonor, donation_store
+
+        mock_blessing.return_value = True
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 9999
+        mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
+        mock_update.effective_message = mock_msg
+        mock_context = MagicMock()
+        mock_context.args = ["1272791365", "1.0", "coffee", "Dara"]
+
+        with patch("app.services.donation.handlers.is_admin_user", return_value=True):
+            await cmd_adddonor(mock_update, mock_context)
+
+        mock_msg.reply_text.assert_awaited_once()
+        reply = mock_msg.reply_text.call_args[0][0]
+        self.assertIn("បានកត់ត្រាការឧបត្ថម្ភជោគជ័យ", reply)
+        self.assertIn("Dara", reply)
+        self.assertIn("1272791365", reply)
+
+        stats = await donation_store.get_donation_stats()
+        self.assertEqual(1.0, stats["total_usd"])
+        self.assertEqual(1, stats["total_donors"])
+
+    @patch("app.services.donation.handlers.deliver_voice_blessing", new_callable=AsyncMock)
+    async def test_adddonor_omitted_tier(self, mock_blessing: AsyncMock) -> None:
+        from app.services.donation.handlers import cmd_adddonor
+
+        mock_blessing.return_value = True
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 9999
+        mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
+        mock_update.effective_message = mock_msg
+        mock_context = MagicMock()
+        mock_context.args = ["1272791365", "2.0", "Sokha"]
+
+        with patch("app.services.donation.handlers.is_admin_user", return_value=True):
+            await cmd_adddonor(mock_update, mock_context)
+
+        mock_msg.reply_text.assert_awaited_once()
+        reply = mock_msg.reply_text.call_args[0][0]
+        self.assertIn("Sokha", reply)
+        self.assertIn("milktea", reply)
+
+    async def test_adddonor_usage_help(self) -> None:
+        from app.services.donation.handlers import cmd_adddonor
+
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 9999
+        mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
+        mock_update.effective_message = mock_msg
+        mock_context = MagicMock()
+        mock_context.args = ["help"]
+
+        with patch("app.services.donation.handlers.is_admin_user", return_value=True):
+            await cmd_adddonor(mock_update, mock_context)
+
+        mock_msg.reply_text.assert_awaited_once()
+        reply = mock_msg.reply_text.call_args[0][0]
+        self.assertIn("របៀបប្រើប្រាស់ពាក្យបញ្ជា /adddonor", reply)
+        self.assertIn("/adddonor &lt;user_id&gt; &lt;amount&gt; [tier] [name]", reply)
+        self.assertIn("coffee", reply)
+        self.assertIn("patron", reply)
+
+
+class AddDonorWizardFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.test_dir = tempfile.mkdtemp()
+        self.store_file = os.path.join(self.test_dir, "test_donations_wizard.json")
+        from app.services.donation import handlers
+        handlers.donation_store = DonationStore(file_path=self.store_file)
+
+    async def asyncTearDown(self) -> None:
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    async def test_step1_launch_wizard_empty_args(self) -> None:
+        from app.services.donation.handlers import cmd_adddonor
+
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 9999
+        mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
+        mock_update.effective_message = mock_msg
+        mock_context = MagicMock()
+        mock_context.args = []
+        mock_context.user_data = {}
+
+        with patch("app.services.donation.handlers.is_admin_user", return_value=True):
+            await cmd_adddonor(mock_update, mock_context)
+
+        self.assertEqual("wait_user_id", mock_context.user_data.get("adddonor_state"))
+        mock_msg.reply_text.assert_awaited_once()
+        reply = mock_msg.reply_text.call_args[0][0]
+        self.assertIn("ជំហានទី ១/៤", reply)
+        self.assertIn("Telegram User ID", reply)
+
+    async def test_step1_launch_wizard_one_arg_userid(self) -> None:
+        from app.services.donation.handlers import cmd_adddonor
+
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 9999
+        mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
+        mock_update.effective_message = mock_msg
+        mock_context = MagicMock()
+        mock_context.args = ["1272791365"]
+        mock_context.user_data = {}
+        mock_context.bot = None
+
+        with patch("app.services.donation.handlers.is_admin_user", return_value=True):
+            await cmd_adddonor(mock_update, mock_context)
+
+        self.assertEqual("wait_amount", mock_context.user_data.get("adddonor_state"))
+        self.assertEqual(1272791365, mock_context.user_data["adddonor_data"]["user_id"])
+        mock_msg.reply_text.assert_awaited_once()
+        reply = mock_msg.reply_text.call_args[0][0]
+        self.assertIn("ជំហានទី ២/៤", reply)
+
+    async def test_step1_to_step2_numeric_id_text(self) -> None:
+        from app.services.donation.handlers import handle_adddonor_text
+
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 9999
+        mock_msg = MagicMock()
+        mock_msg.text = "1272791365"
+        mock_msg.caption = None
+        mock_msg.forward_from = None
+        mock_msg.forward_from_chat = None
+        mock_msg.reply_text = AsyncMock()
+        mock_update.effective_message = mock_msg
+
+        mock_context = MagicMock()
+        mock_context.user_data = {"adddonor_state": "wait_user_id", "adddonor_data": {}}
+        mock_context.bot = None
+
+        with patch("app.services.donation.handlers.is_admin_user", return_value=True):
+            handled = await handle_adddonor_text(mock_update, mock_context)
+
+        self.assertTrue(handled)
+        self.assertEqual("wait_amount", mock_context.user_data["adddonor_state"])
+        self.assertEqual(1272791365, mock_context.user_data["adddonor_data"]["user_id"])
+        mock_msg.reply_text.assert_awaited_once()
+        self.assertIn("ជំហានទី ២/៤", mock_msg.reply_text.call_args[0][0])
+
+    async def test_step1_to_step2_forwarded_message(self) -> None:
+        from app.services.donation.handlers import handle_adddonor_text
+
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 9999
+        mock_msg = MagicMock()
+        mock_msg.text = None
+        mock_msg.caption = "Donation receipt"
+        mock_fwd = MagicMock()
+        mock_fwd.id = 777888999
+        mock_fwd.first_name = "Bona"
+        mock_fwd.full_name = "Bona Test"
+        mock_msg.forward_from = mock_fwd
+        mock_msg.forward_from_chat = None
+        mock_msg.reply_text = AsyncMock()
+        mock_update.effective_message = mock_msg
+
+        mock_context = MagicMock()
+        mock_context.user_data = {"adddonor_state": "wait_user_id", "adddonor_data": {}}
+        mock_context.bot = None
+
+        with patch("app.services.donation.handlers.is_admin_user", return_value=True):
+            handled = await handle_adddonor_text(mock_update, mock_context)
+
+        self.assertTrue(handled)
+        self.assertEqual("wait_amount", mock_context.user_data["adddonor_state"])
+        self.assertEqual(777888999, mock_context.user_data["adddonor_data"]["user_id"])
+        self.assertEqual("Bona", mock_context.user_data["adddonor_data"]["auto_name"])
+
+    async def test_step2_to_step3_callback_tier(self) -> None:
+        from app.services.donation.handlers import donation_callback
+
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 9999
+        mock_query = MagicMock()
+        mock_query.data = "donate_add_tier:server:5.0"
+        mock_query.answer = AsyncMock()
+        mock_query.message = MagicMock()
+        mock_query.message.edit_text = AsyncMock()
+        mock_update.callback_query = mock_query
+
+        mock_context = MagicMock()
+        mock_context.user_data = {
+            "adddonor_state": "wait_amount",
+            "adddonor_data": {"user_id": 1272791365, "auto_name": "Dara"},
+        }
+
+        with patch("app.services.donation.handlers.is_admin_user", return_value=True):
+            await donation_callback(mock_update, mock_context)
+
+        self.assertEqual("wait_name", mock_context.user_data["adddonor_state"])
+        self.assertEqual(5.0, mock_context.user_data["adddonor_data"]["amount"])
+        self.assertEqual("server", mock_context.user_data["adddonor_data"]["tier"])
+        mock_query.message.edit_text.assert_awaited_once()
+        self.assertIn("ជំហានទី ៣/៤", mock_query.message.edit_text.call_args[0][0])
+
+    async def test_step2_to_step3_text_amount(self) -> None:
+        from app.services.donation.handlers import handle_adddonor_text
+
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 9999
+        mock_msg = MagicMock()
+        mock_msg.text = "$10.0"
+        mock_msg.caption = None
+        mock_msg.reply_text = AsyncMock()
+        mock_update.effective_message = mock_msg
+
+        mock_context = MagicMock()
+        mock_context.user_data = {
+            "adddonor_state": "wait_amount",
+            "adddonor_data": {"user_id": 1272791365, "auto_name": "Dara"},
+        }
+
+        with patch("app.services.donation.handlers.is_admin_user", return_value=True):
+            handled = await handle_adddonor_text(mock_update, mock_context)
+
+        self.assertTrue(handled)
+        self.assertEqual("wait_name", mock_context.user_data["adddonor_state"])
+        self.assertEqual(10.0, mock_context.user_data["adddonor_data"]["amount"])
+        self.assertEqual("patron", mock_context.user_data["adddonor_data"]["tier"])
+        mock_msg.reply_text.assert_awaited_once()
+        self.assertIn("ជំហានទី ៣/៤", mock_msg.reply_text.call_args[0][0])
+
+    async def test_step3_to_step4_text_name(self) -> None:
+        from app.services.donation.handlers import handle_adddonor_text
+
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 9999
+        mock_msg = MagicMock()
+        mock_msg.text = "Brother Sok"
+        mock_msg.caption = None
+        mock_msg.reply_text = AsyncMock()
+        mock_update.effective_message = mock_msg
+
+        mock_context = MagicMock()
+        mock_context.user_data = {
+            "adddonor_state": "wait_name",
+            "adddonor_data": {"user_id": 1272791365, "amount": 5.0, "tier": "server", "auto_name": "Dara"},
+        }
+
+        with patch("app.services.donation.handlers.is_admin_user", return_value=True):
+            handled = await handle_adddonor_text(mock_update, mock_context)
+
+        self.assertTrue(handled)
+        self.assertEqual("confirm", mock_context.user_data["adddonor_state"])
+        self.assertEqual("Brother Sok", mock_context.user_data["adddonor_data"]["custom_name"])
+        mock_msg.reply_text.assert_awaited_once()
+        self.assertIn("ជំហានទី ៤/៤", mock_msg.reply_text.call_args[0][0])
+
+    async def test_step3_to_step4_callback_auto_name(self) -> None:
+        from app.services.donation.handlers import donation_callback
+
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 9999
+        mock_query = MagicMock()
+        mock_query.data = "donate_add_use_auto"
+        mock_query.answer = AsyncMock()
+        mock_query.message = MagicMock()
+        mock_query.message.edit_text = AsyncMock()
+        mock_update.callback_query = mock_query
+
+        mock_context = MagicMock()
+        mock_context.user_data = {
+            "adddonor_state": "wait_name",
+            "adddonor_data": {"user_id": 1272791365, "auto_name": "Dara Official", "amount": 1.0, "tier": "coffee"},
+        }
+
+        with patch("app.services.donation.handlers.is_admin_user", return_value=True):
+            await donation_callback(mock_update, mock_context)
+
+        self.assertEqual("confirm", mock_context.user_data["adddonor_state"])
+        self.assertEqual("Dara Official", mock_context.user_data["adddonor_data"]["custom_name"])
+        mock_query.message.edit_text.assert_awaited_once()
+        self.assertIn("ជំហានទី ៤/៤", mock_query.message.edit_text.call_args[0][0])
+
+    @patch("app.services.donation.handlers.deliver_voice_blessing", new_callable=AsyncMock)
+    async def test_step4_confirm_execution(self, mock_blessing: AsyncMock) -> None:
+        from app.services.donation.handlers import donation_callback, donation_store
+
+        mock_blessing.return_value = True
+
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 9999
+        mock_query = MagicMock()
+        mock_query.data = "donate_add_confirm"
+        mock_query.answer = AsyncMock()
+        mock_query.message = MagicMock()
+        mock_query.message.edit_text = AsyncMock()
+        mock_update.callback_query = mock_query
+
+        mock_context = MagicMock()
+        mock_context.bot = MagicMock()
+        mock_context.user_data = {
+            "adddonor_state": "confirm",
+            "adddonor_data": {
+                "user_id": 1272791365,
+                "custom_name": "Lok Ta",
+                "amount": 5.0,
+                "tier": "server",
+            },
+        }
+
+        with patch("app.services.donation.handlers.is_admin_user", return_value=True):
+            await donation_callback(mock_update, mock_context)
+
+        self.assertNotIn("adddonor_state", mock_context.user_data)
+        self.assertNotIn("adddonor_data", mock_context.user_data)
+
+        # Check recorded in store
+        stats = await donation_store.get_donation_stats()
+        self.assertEqual(5.0, stats["total_usd"])
+        self.assertEqual(1, stats["total_donors"])
+
+        mock_blessing.assert_awaited_once_with(
+            mock_context.bot,
+            user_id=1272791365,
+            donor_name="Lok Ta",
+            tier="server",
+            amount=5.0,
+        )
+
+    async def test_cancel_via_text(self) -> None:
+        from app.services.donation.handlers import handle_adddonor_text
+
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 9999
+        mock_msg = MagicMock()
+        mock_msg.text = "/cancel"
+        mock_msg.reply_text = AsyncMock()
+        mock_update.effective_message = mock_msg
+
+        mock_context = MagicMock()
+        mock_context.user_data = {"adddonor_state": "wait_user_id", "adddonor_data": {}}
+
+        with patch("app.services.donation.handlers.is_admin_user", return_value=True):
+            handled = await handle_adddonor_text(mock_update, mock_context)
+
+        self.assertTrue(handled)
+        self.assertNotIn("adddonor_state", mock_context.user_data)
+        self.assertNotIn("adddonor_data", mock_context.user_data)
+        mock_msg.reply_text.assert_awaited_once()
+        self.assertIn("បោះបង់", mock_msg.reply_text.call_args[0][0])
+
+    async def test_cancel_via_callback(self) -> None:
+        from app.services.donation.handlers import donation_callback
+
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 9999
+        mock_query = MagicMock()
+        mock_query.data = "donate_add_cancel"
+        mock_query.answer = AsyncMock()
+        mock_query.message = MagicMock()
+        mock_query.message.edit_text = AsyncMock()
+        mock_update.callback_query = mock_query
+
+        mock_context = MagicMock()
+        mock_context.user_data = {"adddonor_state": "wait_amount", "adddonor_data": {}}
+
+        await donation_callback(mock_update, mock_context)
+
+        self.assertNotIn("adddonor_state", mock_context.user_data)
+        self.assertNotIn("adddonor_data", mock_context.user_data)
+        mock_query.message.edit_text.assert_awaited_once()
+        self.assertIn("បោះបង់", mock_query.message.edit_text.call_args[0][0])
+
+
+class BakongOpenApiTests(unittest.IsolatedAsyncioTestCase):
+    """Unit tests for Bakong Open API client, token decoding, and real-time payment auto-approval."""
+
+    SAMPLE_TOKEN = (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJkYXRhIjp7ImlkIjoiYjUyMDRmY2UwY2Q2NGE3OCJ9LCJpYXQiOjE3ODkxMDM2MjMsImV4cCI6MTc5Njg3OTYyM30."
+        "NrWjrH7dqOXoQTWYHJiU9p523NU72ywH6WV4Cb57bjw"
+    )
+
+    def test_decode_token_payload(self) -> None:
+        from app.services.donation.bakong_api import decode_token_payload
+
+        meta = decode_token_payload(self.SAMPLE_TOKEN)
+        self.assertTrue(meta.get("configured"))
+        self.assertEqual(meta.get("merchant_id"), "b5204fce0cd64a78")
+        self.assertFalse(meta.get("is_expired"))
+        self.assertIn("2026", meta.get("expires_at", ""))
+
+    async def test_check_transaction_by_md5_success(self) -> None:
+        from app.services.donation.bakong_api import check_transaction_by_md5
+
+        mock_resp = {
+            "responseCode": 0,
+            "responseMessage": "Success",
+            "data": {
+                "hash": "tx_hash_12345",
+                "amount": 2.0,
+                "currency": "USD",
+                "toAccountId": "chuo_kimheng@bkrt",
+            },
+        }
+
+        with patch("app.services.donation.bakong_api._execute_http_post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = (200, mock_resp)
+            res = await check_transaction_by_md5("d41d8cd98f00b204e9800998ecf8427e", token=self.SAMPLE_TOKEN)
+
+            self.assertTrue(res["success"])
+            self.assertEqual(res["response_code"], 0)
+            self.assertIsNotNone(res["data"])
+            self.assertEqual(res["data"]["hash"], "tx_hash_12345")
+
+    async def test_check_transaction_by_md5_not_found(self) -> None:
+        from app.services.donation.bakong_api import check_transaction_by_md5
+
+        mock_resp = {
+            "responseCode": 1,
+            "responseMessage": "Transaction could not be found.",
+            "data": None,
+        }
+
+        with patch("app.services.donation.bakong_api._execute_http_post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = (200, mock_resp)
+            res = await check_transaction_by_md5("d41d8cd98f00b204e9800998ecf8427e", token=self.SAMPLE_TOKEN)
+
+            self.assertFalse(res["success"])
+            self.assertEqual(res["response_code"], 1)
+            self.assertIsNone(res["data"])
+
+    async def test_verify_khqr_payment_hashes_correctly(self) -> None:
+        import hashlib
+        from app.services.donation.bakong_api import verify_khqr_payment
+
+        sample_khqr = "00020101021129370010bakong@nbc0119chuo_kimheng@bkrt5204599953038405802KH5912CHUO KIMHENG6010Phnom Penh6304ABCD"
+        expected_md5 = hashlib.md5(sample_khqr.encode("utf-8")).hexdigest()
+
+        with patch("app.services.donation.bakong_api.check_transaction_by_md5", new_callable=AsyncMock) as mock_check:
+            mock_check.return_value = {"success": True, "data": {"amount": 1.0}, "response_message": "Success"}
+            is_paid, data, msg = await verify_khqr_payment(sample_khqr, token=self.SAMPLE_TOKEN)
+
+            self.assertTrue(is_paid)
+            mock_check.assert_awaited_once_with(expected_md5, token=self.SAMPLE_TOKEN, timeout=12.0)
+
+    async def test_donate_paid_auto_approved_via_bakong(self) -> None:
+        from app.services.donation.handlers import donation_callback
+
+        mock_update = MagicMock()
+        mock_user = MagicMock()
+        mock_user.id = 12345678
+        mock_user.first_name = "Sophea"
+        mock_user.username = "sophea_kh"
+        mock_update.effective_user = mock_user
+
+        mock_query = MagicMock()
+        mock_query.data = "donate_paid:coffee:BILL123:1.00"
+        mock_query.answer = AsyncMock()
+        mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
+        mock_query.message = mock_msg
+        mock_update.callback_query = mock_query
+
+        mock_context = MagicMock()
+        mock_context.bot.send_message = AsyncMock()
+
+        with patch("app.services.donation.bakong_api.is_bakong_api_configured", return_value=True), \
+             patch("app.services.donation.bakong_api.check_transaction_by_md5", new_callable=AsyncMock) as mock_check, \
+             patch("app.services.donation.handlers.deliver_voice_blessing", new_callable=AsyncMock) as mock_voice, \
+             patch("app.services.donation.handlers.donation_store.record_donation", new_callable=AsyncMock) as mock_record:
+
+            mock_check.return_value = {
+                "success": True,
+                "response_code": 0,
+                "response_message": "Success",
+                "data": {"hash": "tx_paid_123"},
+            }
+            mock_voice.return_value = True
+
+            await donation_callback(mock_update, mock_context)
+
+            mock_record.assert_awaited_once()
+            mock_voice.assert_awaited_once()
+            mock_msg.reply_text.assert_awaited_once()
+            # Assert confirmation caption sent to donor
+            reply_text = mock_msg.reply_text.call_args[0][0]
+            self.assertIn("Bakong Open API (ស្វ័យប្រវត្តិ 100%)", reply_text)
+            self.assertIn("ផ្ទៀងផ្ទាត់ជោគជ័យ", reply_text)
+
+    async def test_cmd_bakongstatus_admin_output(self) -> None:
+        from app.services.telegram.commands import cmd_bakongstatus
+
+        mock_status_msg = MagicMock()
+        mock_status_msg.edit_text = AsyncMock()
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 123
+        mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock(return_value=mock_status_msg)
+        mock_update.effective_message = mock_msg
+        mock_context = MagicMock()
+
+        mock_res = {
+            "ok": True,
+            "latency_ms": 125.4,
+            "merchant_id": "b5204fce0cd64a78",
+            "expires_at": "2026-12-10 05:13:43 UTC",
+            "is_expired": False,
+            "message": "Connected",
+        }
+
+        with patch("app.legacy._is_admin", return_value=True), \
+             patch("app.services.donation.bakong_api.test_connection", new_callable=AsyncMock, return_value=mock_res):
+            await cmd_bakongstatus(mock_update, mock_context)
+
+        mock_msg.reply_text.assert_awaited()
+        mock_status_msg.edit_text.assert_awaited_once()
+        status_text = mock_status_msg.edit_text.call_args[0][0]
+        self.assertIn("Bakong Open API", status_text)
+        self.assertIn("b5204fce0cd64a78", status_text)
+        self.assertIn("Connected", status_text)
+
+    async def test_generate_deeplink_by_qr(self) -> None:
+        from app.services.donation.bakong_api import generate_deeplink_by_qr
+
+        mock_resp = {
+            "responseCode": 0,
+            "responseMessage": "Success",
+            "data": {
+                "shortLink": "https://bakong-deeplink.nbc.gov.kh/bakong/mock123",
+                "fullLink": "https://bakong-deeplink.nbc.gov.kh/bakong/payment?mock=1",
+            },
+        }
+        with patch("app.services.donation.bakong_api._execute_http_post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = (200, mock_resp)
+            res = await generate_deeplink_by_qr("dummy_qr_string", token="dummy_token")
+            self.assertIsNotNone(res)
+            self.assertEqual("https://bakong-deeplink.nbc.gov.kh/bakong/mock123", res.get("shortLink"))
+
+    async def test_cmd_khqr_overview(self) -> None:
+        from app.services.telegram.commands import cmd_khqr
+
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 9999
+        mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
+        mock_msg.chat_id = 12345
+        mock_update.effective_message = mock_msg
+        mock_context = MagicMock()
+        mock_context.args = []
+        mock_context.bot = MagicMock()
+        mock_context.bot.send_photo = AsyncMock()
+
+        with patch("app.legacy._is_admin", return_value=True):
+            await cmd_khqr(mock_update, mock_context)
+
+        self.assertTrue(mock_msg.reply_text.called or mock_context.bot.send_photo.called)
+
+    async def test_cmd_khqr_update_account(self) -> None:
+        from app.services.telegram.commands import cmd_khqr
+        from app.services.donation.khqr import get_khqr_config, update_khqr_config
+
+        old_acc = get_khqr_config()["account_id"]
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 9999
+        mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
+        mock_update.effective_message = mock_msg
+        mock_context = MagicMock()
+        mock_context.args = ["account", "test_new_acc@bkrt"]
+
+        with patch("app.legacy._is_admin", return_value=True):
+            await cmd_khqr(mock_update, mock_context)
+
+        mock_msg.reply_text.assert_awaited_once()
+        self.assertIn("test_new_acc@bkrt", mock_msg.reply_text.call_args[0][0])
+        self.assertEqual("test_new_acc@bkrt", get_khqr_config()["account_id"])
+
+        update_khqr_config(account_id=old_acc)
+
+    async def test_cmd_checkpay_usage(self) -> None:
+        from app.services.telegram.commands import cmd_checkpay
+
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 9999
+        mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
+        mock_update.effective_message = mock_msg
+        mock_context = MagicMock()
+        mock_context.args = []
+
+        with patch("app.legacy._is_admin", return_value=True):
+            await cmd_checkpay(mock_update, mock_context)
+
+        mock_msg.reply_text.assert_awaited_once()
+        text = mock_msg.reply_text.call_args[0][0]
+        self.assertIn("ផ្ទៀងផ្ទាត់ការបង់ប្រាក់ Bakong Pay", text)
+        self.assertIn("/checkpay", text)
+
+    async def test_cmd_checkpay_success(self) -> None:
+        from app.services.telegram.commands import cmd_checkpay
+
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 9999
+        mock_msg = MagicMock()
+        mock_status_msg = MagicMock()
+        mock_status_msg.edit_text = AsyncMock()
+        mock_msg.reply_text = AsyncMock(return_value=mock_status_msg)
+        mock_update.effective_message = mock_msg
+        mock_context = MagicMock()
+        mock_context.args = ["a" * 32]
+
+        mock_tx_data = {
+            "success": True,
+            "data": {
+                "hash": "abcdef1234567890",
+                "fromAccountId": "payer@aba",
+                "toAccountId": "chuo_kimheng@bkrt",
+                "amount": "1.00",
+                "currency": "USD",
+            },
+            "response_message": "Success",
+        }
+
+        with patch("app.legacy._is_admin", return_value=True), \
+             patch("app.services.donation.bakong_api.check_transaction_by_md5", new_callable=AsyncMock, return_value=mock_tx_data):
+            await cmd_checkpay(mock_update, mock_context)
+
+        mock_status_msg.edit_text.assert_awaited_once()
+        text = mock_status_msg.edit_text.call_args[0][0]
+        self.assertIn("ប្រតិបត្តិការត្រូវបានផ្ទៀងផ្ទាត់ជោគជ័យ", text)
+        self.assertIn("payer@aba", text)
+        self.assertIn("1.00 USD", text)
+
+    async def test_donate_paid_khr_auto_approved(self) -> None:
+        from app.services.donation.handlers import donation_callback
+
+        mock_update = MagicMock()
+        mock_user = MagicMock()
+        mock_user.id = 87654321
+        mock_user.first_name = "Bopha"
+        mock_user.username = "bopha_khr"
+        mock_update.effective_user = mock_user
+
+        mock_query = MagicMock()
+        mock_query.data = "donate_paid:coffee_khr:BILL789:4000.00"
+        mock_query.answer = AsyncMock()
+        mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
+        mock_query.message = mock_msg
+        mock_update.callback_query = mock_query
+
+        mock_context = MagicMock()
+        mock_context.bot.send_message = AsyncMock()
+
+        with patch("app.services.donation.bakong_api.is_bakong_api_configured", return_value=True), \
+             patch("app.services.donation.bakong_api.check_transaction_by_md5", new_callable=AsyncMock) as mock_check, \
+             patch("app.services.donation.handlers.deliver_voice_blessing", new_callable=AsyncMock) as mock_voice, \
+             patch("app.services.donation.handlers.donation_store.record_donation", new_callable=AsyncMock) as mock_record:
+
+            mock_check.return_value = {
+                "success": True,
+                "response_code": 0,
+                "response_message": "Success",
+                "data": {"hash": "tx_khr_paid_789"},
+            }
+            mock_voice.return_value = True
+
+            await donation_callback(mock_update, mock_context)
+
+            mock_record.assert_awaited_once()
+            record_kwargs = mock_record.call_args[1]
+            self.assertEqual("KHR", record_kwargs.get("currency"))
+            self.assertEqual(4000.0, record_kwargs.get("amount"))
+
+            mock_msg.reply_text.assert_awaited_once()
+            reply_text = mock_msg.reply_text.call_args[0][0]
+            self.assertIn("4,000 KHR (៛)", reply_text)
+
+
+
+class DonationUICleanupTests(unittest.IsolatedAsyncioTestCase):
+    """Unit tests for clean UI layout, compact button labels, and single-message transitions."""
+
+    def test_donation_menu_markup_usd(self) -> None:
+        from app.services.donation.handlers import _build_donation_menu_markup
+
+        markup = _build_donation_menu_markup(currency="USD")
+        keyboard = markup.inline_keyboard
+        # 6 tiers in 3 rows (2 per row) + 1 currency switch row + 1 bottom row (2 buttons: Hall of fame & Close)
+        self.assertEqual(5, len(keyboard))
+        # Check tier buttons have compact labels
+        self.assertIn("$1.00 · កាហ្វេ", keyboard[0][0].text)
+        self.assertEqual("donate_tier:coffee", keyboard[0][0].callback_data)
+        self.assertIn("$2.00 · តែដោះគោ", keyboard[0][1].text)
+        self.assertEqual("donate_tier:milktea", keyboard[0][1].callback_data)
+
+        # Check currency switch row
+        self.assertIn("ប្តូរទៅប្រាក់រៀល (៛ KHR)", keyboard[3][0].text)
+        self.assertEqual("donate_curr:KHR", keyboard[3][0].callback_data)
+
+        # Check bottom row has both Hall of fame and Close button side by side
+        self.assertEqual(2, len(keyboard[4]))
+        self.assertIn("តារាងកិត្តិយស", keyboard[4][0].text)
+        self.assertEqual("donate_halloffame", keyboard[4][0].callback_data)
+        self.assertIn("បិទ", keyboard[4][1].text)
+        self.assertEqual("donate_close", keyboard[4][1].callback_data)
+
+    def test_donation_menu_markup_khr(self) -> None:
+        from app.services.donation.handlers import _build_donation_menu_markup
+
+        markup = _build_donation_menu_markup(currency="KHR")
+        keyboard = markup.inline_keyboard
+        self.assertEqual(5, len(keyboard))
+        self.assertIn("4,000៛ · កាហ្វេ", keyboard[0][0].text)
+        self.assertEqual("donate_tier:coffee_khr", keyboard[0][0].callback_data)
+        self.assertIn("ប្តូរទៅប្រាក់ដុល្លារ ($ USD)", keyboard[3][0].text)
+        self.assertEqual("donate_curr:USD", keyboard[3][0].callback_data)
+        self.assertIn("បិទ", keyboard[4][1].text)
+
+    def test_clean_menu_text(self) -> None:
+        from app.services.donation.handlers import _get_donation_menu_text
+
+        text = _get_donation_menu_text("Dara")
+        self.assertIn("Dara", text)
+        self.assertIn("ឧបត្ថម្ភគាំទ្រ Bot Voice", text)
+        self.assertIn("AI Voice Blessing", text)
+        self.assertIn("/donors", text)
+
+    async def test_send_khqr_screen_deletes_previous_menu(self) -> None:
+        from app.services.donation.handlers import _send_khqr_screen
+
+        mock_query = MagicMock()
+        mock_msg = MagicMock()
+        mock_msg.delete = AsyncMock()
+        mock_query.message = mock_msg
+
+        mock_context = MagicMock()
+        mock_context.bot = MagicMock()
+        mock_context.bot.send_photo = AsyncMock()
+
+        with patch("app.services.donation.handlers.get_khqr_qr_image", new_callable=AsyncMock) as mock_qr:
+            mock_qr.return_value = b"RIFFmockwebp"
+            await _send_khqr_screen(
+                chat_id=12345,
+                user_name="Dara",
+                amount=1.0,
+                tier_key="coffee",
+                tier_title="កាហ្វេ",
+                context=mock_context,
+                currency="USD",
+                query=mock_query,
+            )
+
+        # Previous message must be deleted to avoid stacking duplicate messages
+        mock_msg.delete.assert_awaited_once()
+        mock_context.bot.send_photo.assert_awaited_once()
+
+    async def test_donate_close_callback_deletes_message(self) -> None:
+        from app.services.donation.handlers import donation_callback
+
+        mock_update = MagicMock()
+        mock_query = MagicMock()
+        mock_query.data = "donate_close"
+        mock_query.answer = AsyncMock()
+        mock_msg = MagicMock()
+        mock_msg.delete = AsyncMock()
+        mock_query.message = mock_msg
+        mock_update.callback_query = mock_query
+        mock_context = MagicMock()
+
+        await donation_callback(mock_update, mock_context)
+
+        mock_query.answer.assert_awaited_once()
+        mock_msg.delete.assert_awaited_once()
+
+    async def test_donate_menu_deletes_photo_message(self) -> None:
+        from app.services.donation.handlers import donation_callback
+
+        mock_update = MagicMock()
+        mock_update.effective_chat.id = 555
+        mock_query = MagicMock()
+        mock_query.data = "donate_menu"
+        mock_query.answer = AsyncMock()
+        mock_msg = MagicMock()
+        mock_msg.photo = [MagicMock()]
+        mock_msg.delete = AsyncMock()
+        mock_query.message = mock_msg
+        mock_update.callback_query = mock_query
+
+        mock_context = MagicMock()
+        mock_context.bot = MagicMock()
+        mock_context.bot.send_message = AsyncMock()
+
+        await donation_callback(mock_update, mock_context)
+
+        mock_msg.delete.assert_awaited_once()
+        mock_context.bot.send_message.assert_awaited_once()
+
+    async def test_cmd_donors_self_healing_stats(self) -> None:
+        from app.services.donation.handlers import cmd_donors
+
+        mock_update = MagicMock()
+        mock_update.effective_user.id = 123
+        mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
+        mock_update.effective_message = mock_msg
+        mock_update.callback_query = None
+        mock_context = MagicMock()
+
+        # Simulate scenario where stats returns 0 but top_supporters has HENG with $3 (3 cups)
+        fake_top = [
+            {"badge": "🥇", "full_name": "HENG", "total_amount": 3.0, "total_cups": 3}
+        ]
+        fake_recent = [
+            {"full_name": "HENG", "amount": 1.0, "tier": "coffee"},
+            {"full_name": "HENG", "amount": 2.0, "tier": "milktea"},
+        ]
+        fake_stats = {"total_usd": 0.0, "total_cups": 0, "total_donors": 0}
+
+        with patch("app.services.donation.handlers.donation_store.get_donation_stats", new_callable=AsyncMock, return_value=fake_stats), \
+             patch("app.services.donation.handlers.donation_store.get_top_supporters", new_callable=AsyncMock, return_value=fake_top), \
+             patch("app.services.donation.handlers.donation_store.get_recent_donations", new_callable=AsyncMock, return_value=fake_recent):
+            await cmd_donors(mock_update, mock_context)
+
+        mock_msg.reply_text.assert_awaited_once()
+        rendered_text = mock_msg.reply_text.call_args[0][0]
+
+        # The header must self-heal and display 3 cups, $3.00, and 1 donor instead of 0!
+        self.assertIn("<b>3</b> កែវ", rendered_text)
+        self.assertIn("<b>$3.00 USD</b>", rendered_text)
+        self.assertIn("<b>1</b> នាក់", rendered_text)
+        self.assertIn("HENG", rendered_text)
+
+    async def test_check_and_approve_pending_ticket_success(self) -> None:
+        from app.services.donation.handlers import (
+            _PENDING_DONATIONS,
+            _PENDING_LOCK,
+            check_and_approve_pending_ticket,
+        )
+
+        ticket_id = "test_ticket_autocheck_1"
+        with _PENDING_LOCK:
+            _PENDING_DONATIONS[ticket_id] = {
+                "user_id": 9999,
+                "amount": 2.0,
+                "tier_key": "milktea",
+                "currency": "USD",
+                "bill_no": "BILL_AUTO_1",
+                "user_name": "Sophea",
+                "md5": "md5_hash_sample",
+                "created_at": time.time(),
+            }
+
+        mock_context = MagicMock()
+        mock_context.bot.send_message = AsyncMock()
+        mock_target_msg = MagicMock()
+        mock_target_msg.edit_text = AsyncMock()
+
+        with patch("app.services.donation.bakong_api.is_bakong_api_configured", return_value=True), \
+             patch("app.services.donation.bakong_api.check_transaction_by_md5", new_callable=AsyncMock) as mock_check, \
+             patch("app.services.donation.handlers._execute_donation_approval", new_callable=AsyncMock) as mock_exec:
+            mock_check.return_value = {"success": True, "response_code": 0, "data": {"hash": "tx_xyz"}}
+            mock_exec.return_value = (True, "Recorded to DB")
+
+            result = await check_and_approve_pending_ticket(
+                ticket_id=ticket_id,
+                context=mock_context,
+                target_msg=mock_target_msg,
+            )
+
+            self.assertTrue(result)
+            mock_check.assert_awaited_once_with("md5_hash_sample")
+            mock_exec.assert_awaited_once()
+            mock_target_msg.edit_text.assert_awaited_once()
+            caption = mock_target_msg.edit_text.call_args[0][0]
+            self.assertIn("ការផ្ទេរប្រាក់ត្រូវបានផ្ទៀងផ្ទាត់ជោគជ័យ", caption)
+
+    async def test_auto_poll_ticket_lifecycle(self) -> None:
+        from app.services.donation.handlers import (
+            _PENDING_DONATIONS,
+            _PENDING_LOCK,
+            _auto_poll_ticket,
+        )
+
+        ticket_id = "test_ticket_autocheck_poll"
+        with _PENDING_LOCK:
+            _PENDING_DONATIONS[ticket_id] = {
+                "user_id": 8888,
+                "amount": 1.0,
+                "tier_key": "coffee",
+                "currency": "USD",
+                "bill_no": "BILL_POLL_1",
+                "user_name": "Dara",
+                "md5": "md5_dara",
+                "created_at": time.time(),
+            }
+
+        mock_context = MagicMock()
+        mock_target_msg = MagicMock()
+
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep, \
+             patch("app.services.donation.handlers.check_and_approve_pending_ticket", new_callable=AsyncMock) as mock_approve:
+            mock_approve.return_value = True
+
+            await _auto_poll_ticket(ticket_id, mock_target_msg, mock_context)
+
+            mock_sleep.assert_awaited_once_with(3)
+            mock_approve.assert_awaited_once()
+
+    def test_decode_token_payload_string_and_invalid_timestamps(self) -> None:
+        import base64
+        import json
+        from app.services.donation.bakong_api import decode_token_payload, inspect_bakong_token
+
+        def _make_mock_jwt(payload_dict: dict) -> str:
+            hdr = base64.urlsafe_b64encode(json.dumps({"alg": "HS256"}).encode()).decode().rstrip("=")
+            body = base64.urlsafe_b64encode(json.dumps(payload_dict).encode()).decode().rstrip("=")
+            sig = "mock_signature"
+            return f"{hdr}.{body}.{sig}"
+
+        # 1. String-encoded timestamps
+        jwt_str = _make_mock_jwt({
+            "exp": "1735689600",
+            "iat": "1704067200",
+            "data": {"id": "TEST_MERCHANT_STRING_TS"},
+        })
+        info_str = decode_token_payload(jwt_str)
+        self.assertTrue(info_str["configured"])
+        self.assertEqual("TEST_MERCHANT_STRING_TS", info_str["merchant_id"])
+        self.assertIn("2024", info_str["issued_at"])
+        self.assertIn("2025", info_str["expires_at"])
+
+        # 2. inspect_bakong_token alias works identically
+        info_alias = inspect_bakong_token(jwt_str)
+        self.assertEqual(info_str, info_alias)
+
+        # 3. Invalid non-numeric timestamp strings don't crash
+        jwt_invalid = _make_mock_jwt({
+            "exp": "not_a_valid_timestamp",
+            "iat": "invalid_iat",
+            "data": {"id": "TEST_MERCHANT_INV"},
+        })
+        info_invalid = decode_token_payload(jwt_invalid)
+        self.assertTrue(info_invalid["configured"])
+        self.assertEqual("", info_invalid["expires_at"])
+        self.assertEqual("", info_invalid["issued_at"])
+
+        # 4. Malformed JWT
+        info_malformed = decode_token_payload("just.two.parts.extra.parts")
+        self.assertFalse(info_malformed["configured"])
+        self.assertIn("Malformed", info_malformed["error"])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+
+

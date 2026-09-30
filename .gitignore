@@ -1,0 +1,47 @@
+# Environments and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Logs and databases
+*.log
+logs/
+*.sqlite3
+*.db
+
+# Temporary disassembly and reconstruction artifacts
+disasm.txt
+missing_disasm.txt
+reconstructed.py
+commands_decompiled.py
+backups/
+on_voice_fixed.txt
+on_voice_out.txt
+
+# OS / Editor artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

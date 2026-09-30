@@ -1,0 +1,253 @@
+{
+  "test_ticket_autocheck_poll": {
+    "user_id": 8888,
+    "amount": 1.0,
+    "tier_key": "coffee",
+    "currency": "USD",
+    "bill_no": "BILL_POLL_1",
+    "user_name": "Dara",
+    "md5": "md5_dara",
+    "created_at": 1790748414.7229116
+  },
+  "test_ticket_autocheck_1": {
+    "user_id": 9999,
+    "amount": 2.0,
+    "tier_key": "milktea",
+    "currency": "USD",
+    "bill_no": "BILL_AUTO_1",
+    "user_name": "Sophea",
+    "md5": "md5_hash_sample",
+    "created_at": 1790748414.740719
+  },
+  "t01d67b9e": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "COFF6aab9971",
+    "user_name": "Dara",
+    "md5": "43f79d6502a4c41a33f7846453d3e2be",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912KIMHENG CHUO6010Phnom Penh62370112COFF6aab99710505123450708BOTVOICE99340013178963083356601131789717233566630401CF",
+    "created_at": 1789630833.5666876
+  },
+  "t01db159c": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "COFF6aab9a9f",
+    "user_name": "Dara",
+    "md5": "bb94f2176e87b033959ad6ad09e8a704",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912CHUO KIMHENG6010Phnom Penh62370112COFF6aab9a9f0505123450708BOTVOICE9934001317896311351320113178971753513263040DCB",
+    "created_at": 1789631135.132525
+  },
+  "t05263b63": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "COFF6ab28cf7",
+    "user_name": "Dara",
+    "md5": "2189e4bb3ec2b77ce31c670fae344a43",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912CHUO KIMHENG6010Phnom Penh62370112COFF6ab28cf70505123450708BOTVOICE993400131790086391651011317901727916516304F736",
+    "created_at": 1790086391.6511524
+  },
+  "t0540e985": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "COFF6ab293cc",
+    "user_name": "Dara",
+    "md5": "ac5a26678858fa9752e655a608190e21",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912CHUO KIMHENG6010Phnom Penh62370112COFF6ab293cc0505123450708BOTVOICE99340013179008814016501131790174540165630423B6",
+    "created_at": 1790088140.1651556
+  },
+  "t0577fa4e": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "COFF6ab2a1e4",
+    "user_name": "Dara",
+    "md5": "c3ee85d2eab07f06c3992e8ee14aa325",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912CHUO KIMHENG6010Phnom Penh62370112COFF6ab2a1e40505123450708BOTVOICE993400131790091748942011317901781489426304BE5E",
+    "created_at": 1790091748.942564
+  },
+  "t04718f9c": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "COFF6ab3e557",
+    "user_name": "Dara",
+    "md5": "e8647949251dc4e5ce62ed6cf7333750",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912CHUO KIMHENG6010Phnom Penh62370112COFF6ab3e5570505123450708BOTVOICE9934001317901745511960113179026095119663041998",
+    "created_at": 1790174551.1962464
+  },
+  "t0484bfc1": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "COFF6ab3ea40",
+    "user_name": "Dara",
+    "md5": "fae1b40e62727b7742a9458b034840ea",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912CHUO KIMHENG6010Phnom Penh62370112COFF6ab3ea400505123450708BOTVOICE9934001317901758087050113179026220870563044572",
+    "created_at": 1790175808.7054229
+  },
+  "t048a2775": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "COFF6ab3eba2",
+    "user_name": "Dara",
+    "md5": "25f0fc6adb012d9e272d96f3bbcf59c5",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912CHUO KIMHENG6010Phnom Penh62370112COFF6ab3eba20505123450708BOTVOICE9934001317901761629330113179026256293363043199",
+    "created_at": 1790176162.933632
+  },
+  "t04abd76c": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "COFF6ab3f442",
+    "user_name": "Dara",
+    "md5": "1fa1de4343191f0c46328442bba99b83",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912CHUO KIMHENG6010Phnom Penh62370112COFF6ab3f4420505123450708BOTVOICE9934001317901783706680113179026477066863043A5F",
+    "created_at": 1790178370.6683137
+  },
+  "t04aff73e": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "COFF6ab3f550",
+    "user_name": "Dara",
+    "md5": "c97a898b74e0583817208afed9d3b98f",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912CHUO KIMHENG6010Phnom Penh62370112COFF6ab3f5500505123450708BOTVOICE9934001317901786409580113179026504095863042959",
+    "created_at": 1790178640.958162
+  },
+  "t04c4dcb7": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "COFF6ab3faaa",
+    "user_name": "Dara",
+    "md5": "88faa37f23c1776b1c34d17ac6718e20",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912CHUO KIMHENG6010Phnom Penh62370112COFF6ab3faaa0505123450708BOTVOICE993400131790180010423011317902664104236304F603",
+    "created_at": 1790180010.4239283
+  },
+  "t01e1cc1a": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "FF1a0efeb5f19686",
+    "user_name": "Dara",
+    "md5": "38f23ae99a52d0cb8b55d91c79cace2e",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912CHUO KIMHENG6010Phnom Penh62410116FF1a0efeb5f196860505123450708BOTVOICE993400131790731575066011317908179750666304D5A6",
+    "created_at": 1790731575.0662696
+  },
+  "t022ce21f": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "FF1a0f036751f739",
+    "user_name": "Dara",
+    "md5": "4230075a3ea021be25c5c3356047da7a",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912KIMHENG CHUO6010Phnom Penh62410116FF1a0f036751f7390505123450708BOTVOICE993400131790736495903011317908228959036304F8BC",
+    "created_at": 1790736495.9034843
+  },
+  "t02329b1f": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "COFF1a0f03c2e1f6",
+    "user_name": "Dara",
+    "md5": "d4eaf65aa3ef6b261c0984797928265d",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912KIMHENG CHUO6010Phnom Penh62410116COFF1a0f03c2e1f60505123450708BOTVOICE993400131790736870943011317908232709436304C641",
+    "created_at": 1790736870.943687
+  },
+  "t0232ed95": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "COFF1a0f03c80952",
+    "user_name": "Dara",
+    "md5": "495b8333948b05186d87331a7cc29ceb",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912KIMHENG CHUO6010Phnom Penh62410116COFF1a0f03c809520505123450708BOTVOICE993400131790736892053011317908232920536304249A",
+    "created_at": 1790736892.0534174
+  },
+  "t025919c1": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "COFF1a0f062acc1d",
+    "user_name": "Dara",
+    "md5": "932b002877eaddaa2da4d3f638ba3850",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912CHUO KIMHENG6010Phnom Penh62410116COFF1a0f062acc1d0505123450708BOTVOICE9934001317907393937290113179082579372963049932",
+    "created_at": 1790739393.7293453
+  },
+  "t0274e8d7": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "COFF1a0f07e7bd7e",
+    "user_name": "Dara",
+    "md5": "0bc83e4b7ec61f3b40fb36dbb0033ff2",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912CHUO KIMHENG6010Phnom Penh62410116COFF1a0f07e7bd7e0505123450708BOTVOICE993400131790741216215011317908276162156304C543",
+    "created_at": 1790741216.2158093
+  },
+  "t029c7e7a": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "COFF1a0f0a6117aa",
+    "user_name": "Dara",
+    "md5": "e3c396e9bc13bbf146951c1d0ee949ba",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912CHUO KIMHENG6010Phnom Penh62410116COFF1a0f0a6117aa0505123450708BOTVOICE99340013179074381042601131790830210426630471DB",
+    "created_at": 1790743810.4267304
+  },
+  "t02ade598": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "COFF1a0f0b778982",
+    "user_name": "Dara",
+    "md5": "bcd4a61fa560c4da49a314f8c8cd34d3",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912CHUO KIMHENG6010Phnom Penh62410116COFF1a0f0b7789820505123450708BOTVOICE993400131790744950936011317908313509366304AE3D",
+    "created_at": 1790744950.9364226
+  },
+  "t02dd3b8d": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "COFF1a0f0e6ce8d4",
+    "user_name": "Dara",
+    "md5": "efff0e941c591ac168dd09b554962169",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912CHUO KIMHENG6010Phnom Penh62410116COFF1a0f0e6ce8d40505123450708BOTVOICE99340013179074805313301131790834453133630426D5",
+    "created_at": 1790748053.1333115
+  },
+  "t02e2c0b3": {
+    "user_id": 12345,
+    "amount": 1.0,
+    "currency": "USD",
+    "tier_key": "coffee",
+    "bill_no": "COFF1a0f0ec53b30",
+    "user_name": "Dara",
+    "md5": "33928c2b9d2101b5511d1217904623bc",
+    "khqr_text": "00020101021229210017chuo_kimheng@bkrt52045999530384054041.005802KH5912CHUO KIMHENG6010Phnom Penh62410116COFF1a0f0ec53b300505123450708BOTVOICE993400131790748414899011317908348148996304683A",
+    "created_at": 1790748414.899358
+  }
+}

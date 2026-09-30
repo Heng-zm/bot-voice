@@ -1,0 +1,56 @@
+[Unit]
+Description=Bot Voice — Multilingual Telegram Voice, Vision OCR & AI Assistant Suite
+Documentation=https://github.com/Heng-zm/bot-voice
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Security recommendation: Run as an unprivileged service user instead of root.
+# To use a dedicated user:
+#   useradd -r -s /bin/false botvoice
+#   chown -R botvoice:botvoice /opt/bot-voice/data /opt/bot-voice/logs
+#   User=botvoice
+#   Group=botvoice
+User=root
+WorkingDirectory=/opt/bot-voice
+EnvironmentFile=/opt/bot-voice/.env
+
+# Runtime Python & Environment Configuration
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PATH=/opt/bot-voice/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Main Uvicorn Server Launch Command
+ExecStart=/opt/bot-voice/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 1 --lifespan on --access-log
+
+# Fault Tolerance & Auto-Restart Policies
+Restart=always
+RestartSec=3s
+TimeoutStartSec=60s
+TimeoutStopSec=15s
+KillMode=mixed
+
+# High-Concurrency Resource & File Descriptor Limits
+LimitNOFILE=65536
+LimitNPROC=4096
+TasksMax=4096
+
+# Memory Protection & OOM Shields (1.8GB Hard Cap, 1.4GB High Warning)
+MemoryHigh=1400M
+MemoryMax=1800M
+
+# Security Sandboxing & Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/bot-voice/data /opt/bot-voice/logs /tmp
+
+# Logging & Systemd Journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bot-voice
+
+[Install]
+WantedBy=multi-user.target

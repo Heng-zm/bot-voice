@@ -1,0 +1,1279 @@
+"""Extracted Telegram handler implementations.
+
+These are live runtime handlers; app.legacy now contains compatibility wrappers only.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import html
+import io
+import logging
+import os
+import re
+import time
+from contextlib import suppress
+from typing import Any
+
+from telegram import Update
+from telegram.error import BadRequest
+from telegram.ext import ContextTypes
+
+# Transitional V4.1 modules bind remaining legacy helpers at runtime.
+# ruff: noqa: F821
+from app.services.telegram._legacy_runtime import legacy_bound_handler, safe_send
+from app.services.telegram.workloads import WorkloadBusy, run_telegram_workload
+from app.services.tts import (
+    get_cached_telegram_file_id,
+    invalidate_cached_telegram_file_id,
+    make_tts_audio_cache_key,
+    set_cached_telegram_file_id,
+)
+
+logger = logging.getLogger(__name__)
+
+_URL_PATTERN = re.compile(r"^https?://\S+$")
+
+
+@legacy_bound_handler
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    user = update.effective_user
+    user_id = user.id if user else None
+    if user_id is None or msg is None:
+        return
+
+    if _is_admin(user_id):
+        caption = (msg.caption or "").strip()
+        if caption.lower().startswith("#khqr") or context.user_data.get("khqr_state") == "wait_photo":
+            context.user_data.pop("khqr_state", None)
+            try:
+                photo = msg.photo[-1]
+                f = await context.bot.get_file(photo.file_id)
+                buf = io.BytesIO()
+                await f.download_to_memory(buf)
+                img_data = buf.getvalue()
+                if img_data:
+                    from app.services.donation.khqr import (
+                        PROJECT_ROOT,
+                        invalidate_branded_card_cache,
+                    )
+
+                    dest_path = os.path.join(PROJECT_ROOT, "assets", "my_khqr.webp")
+                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                    with open(dest_path, "wb") as out_f:
+                        out_f.write(img_data)
+                    invalidate_branded_card_cache()
+                    await safe_send(lambda: msg.reply_text(
+                        "✅ <b>បានផ្លាស់ប្តូររូបភាព Bakong KHQR (Static QR) ជោគជ័យ!</b>\n\n"
+                        f"📁 រក្សាទុកនៅ: <code>assets/my_khqr.webp</code> ({len(img_data):,} bytes)",
+                        parse_mode="HTML"
+                    ))
+                    return
+            except Exception as exc:
+                logger.warning("Failed to save admin KHQR photo: %s", exc)
+                await safe_send(lambda: msg.reply_text(f"❌ បរាជ័យក្នុងការរក្សាទុករូបភាព KHQR: {exc}"))
+                return
+
+        if await _handle_admin_welcome_photo(update, context):
+            return
+        sched_state = context.user_data.get("sched_state")
+        if sched_state == SCHED_EDIT_WAIT_PHOTO:
+            await _handle_sched_edit_photo(update, context)
+            return
+        if sched_state == SCHED_WAIT_MSG:
+            await _handle_sched_content(update, context)
+            return
+        if context.user_data.get("adddonor_state") == "wait_user_id":
+            from app.services.donation.handlers import handle_adddonor_text
+
+            if await handle_adddonor_text(update, context):
+                return
+        if context.user_data.get("bc_state") == BROADCAST_WAIT_MESSAGE:
+            await broadcast_receive(update, context)
+            return
+        if context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
+            target_id = _admin_chat_target.get(user_id)
+            if target_id:
+                ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
+                reply = (
+                    f"✅ បានផ្ញើរូបភាពទៅកាន់អ្នកប្រើប្រាស់ <code>{target_id}</code>។"
+                    if ok else
+                    f"❌ អ្នកប្រើប្រាស់ <code>{target_id}</code> បានបិទបូត (Blocked)។"
+                )
+                await safe_send(lambda: msg.reply_text(reply, parse_mode="HTML"))
+                if not ok:
+                    _close_session(user_id)
+                    context.user_data.pop("chat_state", None)
+            return
+
+    admin_id = _get_admin_for_user(user_id)
+    if admin_id is not None:
+        uname = user.username or user.first_name or str(user_id)
+        await _fwd_user_to_admin(context.bot, admin_id, user_id, uname, msg)
+        await safe_send(lambda: msg.reply_text("✅ បានផ្ញើរូបភាពទៅកាន់អ្នកគ្រប់គ្រង។"))
+        return
+
+    from app.core.features import is_ocr_enabled
+    if not is_ocr_enabled():
+        await safe_send(lambda: msg.reply_text("⚠️ មុខងារអានអត្ថបទពីរូបភាព (OCR) ត្រូវបានបិទដំណើរការ (OCR Disabled)។"))
+        return
+
+    if not await _ensure_user_allowed(update, context, "ocr_enabled", "អានអត្ថបទពីរូបភាព"):
+        return
+    if not _ocr_configured():
+        await safe_send(lambda: msg.reply_text(_ocr_status_for_user()))
+        return
+    if await _check_cooldown(msg, user_id):
+        return
+
+    _metric_inc("ocr")
+    await safe_send(lambda: context.bot.send_chat_action(chat_id=msg.chat_id, action="typing"))
+    sync_user_data(user)
+    uname = user.username or user.first_name or str(user_id)
+    caption = (msg.caption or "").strip()
+    has_caption = bool(caption)
+    title = "កំពុងវិភាគរូបភាព (AI Vision)" if has_caption else "កំពុងអានអត្ថបទពីរូបភាព"
+    detail = f"សំណួរ: {caption[:40]}..." if has_caption else "កំពុងរៀបចំឯកសាររូបភាព។"
+    progress = await TelegramProgress.start(
+        bot=context.bot,
+        chat_id=msg.chat_id,
+        reply_target=msg,
+        title=title,
+        percent=5,
+        stage="កំពុងពិនិត្យរូបភាព",
+        detail=detail,
+    )
+    img_path: str | None = None
+    try:
+        await progress.update(12, "កំពុងទាញយករូបភាព", "កំពុងទទួលយករូបភាពគុណភាពខ្ពស់ពី Telegram...", force=True)
+        img_path = _make_temp_img(suffix=".jpg")
+        tg_file = await safe_send(lambda: context.bot.get_file(msg.photo[-1].file_id))
+        if not tg_file:
+            raise RuntimeError("Could not download photo.")
+        await tg_file.download_to_drive(img_path)
+
+        await progress.update(35, "បានទាញយករូបភាព", "កំពុងស្គាល់ប្រភេទរូបភាព...", force=True)
+        mime_type = _detect_image_mime(img_path)
+
+        stage_text = "រូបភាពកំពុងត្រូវបានវិភាគដោយ AI Vision..." if has_caption else "រូបភាពកំពុងត្រូវបានផ្ញើទៅម៉ាស៊ីន OCR..."
+        await progress.update(50, "កំពុងដំណើរការ", stage_text, force=True)
+        ocr_text = await run_telegram_workload(
+            "ocr", lambda: ocr_image(img_path, mime_type=mime_type, user_prompt=caption)
+        )
+        if not ocr_text or ocr_text.upper() == "NOTEXT":
+            await progress.finish("⚠️ រូបភាពនេះមិនមានអត្ថបទដែលអាចអានបានទេ!")
+            return
+
+        finish_stage = "បានវិភាគរូបភាពរួចរាល់" if has_caption else "បានអានអត្ថបទរួចរាល់"
+        await progress.update(85, finish_stage, f"ទទួលបាន {len(ocr_text)} តួអក្សរ។", force=True)
+        record_turn(
+            user_id,
+            "user",
+            f"[Image Vision]: {caption} -> {ocr_text[:400]}" if has_caption else f"[Image OCR]: {ocr_text[:500]}",
+        )
+
+        lang_key = _detect_lang(ocr_text)
+        if has_caption:
+            header = f"🤖 <b>AI Vision ឆ្លើយតប:</b>\n<i>សំណួរ: {html.escape(caption)}</i>\n\n"
+        else:
+            lang_flag, lang_name = _language_display(lang_key)
+            header = f"📝 <b>អត្ថបទពីរូបភាព {lang_flag} {html.escape(lang_name)}</b>\n\n"
+
+        plain_pages = _paginate_plain(ocr_text, limit=max(500, TELE_MSG_LIMIT - len(header) - 64))
+        if not plain_pages:
+            await progress.fail("❌ មិនអាចរៀបចំអត្ថបទដែលបានអានទេ!")
+            return
+
+        from app.services.telegram.formatters import markdown_to_telegram_html
+
+        first_body = markdown_to_telegram_html(plain_pages[0]) if has_caption else html.escape(plain_pages[0])
+        first_page = header + first_body
+        await progress.finish(first_page, parse_mode="HTML")
+        result_id = progress.message_id or int(msg.message_id)
+        save_text_cache(
+            result_id,
+            ocr_text,
+            chat_id=msg.chat_id,
+            user_id=user_id,
+            username=uname,
+        )
+        if progress.message is not None:
+            await safe_send(lambda: progress.message.edit_reply_markup(
+                reply_markup=get_ocr_confirm_kb(result_id, is_khmer=(lang_key == "km"))
+            ))
+
+        total_pages = len(plain_pages)
+        for idx, plain_page in enumerate(plain_pages[1:], 2):
+            page_content = markdown_to_telegram_html(plain_page) if has_caption else html.escape(plain_page)
+            page_body = (
+                f"📝 <b>អត្ថបទពីរូបភាព — ទំព័រ {idx}/{total_pages}</b>\n\n"
+                + page_content
+            )
+            await safe_send(lambda pb=page_body: msg.reply_text(pb, parse_mode="HTML"))
+            await asyncio.sleep(0.15)
+    except WorkloadBusy:
+        _metric_inc("busy_rejected")
+        await progress.fail("⏳ សេវា OCR កំពុងរវល់។ សូមសាកល្បងម្ដងទៀតបន្តិចក្រោយ។")
+    except Exception as exc:
+        err_msg = str(exc) or repr(exc)
+        if _is_expected_ocr_outage_error(err_msg):
+            logger.warning("on_photo OCR unavailable: %s: %s", type(exc).__name__, err_msg[:700])
+        else:
+            logger.error("on_photo OCR error: %s: %r", type(exc).__name__, exc, exc_info=True)
+        if _is_dns_or_network_error(err_msg):
+            user_msg = "❌ មិនអាចភ្ជាប់ទៅសេវា OCR បានទេ! សូមសាកល្បងម្ដងទៀតបន្តិចក្រោយ។"
+        elif "temporarily disabled" in err_msg.lower():
+            user_msg = "⚠️ សេវា OCR ត្រូវបានផ្អាកបណ្ដោះអាសន្ន។ សូមសាកល្បងម្ដងទៀតនៅពេលក្រោយ។"
+        else:
+            user_msg = "❌ មិនអាចអានអត្ថបទពីរូបភាពនេះបានទេ! សូមប្រើរូបភាពច្បាស់ជាងនេះ ហើយសាកល្បងម្ដងទៀត។"
+        await progress.fail(user_msg)
+    finally:
+        if img_path:
+            _cleanup(img_path)
+
+
+@legacy_bound_handler
+async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    user = update.effective_user
+    if msg is None or user is None or msg.voice is None:
+        return
+    user_id = int(user.id)
+
+    if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
+        target_id = _admin_chat_target.get(user_id)
+        if target_id:
+            ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
+            reply = (
+                f"✅ បានផ្ញើសារសំឡេងទៅកាន់អ្នកប្រើប្រាស់ <code>{target_id}</code>។"
+                if ok else
+                f"❌ អ្នកប្រើប្រាស់ <code>{target_id}</code> បានបិទបូត (Blocked)។"
+            )
+            await safe_send(lambda: msg.reply_text(reply, parse_mode="HTML"))
+            if not ok:
+                _close_session(user_id)
+                context.user_data.pop("chat_state", None)
+        return
+
+    admin_id = _get_admin_for_user(user_id)
+    if admin_id is not None:
+        uname = user.username or user.first_name or str(user_id)
+        await _fwd_user_to_admin(context.bot, admin_id, user_id, uname, msg)
+        await safe_send(lambda: msg.reply_text("✅ បានផ្ញើសារសំឡេងទៅកាន់អ្នកគ្រប់គ្រង។"))
+        return
+
+    from app.core.features import is_audio_transcription_enabled
+    if not is_audio_transcription_enabled():
+        await safe_send(lambda: msg.reply_text("⚠️ មុខងារបម្លែងសំឡេងទៅជាអត្ថបទត្រូវបានបិទដំណើរការ (Transcription Disabled)។"))
+        return
+
+    if not await _ensure_user_allowed(update, context, "voice_transcribe_enabled", "បម្លែងសំឡេងទៅជាអត្ថបទ"):
+        return
+    if not _gemini:
+        await safe_send(lambda: msg.reply_text("❌ សេវាបម្លែងសំឡេងទៅជាអត្ថបទមិនទាន់បានបើកដំណើរការទេ។"))
+        return
+    if msg.voice.file_size and msg.voice.file_size > MAX_VOICE_BYTES:
+        await safe_send(lambda: msg.reply_text("❌ ឯកសារសំឡេងធំពេក។ អតិបរមា 20 MB។"))
+        return
+    if await _check_cooldown(msg, user_id):
+        return
+
+    _metric_inc("voice")
+    await safe_send(lambda: context.bot.send_chat_action(chat_id=msg.chat_id, action="typing"))
+    sync_user_data(user)
+    progress = await TelegramProgress.start(
+        bot=context.bot,
+        chat_id=msg.chat_id,
+        reply_target=msg,
+        title="កំពុងបម្លែងសារសំឡេងទៅជាអត្ថបទ",
+        percent=5,
+        stage="កំពុងពិនិត្យសារសំឡេង",
+        detail=f"រយៈពេល {float(msg.voice.duration or 0):g} វិនាទី",
+    )
+    ogg_path = _make_temp_ogg()
+    try:
+        await progress.update(15, "កំពុងទាញយកសារសំឡេង", "កំពុងទទួលឯកសារពី Telegram...", force=True)
+        voice_file = await safe_send(lambda: context.bot.get_file(msg.voice.file_id))
+        if not voice_file:
+            raise RuntimeError("Could not get voice file")
+        await voice_file.download_to_drive(ogg_path)
+
+        await progress.update(40, "បានទាញយកសារសំឡេង", "កំពុងផ្ញើទៅម៉ាស៊ីនស្គាល់សំឡេង...", force=True)
+        transcript = await run_telegram_workload(
+            "transcribe", lambda: transcribe_voice(ogg_path)
+        )
+        if not transcript:
+            await progress.fail("❌ មិនអាចស្គាល់អត្ថបទនៅក្នុងសារសំឡេងនេះបានទេ!")
+            return
+
+        await progress.update(85, "បានស្គាល់អត្ថបទ", f"រកឃើញ {len(transcript)} តួអក្សរ។", force=True)
+        record_turn(user_id, "user", f"[Voice Transcript]: {transcript[:500]}")
+        detected_lang = _detect_lang(transcript)
+        lang_flag, lang_name = _language_display(detected_lang)
+        header = (
+            f"🎙️ <b>អត្ថបទពីសារសំឡេង</b> {lang_flag} "
+            f"{html.escape(lang_name)}\n\n"
+        )
+        pages = _paginate_plain(transcript, limit=max(500, TELE_MSG_LIMIT - len(header) - 64))
+        if not pages:
+            raise RuntimeError("Could not paginate transcript")
+        await progress.finish(header + html.escape(pages[0]), parse_mode="HTML")
+        result_id = progress.message_id or int(msg.message_id)
+        save_text_cache(
+            result_id,
+            transcript,
+            chat_id=msg.chat_id,
+            user_id=user_id,
+            username=user.username or user.first_name,
+        )
+        if progress.message is not None:
+            await safe_send(lambda: progress.message.edit_reply_markup(
+                reply_markup=get_transcription_kb(result_id)
+            ))
+        total_pages = len(pages)
+        for idx, page in enumerate(pages[1:], 2):
+            body = f"🎙️ <b>អត្ថបទពីសារសំឡេង — ទំព័រ {idx}/{total_pages}</b>\n\n{html.escape(page)}"
+            await safe_send(lambda b=body: msg.reply_text(b, parse_mode="HTML"))
+            await asyncio.sleep(0.15)
+    except WorkloadBusy:
+        _metric_inc("busy_rejected")
+        await progress.fail("⏳ សេវាបម្លែងសំឡេងកំពុងរវល់។ សូមសាកល្បងម្ដងទៀតបន្តិចក្រោយ។")
+    except Exception as exc:
+        logger.error("on_voice error: %s", exc, exc_info=True)
+        await progress.fail("❌ មិនអាចបម្លែងសារសំឡេងទៅជាអត្ថបទបានទេ! សូមសាកល្បងម្ដងទៀត។")
+    finally:
+        _cleanup(ogg_path)
+
+
+@legacy_bound_handler
+async def on_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Convert and/or transcribe audio using one progress message."""
+    msg = update.message
+    user = update.effective_user
+    user_id = user.id if user else None
+    if user_id is None or msg is None:
+        return
+
+    if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
+        target_id = _admin_chat_target.get(user_id)
+        if target_id:
+            ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
+            reply = (
+                f"✅ បានផ្ញើឯកសារទៅកាន់អ្នកប្រើប្រាស់ <code>{target_id}</code>។"
+                if ok else
+                f"❌ អ្នកប្រើប្រាស់ <code>{target_id}</code> បានបិទបូត (Blocked)។"
+            )
+            await safe_send(lambda: msg.reply_text(reply, parse_mode="HTML"))
+            if not ok:
+                _close_session(user_id)
+                context.user_data.pop("chat_state", None)
+        return
+
+    admin_id = _get_admin_for_user(user_id)
+    if admin_id is not None:
+        uname = user.username or user.first_name or str(user_id)
+        await _fwd_user_to_admin(context.bot, admin_id, user_id, uname, msg)
+        await safe_send(lambda: msg.reply_text("✅ បានផ្ញើឯកសារទៅកាន់អ្នកគ្រប់គ្រង។"))
+        return
+
+    from app.core.features import is_audio_transcription_enabled
+    if not is_audio_transcription_enabled():
+        await safe_send(lambda: msg.reply_text("⚠️ មុខងារបម្លែងឯកសារសំឡេងទៅជាអត្ថបទត្រូវបានបិទដំណើរការ (Transcription Disabled)។"))
+        return
+
+    doc = msg.document
+    audio = msg.audio
+    if doc is not None:
+        filename = doc.file_name or ""
+        mime_type = doc.mime_type or ""
+        file_id = doc.file_id
+        file_size = int(doc.file_size or 0)
+        if _is_subtitle_file(filename) or not _is_audio_file(filename, mime_type):
+            await on_document(update, context)
+            return
+    elif audio is not None:
+        filename = audio.file_name or ""
+        mime_type = audio.mime_type or ""
+        file_id = audio.file_id
+        file_size = int(audio.file_size or 0)
+    else:
+        return
+
+    if not await _ensure_user_allowed(update, context):
+        return
+    settings, _settings_status = await get_bot_settings_async()
+    convert_enabled = _setting_bool_from(settings, "audio_to_voice_enabled", True)
+    transcribe_enabled = _setting_bool_from(settings, "audio_transcribe_enabled", True)
+    if not convert_enabled and not transcribe_enabled:
+        _metric_inc("disabled_hits")
+        await safe_send(lambda: msg.reply_text(
+            "⚠️ មុខងារបម្លែងឯកសារអូឌីយ៉ូត្រូវបានបិទបណ្ដោះអាសន្នដោយអ្នកគ្រប់គ្រង។"
+        ))
+        return
+    if file_size > MAX_AUDIO_FILE_BYTES:
+        await safe_send(lambda: msg.reply_text(
+            f"❌ ឯកសារអូឌីយ៉ូធំពេក។ អតិបរមា {MAX_AUDIO_FILE_BYTES // 1024 // 1024} MB។"
+        ))
+        return
+    if await _check_cooldown(msg, user_id):
+        return
+
+    await safe_send(lambda: context.bot.send_chat_action(chat_id=msg.chat_id, action="typing"))
+    sync_user_data(user)
+    uname = user.username or user.first_name or str(user_id)
+    ext = os.path.splitext(filename)[1].lower() if filename else ".mp3"
+    if ext not in _AUDIO_EXTENSIONS:
+        ext = ".mp3"
+    gemini_mime = _audio_mime_for_gemini(filename, mime_type)
+    audio_path: str | None = None
+    voice_path: str | None = None
+    voice_sent = False
+    transcript = ""
+    conversion_error: Exception | None = None
+    transcription_error: Exception | None = None
+
+    progress = await TelegramProgress.start(
+        bot=context.bot,
+        chat_id=msg.chat_id,
+        reply_target=msg,
+        title="កំពុងដំណើរការឯកសារអូឌីយ៉ូ",
+        percent=5,
+        stage="កំពុងពិនិត្យឯកសារ",
+        detail=filename or "ឯកសារអូឌីយ៉ូ",
+    )
+    try:
+        await progress.update(12, "កំពុងទាញយកឯកសារ", "កំពុងទទួលទិន្នន័យពី Telegram...", force=True)
+        tg_file = await safe_send(lambda: context.bot.get_file(file_id))
+        if not tg_file:
+            raise RuntimeError("Could not download audio file.")
+        audio_path = await _download_telegram_file_to_temp_path(
+            tg_file,
+            MAX_AUDIO_FILE_BYTES,
+            suffix=ext,
+        )
+        await progress.update(30, "បានទាញយកឯកសារ", "កំពុងរៀបចំប្រតិបត្តិការដែលបានបើក...", force=True)
+
+        if convert_enabled:
+            voice_path = _make_temp_ogg()
+            try:
+                await progress.update(38, "កំពុងបម្លែងទៅសារសំឡេង", "កំពុងបម្លែងទៅទម្រង់ OGG/Opus...", force=True)
+                voice_bytes = await run_telegram_workload(
+                    "audio",
+                    lambda: _convert_uploaded_audio_to_telegram_voice(audio_path, voice_path),
+                )
+                await progress.update(52, "បានបម្លែងសំឡេង", "កំពុងផ្ញើសារសំឡេង...", force=True)
+                display_name = html.escape((filename or "audio")[:80])
+                sent_voice = await safe_send(lambda vb=voice_bytes, dn=display_name: msg.reply_voice(
+                    voice=vb,
+                    caption=f"🎙️ <b>សារសំឡេង</b> — <code>{dn}</code>",
+                    parse_mode="HTML",
+                ))
+                voice_sent = sent_voice is not None
+                if voice_sent:
+                    _metric_inc("audio_to_voice")
+                    await progress.update(60, "បានផ្ញើសារសំឡេង", "ការបម្លែងទៅសារសំឡេងបានជោគជ័យ។", force=True)
+            except WorkloadBusy as exc:
+                conversion_error = exc
+                _metric_inc("busy_rejected")
+                await progress.update(
+                    60,
+                    "សេវាបម្លែងសំឡេងកំពុងរវល់",
+                    "កំពុងបន្តទៅការបម្លែងអត្ថបទ ប្រសិនបើមុខងារនេះត្រូវបានបើក...",
+                    force=True,
+                )
+            except Exception as exc:
+                conversion_error = exc
+                logger.error("Audio-to-voice conversion failed: %s", exc, exc_info=True)
+                await progress.update(60, "មិនអាចបម្លែងទៅសារសំឡេង", "កំពុងព្យាយាមបម្លែងទៅអត្ថបទ ប្រសិនបើមុខងារនេះត្រូវបានបើក...", force=True)
+
+        if transcribe_enabled:
+            if _gemini is None:
+                transcription_error = RuntimeError("Gemini API is not active.")
+            else:
+                try:
+                    await progress.update(68, "កំពុងបម្លែងសំឡេងទៅជាអត្ថបទ", "កំពុងផ្ញើអូឌីយ៉ូទៅម៉ាស៊ីនស្គាល់សំឡេង...", force=True)
+                    transcript = await run_telegram_workload(
+                        "transcribe",
+                        lambda: transcribe_audio_file(audio_path, gemini_mime),
+                    )
+                    if not transcript:
+                        raise RuntimeError("No transcript was found.")
+                    _metric_inc("audio")
+                    record_turn(user_id, "user", f"[Audio File Transcript]: {transcript[:500]}")
+                    await progress.update(88, "បានបម្លែងទៅអត្ថបទ", f"រកឃើញ {len(transcript)} តួអក្សរ។", force=True)
+                except WorkloadBusy as exc:
+                    transcription_error = exc
+                    _metric_inc("busy_rejected")
+                    logger.info("Audio transcription admission rejected: %s", exc)
+                except Exception as exc:
+                    transcription_error = exc
+                    logger.error("Audio transcription failed: %s", exc, exc_info=True)
+
+        if transcript:
+            detected_lang = _detect_lang(transcript)
+            lang_flag, lang_name = _language_display(detected_lang)
+            fname_display = html.escape(filename[:50]) if filename else "audio"
+            conversion_note = (
+                "✅ បានបង្កើតសារសំឡេងរួចរាល់។"
+                if voice_sent else
+                "⚠️ មិនអាចបង្កើតសារសំឡេងបាន ប៉ុន្តែបានបម្លែងទៅជាអត្ថបទ។"
+            )
+            header = (
+                f"🎵 <b>អត្ថបទពីឯកសារអូឌីយ៉ូ</b> {lang_flag} "
+                f"{html.escape(lang_name)} — <code>{fname_display}</code>\n"
+                f"{conversion_note}\n\n"
+            )
+            pages = _paginate_plain(transcript, limit=max(500, TELE_MSG_LIMIT - len(header) - 64))
+            if not pages:
+                raise RuntimeError("Could not paginate transcript.")
+            await progress.finish(header + html.escape(pages[0]), parse_mode="HTML")
+            result_id = progress.message_id or int(msg.message_id)
+            save_text_cache(
+                result_id,
+                transcript,
+                chat_id=msg.chat_id,
+                user_id=user_id,
+                username=uname,
+            )
+            if progress.message is not None:
+                await safe_send(lambda: progress.message.edit_reply_markup(
+                    reply_markup=get_audio_file_kb(result_id)
+                ))
+            total_pages = len(pages)
+            for idx, page in enumerate(pages[1:], 2):
+                body = f"🎵 <b>អត្ថបទពីឯកសារអូឌីយ៉ូ — ទំព័រ {idx}/{total_pages}</b>\n\n{html.escape(page)}"
+                await safe_send(lambda b=body: msg.reply_text(b, parse_mode="HTML"))
+                await asyncio.sleep(0.15)
+            return
+
+        if voice_sent:
+            if transcribe_enabled and transcription_error is not None:
+                await progress.finish(
+                    "⚠️ បានបង្កើតសារសំឡេងរួចរាល់ ប៉ុន្តែមិនអាចបម្លែងអូឌីយ៉ូទៅជាអត្ថបទបានទេ។"
+                )
+            else:
+                await progress.finish("✅ បានបម្លែង និងផ្ញើសារសំឡេងរួចរាល់។", delete_after_s=5.0)
+            return
+
+        logger.warning(
+            "Audio processing produced no output conversion_error=%s transcription_error=%s",
+            conversion_error,
+            transcription_error,
+        )
+        await progress.fail(
+            "❌ មិនអាចដំណើរការឯកសារអូឌីយ៉ូនេះបានទេ! សូមពិនិត្យឯកសារមានសំឡេង និងប្រើទម្រង់ MP3, WAV, OGG ឬ FLAC។"
+        )
+    except WorkloadBusy:
+        _metric_inc("busy_rejected")
+        await progress.fail("⏳ សេវាអូឌីយ៉ូកំពុងរវល់។ សូមសាកល្បងម្ដងទៀតបន្តិចក្រោយ។")
+    except ValueError as exc:
+        logger.warning("Audio upload rejected: %s", exc)
+        await progress.fail("❌ ឯកសារអូឌីយ៉ូមិនត្រឹមត្រូវ ឬធំពេក។ សូមជ្រើសរើសឯកសារសមស្រប។")
+    except Exception as exc:
+        logger.error("on_audio_file error: %s", exc, exc_info=True)
+        await progress.fail("❌ មានបញ្ហាក្នុងការទាញយក ឬដំណើរការឯកសារអូឌីយ៉ូ! សូមសាកល្បងម្ដងទៀត។")
+    finally:
+        if audio_path:
+            _cleanup(audio_path)
+        if voice_path:
+            _cleanup(voice_path)
+
+
+@legacy_bound_handler
+async def on_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    user = update.effective_user
+    user_id = user.id if user else None
+    if user_id is None:
+        return
+
+    if _is_admin(user_id) and context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
+        target_id = _admin_chat_target.get(user_id)
+        if target_id:
+            ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
+            reply = (
+                f"✅ ផ្ញើដល់ User <code>{target_id}</code> រួចរាល់។"
+                if ok else
+                f"❌ User <code>{target_id}</code> បានបិទបូត (Blocked)។"
+            )
+            await safe_send(lambda: msg.reply_text(reply, parse_mode="HTML"))
+            if not ok:
+                _close_session(user_id)
+                context.user_data.pop("chat_state", None)
+        return
+
+    admin_id = _get_admin_for_user(user_id)
+    if admin_id is not None:
+        uname = user.username or user.first_name or str(user_id)
+        await _fwd_user_to_admin(context.bot, admin_id, user_id, uname, msg)
+        await safe_send(lambda: msg.reply_text("✅ បានផ្ញើទៅកាន់អ្នកគ្រប់គ្រង។"))
+
+
+process_tts_for_text: Any = None
+process_ai_chat_for_text: Any = None
+
+
+@legacy_bound_handler
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    text = msg.text
+    user = update.effective_user
+    if not user:
+        return
+    user_id = int(user.id)
+
+    if _is_admin(user_id):
+        if await _handle_admin_welcome_text(update, context):
+            return
+        if await _handle_admin_button_text(update, context):
+            return
+        if await _handle_feature_request_admin_reply_text(update, context):
+            return
+        if await _handle_runtime_admin_text(update, context):
+            return
+        if await _handle_user_search_text(update, context):
+            return
+        if await _handle_admin_report_day_text(update, context):
+            return
+        if context.user_data.get("adddonor_state"):
+            from app.services.donation.handlers import handle_adddonor_text
+
+            if await handle_adddonor_text(update, context):
+                return
+        sched_state = context.user_data.get("sched_state")
+        if sched_state == SCHED_WAIT_MSG:
+            await _handle_sched_content(update, context)
+            return
+        if sched_state == SCHED_WAIT_TIME:
+            await _handle_sched_datetime(update, context)
+            return
+        if sched_state == SCHED_EDIT_WAIT_TIME:
+            await _handle_sched_edit_time(update, context)
+            return
+        if sched_state == SCHED_EDIT_WAIT_TEXT:
+            await _handle_sched_edit_text(update, context)
+            return
+        if sched_state == SCHED_EDIT_WAIT_PHOTO:
+            await safe_send(lambda: msg.reply_text("⚠️ សូមផ្ញើរូបភាពសមស្រប ឬ /cancel ដើម្បីបោះបង់។"))
+            return
+        if context.user_data.get("bc_state") == BROADCAST_WAIT_MESSAGE:
+            await broadcast_receive(update, context)
+            return
+        if context.user_data.get("chat_state") == CHAT_WAIT_MESSAGE:
+            target_id = _admin_chat_target.get(user_id)
+            if target_id:
+                ok = await _fwd_admin_to_user(context.bot, user_id, target_id, msg)
+                if ok:
+                    await safe_send(lambda: msg.reply_text(
+                        f"✅ បានផ្ញើទៅកាន់អ្នកប្រើប្រាស់ <code>{target_id}</code>។",
+                        parse_mode="HTML",
+                    ))
+                else:
+                    await safe_send(lambda: msg.reply_text(
+                        f"❌ អ្នកប្រើប្រាស់ <code>{target_id}</code> បានបិទបូត (Blocked)។ វគ្គជជែកត្រូវបានបញ្ចប់។",
+                        parse_mode="HTML",
+                    ))
+                    _close_session(user_id)
+                    context.user_data.pop("chat_state", None)
+            return
+
+    if await _handle_feature_request_user_text(update, context):
+        return
+
+    admin_id = _get_admin_for_user(user_id)
+    if admin_id is not None:
+        uname = user.username or user.first_name or str(user_id)
+        await _fwd_user_to_admin(context.bot, admin_id, user_id, uname, msg)
+        await safe_send(lambda: msg.reply_text("✅ សាររបស់អ្នកត្រូវបានផ្ញើទៅកាន់អ្នកគ្រប់គ្រង។"))
+        return
+
+    if not await _ensure_user_allowed(update, context, "tts_enabled", "បម្លែងអត្ថបទទៅជាសំឡេង"):
+        return
+    stripped = text.strip()
+    if not stripped:
+        return
+
+    # --- Dynamic UI Mode Routing ---
+    from app.services.telegram.menu import (
+        BTN_AI_CHAT,
+        BTN_CHAT_FEMALE,
+        BTN_CHAT_MALE,
+        BTN_COPY,
+        BTN_DEPOSIT,
+        BTN_EXCHANGE,
+        BTN_FOOD,
+        BTN_HOMEWORK,
+        BTN_HOMEWORK_EXPLAIN,
+        BTN_PDF,
+        BTN_REMOVE_BG,
+        BTN_SERVICES,
+        BTN_UPSCALE,
+        get_ai_chat_keyboard,
+        get_exit_keyboard,
+        get_quick_reply_keyboard,
+        is_exit_button,
+    )
+    from app.services.telegram.routing_modes import get_user_mode, set_user_mode
+
+    # Quick Guide Menu Button Dispatches
+    if stripped in ("🎙️ បម្លែងសំឡេង (TTS)", "🎙 បម្លែងសំឡេង (TTS)", "បម្លែងសំឡេង (TTS)"):
+        from app.services.telegram.menu import send_tts_quick_guide
+        await send_tts_quick_guide(msg, user_id)
+        return
+
+    if stripped in ("🤖 សួរឆ្លើយ AI", "សួរឆ្លើយ AI", "🤖 សួរឆ្លើយជាមួយ AI", "សួរឆ្លើយជាមួយ AI"):
+        from app.services.telegram.menu import send_ai_chat_quick_guide
+        await send_ai_chat_quick_guide(msg, user_id)
+        return
+
+    # Handle Exit Mode
+    if stripped.startswith("« ចេញពីមុខងារ:") or stripped.startswith("ចេញពីមុខងារ:") or is_exit_button(stripped):
+        set_user_mode(user_id, None)
+        await msg.reply_text("បានត្រឡប់មកកាន់ទំព័រដើម", reply_markup=get_quick_reply_keyboard())
+        return
+
+    # Handle Sub-menu Selection for AI Chat
+    if stripped in (BTN_CHAT_FEMALE, BTN_CHAT_MALE, "🎙 ឆាតជាមួយស្រី", "🎙 ឆាតជាមួយប្រុស"):
+        mode = get_user_mode(user_id)
+        if mode == "ai_chat":
+            gender = "female" if "ស្រី" in stripped else "male"
+            from app.legacy import set_user_pref_async
+
+            await set_user_pref_async(user_id, "gender", gender)
+            await msg.reply_text(f"បានជ្រើសរើសសំឡេង {'ស្រី' if gender == 'female' else 'ប្រុស'}! សូមសួរសំណួររបស់អ្នកមកកាន់ខ្ញុំ...")
+            return
+
+    # --- Mode Activation Handlers ---
+    if stripped == BTN_AI_CHAT:
+        set_user_mode(user_id, "ai_chat")
+        await msg.reply_text(
+            "អ្នកចង់ឆាតជាមួយអ្នកណា?\n\n🙏 សូមចំណាំថា AI អាចមានកំហុសក្នុងការសរសេរ ឬឆ្លើយសំណួរ",
+            reply_markup=get_ai_chat_keyboard(),
+        )
+        return
+
+    if stripped == BTN_REMOVE_BG:
+        set_user_mode(user_id, "remove_bg")
+        await msg.reply_text(
+            "លុប Background\n📸 សូមផ្ញើរូបភាពដែលអ្នកចង់លុប Background\n\nFREE ប្រើបានដោយឥតគិតថ្លៃ",
+            reply_markup=get_exit_keyboard("លុបBG"),
+        )
+        return
+
+    if stripped == BTN_COPY:
+        set_user_mode(user_id, "ocr")
+        await msg.reply_text(
+            "Copy អក្សរចេញពីរូបភាព\n📸 សូមផ្ញើរូបភាពដែលមានអក្សរដើម្បីឱ្យខ្ញុំទាញយកអក្សរចេញមកក្រៅ",
+            reply_markup=get_exit_keyboard("Copy"),
+        )
+        return
+
+    if stripped == BTN_UPSCALE:
+        set_user_mode(user_id, "upscale")
+        await msg.reply_text(
+            "ធ្វើរូបឱ្យច្បាស់\n📸 សូមផ្ញើរូបភាពដែលអ្នកចង់ធ្វើឱ្យច្បាស់",
+            reply_markup=get_exit_keyboard("ច្បាស់"),
+        )
+        return
+
+    if stripped == BTN_PDF:
+        set_user_mode(user_id, "pdf")
+        await msg.reply_text(
+            "មុខងារ PDF\n📄 សូមផ្ញើឯកសារ PDF ឬរូបភាពដើម្បីបំប្លែងទៅជា PDF",
+            reply_markup=get_exit_keyboard("PDF"),
+        )
+        return
+
+    if stripped == BTN_EXCHANGE:
+        set_user_mode(user_id, "exchange")
+        await msg.reply_text(
+            "📈 មុខងារហាងឆេងប្រាក់ (National Bank of Cambodia)\n\n(មុខងារនេះកំពុងអភិវឌ្ឍ...)",
+            reply_markup=get_exit_keyboard("ហាងឆេង"),
+        )
+        return
+
+    if stripped == BTN_FOOD:
+        set_user_mode(user_id, "food")
+        await msg.reply_text(
+            "🥘 ឆែកអាហារ\n📸 សូមផ្ញើរូបភាពម្ហូបអាហារ ដើម្បីឱ្យខ្ញុំប្រាប់ពីឈ្មោះ និងកាឡូរី!",
+            reply_markup=get_exit_keyboard("ឆែកអាហារ"),
+        )
+        return
+
+    if stripped == BTN_HOMEWORK:
+        set_user_mode(user_id, "homework")
+        await msg.reply_text(
+            "🤖 មុខងារលំហាត់\nសូមវាយលំហាត់ ឬផ្ញើរូបភាពលំហាត់មកកាន់ខ្ញុំ",
+            reply_markup=get_exit_keyboard("លំហាត់"),
+        )
+        return
+
+    if stripped == BTN_HOMEWORK_EXPLAIN:
+        set_user_mode(user_id, "homework_explain")
+        await msg.reply_text(
+            "👨‍🏫 លំហាត់-ពន្យល់\nសូមផ្ញើលំហាត់ ខ្ញុំនឹងពន្យល់មួយជំហានៗ!",
+            reply_markup=get_exit_keyboard("លំហាត់-ពន្យល់"),
+        )
+        return
+
+    if stripped == BTN_DEPOSIT:
+        set_user_mode(user_id, "deposit")
+        from app.services.telegram.commands import cmd_khqr
+
+        await cmd_khqr(update, context)
+        return
+
+    if stripped == BTN_SERVICES:
+        set_user_mode(user_id, "services")
+        await msg.reply_text(
+            "⚡ <b>សេវាកម្មដែលពួកយើងមានផ្ដល់ជូន:</b>\n"
+            "— បុកហ្គេម 🎮\n"
+            "— Boost TikTok 🎵\n"
+            "— Telegram Stars ⭐, Premium 🌟\n\n"
+            "ទាក់ទង: @se6la",
+            parse_mode="HTML",
+            reply_markup=get_exit_keyboard("សេវាកម្ម"),
+        )
+        return
+
+    # Check if we are currently in AI Chat mode and user sent text
+    current_mode = get_user_mode(user_id)
+    if current_mode == "ai_chat" and not stripped.startswith("/"):
+        from app.services.telegram.commands import cmd_ask
+
+        msg.text = f"/ask {stripped}"
+        await cmd_ask(update, context)
+        return
+
+    # Check if message is or contains a TikTok link
+    from app.core.features import (
+        is_ai_chat_enabled,
+        is_article_reader_enabled,
+        is_facebook_enabled,
+        is_instagram_enabled,
+        is_tiktok_enabled,
+        is_tts_enabled,
+        is_youtube_enabled,
+    )
+
+    if is_tiktok_enabled():
+        from app.services.downloader.tiktok import handle_tiktok_download, is_tiktok_url
+
+        if is_tiktok_url(stripped):
+            try:
+                await handle_tiktok_download(update, context, stripped)
+            except Exception as exc:
+                logger.error("Error handling TikTok download in on_text: %s", exc, exc_info=True)
+                with suppress(Exception):
+                    await msg.reply_text(f"❌ បរាជ័យក្នុងការទាញយក TikTok: {exc}")
+            return
+
+    # Check if message is or contains a Facebook video/reel link
+    if is_facebook_enabled():
+        from app.services.downloader.facebook import handle_facebook_download, is_facebook_url
+
+        if is_facebook_url(stripped):
+            try:
+                await handle_facebook_download(update, context, stripped)
+            except Exception as exc:
+                logger.error("Error handling Facebook download in on_text: %s", exc, exc_info=True)
+                with suppress(Exception):
+                    await msg.reply_text(f"❌ បរាជ័យក្នុងការទាញយក Facebook: {exc}")
+            return
+
+    # Check if message is or contains an Instagram reel/post link
+    if is_instagram_enabled():
+        from app.services.downloader.instagram import handle_instagram_download, is_instagram_url
+
+        if is_instagram_url(stripped):
+            try:
+                await handle_instagram_download(update, context, stripped)
+            except Exception as exc:
+                logger.error("Error handling Instagram download in on_text: %s", exc, exc_info=True)
+                with suppress(Exception):
+                    await msg.reply_text(f"❌ បរាជ័យក្នុងការទាញយក Instagram: {exc}")
+            return
+
+    # Check if message is or contains a YouTube video/shorts link
+    if is_youtube_enabled():
+        from app.services.downloader.youtube import handle_youtube_download, is_youtube_url
+
+        if is_youtube_url(stripped):
+            try:
+                await handle_youtube_download(update, context, stripped)
+            except Exception as exc:
+                logger.error("Error handling YouTube download in on_text: %s", exc, exc_info=True)
+                with suppress(Exception):
+                    await msg.reply_text(f"❌ បរាជ័យក្នុងការទាញយក YouTube: {exc}")
+            return
+
+    if is_article_reader_enabled() and _URL_PATTERN.match(stripped):
+        from app.services.telegram.commands import cmd_narrate
+
+        await cmd_narrate(update, context)
+        return
+
+    # Check text character limits
+    max_chars = globals().get("MAX_INPUT_CHARS", 4000)
+    if len(stripped) > max_chars:
+        await safe_send(lambda: msg.reply_text(
+            f"❌ អត្ថបទវែងពេក។ អតិបរមា {max_chars} តួអក្សរ។\n"
+            f"អ្នកបានផ្ញើ {len(stripped)} តួអក្សរ។"
+        ))
+        return
+    if await _check_cooldown(msg, user_id):
+        return
+
+    # Check user interaction intent (Auto-Detect / TTS Only / Smart AI Chat)
+    prefs = await get_user_prefs_async(user_id)
+    user_mode = prefs.get("bot_mode", "auto")
+    from app.services.telegram.flow import classify_text_intent
+
+    intent = classify_text_intent(stripped, user_mode)
+
+    if intent == "ai_chat":
+        if not is_ai_chat_enabled():
+            intent = "tts"
+        else:
+            cleaned_prompt = stripped
+            if cleaned_prompt.startswith("?") or cleaned_prompt.startswith("❓"):
+                cleaned_prompt = cleaned_prompt[1:].strip()
+            if not cleaned_prompt:
+                cleaned_prompt = stripped
+            await process_ai_chat_for_text(update, context, cleaned_prompt, user_id)
+            return
+
+    if not is_tts_enabled():
+        await safe_send(lambda: msg.reply_text("⚠️ មុខងារបម្លែងសំឡេង (TTS) ត្រូវបានបិទដំណើរការ។"))
+        return
+
+    if not _reserve_tts_request(user_id):
+        await safe_send(lambda: msg.reply_text("⏳ សូមរង់ចាំ TTS មុននៅក្នុងដំណើរការ..."))
+        return
+
+    try:
+        await process_tts_for_text(update, context, stripped, user_id)
+    except Exception as err:
+        logger.warning("process_tts_for_text failed for user %s: %s", user_id, err)
+
+
+@legacy_bound_handler
+async def process_tts_for_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    stripped: str,
+    user_id: int,
+    *,
+    gender_override: str | None = None,
+    voice_markup_override: Any = None,
+):
+    """Core TTS processing extracted from on_text so it can be called programmatically."""
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    file_path: str | None = None
+    progress: TelegramProgress | None = None
+    try:
+        _metric_inc("tts", user_id=user_id)
+        await safe_send(lambda: context.bot.send_chat_action(chat_id=msg.chat_id, action="record_voice"))
+        sync_user_data(user)
+
+        loop = asyncio.get_running_loop()
+        prefs, tts_text = await asyncio.gather(
+            get_user_prefs_async(user_id),
+            resolve_tts_text(user_id, stripped, loop),
+        )
+        gender = gender_override or prefs["gender"]
+        speed = prefs["speed"]
+        tts_model = prefs.get("tts_model", "auto")
+        tts_text = tts_text.strip() or stripped
+        model_key = _normalize_tts_model(tts_model)
+        model_label = TTS_MODEL_OPTIONS.get(model_key, TTS_MODEL_OPTIONS["auto"])[0]
+
+        chat_type = str(getattr(msg.chat, "type", "private") or "private").lower()
+        is_channel_or_group = chat_type in ("channel", "group", "supergroup") or int(msg.chat_id) < 0
+        allow_channel_buttons = (
+            os.environ.get("CHANNEL_NARRATOR_SHOW_BUTTONS", "false").lower() in ("1", "true", "yes")
+            or (bot_setting_bool_cached("channel_narrator_show_buttons", False) if "bot_setting_bool_cached" in globals() else False)
+        )
+        if voice_markup_override is not None:
+            voice_markup = voice_markup_override
+        else:
+            voice_markup = get_main_kb(gender, tts_model, speed=speed) if (not is_channel_or_group or allow_channel_buttons) else None
+
+        # --- Fast Path: Instant Telegram CDN file_id Delivery ---
+        cache_key = ""
+        max_single_chars = globals().get("TTS_SINGLE_VOICE_MAX_CHARS", 500)
+        bot_tag = globals().get("BOT_TAG", "@khmer_voice_bot")
+        if len(tts_text) <= max_single_chars:
+            if "_tts_audio_cache_key" in globals():
+                cache_key = _tts_audio_cache_key(tts_text, gender, speed, tts_model)
+            else:
+                cache_key = make_tts_audio_cache_key(
+                    tts_text,
+                    gender,
+                    speed,
+                    tts_model,
+                    provider_context="",
+                )
+            cached_file_id = get_cached_telegram_file_id(cache_key)
+            if cached_file_id:
+                logger.info("⚡ Instant TTS CDN cache hit for user %s (key=%s)", user_id, cache_key[:12])
+                sent_msg = await safe_send(lambda fid=cached_file_id: msg.reply_voice(
+                    voice=fid,
+                    caption=f"🎙️ {bot_tag}",
+                    reply_markup=voice_markup,
+                ))
+                if sent_msg is not None:
+                    _metric_inc("tts_cache_hit", user_id=user_id)
+                    save_text_cache(
+                        sent_msg.message_id,
+                        tts_text,
+                        chat_id=msg.chat_id,
+                        user_id=user_id,
+                        username=user.username or user.first_name,
+                    )
+                    set_last_tts_text(user_id, tts_text)
+                    record_turn(user_id, "user", stripped)
+                    record_turn(user_id, "assistant", tts_text)
+                    _set_last_tts(user_id)
+                    return
+                else:
+                    invalidate_cached_telegram_file_id(cache_key)
+
+        # Cache Miss: Display minimal progress bar during speech synthesis
+        progress = await TelegramProgress.start(
+            bot=context.bot,
+            chat_id=msg.chat_id,
+            reply_target=msg,
+            title="កំពុងបម្លែងអត្ថបទទៅជាសំឡេង",
+            percent=15,
+            stage="កំពុងរៀបចំសំឡេង",
+            detail=f"ម៉ូដែល៖ {model_label} — អត្ថបទ {len(tts_text)} តួអក្សរ។",
+            minimal=True,
+        )
+
+        lock = _get_user_lock(user_id)
+        async with lock:
+            if len(tts_text) > max_single_chars:
+                uname = user.username or user.first_name or str(user_id)
+                try:
+                    sent_count, failed_count = await asyncio.wait_for(
+                        _deliver_paged_tts(
+                            chat_id=msg.chat_id,
+                            bot=context.bot,
+                            text=tts_text,
+                            gender=gender,
+                            speed=speed,
+                            user_id=user_id,
+                            username=uname,
+                            tts_model=tts_model,
+                            progress=progress,
+                            progress_start=25,
+                            progress_end=95,
+                        ),
+                        timeout=900.0,
+                    )
+                except TimeoutError as exc:
+                    raise RuntimeError("ប្រតិបត្តិការចំណាយពេលយូរពេក (Timeout)។") from exc
+                record_turn(user_id, "user", stripped)
+                max_ctx = globals().get("CONV_CONTEXT_MAX_CHARS", 2000)
+                record_turn(user_id, "assistant", tts_text[:max_ctx])
+                _set_last_tts(user_id)
+                if failed_count:
+                    await progress.finish(
+                        f"⚠️ បានផ្ញើសំឡេង {sent_count} ផ្នែក ប៉ុន្តែមាន {failed_count} ផ្នែកមិនបានជោគជ័យ។"
+                    )
+                else:
+                    await progress.finish(
+                        f"✅ បានបង្កើត និងផ្ញើសំឡេងរួចរាល់ ({sent_count} ផ្នែក)។",
+                        delete_after_s=1.5,
+                    )
+                return
+
+            file_path = _make_temp_ogg()
+            await progress.update(35, "កំពុងបង្កើតសំឡេង", f"កំពុងប្រើ {model_label}...", force=True)
+            generation_started = time.perf_counter()
+            try:
+                audio_bytes = await asyncio.wait_for(
+                    generate_user_voice_limited(
+                        tts_text,
+                        gender,
+                        speed,
+                        file_path,
+                        tts_model,
+                        user_id=user_id,
+                        bot=context.bot,
+                        chat_id=msg.chat_id,
+                        progress=progress,
+                    ),
+                    timeout=45.0,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Primary voice generation failed/timed out (%s); activating fast emergency Edge-TTS fallback...",
+                    exc,
+                )
+                with suppress(Exception):
+                    await progress.update(
+                        60,
+                        "កំពុងដំណើរការសំឡេងបម្រុង",
+                        "កំពុងប្រើប្រាស់ Edge-TTS ល្បឿនលឿន...",
+                        force=True,
+                    )
+                try:
+                    audio_bytes = await asyncio.wait_for(
+                        _generate_voice_edge(tts_text, gender, speed, file_path),
+                        timeout=45.0,
+                    )
+                except Exception as fallback_exc:
+                    logger.error("Emergency Edge-TTS fallback failed: %s", fallback_exc)
+                    raise RuntimeError("ការបង្កើតសំឡេងចំណាយពេលយូរពេក សូមព្យាយាមម្ដងទៀត។") from fallback_exc
+
+            _record_admin_usage(
+                user_id,
+                "tts_generation",
+                duration_ms=(time.perf_counter() - generation_started) * 1_000,
+            )
+            await progress.update(88, "បានបង្កើតសំឡេង", "កំពុងផ្ញើសារសំឡេងទៅកាន់អ្នក...", force=True)
+
+            sent_msg = await safe_send(lambda ab=audio_bytes: msg.reply_voice(
+                voice=io.BytesIO(ab),
+                caption=f"🎙️ {bot_tag}",
+                reply_markup=voice_markup,
+            ))
+            if sent_msg is None:
+                raise RuntimeError("Telegram មិនអាចផ្ញើសារសំឡេងបានទេ។")
+            if getattr(sent_msg, "voice", None) and sent_msg.voice.file_id and cache_key:
+                set_cached_telegram_file_id(cache_key, sent_msg.voice.file_id)
+            save_text_cache(
+                sent_msg.message_id,
+                tts_text,
+                chat_id=msg.chat_id,
+                user_id=user_id,
+                username=user.username or user.first_name,
+            )
+            set_last_tts_text(user_id, tts_text)
+            record_turn(user_id, "user", stripped)
+            record_turn(user_id, "assistant", tts_text)
+            _set_last_tts(user_id)
+            await progress.finish("✅ បានបង្កើត និងផ្ញើសំឡេងរួចរាល់។", delete_after_s=1.5)
+    except Exception as exc:
+        logger.error("on_text TTS error: %s", exc, exc_info=True)
+        err_msg = _tts_user_error_message(exc) if "_tts_user_error_message" in globals() else f"❌ បរាជ័យ: {exc}"
+        if progress is not None:
+            await progress.fail(err_msg)
+        else:
+            await safe_send(lambda: msg.reply_text(err_msg))
+    finally:
+        _release_tts_request(user_id)
+        if file_path:
+            _cleanup(file_path)
+
+
+@legacy_bound_handler
+async def process_ai_chat_for_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    prompt: str,
+    user_id: int,
+) -> None:
+    """Smart conversational AI assistant: answers with Gemini AI in clean text format."""
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+
+    from app import legacy
+    gemini_client = getattr(legacy, "_gemini", None)
+    if not gemini_client:
+        await safe_send(lambda: msg.reply_text("⚠️ AI Assistant មិនទាន់ត្រូវបានកំណត់រចនាសម្ព័ន្ធទេ។"))
+        return
+
+    if not _reserve_tts_request(user_id):
+        await safe_send(lambda: msg.reply_text("⏳ សូមរង់ចាំ AI កំពុងដំណើរការ..."))
+        return
+
+    await safe_send(lambda: msg.reply_chat_action("typing"))
+    status_msg = await safe_send(lambda: msg.reply_text(
+        "🤖 <b>AI កំពុងគិត និងវិភាគចម្លើយ...</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚡ ម៉ូដែល: <code>Gemini 2.5 Flash</code>\n"
+        "🔍 <i>កំពុងស្រាវជ្រាវ និងរៀបចំខ្លឹមសារ...</i>",
+        parse_mode="HTML",
+    ))
+    from app.services.telegram.formatters import StatusCardAnimator
+
+    animator = StatusCardAnimator(
+        status_msg,
+        title="AI កំពុងគិត និងវិភាគចម្លើយ...",
+        icon="🤖",
+        header_extra="⚡ ម៉ូដែល: <code>Gemini 2.5 Flash</code>",
+        detail="កំពុងស្រាវជ្រាវ និងរៀបចំខ្លឹមសារ",
+    )
+    try:
+        loop = asyncio.get_running_loop()
+        from app.services.ai.gemini import (
+            extract_gemini_text,
+            generate_content_with_fallback,
+        )
+
+        preferred = getattr(legacy, "GEMINI_MODEL", "gemini-2.5-flash")
+
+        ai_prompt = (
+            "You are Bot Voice, a helpful, intelligent Cambodian AI assistant. "
+            "Answer the following user question or message clearly, helpfully, and concisely. "
+            "If the user asks in Khmer, answer naturally in Khmer. "
+            "Format your answer cleanly for Telegram chat using readable paragraphs and neat formatting:\n\n"
+            f"{prompt}"
+        )
+
+        def _call_ai():
+            return generate_content_with_fallback(
+                gemini_client,
+                contents=ai_prompt,
+                preferred_model=preferred,
+            )
+
+        async with animator:
+            resp = await loop.run_in_executor(None, _call_ai)
+            ai_text = extract_gemini_text(resp)
+
+        if status_msg and hasattr(status_msg, "delete"):
+            with suppress(Exception):
+                await status_msg.delete()
+        if not ai_text:
+            _release_tts_request(user_id)
+            await safe_send(lambda: msg.reply_text(
+                "⚠️ មិនអាចឆ្លើយបានទេ (អាចដោយសារគោលការណ៍សុវត្ថិភាព AI ឬគ្មានចម្លើយ)។"
+            ))
+            return
+
+        from app.services.telegram.formatters import markdown_to_telegram_html, send_split_html
+
+        formatted_html = markdown_to_telegram_html(ai_text)
+        ai_header = f"🤖 <b>AI:</b>\n\n{formatted_html}"
+        await send_split_html(msg, ai_header, disable_web_page_preview=True)
+        _release_tts_request(user_id)
+    except Exception as exc:
+        if status_msg and hasattr(status_msg, "delete"):
+            with suppress(Exception):
+                await status_msg.delete()
+        _release_tts_request(user_id)
+        logger.warning("process_ai_chat_for_text failed for user %s: %s", user_id, exc)
+        await safe_send(lambda: msg.reply_text(f"❌ បរាជ័យក្នុងការឆ្លើយតប AI: {exc}"))
+
+
+__all__ = [
+    'on_any_media',
+    'on_audio_file',
+    'on_photo',
+    'on_text',
+    'on_voice',
+    'process_ai_chat_for_text',
+    'process_tts_for_text',
+]

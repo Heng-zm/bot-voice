@@ -1,0 +1,46 @@
+[
+  {
+    "id": 1,
+    "user_id": 1272791365,
+    "username": "",
+    "full_name": "HENG",
+    "amount": 2,
+    "currency": "USD",
+    "tier": "milktea",
+    "note": "",
+    "blessing_sent": true,
+    "status": "completed",
+    "created_at": "2026-09-12T09:10:23.638827+00:00",
+    "updated_at": "2026-09-12T11:00:25.384806+00:00",
+    "cups": 1
+  },
+  {
+    "id": 2,
+    "user_id": 1272791365,
+    "username": "",
+    "full_name": "HENG",
+    "amount": 1,
+    "currency": "USD",
+    "tier": "coffee",
+    "note": "",
+    "blessing_sent": true,
+    "status": "completed",
+    "created_at": "2026-09-12T09:45:31.710994+00:00",
+    "updated_at": "2026-09-12T11:00:25.384806+00:00",
+    "cups": 1
+  },
+  {
+    "id": 1790670737460,
+    "user_id": 1272791365,
+    "username": "",
+    "full_name": "HENG",
+    "amount": 0.1,
+    "currency": "USD",
+    "tier": "custom",
+    "cups": 1,
+    "note": "",
+    "blessing_sent": true,
+    "status": "completed",
+    "created_at": "2026-09-29T08:32:17.460754+00:00"
+  }
+]

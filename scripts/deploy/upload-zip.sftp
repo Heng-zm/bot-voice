@@ -1,0 +1,2 @@
+# SFTP Batch file: Upload single archive to Anajak Cloud
+put bot-voice-update.zip
