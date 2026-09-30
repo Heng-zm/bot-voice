@@ -13,26 +13,26 @@ except (ImportError, ModuleNotFoundError, AttributeError):
         def include_router(self, *args, **kwargs) -> None:
             pass
 
+from app.api.health import router as health_router
+from app.api.logs import router as logs_router
 from app.api.routes.ai import router as ai_router
-from app.api.routes.logs import router as logs_router
-from app.api.routes.system import router as system_router
-from app.api.routes.telegram import router as telegram_router
-from app.api.routes.tts import router as tts_router
+from app.api.tts import router as tts_router
+from app.api.webhook import router as webhook_router
 
 api_router = APIRouter()
 
 # Register sub-routers
-api_router.include_router(system_router)
+api_router.include_router(health_router)
 api_router.include_router(logs_router)
-api_router.include_router(telegram_router)
+api_router.include_router(webhook_router)
 api_router.include_router(tts_router)
 api_router.include_router(ai_router)
 
 __all__ = [
-    "api_router",
     "ai_router",
+    "api_router",
+    "health_router",
     "logs_router",
-    "system_router",
-    "telegram_router",
     "tts_router",
+    "webhook_router",
 ]
